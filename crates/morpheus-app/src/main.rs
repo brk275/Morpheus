@@ -7,6 +7,8 @@ mod attachments;
 mod calls;
 mod drafts;
 mod live;
+#[cfg(feature = "native-calls")]
+mod local_video;
 mod notifications;
 mod security;
 mod sso;
@@ -20,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 #[cfg(feature = "native-calls")]
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, atomic::Ordering};
 use std::thread;
 use std::time::Duration;
@@ -39,6 +41,8 @@ use crate::attachments::{UploadCommand, UploadController, mime_type_for};
 #[cfg(feature = "native-calls")]
 use crate::calls::{AudioUpdate, CallController, CallControllerError, CallJoinMode, CallStatus};
 use crate::live::{LiveUi, MessageTarget, RoomAction, show_error};
+#[cfg(feature = "native-calls")]
+use crate::local_video::{CaptureKind, CapturePhase, CaptureSource, LocalVideoStatus};
 use crate::notifications::DesktopNotifications;
 #[cfg(feature = "native-calls")]
 use crate::video_render::VideoUpdate;
@@ -1180,7 +1184,7 @@ fn call_status_label(status: &CallStatus) -> String {
         CallStatus::Ending { .. } => "Leaving call…".into(),
         CallStatus::CleanupFailed { reason, .. } => {
             format!(
-                "Local media stopped; server leave unconfirmed: {}. Review before continuing.",
+                "Call cleanup is incomplete: {}. Review before continuing.",
                 directory_plain_text(reason, 180)
             )
         }
@@ -1265,6 +1269,144 @@ fn clear_native_video(ui: &AppWindow) {
     ui.set_native_video_visible(false);
     ui.set_native_video_frame(slint::Image::default());
     ui.set_native_video_source(SharedString::default());
+}
+
+#[cfg(feature = "native-calls")]
+fn clear_native_capture(ui: &AppWindow) {
+    ui.set_native_camera_active(false);
+    ui.set_native_screen_active(false);
+    ui.set_native_camera_busy(false);
+    ui.set_native_screen_busy(false);
+    ui.set_native_camera_stopping(false);
+    ui.set_native_screen_stopping(false);
+    ui.set_native_camera_source(SharedString::default());
+    ui.set_native_screen_source(SharedString::default());
+    ui.set_native_capture_error(SharedString::default());
+    ui.set_native_camera_error(SharedString::default());
+    ui.set_native_screen_error(SharedString::default());
+    ui.set_native_capture_picker_open(false);
+    ui.set_native_capture_sources(ModelRc::new(VecModel::from(
+        Vec::<CallCaptureSourceItem>::new(),
+    )));
+    ui.set_native_capture_source_loading(false);
+    ui.set_native_capture_source_error(SharedString::default());
+}
+
+#[cfg(feature = "native-calls")]
+fn safe_capture_label(label: &str) -> String {
+    let visible = sanitized_capture_text(label, 80);
+    if visible.is_empty() {
+        "Unnamed source".into()
+    } else {
+        visible
+    }
+}
+
+#[cfg(feature = "native-calls")]
+fn safe_capture_error(error: &str) -> String {
+    let visible = sanitized_capture_text(error, 240);
+    if visible.is_empty() {
+        "Unknown capture error".into()
+    } else {
+        visible
+    }
+}
+
+#[cfg(feature = "native-calls")]
+fn sanitized_capture_text(text: &str, limit: usize) -> String {
+    let visible: String = text
+        .chars()
+        .filter(|character| {
+            !character.is_control()
+                && !matches!(
+                    *character,
+                    '\u{061c}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}'
+                        | '\u{2060}'..='\u{206f}' | '\u{feff}'
+                )
+        })
+        .take(limit)
+        .collect();
+    visible.trim().into()
+}
+
+#[cfg(feature = "native-calls")]
+fn capture_sources(picker_kind: i32) -> Result<Vec<(i32, String, String)>, String> {
+    if picker_kind == 0 {
+        return morpheus_rtc::CameraCapture::camera_sources()
+            .map(|sources| {
+                sources
+                    .into_iter()
+                    .map(|(id, name)| (0, id, safe_capture_label(&name)))
+                    .collect()
+            })
+            .map_err(|error| safe_capture_label(&error.to_string()));
+    }
+    if picker_kind != 1 {
+        return Err("Unknown capture source type".into());
+    }
+    let displays = morpheus_rtc::ScreenCapture::display_sources();
+    let windows = morpheus_rtc::ScreenCapture::window_sources();
+    let mut sources = Vec::new();
+    if let Ok(displays) = &displays {
+        sources.extend(
+            displays
+                .iter()
+                .map(|(id, name)| (1, id.clone(), safe_capture_label(name))),
+        );
+    }
+    if let Ok(windows) = &windows {
+        sources.extend(
+            windows
+                .iter()
+                .map(|(id, name)| (2, id.clone(), safe_capture_label(name))),
+        );
+    }
+    if sources.is_empty() {
+        let details = displays.err().or_else(|| windows.err());
+        Err(details
+            .map(|error| safe_capture_label(&error.to_string()))
+            .unwrap_or_else(|| "No displays or windows are available to share".into()))
+    } else {
+        Ok(sources)
+    }
+}
+
+#[cfg(feature = "native-calls")]
+fn apply_capture_status(ui: &AppWindow, status: LocalVideoStatus) {
+    let camera_error = match &status.camera.phase {
+        CapturePhase::Failed(error) => Some(error.as_str()),
+        _ => None,
+    };
+    let screen_error = match &status.screen.phase {
+        CapturePhase::Failed(error) => Some(error.as_str()),
+        _ => None,
+    };
+    ui.set_native_camera_active(matches!(&status.camera.phase, CapturePhase::Active));
+    ui.set_native_screen_active(matches!(&status.screen.phase, CapturePhase::Active));
+    ui.set_native_camera_busy(matches!(
+        &status.camera.phase,
+        CapturePhase::Starting | CapturePhase::Stopping
+    ));
+    ui.set_native_screen_busy(matches!(
+        &status.screen.phase,
+        CapturePhase::Starting | CapturePhase::Stopping
+    ));
+    ui.set_native_camera_stopping(matches!(&status.camera.phase, CapturePhase::Stopping));
+    ui.set_native_screen_stopping(matches!(&status.screen.phase, CapturePhase::Stopping));
+    ui.set_native_camera_source(status.camera.source.into());
+    ui.set_native_screen_source(status.screen.source.into());
+    ui.set_native_camera_error(
+        camera_error
+            .map(safe_capture_error)
+            .unwrap_or_default()
+            .into(),
+    );
+    ui.set_native_screen_error(
+        screen_error
+            .map(safe_capture_error)
+            .unwrap_or_default()
+            .into(),
+    );
 }
 
 #[cfg(feature = "native-calls")]
@@ -1499,6 +1641,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+    #[cfg(feature = "native-calls")]
+    {
+        let calls = calls.clone();
+        let weak = ui.as_weak();
+        let applied_token = Arc::new(AtomicU64::new(0));
+        runtime.spawn(async move {
+            let mut capture = calls.subscribe_local_video();
+            loop {
+                let update = capture.borrow_and_update().clone();
+                let calls_for_ui = calls.clone();
+                let applied_token = applied_token.clone();
+                let closed = weak
+                    .upgrade_in_event_loop(move |ui| {
+                        let current = calls_for_ui.video_token();
+                        if update.token != current {
+                            if applied_token.load(Ordering::SeqCst) != current {
+                                clear_native_capture(&ui);
+                                applied_token.store(current, Ordering::SeqCst);
+                            }
+                            return;
+                        }
+                        if update.token == 0 {
+                            clear_native_capture(&ui);
+                        } else {
+                            apply_capture_status(&ui, update);
+                        }
+                        applied_token.store(current, Ordering::SeqCst);
+                    })
+                    .is_err();
+                if closed || capture.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
     runtime.spawn(live.clone().watch_updates(ui.as_weak()));
     runtime.spawn(live.clone().watch_sync(ui.as_weak()));
     ui.set_config_path(store.path().display().to_string().into());
@@ -1648,6 +1825,191 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if !matches!(error, CallControllerError::StaleCall) {
                         show_error(&weak, error.to_string());
                     }
+                }
+            });
+        });
+    }
+    #[cfg(feature = "native-calls")]
+    {
+        let weak = ui.as_weak();
+        let calls = calls.clone();
+        let handle = runtime.handle().clone();
+        let listing = Arc::new(AtomicBool::new(false));
+        ui.on_refresh_native_capture_sources(move |picker_kind| {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            if !window.get_live_session()
+                || !window.get_native_call_joined()
+                || !window.get_native_capture_picker_open()
+                || !matches!(picker_kind, 0 | 1)
+            {
+                return;
+            }
+            if listing.swap(true, Ordering::AcqRel) {
+                window.set_native_capture_source_error("Device discovery is still running".into());
+                return;
+            }
+            let token = calls.video_token();
+            window.set_native_capture_source_loading(true);
+            window.set_native_capture_source_error(SharedString::default());
+            window.set_native_capture_sources(ModelRc::new(VecModel::from(Vec::<
+                CallCaptureSourceItem,
+            >::new())));
+            let listing = listing.clone();
+            let weak = weak.clone();
+            let calls = calls.clone();
+            handle.spawn(async move {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(12),
+                    tokio::task::spawn_blocking(move || {
+                        let result = capture_sources(picker_kind);
+                        listing.store(false, Ordering::Release);
+                        result
+                    }),
+                )
+                .await;
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    if calls.video_token() != token
+                        || !ui.get_native_call_joined()
+                        || !ui.get_native_capture_picker_open()
+                        || ui.get_native_capture_picker_kind() != picker_kind
+                    {
+                        return;
+                    }
+                    ui.set_native_capture_source_loading(false);
+                    match result {
+                        Ok(Ok(Ok(sources))) => {
+                            let rows: Vec<_> = sources
+                                .into_iter()
+                                .map(|(kind, id, name)| CallCaptureSourceItem {
+                                    kind,
+                                    id: id.into(),
+                                    name: name.into(),
+                                })
+                                .collect();
+                            if rows.is_empty() {
+                                ui.set_native_capture_source_error(
+                                    "No sources are available".into(),
+                                );
+                            }
+                            ui.set_native_capture_sources(ModelRc::new(VecModel::from(rows)));
+                        }
+                        Ok(Ok(Err(error))) => ui.set_native_capture_source_error(error.into()),
+                        Ok(Err(_)) => ui.set_native_capture_source_error(
+                            "Device discovery stopped unexpectedly".into(),
+                        ),
+                        Err(_) => ui.set_native_capture_source_error(
+                            "Device discovery is still running in the OS; wait before refreshing"
+                                .into(),
+                        ),
+                    }
+                });
+            });
+        });
+    }
+    #[cfg(feature = "native-calls")]
+    {
+        let weak = ui.as_weak();
+        let calls = calls.clone();
+        let handle = runtime.handle().clone();
+        ui.on_start_native_capture(move |kind, id| {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            if !window.get_live_session() || !window.get_native_call_joined() {
+                return;
+            }
+            let id = id.to_string();
+            let model = window.get_native_capture_sources();
+            let selected = (0..model.row_count())
+                .filter_map(|index| model.row_data(index))
+                .find(|source| source.kind == kind && source.id.as_str() == id);
+            let Some(selected) = selected else {
+                window
+                    .set_native_capture_error("Capture source changed; refresh the picker".into());
+                return;
+            };
+            let source = match kind {
+                0 => CaptureSource::Camera(id),
+                1 => CaptureSource::Display(id),
+                2 => CaptureSource::Window(id),
+                _ => return,
+            };
+            let token = calls.video_token();
+            if token == 0 {
+                return;
+            }
+            let label = safe_capture_label(selected.name.as_str());
+            window.set_native_capture_error(SharedString::default());
+            if kind == 0 {
+                window.set_native_camera_busy(true);
+            } else {
+                window.set_native_screen_busy(true);
+            }
+            let calls = calls.clone();
+            let weak = weak.clone();
+            handle.spawn(async move {
+                if let Err(error) = calls.start_video_capture(token, source, label).await {
+                    let _ = weak.upgrade_in_event_loop(move |ui| {
+                        if calls.video_token() == token {
+                            if kind == 0 {
+                                ui.set_native_camera_busy(false);
+                            } else {
+                                ui.set_native_screen_busy(false);
+                            }
+                            ui.set_native_capture_error(
+                                safe_capture_label(&error.to_string()).into(),
+                            );
+                        }
+                    });
+                }
+            });
+        });
+    }
+    #[cfg(feature = "native-calls")]
+    {
+        let weak = ui.as_weak();
+        let calls = calls.clone();
+        let handle = runtime.handle().clone();
+        ui.on_stop_native_capture(move |kind| {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            if !window.get_live_session() || !window.get_native_call_joined() {
+                return;
+            }
+            let capture_kind = match kind {
+                0 => CaptureKind::Camera,
+                1 => CaptureKind::Screen,
+                _ => return,
+            };
+            let token = calls.video_token();
+            if token == 0 {
+                return;
+            }
+            window.set_native_capture_error(SharedString::default());
+            if kind == 0 {
+                window.set_native_camera_busy(true);
+            } else {
+                window.set_native_screen_busy(true);
+            }
+            let calls = calls.clone();
+            let weak = weak.clone();
+            handle.spawn(async move {
+                if let Err(error) = calls.stop_video_capture(token, capture_kind).await {
+                    let _ = weak.upgrade_in_event_loop(move |ui| {
+                        if calls.video_token() == token {
+                            if kind == 0 {
+                                ui.set_native_camera_busy(false);
+                            } else {
+                                ui.set_native_screen_busy(false);
+                            }
+                            ui.set_native_capture_error(
+                                safe_capture_label(&error.to_string()).into(),
+                            );
+                        }
+                    });
                 }
             });
         });

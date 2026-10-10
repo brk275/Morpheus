@@ -69,6 +69,12 @@ export struct CallParticipantItem {
     is-local: bool,
 }
 
+export struct CallCaptureSourceItem {
+    kind: int, // 0 camera, 1 display, 2 window
+    id: string,
+    name: string,
+}
+
 export struct PublicRoomItem {
     id: string,
     title: string,
@@ -361,6 +367,22 @@ export component AppWindow inherits Window {
     in-out property <image> native-video-frame;
     in-out property <string> native-video-source;
     in-out property <[CallParticipantItem]> native-call-participants;
+    in-out property <[CallCaptureSourceItem]> native-capture-sources;
+    in-out property <bool> native-capture-source-loading: false;
+    in-out property <string> native-capture-source-error;
+    in-out property <bool> native-capture-picker-open: false;
+    in-out property <int> native-capture-picker-kind: 0; // 0 camera, 1 screen
+    in-out property <bool> native-camera-active: false;
+    in-out property <bool> native-screen-active: false;
+    in-out property <bool> native-camera-busy: false;
+    in-out property <bool> native-screen-busy: false;
+    in-out property <bool> native-camera-stopping: false;
+    in-out property <bool> native-screen-stopping: false;
+    in-out property <string> native-camera-source;
+    in-out property <string> native-screen-source;
+    in-out property <string> native-capture-error;
+    in-out property <string> native-camera-error;
+    in-out property <string> native-screen-error;
     in-out property <[PublicRoomItem]> directory-results;
     in-out property <[MessageSearchItem]> room-search-results;
     in-out property <[MessageSearchItem]> room-search-context;
@@ -458,6 +480,9 @@ export component AppWindow inherits Window {
     callback join-discovery-target(string, string, string, string, bool);
     callback toggle-native-microphone();
     callback toggle-native-deafen();
+    callback refresh-native-capture-sources(int);
+    callback start-native-capture(int, string);
+    callback stop-native-capture(int);
     callback confirm-leave-call(int);
     callback open-security();
     callback refresh-security();
@@ -491,6 +516,10 @@ export component AppWindow inherits Window {
             root.sas-compared = false;
             root.notification-highlight-error = "";
         }
+        if root.page != 2 { root.native-capture-picker-open = false; }
+    }
+    changed native-call-joined => {
+        if !root.native-call-joined { root.native-capture-picker-open = false; }
     }
     property <bool> mic-muted: false;
     property <bool> camera-off: true;
@@ -2055,6 +2084,31 @@ export component AppWindow inherits Window {
                         accessible-live-region: polite;
                         color: root.muted; font-size: 12px * root.text-scale;
                     }
+                    if root.live-session && root.native-camera-active : Text {
+                        text: "Camera · " + root.native-camera-source;
+                        color: root.muted; font-size: 11px * root.text-scale;
+                        overflow: elide; accessible-live-region: polite;
+                    }
+                    if root.live-session && root.native-screen-active : Text {
+                        text: "Sharing · " + root.native-screen-source;
+                        color: root.muted; font-size: 11px * root.text-scale;
+                        overflow: elide; accessible-live-region: polite;
+                    }
+                    if root.live-session && root.native-capture-error != "" : Text {
+                        text: root.native-capture-error;
+                        color: #ef9da9; font-size: 11px * root.text-scale;
+                        wrap: word-wrap; accessible-live-region: polite;
+                    }
+                    if root.live-session && root.native-camera-error != "" : Text {
+                        text: "Camera: " + root.native-camera-error;
+                        color: #ef9da9; font-size: 11px * root.text-scale;
+                        wrap: word-wrap; accessible-live-region: polite;
+                    }
+                    if root.live-session && root.native-screen-error != "" : Text {
+                        text: "Screen share: " + root.native-screen-error;
+                        color: #ef9da9; font-size: 11px * root.text-scale;
+                        wrap: word-wrap; accessible-live-region: polite;
+                    }
                     if root.live-session && root.native-call-enabled : ActionRect {
                         height: 60px; border-radius: 10px;
                         background: root.element-call-compatibility ? root.hover : root.panel;
@@ -2193,11 +2247,11 @@ export component AppWindow inherits Window {
                     Rectangle {
                         height: 62px; background: root.panel; border-radius: 12px;
                         HorizontalLayout {
-                            padding-left: 12px; padding-right: 12px; spacing: 8px; alignment: center;
+                            padding-left: 10px; padding-right: 10px; spacing: 6px; alignment: center;
                             if !root.live-session : IconAction { width: 43px; height: 43px; icon: root.mic-muted ? "✕" : "♩"; label: root.mic-muted ? "Unmute microphone preview" : "Mute microphone preview"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.mic-muted = !root.mic-muted; } }
                             if !root.live-session : IconAction { width: 43px; height: 43px; icon: "V"; label: root.camera-off ? "Turn camera preview on" : "Turn camera preview off"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.camera-off = !root.camera-off; } }
                             if root.live-session : ActionRect {
-                                width: 106px; height: 43px; border-radius: 9px;
+                                width: 88px; height: 43px; border-radius: 9px;
                                 background: root.native-microphone-muted && root.native-audio-ready ? root.hover : root.elevated;
                                 focus-color: root.accent;
                                 label: root.native-microphone-muted ? "Unmute microphone" : "Mute microphone";
@@ -2211,7 +2265,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                             if root.live-session : ActionRect {
-                                width: 106px; height: 43px; border-radius: 9px;
+                                width: 88px; height: 43px; border-radius: 9px;
                                 background: root.native-deafened && root.native-audio-ready ? root.hover : root.elevated;
                                 focus-color: root.accent;
                                 label: root.native-deafened ? "Undeafen speaker" : "Deafen speaker";
@@ -2224,10 +2278,56 @@ export component AppWindow inherits Window {
                                     horizontal-alignment: center; vertical-alignment: center;
                                 }
                             }
+                            if root.live-session : ActionRect {
+                                width: 96px; height: 43px; border-radius: 9px;
+                                background: root.native-camera-active ? root.hover : root.elevated;
+                                focus-color: root.accent;
+                                label: root.native-camera-active ? "Stop camera" : "Choose camera and start video";
+                                accessible-checkable: true;
+                                accessible-checked: root.native-camera-active;
+                                enabled: root.native-call-enabled && root.native-call-joined && !root.native-camera-busy;
+                                activated => {
+                                    if root.native-camera-active { root.stop-native-capture(0); }
+                                    else {
+                                        root.native-capture-picker-kind = 0;
+                                        root.native-capture-picker-open = true;
+                                        root.refresh-native-capture-sources(0);
+                                    }
+                                }
+                                Text {
+                                    text: root.native-camera-stopping ? "Stopping…" : root.native-camera-busy ? "Camera…" : root.native-camera-active ? "Stop camera" : "Camera";
+                                    color: root.native-call-joined ? root.ink : root.muted;
+                                    font-size: 11px * root.text-scale; font-weight: 700;
+                                    horizontal-alignment: center; vertical-alignment: center;
+                                }
+                            }
+                            if root.live-session : ActionRect {
+                                width: 106px; height: 43px; border-radius: 9px;
+                                background: root.native-screen-active ? root.hover : root.elevated;
+                                focus-color: root.accent;
+                                label: root.native-screen-active ? "Stop screen sharing" : "Choose a display or window to share";
+                                accessible-checkable: true;
+                                accessible-checked: root.native-screen-active;
+                                enabled: root.native-call-enabled && root.native-call-joined && !root.native-screen-busy;
+                                activated => {
+                                    if root.native-screen-active { root.stop-native-capture(1); }
+                                    else {
+                                        root.native-capture-picker-kind = 1;
+                                        root.native-capture-picker-open = true;
+                                        root.refresh-native-capture-sources(1);
+                                    }
+                                }
+                                Text {
+                                    text: root.native-screen-stopping ? "Stopping…" : root.native-screen-busy ? "Sharing…" : root.native-screen-active ? "Stop share" : "Share screen";
+                                    color: root.native-call-joined ? root.ink : root.muted;
+                                    font-size: 11px * root.text-scale; font-weight: 700;
+                                    horizontal-alignment: center; vertical-alignment: center;
+                                }
+                            }
                             ActionRect {
-                                width: 118px; height: 43px; border-radius: 9px; background: root.live-session && !root.native-call-enabled ? root.hover : root.call-connected ? #d65163 : root.accent;
+                                width: 110px; height: 43px; border-radius: 9px; background: root.live-session && !root.native-call-enabled ? root.hover : root.call-connected ? #d65163 : root.accent;
                                 focus-color: root.ink;
-                                label: root.live-session ? (root.native-leave-unconfirmed ? "Review unconfirmed call departure" : (root.call-connected ? "Leave native call" : "Join native call")) : (root.call-connected ? "End call preview" : "Start call preview");
+                                label: root.live-session ? (root.native-leave-unconfirmed ? "Review incomplete call cleanup" : (root.call-connected ? "Leave native call" : "Join native call")) : (root.call-connected ? "End call preview" : "Start call preview");
                                 enabled: !root.live-session || root.native-call-enabled;
                                 activated => {
                                     if root.live-session {
@@ -2240,7 +2340,7 @@ export component AppWindow inherits Window {
                                 }
                                 Text { text: root.live-session ? (root.native-call-enabled ? (root.native-leave-unconfirmed ? "Review leave" : (root.call-connected ? "Leave call" : (root.element-call-compatibility ? "Join legacy call" : "Join call"))) : "Unavailable") : (root.call-connected ? "End preview" : "Start preview"); color: #ffffff; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                             }
-                            IconAction { width: 43px; height: 43px; icon: "R"; label: "Return to chat"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.page = 0; } }
+                            IconAction { width: 40px; height: 43px; icon: "R"; label: "Return to chat"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.page = 0; } }
                         }
                     }
                 }
@@ -3050,6 +3150,154 @@ export component AppWindow inherits Window {
         }
     }
 
+    if root.native-capture-picker-open && root.page == 2 && root.live-session && root.native-call-joined : FocusScope {
+        focus-on-tab-navigation: false;
+        init => { capture-picker-close.focus(); }
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.native-capture-picker-open = false;
+                accept
+            } else { reject }
+        }
+        Rectangle {
+            background: #000000aa;
+            TouchArea { width: parent.width; height: parent.height; }
+            Rectangle {
+                width: 486px;
+                height: 452px;
+                x: (parent.width - 486px) / 2;
+                y: (parent.height - 452px) / 2;
+                background: root.canvas;
+                border-color: root.divider;
+                border-width: 1px;
+                border-radius: 14px;
+                accessible-role: region;
+                accessible-label: root.native-capture-picker-kind == 0 ? "Choose a camera" : "Choose a display or window to share";
+                VerticalLayout {
+                    padding: 20px;
+                    spacing: 12px;
+                    HorizontalLayout {
+                        height: 33px;
+                        spacing: 8px;
+                        Text {
+                            text: root.native-capture-picker-kind == 0 ? "Choose a camera" : "Share a display or window";
+                            color: root.ink;
+                            font-size: 19px * root.text-scale;
+                            font-weight: 750;
+                            horizontal-stretch: 1;
+                            vertical-alignment: center;
+                        }
+                        capture-picker-close := Button {
+                            width: 35px; height: 33px;
+                            text: "×";
+                            accessible-label: "Close capture source picker";
+                            clicked => { root.native-capture-picker-open = false; }
+                        }
+                    }
+                    Text {
+                        text: root.native-capture-picker-kind == 0
+                            ? "Your system may ask for camera access after you choose a source."
+                            : "Only picture from the selected display or window is shared. Your microphone remains separate.";
+                        color: root.muted;
+                        font-size: 12px * root.text-scale;
+                        wrap: word-wrap;
+                    }
+                    if root.native-capture-source-loading : Text {
+                        text: "Looking for available sources…";
+                        color: root.muted;
+                        font-size: 12px * root.text-scale;
+                        accessible-live-region: polite;
+                    }
+                    if root.native-capture-source-error != "" : Text {
+                        text: root.native-capture-source-error;
+                        color: #ef9da9;
+                        font-size: 12px * root.text-scale;
+                        wrap: word-wrap;
+                        accessible-live-region: polite;
+                    }
+                    capture-source-list := ScrollView {
+                        vertical-stretch: 1;
+                        horizontal-scrollbar-policy: always-off;
+                        VerticalLayout {
+                            width: capture-source-list.visible-width;
+                            spacing: 6px;
+                            for source in root.native-capture-sources : Rectangle {
+                                height: ((root.native-capture-picker-kind == 0 && source.kind == 0)
+                                    || (root.native-capture-picker-kind == 1 && source.kind != 0)) ? 48px : 0px;
+                                background: transparent;
+                                if (root.native-capture-picker-kind == 0 && source.kind == 0)
+                                    || (root.native-capture-picker-kind == 1 && source.kind != 0) : ActionRect {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    border-radius: 8px;
+                                    border-color: root.divider;
+                                    border-width: 1px;
+                                    background: root.elevated;
+                                    focus-color: root.accent;
+                                    label: source.kind == 0 ? "Use camera " + source.name
+                                        : source.kind == 1 ? "Share display " + source.name
+                                        : "Share window " + source.name;
+                                    enabled: !root.native-capture-source-loading
+                                        && !root.native-camera-busy && !root.native-screen-busy;
+                                    activated => {
+                                        root.native-capture-picker-open = false;
+                                        root.start-native-capture(source.kind, source.id);
+                                    }
+                                    HorizontalLayout {
+                                        padding-left: 12px;
+                                        padding-right: 12px;
+                                        spacing: 8px;
+                                        Text {
+                                            text: source.kind == 0 ? "CAMERA" : source.kind == 1 ? "DISPLAY" : "WINDOW";
+                                            color: root.accent;
+                                            font-size: 10px * root.text-scale;
+                                            font-weight: 750;
+                                            vertical-alignment: center;
+                                        }
+                                        Text {
+                                            text: source.name;
+                                            color: root.ink;
+                                            font-size: 12px * root.text-scale;
+                                            horizontal-stretch: 1;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Text {
+                        text: root.native-capture-picker-kind == 0
+                            ? "If a camera is missing, check system permissions and refresh this list."
+                            : "A changed window title or display layout stops sharing. Choose the source again to resume.";
+                        color: root.muted;
+                        font-size: 11px * root.text-scale;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        height: 36px;
+                        spacing: 8px;
+                        alignment: end;
+                        Button {
+                            width: 105px;
+                            text: "Refresh";
+                            enabled: !root.native-capture-source-loading;
+                            accessible-label: "Refresh available capture sources";
+                            clicked => { root.refresh-native-capture-sources(root.native-capture-picker-kind); }
+                        }
+                        Button {
+                            width: 90px;
+                            text: "Cancel";
+                            accessible-label: "Cancel capture source selection";
+                            clicked => { root.native-capture-picker-open = false; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if root.leave-call-dialog : FocusScope {
         init => { cancel-leave.focus(); }
         key-pressed(event) => {
@@ -3073,12 +3321,12 @@ export component AppWindow inherits Window {
             border-width: 1px;
             border-radius: 14px;
             accessible-role: region;
-            accessible-label: root.native-leave-unconfirmed ? "Unconfirmed MatrixRTC call departure" : root.live-session ? "Leave call before changing accounts" : "End call preview before changing accounts";
+            accessible-label: root.native-leave-unconfirmed ? "Incomplete MatrixRTC call cleanup" : root.live-session ? "Leave call before changing accounts" : "End call preview before changing accounts";
             VerticalLayout {
                 padding: 22px;
                 spacing: 13px;
-                Text { text: root.leave-call-busy ? (root.native-leave-unconfirmed ? "Checking call worker…" : "Leaving call…") : root.native-leave-unconfirmed ? "Call departure unconfirmed" : root.live-session ? "Leave call?" : "Leave call preview?"; color: root.ink; font-size: 19px * root.text-scale; font-weight: 750; }
-                Text { text: root.native-leave-unconfirmed ? "Local media has stopped, but the server may still show you in the call. Continuing clears this app's call state; it cannot retry the server leave." : root.pending-account-index == -2 ? "Leave the current call before adding another account." : root.pending-account-index == -3 ? "Leave the current call before logging out." : "Leave the current call before switching accounts."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                Text { text: root.leave-call-busy ? (root.native-leave-unconfirmed ? "Checking call cleanup…" : "Leaving call…") : root.native-leave-unconfirmed ? "Call cleanup incomplete" : root.live-session ? "Leave call?" : "Leave call preview?"; color: root.ink; font-size: 19px * root.text-scale; font-weight: 750; }
+                Text { text: root.native-leave-unconfirmed ? "Account changes remain blocked while native capture is stopping. Once it ends, you can acknowledge an uncertain server leave; the app cannot retry that leave." : root.pending-account-index == -2 ? "Leave the current call before adding another account." : root.pending-account-index == -3 ? "Leave the current call before logging out." : "Leave the current call before switching accounts."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                 Rectangle { vertical-stretch: 1; background: transparent; }
                 HorizontalLayout {
                     spacing: 9px;
@@ -3099,7 +3347,7 @@ export component AppWindow inherits Window {
                     confirm-leave := ActionRect {
                         width: 182px; height: 36px; border-radius: 8px; background: root.accent;
                         focus-color: root.accent-ink;
-                        label: root.native-leave-unconfirmed ? (root.pending-account-index == -4 ? "Acknowledge unconfirmed call departure" : "Continue account action despite unconfirmed call departure") : root.pending-account-index == -2 ? "Leave call and add account" : root.pending-account-index == -3 ? "Leave call and log out" : "Leave call and switch account";
+                        label: root.native-leave-unconfirmed ? (root.pending-account-index == -4 ? "Acknowledge incomplete call cleanup" : "Continue account action after call cleanup") : root.pending-account-index == -2 ? "Leave call and add account" : root.pending-account-index == -3 ? "Leave call and log out" : "Leave call and switch account";
                         enabled: !root.leave-call-busy;
                         trap-tab: true;
                         cancel-on-escape: true;
@@ -3107,7 +3355,7 @@ export component AppWindow inherits Window {
                         previous-focus => { cancel-leave.focus(); }
                         cancelled => { root.leave-call-dialog = false; root.pending-account-index = -1; account-trigger.focus(); }
                         activated => { root.confirm-leave-call(root.pending-account-index); }
-                        Text { text: root.leave-call-busy ? "Checking…" : root.native-leave-unconfirmed ? "Continue anyway" : "Leave call"; color: root.accent-ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        Text { text: root.leave-call-busy ? "Checking…" : root.native-leave-unconfirmed ? "Continue if safe" : "Leave call"; color: root.accent-ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                     }
                 }
             }

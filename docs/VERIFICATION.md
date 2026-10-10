@@ -1,7 +1,50 @@
 # Verification log
 
-Morpheus is a private pre-alpha. This log records checks actually completed;
+Morpheus is pre-alpha software with no approved installer release. This log records checks actually completed;
 the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
+
+## 2026-10-10 public-source preparation
+
+Public development does not authorize installer distribution. The original
+binary release gates, including real devices and all supported platforms,
+remain open.
+
+- Removed automatic QA-account bootstrap from the desktop app. Explicit
+  disposable tests remain; fixture generators reject checkout destinations,
+  preserve owner-only files, and reject symlink writes.
+- Passed 53 `lru` unit tests, 32 LiveKit tests, 10 MatrixRTC transport tests,
+  31 native RTC/device tests, and 37 desktop controller tests on Apple Silicon.
+  The cancellation cases cover a queued permission grant, a late grant after
+  cancellation, permission denial/timeouts, and a cancelled open before native
+  enumeration. They do not establish physical camera behavior on every OS.
+- Local listeners confirmed authenticated requests do not follow
+  301/302/303/307/308 redirects. Invalid foci fail before OpenID acquisition;
+  unsafe SFU and region URLs are rejected before credential use. Captured logs
+  omit reflected dummy bearer/proxy credentials. Unsupported proxy schemes
+  open no socket; HTTP CONNECT remains supported.
+- Passed 25 Python tests for CI scope, platform packaging configuration,
+  private fixture paths, the loopback relay, and stale fixture mounts. Rust
+  formatting, Actionlint, Python compilation, JavaScript syntax, and package
+  configuration checks passed without building installers.
+- Fresh disposable accounts on two local homeservers passed login, encrypted
+  room, and token-isolation checks. The native RTC fixture's discovery,
+  OpenID-to-JWT exchange through its private relay, returned loopback URL, and
+  SFU reachability checks passed. The fresh native two-device encrypted call
+  test passed 1/1 in 19.41 seconds: synthetic audio, camera and screen tracks,
+  signaling reconnect, participant departure, leave-triggered key rotation,
+  and media after rejoining. This is loopback acceptance on Apple Silicon,
+  not physical-device or Element Call interoperability acceptance.
+- Fresh secret scans found no live credentials. The upstream LiveKit public
+  JWT test vector and one historical property-name comparison are documented
+  scanner false positives with narrowly scoped fingerprints.
+- Preserved a private manifest of historical run/source/artifact identities,
+  then deleted three old package runs and all ten unsigned installer artifacts.
+  A subsequent GitHub API read reported zero remaining Actions artifacts and
+  zero releases. Historical package results do not verify this candidate.
+- Hosted jobs are gated while private. Public CI uses standard runners,
+  read-only permissions, pinned actions, approval for outside contributors,
+  trusted-main cache writes, and no installer uploads. The complete public
+  native matrix is recorded separately after publication.
 
 ## 2026-10-09 local desktop and Matrix checks
 
@@ -485,6 +528,80 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
   visible. This is preferences UI and file watcher evidence on macOS, not a
   notification banner, sound, or Linux/Windows acceptance check.
 
+## Native outgoing video GUI acceptance (partial)
+
+An ad hoc signed macOS Apple Silicon QA app used a temporary, debug-only
+in-process login bootstrap with a protected disposable fixture. This bypassed
+a Keychain ACL timeout when a separately signed test seeder tried to restore
+its account in the GUI; the app's ordinary sign-in path has separate earlier
+QA coverage. On the fresh `46632fc9428249d8` encrypted room, Bob's verified
+device was running **before** Alice opened the call. The GUI joined, displayed
+both participants, and reported active display sharing. Bob saw Alice as
+reachable and decoded **one nonblank encrypted ScreenShare I420 frame**. The
+GUI returned Share to Off after Stop and cleared its local call state on Leave.
+This establishes a real GUI-to-peer frame path, but one frame does not establish
+sustained picture or remote publication removal after Stop.
+
+On a second fresh encrypted room (`93241672ba46d084`), Bob was again signed
+in and verified before Alice opened the slot. Alice's signed GUI showed both
+participants and an active display share. Bob decoded **10 nonblank encrypted
+ScreenShare I420 frames** from Alice. This establishes sustained GUI display
+picture delivery on the tested macOS machine. Alice then stopped sharing and
+left; the GUI cleared both local controls. Bob-side publication removal after
+Stop was not asserted in this run.
+
+The same run's FaceTime HD Camera selection never reached Active: the UI
+showed Starting, then Stopping, then a 20-second no-frame error. The pinned
+Nokhwa macOS backend maps the camera's native 8-bit `420v` format incorrectly
+and had an unbounded frame receive. A locally patched Nokhwa build in the
+second run bounded frame receive and requested 8-bit NV12; the FaceTime camera
+still produced no first frame, ending with a three-second channel timeout.
+Further session/delegate diagnostics and camera publication remain open.
+Earlier fresh-device observer attempts started Bob **after** Alice's encrypted
+sticky membership was sent. Bob saw only himself for 45 seconds although
+Alice saw Bob. When Bob's device existed first, Bob saw Alice as reachable.
+The working hypothesis is that Bob could not decrypt Alice's historical
+Megolm membership and the RTC sticky feeder projected only decrypted live
+events. This is a beta call-join limitation requiring recovery or membership
+republication; it is not evidence that every late call join fails.
+
+Docker Desktop initially stopped responding but recovered; local Synapse,
+native LiveKit, and RTC transport probe passed. Generated-pixel and command-line
+capture proofs remain separate from the GUI evidence above.
+
+When the disposable stack is healthy, run one bounded macOS acceptance pass:
+
+1. Use the [RTC fixture runbook](../tests/LOCAL_MATRIX_RTC.md) to create a fresh
+   encrypted Alice/Bob room. Keep credentials in its mode-0600 fixture file.
+   Start Bob as a separately verified device in the headless RTC observer,
+   then sign Alice into an isolated Morpheus app profile and join that room's
+   call. Verify the two-person roster first. Repeat with a newly created Bob
+   device joining after Alice to exercise encrypted membership recovery.
+2. Open Camera, choose one labeled source, and wait at most 30 seconds for the
+   UI to report it active. Bob must observe an unmuted Camera track and decode
+   at least 10 nonblank frames with nonzero dimensions in 30 seconds. Stop
+   camera; Bob must see that publication end within 15 seconds and the UI must
+   show it off. Repeat once to catch a stop/start device race.
+3. Share a display, then a window, one at a time. For each, inspect the picker
+   label before selection, confirm the OS permission prompt if shown, require
+   the UI active state and 10 nonblank decoded ScreenShare frames at Bob
+   within 30 seconds, then Stop share and require publication removal within
+   15 seconds. A changed window title or display geometry deliberately ends
+   capture and requires reselection; check that the UI reports this rather
+   than continuing on a changed source. The publication uses 1280×720 frames
+   while its selected source identity remains unchanged.
+4. Start camera and share together, then Leave. Require both local active
+   indicators to clear and both Bob publications to end within 15 seconds.
+   Repeat while choosing the bottom-left other account: the leave-call dialog
+   must appear; cancelling retains the call and tracks, confirming leaves and
+   switches only after both publications stop. No Alice source may appear in
+   the new account's call stage.
+
+Record app build, macOS and permission state, fixture mode, Bob's decoded
+frame counts/dimensions, and any timeout. Keep the disposable credential file
+out of logs. This checks one macOS run; Windows/Linux and packaged-app
+permissions remain separate release gates.
+
 ## GitHub CI
 
 [Run 38012987752](https://github.com/brk275/Morpheus/actions/runs/38012987752)
@@ -514,6 +631,10 @@ Apple Silicon job failed before steps due Actions capacity/budget. The latest
 did not start any platform job because GitHub reported an Actions budget
 preventing further use. Current source therefore has no four-platform CI
 result.
+[Run 38042914642](https://github.com/brk275/Morpheus/actions/runs/38042914642)
+for commit `31a2d65` also failed before any job steps on all four runners:
+GitHub reported the same Actions budget restriction. This is a CI capacity
+failure, not evidence of a source or platform build failure.
 
 ## Native timeline stress preview
 

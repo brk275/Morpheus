@@ -1,0 +1,98 @@
+#!/usr/bin/env python3
+"""Select development checks by impact; unknown inputs require every platform."""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+from pathlib import PurePosixPath
+
+
+PLATFORMS = ("macos-15", "macos-15-intel", "ubuntu-24.04", "windows-2025")
+MACOS = PLATFORMS[:2]
+
+
+def classify(paths, force_all=False):
+    native = set(PLATFORMS if force_all else ())
+    config = False
+    for raw in paths:
+        path = str(PurePosixPath(raw))
+        if path.endswith(".md") or path in {"LICENSE", ".gitignore", ".gitleaksignore"}:
+            continue
+        if path == "Cargo.lock" or path.endswith("Cargo.toml"):
+            native.update(PLATFORMS)
+        elif path.startswith("packaging/linux/") or path == "packaging/linux.toml":
+            native.add("ubuntu-24.04")
+        elif path.startswith(("packaging/macos/", "vendor/nokhwa-bindings-macos/")):
+            native.update(MACOS)
+        elif path.startswith("packaging/windows/"):
+            native.add("windows-2025")
+        elif path.startswith("themes/"):
+            config = True
+        elif path in {"scripts/ci_scope.py", "scripts/package.py"}:
+            # These scripts control native scope or shared package inputs.
+            native.update(PLATFORMS)
+        elif path.startswith(("scripts/", "tests/")):
+            # Scope job checks Python and JavaScript without external accounts.
+            continue
+        elif path in {".github/CODEOWNERS", ".github/dependabot.yml"} or path.startswith(".github/ISSUE_TEMPLATE/"):
+            continue
+        else:
+            # Includes shared native source, workflow/build configuration,
+            # dependency locks, assets, and previously unknown inputs.
+            native.update(PLATFORMS)
+    return {
+        "native": bool(native),
+        "native_matrix": {"os": [p for p in PLATFORMS if p in native]},
+        "config": config and not native,
+    }
+
+
+def changed_paths(event, event_name):
+    if event_name == "workflow_dispatch":
+        return [], True
+    if event_name == "pull_request":
+        before = event["pull_request"]["base"]["sha"]
+        after = event["pull_request"]["head"]["sha"]
+        separator = "..."
+    elif event_name == "push":
+        before, after = event["before"], event["after"]
+        separator = ".."
+    else:
+        return [], True
+    if not all(re.fullmatch(r"[0-9a-f]{40}", value) for value in (before, after)):
+        raise ValueError("GitHub event contains an invalid commit SHA")
+    if before == "0" * 40:
+        return [], True
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--no-renames", "--name-only", "-z", before + separator + after],
+            check=True, capture_output=True,
+        )
+    except subprocess.CalledProcessError:
+        # Missing history must widen verification, never silently skip it.
+        return [], True
+    return [p.decode("utf-8", errors="surrogateescape") for p in result.stdout.split(b"\0") if p], False
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("paths", nargs="*")
+    parser.add_argument("--all", action="store_true")
+    parser.add_argument("--github-event", action="store_true")
+    args = parser.parse_args()
+    paths, force_all = args.paths, args.all
+    if args.github_event:
+        with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
+            paths, force_all = changed_paths(json.load(event_file), os.environ["GITHUB_EVENT_NAME"])
+    result = classify(paths, force_all)
+    print(json.dumps(result, sort_keys=True))
+    if args.github_event:
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            for key, value in result.items():
+                output.write(f"{key}={json.dumps(value, separators=(',', ':'))}\n")
+
+
+if __name__ == "__main__":
+    main()

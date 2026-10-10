@@ -111,15 +111,45 @@ pub fn classify_transports(transports: &Value) -> TransportSupport {
         .iter()
         .filter(|entry| entry.get("type").and_then(Value::as_str) == Some("livekit"))
         .filter_map(|entry| entry.get("livekit_service_url").and_then(Value::as_str))
-        .find(|candidate| {
-            Url::parse(candidate).is_ok_and(|url| {
-                matches!(url.scheme(), "https" | "http") && url.host_str().is_some()
-            })
-        })
-        .map(|service_url| TransportSupport::LiveKit {
-            service_url: service_url.to_owned(),
-        })
+        .find_map(valid_service_url)
+        .map(|service_url| TransportSupport::LiveKit { service_url })
         .unwrap_or(TransportSupport::NoLiveKitTransport)
+}
+
+// This early discovery filter matches the vendored transport's policy. The
+// transport repeats validation for remote membership foci before any OpenID
+// request; discovery alone is not a credential security boundary.
+fn valid_service_url(raw: &str) -> Option<String> {
+    if raw.chars().any(char::is_control) {
+        return None;
+    }
+    let mut url = Url::parse(raw).ok()?;
+    if !url.has_host()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    if url.host_str() == Some("localhost") {
+        url.set_host(Some("127.0.0.1")).ok()?;
+    }
+    let loopback = match url.host() {
+        Some(url::Host::Ipv4(address)) => address.is_loopback(),
+        Some(url::Host::Ipv6(address)) => address.is_loopback(),
+        _ => false,
+    };
+    if url.scheme() != "https" && !(url.scheme() == "http" && loopback) {
+        return None;
+    }
+    // Keep server path spelling and avoid introducing a trailing slash solely
+    // through parsing, except when localhost normalization was necessary.
+    if Url::parse(raw).ok()?.host_str() == Some("localhost") {
+        Some(url.into())
+    } else {
+        Some(raw.to_owned())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -195,6 +225,10 @@ mod tests {
             json!([{"type": "org.example.p2p", "url": "https://p2p.example"}]),
             json!([{"type": "livekit", "livekit_service_url": "file:///tmp/token"}]),
             json!([{"type": "livekit", "livekit_service_url": "https://"}]),
+            json!([{"type": "livekit", "livekit_service_url": "http://rtc.example.org"}]),
+            json!([{"type": "livekit", "livekit_service_url": "https://user:secret@rtc.example.org"}]),
+            json!([{"type": "livekit", "livekit_service_url": "https://rtc.example.org?token=secret"}]),
+            json!([{"type": "livekit", "livekit_service_url": "https://rtc.example.org#secret"}]),
         ] {
             assert_eq!(
                 classify_transports(&transports),

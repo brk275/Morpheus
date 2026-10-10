@@ -1,0 +1,56 @@
+# Copyright 2026 Element Creations Ltd.
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
+[package]
+name = "matrix-rtc-livekit"
+version = "0.5.0-rc.2"
+edition = "2024"
+license = "AGPL-3.0-only OR LicenseRef-Element-Commercial"
+publish = false
+description = "MSC4195 LiveKit transport for MatrixRTC: SFU token exchange, media session, and E2EE key bridging."
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+matrix-rtc-core = { git = "https://github.com/element-hq/matrix-rust-rtc", tag = "v0.5.0-rc.2" }
+# The transport contract this crate implements (`transport_impl`), and the pure
+# MSC4195 control plane (`livekit`: identity derivations, token shapes, dialect
+# choices) shared with the web binding. This crate re-exports the latter and
+# adds the IO: reqwest for the token POST, livekit for the SFU itself.
+matrix-rtc-transport = { git = "https://github.com/element-hq/matrix-rust-rtc", tag = "v0.5.0-rc.2" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+async-trait = "0.1"
+log = "0.4"
+# `media` uses tokio timers (interval / timeout_at) on top of the workspace rt+sync.
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+# The token POST. Version and TLS backend are the workspace's.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# The LiveKit client; see the workspace manifest for its version and features
+# (both rustls root stores, and why). Pulls in libwebrtc (native C++) via
+# webrtc-sys, so building this crate needs a C++ toolchain — CI jobs that lack
+# one must not build this crate.
+livekit = { version = "0.7", features = ["rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
+livekit-api = { version = "=0.5.3", default-features = false }
+# Stream combinators for draining the LiveKit audio stream in the media helpers.
+futures-util = "0.3"
+[target.'cfg(target_os = "android")'.dependencies]
+# For the `android::initialize_android` re-export's signature; unifies with
+# the jni version libwebrtc itself uses.
+jni = "0.21"
+
+[features]
+# Exposes the test-only parts of the `media` module (tone generator, Goertzel
+# frequency detector) for `matrix-rtc-call-sdk`'s examples and integration
+# tests; recording/WAV helpers in that module are shipped API and need no
+# feature. Otherwise the test-only parts compile only under `cfg(test)`.
+testing = []
+
+[dev-dependencies]
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+matrix-rtc-core = { git = "https://github.com/element-hq/matrix-rust-rtc", tag = "v0.5.0-rc.2", features = ["testing"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "test-util", "net", "io-util"] }

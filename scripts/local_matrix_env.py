@@ -22,11 +22,13 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from fixture_paths import external_path, fixture_home, private_directory, write_private
+
 
 IMAGE = "ghcr.io/element-hq/synapse:v1.162.0"
 NETWORK = "morpheus-matrix-test"
-HOME = Path(os.environ.get("MORPHEUS_MATRIX_TEST_HOME", Path(tempfile.gettempdir()) / "morpheus-matrix-test"))
-CREDS = HOME / "accounts.json"
+FIXTURE_HOME = fixture_home()
+CREDS = FIXTURE_HOME / "accounts.json"
 SERVERS = (
     {"name": "a", "container": "morpheus-synapse-a", "volume": "morpheus-synapse-a-data", "server_name": "morpheus-a.test", "port": 18008},
     {"name": "b", "container": "morpheus-synapse-b", "volume": "morpheus-synapse-b-data", "server_name": "morpheus-b.test", "port": 18009},
@@ -79,6 +81,7 @@ def wait_ready(server: dict[str, object]) -> None:
 def configure(server: dict[str, object]) -> bool:
     script = r'''
 from pathlib import Path
+
 import re
 import secrets
 
@@ -120,7 +123,7 @@ print('updated' if config != original else 'unchanged')
 
 
 def start_servers() -> None:
-    if shutil.disk_usage(HOME.parent).free < 2 * 1024**3:
+    if shutil.disk_usage(FIXTURE_HOME.parent).free < 2 * 1024**3:
         raise RuntimeError("At least 2 GiB free space is required before starting local Synapse")
     if not exists("network", NETWORK):
         docker("network", "create", NETWORK)
@@ -153,10 +156,10 @@ def start_servers() -> None:
 
 
 def credential_data() -> dict:
+    external_path(CREDS)
     if CREDS.exists():
         return json.loads(CREDS.read_text())
-    HOME.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(HOME, 0o700)
+    private_directory(FIXTURE_HOME)
     accounts = []
     for label, username, server in (
         ("a_primary", "alice", SERVERS[0]),
@@ -176,18 +179,7 @@ def credential_data() -> dict:
 
 
 def save_credentials(data: dict, *, exclusive: bool = False) -> None:
-    HOME.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(HOME, 0o700)
-    temporary = CREDS.with_suffix(".json.tmp")
-    fd = os.open(temporary, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
-    with os.fdopen(fd, "w") as file:
-        json.dump(data, file, indent=2)
-        file.write("\n")
-    os.chmod(temporary, 0o600)
-    if exclusive and CREDS.exists():
-        temporary.unlink()
-        raise RuntimeError("Credential file appeared concurrently; retry")
-    temporary.replace(CREDS)
+    write_private(CREDS, json.dumps(data, indent=2) + "\n", create=exclusive)
 
 
 def login(account: dict) -> dict:
@@ -290,24 +282,7 @@ def verify(data: dict) -> None:
 
 def save_private_fixture(path: Path, data: dict, *, create: bool = False) -> None:
     """Keep one-off test secrets separate from the app QA fixture."""
-    HOME.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(HOME, 0o700)
-    if create:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        temporary = path
-    else:
-        fd, name = tempfile.mkstemp(prefix=".fixture-", dir=HOME)
-        temporary = Path(name)
-    try:
-        with os.fdopen(fd, "w") as file:
-            json.dump(data, file, indent=2)
-            file.write("\n")
-        os.chmod(temporary, 0o600)
-        if not create:
-            temporary.replace(path)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
+    write_private(path, json.dumps(data, indent=2) + "\n", create=create)
 
 
 def recovery_fixture() -> None:
@@ -331,7 +306,7 @@ def recovery_fixture() -> None:
             "password": secrets.token_urlsafe(32),
         })
     data = {"image": IMAGE, "accounts": accounts, "rooms": {}}
-    path = HOME / f"recovery-{nonce}.json"
+    path = FIXTURE_HOME / f"recovery-{nonce}.json"
     # Persist the generated passwords before mutating Synapse, so an interrupted
     # registration never leaves a test account whose credential was discarded.
     save_private_fixture(path, data, create=True)
@@ -391,7 +366,7 @@ def rtc_gate_fixture() -> None:
         "homeserver_url": endpoint(server),
         "password": secrets.token_urlsafe(32),
     }
-    path = HOME / f"rtc-gate-{nonce}.json"
+    path = FIXTURE_HOME / f"rtc-gate-{nonce}.json"
     # Save the password before registration so an interrupted run can still be
     # recovered. Never mutate the shared accounts.json fixture.
     save_private_fixture(path, {"image": IMAGE, "accounts": [account]}, create=True)
@@ -435,9 +410,9 @@ def destroy() -> None:
             docker("volume", "rm", str(server["volume"]))
     if CREDS.exists():
         CREDS.unlink()
-    for fixture in HOME.glob("recovery-*.json"):
+    for fixture in FIXTURE_HOME.glob("recovery-*.json"):
         fixture.unlink()
-    for fixture in HOME.glob("rtc-gate-*.json"):
+    for fixture in FIXTURE_HOME.glob("rtc-gate-*.json"):
         fixture.unlink()
     print("Local Matrix test data and credentials removed; shared image retained.")
 

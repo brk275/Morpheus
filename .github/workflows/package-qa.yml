@@ -1,47 +1,75 @@
-name: Unsigned internal package QA
+name: Unsigned package validation
 
 on:
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Platforms affected by this package change (all for release candidates)
+        type: choice
+        required: true
+        default: linux
+        options: [linux, windows, macos, all]
 
 permissions:
   contents: read
 
+concurrency:
+  group: package-qa-${{ github.ref }}
+  # Let an in-flight packaging run finish and populate its cache.
+  cancel-in-progress: false
+
 env:
   CARGO_BUILD_JOBS: "2"
   CARGO_INCREMENTAL: "0"
-  # linuxdeploy is an AppImage and GitHub runners do not need FUSE to extract it.
   APPIMAGE_EXTRACT_AND_RUN: "1"
 
 jobs:
+  scope:
+    name: Select package platforms
+    if: github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.scope.outputs.matrix }}
+    steps:
+      - name: Select requested standard runners
+        id: scope
+        env:
+          PACKAGE_PLATFORM: ${{ inputs.platform }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          options = {
+              "linux": [{"os": "ubuntu-24.04", "label": "linux-x64", "formats": "deb,appimage"}],
+              "windows": [{"os": "windows-2025", "label": "windows-x64", "formats": "nsis"}],
+              "macos": [
+                  {"os": "macos-15", "label": "macos-arm64", "formats": "dmg"},
+                  {"os": "macos-15-intel", "label": "macos-x64", "formats": "dmg"},
+              ],
+          }
+          options["all"] = options["macos"] + options["windows"] + options["linux"]
+          matrix = {"include": options[os.environ["PACKAGE_PLATFORM"]]}
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("matrix=" + json.dumps(matrix) + "\n")
+          PY
+
   package:
-    name: Unsigned internal QA (${{ matrix.label }})
-    if: github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event.repository.private == true
+    name: Unsigned validation (${{ matrix.label }})
+    needs: scope
+    if: github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event.repository.private == false
     runs-on: ${{ matrix.os }}
+    # CI and packaging for the same platform/candidate share this lock.
+    concurrency:
+      group: native-${{ github.sha }}-${{ matrix.os }}
+      cancel-in-progress: false
     timeout-minutes: 150
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: macos-15
-            label: macos-arm64
-            formats: dmg
-            artifact: dist/*.dmg
-          - os: macos-15-intel
-            label: macos-x64
-            formats: dmg
-            artifact: dist/*.dmg
-          - os: windows-2025
-            label: windows-x64
-            formats: nsis
-            artifact: dist/*.exe
-          - os: ubuntu-24.04
-            label: linux-x64
-            formats: deb,appimage
-            artifact: |
-              dist/*.deb
-              dist/*.AppImage
+      matrix: ${{ fromJSON(needs.scope.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Linux native dependencies
         if: runner.os == 'Linux'
         run: |
@@ -54,14 +82,16 @@ jobs:
             libxcb-xfixes0-dev libxcursor-dev libxkbcommon-dev \
             libxkbcommon-x11-dev libxi6 libxrandr-dev pkg-config xvfb
       - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action
         with:
           toolchain: 1.99.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
       - name: Install pinned Cargo Packager
         run: cargo install cargo-packager --version 0.11.8 --locked
       - name: Build unsigned QA package
-        run: cargo packager --release --formats ${{ matrix.formats }}
+        run: python3 scripts/package.py --formats ${{ matrix.formats }}
       - name: Smoke test Linux AppImage under Xvfb
         if: runner.os == 'Linux'
         shell: bash
@@ -73,11 +103,5 @@ jobs:
             echo "The Linux AppImage exited before the smoke window (status $result)"
             exit 1
           fi
-      - name: Upload unsigned internal QA package
-        uses: actions/upload-artifact@v4
-        with:
-          name: morpheus-UNSIGNED-INTERNAL-QA-${{ matrix.label }}-${{ github.run_number }}
-          path: ${{ matrix.artifact }}
-          if-no-files-found: error
-          retention-days: 5
-          compression-level: 0
+      # Installers deliberately stay on the ephemeral runner. Public artifact
+      # uploads and releases require the separate release acceptance gates.

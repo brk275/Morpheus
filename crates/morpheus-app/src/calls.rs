@@ -21,14 +21,13 @@
 //! standard call mode. Element Call's legacy room-state mode has no slot. It reads
 //! the room's current encryption state and never uses Morpheus's optional
 //! voice-space presentation marker to decide permissions or call semantics.
-//! Live microphone mute and local deafen are bound to the current call join.
-//! Local camera publishing is not exposed here yet.
+//! Live microphone, camera, and screen controls are bound to the current join.
 
 use std::{
     fmt,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -40,11 +39,17 @@ use morpheus_rtc::{
     TransportSupport, local_device_support, local_support,
 };
 use tokio::{
-    sync::{Mutex, oneshot, watch},
+    sync::{Mutex, mpsc, oneshot, watch},
     time::timeout,
 };
 
-use crate::video_render::{RosterUpdate, VideoUpdate, run_remote_video};
+use crate::{
+    local_video::{
+        CaptureCommand, CaptureKind, CaptureSource, CaptureStop, LocalVideoSession,
+        LocalVideoStatus,
+    },
+    video_render::{RosterUpdate, VideoUpdate, run_remote_video},
+};
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 const JOIN_TIMEOUT: Duration = Duration::from_secs(45);
@@ -201,6 +206,8 @@ struct RunningCall {
     cancel: Option<oneshot::Sender<()>>,
     done: watch::Receiver<Option<Result<(), String>>>,
     audio_controls: Option<AudioControls>,
+    video_commands: mpsc::Sender<CaptureCommand>,
+    capture_stop: Arc<CaptureStop>,
 }
 
 /// An applied audio state is scoped to one call generation. A control click
@@ -252,6 +259,8 @@ struct Shared {
     video: watch::Sender<VideoUpdate>,
     roster: watch::Sender<RosterUpdate>,
     audio: watch::Sender<AudioUpdate>,
+    local_video: watch::Sender<LocalVideoStatus>,
+    active_capture_workers: Arc<AtomicUsize>,
     active_video_token: AtomicU64,
     active_audio_token: AtomicU64,
     next_token: AtomicU64,
@@ -333,6 +342,7 @@ impl Shared {
         // newer call's generation.
         if cleared || self.active_video_token.load(Ordering::SeqCst) == 0 {
             self.video.send_replace(VideoUpdate::Clear { token: 0 });
+            self.local_video.send_replace(LocalVideoStatus::default());
             self.roster.send_replace(RosterUpdate {
                 token: 0,
                 members: Vec::new(),
@@ -357,6 +367,7 @@ impl CallController {
             members: Vec::new(),
         });
         let (audio, _) = watch::channel(AudioUpdate::Unavailable { token: 0 });
+        let (local_video, _) = watch::channel(LocalVideoStatus::default());
         Self {
             manager,
             shared: Arc::new(Shared {
@@ -365,6 +376,8 @@ impl CallController {
                 video,
                 roster,
                 audio,
+                local_video,
+                active_capture_workers: Arc::new(AtomicUsize::new(0)),
                 active_video_token: AtomicU64::new(0),
                 active_audio_token: AtomicU64::new(0),
                 next_token: AtomicU64::new(1),
@@ -386,6 +399,10 @@ impl CallController {
 
     pub fn subscribe_audio(&self) -> watch::Receiver<AudioUpdate> {
         self.shared.audio.subscribe()
+    }
+
+    pub fn subscribe_local_video(&self) -> watch::Receiver<LocalVideoStatus> {
+        self.shared.local_video.subscribe()
     }
 
     /// A queued UI update may only render for the current call generation.
@@ -416,6 +433,71 @@ impl CallController {
     ) -> Result<(), CallControllerError> {
         self.with_current_audio_controls(token, |controls| controls.set_deafened(deafened))
             .await
+    }
+
+    /// Request a native camera or selected window/display publication for the
+    /// call generation the UI observed. The watch status reports when frames
+    /// are actually being captured and published.
+    pub async fn start_video_capture(
+        &self,
+        token: u64,
+        source: CaptureSource,
+        label: String,
+    ) -> Result<(), CallControllerError> {
+        self.send_video_command(token, |reply| CaptureCommand::Start {
+            source,
+            label,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn stop_video_capture(
+        &self,
+        token: u64,
+        kind: CaptureKind,
+    ) -> Result<(), CallControllerError> {
+        self.send_video_command(token, |reply| CaptureCommand::Stop { kind, reply })
+            .await
+    }
+
+    async fn send_video_command(
+        &self,
+        token: u64,
+        command: impl FnOnce(oneshot::Sender<Result<(), MediaError>>) -> CaptureCommand,
+    ) -> Result<(), CallControllerError> {
+        if token == 0 || self.video_token() != token {
+            return Err(CallControllerError::StaleCall);
+        }
+        let account = self
+            .manager
+            .active_account()
+            .await
+            .ok_or(CallControllerError::AccountChanged)?;
+        let sender = {
+            let slot = self.shared.slot.lock().await;
+            let CallSlot::Running(running) = &*slot else {
+                return Err(CallControllerError::StaleCall);
+            };
+            if running.token != token
+                || running.account_id != account.id
+                || running.cancel.is_none()
+                || running.capture_stop.requested()
+                || !matches!(self.status(), CallStatus::Joined { .. })
+            {
+                return Err(CallControllerError::StaleCall);
+            }
+            running.video_commands.clone()
+        };
+        let (reply, result) = oneshot::channel();
+        sender
+            .send(command(reply))
+            .await
+            .map_err(|_| CallControllerError::WorkerStopped)?;
+        result
+            .await
+            .map_err(|_| CallControllerError::WorkerStopped)??;
+        Ok(())
     }
 
     async fn with_current_audio_controls(
@@ -580,6 +662,8 @@ impl CallController {
         }
         let token = self.shared.next_token.fetch_add(1, Ordering::Relaxed);
         let (cancel_tx, cancel_rx) = oneshot::channel();
+        let (video_tx, video_rx) = mpsc::channel(4);
+        let capture_stop = Arc::new(CaptureStop::default());
         let (done_tx, done_rx) = watch::channel(None);
         let (ready_tx, ready_rx) = oneshot::channel();
         {
@@ -594,6 +678,8 @@ impl CallController {
                 cancel: Some(cancel_tx),
                 done: done_rx,
                 audio_controls: None,
+                video_commands: video_tx,
+                capture_stop: Arc::clone(&capture_stop),
             });
             self.shared
                 .active_video_token
@@ -609,6 +695,10 @@ impl CallController {
             self.shared
                 .audio
                 .send_replace(AudioUpdate::Unavailable { token });
+            self.shared.local_video.send_replace(LocalVideoStatus {
+                token,
+                ..LocalVideoStatus::default()
+            });
             self.shared.status.send_replace(CallStatus::Starting {
                 account_id: account.id.clone(),
                 room_id: room_id.to_owned(),
@@ -624,6 +714,8 @@ impl CallController {
             cancel: cancel_rx,
             done: done_tx,
             ready: Some(ready_tx),
+            video_commands: Some(video_rx),
+            capture_stop,
         };
         tokio::spawn(worker.run());
         ready_rx
@@ -707,6 +799,7 @@ impl CallController {
                 CallSlot::Running(running) => running,
             };
             let cancel = running.cancel.take();
+            running.capture_stop.request();
             let done = running.done.clone();
             self.shared.status.send_replace(CallStatus::Ending {
                 account_id: running.account_id.clone(),
@@ -767,8 +860,11 @@ impl CallController {
         let _ = wait_cleanup_done(&mut done).await?;
         if self.shared.active_audio_token.load(Ordering::SeqCst) == token
             || self.shared.active_video_token.load(Ordering::SeqCst) == token
+            || self.shared.active_capture_workers.load(Ordering::SeqCst) != 0
         {
-            return Err(CallControllerError::AlreadyBusy);
+            return Err(CallControllerError::Cleanup(
+                "native capture is still stopping; try again when the device releases it".into(),
+            ));
         }
         let mut slot = self.shared.slot.lock().await;
         if matches!(&*slot, CallSlot::CleanupFailed { token: current, .. } if *current == token) {
@@ -843,6 +939,8 @@ struct CallWorker {
     cancel: oneshot::Receiver<()>,
     done: watch::Sender<Option<Result<(), String>>>,
     ready: Option<oneshot::Sender<Result<CallInfo, CallControllerError>>>,
+    video_commands: Option<mpsc::Receiver<CaptureCommand>>,
+    capture_stop: Arc<CaptureStop>,
 }
 
 impl CallWorker {
@@ -943,6 +1041,58 @@ impl CallWorker {
             self.finish(cleanup, Some(reason.to_string())).await;
             return;
         }
+        let mut outgoing = LocalVideoSession::new(
+            self.token,
+            self.video_commands
+                .take()
+                .expect("call owns video commands"),
+            self.shared.local_video.clone(),
+            Arc::clone(&self.capture_stop),
+            Arc::clone(&self.shared.active_capture_workers),
+        );
+        // A platform publish operation can suspend the call worker. These
+        // watchers stop OS capture immediately even if the worker has not yet
+        // returned to its main account/sync select loop.
+        let account_capture_guard = {
+            let mut active = active.clone();
+            let account_id = self.account_id.clone();
+            let stop = Arc::clone(&self.capture_stop);
+            tokio::spawn(async move {
+                loop {
+                    if active.borrow().as_ref().map(|account| account.id.as_str())
+                        != Some(account_id.as_str())
+                    {
+                        stop.request();
+                        break;
+                    }
+                    if active.changed().await.is_err() {
+                        stop.request();
+                        break;
+                    }
+                }
+            })
+        };
+        let sync_capture_guard = {
+            let mut sync = sync.clone();
+            let stop = Arc::clone(&self.capture_stop);
+            tokio::spawn(async move {
+                loop {
+                    if !matches!(
+                        *sync.borrow(),
+                        SyncStatus::Running {
+                            backend: SyncBackend::SlidingSticky
+                        }
+                    ) {
+                        stop.request();
+                        break;
+                    }
+                    if sync.changed().await.is_err() {
+                        stop.request();
+                        break;
+                    }
+                }
+            })
+        };
         let media_result = {
             let audio = rtc.run_audio_controlled(&self.room_id, &controls);
             let mut applied_audio = controls.subscribe_applied_state();
@@ -991,14 +1141,38 @@ impl CallWorker {
                     // A closed roster/video stream must not end microphone
                     // audio. run_remote_video normally waits for cancellation.
                     () = &mut video, if video_running => video_running = false,
+                    event = outgoing.next_event() => {
+                        // A capture command may be ready in the same select
+                        // as Leave or an account change. Check the current
+                        // generation before opening any OS capture device.
+                        if self.cancel.try_recv().is_ok() {
+                            break Ok(());
+                        }
+                        if self.shared.active_video_token.load(Ordering::SeqCst) != self.token
+                            || active.borrow().as_ref().map(|account| account.id.as_str())
+                                != Some(self.account_id.as_str())
+                        {
+                            break Err(CallControllerError::AccountChanged);
+                        }
+                        outgoing.handle_event(&rtc, &self.room_id, event).await;
+                    },
                 }
             }
         };
+        self.capture_stop.request();
+        account_capture_guard.abort();
+        sync_capture_guard.abort();
+        let outgoing_result = outgoing.shutdown().await;
         self.shared.clear_media(self.token);
         let leave_result = leave_with_timeout(&mut rtc, &self.room_id).await;
-        let cleanup = leave_result.map_err(|error| error.to_string());
-        self.finish(cleanup, media_result.err().map(|error| error.to_string()))
-            .await;
+        let cleanup = match (leave_result, outgoing_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error.to_string()),
+            (Ok(()), Err(video)) => Err(format!("video cleanup: {video}")),
+            (Err(error), Err(video)) => Err(format!("{error}; video cleanup: {video}")),
+        };
+        let failure = media_result.err().map(|error| error.to_string());
+        self.finish(cleanup, failure).await;
     }
 
     async fn setup(&mut self) -> Result<(RtcService, CallInfo), CallControllerError> {
@@ -1275,6 +1449,44 @@ mod tests {
         assert!(!controller.status().blocks_account_switch());
     }
 
+    #[tokio::test]
+    async fn stuck_capture_worker_keeps_account_switch_blocked() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Arc::new(AccountManager::open(root.path()).unwrap());
+        let controller = CallController::new(manager);
+        let (_, done_rx) = watch::channel(Some(Err("native capture still stopping".into())));
+        {
+            let mut slot = controller.shared.slot.lock().await;
+            *slot = CallSlot::CleanupFailed {
+                token: 7,
+                done: done_rx,
+            };
+            controller
+                .shared
+                .status
+                .send_replace(CallStatus::CleanupFailed {
+                    account_id: "account-a".into(),
+                    room_id: "!room-a:example.org".into(),
+                    reason: "native capture still stopping".into(),
+                });
+        }
+        controller
+            .shared
+            .active_capture_workers
+            .store(1, Ordering::SeqCst);
+        assert!(matches!(
+            controller.abandon_failed_leave().await,
+            Err(CallControllerError::Cleanup(_))
+        ));
+        assert!(controller.status().blocks_account_switch());
+        controller
+            .shared
+            .active_capture_workers
+            .store(0, Ordering::SeqCst);
+        controller.abandon_failed_leave().await.unwrap();
+        assert!(!controller.status().blocks_account_switch());
+    }
+
     #[test]
     fn call_modes_keep_current_slot_and_legacy_room_state_separate() {
         use morpheus_rtc::InteropMode;
@@ -1288,6 +1500,25 @@ mod tests {
         assert_eq!(legacy.slot_id, "m.call#room");
     }
 
+    #[tokio::test]
+    async fn stale_generation_cannot_start_native_capture() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Arc::new(AccountManager::open(root.path()).unwrap());
+        let controller = CallController::new(manager);
+        controller
+            .shared
+            .active_video_token
+            .store(9, Ordering::SeqCst);
+        let result = controller
+            .start_video_capture(
+                8,
+                CaptureSource::Camera("n:0:stale".into()),
+                "Camera".into(),
+            )
+            .await;
+        assert!(matches!(result, Err(CallControllerError::StaleCall)));
+    }
+
     #[test]
     fn final_cleanup_reasserts_clear_after_late_old_call_update() {
         let (status, _) = watch::channel(CallStatus::Idle);
@@ -1297,12 +1528,18 @@ mod tests {
             members: Vec::new(),
         });
         let (audio, _) = watch::channel(AudioUpdate::Unavailable { token: 5 });
+        let (local_video, _) = watch::channel(LocalVideoStatus {
+            token: 5,
+            ..LocalVideoStatus::default()
+        });
         let shared = Shared {
             slot: Mutex::new(CallSlot::Idle),
             status,
             video,
             roster,
             audio,
+            local_video,
+            active_capture_workers: Arc::new(AtomicUsize::new(0)),
             active_video_token: AtomicU64::new(5),
             active_audio_token: AtomicU64::new(5),
             next_token: AtomicU64::new(6),
@@ -1310,6 +1547,14 @@ mod tests {
         shared.clear_video(5);
         assert_eq!(shared.active_video_token.load(Ordering::SeqCst), 0);
         shared.video.send_replace(VideoUpdate::Clear { token: 5 });
+        shared.local_video.send_replace(LocalVideoStatus {
+            token: 5,
+            camera: crate::local_video::CaptureState {
+                phase: crate::local_video::CapturePhase::Active,
+                source: "Old camera".into(),
+            },
+            ..LocalVideoStatus::default()
+        });
         shared.roster.send_replace(RosterUpdate {
             token: 5,
             members: Vec::new(),
@@ -1317,11 +1562,22 @@ mod tests {
         shared.clear_video(5);
         assert_eq!(shared.video.borrow().token(), 0);
         assert_eq!(shared.roster.borrow().token, 0);
+        assert_eq!(shared.local_video.borrow().token, 0);
 
         shared.active_video_token.store(6, Ordering::SeqCst);
         shared.video.send_replace(VideoUpdate::Clear { token: 6 });
+        shared.local_video.send_replace(LocalVideoStatus {
+            token: 6,
+            screen: crate::local_video::CaptureState {
+                phase: crate::local_video::CapturePhase::Active,
+                source: "New display".into(),
+            },
+            ..LocalVideoStatus::default()
+        });
         shared.clear_video(5);
         assert_eq!(shared.video.borrow().token(), 6);
+        assert_eq!(shared.local_video.borrow().token, 6);
+        assert_eq!(shared.local_video.borrow().screen.source, "New display");
     }
 
     #[test]
@@ -1333,12 +1589,18 @@ mod tests {
             members: Vec::new(),
         });
         let (audio, _) = watch::channel(AudioUpdate::Unavailable { token: 5 });
+        let (local_video, _) = watch::channel(LocalVideoStatus {
+            token: 5,
+            ..LocalVideoStatus::default()
+        });
         let shared = Shared {
             slot: Mutex::new(CallSlot::Idle),
             status,
             video,
             roster,
             audio,
+            local_video,
+            active_capture_workers: Arc::new(AtomicUsize::new(0)),
             active_video_token: AtomicU64::new(5),
             active_audio_token: AtomicU64::new(5),
             next_token: AtomicU64::new(6),

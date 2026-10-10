@@ -4,7 +4,7 @@ Morpheus is an original, native Rust Matrix desktop client in development. The
 interface is inspired by familiar community-chat navigation, with a distinct
 design, deep configuration, and fast Matrix account switching.
 
-**Status:** private pre-alpha. Password sign-in, account switching, Spaces,
+**Status:** public source pre-alpha; no installer release. Password sign-in, account switching, Spaces,
 room creation and joining, invitations, public room discovery, basic room
 timelines, plain-text replies and edits, reactions, text threads, encrypted
 per-room drafts, local message search, and native attachment selection and
@@ -36,12 +36,18 @@ checks in [the feature matrix](docs/FEATURE_MATRIX.md).
 - In-app settings and a reloadable TOML configuration.
 - macOS, Linux, and Windows releases after platform testing.
 
-The source is original. Cinny, Discord, and Halloy are design and product
-references, and their code, artwork, names, and icons are not included.
+Morpheus's application code and assets are original. Cinny, Discord, and Halloy
+are design and product references; their code and artwork are not included.
+Third-party Rust dependencies and narrowly patched vendored crates retain their
+upstream licenses and notices. See [vendor provenance](vendor/README.md).
+
+Contributions are welcome; start with [CONTRIBUTING.md](CONTRIBUTING.md).
+Use [private vulnerability reporting](SECURITY.md) for security issues.
 
 ## Development
 
-Install the toolchain in `rust-toolchain.toml`, then run:
+Read [the build policy](AGENTS.md) and install the toolchain in
+`rust-toolchain.toml`. Choose checks relevant to your changes; examples:
 
 ```sh
 cargo fmt --all -- --check
@@ -68,9 +74,10 @@ suggested. An unrecoverable wedged request still needs complete message-level
 controls in the app.
 See [architecture](docs/ARCHITECTURE.md) for the intended boundaries.
 
-The package configuration is in [Packager.toml](Packager.toml). Install
-`cargo-packager` to build a local installer with `cargo packager --release`.
-Private preview packages are not signed or offered as public downloads.
+See [packaging](docs/PACKAGING.md) for local installer builds. Public CI uses
+standard hosted runners and publishes validation results, without installer
+downloads. The [release checks](docs/RELEASE_CHECKLIST.md) still apply before
+binary distribution; public source availability does not establish beta readiness.
 
 ## License
 

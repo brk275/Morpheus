@@ -5,6 +5,15 @@ members = [
     "crates/morpheus-config",
     "crates/morpheus-matrix",
     "crates/morpheus-rtc",
+    "vendor/lru",
+    "vendor/livekit-api",
+    "vendor/matrix-rtc-livekit",
+]
+default-members = [
+    "crates/morpheus-app",
+    "crates/morpheus-config",
+    "crates/morpheus-matrix",
+    "crates/morpheus-rtc",
 ]
 
 [workspace.package]
@@ -13,6 +22,18 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/brk275/Morpheus"
 
 [patch.crates-io]
+lru = { path = "vendor/lru" }
+# Enforce secure signaling URLs and prohibit authenticated redirects.
+livekit-api = { path = "vendor/livekit-api" }
 # Required by the pinned MatrixRTC SDK revision until its upstream dependency
 # pin is released on crates.io.
 const_panic = { git = "https://github.com/jplatte/const_panic", rev = "e0b317a9a7bde2d48a7d15b6a60d70e4a41d3b5f" }
+# The pinned Nokhwa AVFoundation path mislabels 8-bit NV12 as YUYV and blocks
+# forever when a camera supplies no frame. Keep the two small upstream crates
+# pinned locally until those fixes are available in a tested release.
+nokhwa = { path = "vendor/nokhwa" }
+nokhwa-bindings-macos = { path = "vendor/nokhwa-bindings-macos" }
+
+[patch."https://github.com/element-hq/matrix-rust-rtc"]
+# Validate every local/remote focus before exchanging Matrix OpenID credentials.
+matrix-rtc-livekit = { path = "vendor/matrix-rtc-livekit" }

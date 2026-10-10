@@ -29,12 +29,16 @@ host networking. Docker Desktop on this Mac could issue JWTs but its isolated
 loopback prevented ICE checks from reaching the native client.
 
 The Synapse A client API is `127.0.0.1:18008`; the authorization service is
-`127.0.0.1:18010`; LiveKit signaling is `morpheus-rtc.localhost:18011`, and
+`127.0.0.1:18010`; LiveKit signaling is `127.0.0.1:18011`, and
 native media uses UDP `127.0.0.1:18012`. In Docker-only mode, Docker publishes
 UDP `127.0.0.1:18012` and TCP fallback `127.0.0.1:18013` on loopback. A private HTTPS bridge inside
 the Docker network lets the authorization service verify Synapse A's OpenID
 tokens through its federation API; that bridge has no host port. The service
-uses a self-signed certificate bypass only for this local bridge.
+uses a self-signed certificate bypass only for this local bridge. A private TCP
+relay shares the authorization container's network namespace so its own
+`127.0.0.1:18011` reaches the SFU. This keeps the returned client endpoint
+literal loopback under the credential transport policy; no relay port is
+published and the relay logs no traffic.
 
 `up` and `up-native` turn on Synapse's simplified sliding sync, MSC4354 sticky events,
 MSC4143 transport discovery, and delayed events for this disposable server.
@@ -271,6 +275,19 @@ not a completed current-format interoperability pass. The browser harness
 was stopped after the failed Rust test; no leave/departure assertion passed in
 this run.
 
+The refresh explanation is an upstream hypothesis to test, not proof that
+every Element Call deployment fails or that Morpheus's wire format is
+universally correct. In the bundled JS SDK v42.2.0, [classic sync processing](https://github.com/matrix-org/matrix-js-sdk/blob/v42.2.0/src/sync.ts)
+adds and announces sticky events before starting critical-event decryption.
+The [session manager](https://github.com/matrix-org/matrix-js-sdk/blob/v42.2.0/src/matrixrtc/MatrixRTCSessionManager.ts)
+and [RTC session](https://github.com/matrix-org/matrix-js-sdk/blob/v42.2.0/src/matrixrtc/MatrixRTCSession.ts)
+refresh only when an incoming event already reports the RTC membership type;
+neither listens for the later [`Event.decrypted`](https://github.com/matrix-org/matrix-js-sdk/blob/v42.2.0/src/models/event.ts)
+notification. A focused upstream regression should deliver an encrypted
+sticky membership before decryption, then verify that the live RTC roster
+updates after decryption. Retest unmodified Element Call with the resulting
+SDK fix before counting stock interoperability as passed.
+
 For a transport-only diagnostic, `MORPHEUS_ELEMENT_DIAG_REFRESH=1` makes the
 browser harness call `client.matrixRTC.refreshRoom(room)` once after logging
 the stock status. That changed both live membership arrays from zero to two.
@@ -281,6 +298,14 @@ I420 camera frames, and observed departure. This shows that the
 browser refresh. The diagnostic mutates Element Call's runtime state; it does
 not meet the stock Element Call release gate. The current 2026 membership
 format also remains unverified against Element Call v0.26.1.
+
+This `Sticky2025` diagnostic does not validate Morpheus's default `Current`
+mode. The pinned Rust core keeps an internal lowercase `m.call#room` slot and
+its `Sticky2025` dialect writes Element Call's uppercase `m.call#ROOM` on the
+wire. Element Call v0.26.1 uses the uppercase room slot; a separate native
+uppercase-`Current` regression failed roster discovery. The slot/dialect
+choice therefore remains a second compatibility gate after the browser
+refresh problem is fixed.
 
 To repeat this diagnostic, set the Element Call config's `matrix_rtc_mode` to
 `"matrix_2_0"`, set `MORPHEUS_ELEMENT_INTEROP_MODE=sticky-2025` and

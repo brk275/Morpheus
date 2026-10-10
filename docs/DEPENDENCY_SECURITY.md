@@ -1,0 +1,60 @@
+# Dependency security review
+
+Reviewed 2026-10-10 against the publication Cargo lockfile. OSV queries cover
+all 1,052 registry package versions: seven maintenance notices remain and
+OpenSSL/OpenSSL-sys have no advisory matches. The patched local `lru` version
+match is reviewed separately below. Version-based results do not verify
+unpublished Git revisions, local source patches, or every native library
+bundled by a dependency; source review and platform acceptance remain required.
+
+## Applied panic-safety backport
+
+`lru` 0.16.4 is pulled in by Tantivy 0.26.2. [RUSTSEC-2026-0253](https://rustsec.org/advisories/RUSTSEC-2026-0253.html)
+describes a dangling-list-pointer bug when a popped key's destructor panics.
+The local patch backports [upstream PR 238](https://github.com/jeromefroe/lru-rs/pull/238)
+and retains its regression test. This preserves the pinned Matrix SDK and
+Tantivy dependency interfaces. Current Tantivy code uses integer keys, whose
+destructors cannot trigger this failure, but the dependency is hardened anyway.
+
+The local crate retains version 0.16.4. Version-only scanners may still flag it;
+review the patch provenance in `vendor/lru/MORPHEUS_PATCH.md` and rerun its panic
+regression instead of suppressing all advisories. Remove the patch after an
+upstream dependency update supplies a verified fixed release.
+
+## Five existing dependency maintenance notices
+
+These notices identify unmaintained transitive dependencies, not five confirmed
+exploitable vulnerabilities in Morpheus. Track replacements through the owning
+dependency and reassess on each lockfile update; do not silently change the
+serialization or SDK interfaces to remove a warning.
+
+| Dependency | Advisory | Introduced by | Follow-up |
+| --- | --- | --- | --- |
+| anymap2 0.13.0 | RUSTSEC-2026-0319 | matrix-sdk 0.19.1 | Follow the SDK's migration to a maintained type map |
+| bincode 2.0.1 | RUSTSEC-2025-0141 | typed-index-collections 3.5.0 | Review enabled features and upstream serialization migration |
+| derivative 2.2.0 | RUSTSEC-2024-0388 | wasm_evt_listener 0.1.0 | Recheck target reachability and upstream replacement |
+| paste 1.0.15 | RUSTSEC-2024-0436 | nokhwa 0.10.11 | Follow a maintained camera backend or macro replacement |
+| ttf-parser 0.25.1 | RUSTSEC-2026-0192 | owned_ttf_parser 0.25.1 | Follow the font/rendering stack's maintained parser migration |
+
+## Optional backend entries introduced by vendored test workspaces
+
+Making the patched crates workspace members allows their own regression tests
+to run. Cargo also locks their optional backends, even though Morpheus enables
+Tokio and Rustls. The resulting lockfile adds two further maintenance notices:
+
+| Dependency | Advisory | Scope |
+| --- | --- | --- |
+| async-std 1.13.2 | RUSTSEC-2025-0052 | Discontinued; disabled async-std transport backend |
+| instant 0.1.13 | RUSTSEC-2024-0384 | Unmaintained; disabled async-std transport backend |
+
+The optional native-TLS backend initially resolved OpenSSL 0.10.78. Its three
+advisories concern the OCSP URL accessor and AES key-wrap-with-padding APIs.
+The publication lockfile uses 0.10.80, which fixes all three:
+[OCSP URL](https://github.com/rust-openssl/rust-openssl/security/advisories/GHSA-xp3w-r5p5-63rr),
+[key-wrap update](https://github.com/rust-openssl/rust-openssl/security/advisories/GHSA-xv59-967r-8726),
+and [in-place update](https://github.com/rust-openssl/rust-openssl/security/advisories/GHSA-phqj-4mhp-q6mq).
+OpenSSL is absent from Morpheus's `native-calls` dependency graph across targets.
+Enabling either optional backend requires its own security and platform review.
+
+New advisories require fresh review. A previous clean scan does not establish
+the safety of changed dependencies or a release candidate.

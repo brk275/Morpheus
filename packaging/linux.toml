@@ -1,0 +1,24 @@
+# Linux-only package requirements; merged by scripts/package.py.
+[deb]
+depends = [
+  "libc6 (>= 2.39)",
+  "libstdc++6 (>= 12.1.0)",
+  "libgcc-s1",
+  "libfontconfig1",
+  "libasound2t64 | libasound2",
+  "libdbus-1-3",
+  "libsqlite3-0",
+  "libegl1",
+  "libxkbcommon0",
+  "libxkbcommon-x11-0",
+  "libwayland-client0",
+  "libx11-6",
+  "libxi6",
+  "libxcb1",
+  "libxcursor1",
+  "libxrandr2",
+  "libpipewire-0.3-0",
+]
+
+[deb.files]
+"LICENSE" = "usr/share/doc/morpheus/copyright"

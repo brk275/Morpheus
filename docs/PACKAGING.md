@@ -1,19 +1,46 @@
 # Packaging Morpheus
 
-The package configuration is in [`Packager.toml`](../Packager.toml). Its build hook compiles `morpheus-app` in release mode with the `native-calls` feature and uses the lockfile. Run packaging on each target operating system:
+Shared package configuration is in [`Packager.toml`](../Packager.toml); Debian and other Linux settings live in [`packaging/linux.toml`](../packaging/linux.toml). The wrapper merges only the current platform's settings. Its build hook compiles `morpheus-app` in release mode with `native-calls` and the lockfile. Read [AGENTS.md](../AGENTS.md) before building; select the affected platform rather than starting a full packaging matrix.
 
 ```sh
 cargo install cargo-packager --version 0.11.8 --locked
-cargo packager --release
+python3 scripts/package.py
 ```
 
 The package output goes to `dist/`. This command does not make a public release. The packaged call feature still needs real MatrixRTC interoperability and device testing before a beta can be distributed.
 
-## Unsigned internal package QA
+## Unsigned package validation
 
-The manual [`package-qa.yml`](../.github/workflows/package-qa.yml) workflow packages the private repository's `main` branch on macOS Apple Silicon and Intel, Windows x64, and Linux x64. It pins Rust 1.99.0 and Cargo Packager 0.11.8, using `Packager.toml`'s release build hook. It produces a DMG on each Mac runner, an NSIS installer on Windows, and both a Debian package and AppImage on Linux. The Linux runner currently uses Ubuntu 24.04. Run it from the GitHub Actions tab or with `gh workflow run package-qa.yml --ref main` after the workflow lands on `main`.
+The manual [`package-qa.yml`](../.github/workflows/package-qa.yml) workflow runs
+only on public `main` using standard hosted runners. It requires an explicit
+platform choice (`linux`, `windows`, `macos`, or `all`), defaulting to Linux.
+Shared release candidates require `all`; a Linux-only packaging edit selects
+only Linux. It pins Rust 1.99.0 and Cargo Packager 0.11.8. To dispatch an
+appropriate check after confirming no equivalent run is active:
 
-The workflow only runs while the repository is private. It has a read-only token, passes no signing or notarization credentials, and only uploads Actions artifacts named `morpheus-UNSIGNED-INTERNAL-QA-...`. They expire after five days. [GitHub requires repository read access to download artifacts](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/download-workflow-artifacts). Delete these runs and artifacts before changing the repository's visibility, since public repositories expose Actions history and logs. These packages are for install smoke tests and preliminary device permission checks by authorized collaborators; they are not signed, notarized, updater payloads, or release candidates. On Linux, set the downloaded AppImage executable bit with `chmod +x` before running it, because Actions artifact upload does not preserve file permissions.
+```sh
+gh workflow run package-qa.yml --ref main -f platform=linux
+```
+
+The workflow builds DMGs on the Mac runners, NSIS on Windows, and DEB/AppImage
+on Ubuntu 24.04. It smoke-tests Linux startup and leaves installers on the
+ephemeral runner: there is no artifact upload or release publication. Public
+source and logs do not imply tested, signed installers. Native CI and packaging
+use separate concurrency groups; do not dispatch equivalent work concurrently.
+All hosted jobs are gated off while the repository is private; paid runs require
+separate owner authorization.
+
+For a local package, use `python3 scripts/package.py --formats deb,appimage`,
+`--formats dmg`, or `--formats nsis` on the relevant platform. Run
+`python3 scripts/package.py --check` to validate configuration without building.
+Direct `cargo packager` calls bypass the Linux overlay and are not the supported
+packaging entry point.
+
+Earlier private QA runs uploaded unsigned installers for five days. Their runs
+and artifacts must be removed before source publication; retain a private
+manifest of producing revisions and immutable artifact identities. Public
+repositories expose Actions history and logs. Existing historical evidence
+below describes older inputs and does not verify changed source or packages.
 
 The first private QA DMG displayed the entire AGPL as a mount agreement because `license-file = "LICENSE"` was set. The packaging config now bundles `LICENSE` as a readable resource instead; the Debian package also puts it in `/usr/share/doc/morpheus/copyright`. This removes the DMG mount agreement and the NSIS license page. Later extracted Apple Silicon, Windows, and Linux artifacts contain the license; installed-package behavior still needs checking on every platform. Provide recipients the Corresponding Source separately as required by the AGPL.
 
@@ -30,7 +57,7 @@ The Linux QA executable built on Ubuntu 24.04 required `GLIBC_2.39` and `GLIBCXX
 - The Windows x64 job in run `38029335100` produced a 35,087,286-byte NSIS installer. Extracting it showed the app, uninstaller, theme, and AGPL license; the license matches the source after Windows line-ending normalization. The installer stub is a GUI executable, but the packaged app still uses the PE console subsystem at this older commit. Current source adds the Windows GUI subsystem attribute, which needs a fresh package and Windows install/launch/uninstall acceptance.
 - The macOS ARM job in run `38029335100` never obtained a runner. GitHub annotated it as blocked by an Actions budget, with a separate macOS ARM capacity notice. This is not a package build result. Check the account's Actions budget before another private run.
 
-The generated DEB currently lacks a `Maintainer` control field, which triggers a `dpkg-query` warning. Cargo Packager takes this field from top-level `authors`; set it to a real maintainer name and working email address before distribution.
+The generated DEB currently lacks a `Maintainer` control field, which triggers a `dpkg-query` warning. Cargo Packager takes this field from top-level `authors`; set it to a project maintainer identity and working project contact address before distribution. A personal identity is not required.
 
 ## macOS permissions and signing
 
@@ -47,13 +74,13 @@ spctl --assess --type execute --verbose dist/Morpheus.app
 
 Signing identity and notarization credentials belong in the release environment, not this repository. Run microphone, camera, and screen capture permission flows on the **signed package**; unsigned developer runs do not validate those flows.
 
-## Updates and private betas
+## Updates and controlled betas
 
 The updater is not integrated yet. Cargo Packager's default formats currently produce a macOS `.app` and `.dmg`, a Windows NSIS installer, and Linux `.deb`, AppImage, and Pacman packages. `cargo-packager-updater` supports installing signed updates into a macOS `.app`, a Windows NSIS installer (or WiX if packaged), and a Linux AppImage. The macOS updater needs an `.app` update bundle even when the installed app originally came from a DMG; a DMG is not an updater payload. Debian and Pacman installations should use their package managers. On Linux, enable self-update only when running from a writable AppImage.
 
 An updater release needs an HTTPS feed returning `204 No Content` or a `200 OK` JSON response with a newer semantic version, artifact URL, exact artifact signature, and supported format. The app verifies that signature with an embedded public key; the signing private key stays in the release environment. This signature is separate from macOS notarization and Windows code signing. Test the actual installed upgrade, bad signature, interrupted download, failed install, and recovery path on each supported platform before enabling it.
 
-Assets in this private GitHub repository require authorized access. Do not embed a repository token in the app. Distribute pre-release packages manually to authorized testers through restricted GitHub releases or Actions artifacts, or provide a private update service with per-user authorization for both the feed and downloads. Keep automatic updates disabled until that service and the signing flow are verified.
+This source repository is public; its releases and Actions artifacts cannot provide private beta access. Do not embed a repository token in the app. Any future restricted beta needs a separately controlled distribution service with per-user authorization for both its feed and assets. Keep automatic updates disabled until access controls and the signing flow are verified. Public installer releases must pass the release checklist.
 
 ## Platform acceptance
 

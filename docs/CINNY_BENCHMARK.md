@@ -21,6 +21,11 @@ formatting, media, and device-management changes.
 
 - [ ] Send and display plain text, formatted text, links, mentions, emoji,
       stickers, replies, edits, redactions, reactions, and threaded messages.
+      Encrypted replies, edits, reactions, and threads passed local core checks;
+      the native Markdown toggle and send path passed a macOS click-through.
+      A safe subset of rich text renders in the offline timeline and thread
+      preview. Live decrypted rich rendering, mention suggestions, emoji and
+      sticker pickers, and the complete behavior set remain open.
 - [ ] Upload, download, preview, and safely open images, video, audio, and
       files in encrypted and unencrypted rooms. The Matrix core passed an
       encrypted binary-file upload/download roundtrip with metadata, account
@@ -53,17 +58,28 @@ formatting, media, and device-management changes.
       joins without ringing every member and show a participant roster. A
       shared voice-space room-state marker and Morpheus roster snapshot passed
       a local two-device test. A native two-person call-stage roster passed an
-      isolated macOS app check; voice-space navigation and drop-in acceptance
-      remain open.
+      isolated macOS app check; an encrypted macOS GUI call also joined with
+      two participants. Voice-space navigation and designation are wired, but
+      drop-in acceptance and DM/room ringing remain open.
 - [ ] Encrypted voice and video, reconnect, device selection, and screen share
       interoperate with Element Call on compatible homeservers. Local encrypted
       transport has carried synthetic camera/audio and real macOS display and
       window pixels. An opt-in legacy room-state call exchanged encrypted
       microphone and video with an Element Call v0.26.1 browser peer. Its
       current `matrix_2_0` mode still fails the local interop fixture. The
-      remote tile compiles; an unencrypted-room live probe found no remote
-      camera track despite a publishing peer. Received-frame playback in the
-      tile, publication controls, and reconnect remain unverified.
+      remote tile and native Camera/Share source controls compile. In one
+      encrypted macOS GUI call, the display-share UI reached Active and Bob's
+      observer decoded one encrypted `ScreenShare` I420 frame. Sustained
+      sharing, camera publication, and Morpheus's received tile are
+      unverified. On the tested FaceTime camera, a format-selection change
+      still produced no GUI frame: capture stayed Starting for about 20
+      seconds, then moved through Stopping and Failed to Off. Native camera
+      capture remains blocked on that macOS device. An unencrypted-room probe
+      found no remote camera track despite a publishing peer. Current-format
+      calls therefore reject cleartext rooms. Forced signalling socket closure
+      recovered in a native test; a full network outage, SFU restart, capture
+      stop/start, device selection, and cross-platform call acceptance remain
+      open.
 - [ ] Settings, themes, accessibility, and platform packaging work on macOS,
       Windows, and Linux.
 

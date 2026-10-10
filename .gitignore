@@ -12,3 +12,19 @@
 /assets/icon.iconset/
 __pycache__/
 *.pyc
+
+# Disposable QA accounts and local signing material never belong in source.
+/morpheus-matrix-test/
+/qa-data/
+/private/
+/signing/
+/accounts.json
+**/accounts-*.json
+**/recovery-*.json
+**/rtc-gate-*.json
+**/secrets.json
+**/auth.env
+/*.p12
+/*.pfx
+/*-private-key.pem
+/*-private-key.key

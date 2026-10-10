@@ -1,8 +1,16 @@
-# Private beta and public release gate
+# Source publication and binary release gates
 
-The repository stays private, and installers stay private, until every relevant
+The source is available for public pre-alpha development. Public CI results are
+not a beta release. Installer downloads remain disabled until every relevant
 item below has evidence from real accounts, homeservers, and installed packages.
-The preview shell and unit tests alone do not satisfy this gate.
+The preview shell and unit tests alone do not satisfy the binary release gate.
+
+Before publishing source, scan the candidate and its Git history for secrets,
+review screenshots and hosted logs, remove private QA installer artifacts,
+verify least-privilege CI and private vulnerability reporting, and fix identified
+credential-transport and capture-cancellation defects. Keep personal account
+data and signing material outside the repository. Repeat the relevant checks
+when publication inputs change.
 
 ## Functional beta gate
 
@@ -68,8 +76,9 @@ The preview shell and unit tests alone do not satisfy this gate.
       libstdc++ symbol requirements match that baseline.
 - [ ] Include `libxi6` in a rebuilt Debian package and verify a clean X11
       installation launches without manually installing extra libraries.
-- [ ] Put a real maintainer name and working email address in the Debian
-      package's `Maintainer` field.
+- [ ] Put a project maintainer identity and working project contact address in
+      the Debian package's `Maintainer` field; a personal name or email is not
+      required.
 - [ ] Establish and verify a Linux package build path for distributions older
       than Ubuntu 24.04 before claiming support for them.
 - [ ] Test upgrades from installed older builds, failed or interrupted updates,

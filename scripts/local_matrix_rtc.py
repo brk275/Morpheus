@@ -28,16 +28,18 @@ import uuid
 from pathlib import Path
 
 import local_matrix_env as matrix_env
+from fixture_paths import external_path, write_private
 
 
-HOME = Path(os.environ.get("MORPHEUS_MATRIX_TEST_HOME", Path(tempfile.gettempdir()) / "morpheus-matrix-test"))
-STATE = HOME / "rtc"
+FIXTURE_HOME = matrix_env.FIXTURE_HOME
+STATE = FIXTURE_HOME / "rtc"
 SECRET_FILE = STATE / "secrets.json"
 SFU_CONFIG = STATE / "livekit.yaml"
 NATIVE_SFU_CONFIG = STATE / "livekit-native.yaml"
 NATIVE_SFU_PID = STATE / "livekit-native.pid"
 NATIVE_SFU_LOG = STATE / "livekit-native.log"
 AUTH_ENV = STATE / "auth.env"
+SFU_LOOPBACK_SCRIPT = STATE / "sfu_loopback.py"
 FEDERATION_PROXY = STATE / "federation_proxy.py"
 FEDERATION_CERT = STATE / "federation.crt"
 FEDERATION_KEY = STATE / "federation.key"
@@ -45,11 +47,66 @@ NETWORK = "morpheus-matrix-test"
 SYNAPSE = "morpheus-synapse-a"
 SFU = "morpheus-rtc-livekit"
 AUTH = "morpheus-rtc-auth"
+SFU_LOOPBACK = "morpheus-rtc-sfu-loopback"
 FEDERATION = "morpheus-rtc-federation"
 SFU_IMAGE = "livekit/livekit-server@sha256:d0c04791bf63ca8dcea123571827d56ba9504bd57c8d5de60ee03b5408cc3154"
 AUTH_IMAGE = "ghcr.io/element-hq/lk-jwt-service@sha256:fe787619877b9c12d4370ed39dc8edecf99b1a71fa8958c0fdcb687c1d31c775"
 DISCOVERY_URL = "http://127.0.0.1:18010"
-SFU_URL = "ws://morpheus-rtc.localhost:18011"
+SFU_URL = "ws://127.0.0.1:18011"
+
+# The pinned JWT service uses LIVEKIT_URL both for its server-side room API
+# and for URLs returned to clients. Its private network namespace therefore
+# needs its own loopback route to the SFU. This transparent TCP bridge keeps
+# JWT responses unchanged and never handles Matrix/LiveKit credentials itself.
+SFU_LOOPBACK_SOURCE = '''"""Private loopback route for the local JWT service only."""
+import select
+import socket
+import socketserver
+
+
+class Handler(socketserver.BaseRequestHandler):
+    def handle(self):
+        try:
+            with socket.create_connection(self.server.target, timeout=5) as upstream:
+                upstream.settimeout(10)
+                self.request.settimeout(10)
+                peers = {self.request: upstream, upstream: self.request}
+                while peers:
+                    readable, _, _ = select.select(list(peers), [], [], 30)
+                    if not readable:
+                        return
+                    for source in readable:
+                        destination = peers[source]
+                        chunk = source.recv(65536)
+                        if chunk:
+                            destination.sendall(chunk)
+                        else:
+                            # Preserve half-close: the SFU may send its final
+                            # response only after receiving the entire request.
+                            destination.shutdown(socket.SHUT_WR)
+                            del peers[source]
+        except OSError:
+            # Network failures close the connection. Never log request bytes,
+            # headers, OpenID tokens, JWTs, or native API credentials.
+            return
+
+
+class Forwarder(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, target=("morpheus-rtc.localhost", 18011), port=18011):
+        self.target = target
+        super().__init__(("127.0.0.1", port), Handler)
+
+    def handle_error(self, request, client_address):
+        pass
+
+
+if __name__ == "__main__":
+    with Forwarder() as server:
+        server.serve_forever()
+'''
 
 
 def docker(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -69,15 +126,11 @@ def running(name: str) -> bool:
 
 
 def private_file(path: Path, content: str) -> None:
-    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(STATE, 0o700)
-    fd = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
-    with os.fdopen(fd, "w") as file:
-        file.write(content)
-    os.chmod(path, 0o600)
+    write_private(path, content)
 
 
 def secrets_data() -> dict[str, str]:
+    external_path(SECRET_FILE)
     if SECRET_FILE.exists():
         return json.loads(SECRET_FILE.read_text())
     data = {"key": "morpheus" + secrets.token_hex(8), "secret": secrets.token_urlsafe(36)}
@@ -138,6 +191,7 @@ LIVEKIT_FULL_ACCESS_HOMESERVERS=morpheus-a.test
 LIVEKIT_CS_API_URL_OVERRIDES=morpheus-a.test=http://{SYNAPSE}:8008
 LIVEKIT_INSECURE_SKIP_VERIFY_TLS=YES_I_KNOW_WHAT_I_AM_DOING
 """)
+    private_file(SFU_LOOPBACK_SCRIPT, SFU_LOOPBACK_SOURCE)
     private_file(FEDERATION_PROXY, '''"""Private HTTPS bridge for local OpenID verification only."""
 import http.server
 import ssl
@@ -237,7 +291,7 @@ def verify_discovery() -> None:
         flags = json.load(response)["unstable_features"]
     if not flags.get("org.matrix.simplified_msc3575") or not flags.get("org.matrix.msc4354"):
         raise RuntimeError("Synapse A lacks sliding sync or MSC4354 sticky events")
-    accounts = json.loads((HOME / "accounts.json").read_text())["accounts"]
+    accounts = json.loads((FIXTURE_HOME / "accounts.json").read_text())["accounts"]
     alice = next(account for account in accounts if account["label"] == "a_primary")
     login = urllib.request.Request(
         alice["homeserver_url"] + "/_matrix/client/v3/login",
@@ -263,7 +317,7 @@ def verify_discovery() -> None:
 def probe() -> None:
     """Exercise authenticated discovery and MSC4195 token exchange, never printing tokens."""
     verify_discovery()
-    fixture = json.loads((HOME / "accounts.json").read_text())
+    fixture = json.loads((FIXTURE_HOME / "accounts.json").read_text())
     alice = next(account for account in fixture["accounts"] if account["label"] == "a_primary")
     login_request = urllib.request.Request(
         alice["homeserver_url"] + "/_matrix/client/v3/login",
@@ -305,7 +359,7 @@ def probe() -> None:
         token = json.load(response)
     if not token.get("jwt") or token.get("url") != SFU_URL:
         raise RuntimeError("RTC service returned no JWT or the wrong local SFU URL")
-    wait_http("http://morpheus-rtc.localhost:18011/")
+    wait_http("http://127.0.0.1:18011/")
     print("Authenticated RTC discovery and LiveKit JWT exchange passed; SFU is reachable.")
 
 
@@ -351,7 +405,8 @@ def start_native_sfu() -> None:
     version = subprocess.run([binary, "--version"], capture_output=True, text=True)
     if version.returncode or "version 1.13.9" not in version.stdout:
         raise RuntimeError("Native LiveKit must be version 1.13.9 for this fixture")
-    fd = os.open(NATIVE_SFU_LOG, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+    external_path(NATIVE_SFU_LOG)
+    fd = os.open(NATIVE_SFU_LOG, os.O_CREAT | os.O_APPEND | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(fd, "a") as log:
         process = subprocess.Popen(
             [binary, "--config", str(NATIVE_SFU_CONFIG)],
@@ -371,7 +426,17 @@ def start_native_sfu() -> None:
 
 
 def start_federation_bridge() -> None:
-    if not exists("container", FEDERATION):
+    present = exists("container", FEDERATION)
+    if present:
+        mounts = json.loads(docker("inspect", "--format", "{{json .Mounts}}", FEDERATION).stdout)
+        source = next((mount.get("Source") for mount in mounts if mount.get("Destination") == "/etc/rtc"), None)
+        if source is None or Path(source).resolve() != STATE.resolve():
+            # A fresh fixture home has a new certificate and proxy script. Do
+            # not restart a stale container bound to a deleted/older test home.
+            # This container owns no Synapse data volume.
+            docker("rm", "-f", FEDERATION)
+            present = False
+    if not present:
         docker(
             "run", "-d", "--name", FEDERATION, "--network", NETWORK,
             "--network-alias", "morpheus-a.test", "--entrypoint", "python3",
@@ -384,17 +449,39 @@ def start_federation_bridge() -> None:
 
 
 def start_authorization(*, native_sfu: bool) -> None:
-    # Recreate on each mode switch so /etc/hosts never points at the wrong SFU.
+    # The bridge owns the namespace and the existing loopback-only auth port.
+    # The JWT service joins that namespace: its 127.0.0.1:18011 goes through
+    # the bridge, while desktop clients' 127.0.0.1:18011 goes straight to SFU.
+    # In Docker mode the bridge resolves the SFU's network alias. Native mode
+    # (macOS Docker Desktop only) maps the same name to the host gateway.
+    # Recreate both containers on mode changes; remove the namespace user first.
     if exists("container", AUTH):
         docker("rm", "-f", AUTH)
-    args = ["run", "-d", "--name", AUTH, "--network", NETWORK]
+    if exists("container", SFU_LOOPBACK):
+        docker("rm", "-f", SFU_LOOPBACK)
+    args = [
+        "run", "-d", "--name", SFU_LOOPBACK, "--network", NETWORK,
+        "--network-alias", AUTH,
+        "--publish", "127.0.0.1:18010:8080/tcp",
+        "--entrypoint", "python3",
+        "--mount", f"type=bind,src={SFU_LOOPBACK_SCRIPT},dst=/sfu_loopback.py,readonly",
+    ]
     if native_sfu:
         args += ["--add-host", "morpheus-rtc.localhost:host-gateway"]
-    args += [
-        "--publish", "127.0.0.1:18010:8080/tcp",
-        "--env-file", str(AUTH_ENV), AUTH_IMAGE,
-    ]
+    # Reuse the already-required Synapse Python image; do not rebuild or alter
+    # the pinned authorization service. No keys/config are mounted in bridge.
+    args += [matrix_env.IMAGE, "-u", "/sfu_loopback.py"]
     docker(*args)
+    try:
+        docker(
+            "run", "-d", "--name", AUTH,
+            "--network", f"container:{SFU_LOOPBACK}",
+            "--env-file", str(AUTH_ENV), AUTH_IMAGE,
+        )
+    except RuntimeError:
+        docker("rm", "-f", AUTH, check=False)
+        docker("rm", "-f", SFU_LOOPBACK, check=False)
+        raise
 
 
 def rtc_fixture() -> None:
@@ -481,7 +568,7 @@ def rtc_fixture() -> None:
 
 
 def up() -> None:
-    if shutil.disk_usage(HOME.parent).free < 8 * 1024**3:
+    if shutil.disk_usage(FIXTURE_HOME.parent).free < 8 * 1024**3:
         raise RuntimeError("Less than 8 GiB free; refusing to start MatrixRTC images")
     if not exists("network", NETWORK):
         raise RuntimeError("Run scripts/local_matrix_env.py up first")
@@ -535,7 +622,7 @@ def up_native() -> None:
 
 
 def status() -> None:
-    for name in (SYNAPSE, FEDERATION, SFU, AUTH):
+    for name in (SYNAPSE, FEDERATION, SFU, SFU_LOOPBACK, AUTH):
         print(f"{name}: {'running' if running(name) else 'stopped/absent'}")
     print("RTC config: " + (str(STATE) if STATE.exists() else "absent"))
     print("native LiveKit: " + ("running" if native_sfu_pid() is not None else "stopped"))
@@ -543,7 +630,7 @@ def status() -> None:
 
 def down() -> None:
     stop_native_sfu()
-    for name in (AUTH, SFU, FEDERATION):
+    for name in (AUTH, SFU_LOOPBACK, SFU, FEDERATION):
         if exists("container", name):
             docker("rm", "-f", name)
     print("Local RTC containers stopped; private config retained. Synapse A remains running.")

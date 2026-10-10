@@ -261,7 +261,7 @@ try {
         hasVersions: Array.isArray(event.getContent().versions),
         hasTransport: !!event.getContent().transports,
         hasLegacyTransport: !!event.getContent().rtc_transports,
-        isLeave: Object.keys(event.getContent()).every((key) => key === "msc4354_sticky_key"),
+        isLeave: Object.keys(event.getContent()).every((field) => field === "msc4354_sticky_key"),
       })),
       stickyUpdateSamples: (window.__morpheusStickyUpdates ?? []).slice(0, 12),
       sources: (window.__morpheusSyntheticSources ?? []).map((source) => ({
