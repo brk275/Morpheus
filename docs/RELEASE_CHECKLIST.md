@@ -65,7 +65,7 @@ when publication inputs change.
       disabled until access and signing are verified.
 - [ ] Give private beta recipients the Corresponding Source required by the
       [AGPL](https://www.gnu.org/licenses/agpl-3.0.html) for distributed builds,
-      even while the GitHub repository remains private.
+      matching each distributed build and its dependency patches.
 - [ ] Verify the macOS DMG mounts without a full-AGPL agreement and the
       installed macOS, Windows, and Linux packages contain a readable license
       and required source notices.

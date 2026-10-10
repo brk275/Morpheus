@@ -3,6 +3,52 @@
 Morpheus is pre-alpha software with no approved installer release. This log records checks actually completed;
 the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
+## Public source publication, 2026-10-10
+
+- Published `brk275/Morpheus` as public pre-alpha source at
+  `bc1614bbea5e8513c04c4cbbe4387cfb80fae54e`. Anonymous GitHub API access
+  confirmed public visibility. Commit identities remain pseudonymous.
+- The private cleanup push [run 38092927224](https://github.com/brk275/Morpheus/actions/runs/38092927224)
+  skipped all hosted jobs. It performed no native build.
+- Verified secret scanning and push protection enabled, private vulnerability
+  reporting enabled, approval required for all outside contributors' workflows,
+  and read-only default workflow permissions. GitHub reported no open
+  secret-scanning alerts at publication; scans do not guarantee future safety.
+- Standard hosted runners provide free public-repository build compute, not
+  account credits ([GitHub runner documentation](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)).
+  Earlier charges, storage rules, and paid-runner restrictions remain separate.
+  Billing caps were not changed.
+
+### Complete native CI matrix
+
+[Run 38092977119](https://github.com/brk275/Morpheus/actions/runs/38092977119)
+checked source revision `bc1614bbea5e8513c04c4cbbe4387cfb80fae54e` on standard
+public runners. All native build and test steps passed on the first attempt:
+
+| Target | Runner | Result |
+| --- | --- | --- |
+| Linux x64 | `ubuntu-24.04` | Native build, tests, and Xvfb startup smoke passed |
+| macOS Apple Silicon | `macos-15` | Native build and tests passed |
+| macOS Intel | `macos-15-intel` | Native build and tests passed |
+| Windows x64 | `windows-2025` | Native build and tests passed |
+
+The workflow completed successfully. Actual Rust host targets were verified
+for all four jobs; 23,893 native-job log lines passed credential scanning with
+zero unresolved findings. Private evidence retains the completed job records.
+
+Each target checked the default desktop configuration, built `native-calls`,
+and tested desktop controllers, native device guards, and the vendored security
+patches. Real homeserver tests remain explicitly invoked local checks; hosted
+jobs had no Matrix credentials. The standalone theme job was intentionally
+skipped because the full native jobs already test configuration.
+
+This run did not build or upload installers. It is not installed-package,
+physical-device, signing, accessibility, or interoperability acceptance.
+Nonfatal upstream warnings remain, including `block` future-Rust compatibility,
+macOS duplicate JPEG symbols/debug unwind size, and deprecated native APIs.
+The pinned checkout action also reports its Node 20 declaration while GitHub
+runs it on Node 24. These need dependency/toolchain follow-up before release.
+
 ## 2026-10-10 public-source preparation
 
 Public development does not authorize installer distribution. The original

@@ -26,7 +26,8 @@ The workflow builds DMGs on the Mac runners, NSIS on Windows, and DEB/AppImage
 on Ubuntu 24.04. It smoke-tests Linux startup and leaves installers on the
 ephemeral runner: there is no artifact upload or release publication. Public
 source and logs do not imply tested, signed installers. Native CI and packaging
-use separate concurrency groups; do not dispatch equivalent work concurrently.
+share a candidate/platform lock. Their workflow-level groups are separate;
+check active and completed runs before dispatching equivalent work.
 All hosted jobs are gated off while the repository is private; paid runs require
 separate owner authorization.
 
@@ -36,9 +37,10 @@ For a local package, use `python3 scripts/package.py --formats deb,appimage`,
 Direct `cargo packager` calls bypass the Linux overlay and are not the supported
 packaging entry point.
 
-Earlier private QA runs uploaded unsigned installers for five days. Their runs
-and artifacts must be removed before source publication; retain a private
-manifest of producing revisions and immutable artifact identities. Public
+Earlier private QA runs uploaded unsigned installers for five days. On
+2026-10-10, their three runs and all ten artifacts were removed before source
+publication. A private manifest retains producing revisions and immutable
+artifact identities. Public
 repositories expose Actions history and logs. Existing historical evidence
 below describes older inputs and does not verify changed source or packages.
 
