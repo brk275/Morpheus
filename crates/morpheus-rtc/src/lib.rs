@@ -138,6 +138,17 @@ pub enum RtcError {
     #[error("MatrixRTC transport discovery failed: {0}")]
     Discovery(String),
     #[cfg(feature = "native-rtc")]
+    #[error("could not check encrypted-call device readiness: {0}")]
+    EncryptionReadiness(String),
+    #[cfg(feature = "native-rtc")]
+    #[error("room encryption state is unknown; retry after room state loads")]
+    UnknownEncryptionState,
+    #[cfg(feature = "native-rtc")]
+    #[error(
+        "this device is not ready for encrypted calls; complete cross-signing verification or recovery"
+    )]
+    EncryptionIdentityNotReady,
+    #[cfg(feature = "native-rtc")]
     #[error("MatrixRTC call failed: {0}")]
     Call(#[from] matrix_rtc_call_sdk::LiveKitCallError),
 }

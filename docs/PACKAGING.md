@@ -24,8 +24,16 @@ spctl --assess --type execute --verbose dist/Morpheus.app
 
 Signing identity and notarization credentials belong in the release environment, not this repository. Run microphone, camera, and screen capture permission flows on the **signed package**; unsigned developer runs do not validate those flows.
 
+## Updates and private betas
+
+The updater is not integrated yet. Cargo Packager's default formats currently produce a macOS `.app` and `.dmg`, a Windows NSIS installer, and Linux `.deb`, AppImage, and Pacman packages. `cargo-packager-updater` supports installing signed updates into a macOS `.app`, a Windows NSIS installer (or WiX if packaged), and a Linux AppImage. The macOS updater needs an `.app` update bundle even when the installed app originally came from a DMG; a DMG is not an updater payload. Debian and Pacman installations should use their package managers. On Linux, enable self-update only when running from a writable AppImage.
+
+An updater release needs an HTTPS feed returning `204 No Content` or a `200 OK` JSON response with a newer semantic version, artifact URL, exact artifact signature, and supported format. The app verifies that signature with an embedded public key; the signing private key stays in the release environment. This signature is separate from macOS notarization and Windows code signing. Test the actual installed upgrade, bad signature, interrupted download, failed install, and recovery path on each supported platform before enabling it.
+
+Assets in this private GitHub repository require authorized access. Do not embed a repository token in the app. Distribute pre-release packages manually to authorized testers through restricted GitHub releases or Actions artifacts, or provide a private update service with per-user authorization for both the feed and downloads. Keep automatic updates disabled until that service and the signing flow are verified.
+
 ## Platform acceptance
 
 Build and install on macOS Apple Silicon and Intel, Windows x64, and Linux x64 under both Wayland and X11. Check install, launch, update, uninstall, credential storage, and native call devices on each system. The updater and signed release pipeline have not been implemented or validated yet.
 
-Cargo Packager configuration: <https://docs.crabnebula.dev/packager/configuration/>. Apple permission and hardened-runtime requirements: <https://developer.apple.com/documentation/xcode/configuring-the-hardened-runtime>, <https://developer.apple.com/documentation/screencapturekit>.
+Cargo Packager configuration and updater: <https://docs.crabnebula.dev/packager/configuration/>, <https://docs.crabnebula.dev/packager/updater/>. Apple permission and hardened-runtime requirements: <https://developer.apple.com/documentation/xcode/configuring-the-hardened-runtime>, <https://developer.apple.com/documentation/screencapturekit>.

@@ -18,6 +18,13 @@ use tokio::{sync::Mutex, task::JoinHandle};
 
 use crate::{AccountItem, AccountOption, AppWindow, MemberItem, MessageItem, RoomItem, SpaceItem};
 
+pub enum MessageTarget {
+    Room,
+    Reply(String),
+    Edit(String),
+    Thread(String),
+}
+
 pub struct LiveUi {
     pub manager: Arc<AccountManager>,
     pub is_live: Arc<AtomicBool>,
@@ -26,6 +33,8 @@ pub struct LiveUi {
     render_epoch: Arc<AtomicU64>,
     feed: Mutex<Option<JoinHandle<()>>>,
     feed_key: Mutex<Option<(String, String)>>,
+    thread_feed: Mutex<Option<JoinHandle<()>>>,
+    thread_generation: Arc<AtomicU64>,
     selected_room: Mutex<Option<String>>,
     selected_space: Mutex<Option<String>>,
     space_children: Mutex<HashMap<String, HashSet<String>>>,
@@ -44,6 +53,8 @@ impl LiveUi {
             render_epoch: Arc::new(AtomicU64::new(0)),
             feed: Mutex::new(None),
             feed_key: Mutex::new(None),
+            thread_feed: Mutex::new(None),
+            thread_generation: Arc::new(AtomicU64::new(0)),
             selected_room: Mutex::new(None),
             selected_space: Mutex::new(None),
             space_children: Mutex::new(HashMap::new()),
@@ -345,6 +356,14 @@ impl LiveUi {
     }
 
     pub async fn open_room(self: &Arc<Self>, room_id: String, ui: Weak<AppWindow>) {
+        if self.selected_room.lock().await.as_deref() != Some(room_id.as_str()) {
+            self.clear_thread().await;
+            let _ = ui.upgrade_in_event_loop(|ui| {
+                ui.set_thread_root_id("".into());
+                ui.set_thread_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new())));
+                ui.set_thread_composer_text("".into());
+            });
+        }
         *self.selected_room.lock().await = Some(room_id.clone());
         let account_id = match self.manager.active_account().await {
             Some(account) => account.id,
@@ -408,6 +427,108 @@ impl LiveUi {
             task.abort();
         }
         *self.feed_key.lock().await = None;
+        self.clear_thread().await;
+    }
+
+    pub async fn open_thread(
+        self: &Arc<Self>,
+        account_id: String,
+        room_id: String,
+        root_event_id: String,
+        generation: u64,
+        ui: Weak<AppWindow>,
+    ) -> Result<(), MatrixCoreError> {
+        if self.thread_generation.load(Ordering::Acquire) != generation {
+            return Ok(());
+        }
+        self.require_selected_room(&room_id).await?;
+        {
+            let mut feed = self.thread_feed.lock().await;
+            if self.thread_generation.load(Ordering::Acquire) != generation {
+                return Ok(());
+            }
+            if let Some(previous) = feed.take() {
+                previous.abort();
+            }
+        }
+        let feed = self
+            .manager
+            .thread_message_feed_for(&account_id, &room_id, &root_event_id)
+            .await?;
+        if self.thread_generation.load(Ordering::Acquire) != generation {
+            return Ok(());
+        }
+        let mut updates = feed.subscribe();
+        let current_generation = self.thread_generation.clone();
+        let is_live = self.is_live.clone();
+        let handle = tokio::spawn(async move {
+            let _feed = feed;
+            loop {
+                let messages = updates.borrow_and_update().clone();
+                let ui_for_update = ui.clone();
+                let current_generation = current_generation.clone();
+                let is_live = is_live.clone();
+                let account_id = account_id.clone();
+                let room_id = room_id.clone();
+                let root_event_id = root_event_id.clone();
+                let _ = ui_for_update.upgrade_in_event_loop(move |ui| {
+                    if is_live.load(Ordering::Acquire)
+                        && current_generation.load(Ordering::Acquire) == generation
+                        && ui.get_active_account_local_id().as_str() == account_id
+                        && ui.get_active_room_id().as_str() == room_id
+                        && ui.get_thread_root_id().as_str() == root_event_id
+                    {
+                        ui.set_thread_messages(ModelRc::new(VecModel::from(
+                            messages
+                                .iter()
+                                .filter(|message| {
+                                    message.event_id.as_deref() != Some(root_event_id.as_str())
+                                })
+                                .map(message_item)
+                                .collect::<Vec<_>>(),
+                        )));
+                    }
+                });
+                if updates.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut current = self.thread_feed.lock().await;
+        if self.thread_generation.load(Ordering::Acquire) == generation {
+            *current = Some(handle);
+        } else {
+            handle.abort();
+        }
+        Ok(())
+    }
+
+    pub fn begin_thread_request(&self) -> u64 {
+        self.thread_generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    pub async fn clear_thread(&self) {
+        let generation = self.begin_thread_request();
+        self.clear_thread_if_current(generation).await;
+    }
+
+    pub async fn clear_thread_if_current(&self, generation: u64) {
+        let mut feed = self.thread_feed.lock().await;
+        if self.thread_generation.load(Ordering::Acquire) == generation {
+            if let Some(task) = feed.take() {
+                task.abort();
+            }
+        }
+    }
+
+    async fn require_selected_room(&self, room_id: &str) -> Result<(), MatrixCoreError> {
+        if !self.is_live.load(Ordering::Acquire) {
+            return Err(MatrixCoreError::NoActiveAccount);
+        }
+        if self.selected_room.lock().await.as_deref() != Some(room_id) {
+            return Err(MatrixCoreError::SelectedRoomChanged);
+        }
+        Ok(())
     }
 
     pub async fn send(
@@ -415,15 +536,43 @@ impl LiveUi {
         account_id: String,
         room_id: String,
         body: String,
+        target: MessageTarget,
     ) -> Result<(), MatrixCoreError> {
-        if !self.is_live.load(Ordering::Acquire) {
-            return Err(MatrixCoreError::NoActiveAccount);
+        self.require_selected_room(&room_id).await?;
+        match target {
+            MessageTarget::Room => {
+                self.manager
+                    .send_text_for(&account_id, &room_id, body)
+                    .await
+            }
+            MessageTarget::Reply(event_id) => {
+                self.manager
+                    .send_reply_for(&account_id, &room_id, &event_id, body)
+                    .await
+            }
+            MessageTarget::Edit(event_id) => {
+                self.manager
+                    .edit_text_for(&account_id, &room_id, &event_id, body)
+                    .await
+            }
+            MessageTarget::Thread(root_event_id) => {
+                self.manager
+                    .send_thread_text_for(&account_id, &room_id, &root_event_id, body)
+                    .await
+            }
         }
-        if self.selected_room.lock().await.as_deref() != Some(room_id.as_str()) {
-            return Err(MatrixCoreError::SelectedRoomChanged);
-        }
+    }
+
+    pub async fn toggle_reaction(
+        &self,
+        account_id: String,
+        room_id: String,
+        event_id: String,
+        reaction: String,
+    ) -> Result<bool, MatrixCoreError> {
+        self.require_selected_room(&room_id).await?;
         self.manager
-            .send_text_for(&account_id, &room_id, body)
+            .toggle_reaction_for(&account_id, &room_id, &event_id, &reaction)
             .await
     }
 
@@ -552,10 +701,19 @@ impl DraftStore {
 
 fn apply_snapshot(ui: &AppWindow, view: Snapshot, drafts: &DraftStore) {
     let next_room_id = view.selected.as_deref().unwrap_or("");
-    if ui.get_active_account_local_id().as_str() != view.active.id
-        || ui.get_active_room_id().as_str() != next_room_id
-    {
+    let selection_changed = ui.get_active_account_local_id().as_str() != view.active.id
+        || ui.get_active_room_id().as_str() != next_room_id;
+    if selection_changed {
         ui.set_composer_text(drafts.get(&view.active.id, next_room_id).into());
+        ui.set_composer_mode(0);
+        ui.set_composer_target_id("".into());
+        ui.set_composer_target_label("".into());
+        ui.set_composer_saved_draft("".into());
+        ui.set_composer_busy(false);
+        ui.set_composer_operation(ui.get_composer_operation().wrapping_add(1));
+        ui.set_thread_root_id("".into());
+        ui.set_thread_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new())));
+        ui.set_thread_composer_text("".into());
     }
     let active_index = view
         .accounts
@@ -622,25 +780,26 @@ fn apply_snapshot(ui: &AppWindow, view: Snapshot, drafts: &DraftStore) {
             room.is_direct || !view.all_space_children.contains(&room.room_id)
         }
     };
-    ui.set_channels(ModelRc::new(VecModel::from(
+    ui.set_unsorted_channels(ModelRc::new(VecModel::from(
         view.rooms
             .iter()
             .filter(|room| !room.is_direct && visible(room))
             .map(room_item)
             .collect::<Vec<_>>(),
     )));
-    ui.set_direct_messages(ModelRc::new(VecModel::from(
+    ui.set_unsorted_direct_messages(ModelRc::new(VecModel::from(
         view.rooms
             .iter()
             .filter(|room| room.is_direct && visible(room))
             .map(room_item)
             .collect::<Vec<_>>(),
     )));
+    crate::apply_room_sort(ui);
     ui.set_members(ModelRc::new(VecModel::<MemberItem>::from(Vec::new())));
     ui.set_stress_timeline_active(false);
     if let Some(room_id) = view.selected {
         if let Some(room) = view.rooms.iter().find(|room| room.room_id == room_id) {
-            if ui.get_active_room_id().as_str() != room_id {
+            if selection_changed {
                 ui.set_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new())));
             }
             ui.set_active_room_id(room.room_id.as_str().into());
@@ -697,13 +856,15 @@ fn message_item(info: &MessageInfo) -> MessageItem {
             .unwrap_or_default(),
     };
     MessageItem {
+        event_id: info.event_id.as_deref().unwrap_or("").into(),
+        is_own: info.is_own,
         sender: sender.into(),
         initials: sender_initials.into(),
         time: time.into(),
         body: info.body.as_str().into(),
-        reply_to: SharedString::default(),
+        reply_to: info.reply_preview.as_deref().unwrap_or("").into(),
         attachment: SharedString::default(),
-        reaction: SharedString::default(),
+        reaction: info.reaction_summary.as_str().into(),
         accent: accent(&info.sender),
     }
 }

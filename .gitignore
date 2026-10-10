@@ -10,3 +10,5 @@
 /dist/
 /release/
 /assets/icon.iconset/
+__pycache__/
+*.pyc

@@ -4396,6 +4396,7 @@ version = "0.38.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
 dependencies = [
+ "cc",
  "pkg-config",
  "vcpkg",
 ]
@@ -5420,6 +5421,7 @@ dependencies = [
  "eyeball-im",
  "futures-util",
  "keyring",
+ "libsqlite3-sys",
  "matrix-sdk",
  "matrix-sdk-ui",
  "serde",
@@ -5442,8 +5444,10 @@ dependencies = [
  "matrix-rtc-core",
  "matrix-rtc-transport",
  "matrix-sdk",
+ "morpheus-matrix",
  "nokhwa",
  "rustls",
+ "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",

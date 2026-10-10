@@ -26,6 +26,9 @@ keyring = { version = "=3.6.3", default-features = false, features = ["apple-nat
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "=3.6.3", default-features = false, features = ["windows-native"] }
+# Matrix's SQLite dependency otherwise links against a system sqlite3.lib,
+# which is not provided by the standard Windows runner or a clean desktop.
+libsqlite3-sys = { version = "=0.38.2", features = ["bundled-windows"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "=3.6.3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }

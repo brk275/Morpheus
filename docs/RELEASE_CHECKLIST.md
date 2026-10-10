@@ -43,8 +43,27 @@ The preview shell and unit tests alone do not satisfy this gate.
 | Linux x64 X11 | [ ] | [ ] | Orca [ ] | [ ] |
 | Linux x64 Wayland | [ ] | [ ] | Orca [ ] | [ ] |
 
+## Update and distribution gate
+
+- [ ] Produce signed updater artifacts and a versioned HTTPS feed with the exact
+      signature and URL for each target. Reject an invalid signature and an
+      unsupported format before installation.
+- [ ] Keep in-app updates specific to installed macOS `.app`, Windows NSIS,
+      and Linux AppImage builds. Serve an `.app` update bundle for macOS,
+      including apps originally installed from a DMG. Give `.deb` and Pacman
+      users a package-manager update path.
+- [ ] For private beta packages, restrict both feed and asset access without
+      embedding a GitHub repository token in Morpheus. Keep automatic updates
+      disabled until access and signing are verified.
+- [ ] Give private beta recipients the Corresponding Source required by the
+      [AGPL](https://www.gnu.org/licenses/agpl-3.0.html) for distributed builds,
+      even while the GitHub repository remains private.
+- [ ] Test upgrades from installed older builds, failed or interrupted updates,
+      recovery or rollback, retained account data, and update behavior during
+      a call on every applicable platform.
+
 Before public release, sign the binaries, notarize macOS packages, verify
-signed updater metadata and rollback behavior, inspect bundled dependency
+update signatures and recovery behavior, inspect bundled dependency
 licenses, publish the AGPL source and notices, and document the homeserver
 MatrixRTC service requirement. Keep signing keys and updater private keys out
 of the repository and CI logs.

@@ -30,7 +30,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             libasound2-dev libclang-dev libdbus-1-dev libegl-dev \
-            libfontconfig1-dev libpipewire-0.3-dev libssl-dev libudev-dev \
+            libfontconfig1-dev libgbm-dev libglib2.0-dev libpipewire-0.3-dev libssl-dev libudev-dev \
             libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev \
             libxkbcommon-dev libxkbcommon-x11-dev libxrandr-dev pkg-config
@@ -49,3 +49,6 @@ jobs:
         run: cargo check --locked -p morpheus-app -p morpheus-matrix
       - name: Build desktop with native call and device adapters
         run: cargo build --locked -p morpheus-app --features native-calls
+      - name: Test native audio mixer
+        if: matrix.os == 'macos-15'
+        run: cargo test --locked -p morpheus-rtc --features native-devices --lib audio_device::tests

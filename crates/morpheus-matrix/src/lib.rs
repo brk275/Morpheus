@@ -21,7 +21,7 @@ use matrix_sdk::{
     authentication::matrix::MatrixSession,
     config::SyncSettings,
     encryption::{
-        VerificationState,
+        BackupDownloadStrategy, EncryptionSettings, VerificationState,
         backups::BackupState,
         recovery::RecoveryState,
         verification::{SasVerification, VerificationRequest},
@@ -46,7 +46,8 @@ use matrix_sdk::{
 };
 use matrix_sdk_ui::sync_service::{Error as ServiceError, State as ServiceState, SyncService};
 use matrix_sdk_ui::timeline::{
-    EventSendState, RoomExt, Timeline, TimelineEventItemId, TimelineFocus, TimelineItem,
+    EventSendState, RoomExt, Timeline, TimelineDetails, TimelineEventItemId, TimelineFocus,
+    TimelineItem,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -164,6 +165,16 @@ pub enum SyncBackend {
     Classic,
 }
 
+/// Select the sync adapter for an account manager. `ClassicOnly` is useful
+/// when diagnosing a homeserver's sliding-sync implementation and for
+/// exercising the fallback path against a modern test server.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SyncPolicy {
+    #[default]
+    Auto,
+    ClassicOnly,
+}
+
 /// Plain data for a native UI. Non-message timeline entries are omitted.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageInfo {
@@ -171,6 +182,8 @@ pub struct MessageInfo {
     pub event_id: Option<String>,
     pub sender: String,
     pub body: String,
+    pub reply_preview: Option<String>,
+    pub reaction_summary: String,
     pub timestamp_ms: u64,
     pub is_own: bool,
     pub is_local_echo: bool,
@@ -415,6 +428,7 @@ struct SyncTask {
 /// without losing access to the account picker.
 pub struct AccountManager {
     data_dir: PathBuf,
+    sync_policy: SyncPolicy,
     state: Mutex<State>,
     active_tx: watch::Sender<Option<AccountInfo>>,
     sync_tx: watch::Sender<SyncStatus>,
@@ -422,6 +436,13 @@ pub struct AccountManager {
 
 impl AccountManager {
     pub fn open(data_dir: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_with_sync_policy(data_dir, SyncPolicy::Auto)
+    }
+
+    pub fn open_with_sync_policy(
+        data_dir: impl Into<PathBuf>,
+        sync_policy: SyncPolicy,
+    ) -> Result<Self> {
         let data_dir = data_dir.into();
         fs::create_dir_all(data_dir.join("accounts"))?;
         let registry_path = data_dir.join("accounts.json");
@@ -435,6 +456,7 @@ impl AccountManager {
         let (sync_tx, _) = watch::channel(SyncStatus::Stopped);
         Ok(Self {
             data_dir,
+            sync_policy,
             state: Mutex::new(State {
                 registry,
                 loaded: HashMap::new(),
@@ -983,25 +1005,99 @@ impl AccountManager {
             .get(&account_id)
             .ok_or(MatrixCoreError::NoActiveAccount)?;
         let timeline = loaded.timeline(room_id).await?;
-        let (items, mut stream) = timeline.subscribe().await;
-        let mut mapped: Vector<Option<MessageInfo>> =
-            items.iter().map(|item| message_info(item)).collect();
-        let initial = mapped.iter().filter_map(Clone::clone).collect();
-        let (updates, receiver) = watch::channel(initial);
-        let task = tokio::spawn(async move {
-            while let Some(diffs) = stream.next().await {
-                for diff in diffs {
-                    diff.map(|item| message_info(&item)).apply(&mut mapped);
-                }
-                updates.send_replace(mapped.iter().filter_map(Clone::clone).collect());
-            }
-        });
-        Ok(MessageFeed {
-            account_id,
-            room_id: room_id.into(),
-            updates: receiver,
-            task,
-        })
+        Ok(message_feed_from_timeline(account_id, room_id, timeline).await)
+    }
+
+    /// A native UI friendly stream of the root and replies in one thread.
+    /// Both account and room are checked before the subscriber is created.
+    pub async fn thread_message_feed_for(
+        &self,
+        expected_account_id: &str,
+        room_id: &str,
+        root_event_id: &str,
+    ) -> Result<MessageFeed> {
+        let state = self.state.lock().await;
+        let loaded = selected_loaded_for(&state, expected_account_id)?;
+        let timeline = loaded.thread_timeline(room_id, root_event_id).await?;
+        Ok(message_feed_from_timeline(expected_account_id.to_owned(), room_id, timeline).await)
+    }
+
+    /// Queue a reply only for the account the user saw when composing it.
+    pub async fn send_reply_for(
+        &self,
+        expected_account_id: &str,
+        room_id: &str,
+        reply_to: &str,
+        body: impl Into<String>,
+    ) -> Result<()> {
+        let state = self.state.lock().await;
+        let loaded = selected_loaded_for(&state, expected_account_id)?;
+        let timeline = loaded.timeline(room_id).await?;
+        let event_id = parse_event_id(reply_to)?;
+        timeline
+            .send_reply(
+                RoomMessageEventContentWithoutRelation::text_plain(body.into()),
+                event_id,
+            )
+            .await
+            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn send_thread_text_for(
+        &self,
+        expected_account_id: &str,
+        room_id: &str,
+        root_event_id: &str,
+        body: impl Into<String>,
+    ) -> Result<()> {
+        let state = self.state.lock().await;
+        let loaded = selected_loaded_for(&state, expected_account_id)?;
+        let timeline = loaded.thread_timeline(room_id, root_event_id).await?;
+        timeline
+            .send(RoomMessageEventContent::text_plain(body.into()).into())
+            .await
+            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn edit_text_for(
+        &self,
+        expected_account_id: &str,
+        room_id: &str,
+        event_id: &str,
+        body: impl Into<String>,
+    ) -> Result<()> {
+        let state = self.state.lock().await;
+        let loaded = selected_loaded_for(&state, expected_account_id)?;
+        let timeline = loaded.timeline(room_id).await?;
+        let item_id = TimelineEventItemId::EventId(parse_event_id(event_id)?);
+        timeline
+            .edit(
+                &item_id,
+                EditedContent::RoomMessage(RoomMessageEventContentWithoutRelation::text_plain(
+                    body.into(),
+                )),
+            )
+            .await
+            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
+    }
+
+    pub async fn toggle_reaction_for(
+        &self,
+        expected_account_id: &str,
+        room_id: &str,
+        event_id: &str,
+        reaction: &str,
+    ) -> Result<bool> {
+        let state = self.state.lock().await;
+        let loaded = selected_loaded_for(&state, expected_account_id)?;
+        let timeline = loaded.timeline(room_id).await?;
+        let item_id = TimelineEventItemId::EventId(parse_event_id(event_id)?);
+        timeline
+            .toggle_reaction(&item_id, reaction)
+            .await
+            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
     }
 
     /// Queue a plain text message in the selected room. Observe the timeline
@@ -1595,12 +1691,15 @@ impl AccountManager {
     }
 
     fn start_sync(&self, state: &mut State, client: Client) {
+        let sync_policy = self.sync_policy;
         self.sync_tx.send_replace(SyncStatus::Starting);
         let status = self.sync_tx.clone();
         let (shutdown, receiver) = oneshot::channel();
         state.sync_task = Some(SyncTask {
             shutdown,
-            task: tokio::spawn(async move { run_sync(client, status, receiver).await }),
+            task: tokio::spawn(
+                async move { run_sync(client, status, receiver, sync_policy).await },
+            ),
         });
     }
 
@@ -1732,7 +1831,11 @@ impl LoadedAccount {
             .get_room(&id)
             .ok_or_else(|| MatrixCoreError::RoomNotFound(room_id.into()))?;
         let timeline = Arc::new(
-            room.timeline()
+            room.timeline_builder()
+                .with_focus(TimelineFocus::Live {
+                    hide_threaded_events: true,
+                })
+                .build()
                 .await
                 .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?,
         );
@@ -1765,6 +1868,42 @@ impl LoadedAccount {
         timelines.insert(key, timeline.clone());
         Ok(timeline)
     }
+}
+
+async fn message_feed_from_timeline(
+    account_id: String,
+    room_id: &str,
+    timeline: Arc<Timeline>,
+) -> MessageFeed {
+    let (items, mut stream) = timeline.subscribe().await;
+    let mut mapped: Vector<Option<MessageInfo>> =
+        items.iter().map(|item| message_info(item)).collect();
+    let initial = mapped.iter().filter_map(Clone::clone).collect();
+    let (updates, receiver) = watch::channel(initial);
+    let task = tokio::spawn(async move {
+        while let Some(diffs) = stream.next().await {
+            for diff in diffs {
+                diff.map(|item| message_info(&item)).apply(&mut mapped);
+            }
+            updates.send_replace(mapped.iter().filter_map(Clone::clone).collect());
+        }
+    });
+    MessageFeed {
+        account_id,
+        room_id: room_id.into(),
+        updates: receiver,
+        task,
+    }
+}
+
+fn selected_loaded_for<'a>(
+    state: &'a State,
+    expected_account_id: &str,
+) -> Result<&'a Arc<LoadedAccount>> {
+    if state.registry.active_account_id.as_deref() != Some(expected_account_id) {
+        return Err(MatrixCoreError::SelectedAccountChanged);
+    }
+    selected_loaded(state)
 }
 
 fn selected_loaded(state: &State) -> Result<&Arc<LoadedAccount>> {
@@ -1847,6 +1986,29 @@ async fn room_info(room: &Room) -> RoomInfo {
 fn message_info(item: &TimelineItem) -> Option<MessageInfo> {
     let event = item.as_event()?;
     let message = event.content().as_message()?;
+    let reply_preview =
+        event
+            .content()
+            .in_reply_to()
+            .as_ref()
+            .map(|details| match &details.event {
+                TimelineDetails::Ready(replied_to) => {
+                    let sender = replied_to
+                        .sender
+                        .as_str()
+                        .trim_start_matches('@')
+                        .split(':')
+                        .next()
+                        .unwrap_or("someone");
+                    let body = replied_to
+                        .content
+                        .as_message()
+                        .map(|message| message.body().lines().next().unwrap_or("message"))
+                        .unwrap_or("message");
+                    format!("{sender}: {}", body.chars().take(72).collect::<String>())
+                }
+                _ => format!("message {}", details.event_id),
+            });
     let send_state = match event.send_state() {
         Some(EventSendState::NotSentYet { .. }) => MessageSendState::Pending,
         Some(EventSendState::SendingFailed { .. }) => MessageSendState::Failed,
@@ -1857,6 +2019,14 @@ fn message_info(item: &TimelineItem) -> Option<MessageInfo> {
         event_id: event.event_id().map(ToString::to_string),
         sender: event.sender().to_string(),
         body: message.body().to_owned(),
+        reply_preview,
+        reaction_summary: event
+            .reactions()
+            .iter()
+            .take(3)
+            .map(|(key, senders)| format!("{key} {}", senders.len()))
+            .collect::<Vec<_>>()
+            .join("   "),
         timestamp_ms: event.timestamp().get().into(),
         is_own: event.is_own(),
         is_local_echo: event.is_local_echo(),
@@ -1898,6 +2068,11 @@ async fn build_client(homeserver: &str, store_path: &Path, passphrase: &str) -> 
     Client::builder()
         .homeserver_url(homeserver)
         .sqlite_store(store_path, Some(passphrase))
+        // Fetch only missing room keys after recovery, avoiding a full-account backup download.
+        .with_encryption_settings(EncryptionSettings {
+            backup_download_strategy: BackupDownloadStrategy::AfterDecryptionFailure,
+            ..Default::default()
+        })
         .handle_refresh_tokens()
         .build()
         .await
@@ -1915,34 +2090,39 @@ async fn run_sync(
     client: Client,
     status: watch::Sender<SyncStatus>,
     mut shutdown: oneshot::Receiver<()>,
+    sync_policy: SyncPolicy,
 ) {
     // Sliding Sync is the source of room sticky events used by native
     // MatrixRTC. The UI crate's unstable-msc4354 feature configures that
     // extension. Older homeservers can still use classic /sync for chat.
     let mut retry_seconds = 2;
-    let supports_sliding = loop {
-        let versions = tokio::select! {
-            _ = &mut shutdown => {
-                status.send_replace(SyncStatus::Stopped);
-                return;
-            }
-            result = client.supported_versions() => result,
-        };
-        match versions {
-            Ok(versions) => break versions.features.contains(&FeatureFlag::Msc4186),
-            Err(e) => {
-                status.send_replace(SyncStatus::Retrying {
-                    after_seconds: retry_seconds,
-                    reason: e.to_string(),
-                });
-                tokio::select! {
-                    _ = &mut shutdown => {
-                        status.send_replace(SyncStatus::Stopped);
-                        return;
-                    }
-                    _ = tokio::time::sleep(Duration::from_secs(retry_seconds)) => {},
+    let supports_sliding = if sync_policy == SyncPolicy::ClassicOnly {
+        false
+    } else {
+        loop {
+            let versions = tokio::select! {
+                _ = &mut shutdown => {
+                    status.send_replace(SyncStatus::Stopped);
+                    return;
                 }
-                retry_seconds = (retry_seconds * 2).min(60);
+                result = client.supported_versions() => result,
+            };
+            match versions {
+                Ok(versions) => break versions.features.contains(&FeatureFlag::Msc4186),
+                Err(e) => {
+                    status.send_replace(SyncStatus::Retrying {
+                        after_seconds: retry_seconds,
+                        reason: e.to_string(),
+                    });
+                    tokio::select! {
+                        _ = &mut shutdown => {
+                            status.send_replace(SyncStatus::Stopped);
+                            return;
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(retry_seconds)) => {},
+                    }
+                    retry_seconds = (retry_seconds * 2).min(60);
+                }
             }
         }
     };
@@ -2188,14 +2368,22 @@ async fn save_secret(id: &str, secret: StoredSecret) -> Result<()> {
 
 async fn load_secret(id: &str) -> Result<StoredSecret> {
     let id = id.to_owned();
-    let payload = tokio::task::spawn_blocking(move || {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, &id)
-            .map_err(|e| MatrixCoreError::Keyring(e.to_string()))?;
-        entry
-            .get_password()
-            .map_err(|e| MatrixCoreError::Keyring(e.to_string()))
-    })
+    let payload = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || {
+            let entry = keyring::Entry::new(KEYRING_SERVICE, &id)
+                .map_err(|e| MatrixCoreError::Keyring(e.to_string()))?;
+            entry
+                .get_password()
+                .map_err(|e| MatrixCoreError::Keyring(e.to_string()))
+        }),
+    )
     .await
+    .map_err(|_| {
+        MatrixCoreError::Keyring(
+            "OS credential vault did not respond within 30 seconds; check its unlock or access prompt, then restart Morpheus and sign in again".into(),
+        )
+    })?
     .map_err(|e| MatrixCoreError::Keyring(e.to_string()))??;
     serde_json::from_str(&payload).map_err(Into::into)
 }

@@ -7,19 +7,20 @@ mod live;
 mod sso;
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, atomic::Ordering};
 use std::thread;
 use std::time::Duration;
 
 use directories::ProjectDirs;
-use morpheus_config::{Config, ConfigStore, LoadedConfig, ThemeMode, ThemePack};
+use morpheus_config::{Config, ConfigStore, Density, LoadedConfig, ThemeMode, ThemePack};
 use morpheus_matrix::AccountManager;
-use slint::{Color, ModelRc, SharedString, VecModel};
+use slint::{Color, Model, ModelRc, SharedString, VecModel};
 
 #[cfg(feature = "native-calls")]
 use crate::calls::{CallController, CallStatus};
-use crate::live::{LiveUi, show_error};
+use crate::live::{LiveUi, MessageTarget, show_error};
 
 slint::include_modules!();
 
@@ -43,6 +44,7 @@ struct PreviewState {
     active_account: usize,
     active_room: String,
     stress_backup: Option<Vec<MessageItem>>,
+    thread_replies: HashMap<(usize, String, String), Vec<MessageItem>>,
 }
 
 fn rgb(red: u8, green: u8, blue: u8) -> Color {
@@ -90,6 +92,8 @@ fn message(
     accent: Color,
 ) -> MessageItem {
     MessageItem {
+        event_id: SharedString::default(),
+        is_own: false,
         sender: sender.into(),
         initials: initials.into(),
         time: time.into(),
@@ -508,10 +512,25 @@ fn fixtures() -> PreviewState {
         active_account: 0,
         active_room: "#general".to_owned(),
         stress_backup: None,
+        thread_replies: HashMap::new(),
     }
 }
 
 fn apply_state(ui: &AppWindow, state: &PreviewState) {
+    if ui.get_live_session()
+        || ui.get_active_account_index() != state.active_account as i32
+        || ui.get_active_room_id().as_str() != state.active_room
+    {
+        ui.set_composer_mode(0);
+        ui.set_composer_target_id("".into());
+        ui.set_composer_target_label("".into());
+        ui.set_composer_saved_draft("".into());
+        ui.set_composer_busy(false);
+        ui.set_composer_operation(ui.get_composer_operation().wrapping_add(1));
+        ui.set_thread_root_id("".into());
+        ui.set_thread_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new())));
+        ui.set_thread_composer_text("".into());
+    }
     ui.set_live_session(false);
     ui.set_stress_timeline_active(state.stress_backup.is_some());
     let account = &state.accounts[state.active_account];
@@ -543,20 +562,21 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
     ui.set_active_account_initials(account.item.initials.clone());
     ui.set_active_account_status(account.item.status.clone());
     ui.set_active_account_accent(account.item.accent);
-    ui.set_channels(ModelRc::new(VecModel::from(
+    ui.set_unsorted_channels(ModelRc::new(VecModel::from(
         account
             .channels
             .iter()
             .map(|r| r.item.clone())
             .collect::<Vec<_>>(),
     )));
-    ui.set_direct_messages(ModelRc::new(VecModel::from(
+    ui.set_unsorted_direct_messages(ModelRc::new(VecModel::from(
         account
             .directs
             .iter()
             .map(|r| r.item.clone())
             .collect::<Vec<_>>(),
     )));
+    apply_room_sort(ui);
     ui.set_members(ModelRc::new(VecModel::from(account.members.clone())));
 
     if state.active_room == "#discover" {
@@ -586,7 +606,51 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
         ui.set_active_room_id(room.item.id.clone());
         ui.set_active_room_name(room.item.name.clone());
         ui.set_active_room_topic(room.topic.clone());
-        ui.set_messages(ModelRc::new(VecModel::from(room.messages.clone())));
+        ui.set_messages(ModelRc::new(VecModel::from(
+            room.messages
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, mut item)| {
+                    item.event_id = format!("preview:{index}").into();
+                    item.is_own = item.sender == account.item.name;
+                    item
+                })
+                .collect::<Vec<_>>(),
+        )));
+    }
+}
+
+fn preview_event_index(event_id: &str) -> Option<usize> {
+    event_id.strip_prefix("preview:")?.parse().ok()
+}
+
+fn finish_composer_submission(
+    ui: &AppWindow,
+    operation: i32,
+    mode: i32,
+    target_id: &str,
+    submitted: &str,
+    saved_draft: &str,
+) {
+    if ui.get_composer_operation() != operation {
+        return;
+    }
+    ui.set_composer_busy(false);
+    if ui.get_composer_mode() != mode
+        || ui.get_composer_target_id().as_str() != target_id
+        || ui.get_composer_text().as_str() != submitted
+    {
+        return;
+    }
+    if mode == 0 {
+        ui.set_composer_text("".into());
+    } else {
+        ui.set_composer_mode(0);
+        ui.set_composer_target_id("".into());
+        ui.set_composer_target_label("".into());
+        ui.set_composer_saved_draft("".into());
+        ui.set_composer_text(saved_draft.into());
     }
 }
 
@@ -643,6 +707,18 @@ fn color_from_hex(value: &str) -> Color {
     Color::from_rgb_u8((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
 }
 
+fn apply_room_sort(ui: &AppWindow) {
+    let sort_unread_first = ui.get_sort_unread_first();
+    let mut channels = ui.get_unsorted_channels().iter().collect::<Vec<_>>();
+    let mut direct_messages = ui.get_unsorted_direct_messages().iter().collect::<Vec<_>>();
+    if sort_unread_first {
+        channels.sort_by_key(|room| room.unread == 0);
+        direct_messages.sort_by_key(|room| room.unread == 0);
+    }
+    ui.set_channels(ModelRc::new(VecModel::from(channels)));
+    ui.set_direct_messages(ModelRc::new(VecModel::from(direct_messages)));
+}
+
 fn apply_config(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
     let mode = match config.appearance.theme {
         ThemeMode::Dark => 0,
@@ -651,6 +727,14 @@ fn apply_config(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
         ThemeMode::System => 3,
     };
     ui.set_theme_mode(mode);
+    ui.set_font_scale_percent(config.appearance.scale_percent.into());
+    ui.set_density_mode(match config.appearance.density {
+        Density::Compact => 0,
+        Density::Comfortable => 1,
+        Density::Spacious => 2,
+    });
+    ui.set_sort_unread_first(config.layout.sort_unread_first);
+    apply_room_sort(ui);
     ui.set_room_list_width(config.layout.room_list_width.into());
     ui.set_details_width(config.layout.details_width.into());
     ui.set_show_side_panel(config.layout.show_member_panel);
@@ -708,7 +792,35 @@ fn call_status_label(status: &CallStatus) -> String {
         CallStatus::Starting { .. } => "Joining MatrixRTC audio…".into(),
         CallStatus::Joined { .. } => "Connected · native microphone and speaker".into(),
         CallStatus::Ending { .. } => "Leaving call…".into(),
+        CallStatus::CleanupFailed { reason, .. } => {
+            format!("Could not confirm call leave: {reason}. Confirm Leave again to continue.")
+        }
         CallStatus::Failed { reason, .. } => format!("Call failed: {reason}"),
+    }
+}
+
+#[cfg(feature = "native-calls")]
+fn ask_to_leave_call(ui: &slint::Weak<AppWindow>, calls: &CallController, action: i32) -> bool {
+    if !calls.status().blocks_account_switch() {
+        return false;
+    }
+    if let Some(ui) = ui.upgrade() {
+        ui.set_pending_account_index(action);
+        ui.set_leave_call_dialog(true);
+    }
+    true
+}
+
+fn continue_account_action(ui: &AppWindow, action: i32) {
+    ui.set_leave_call_busy(false);
+    ui.set_leave_call_dialog(false);
+    ui.set_pending_account_index(-1);
+    ui.set_account_menu_open(false);
+    match action {
+        -2 => ui.invoke_add_account(),
+        -3 => ui.invoke_log_out(),
+        index if index >= 0 => ui.invoke_switch_account(index),
+        _ => {}
     }
 }
 
@@ -861,6 +973,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let switch_calls = calls.clone();
     ui.on_switch_account(move |index| {
         if switch_live.is_live.load(Ordering::Acquire) {
+            #[cfg(feature = "native-calls")]
+            if ask_to_leave_call(&weak, &switch_calls, index) {
+                return;
+            }
             if let Ok(index) = usize::try_from(index) {
                 switch_live.invalidate_navigation();
                 let live = switch_live.clone();
@@ -869,8 +985,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let calls = switch_calls.clone();
                 switch_handle.spawn(async move {
                     #[cfg(feature = "native-calls")]
-                    if let Err(error) = calls.end_call().await {
-                        show_error(&ui, error.to_string());
+                    if calls.status().blocks_account_switch() {
+                        let _ = ui.upgrade_in_event_loop(move |window| {
+                            window.set_pending_account_index(index as i32);
+                            window.set_leave_call_dialog(true);
+                        });
                         return;
                     }
                     if let Err(error) = live.select_account(index, ui.clone()).await {
@@ -937,6 +1056,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return;
         }
         if let Some(ui) = weak.upgrade() {
+            if ui.get_composer_mode() != 0 {
+                return;
+            }
             draft_live.remember_draft(
                 ui.get_active_account_local_id().as_str(),
                 ui.get_active_room_id().as_str(),
@@ -955,88 +1077,332 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if message_text.is_empty() {
             return;
         }
-        if send_live.is_live.load(Ordering::Acquire) {
-            if let Some(ui) = weak.upgrade() {
-                let account_id = ui.get_active_account_local_id().to_string();
-                let room_id = ui.get_active_room_id().to_string();
-                let account_for_ui = account_id.clone();
-                let room_for_ui = room_id.clone();
-                let live = send_live.clone();
-                let weak = weak.clone();
-                send_handle.spawn(async move {
-                    match live.send(account_id, room_id, message_text).await {
-                        Ok(()) => {
-                            live.clear_draft_if_unchanged(
-                                &account_for_ui,
-                                &room_for_ui,
-                                &submitted_text,
-                            );
-                            let _ = weak.upgrade_in_event_loop(move |ui| {
-                                if ui.get_active_account_local_id().as_str() == account_for_ui
-                                    && ui.get_active_room_id().as_str() == room_for_ui
-                                    && ui.get_composer_text().as_str() == submitted_text
-                                {
-                                    ui.set_composer_text("".into());
-                                }
-                            });
-                        }
-                        Err(error) => show_error(&weak, error.to_string()),
-                    }
-                });
-            }
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.get_composer_busy() {
             return;
         }
-        if let Some(ui) = weak.upgrade() {
-            let mut state = send_state.borrow_mut();
-            let active_room = state.active_room.clone();
-            let active_account = state.active_account;
-            let account = &mut state.accounts[active_account];
-            let item = account.item.clone();
-            if let Some(room) = account
-                .channels
-                .iter_mut()
-                .chain(&mut account.directs)
-                .find(|room| room.item.id.as_str() == active_room)
-            {
-                room.messages.push(message(
-                    item.name.as_str(),
-                    item.initials.as_str(),
-                    "Now",
-                    &message_text,
-                    "",
-                    "",
-                    "",
-                    item.accent,
-                ));
-                apply_state(&ui, &state);
-                if ui.get_composer_text().as_str() == submitted_text {
-                    ui.set_composer_text("".into());
+        let mode = ui.get_composer_mode();
+        let target_id = ui.get_composer_target_id().to_string();
+        let saved_draft = ui.get_composer_saved_draft().to_string();
+        if mode != 0 && target_id.is_empty() {
+            ui.set_session_error("Select a message before replying or editing".into());
+            return;
+        }
+        let operation = ui.get_composer_operation().wrapping_add(1);
+        ui.set_composer_operation(operation);
+        ui.set_composer_busy(true);
+        if send_live.is_live.load(Ordering::Acquire) {
+            let account_id = ui.get_active_account_local_id().to_string();
+            let room_id = ui.get_active_room_id().to_string();
+            let target = match mode {
+                0 => MessageTarget::Room,
+                1 => MessageTarget::Reply(target_id.clone()),
+                2 => MessageTarget::Edit(target_id.clone()),
+                _ => {
+                    ui.set_composer_busy(false);
+                    ui.set_session_error("Unknown composer action".into());
+                    return;
                 }
+            };
+            let account_for_ui = account_id.clone();
+            let room_for_ui = room_id.clone();
+            let live = send_live.clone();
+            let weak = weak.clone();
+            send_handle.spawn(async move {
+                match live.send(account_id, room_id, message_text, target).await {
+                    Ok(()) => {
+                        let _ = weak.upgrade_in_event_loop(move |ui| {
+                            if ui.get_active_account_local_id().as_str() == account_for_ui
+                                && ui.get_active_room_id().as_str() == room_for_ui
+                                && ui.get_composer_operation() == operation
+                            {
+                                if mode == 0 {
+                                    live.clear_draft_if_unchanged(
+                                        &account_for_ui,
+                                        &room_for_ui,
+                                        &submitted_text,
+                                    );
+                                }
+                                finish_composer_submission(
+                                    &ui,
+                                    operation,
+                                    mode,
+                                    &target_id,
+                                    &submitted_text,
+                                    &saved_draft,
+                                );
+                            }
+                        });
+                    }
+                    Err(error) => {
+                        let error = error.to_string();
+                        let _ = weak.upgrade_in_event_loop(move |ui| {
+                            if ui.get_active_account_local_id().as_str() == account_for_ui
+                                && ui.get_active_room_id().as_str() == room_for_ui
+                                && ui.get_composer_operation() == operation
+                            {
+                                ui.set_composer_busy(false);
+                                if ui.get_composer_mode() == mode
+                                    && ui.get_composer_target_id().as_str() == target_id
+                                {
+                                    ui.set_session_error(error.into());
+                                }
+                            }
+                        });
+                    }
+                }
+            });
+            return;
+        }
+        let mut state = send_state.borrow_mut();
+        let active_room = state.active_room.clone();
+        let active_account = state.active_account;
+        let account = &mut state.accounts[active_account];
+        let item = account.item.clone();
+        if let Some(room) = account
+            .channels
+            .iter_mut()
+            .chain(&mut account.directs)
+            .find(|room| room.item.id.as_str() == active_room)
+        {
+            let result = match mode {
+                0 => {
+                    room.messages.push(message(
+                        item.name.as_str(),
+                        item.initials.as_str(),
+                        "Now",
+                        &message_text,
+                        "",
+                        "",
+                        "",
+                        item.accent,
+                    ));
+                    true
+                }
+                1 => {
+                    let context = preview_event_index(&target_id)
+                        .and_then(|index| room.messages.get(index))
+                        .map(|target| {
+                            format!(
+                                "{}: {}",
+                                target.sender,
+                                target.body.chars().take(48).collect::<String>()
+                            )
+                        });
+                    if let Some(context) = context {
+                        room.messages.push(message(
+                            item.name.as_str(),
+                            item.initials.as_str(),
+                            "Now",
+                            &message_text,
+                            &context,
+                            "",
+                            "",
+                            item.accent,
+                        ));
+                        true
+                    } else {
+                        false
+                    }
+                }
+                2 => preview_event_index(&target_id)
+                    .and_then(|index| room.messages.get_mut(index))
+                    .filter(|target| target.sender == item.name)
+                    .map(|target| {
+                        target.body = message_text.clone().into();
+                    })
+                    .is_some(),
+                _ => false,
+            };
+            if result {
+                apply_state(&ui, &state);
+                finish_composer_submission(
+                    &ui,
+                    operation,
+                    mode,
+                    &target_id,
+                    &submitted_text,
+                    &saved_draft,
+                );
+            } else {
+                ui.set_composer_busy(false);
+                ui.set_session_error("That preview message is no longer available".into());
             }
+        } else {
+            ui.set_composer_busy(false);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let reaction_state = state.clone();
+    let reaction_live = live.clone();
+    let reaction_handle = runtime.handle().clone();
+    ui.on_toggle_message_reaction(move |event_id, reaction| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let event_id = event_id.to_string();
+        let reaction = reaction.to_string();
+        if reaction_live.is_live.load(Ordering::Acquire) {
+            let account_id = ui.get_active_account_local_id().to_string();
+            let room_id = ui.get_active_room_id().to_string();
+            let live = reaction_live.clone();
+            let weak = weak.clone();
+            reaction_handle.spawn(async move {
+                if let Err(error) = live
+                    .toggle_reaction(account_id, room_id, event_id, reaction)
+                    .await
+                {
+                    show_error(&weak, error.to_string());
+                }
+            });
+            return;
+        }
+        let Some(index) = preview_event_index(&event_id) else {
+            return;
+        };
+        let mut state = reaction_state.borrow_mut();
+        let active_room = state.active_room.clone();
+        let active_account = state.active_account;
+        let account = &mut state.accounts[active_account];
+        if let Some(message) = account
+            .channels
+            .iter_mut()
+            .chain(&mut account.directs)
+            .find(|room| room.item.id.as_str() == active_room)
+            .and_then(|room| room.messages.get_mut(index))
+        {
+            let label = format!("{reaction}  1");
+            message.reaction = if message.reaction.as_str() == label {
+                "".into()
+            } else {
+                label.into()
+            };
+            apply_state(&ui, &state);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let thread_state = state.clone();
+    let thread_live = live.clone();
+    let thread_handle = runtime.handle().clone();
+    ui.on_open_thread(move |event_id, _sender, _body| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let event_id = event_id.to_string();
+        let room_id = ui.get_active_room_id().to_string();
+        if thread_live.is_live.load(Ordering::Acquire) {
+            let account_id = ui.get_active_account_local_id().to_string();
+            let live = thread_live.clone();
+            let generation = live.begin_thread_request();
+            let weak = weak.clone();
+            thread_handle.spawn(async move {
+                if let Err(error) = live
+                    .open_thread(account_id, room_id, event_id, generation, weak.clone())
+                    .await
+                {
+                    show_error(&weak, error.to_string());
+                }
+            });
+            return;
+        }
+        let state = thread_state.borrow();
+        let replies = state
+            .thread_replies
+            .get(&(state.active_account, room_id, event_id))
+            .cloned()
+            .unwrap_or_default();
+        ui.set_thread_messages(ModelRc::new(VecModel::from(replies)));
+    });
+
+    let close_live = live.clone();
+    let close_handle = runtime.handle().clone();
+    ui.on_close_thread(move || {
+        let live = close_live.clone();
+        let generation = live.begin_thread_request();
+        close_handle.spawn(async move { live.clear_thread_if_current(generation).await });
+    });
+
+    let weak = ui.as_weak();
+    let thread_send_state = state.clone();
+    let thread_send_live = live.clone();
+    let thread_send_handle = runtime.handle().clone();
+    ui.on_send_thread_message(move |body| {
+        let submitted = body.to_string();
+        let trimmed = submitted.trim().to_owned();
+        if trimmed.is_empty() {
+            return;
+        }
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let root_id = ui.get_thread_root_id().to_string();
+        if root_id.is_empty() {
+            return;
+        }
+        let room_id = ui.get_active_room_id().to_string();
+        if thread_send_live.is_live.load(Ordering::Acquire) {
+            let account_id = ui.get_active_account_local_id().to_string();
+            let live = thread_send_live.clone();
+            let weak = weak.clone();
+            thread_send_handle.spawn(async move {
+                let result = live
+                    .send(
+                        account_id.clone(),
+                        room_id.clone(),
+                        trimmed,
+                        MessageTarget::Thread(root_id.clone()),
+                    )
+                    .await;
+                match result {
+                    Ok(()) => {
+                        let _ = weak.upgrade_in_event_loop(move |ui| {
+                            if ui.get_active_account_local_id().as_str() == account_id
+                                && ui.get_active_room_id().as_str() == room_id
+                                && ui.get_thread_root_id().as_str() == root_id
+                                && ui.get_thread_composer_text().as_str() == submitted
+                            {
+                                ui.set_thread_composer_text("".into());
+                            }
+                        });
+                    }
+                    Err(error) => show_error(&weak, error.to_string()),
+                }
+            });
+            return;
+        }
+        let mut state = thread_send_state.borrow_mut();
+        let account_index = state.active_account;
+        let account = state.accounts[account_index].item.clone();
+        let replies = state
+            .thread_replies
+            .entry((account_index, room_id, root_id))
+            .or_default();
+        replies.push(message(
+            account.name.as_str(),
+            account.initials.as_str(),
+            "Now",
+            &trimmed,
+            "",
+            "",
+            "",
+            account.accent,
+        ));
+        ui.set_thread_messages(ModelRc::new(VecModel::from(replies.clone())));
+        if ui.get_thread_composer_text().as_str() == submitted {
+            ui.set_thread_composer_text("".into());
         }
     });
 
     let weak = ui.as_weak();
     #[cfg(feature = "native-calls")]
     let add_calls = calls.clone();
-    #[cfg(feature = "native-calls")]
-    let add_handle = runtime.handle().clone();
     ui.on_add_account(move || {
         #[cfg(feature = "native-calls")]
-        if add_calls.status().blocks_account_switch() {
-            let calls = add_calls.clone();
-            let ui = weak.clone();
-            add_handle.spawn(async move {
-                match calls.end_call().await {
-                    Ok(()) => {
-                        let _ = ui.upgrade_in_event_loop(|ui| {
-                            ui.set_login_error("".into());
-                            ui.set_show_sign_in(true);
-                        });
-                    }
-                    Err(error) => show_error(&ui, error.to_string()),
-                }
-            });
+        if ask_to_leave_call(&weak, &add_calls, -2) {
             return;
         }
         if let Some(ui) = weak.upgrade() {
@@ -1159,6 +1525,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             return;
         }
+        #[cfg(feature = "native-calls")]
+        if ask_to_leave_call(&weak, &logout_calls, -3) {
+            return;
+        }
         logout_live.invalidate_navigation();
         let live = logout_live.clone();
         let ui = weak.clone();
@@ -1166,8 +1536,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let calls = logout_calls.clone();
         logout_handle.spawn(async move {
             #[cfg(feature = "native-calls")]
-            if let Err(error) = calls.end_call().await {
-                show_error(&ui, error.to_string());
+            if calls.status().blocks_account_switch() {
+                let _ = ui.upgrade_in_event_loop(|window| {
+                    window.set_pending_account_index(-3);
+                    window.set_leave_call_dialog(true);
+                });
                 return;
             }
             let Some(active) = live.manager.active_account().await else {
@@ -1194,6 +1567,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let weak = ui.as_weak();
+    let confirm_live = live.clone();
+    #[cfg(feature = "native-calls")]
+    let confirm_calls = calls.clone();
+    #[cfg(feature = "native-calls")]
+    let confirm_handle = runtime.handle().clone();
+    ui.on_confirm_leave_call(move |action| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if !ui.get_leave_call_dialog()
+            || ui.get_leave_call_busy()
+            || ui.get_pending_account_index() != action
+        {
+            return;
+        }
+        ui.set_leave_call_busy(true);
+        if !confirm_live.is_live.load(Ordering::Acquire) {
+            ui.set_call_connected(false);
+            continue_account_action(&ui, action);
+            return;
+        }
+        #[cfg(feature = "native-calls")]
+        {
+            let calls = confirm_calls.clone();
+            let weak = weak.clone();
+            confirm_handle.spawn(async move {
+                let result = calls.end_call().await.map_err(|error| error.to_string());
+                let _ = weak.upgrade_in_event_loop(move |ui| match result {
+                    Ok(()) => continue_account_action(&ui, action),
+                    Err(error) => {
+                        ui.set_leave_call_busy(false);
+                        ui.set_session_error(error.into());
+                    }
+                });
+            });
+        }
+        #[cfg(not(feature = "native-calls"))]
+        continue_account_action(&ui, action);
+    });
+
+    let weak = ui.as_weak();
     let setting_store = store.clone();
     ui.on_choose_theme(move |index| {
         if let Some(ui) = weak.upgrade() {
@@ -1207,6 +1621,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             save_config_change(&ui, &setting_store, |config| {
                 config.appearance.theme = theme;
                 config.appearance.theme_pack = None;
+            });
+        }
+    });
+
+    let weak = ui.as_weak();
+    let setting_store = store.clone();
+    ui.on_change_font_scale(move |percent| {
+        if let Some(ui) = weak.upgrade() {
+            save_config_change(&ui, &setting_store, |config| {
+                config.appearance.scale_percent = percent.clamp(75, 200) as u16;
+            });
+        }
+    });
+
+    let weak = ui.as_weak();
+    let setting_store = store.clone();
+    ui.on_choose_density(move |index| {
+        if let Some(ui) = weak.upgrade() {
+            let density = match index {
+                0 => Density::Compact,
+                1 => Density::Comfortable,
+                2 => Density::Spacious,
+                _ => return,
+            };
+            save_config_change(&ui, &setting_store, |config| {
+                config.appearance.density = density;
+            });
+        }
+    });
+
+    let weak = ui.as_weak();
+    let setting_store = store.clone();
+    ui.on_set_sort_unread_first(move |sort_unread_first| {
+        if let Some(ui) = weak.upgrade() {
+            save_config_change(&ui, &setting_store, |config| {
+                config.layout.sort_unread_first = sort_unread_first;
             });
         }
     });

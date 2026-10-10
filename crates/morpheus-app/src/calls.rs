@@ -13,6 +13,9 @@
 //! `CallStatus::blocks_account_switch()` and finish `end_call()` first. The
 //! controller also notices unexpected account changes and leaves the old
 //! call, but the old account's sync may already have stopped by then.
+//! A failed leave keeps the switch blocked until the user explicitly confirms
+//! the action again. Upstream consumes the call handle during leave, so the
+//! second confirmation acknowledges the error; it cannot retry that handle.
 //!
 //! `open_slot()` writes `m.rtc.slot` only on an explicit user action. It reads
 //! the room's current encryption state and never uses Morpheus's optional
@@ -25,6 +28,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use morpheus_matrix::{AccountManager, MatrixCoreError, SyncBackend, SyncStatus};
@@ -33,7 +37,15 @@ use morpheus_rtc::{
     CallOptions, LocalRtcSupport, MediaError, RtcError, RtcService, TransportSupport,
     local_device_support, local_support,
 };
-use tokio::sync::{Mutex, oneshot, watch};
+use tokio::{
+    sync::{Mutex, oneshot, watch},
+    time::timeout,
+};
+
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+const JOIN_TIMEOUT: Duration = Duration::from_secs(45);
+const LEAVE_TIMEOUT: Duration = Duration::from_secs(10);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// A read-only compatibility result. `TransportReady` means the binary,
 /// account sync, and homeserver transport can support native calls; it does
@@ -51,10 +63,27 @@ pub enum AudioCallCapability {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CallStatus {
     Idle,
-    Starting { account_id: String, room_id: String },
-    Joined { account_id: String, call: CallInfo },
-    Ending { account_id: String, room_id: String },
-    Failed { room_id: String, reason: String },
+    Starting {
+        account_id: String,
+        room_id: String,
+    },
+    Joined {
+        account_id: String,
+        call: CallInfo,
+    },
+    Ending {
+        account_id: String,
+        room_id: String,
+    },
+    CleanupFailed {
+        account_id: String,
+        room_id: String,
+        reason: String,
+    },
+    Failed {
+        room_id: String,
+        reason: String,
+    },
 }
 
 impl CallStatus {
@@ -62,7 +91,10 @@ impl CallStatus {
     pub fn blocks_account_switch(&self) -> bool {
         matches!(
             self,
-            Self::Starting { .. } | Self::Joined { .. } | Self::Ending { .. }
+            Self::Starting { .. }
+                | Self::Joined { .. }
+                | Self::Ending { .. }
+                | Self::CleanupFailed { .. }
         )
     }
 }
@@ -80,6 +112,7 @@ pub enum CallControllerError {
     Rtc(RtcError),
     Media(MediaError),
     WorkerStopped,
+    TimedOut(&'static str),
     Cleanup(String),
 }
 
@@ -105,6 +138,7 @@ impl fmt::Display for CallControllerError {
             Self::Rtc(error) => write!(formatter, "MatrixRTC error: {error}"),
             Self::Media(error) => write!(formatter, "native media error: {error}"),
             Self::WorkerStopped => write!(formatter, "the call worker stopped unexpectedly"),
+            Self::TimedOut(phase) => write!(formatter, "timed out while {phase}"),
             Self::Cleanup(error) => write!(formatter, "could not leave the call cleanly: {error}"),
         }
     }
@@ -141,6 +175,7 @@ struct RunningCall {
 enum CallSlot {
     Idle,
     Running(RunningCall),
+    CleanupFailed { token: u64 },
 }
 
 struct Shared {
@@ -201,7 +236,9 @@ impl CallController {
         let client = self.manager.active_client().await?;
         self.ensure_account(&account.id).await?;
         let rtc = RtcService::new(client);
-        let transport = rtc.discover_transport().await?;
+        let transport = timeout(DISCOVERY_TIMEOUT, rtc.discover_transport())
+            .await
+            .map_err(|_| CallControllerError::TimedOut("discovering MatrixRTC transport"))??;
         self.ensure_account(&account.id).await?;
         Ok(match transport {
             TransportSupport::LiveKit { service_url } => AudioCallCapability::TransportReady {
@@ -228,25 +265,26 @@ impl CallController {
             .into_iter()
             .find(|room| room.room_id().as_str() == room_id)
             .ok_or(CallControllerError::RoomNotLoaded)?;
-        let encryption = room
-            .latest_encryption_state()
+        let encryption = timeout(DISCOVERY_TIMEOUT, room.latest_encryption_state())
             .await
+            .map_err(|_| CallControllerError::TimedOut("reading room encryption state"))?
             .map_err(|error| CallControllerError::RoomState(error.to_string()))?;
         if encryption.is_unknown() {
             return Err(CallControllerError::UnknownEncryptionState);
         }
         self.ensure_account(&account_id).await?;
-        rtc.open_slot(room_id, "m.call#room", encryption.is_encrypted())
-            .await?;
+        timeout(
+            JOIN_TIMEOUT,
+            rtc.open_slot(room_id, "m.call#room", encryption.is_encrypted()),
+        )
+        .await
+        .map_err(|_| CallControllerError::TimedOut("opening MatrixRTC call slot"))??;
         self.ensure_account(&account_id).await
     }
 
     /// Join an already-open `m.call#room` slot and start default microphone
-    /// capture plus playback of the first remote microphone stream.
-    pub async fn start_two_person_audio(
-        &self,
-        room_id: &str,
-    ) -> Result<CallInfo, CallControllerError> {
+    /// capture plus playback of subscribed remote microphones.
+    pub async fn start_audio(&self, room_id: &str) -> Result<CallInfo, CallControllerError> {
         let account =
             self.manager
                 .active_account()
@@ -291,13 +329,31 @@ impl CallController {
             .map_err(|_| CallControllerError::WorkerStopped)?
     }
 
-    /// Cancel capture and wait until the MatrixRTC leave has finished. Safe to
-    /// call again if the call has already ended.
+    /// Compatibility name for the initial two-person proof. This now receives
+    /// and mixes subscribed microphones from a group call too.
+    pub async fn start_two_person_audio(
+        &self,
+        room_id: &str,
+    ) -> Result<CallInfo, CallControllerError> {
+        self.start_audio(room_id).await
+    }
+
+    /// Cancel capture and wait until the MatrixRTC leave has finished. If a
+    /// leave fails, the first call returns the error and keeps account changes
+    /// blocked. A later explicit call acknowledges that error and clears the
+    /// block. The upstream leave consumes its call handle even on failure, so
+    /// there is no safe way to retry that same call through `RtcService`.
     pub async fn end_call(&self) -> Result<(), CallControllerError> {
-        let (cancel, mut done) = {
+        let (cancel, mut done, token, account_id, room_id) = {
             let mut slot = self.shared.slot.lock().await;
-            let CallSlot::Running(running) = &mut *slot else {
-                return Ok(());
+            let running = match &mut *slot {
+                CallSlot::Idle => return Ok(()),
+                CallSlot::CleanupFailed { .. } => {
+                    *slot = CallSlot::Idle;
+                    self.shared.status.send_replace(CallStatus::Idle);
+                    return Ok(());
+                }
+                CallSlot::Running(running) => running,
             };
             let cancel = running.cancel.take();
             let done = running.done.clone();
@@ -305,18 +361,60 @@ impl CallController {
                 account_id: running.account_id.clone(),
                 room_id: running.room_id.clone(),
             });
-            (cancel, done)
+            (
+                cancel,
+                done,
+                running.token,
+                running.account_id.clone(),
+                running.room_id.clone(),
+            )
         };
         if let Some(cancel) = cancel {
             let _ = cancel.send(());
         }
-        loop {
-            if let Some(result) = done.borrow_and_update().clone() {
-                return result.map_err(CallControllerError::Cleanup);
+        let finished = timeout(SHUTDOWN_TIMEOUT, async {
+            loop {
+                if let Some(result) = done.borrow_and_update().clone() {
+                    return result.map_err(CallControllerError::Cleanup);
+                }
+                done.changed()
+                    .await
+                    .map_err(|_| CallControllerError::WorkerStopped)?;
             }
-            done.changed()
-                .await
-                .map_err(|_| CallControllerError::WorkerStopped)?;
+        })
+        .await;
+        match finished {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error @ CallControllerError::WorkerStopped)) => {
+                self.mark_cleanup_unknown(token, &account_id, &room_id, error.to_string())
+                    .await;
+                Err(error)
+            }
+            Ok(Err(error)) => Err(error),
+            Err(_) => {
+                let error = CallControllerError::TimedOut("waiting for call shutdown");
+                self.mark_cleanup_unknown(token, &account_id, &room_id, error.to_string())
+                    .await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn mark_cleanup_unknown(
+        &self,
+        token: u64,
+        account_id: &str,
+        room_id: &str,
+        reason: String,
+    ) {
+        let mut slot = self.shared.slot.lock().await;
+        if matches!(&*slot, CallSlot::Running(running) if running.token == token) {
+            *slot = CallSlot::CleanupFailed { token };
+            self.shared.status.send_replace(CallStatus::CleanupFailed {
+                account_id: account_id.to_owned(),
+                room_id: room_id.to_owned(),
+                reason,
+            });
         }
     }
 
@@ -355,8 +453,14 @@ impl CallWorker {
             Ok(joined) => joined,
             Err(error) => {
                 let reason = error.to_string();
+                let cancelled = matches!(error, CallControllerError::Cancelled);
+                let cleanup = if matches!(error, CallControllerError::Cleanup(_)) {
+                    Err(reason.clone())
+                } else {
+                    Ok(())
+                };
                 self.send_ready(Err(error));
-                self.finish(Err(reason)).await;
+                self.finish(cleanup, (!cancelled).then_some(reason)).await;
                 return;
             }
         };
@@ -368,9 +472,10 @@ impl CallWorker {
             .await
             .is_err()
         {
-            let _ = rtc.leave(&self.room_id).await;
+            let leave = leave_with_timeout(&mut rtc, &self.room_id).await;
             self.send_ready(Err(CallControllerError::Cancelled));
-            self.finish(Ok(())).await;
+            self.finish(leave.map_err(|error| error.to_string()), None)
+                .await;
             return;
         }
         {
@@ -386,16 +491,18 @@ impl CallWorker {
                 }
                 _ => {
                     drop(slot);
-                    let _ = rtc.leave(&self.room_id).await;
+                    let leave = leave_with_timeout(&mut rtc, &self.room_id).await;
                     self.send_ready(Err(CallControllerError::Cancelled));
-                    self.finish(Ok(())).await;
+                    self.finish(leave.map_err(|error| error.to_string()), None)
+                        .await;
                     return;
                 }
             }
         }
         if self.send_ready(Ok(info)) {
-            let _ = rtc.leave(&self.room_id).await;
-            self.finish(Ok(())).await;
+            let leave = leave_with_timeout(&mut rtc, &self.room_id).await;
+            self.finish(leave.map_err(|error| error.to_string()), None)
+                .await;
             return;
         }
 
@@ -419,12 +526,13 @@ impl CallWorker {
             } else {
                 CallControllerError::AccountChanged
             };
-            let _ = rtc.leave(&self.room_id).await;
-            self.finish(Err(reason.to_string())).await;
+            let leave = leave_with_timeout(&mut rtc, &self.room_id).await;
+            let cleanup = leave.map_err(|error| error.to_string());
+            self.finish(cleanup, Some(reason.to_string())).await;
             return;
         }
         let media_result = {
-            let audio = rtc.run_two_person_audio(&self.room_id);
+            let audio = rtc.run_audio(&self.room_id);
             tokio::pin!(audio);
             loop {
                 tokio::select! {
@@ -445,32 +553,85 @@ impl CallWorker {
                 }
             }
         };
-        let leave_result = rtc
-            .leave(&self.room_id)
-            .await
-            .map_err(CallControllerError::Rtc);
-        let outcome = media_result
-            .and(leave_result)
-            .map_err(|error| error.to_string());
-        self.finish(outcome).await;
+        let leave_result = leave_with_timeout(&mut rtc, &self.room_id).await;
+        let cleanup = leave_result.map_err(|error| error.to_string());
+        self.finish(cleanup, media_result.err().map(|error| error.to_string()))
+            .await;
     }
 
-    async fn setup(&self) -> Result<(RtcService, CallInfo), CallControllerError> {
+    async fn setup(&mut self) -> Result<(RtcService, CallInfo), CallControllerError> {
         let controller = CallController {
             manager: Arc::clone(&self.manager),
             shared: Arc::clone(&self.shared),
         };
-        match controller.probe_audio().await? {
+        let probe = tokio::select! {
+            biased;
+            _ = &mut self.cancel => return Err(CallControllerError::Cancelled),
+            result = controller.probe_audio() => result?,
+        };
+        match probe {
             AudioCallCapability::TransportReady { .. } => {}
             unavailable => return Err(CallControllerError::Unavailable(unavailable)),
         }
         ensure_account(&self.manager, &self.account_id).await?;
-        let client = self.manager.active_client().await?;
+        let client = tokio::select! {
+            biased;
+            _ = &mut self.cancel => return Err(CallControllerError::Cancelled),
+            result = self.manager.active_client() => result?,
+        };
         ensure_account(&self.manager, &self.account_id).await?;
         let mut rtc = RtcService::new(client);
-        let info = rtc.join(&self.room_id, CallOptions::default()).await?;
+        if !matches!(
+            self.cancel.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ) {
+            return Err(CallControllerError::Cancelled);
+        }
+        let room_id = self.room_id.clone();
+        let mut cancelled = false;
+        // Once joining starts, keep the upstream join future alive until it
+        // yields a call handle. It can publish membership before connecting
+        // media; dropping it on cancellation would skip an explicit leave.
+        let joined = {
+            let join = timeout(JOIN_TIMEOUT, rtc.join(&room_id, CallOptions::default()));
+            tokio::pin!(join);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = &mut self.cancel, if !cancelled => {
+                        cancelled = true;
+                        if let Some(ready) = self.ready.take() {
+                            let _ = ready.send(Err(CallControllerError::Cancelled));
+                        }
+                    }
+                    result = &mut join => break result,
+                }
+            }
+        };
+        let info = match joined {
+            Ok(Ok(info)) => info,
+            Ok(Err(error)) => {
+                return Err(cleanup_after_failed_join(&mut rtc, &room_id, error.into()).await);
+            }
+            Err(_) => {
+                let original = CallControllerError::TimedOut("joining MatrixRTC call");
+                return Err(cleanup_after_failed_join(&mut rtc, &room_id, original).await);
+            }
+        };
+        if cancelled {
+            leave_with_timeout(&mut rtc, &room_id)
+                .await
+                .map_err(|error| CallControllerError::Cleanup(error.to_string()))?;
+            return Err(CallControllerError::Cancelled);
+        }
         if let Err(error) = ensure_account(&self.manager, &self.account_id).await {
-            let _ = rtc.leave(&self.room_id).await;
+            leave_with_timeout(&mut rtc, &room_id)
+                .await
+                .map_err(|cleanup| {
+                    CallControllerError::Cleanup(format!(
+                        "{error}; cleanup after account change also failed: {cleanup}"
+                    ))
+                })?;
             return Err(error);
         }
         Ok((rtc, info))
@@ -483,21 +644,61 @@ impl CallWorker {
             .is_none_or(|sender| sender.send(result).is_err())
     }
 
-    async fn finish(&self, outcome: Result<(), String>) {
+    async fn finish(&self, cleanup: Result<(), String>, failure: Option<String>) {
         {
             let mut slot = self.shared.slot.lock().await;
-            if matches!(&*slot, CallSlot::Running(running) if running.token == self.token) {
-                *slot = CallSlot::Idle;
-                self.shared.status.send_replace(match &outcome {
-                    Ok(()) => CallStatus::Idle,
-                    Err(reason) => CallStatus::Failed {
+            if matches!(&*slot, CallSlot::Running(running) if running.token == self.token)
+                || matches!(&*slot, CallSlot::CleanupFailed { token } if *token == self.token)
+            {
+                if let Err(reason) = &cleanup {
+                    *slot = CallSlot::CleanupFailed { token: self.token };
+                    self.shared.status.send_replace(CallStatus::CleanupFailed {
+                        account_id: self.account_id.clone(),
                         room_id: self.room_id.clone(),
                         reason: reason.clone(),
-                    },
-                });
+                    });
+                } else {
+                    *slot = CallSlot::Idle;
+                    self.shared.status.send_replace(match failure {
+                        None => CallStatus::Idle,
+                        Some(ref reason) => CallStatus::Failed {
+                            room_id: self.room_id.clone(),
+                            reason: reason.clone(),
+                        },
+                    });
+                }
             }
+            // Publish completion while holding the slot lock, so a later
+            // acknowledgement sees a completed first cleanup attempt.
+            self.done.send_replace(Some(cleanup));
         }
-        self.done.send_replace(Some(outcome));
+    }
+}
+
+async fn leave_with_timeout(
+    rtc: &mut RtcService,
+    room_id: &str,
+) -> Result<(), CallControllerError> {
+    timeout(LEAVE_TIMEOUT, rtc.leave(room_id))
+        .await
+        .map_err(|_| CallControllerError::TimedOut("leaving MatrixRTC call"))??;
+    Ok(())
+}
+
+async fn cleanup_after_failed_join(
+    rtc: &mut RtcService,
+    room_id: &str,
+    original: CallControllerError,
+) -> CallControllerError {
+    // The upstream join can publish membership before it yields a call handle.
+    // Try an explicit leave even after an error or timeout. If the handle was
+    // never installed, NotJoined is expected and the server's delayed leave
+    // remains the fallback for a membership published by an interrupted join.
+    match leave_with_timeout(rtc, room_id).await {
+        Ok(()) | Err(CallControllerError::Rtc(RtcError::NotJoined)) => original,
+        Err(cleanup) => CallControllerError::Cleanup(format!(
+            "{original}; cleanup after failed join also failed: {cleanup}"
+        )),
     }
 }
 

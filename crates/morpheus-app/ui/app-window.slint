@@ -31,6 +31,8 @@ export struct RoomItem {
 }
 
 export struct MessageItem {
+    event-id: string,
+    is-own: bool,
     sender: string,
     initials: string,
     time: string,
@@ -109,7 +111,10 @@ export component AppWindow inherits Window {
     in-out property <string> active-space-name: "Home";
     in-out property <[RoomItem]> channels;
     in-out property <[RoomItem]> direct-messages;
+    in-out property <[RoomItem]> unsorted-channels;
+    in-out property <[RoomItem]> unsorted-direct-messages;
     in-out property <[MessageItem]> messages;
+    in-out property <[MessageItem]> thread-messages;
     in-out property <[MemberItem]> members;
     in-out property <int> active-account-index: 0;
     in-out property <string> active-account-local-id;
@@ -122,6 +127,9 @@ export component AppWindow inherits Window {
     in-out property <string> active-room-name;
     in-out property <string> active-room-topic;
     in-out property <int> theme-mode: 0;
+    in-out property <int> font-scale-percent: 100;
+    in-out property <int> density-mode: 1;
+    in-out property <bool> sort-unread-first: false;
     in-out property <int> room-list-width: 262;
     in-out property <int> details-width: 250;
     in-out property <bool> show-side-panel: true;
@@ -152,10 +160,17 @@ export component AppWindow inherits Window {
     callback select-space(string);
     callback open-room(string);
     callback send-message(string);
+    callback send-thread-message(string);
+    callback open-thread(string, string, string);
+    callback close-thread();
+    callback toggle-message-reaction(string, string);
     callback add-account();
     callback manage-accounts();
     callback log-out();
     callback choose-theme(int);
+    callback change-font-scale(int);
+    callback choose-density(int);
+    callback set-sort-unread-first(bool);
     callback set-side-panel(bool);
     callback change-room-list-width(int);
     callback change-details-width(int);
@@ -167,8 +182,9 @@ export component AppWindow inherits Window {
     callback start-native-call();
     callback end-native-call();
     callback open-native-call-slot();
+    callback confirm-leave-call(int);
 
-    property <bool> account-menu-open: false;
+    in-out property <bool> account-menu-open: false;
     in-out property <bool> manage-accounts-open: false;
     in-out property <bool> stress-timeline-active: false;
     property <int> side-panel-tab: 0;
@@ -176,14 +192,27 @@ export component AppWindow inherits Window {
     property <bool> mic-muted: false;
     property <bool> camera-off: true;
     in-out property <bool> call-connected: false;
-    property <bool> leave-call-dialog: false;
-    property <int> pending-account-index: -1;
+    in-out property <bool> leave-call-dialog: false;
+    in-out property <bool> leave-call-busy: false;
+    in-out property <int> pending-account-index: -1;
+    property <bool> leave-call-confirm-focused: false;
     in-out property <string> composer-text;
+    in-out property <bool> composer-busy: false;
+    in-out property <int> composer-operation: 0;
+    in-out property <int> composer-mode: 0; // 0 message, 1 reply, 2 edit
+    in-out property <string> composer-target-id;
+    in-out property <string> composer-target-label;
+    in-out property <string> composer-saved-draft;
+    in-out property <string> thread-root-id;
+    in-out property <string> thread-root-sender;
+    in-out property <string> thread-root-body;
+    in-out property <string> thread-composer-text;
     property <string> login-homeserver: "https://matrix.org";
     property <string> login-username;
     property <string> login-password;
 
     property <bool> light-palette: root.theme-mode == 1 || (root.theme-mode == 3 && Palette.color-scheme == ColorScheme.light);
+    property <float> text-scale: root.font-scale-percent / 100.0;
     property <color> rail: custom-theme-active ? custom-rail : light-palette ? #e7ebf3 : theme-mode == 2 ? #000000 : #10131b;
     property <color> sidebar: custom-theme-active ? custom-sidebar : light-palette ? #f1f3f8 : theme-mode == 2 ? #101010 : #171b26;
     property <color> canvas: custom-theme-active ? custom-canvas : light-palette ? #ffffff : theme-mode == 2 ? #000000 : #1e2330;
@@ -215,7 +244,7 @@ export component AppWindow inherits Window {
                     Text {
                         text: "M";
                         color: root.accent-ink;
-                        font-size: 23px;
+                        font-size: 23px * root.text-scale;
                         font-weight: 800;
                         horizontal-alignment: center;
                         vertical-alignment: center;
@@ -322,7 +351,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "Morpheus";
                             color: root.ink;
-                            font-size: 17px;
+                            font-size: 17px * root.text-scale;
                             font-weight: 750;
                             vertical-alignment: center;
                             horizontal-stretch: 1;
@@ -330,7 +359,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: "v";
                             color: root.muted;
-                            font-size: 17px;
+                            font-size: 17px * root.text-scale;
                             vertical-alignment: center;
                         }
                     }
@@ -350,7 +379,7 @@ export component AppWindow inherits Window {
                             x: 12px;
                             text: "Search rooms";
                             color: root.muted;
-                            font-size: 13px;
+                            font-size: 13px * root.text-scale;
                             vertical-alignment: center;
                         }
                         TouchArea {
@@ -371,7 +400,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: root.active-space-id == "" ? "YOUR ROOMS" : "SPACE ROOMS";
                             color: root.muted;
-                            font-size: 10px;
+                            font-size: 10px * root.text-scale;
                             font-weight: 750;
                             letter-spacing: 1px;
                             height: 29px;
@@ -384,13 +413,13 @@ export component AppWindow inherits Window {
                                 x: 8px;
                                 text: "v   " + (root.active-space-id == "" ? "Home" : root.active-space-name);
                                 color: root.ink;
-                                font-size: 13px;
+                                font-size: 13px * root.text-scale;
                                 font-weight: 650;
                                 vertical-alignment: center;
                             }
                         }
                         for room in root.channels : Rectangle {
-                            height: 36px;
+                            height: max(root.density-mode == 0 ? 30px : root.density-mode == 2 ? 44px : 36px, 22px * root.text-scale);
                             border-radius: 8px;
                             background: room.id == root.active-room-id && root.page == 0 ? root.hover : row-hit.has-hover ? root.elevated : transparent;
                             accessible-role: button;
@@ -400,11 +429,11 @@ export component AppWindow inherits Window {
                                 padding-left: 10px;
                                 padding-right: 9px;
                                 spacing: 8px;
-                                Text { text: room.private-room ? "⌑" : "#"; color: root.muted; font-size: 18px; vertical-alignment: center; }
-                                Text { text: room.name; color: room.unread > 0 ? root.ink : root.muted; font-size: 13px; font-weight: room.unread > 0 ? 700 : 500; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                                Text { text: room.private-room ? "⌑" : "#"; color: root.muted; font-size: 18px * root.text-scale; vertical-alignment: center; }
+                                Text { text: room.name; color: room.unread > 0 ? root.ink : root.muted; font-size: 13px * root.text-scale; font-weight: room.unread > 0 ? 700 : 500; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
                                 if room.unread > 0 : Rectangle {
                                     width: 20px; height: 20px; border-radius: 10px; background: root.accent;
-                                    Text { text: room.unread; color: root.accent-ink; font-size: 10px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                                    Text { text: room.unread; color: root.accent-ink; font-size: 10px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                                 }
                             }
                             row-hit := TouchArea { mouse-cursor: pointer; clicked => { root.page = 0; root.open-room(room.id); } }
@@ -412,14 +441,14 @@ export component AppWindow inherits Window {
                         Text {
                             text: "DIRECT MESSAGES";
                             color: root.muted;
-                            font-size: 10px;
+                            font-size: 10px * root.text-scale;
                             font-weight: 750;
                             letter-spacing: 1px;
                             height: 40px;
                             vertical-alignment: bottom;
                         }
                         for room in root.direct-messages : Rectangle {
-                            height: 39px;
+                            height: max(root.density-mode == 0 ? 32px : root.density-mode == 2 ? 47px : 39px, 22px * root.text-scale);
                             border-radius: 8px;
                             background: room.id == root.active-room-id && root.page == 0 ? root.hover : dm-hit.has-hover ? root.elevated : transparent;
                             accessible-role: button;
@@ -431,12 +460,12 @@ export component AppWindow inherits Window {
                                 spacing: 9px;
                                 Rectangle {
                                     width: 25px; height: 25px; border-radius: 9px; background: root.accent;
-                                    Text { text: "@"; color: root.accent-ink; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                                    Text { text: "@"; color: root.accent-ink; font-size: 13px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
                                 }
-                                Text { text: room.name; color: room.unread > 0 ? root.ink : root.muted; font-size: 13px; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                                Text { text: room.name; color: room.unread > 0 ? root.ink : root.muted; font-size: 13px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
                                 if room.unread > 0 : Rectangle {
                                     width: 20px; height: 20px; border-radius: 10px; background: root.accent;
-                                    Text { text: room.unread; color: root.accent-ink; font-size: 10px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                                    Text { text: room.unread; color: root.accent-ink; font-size: 10px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                                 }
                             }
                             dm-hit := TouchArea { mouse-cursor: pointer; clicked => { root.page = 0; root.open-room(room.id); } }
@@ -460,10 +489,10 @@ export component AppWindow inherits Window {
                             alignment: center;
                             spacing: 2px;
                             horizontal-stretch: 1;
-                            Text { text: root.active-account-name; color: root.ink; font-size: 13px; font-weight: 700; overflow: elide; }
-                            Text { text: root.active-account-handle; color: root.muted; font-size: 11px; overflow: elide; }
+                            Text { text: root.active-account-name; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; overflow: elide; }
+                            Text { text: root.active-account-handle; color: root.muted; font-size: 11px * root.text-scale; overflow: elide; }
                         }
-                        Text { text: "⌃"; color: root.muted; font-size: 16px; vertical-alignment: center; }
+                        Text { text: "⌃"; color: root.muted; font-size: 16px * root.text-scale; vertical-alignment: center; }
                     }
                     TouchArea { mouse-cursor: pointer; clicked => { root.account-menu-open = !root.account-menu-open; } }
                 }
@@ -488,7 +517,7 @@ export component AppWindow inherits Window {
                     Text {
                         text: "SWITCH ACCOUNT";
                         color: root.muted;
-                        font-size: 10px;
+                        font-size: 10px * root.text-scale;
                         font-weight: 750;
                         letter-spacing: 1px;
                         height: 22px;
@@ -524,10 +553,10 @@ export component AppWindow inherits Window {
                                 alignment: center;
                                 spacing: 1px;
                                 horizontal-stretch: 1;
-                                Text { text: account.name; color: root.ink; font-size: 12px; font-weight: 650; overflow: elide; }
-                                Text { text: account.handle; color: root.muted; font-size: 10px; overflow: elide; }
+                                Text { text: account.name; color: root.ink; font-size: 12px * root.text-scale; font-weight: 650; overflow: elide; }
+                                Text { text: account.handle; color: root.muted; font-size: 10px * root.text-scale; overflow: elide; }
                             }
-                            if account.index == root.active-account-index : Text { text: "✓"; color: root.accent; font-size: 15px; vertical-alignment: center; }
+                            if account.index == root.active-account-index : Text { text: "✓"; color: root.accent; font-size: 15px * root.text-scale; vertical-alignment: center; }
                         }
                         account-hit := TouchArea {
                             mouse-cursor: pointer;
@@ -560,7 +589,7 @@ export component AppWindow inherits Window {
                                 root.account-menu-open = false;
                             }
                         }
-                        Text { x: 9px; text: "+   Add an account"; color: root.ink; font-size: 12px; vertical-alignment: center; }
+                        Text { x: 9px; text: "+   Add an account"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; }
                         add-hit := TouchArea {
                             mouse-cursor: pointer;
                             clicked => {
@@ -581,7 +610,7 @@ export component AppWindow inherits Window {
                         accessible-role: button;
                         accessible-label: "Manage accounts";
                         accessible-action-default => { root.manage-accounts-open = true; root.manage-accounts(); root.account-menu-open = false; }
-                        Text { x: 9px; text: "⚙   Manage accounts"; color: root.ink; font-size: 12px; vertical-alignment: center; }
+                        Text { x: 9px; text: "⚙   Manage accounts"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; }
                         manage-hit := TouchArea { mouse-cursor: pointer; clicked => { root.manage-accounts-open = true; root.manage-accounts(); root.account-menu-open = false; } }
                     }
                     Rectangle {
@@ -594,7 +623,7 @@ export component AppWindow inherits Window {
                             if root.call-connected { root.pending-account-index = -3; root.leave-call-dialog = true; }
                             else { root.log-out(); root.account-menu-open = false; }
                         }
-                        Text { x: 9px; text: "↪   Log out"; color: #e47483; font-size: 12px; vertical-alignment: center; }
+                        Text { x: 9px; text: "↪   Log out"; color: #e47483; font-size: 12px * root.text-scale; vertical-alignment: center; }
                         logout-hit := TouchArea { mouse-cursor: pointer; clicked => {
                             if root.call-connected { root.pending-account-index = -3; root.leave-call-dialog = true; }
                             else { root.log-out(); root.account-menu-open = false; }
@@ -620,13 +649,13 @@ export component AppWindow inherits Window {
                         Text {
                             text: root.page == 1 ? "⚙" : root.page == 2 ? "☏" : "#";
                             color: root.muted;
-                            font-size: 20px;
+                            font-size: 20px * root.text-scale;
                             vertical-alignment: center;
                         }
                         Text {
                             text: root.page == 1 ? "Settings" : root.page == 2 ? "Voice & video" : root.active-room-name;
                             color: root.ink;
-                            font-size: 16px;
+                            font-size: 16px * root.text-scale;
                             font-weight: 750;
                             vertical-alignment: center;
                         }
@@ -634,7 +663,7 @@ export component AppWindow inherits Window {
                         Text {
                             text: root.page == 0 ? root.active-room-topic : root.page == 1 ? "Make Morpheus yours" : "The Workshop";
                             color: root.muted;
-                            font-size: 12px;
+                            font-size: 12px * root.text-scale;
                             vertical-alignment: center;
                             horizontal-stretch: 1;
                             overflow: elide;
@@ -660,7 +689,7 @@ export component AppWindow inherits Window {
                         width: parent.width - 32px;
                         text: "Settings file: " + root.config-error;
                         color: #ffffff;
-                        font-size: 11px;
+                        font-size: 11px * root.text-scale;
                         vertical-alignment: center;
                         overflow: elide;
                     }
@@ -673,7 +702,7 @@ export component AppWindow inherits Window {
                         width: parent.width - 32px;
                         text: root.session-error;
                         color: #ffffff;
-                        font-size: 11px;
+                        font-size: 11px * root.text-scale;
                         vertical-alignment: center;
                         overflow: elide;
                     }
@@ -689,8 +718,8 @@ export component AppWindow inherits Window {
                             padding-left: 24px;
                             padding-right: 24px;
                             spacing: 5px;
-                            Text { text: "Welcome to #" + root.active-room-name; color: root.ink; font-size: 24px; font-weight: 780; }
-                            Text { text: root.active-room-topic; color: root.muted; font-size: 12px; wrap: word-wrap; }
+                            Text { text: "Welcome to #" + root.active-room-name; color: root.ink; font-size: 24px * root.text-scale; font-weight: 780; }
+                            Text { text: root.active-room-topic; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         }
                     }
                     timeline-list := ListView {
@@ -699,35 +728,78 @@ export component AppWindow inherits Window {
                         for message[index] in root.messages : Rectangle {
                                 width: timeline-list.visible-width;
                                 background: message-hover.has-hover ? root.elevated : transparent;
-                                min-height: 65px;
+                                min-height: root.density-mode == 0 ? 52px : root.density-mode == 2 ? 80px : 65px;
+                                message-hover := TouchArea { mouse-cursor: default; }
                                 VerticalLayout {
                                     padding-left: 24px;
                                     padding-right: 24px;
-                                    padding-top: 9px;
-                                    padding-bottom: 10px;
-                                    spacing: 5px;
+                                    padding-top: root.density-mode == 0 ? 5px : root.density-mode == 2 ? 15px : 9px;
+                                    padding-bottom: root.density-mode == 0 ? 5px : root.density-mode == 2 ? 16px : 10px;
+                                    spacing: root.density-mode == 0 ? 3px : root.density-mode == 2 ? 8px : 5px;
                                     HorizontalLayout {
                                         spacing: 10px;
                                         AvatarBadge { width: 36px; height: 36px; border-radius: 12px; initials: message.initials; accent: message.accent; }
                                         VerticalLayout {
                                             horizontal-stretch: 1;
-                                            spacing: 5px;
+                                            spacing: root.density-mode == 0 ? 3px : root.density-mode == 2 ? 8px : 5px;
                                             HorizontalLayout {
                                                 spacing: 8px;
-                                                Text { text: message.sender; color: root.ink; font-size: 13px; font-weight: 750; }
-                                                Text { text: message.time; color: root.muted; font-size: 10px; vertical-alignment: center; }
+                                                Text { text: message.sender; color: root.ink; font-size: 13px * root.text-scale; font-weight: 750; }
+                                                Text { text: message.time; color: root.muted; font-size: 10px * root.text-scale; vertical-alignment: center; }
+                                                Rectangle { horizontal-stretch: 1; background: transparent; }
+                                                if message.event-id != "" : IconAction {
+                                                    width: 28px; height: 26px; icon: "↩"; label: "Reply to " + message.sender;
+                                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                                    activated => {
+                                                        if root.composer-mode == 0 { root.composer-saved-draft = root.composer-text; }
+                                                        root.composer-mode = 1;
+                                                        root.composer-target-id = message.event-id;
+                                                        root.composer-target-label = message.sender;
+                                                        root.composer-text = "";
+                                                    }
+                                                }
+                                                if message.event-id != "" && message.is-own : IconAction {
+                                                    width: 28px; height: 26px; icon: "✎"; label: "Edit your message";
+                                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                                    activated => {
+                                                        if root.composer-mode == 0 { root.composer-saved-draft = root.composer-text; }
+                                                        root.composer-mode = 2;
+                                                        root.composer-target-id = message.event-id;
+                                                        root.composer-target-label = message.sender;
+                                                        root.composer-text = message.body;
+                                                    }
+                                                }
+                                                if message.event-id != "" : IconAction {
+                                                    width: 28px; height: 26px; icon: "♥"; label: "Toggle heart reaction";
+                                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                                    activated => { root.toggle-message-reaction(message.event-id, "❤️"); }
+                                                }
+                                                if message.event-id != "" : IconAction {
+                                                    width: 28px; height: 26px; icon: "☷"; label: "Open thread for " + message.sender;
+                                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                                    activated => {
+                                                        root.thread-root-id = message.event-id;
+                                                        root.thread-root-sender = message.sender;
+                                                        root.thread-root-body = message.body;
+                                                        root.thread-composer-text = "";
+                                                        root.thread-messages = [];
+                                                        root.side-panel-tab = 1;
+                                                        root.show-side-panel = true;
+                                                        root.open-thread(message.event-id, message.sender, message.body);
+                                                    }
+                                                }
                                             }
                                             if message.reply-to != "" : Rectangle {
                                                 height: 25px;
                                                 border-radius: 5px;
                                                 background: root.hover;
-                                                Text { x: 8px; text: "Reply to " + message.reply-to; color: root.muted; font-size: 11px; vertical-alignment: center; overflow: elide; }
+                                                Text { x: 8px; text: "Reply to " + message.reply-to; color: root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; overflow: elide; }
                                             }
                                             Text {
                                                 width: max(100px, timeline-list.visible-width - 110px);
                                                 text: message.body;
                                                 color: root.ink;
-                                                font-size: 13px;
+                                                font-size: 13px * root.text-scale;
                                                 wrap: word-wrap;
                                                 line-height-factor: 1.25;
                                             }
@@ -741,32 +813,49 @@ export component AppWindow inherits Window {
                                                     padding-left: 12px;
                                                     padding-right: 12px;
                                                     spacing: 10px;
-                                                    Text { text: "F"; color: root.accent; font-size: 20px; vertical-alignment: center; }
-                                                    Text { text: message.attachment; color: root.ink; font-size: 12px; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
-                                                    Text { text: "↗"; color: root.muted; font-size: 16px; vertical-alignment: center; }
+                                                    Text { text: "F"; color: root.accent; font-size: 20px * root.text-scale; vertical-alignment: center; }
+                                                    Text { text: message.attachment; color: root.ink; font-size: 12px * root.text-scale; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
+                                                    Text { text: "↗"; color: root.muted; font-size: 16px * root.text-scale; vertical-alignment: center; }
                                                 }
                                             }
                                             if message.reaction != "" : Rectangle {
-                                                width: 59px;
+                                                width: 126px;
                                                 height: 24px;
                                                 border-radius: 8px;
                                                 border-color: root.divider;
                                                 border-width: 1px;
                                                 background: root.panel;
-                                                Text { text: message.reaction; color: root.ink; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                                                Text { text: message.reaction; color: root.ink; font-size: 11px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
                                             }
                                         }
                                     }
                                 }
-                                message-hover := TouchArea { mouse-cursor: default; }
                         }
                     }
                     Rectangle {
-                        height: 78px;
+                        height: root.composer-mode == 0 ? 78px : 109px;
                         background: root.canvas;
+                        if root.composer-mode != 0 : HorizontalLayout {
+                            x: 20px; y: 4px; width: parent.width - 40px; height: 27px; spacing: 8px;
+                            Text {
+                                text: root.composer-mode == 1 ? "Replying to " + root.composer-target-label : "Editing your message";
+                                color: root.accent; font-size: 11px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
+                            }
+                            IconAction {
+                                width: 26px; height: 25px; icon: "×"; label: "Cancel reply or edit";
+                                ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                activated => {
+                                    root.composer-mode = 0;
+                                    root.composer-target-id = "";
+                                    root.composer-target-label = "";
+                                    root.composer-text = root.composer-saved-draft;
+                                    root.composer-saved-draft = "";
+                                }
+                            }
+                        }
                         Rectangle {
                             x: 18px;
-                            y: 7px;
+                            y: root.composer-mode == 0 ? 7px : 38px;
                             width: parent.width - 36px;
                             height: 58px;
                             border-radius: 11px;
@@ -789,9 +878,9 @@ export component AppWindow inherits Window {
                                     clip: true;
                                     if root.composer-text == "" : Text {
                                         x: 3px;
-                                        text: "Message #" + root.active-room-name;
+                                        text: root.composer-mode == 1 ? "Write a reply" : root.composer-mode == 2 ? "Edit your message" : "Message #" + root.active-room-name;
                                         color: root.muted;
-                                        font-size: 13px;
+                                        font-size: 13px * root.text-scale;
                                         vertical-alignment: center;
                                     }
                                     TextInput {
@@ -800,7 +889,7 @@ export component AppWindow inherits Window {
                                         height: parent.height;
                                         text <=> root.composer-text;
                                         color: root.ink;
-                                        font-size: 13px;
+                                        font-size: 13px * root.text-scale;
                                         vertical-alignment: center;
                                         accessible-label: "Message composer";
                                         edited => {
@@ -812,7 +901,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 IconAction {
-                                    icon: "➤"; label: "Send message"; ink: root.accent;
+                                    icon: "➤"; label: root.composer-mode == 2 ? "Save edit" : root.composer-mode == 1 ? "Send reply" : "Send message"; ink: root.accent;
                                     surface: transparent; hover-surface: root.hover;
                                     activated => { root.send-message(root.composer-text); }
                                 }
@@ -828,8 +917,8 @@ export component AppWindow inherits Window {
                         width: parent.width;
                         padding: 26px;
                         spacing: 18px;
-                        Text { text: "Appearance"; color: root.ink; font-size: 24px; font-weight: 780; }
-                        Text { text: "Choose a theme that feels right in every room."; color: root.muted; font-size: 13px; }
+                        Text { text: "Appearance"; color: root.ink; font-size: 24px * root.text-scale; font-weight: 780; }
+                        Text { text: "Choose a theme that feels right in every room."; color: root.muted; font-size: 13px * root.text-scale; }
                         HorizontalLayout {
                             spacing: 12px;
                             for choice[index] in ["Dark", "Light", "High contrast", "System"] : Rectangle {
@@ -854,21 +943,48 @@ export component AppWindow inherits Window {
                                             background: index == 2 ? #ffff00 : #a88cff;
                                         }
                                     }
-                                    Text { text: choice; color: root.ink; font-size: 12px; font-weight: 700; overflow: elide; }
+                                    Text { text: choice; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; overflow: elide; }
                                 }
                                 TouchArea { mouse-cursor: pointer; clicked => { root.choose-theme(index); } }
                             }
                         }
+                        Rectangle {
+                            height: 70px; border-radius: 10px; background: root.elevated;
+                            HorizontalLayout {
+                                padding-left: 16px; padding-right: 16px; spacing: 9px;
+                                VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 3px;
+                                    Text { text: "Font scale"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+                                    Text { text: root.font-scale-percent + "% · text throughout the app"; color: root.muted; font-size: 11px * root.text-scale; }
+                                }
+                                IconAction { icon: "−"; label: "Decrease font scale"; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-font-scale(root.font-scale-percent - 10); } }
+                                IconAction { icon: "+"; label: "Increase font scale"; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-font-scale(root.font-scale-percent + 10); } }
+                            }
+                        }
+                        Text { text: "Density"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            for choice[index] in ["Compact", "Comfortable", "Spacious"] : Rectangle {
+                                width: 142px; height: 40px; border-radius: 9px;
+                                background: index == root.density-mode ? root.hover : root.elevated;
+                                border-color: index == root.density-mode ? root.accent : root.divider;
+                                border-width: index == root.density-mode ? 2px : 1px;
+                                accessible-role: button;
+                                accessible-label: "Use " + choice + " room and message density";
+                                accessible-action-default => { root.choose-density(index); }
+                                Text { text: choice; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                                TouchArea { mouse-cursor: pointer; clicked => { root.choose-density(index); } }
+                            }
+                        }
                         Rectangle { height: 1px; background: root.divider; }
-                        Text { text: "Layout"; color: root.ink; font-size: 20px; font-weight: 750; }
+                        Text { text: "Layout"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Rectangle {
                             height: 70px; border-radius: 10px; background: root.elevated;
                             HorizontalLayout {
                                 padding-left: 16px; padding-right: 16px; spacing: 12px;
                                 VerticalLayout {
                                     alignment: center; horizontal-stretch: 1; spacing: 3px;
-                                    Text { text: "Members & thread panel"; color: root.ink; font-size: 13px; font-weight: 700; }
-                                    Text { text: "Show room context beside the conversation"; color: root.muted; font-size: 11px; }
+                                    Text { text: "Members & thread panel"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+                                    Text { text: "Show room context beside the conversation"; color: root.muted; font-size: 11px * root.text-scale; }
                                 }
                                 IconAction {
                                     icon: root.show-side-panel ? "✓" : "+";
@@ -883,8 +999,8 @@ export component AppWindow inherits Window {
                             HorizontalLayout {
                                 padding-left: 16px; padding-right: 16px; spacing: 9px;
                                 VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 3px;
-                                    Text { text: "Room list width"; color: root.ink; font-size: 13px; font-weight: 700; }
-                                    Text { text: root.room-list-width + " px"; color: root.muted; font-size: 11px; }
+                                    Text { text: "Room list width"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+                                    Text { text: root.room-list-width + " px"; color: root.muted; font-size: 11px * root.text-scale; }
                                 }
                                 IconAction { icon: "−"; label: "Narrow room list"; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-room-list-width(root.room-list-width - 20); } }
                                 IconAction { icon: "+"; label: "Widen room list"; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-room-list-width(root.room-list-width + 20); } }
@@ -895,8 +1011,8 @@ export component AppWindow inherits Window {
                             HorizontalLayout {
                                 padding-left: 16px; padding-right: 16px; spacing: 9px;
                                 VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 3px;
-                                    Text { text: "Details panel width"; color: root.ink; font-size: 13px; font-weight: 700; }
-                                    Text { text: root.details-width + " px"; color: root.muted; font-size: 11px; }
+                                    Text { text: "Details panel width"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+                                    Text { text: root.details-width + " px"; color: root.muted; font-size: 11px * root.text-scale; }
                                 }
                                 IconAction { icon: "−"; label: "Narrow details panel"; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-details-width(root.details-width - 20); } }
                                 IconAction { icon: "+"; label: "Widen details panel"; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-details-width(root.details-width + 20); } }
@@ -905,10 +1021,27 @@ export component AppWindow inherits Window {
                         Rectangle {
                             height: 70px; border-radius: 10px; background: root.elevated;
                             HorizontalLayout {
+                                padding-left: 16px; padding-right: 16px; spacing: 12px;
+                                VerticalLayout {
+                                    alignment: center; horizontal-stretch: 1; spacing: 3px;
+                                    Text { text: "Unread rooms first"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+                                    Text { text: "Move unread rooms and DMs to the top of each list"; color: root.muted; font-size: 11px * root.text-scale; }
+                                }
+                                IconAction {
+                                    icon: root.sort-unread-first ? "✓" : "+";
+                                    label: root.sort-unread-first ? "Turn off unread first sorting" : "Turn on unread first sorting";
+                                    ink: root.accent; surface: root.panel; hover-surface: root.hover;
+                                    activated => { root.set-sort-unread-first(!root.sort-unread-first); }
+                                }
+                            }
+                        }
+                        Rectangle {
+                            height: 70px; border-radius: 10px; background: root.elevated;
+                            HorizontalLayout {
                                 padding-left: 16px; padding-right: 16px; spacing: 9px;
                                 VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 3px;
-                                    Text { text: "Timeline performance preview"; color: root.ink; font-size: 13px; font-weight: 700; }
-                                    Text { text: root.stress-timeline-active ? "10,000 synthetic messages loaded" : "Test variable-height messages at scale"; color: root.muted; font-size: 11px; }
+                                    Text { text: "Timeline performance preview"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+                                    Text { text: root.stress-timeline-active ? "10,000 synthetic messages loaded" : "Test variable-height messages at scale"; color: root.muted; font-size: 11px * root.text-scale; }
                                 }
                                 IconAction {
                                     icon: root.stress-timeline-active ? "✓" : "10k";
@@ -919,16 +1052,16 @@ export component AppWindow inherits Window {
                             }
                         }
                         Rectangle { height: 1px; background: root.divider; }
-                        Text { text: "Accounts"; color: root.ink; font-size: 20px; font-weight: 750; }
-                        Text { text: "Select your account in the bottom-left corner to switch instantly."; color: root.muted; font-size: 13px; wrap: word-wrap; }
+                        Text { text: "Accounts"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
+                        Text { text: "Select your account in the bottom-left corner to switch instantly."; color: root.muted; font-size: 13px * root.text-scale; wrap: word-wrap; }
                         Rectangle { height: 1px; background: root.divider; }
-                        Text { text: "Advanced customization"; color: root.ink; font-size: 20px; font-weight: 750; }
-                        Text { text: "Edit your settings and theme pack files. Valid changes appear here automatically."; color: root.muted; font-size: 12px; wrap: word-wrap; }
-                        Text { text: root.config-path; color: root.muted; font-size: 11px; wrap: word-wrap; }
+                        Text { text: "Advanced customization"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
+                        Text { text: "Edit your settings and theme pack files. Valid changes appear here automatically."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                        Text { text: root.config-path; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
                         Rectangle { height: 1px; background: root.divider; }
-                        Text { text: "About"; color: root.ink; font-size: 20px; font-weight: 750; }
-                        Text { text: "Morpheus is an open-source Matrix desktop client."; color: root.muted; font-size: 12px; wrap: word-wrap; }
-                        Text { text: "Interface powered by Slint · slint.dev"; color: root.muted; font-size: 12px; wrap: word-wrap; }
+                        Text { text: "About"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
+                        Text { text: "Morpheus is an open-source Matrix desktop client."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                        Text { text: "Interface powered by Slint · slint.dev"; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         AboutSlint { }
                     }
                 }
@@ -937,12 +1070,12 @@ export component AppWindow inherits Window {
                     vertical-stretch: 1;
                     padding: 24px;
                     spacing: 16px;
-                    Text { text: root.live-session ? "Audio call · " + root.active-room-name : "The Workshop · Lounge"; color: root.ink; font-size: 21px; font-weight: 760; }
+                    Text { text: root.live-session ? "Audio call · " + root.active-room-name : "The Workshop · Lounge"; color: root.ink; font-size: 21px * root.text-scale; font-weight: 760; }
                     Text {
                         text: root.live-session
                             ? (root.native-call-enabled ? root.native-call-status : "Native calls are unavailable in this build")
                             : (root.call-connected ? "Call preview active · no network connection" : "Call preview · no network connection");
-                        color: root.muted; font-size: 12px;
+                        color: root.muted; font-size: 12px * root.text-scale;
                     }
                     if root.live-session : Rectangle {
                         vertical-stretch: 1; background: root.elevated; border-radius: 14px;
@@ -950,7 +1083,7 @@ export component AppWindow inherits Window {
                             text: root.native-call-enabled
                                 ? "Native audio is available when this homeserver advertises a compatible MatrixRTC service. Select a room and join its call."
                                 : "This build does not include the native media backend.";
-                            color: root.muted; font-size: 15px; wrap: word-wrap;
+                            color: root.muted; font-size: 15px * root.text-scale; wrap: word-wrap;
                             horizontal-alignment: center; vertical-alignment: center;
                             x: 28px; width: parent.width - 56px;
                         }
@@ -960,7 +1093,7 @@ export component AppWindow inherits Window {
                             background: root.hover; border-color: root.divider; border-width: 1px;
                             accessible-role: button; accessible-label: "Open MatrixRTC call in selected room";
                             accessible-action-default => { root.open-native-call-slot(); }
-                            Text { text: "Open room call"; color: root.ink; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                            Text { text: "Open room call"; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                             TouchArea { mouse-cursor: pointer; clicked => { root.open-native-call-slot(); } }
                         }
                     }
@@ -970,12 +1103,12 @@ export component AppWindow inherits Window {
                         Rectangle {
                             horizontal-stretch: 1; background: root.elevated; border-radius: 14px;
                             AvatarBadge { x: (parent.width - 74px) / 2; y: (parent.height - 74px) / 2 - 16px; width: 74px; height: 74px; border-radius: 24px; initials: "AM"; accent: #a88cff; }
-                            Text { y: parent.height - 43px; text: "Alex"; color: root.ink; font-size: 13px; font-weight: 700; horizontal-alignment: center; }
+                            Text { y: parent.height - 43px; text: "Alex"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; }
                         }
                         Rectangle {
                             horizontal-stretch: 1; background: root.elevated; border-radius: 14px;
                             AvatarBadge { x: (parent.width - 74px) / 2; y: (parent.height - 74px) / 2 - 16px; width: 74px; height: 74px; border-radius: 24px; initials: "JN"; accent: #f39f78; }
-                            Text { y: parent.height - 43px; text: "Jules"; color: root.ink; font-size: 13px; font-weight: 700; horizontal-alignment: center; }
+                            Text { y: parent.height - 43px; text: "Jules"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; }
                         }
                     }
                     if !root.live-session : HorizontalLayout {
@@ -984,11 +1117,11 @@ export component AppWindow inherits Window {
                         Rectangle {
                             horizontal-stretch: 1; background: root.elevated; border-radius: 14px;
                             AvatarBadge { x: (parent.width - 74px) / 2; y: (parent.height - 74px) / 2 - 16px; width: 74px; height: 74px; border-radius: 24px; initials: "SK"; accent: #78c8b1; }
-                            Text { y: parent.height - 43px; text: "Sam"; color: root.ink; font-size: 13px; font-weight: 700; horizontal-alignment: center; }
+                            Text { y: parent.height - 43px; text: "Sam"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; }
                         }
                         Rectangle {
                             horizontal-stretch: 1; background: root.panel; border-radius: 14px;
-                            Text { text: "Your camera is off"; color: root.muted; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                            Text { text: "Your camera is off"; color: root.muted; font-size: 13px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
                         }
                     }
                     Rectangle {
@@ -1010,7 +1143,7 @@ export component AppWindow inherits Window {
                                         }
                                     } else { root.call-connected = !root.call-connected; }
                                 }
-                                Text { text: root.live-session ? (root.native-call-enabled ? (root.call-connected ? "Leave audio" : "Join audio") : "Unavailable") : (root.call-connected ? "End preview" : "Start preview"); color: #ffffff; font-size: 13px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                                Text { text: root.live-session ? (root.native-call-enabled ? (root.call-connected ? "Leave audio" : "Join audio") : "Unavailable") : (root.call-connected ? "End preview" : "Start preview"); color: #ffffff; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                                 TouchArea { enabled: !root.live-session || root.native-call-enabled; mouse-cursor: pointer; clicked => {
                                     if root.live-session {
                                         if root.call-connected { root.end-native-call(); }
@@ -1042,7 +1175,7 @@ export component AppWindow inherits Window {
                             background: root.side-panel-tab == 0 ? root.hover : transparent;
                             accessible-role: button; accessible-label: "Show members";
                             accessible-action-default => { root.side-panel-tab = 0; }
-                            Text { text: "Members"; color: root.side-panel-tab == 0 ? root.ink : root.muted; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                            Text { text: "Members"; color: root.side-panel-tab == 0 ? root.ink : root.muted; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                             TouchArea { mouse-cursor: pointer; clicked => { root.side-panel-tab = 0; } }
                         }
                         Rectangle {
@@ -1050,7 +1183,7 @@ export component AppWindow inherits Window {
                             background: root.side-panel-tab == 1 ? root.hover : transparent;
                             accessible-role: button; accessible-label: "Show thread";
                             accessible-action-default => { root.side-panel-tab = 1; }
-                            Text { text: "Thread"; color: root.side-panel-tab == 1 ? root.ink : root.muted; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                            Text { text: "Thread"; color: root.side-panel-tab == 1 ? root.ink : root.muted; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                             TouchArea { mouse-cursor: pointer; clicked => { root.side-panel-tab = 1; } }
                         }
                     }
@@ -1063,7 +1196,7 @@ export component AppWindow inherits Window {
                         width: parent.width;
                         padding: 12px;
                         spacing: 10px;
-                        Text { text: "IN THIS ROOM — " + root.members.length; color: root.muted; font-size: 10px; font-weight: 750; letter-spacing: 1px; height: 22px; vertical-alignment: center; }
+                        Text { text: "IN THIS ROOM — " + root.members.length; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; letter-spacing: 1px; height: 22px; vertical-alignment: center; }
                         for member in root.members : Rectangle {
                             height: 43px;
                             background: transparent;
@@ -1072,8 +1205,8 @@ export component AppWindow inherits Window {
                                 AvatarBadge { width: 32px; height: 32px; border-radius: 11px; initials: member.initials; accent: member.accent; }
                                 VerticalLayout {
                                     alignment: center; horizontal-stretch: 1; spacing: 2px;
-                                    Text { text: member.name; color: root.ink; font-size: 12px; font-weight: 700; overflow: elide; }
-                                    Text { text: member.detail; color: root.muted; font-size: 10px; overflow: elide; }
+                                    Text { text: member.name; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; overflow: elide; }
+                                    Text { text: member.detail; color: root.muted; font-size: 10px * root.text-scale; overflow: elide; }
                                 }
                                 Rectangle { width: 7px; height: 7px; border-radius: 4px; background: member.online ? #64c9a7 : root.muted; }
                             }
@@ -1082,25 +1215,99 @@ export component AppWindow inherits Window {
                 }
                 if root.side-panel-tab == 1 : VerticalLayout {
                     vertical-stretch: 1;
-                    padding: 17px;
-                    spacing: 12px;
-                    Text { text: "Thread"; color: root.ink; font-size: 19px; font-weight: 750; }
-                    Text { text: "A closer look at the conversation."; color: root.muted; font-size: 12px; wrap: word-wrap; }
+                    spacing: 0px;
+                    HorizontalLayout {
+                        height: 49px; padding-left: 14px; padding-right: 10px; spacing: 8px;
+                        Text { text: "Thread"; color: root.ink; font-size: 17px * root.text-scale; font-weight: 750; horizontal-stretch: 1; vertical-alignment: center; }
+                        if root.thread-root-id != "" : IconAction {
+                            width: 28px; height: 28px; icon: "×"; label: "Close thread";
+                            ink: root.muted; surface: root.panel; hover-surface: root.hover;
+                            activated => {
+                                root.thread-root-id = "";
+                                root.thread-messages = [];
+                                root.thread-composer-text = "";
+                                root.close-thread();
+                            }
+                        }
+                    }
                     Rectangle { height: 1px; background: root.divider; }
-                    Text { text: "Jules · 10:42 AM"; color: root.ink; font-size: 12px; font-weight: 700; }
-                    Text { text: "I put together a few notes on the layout. The sidebar can stay compact while the conversation takes the lead."; color: root.muted; font-size: 12px; wrap: word-wrap; }
-                    Rectangle { height: 1px; background: root.divider; }
-                    Text { text: "Sam · 10:47 AM"; color: root.ink; font-size: 12px; font-weight: 700; }
-                    Text { text: "The account switcher belongs right beside the current identity. This feels natural."; color: root.muted; font-size: 12px; wrap: word-wrap; }
-                    Rectangle { vertical-stretch: 1; background: transparent; }
-                    Text { text: "Thread replies are shown here."; color: root.muted; font-size: 11px; }
+                    if root.thread-root-id == "" : Text {
+                        text: "Choose a message and open its thread.";
+                        color: root.muted; font-size: 12px * root.text-scale;
+                        wrap: word-wrap; horizontal-alignment: center; vertical-alignment: center;
+                        vertical-stretch: 1;
+                    }
+                    if root.thread-root-id != "" : ScrollView {
+                        vertical-stretch: 1;
+                        horizontal-scrollbar-policy: always-off;
+                        VerticalLayout {
+                            width: parent.width;
+                            padding: 12px;
+                            spacing: 10px;
+                            Text { text: root.thread-root-sender; color: root.ink; font-size: 12px * root.text-scale; font-weight: 750; }
+                            Text { text: root.thread-root-body; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                            Rectangle { height: 1px; background: root.divider; }
+                            Text { text: "REPLIES · " + root.thread-messages.length; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; }
+                            for reply in root.thread-messages : Rectangle {
+                                min-height: 43px;
+                                background: root.elevated;
+                                border-radius: 8px;
+                                VerticalLayout {
+                                    padding: 9px; spacing: 4px;
+                                    Text { text: reply.sender + " · " + reply.time; color: root.accent; font-size: 11px * root.text-scale; font-weight: 700; }
+                                    Text { text: reply.body; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                                }
+                            }
+                        }
+                    }
+                    if root.thread-root-id != "" : Rectangle {
+                        height: 64px; background: root.panel;
+                        HorizontalLayout {
+                            padding-left: 10px; padding-right: 10px; padding-top: 8px; padding-bottom: 8px; spacing: 5px;
+                            Rectangle {
+                                horizontal-stretch: 1; background: root.elevated; border-radius: 8px;
+                                TextInput {
+                                    x: 8px; width: parent.width - 16px; height: parent.height;
+                                    text <=> root.thread-composer-text; color: root.ink; font-size: 12px * root.text-scale;
+                                    accessible-label: "Thread reply composer";
+                                    accepted => { root.send-thread-message(root.thread-composer-text); }
+                                }
+                            }
+                            IconAction {
+                                icon: "➤"; label: "Send thread reply"; ink: root.accent;
+                                surface: root.panel; hover-surface: root.hover;
+                                activated => { root.send-thread-message(root.thread-composer-text); }
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
-    if root.leave-call-dialog : Rectangle {
+    if root.leave-call-dialog : FocusScope {
+        init => { self.focus(); root.leave-call-confirm-focused = false; }
+        key-pressed(event) => {
+            if !root.leave-call-busy {
+                if event.text == Key.Escape {
+                    root.leave-call-dialog = false;
+                    root.pending-account-index = -1;
+                } else if event.text == Key.Tab || event.text == Key.Backtab || event.text == Key.LeftArrow || event.text == Key.RightArrow {
+                    root.leave-call-confirm-focused = !root.leave-call-confirm-focused;
+                } else if event.text == Key.Return || event.text == Key.Space {
+                    if root.leave-call-confirm-focused {
+                        root.confirm-leave-call(root.pending-account-index);
+                    } else {
+                        root.leave-call-dialog = false;
+                        root.pending-account-index = -1;
+                    }
+                }
+            }
+            accept
+        }
+        Rectangle {
         background: #000000aa;
+        TouchArea { width: parent.width; height: parent.height; }
         Rectangle {
             x: (parent.width - 392px) / 2;
             y: (parent.height - 214px) / 2;
@@ -1115,47 +1322,37 @@ export component AppWindow inherits Window {
             VerticalLayout {
                 padding: 22px;
                 spacing: 13px;
-                Text { text: root.live-session ? "Leave call?" : "Leave call preview?"; color: root.ink; font-size: 19px; font-weight: 750; }
-                Text { text: root.live-session ? "Leave the current call before switching accounts or logging out." : "End the current preview before switching accounts or logging out."; color: root.muted; font-size: 12px; wrap: word-wrap; }
+                Text { text: root.leave-call-busy ? "Leaving call…" : root.live-session ? "Leave call?" : "Leave call preview?"; color: root.ink; font-size: 19px * root.text-scale; font-weight: 750; }
+                Text { text: root.pending-account-index == -2 ? "Leave the current call before adding another account." : root.pending-account-index == -3 ? "Leave the current call before logging out." : "Leave the current call before switching accounts."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                 Rectangle { vertical-stretch: 1; background: transparent; }
                 HorizontalLayout {
                     spacing: 9px;
                     alignment: end;
                     Rectangle {
                         width: 104px; height: 36px; border-radius: 8px; background: root.panel;
+                        border-color: root.accent; border-width: root.leave-call-confirm-focused ? 0px : 2px;
                         accessible-role: button; accessible-label: "Cancel account switch";
-                        accessible-action-default => { root.leave-call-dialog = false; root.pending-account-index = -1; }
-                        Text { text: "Cancel"; color: root.ink; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
-                        TouchArea { mouse-cursor: pointer; clicked => { root.leave-call-dialog = false; root.pending-account-index = -1; } }
+                        accessible-enabled: !root.leave-call-busy;
+                        accessible-action-default => { if !root.leave-call-busy { root.leave-call-dialog = false; root.pending-account-index = -1; } }
+                        Text { text: "Cancel"; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { enabled: !root.leave-call-busy; mouse-cursor: pointer; clicked => { root.leave-call-dialog = false; root.pending-account-index = -1; } }
                     }
                     Rectangle {
                         width: 153px; height: 36px; border-radius: 8px; background: root.accent;
-                        accessible-role: button; accessible-label: root.pending-account-index == -3 ? "End preview and log out" : "End preview and switch account";
-                        accessible-action-default => {
-                            root.call-connected = false;
-                            if root.pending-account-index == -2 { root.add-account(); }
-                            else if root.pending-account-index == -3 { root.log-out(); }
-                            else if root.pending-account-index >= 0 { root.switch-account(root.pending-account-index); }
-                            root.leave-call-dialog = false;
-                            root.pending-account-index = -1;
-                            root.account-menu-open = false;
-                        }
-                        Text { text: root.pending-account-index == -3 ? "End & log out" : "End & switch"; color: root.accent-ink; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        border-color: root.accent-ink; border-width: root.leave-call-confirm-focused ? 2px : 0px;
+                        accessible-role: button; accessible-label: root.pending-account-index == -2 ? "Leave call and add account" : root.pending-account-index == -3 ? "Leave call and log out" : "Leave call and switch account";
+                        accessible-enabled: !root.leave-call-busy;
+                        accessible-action-default => { if !root.leave-call-busy { root.confirm-leave-call(root.pending-account-index); } }
+                        Text { text: root.leave-call-busy ? "Leaving…" : "Leave call"; color: root.accent-ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                         TouchArea {
+                            enabled: !root.leave-call-busy;
                             mouse-cursor: pointer;
-                            clicked => {
-                                root.call-connected = false;
-                                if root.pending-account-index == -2 { root.add-account(); }
-                                else if root.pending-account-index == -3 { root.log-out(); }
-                                else if root.pending-account-index >= 0 { root.switch-account(root.pending-account-index); }
-                                root.leave-call-dialog = false;
-                                root.pending-account-index = -1;
-                                root.account-menu-open = false;
-                            }
+                            clicked => { root.confirm-leave-call(root.pending-account-index); }
                         }
                     }
                 }
             }
+        }
         }
     }
 
@@ -1175,8 +1372,8 @@ export component AppWindow inherits Window {
             VerticalLayout {
                 padding: 20px;
                 spacing: 10px;
-                Text { text: "Manage accounts"; color: root.ink; font-size: 21px; font-weight: 760; }
-                Text { text: "The current account appears first. Each account keeps its own rooms and session."; color: root.muted; font-size: 12px; wrap: word-wrap; }
+                Text { text: "Manage accounts"; color: root.ink; font-size: 21px * root.text-scale; font-weight: 760; }
+                Text { text: "The current account appears first. Each account keeps its own rooms and session."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                 ScrollView {
                     vertical-stretch: 1;
                     horizontal-scrollbar-policy: always-off;
@@ -1189,10 +1386,10 @@ export component AppWindow inherits Window {
                                 padding-left: 10px; padding-right: 10px; spacing: 10px;
                                 AvatarBadge { width: 35px; height: 35px; border-radius: 11px; initials: account.initials; accent: account.accent; }
                                 VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 2px;
-                                    Text { text: account.name; color: root.ink; font-size: 12px; font-weight: 700; }
-                                    Text { text: account.handle; color: root.muted; font-size: 10px; }
+                                    Text { text: account.name; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; }
+                                    Text { text: account.handle; color: root.muted; font-size: 10px * root.text-scale; }
                                 }
-                                if account.index == root.active-account-index : Text { text: "CURRENT"; color: root.accent; font-size: 10px; font-weight: 700; vertical-alignment: center; }
+                                if account.index == root.active-account-index : Text { text: "CURRENT"; color: root.accent; font-size: 10px * root.text-scale; font-weight: 700; vertical-alignment: center; }
                             }
                         }
                     }
@@ -1203,7 +1400,7 @@ export component AppWindow inherits Window {
                         width: 120px; height: 38px; background: root.elevated; border-radius: 8px;
                         accessible-role: button; accessible-label: "Add Matrix account";
                         accessible-action-default => { root.manage-accounts-open = false; root.add-account(); }
-                        Text { text: "Add account"; color: root.ink; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        Text { text: "Add account"; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                         TouchArea { mouse-cursor: pointer; clicked => { root.manage-accounts-open = false; root.add-account(); } }
                     }
                     Rectangle { horizontal-stretch: 1; background: transparent; }
@@ -1211,7 +1408,7 @@ export component AppWindow inherits Window {
                         width: 80px; height: 38px; background: root.accent; border-radius: 8px;
                         accessible-role: button; accessible-label: "Close account manager";
                         accessible-action-default => { root.manage-accounts-open = false; }
-                        Text { text: "Done"; color: root.accent-ink; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        Text { text: "Done"; color: root.accent-ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                         TouchArea { mouse-cursor: pointer; clicked => { root.manage-accounts-open = false; } }
                     }
                 }
@@ -1237,28 +1434,28 @@ export component AppWindow inherits Window {
                 spacing: 11px;
                 Rectangle {
                     width: 48px; height: 48px; border-radius: 15px; background: root.accent;
-                    Text { text: "M"; color: root.accent-ink; font-size: 22px; font-weight: 800; horizontal-alignment: center; vertical-alignment: center; }
+                    Text { text: "M"; color: root.accent-ink; font-size: 22px * root.text-scale; font-weight: 800; horizontal-alignment: center; vertical-alignment: center; }
                 }
-                Text { text: "Welcome to Morpheus"; color: root.ink; font-size: 22px; font-weight: 770; }
-                Text { text: "Sign in with an existing Matrix account."; color: root.muted; font-size: 12px; }
+                Text { text: "Welcome to Morpheus"; color: root.ink; font-size: 22px * root.text-scale; font-weight: 770; }
+                Text { text: "Sign in with an existing Matrix account."; color: root.muted; font-size: 12px * root.text-scale; }
                 Rectangle { height: 6px; background: transparent; }
-                Text { text: "HOMESERVER"; color: root.muted; font-size: 10px; font-weight: 750; letter-spacing: 1px; }
+                Text { text: "HOMESERVER"; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
                 Rectangle {
                     height: 42px; background: root.elevated; border-radius: 8px; border-color: root.divider; border-width: 1px; clip: true;
-                    TextInput { x: 11px; width: parent.width - 22px; height: parent.height; text <=> root.login-homeserver; color: root.ink; font-size: 13px; vertical-alignment: center; accessible-label: "Homeserver URL"; }
+                    TextInput { x: 11px; width: parent.width - 22px; height: parent.height; text <=> root.login-homeserver; color: root.ink; font-size: 13px * root.text-scale; vertical-alignment: center; accessible-label: "Homeserver URL"; }
                 }
-                Text { text: "MATRIX ID OR USERNAME"; color: root.muted; font-size: 10px; font-weight: 750; letter-spacing: 1px; }
+                Text { text: "MATRIX ID OR USERNAME"; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
                 Rectangle {
                     height: 42px; background: root.elevated; border-radius: 8px; border-color: root.divider; border-width: 1px; clip: true;
-                    TextInput { x: 11px; width: parent.width - 22px; height: parent.height; text <=> root.login-username; color: root.ink; font-size: 13px; vertical-alignment: center; accessible-label: "Matrix ID or username"; }
+                    TextInput { x: 11px; width: parent.width - 22px; height: parent.height; text <=> root.login-username; color: root.ink; font-size: 13px * root.text-scale; vertical-alignment: center; accessible-label: "Matrix ID or username"; }
                 }
-                Text { text: "PASSWORD"; color: root.muted; font-size: 10px; font-weight: 750; letter-spacing: 1px; }
+                Text { text: "PASSWORD"; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
                 Rectangle {
                     height: 42px; background: root.elevated; border-radius: 8px; border-color: root.divider; border-width: 1px; clip: true;
                     TextInput {
                         x: 11px; width: parent.width - 22px; height: parent.height;
                         text <=> root.login-password; input-type: password;
-                        color: root.ink; font-size: 13px; vertical-alignment: center;
+                        color: root.ink; font-size: 13px * root.text-scale; vertical-alignment: center;
                         accessible-label: "Password";
                         accepted => {
                             if !root.login-loading {
@@ -1270,8 +1467,8 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                if root.login-error != "" : Text { text: root.login-error; color: #e47483; font-size: 11px; wrap: word-wrap; }
-                if root.config-error != "" : Text { text: "Settings file: " + root.config-error; color: #e47483; font-size: 11px; wrap: word-wrap; }
+                if root.login-error != "" : Text { text: root.login-error; color: #e47483; font-size: 11px * root.text-scale; wrap: word-wrap; }
+                if root.config-error != "" : Text { text: "Settings file: " + root.config-error; color: #e47483; font-size: 11px * root.text-scale; wrap: word-wrap; }
                 Rectangle { vertical-stretch: 1; background: transparent; }
                 Rectangle {
                     height: 43px; border-radius: 9px; background: root.accent;
@@ -1286,7 +1483,7 @@ export component AppWindow inherits Window {
                             root.submit-login(root.login-homeserver, root.login-username, password);
                         }
                     }
-                    Text { text: root.login-loading ? "Signing in…" : "Sign in"; color: root.accent-ink; font-size: 13px; font-weight: 750; horizontal-alignment: center; vertical-alignment: center; }
+                    Text { text: root.login-loading ? "Signing in…" : "Sign in"; color: root.accent-ink; font-size: 13px * root.text-scale; font-weight: 750; horizontal-alignment: center; vertical-alignment: center; }
                     TouchArea {
                         enabled: !root.login-loading;
                         mouse-cursor: pointer;
@@ -1310,7 +1507,7 @@ export component AppWindow inherits Window {
                             root.submit-sso(root.login-homeserver);
                         }
                     }
-                    Text { text: "Sign in with browser · Matrix SSO"; color: root.ink; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                    Text { text: "Sign in with browser · Matrix SSO"; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                     TouchArea {
                         enabled: !root.login-loading; mouse-cursor: pointer;
                         clicked => {
@@ -1324,7 +1521,7 @@ export component AppWindow inherits Window {
                     accessible-role: button; accessible-label: "Open interactive preview without signing in";
                     accessible-enabled: !root.login-loading;
                     accessible-action-default => { if !root.login-loading { root.preview-demo(); } }
-                    Text { text: "Explore the interactive preview"; color: root.muted; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+                    Text { text: "Explore the interactive preview"; color: root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
                     preview-hit := TouchArea { enabled: !root.login-loading; mouse-cursor: pointer; clicked => { root.preview-demo(); } }
                 }
             }

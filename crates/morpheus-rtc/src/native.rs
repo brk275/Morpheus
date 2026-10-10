@@ -55,9 +55,9 @@ pub struct CallInfo {
 /// The host must run matrix-sdk-ui's SyncService with MSC4354 sticky events,
 /// keep this account's Tokio runtime running, and call `leave` before dropping
 /// the service. MatrixRTC uses that sync feed for memberships and media keys.
-/// `LiveKitCall` exposes frame streams. Optional device features add a native
-/// two-person audio loop and capture adapters; the host still owns permissions,
-/// video rendering, device controls, and production group-call mixing.
+/// `LiveKitCall` exposes frame streams. Optional device features add native
+/// microphone capture, bounded group-audio playback, and video capture. The
+/// host still owns permissions, video rendering, and device controls.
 pub struct RtcService {
     client: Client,
     calls: HashMap<String, LiveKitCall>,
@@ -105,6 +105,9 @@ impl RtcService {
         encrypted: bool,
     ) -> Result<(), RtcError> {
         self.ensure_loaded_room(room_id)?;
+        if encrypted {
+            self.ensure_encrypted_call_ready().await?;
+        }
         let encryption = encrypted.then(|| SlotEncryption {
             encryption_type: "m.per_member".to_owned(),
             extra: Default::default(),
@@ -131,6 +134,16 @@ impl RtcService {
         let room = self.ensure_loaded_room(room_id)?;
         if self.calls.contains_key(room_id) {
             return Err(RtcError::AlreadyJoined);
+        }
+        let encryption_state = room
+            .latest_encryption_state()
+            .await
+            .map_err(|error| RtcError::EncryptionReadiness(error.to_string()))?;
+        if encryption_state.is_unknown() {
+            return Err(RtcError::UnknownEncryptionState);
+        }
+        if encryption_state.is_encrypted() {
+            self.ensure_encrypted_call_ready().await?;
         }
         let service_url = match self.discover_transport().await? {
             TransportSupport::LiveKit { service_url } => service_url,
@@ -185,6 +198,30 @@ impl RtcService {
         self.client
             .get_room(&room_id)
             .ok_or(RtcError::RoomNotLoaded)
+    }
+
+    async fn ensure_encrypted_call_ready(&self) -> Result<(), RtcError> {
+        // The pinned native SDK sends media keys using MSC4153's identity-based
+        // strategy. Without a verified own cross-signing identity and a signed
+        // current device, joining can appear to succeed while peers receive no
+        // media key. Report that requirement before opening the SFU session.
+        let user_id = self.client.user_id().ok_or(RtcError::SignedOut)?;
+        let encryption = self.client.encryption();
+        let identity = encryption
+            .get_user_identity(user_id)
+            .await
+            .map_err(|error| RtcError::EncryptionReadiness(error.to_string()))?;
+        if !identity.is_some_and(|identity| identity.is_verified()) {
+            return Err(RtcError::EncryptionIdentityNotReady);
+        }
+        let own_device = encryption
+            .get_own_device()
+            .await
+            .map_err(|error| RtcError::EncryptionReadiness(error.to_string()))?;
+        if !own_device.is_some_and(|device| device.is_verified_with_cross_signing()) {
+            return Err(RtcError::EncryptionIdentityNotReady);
+        }
+        Ok(())
     }
 }
 
