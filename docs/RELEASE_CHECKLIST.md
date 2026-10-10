@@ -58,6 +58,12 @@ The preview shell and unit tests alone do not satisfy this gate.
 - [ ] Give private beta recipients the Corresponding Source required by the
       [AGPL](https://www.gnu.org/licenses/agpl-3.0.html) for distributed builds,
       even while the GitHub repository remains private.
+- [ ] Verify the macOS DMG mounts without a full-AGPL agreement and the
+      installed macOS, Windows, and Linux packages contain a readable license
+      and required source notices.
+- [ ] Install and launch the Linux Debian package and AppImage on Ubuntu 22.04
+      under Wayland and X11; confirm the generated `Depends` and ELF glibc and
+      libstdc++ symbol requirements match that baseline.
 - [ ] Test upgrades from installed older builds, failed or interrupted updates,
       recovery or rollback, retained account data, and update behavior during
       a call on every applicable platform.

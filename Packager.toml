@@ -4,12 +4,34 @@ identifier = "io.github.brk275.morpheus"
 version = "0.1.0"
 description = "A native, customizable Matrix desktop client"
 homepage = "https://github.com/brk275/Morpheus"
-license-file = "LICENSE"
 out-dir = "dist"
 binaries-dir = "target/release"
 before-packaging-command = "cargo build --release --locked -p morpheus-app --features native-calls"
 icons = ["assets/icon.png", "assets/icon.icns", "assets/icon.ico"]
-resources = ["themes/aurora.toml"]
+resources = ["themes/aurora.toml", "LICENSE"]
+
+[deb]
+depends = [
+  "libc6 (>= 2.35)",
+  "libstdc++6",
+  "libgcc-s1",
+  "libfontconfig1",
+  "libasound2t64 | libasound2",
+  "libdbus-1-3",
+  "libsqlite3-0",
+  "libegl1",
+  "libxkbcommon0",
+  "libxkbcommon-x11-0",
+  "libwayland-client0",
+  "libx11-6",
+  "libxcb1",
+  "libxcursor1",
+  "libxrandr2",
+  "libpipewire-0.3-0",
+]
+
+[deb.files]
+"LICENSE" = "usr/share/doc/morpheus/copyright"
 
 [macos]
 info-plist-path = "packaging/macos/Info.plist"
