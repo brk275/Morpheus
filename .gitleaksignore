@@ -1,3 +1,7 @@
 # Confirmed historical false positive: Object.keys().every() key-name comparison.
 # This exact commit/path/rule/line contains no credential; all other matches fail.
 a5074a35d0f8f48bb2f76d4afbbb0dd2418765cd:scripts/element_call_peer.mjs:generic-api-key:225
+
+# Public upstream livekit-api 0.5.3 test JWT; verified with its public dummy key.
+# SHA256: 45fb9c7ff611f830d96b61c071a3b4d6b6b034442e424acef10566fb705838d0
+6888d131799dd715a24f79dd5e03696441d78f05:vendor/livekit-api/src/test_token.txt:jwt:1
