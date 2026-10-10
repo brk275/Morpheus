@@ -2,6 +2,7 @@
 //! All Matrix work runs on Tokio; UI models are created on Slint's event loop.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -10,8 +11,9 @@ use std::time::{Duration, Instant};
 
 use chrono::{Local, TimeZone};
 use morpheus_matrix::{
-    AccountInfo, AccountManager, MatrixCoreError, MessageInfo, MessageSendState, QueuedMessage,
-    RoomInfo, RoomMembership, SyncBackend, SyncStatus,
+    AccountInfo, AccountManager, DownloadedAttachment, MatrixCoreError, MessageInfo,
+    MessageSendState, QueuedAttachment, QueuedMessage, RoomInfo, RoomMembership, SyncBackend,
+    SyncStatus,
 };
 use slint::{Color, ModelRc, SharedString, VecModel, Weak};
 use tokio::{
@@ -20,6 +22,7 @@ use tokio::{
     task::JoinHandle,
 };
 
+use crate::attachments::save_download;
 use crate::drafts::DraftStore;
 use crate::{AccountItem, AccountOption, AppWindow, MemberItem, MessageItem, RoomItem, SpaceItem};
 
@@ -838,6 +841,90 @@ impl LiveUi {
         Ok(())
     }
 
+    pub async fn require_media_context(
+        &self,
+        account_id: &str,
+        room_id: &str,
+    ) -> Result<(), MatrixCoreError> {
+        self.require_selected_room(room_id).await?;
+        if self
+            .manager
+            .active_account()
+            .await
+            .as_ref()
+            .map(|account| account.id.as_str())
+            != Some(account_id)
+        {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        Ok(())
+    }
+
+    pub async fn send_attachment(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        path: PathBuf,
+        mime_type: &str,
+    ) -> Result<QueuedAttachment, MatrixCoreError> {
+        self.require_media_context(account_id, room_id).await?;
+        let queued = self
+            .manager
+            .send_attachment_for(account_id, room_id, path, mime_type)
+            .await?;
+        if let Err(error) = self.require_media_context(account_id, room_id).await {
+            let _ = queued.abort().await;
+            return Err(error);
+        }
+        Ok(queued)
+    }
+
+    pub async fn download_attachment(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        event_id: &str,
+    ) -> Result<DownloadedAttachment, MatrixCoreError> {
+        self.require_media_context(account_id, room_id).await?;
+        let downloaded = self
+            .manager
+            .download_attachment_for(account_id, room_id, event_id)
+            .await?;
+        self.require_media_context(account_id, room_id).await?;
+        Ok(downloaded)
+    }
+
+    /// Commit decrypted bytes only while this exact account and room remain
+    /// selected. Navigation and account switching wait for the bounded local
+    /// write, preventing cross-account saves after an asynchronous download.
+    pub async fn save_download_to(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        path: PathBuf,
+        bytes: Vec<u8>,
+    ) -> Result<PathBuf, MatrixCoreError> {
+        let _transition = self.account_transition.lock().await;
+        let selected = self.selected_room.lock().await;
+        if !self.is_live.load(Ordering::Acquire) || selected.as_deref() != Some(room_id) {
+            return Err(MatrixCoreError::SelectedRoomChanged);
+        }
+        if self
+            .manager
+            .active_account()
+            .await
+            .as_ref()
+            .map(|account| account.id.as_str())
+            != Some(account_id)
+        {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        tokio::task::spawn_blocking(move || save_download(&path, &bytes))
+            .await
+            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?
+            .map_err(MatrixCoreError::Io)
+    }
+
     pub async fn send(
         &self,
         account_id: String,
@@ -982,6 +1069,7 @@ fn apply_snapshot(ui: &AppWindow, view: Snapshot, drafts: &DraftStore) {
         ui.set_room_action_operation(ui.get_room_action_operation().wrapping_add(1));
     }
     if selection_changed {
+        crate::reset_attachment_view(ui);
         ui.set_composer_text(drafts.get(&view.active.id, next_room_id).into());
         ui.set_composer_mode(0);
         ui.set_composer_target_id("".into());
@@ -1177,9 +1265,13 @@ fn message_item(info: &MessageInfo) -> MessageItem {
         sender: sender.into(),
         initials: sender_initials.into(),
         time: time.into(),
-        body: info.body.as_str().into(),
+        body: if info.attachment_name.as_deref() == Some(info.body.as_str()) {
+            SharedString::default()
+        } else {
+            info.body.as_str().into()
+        },
         reply_to: info.reply_preview.as_deref().unwrap_or("").into(),
-        attachment: SharedString::default(),
+        attachment: info.attachment_name.as_deref().unwrap_or("").into(),
         reaction: info.reaction_summary.as_str().into(),
         accent: accent(&info.sender),
     }

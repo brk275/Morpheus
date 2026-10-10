@@ -13,7 +13,7 @@ use morpheus_matrix::{AccountManager, SyncBackend, SyncStatus};
 use morpheus_rtc::ScreenCapture;
 use morpheus_rtc::{
     AudioFrame, CallOptions, I420Buffer, MediaStreamKind, RtcError, RtcService, VideoFrame,
-    VideoRotation,
+    VideoRotation, VoiceSpaceMarker,
 };
 use serde::Deserialize;
 use tokio::sync::oneshot;
@@ -157,9 +157,9 @@ async fn bootstrap_test_identity(client: &Client, account: &TestAccount) {
 async fn wait_for_peer(rtc: &RtcService, room_id: &str, peer_user_id: &str, present: bool) {
     timeout(Duration::from_secs(45), async {
         loop {
-            let call = rtc.call(room_id).expect("Call vanished");
-            if call
-                .participants()
+            if rtc
+                .participants(room_id)
+                .expect("Call roster vanished")
                 .iter()
                 .any(|member| member.user_id == peer_user_id)
                 == present
@@ -525,6 +525,25 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
             .expect("RTC discovery failed")
             .is_supported()
     );
+    alice_rtc
+        .set_voice_space_marker(room_id, true)
+        .await
+        .expect("Cannot designate shared voice space");
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if bob_rtc
+                .voice_space_marker(room_id)
+                .await
+                .expect("Cannot read shared voice-space marker")
+                == Some(VoiceSpaceMarker::ENABLED)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("Bob did not receive the shared voice-space marker");
     alice_rtc
         .open_slot(room_id, "m.call#room", true)
         .await

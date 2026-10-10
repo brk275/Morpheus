@@ -20,7 +20,7 @@
 //! `open_slot()` writes `m.rtc.slot` only on an explicit user action. It reads
 //! the room's current encryption state and never uses Morpheus's optional
 //! voice-space presentation marker to decide permissions or call semantics.
-//! Live mute, deafen, camera, and video rendering are not exposed here yet.
+//! Live mute, deafen, and local camera publishing are not exposed here yet.
 
 use std::{
     fmt,
@@ -41,6 +41,8 @@ use tokio::{
     sync::{Mutex, oneshot, watch},
     time::timeout,
 };
+
+use crate::video_render::{RosterUpdate, VideoUpdate, run_remote_video};
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 const JOIN_TIMEOUT: Duration = Duration::from_secs(45);
@@ -181,7 +183,29 @@ enum CallSlot {
 struct Shared {
     slot: Mutex<CallSlot>,
     status: watch::Sender<CallStatus>,
+    video: watch::Sender<VideoUpdate>,
+    roster: watch::Sender<RosterUpdate>,
+    active_video_token: AtomicU64,
     next_token: AtomicU64,
+}
+
+impl Shared {
+    fn clear_video(&self, token: u64) {
+        let cleared = self
+            .active_video_token
+            .compare_exchange(token, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        // A late producer can race the first clear while its async task is
+        // being cancelled. Re-send on final worker cleanup, but never clear a
+        // newer call's generation.
+        if cleared || self.active_video_token.load(Ordering::SeqCst) == 0 {
+            self.video.send_replace(VideoUpdate::Clear { token: 0 });
+            self.roster.send_replace(RosterUpdate {
+                token: 0,
+                members: Vec::new(),
+            });
+        }
+    }
 }
 
 /// Owns at most one native audio call for the selected account. The worker
@@ -194,11 +218,19 @@ pub struct CallController {
 impl CallController {
     pub fn new(manager: Arc<AccountManager>) -> Self {
         let (status, _) = watch::channel(CallStatus::Idle);
+        let (video, _) = watch::channel(VideoUpdate::Clear { token: 0 });
+        let (roster, _) = watch::channel(RosterUpdate {
+            token: 0,
+            members: Vec::new(),
+        });
         Self {
             manager,
             shared: Arc::new(Shared {
                 slot: Mutex::new(CallSlot::Idle),
                 status,
+                video,
+                roster,
+                active_video_token: AtomicU64::new(0),
                 next_token: AtomicU64::new(1),
             }),
         }
@@ -206,6 +238,19 @@ impl CallController {
 
     pub fn subscribe_status(&self) -> watch::Receiver<CallStatus> {
         self.shared.status.subscribe()
+    }
+
+    pub fn subscribe_video(&self) -> watch::Receiver<VideoUpdate> {
+        self.shared.video.subscribe()
+    }
+
+    pub fn subscribe_roster(&self) -> watch::Receiver<RosterUpdate> {
+        self.shared.roster.subscribe()
+    }
+
+    /// A queued UI update may only render for the current call generation.
+    pub fn video_token(&self) -> u64 {
+        self.shared.active_video_token.load(Ordering::SeqCst)
     }
 
     pub fn status(&self) -> CallStatus {
@@ -308,6 +353,14 @@ impl CallController {
                 cancel: Some(cancel_tx),
                 done: done_rx,
             });
+            self.shared
+                .active_video_token
+                .store(token, Ordering::SeqCst);
+            self.shared.video.send_replace(VideoUpdate::Clear { token });
+            self.shared.roster.send_replace(RosterUpdate {
+                token,
+                members: Vec::new(),
+            });
             self.shared.status.send_replace(CallStatus::Starting {
                 account_id: account.id.clone(),
                 room_id: room_id.to_owned(),
@@ -372,6 +425,7 @@ impl CallController {
         if let Some(cancel) = cancel {
             let _ = cancel.send(());
         }
+        self.shared.clear_video(token);
         let finished = timeout(SHUTDOWN_TIMEOUT, async {
             loop {
                 if let Some(result) = done.borrow_and_update().clone() {
@@ -472,6 +526,7 @@ impl CallWorker {
             .await
             .is_err()
         {
+            self.shared.clear_video(self.token);
             let leave = leave_with_timeout(&mut rtc, &self.room_id).await;
             self.send_ready(Err(CallControllerError::Cancelled));
             self.finish(leave.map_err(|error| error.to_string()), None)
@@ -519,6 +574,7 @@ impl CallWorker {
                 }
             )
         {
+            self.shared.clear_video(self.token);
             let reason = if account_still_active {
                 CallControllerError::Unavailable(AudioCallCapability::StickySyncRequired(
                     sync_state,
@@ -533,7 +589,17 @@ impl CallWorker {
         }
         let media_result = {
             let audio = rtc.run_audio(&self.room_id);
+            let video = run_remote_video(
+                &rtc,
+                &self.room_id,
+                self.token,
+                self.shared.video.clone(),
+                self.shared.roster.clone(),
+                &self.shared.active_video_token,
+            );
             tokio::pin!(audio);
+            tokio::pin!(video);
+            let mut video_running = true;
             loop {
                 tokio::select! {
                     _ = &mut self.cancel => break Ok(()),
@@ -550,9 +616,13 @@ impl CallWorker {
                         }
                     }
                     result = &mut audio => break result.map_err(CallControllerError::Media),
+                    // A closed roster/video stream must not end microphone
+                    // audio. run_remote_video normally waits for cancellation.
+                    () = &mut video, if video_running => video_running = false,
                 }
             }
         };
+        self.shared.clear_video(self.token);
         let leave_result = leave_with_timeout(&mut rtc, &self.room_id).await;
         let cleanup = leave_result.map_err(|error| error.to_string());
         self.finish(cleanup, media_result.err().map(|error| error.to_string()))
@@ -645,6 +715,7 @@ impl CallWorker {
     }
 
     async fn finish(&self, cleanup: Result<(), String>, failure: Option<String>) {
+        self.shared.clear_video(self.token);
         {
             let mut slot = self.shared.slot.lock().await;
             if matches!(&*slot, CallSlot::Running(running) if running.token == self.token)
@@ -716,5 +787,43 @@ async fn ensure_account(
         Ok(())
     } else {
         Err(CallControllerError::AccountChanged)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn final_cleanup_reasserts_clear_after_late_old_call_update() {
+        let (status, _) = watch::channel(CallStatus::Idle);
+        let (video, _) = watch::channel(VideoUpdate::Clear { token: 5 });
+        let (roster, _) = watch::channel(RosterUpdate {
+            token: 5,
+            members: Vec::new(),
+        });
+        let shared = Shared {
+            slot: Mutex::new(CallSlot::Idle),
+            status,
+            video,
+            roster,
+            active_video_token: AtomicU64::new(5),
+            next_token: AtomicU64::new(6),
+        };
+        shared.clear_video(5);
+        assert_eq!(shared.active_video_token.load(Ordering::SeqCst), 0);
+        shared.video.send_replace(VideoUpdate::Clear { token: 5 });
+        shared.roster.send_replace(RosterUpdate {
+            token: 5,
+            members: Vec::new(),
+        });
+        shared.clear_video(5);
+        assert_eq!(shared.video.borrow().token(), 0);
+        assert_eq!(shared.roster.borrow().token, 0);
+
+        shared.active_video_token.store(6, Ordering::SeqCst);
+        shared.video.send_replace(VideoUpdate::Clear { token: 6 });
+        shared.clear_video(5);
+        assert_eq!(shared.video.borrow().token(), 6);
     }
 }

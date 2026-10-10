@@ -22,7 +22,12 @@ formatting, media, and device-management changes.
 - [ ] Send and display plain text, formatted text, links, mentions, emoji,
       stickers, replies, edits, redactions, reactions, and threaded messages.
 - [ ] Upload, download, preview, and safely open images, video, audio, and
-      files in encrypted and unencrypted rooms.
+      files in encrypted and unencrypted rooms. The Matrix core passed an
+      encrypted binary-file upload/download roundtrip with metadata, account
+      isolation, and a local plaintext-store scan. Native attach/save dialogs,
+      a timeline card, progress, cancel, and same-transaction retry are wired;
+      live UI acceptance, media previews, type coverage, and unencrypted-room
+      checks remain open.
 - [ ] Search rooms, users, and message history; show results in their room and
       timeline context.
 - [ ] Preserve per-room drafts, including across restart; failed sends keep the
@@ -45,9 +50,15 @@ formatting, media, and device-management changes.
 ## Calls and desktop behavior
 
 - [ ] DM and ordinary room calls ring appropriately; voice spaces allow drop-in
-      joins without ringing every member and show a participant roster.
+      joins without ringing every member and show a participant roster. A
+      shared voice-space room-state marker and Morpheus roster snapshot passed
+      a local two-device test. The native call-stage roster compiles, but
+      voice-space navigation and live roster UI acceptance remain open.
 - [ ] Encrypted voice and video, reconnect, device selection, and screen share
-      interoperate with Element Call on compatible homeservers.
+      interoperate with Element Call on compatible homeservers. Local encrypted
+      transport has carried synthetic camera/audio and real macOS display and
+      window pixels. The remote tile compiles; received-frame playback in that
+      tile, publish controls, reconnect, and Element Call interop are unverified.
 - [ ] Settings, themes, accessibility, and platform packaging work on macOS,
       Windows, and Linux.
 

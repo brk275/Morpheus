@@ -62,6 +62,34 @@ The Space assertion covers the successful create request; delayed Space
 classification in the SDK room list is handled by the app's temporary Space
 entry and still needs a dedicated UI test.
 
+## Test encrypted attachments
+
+With both local servers running and the protected fixture path set:
+
+```sh
+PATH=/opt/homebrew/opt/rustup/bin:$PATH cargo test --locked -p morpheus-matrix --test media_local -- --nocapture
+```
+
+This opt-in test signs in disposable Alice and Bob on Synapse A, uploads a
+binary file to their encrypted room through the persistent Matrix send queue,
+and downloads it through Bob's session. It checks exact decrypted bytes,
+filename, MIME type, declared size, encrypted-file metadata, and rejection of
+a mismatched active account. After removing the plaintext input file, it scans
+the sender and receiver account stores for a unique payload prefix. A passing
+run logs out both test devices, removes their OS-vault entries, and deletes
+their temporary stores. A failed run can leave a temporary store for diagnosis.
+
+Uploads are capped at 25 MiB before entering the SDK. Downloads reject absent
+or excessive declared sizes and check the returned bytes again. The pinned
+SDK buffers the HTTP response before that second check, so a server that lies
+about size can transiently exceed the cap. The test covers the Matrix core;
+the app's attach/save dialogs, upload controls, timeline card, and preview/open
+behavior remain separate live UI acceptance work. Send queues run for the
+selected account and pause on an account switch; an already in-flight upload
+may finish. Recoverable room-queue errors retry with bounded backoff while
+the account stays selected. A retained request is not treated as a terminal
+failure or offered as a new duplicate send.
+
 ## Test encrypted composer drafts
 
 With both local servers running and the protected fixture path set:

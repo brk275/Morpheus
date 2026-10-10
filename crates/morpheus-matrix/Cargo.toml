@@ -10,6 +10,7 @@ description = "Matrix accounts, sync, rooms, and timelines for Morpheus"
 # crates at the same revision so their Client/Room types are identical.
 matrix-sdk = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd", features = ["sqlite", "e2e-encryption", "experimental-search", "experimental-send-custom-to-device", "unstable-msc4354"] }
 matrix-sdk-ui = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd", features = ["unstable-msc4354"] }
+mime = "0.3"
 eyeball-im = "0.9"
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }

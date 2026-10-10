@@ -1,0 +1,72 @@
+name: Unsigned internal package QA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
+  # linuxdeploy is an AppImage and GitHub runners do not need FUSE to extract it.
+  APPIMAGE_EXTRACT_AND_RUN: "1"
+
+jobs:
+  package:
+    name: Unsigned internal QA (${{ matrix.label }})
+    if: github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event.repository.private == true
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            label: macos-arm64
+            formats: dmg
+            artifact: dist/*.dmg
+          - os: macos-15-intel
+            label: macos-x64
+            formats: dmg
+            artifact: dist/*.dmg
+          - os: windows-2025
+            label: windows-x64
+            formats: nsis
+            artifact: dist/*.exe
+          - os: ubuntu-24.04
+            label: linux-x64
+            formats: deb,appimage
+            artifact: |
+              dist/*.deb
+              dist/*.AppImage
+    steps:
+      - uses: actions/checkout@v4
+      - name: Linux native dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev libclang-dev libdbus-1-dev libegl-dev \
+            libfontconfig1-dev libfuse2t64 libgbm-dev libglib2.0-dev \
+            libpipewire-0.3-dev libssl-dev libudev-dev libwayland-dev \
+            libx11-dev libx11-xcb-dev libxcb1-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libxcursor-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libxrandr-dev pkg-config
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Install pinned Cargo Packager
+        run: cargo install cargo-packager --version 0.11.8 --locked
+      - name: Build unsigned QA package
+        run: cargo packager --release --formats ${{ matrix.formats }}
+      - name: Upload unsigned internal QA package
+        uses: actions/upload-artifact@v4
+        with:
+          name: morpheus-UNSIGNED-INTERNAL-QA-${{ matrix.label }}-${{ github.run_number }}
+          path: ${{ matrix.artifact }}
+          if-no-files-found: error
+          retention-days: 5
+          compression-level: 0

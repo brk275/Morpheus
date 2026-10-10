@@ -1,27 +1,35 @@
 //! Native desktop shell with a live Matrix session and an explicit offline preview.
 #![recursion_limit = "512"]
 
+mod attachments;
 #[cfg(feature = "native-calls")]
 mod calls;
 mod drafts;
 mod live;
 mod sso;
+#[cfg(feature = "native-calls")]
+mod video_render;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+#[cfg(feature = "native-calls")]
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, atomic::Ordering};
 use std::thread;
 use std::time::Duration;
 
 use directories::ProjectDirs;
 use morpheus_config::{Config, ConfigStore, Density, LoadedConfig, ThemeMode, ThemePack};
-use morpheus_matrix::{AccountManager, QueuedSendOutcome};
+use morpheus_matrix::{AccountManager, AttachmentSendUpdate, QueuedSendUpdate};
 use slint::{Color, Model, ModelRc, SharedString, VecModel};
 
+use crate::attachments::{UploadCommand, UploadController, mime_type_for};
 #[cfg(feature = "native-calls")]
 use crate::calls::{CallController, CallStatus};
 use crate::live::{LiveUi, MessageTarget, RoomAction, show_error};
+#[cfg(feature = "native-calls")]
+use crate::video_render::VideoUpdate;
 
 slint::include_modules!();
 
@@ -661,6 +669,60 @@ fn finish_composer_submission(
     }
 }
 
+fn reset_attachment_view(ui: &AppWindow) {
+    // A queued upload may continue in its room after navigation. Its event
+    // loop update must not repaint the newly selected account or room.
+    ui.set_attachment_operation(ui.get_attachment_operation().wrapping_add(1));
+    ui.set_attachment_busy(false);
+    ui.set_attachment_needs_retry(false);
+    ui.set_attachment_status("".into());
+    ui.set_download_operation(ui.get_download_operation().wrapping_add(1));
+    ui.set_downloading_event_id("".into());
+    ui.set_transfer_notice("".into());
+}
+
+fn post_upload_progress(
+    weak: &slint::Weak<AppWindow>,
+    account_id: String,
+    room_id: String,
+    operation: i32,
+    status: String,
+    needs_retry: bool,
+) {
+    let _ = weak.upgrade_in_event_loop(move |ui| {
+        if ui.get_active_account_local_id().as_str() == account_id
+            && ui.get_active_room_id().as_str() == room_id
+            && ui.get_attachment_operation() == operation
+        {
+            ui.set_attachment_status(status.into());
+            ui.set_attachment_needs_retry(needs_retry);
+        }
+    });
+}
+
+fn post_upload_completion(
+    weak: &slint::Weak<AppWindow>,
+    account_id: String,
+    room_id: String,
+    operation: i32,
+    outcome: Result<String, String>,
+) {
+    let _ = weak.upgrade_in_event_loop(move |ui| {
+        if ui.get_active_account_local_id().as_str() == account_id
+            && ui.get_active_room_id().as_str() == room_id
+            && ui.get_attachment_operation() == operation
+        {
+            ui.set_attachment_busy(false);
+            ui.set_attachment_needs_retry(false);
+            ui.set_attachment_status("".into());
+            match outcome {
+                Ok(notice) => ui.set_transfer_notice(notice.into()),
+                Err(error) => ui.set_session_error(error.into()),
+            }
+        }
+    });
+}
+
 fn switch_account(state: &mut PreviewState, index: usize) {
     if let Some(account) = state.accounts.get(index) {
         state.active_account = index;
@@ -807,6 +869,52 @@ fn call_status_label(status: &CallStatus) -> String {
 }
 
 #[cfg(feature = "native-calls")]
+fn call_participant_item(participant: morpheus_rtc::ParticipantInfo) -> CallParticipantItem {
+    use morpheus_rtc::RtcStreamKind;
+
+    let has_live = |kind| {
+        participant
+            .streams
+            .iter()
+            .any(|stream| stream.kind == kind && !stream.muted)
+    };
+    let microphone = participant
+        .streams
+        .iter()
+        .find(|stream| stream.kind == RtcStreamKind::Microphone);
+    let mut media = Vec::new();
+    if has_live(RtcStreamKind::ScreenShare) {
+        media.push("Sharing screen");
+    } else if has_live(RtcStreamKind::Camera) {
+        media.push("Camera on");
+    }
+    match microphone {
+        Some(stream) if stream.muted => media.push("Mic muted"),
+        Some(_) => media.push("Mic on"),
+        None => {}
+    }
+    let detail = if !participant.reachable {
+        "Media unavailable".to_owned()
+    } else if media.is_empty() {
+        "In call".to_owned()
+    } else {
+        media.join(" · ")
+    };
+    CallParticipantItem {
+        name: participant.user_id.into(),
+        detail: detail.into(),
+        is_local: participant.is_local,
+    }
+}
+
+#[cfg(feature = "native-calls")]
+fn clear_native_video(ui: &AppWindow) {
+    ui.set_native_video_visible(false);
+    ui.set_native_video_frame(slint::Image::default());
+    ui.set_native_video_source(SharedString::default());
+}
+
+#[cfg(feature = "native-calls")]
 fn ask_to_leave_call(ui: &slint::Weak<AppWindow>, calls: &CallController, action: i32) -> bool {
     if !calls.status().blocks_account_switch() {
         return false;
@@ -845,6 +953,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     let live = LiveUi::new(manager.clone(), runtime.handle().clone(), ui.as_weak());
+    let uploads = Arc::new(UploadController::default());
     ui.set_native_call_enabled(cfg!(feature = "native-calls"));
     ui.set_native_call_status("Select a room to check call availability".into());
     #[cfg(feature = "native-calls")]
@@ -864,6 +973,82 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ui.set_native_call_status(label.into());
                 });
                 if status.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    #[cfg(feature = "native-calls")]
+    {
+        let calls = calls.clone();
+        let weak = ui.as_weak();
+        let applied_token = Arc::new(AtomicU64::new(0));
+        runtime.spawn(async move {
+            let mut roster = calls.subscribe_roster();
+            loop {
+                let update = roster.borrow_and_update().clone();
+                let members: Vec<_> = update
+                    .members
+                    .into_iter()
+                    .map(call_participant_item)
+                    .collect();
+                let calls_for_ui = calls.clone();
+                let applied_token = applied_token.clone();
+                let closed = weak
+                    .upgrade_in_event_loop(move |ui| {
+                        let current = calls_for_ui.video_token();
+                        if update.token != current {
+                            if applied_token.load(Ordering::SeqCst) != current {
+                                ui.set_native_call_participants(ModelRc::new(VecModel::from(
+                                    Vec::<CallParticipantItem>::new(),
+                                )));
+                                applied_token.store(current, Ordering::SeqCst);
+                            }
+                            return;
+                        }
+                        ui.set_native_call_participants(ModelRc::new(VecModel::from(members)));
+                        applied_token.store(current, Ordering::SeqCst);
+                    })
+                    .is_err();
+                if closed || roster.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    #[cfg(feature = "native-calls")]
+    {
+        let calls = calls.clone();
+        let weak = ui.as_weak();
+        let applied_token = Arc::new(AtomicU64::new(0));
+        runtime.spawn(async move {
+            let mut video = calls.subscribe_video();
+            loop {
+                let update = video.borrow_and_update().clone();
+                let calls_for_ui = calls.clone();
+                let applied_token = applied_token.clone();
+                let closed = weak
+                    .upgrade_in_event_loop(move |ui| {
+                        let current = calls_for_ui.video_token();
+                        if update.token() != current {
+                            if applied_token.load(Ordering::SeqCst) != current {
+                                clear_native_video(&ui);
+                                applied_token.store(current, Ordering::SeqCst);
+                            }
+                            return;
+                        }
+                        match update {
+                            VideoUpdate::Clear { .. } => clear_native_video(&ui),
+                            VideoUpdate::Frame { pixels, source, .. } => {
+                                ui.set_native_video_frame(slint::Image::from_rgb8(pixels));
+                                ui.set_native_video_source(source.into());
+                                ui.set_native_video_visible(true);
+                            }
+                        }
+                        applied_token.store(current, Ordering::SeqCst);
+                    })
+                    .is_err();
+                if closed || video.changed().await.is_err() {
                     break;
                 }
             }
@@ -1172,6 +1357,255 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let weak = ui.as_weak();
+    let attach_live = live.clone();
+    let attach_uploads = uploads.clone();
+    let attach_handle = runtime.handle().clone();
+    ui.on_attach_file(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if !attach_live.is_live.load(Ordering::Acquire)
+            || ui.get_active_room_id().is_empty()
+            || ui.get_composer_mode() != 0
+            || ui.get_attachment_busy()
+        {
+            return;
+        }
+        let account_id = ui.get_active_account_local_id().to_string();
+        let room_id = ui.get_active_room_id().to_string();
+        // The system picker runs modally on the Slint UI thread, which is
+        // required by macOS AppKit. Network and file reads stay on Tokio.
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Choose an attachment")
+            .pick_file()
+        else {
+            return;
+        };
+        if ui.get_active_account_local_id().as_str() != account_id
+            || ui.get_active_room_id().as_str() != room_id
+        {
+            return;
+        }
+        let filename = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "attachment".into());
+        let mime_type = mime_type_for(&path);
+        let operation = ui.get_attachment_operation().wrapping_add(1);
+        ui.set_attachment_operation(operation);
+        ui.set_attachment_busy(true);
+        ui.set_attachment_status(format!("Preparing {filename}…").into());
+        ui.set_transfer_notice("".into());
+        let mut commands = attach_uploads.begin(operation);
+        let live = attach_live.clone();
+        let weak = weak.clone();
+        let uploads = attach_uploads.clone();
+        attach_handle.spawn(async move {
+            let result = live
+                .send_attachment(&account_id, &room_id, path, &mime_type)
+                .await;
+            let mut queued = match result {
+                Ok(queued) => queued,
+                Err(error) => {
+                    uploads.finish(operation);
+                    post_upload_completion(
+                        &weak,
+                        account_id,
+                        room_id,
+                        operation,
+                        Err(format!("Could not attach {filename}: {error}")),
+                    );
+                    return;
+                }
+            };
+            loop {
+                tokio::select! {
+                    biased;
+                    command = commands.recv() => match command {
+                        Some(UploadCommand::Cancel) => match queued.abort().await {
+                            Ok(true) => {
+                                uploads.finish(operation);
+                                post_upload_completion(
+                                    &weak, account_id, room_id, operation,
+                                    Ok(format!("Cancelled {filename}")),
+                                );
+                                return;
+                            }
+                            Ok(false) => {
+                                uploads.finish(operation);
+                                post_upload_completion(
+                                    &weak, account_id, room_id, operation,
+                                    Ok(format!("{filename} was already sent")),
+                                );
+                                return;
+                            }
+                            Err(error) => post_upload_progress(
+                                &weak, account_id.clone(), room_id.clone(), operation,
+                                format!("Could not cancel {filename}: {error}"), true,
+                            ),
+                        },
+                        Some(UploadCommand::Retry) => match queued.retry_wedged().await {
+                            Ok(()) => post_upload_progress(
+                                &weak, account_id.clone(), room_id.clone(), operation,
+                                format!("Retrying {filename}…"), false,
+                            ),
+                            Err(error) => post_upload_progress(
+                                &weak, account_id.clone(), room_id.clone(), operation,
+                                format!("Could not retry {filename}: {error}"), true,
+                            ),
+                        },
+                        None => return,
+                    },
+                    update = queued.next_update() => match update {
+                        AttachmentSendUpdate::Progress { current, total } => {
+                            let percent = if total == 0 { 0 } else { current.min(total) * 100 / total };
+                            post_upload_progress(
+                                &weak,
+                                account_id.clone(),
+                                room_id.clone(),
+                                operation,
+                                format!("Uploading {filename} · {percent}%"),
+                                false,
+                            );
+                        }
+                        AttachmentSendUpdate::Sent { .. } => {
+                            uploads.finish(operation);
+                            post_upload_completion(
+                                &weak,
+                                account_id,
+                                room_id,
+                                operation,
+                                Ok(format!("Sent {filename}")),
+                            );
+                            return;
+                        }
+                        AttachmentSendUpdate::Retained { recoverable } => {
+                            let status = if recoverable {
+                                format!("{filename} is queued; waiting to retry…")
+                            } else {
+                                format!("{filename} send paused; retry or cancel this upload")
+                            };
+                            post_upload_progress(
+                                &weak, account_id.clone(), room_id.clone(), operation,
+                                status, !recoverable,
+                            );
+                        }
+                        AttachmentSendUpdate::Cancelled => {
+                            uploads.finish(operation);
+                            post_upload_completion(
+                                &weak, account_id, room_id, operation,
+                                Ok(format!("Cancelled {filename}")),
+                            );
+                            return;
+                        }
+                        AttachmentSendUpdate::Unknown => {
+                            uploads.finish(operation);
+                            post_upload_completion(
+                                &weak,
+                                account_id,
+                                room_id,
+                                operation,
+                                Err(format!("Could not confirm {filename}; the queued upload may still send. Check the room before another upload")),
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    });
+
+    let weak = ui.as_weak();
+    let cancel_uploads = uploads.clone();
+    ui.on_cancel_attachment(move || {
+        if let Some(ui) = weak.upgrade() {
+            if ui.get_attachment_busy() && cancel_uploads.cancel(ui.get_attachment_operation()) {
+                ui.set_attachment_status("Cancelling attachment…".into());
+            }
+        }
+    });
+
+    let weak = ui.as_weak();
+    let retry_uploads = uploads.clone();
+    ui.on_retry_attachment(move || {
+        if let Some(ui) = weak.upgrade() {
+            if ui.get_attachment_busy()
+                && ui.get_attachment_needs_retry()
+                && retry_uploads.retry(ui.get_attachment_operation())
+            {
+                ui.set_attachment_status("Retrying queued attachment…".into());
+                ui.set_attachment_needs_retry(false);
+            }
+        }
+    });
+
+    let weak = ui.as_weak();
+    let save_live = live.clone();
+    let save_handle = runtime.handle().clone();
+    ui.on_save_attachment(move |event_id, filename| {
+        let Some(ui) = weak.upgrade() else { return };
+        if !save_live.is_live.load(Ordering::Acquire)
+            || event_id.is_empty()
+            || !ui.get_downloading_event_id().is_empty()
+        {
+            return;
+        }
+        let account_id = ui.get_active_account_local_id().to_string();
+        let room_id = ui.get_active_room_id().to_string();
+        let event_id = event_id.to_string();
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Save attachment")
+            .set_file_name(filename.to_string())
+            .save_file()
+        else {
+            return;
+        };
+        if ui.get_active_account_local_id().as_str() != account_id
+            || ui.get_active_room_id().as_str() != room_id
+        {
+            return;
+        }
+        let operation = ui.get_download_operation().wrapping_add(1);
+        ui.set_download_operation(operation);
+        ui.set_downloading_event_id(event_id.clone().into());
+        ui.set_transfer_notice("Downloading and decrypting attachment…".into());
+        let live = save_live.clone();
+        let weak = weak.clone();
+        save_handle.spawn(async move {
+            let result = async {
+                let downloaded = live
+                    .download_attachment(&account_id, &room_id, &event_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                // The final account and room guard is held through the local
+                // write, so navigation cannot race the plaintext save.
+                live.save_download_to(&account_id, &room_id, path, downloaded.bytes)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+            .await;
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                if ui.get_active_account_local_id().as_str() != account_id
+                    || ui.get_active_room_id().as_str() != room_id
+                    || ui.get_download_operation() != operation
+                    || ui.get_downloading_event_id().as_str() != event_id
+                {
+                    return;
+                }
+                ui.set_downloading_event_id("".into());
+                match result {
+                    Ok(path) => {
+                        let name = path.file_name().unwrap_or_default().to_string_lossy();
+                        ui.set_transfer_notice(format!("Saved {name}").into());
+                    }
+                    Err(error) => {
+                        ui.set_transfer_notice("".into());
+                        ui.set_session_error(format!("Could not save attachment: {error}").into());
+                    }
+                }
+            });
+        });
+    });
+
+    let weak = ui.as_weak();
     let send_state = state.clone();
     let send_live = live.clone();
     let send_handle = runtime.handle().clone();
@@ -1260,41 +1694,79 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                             }
                         });
-                        if let Some(queued) = queued.filter(|_| tracked) {
+                        if let Some(mut queued) = queued.filter(|_| tracked) {
                             tokio::spawn(async move {
                                 let transaction_id = queued.transaction_id().to_owned();
-                                let outcome = queued.wait_outcome().await;
-                                let sent = outcome == QueuedSendOutcome::Sent;
-                                let restored = watcher_live.resolve_queued_draft(
-                                    &watcher_account,
-                                    &watcher_room,
-                                    &transaction_id,
-                                    sent,
-                                );
-                                if !sent {
-                                    let _ = watcher_ui.upgrade_in_event_loop(move |ui| {
-                                        if ui.get_active_account_local_id().as_str()
-                                            == watcher_account
-                                            && ui.get_active_room_id().as_str() == watcher_room
-                                        {
-                                            if restored
-                                                && ui.get_composer_mode() == 0
-                                                && ui.get_composer_text().is_empty()
-                                            {
-                                                ui.set_composer_text(watcher_text.into());
-                                            }
-                                            let message = match outcome {
-                                                QueuedSendOutcome::Failed => {
-                                                    "Message failed to send; draft retained"
+                                loop {
+                                    match queued.next_update().await {
+                                        QueuedSendUpdate::Sent => {
+                                            watcher_live.resolve_queued_draft(
+                                                &watcher_account,
+                                                &watcher_room,
+                                                &transaction_id,
+                                                true,
+                                            );
+                                            let account = watcher_account.clone();
+                                            let room = watcher_room.clone();
+                                            let _ = watcher_ui.upgrade_in_event_loop(move |ui| {
+                                                if ui.get_active_account_local_id().as_str() == account
+                                                    && ui.get_active_room_id().as_str() == room
+                                                    && ui.get_transfer_notice().as_str()
+                                                        == "Message queued for retry; it may still send"
+                                                {
+                                                    ui.set_transfer_notice("Message sent".into());
                                                 }
-                                                QueuedSendOutcome::Unknown => {
-                                                    "Could not confirm send; check the room before retrying"
-                                                }
-                                                QueuedSendOutcome::Sent => unreachable!(),
-                                            };
-                                            ui.set_session_error(message.into());
+                                            });
+                                            break;
                                         }
-                                    });
+                                        QueuedSendUpdate::Retained { recoverable } => {
+                                            let account = watcher_account.clone();
+                                            let room = watcher_room.clone();
+                                            let _ = watcher_ui.upgrade_in_event_loop(move |ui| {
+                                                if ui.get_active_account_local_id().as_str() == account
+                                                    && ui.get_active_room_id().as_str() == room
+                                                {
+                                                    if recoverable {
+                                                        ui.set_transfer_notice("Message queued for retry; it may still send".into());
+                                                    } else {
+                                                        ui.set_session_error("Message send paused; the request is still queued. Do not send a duplicate".into());
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        QueuedSendUpdate::Cancelled => {
+                                            let restored = watcher_live.resolve_queued_draft(
+                                                &watcher_account,
+                                                &watcher_room,
+                                                &transaction_id,
+                                                false,
+                                            );
+                                            let _ = watcher_ui.upgrade_in_event_loop(move |ui| {
+                                                if ui.get_active_account_local_id().as_str() == watcher_account
+                                                    && ui.get_active_room_id().as_str() == watcher_room
+                                                {
+                                                    if restored
+                                                        && ui.get_composer_mode() == 0
+                                                        && ui.get_composer_text().is_empty()
+                                                    {
+                                                        ui.set_composer_text(watcher_text.into());
+                                                    }
+                                                    ui.set_transfer_notice("Queued message cancelled; draft retained".into());
+                                                }
+                                            });
+                                            break;
+                                        }
+                                        QueuedSendUpdate::Unknown => {
+                                            let _ = watcher_ui.upgrade_in_event_loop(move |ui| {
+                                                if ui.get_active_account_local_id().as_str() == watcher_account
+                                                    && ui.get_active_room_id().as_str() == watcher_room
+                                                {
+                                                    ui.set_session_error("Could not confirm send; the queued message may still send. Check the room before another message".into());
+                                                }
+                                            });
+                                            break;
+                                        }
+                                    }
                                 }
                             });
                         }

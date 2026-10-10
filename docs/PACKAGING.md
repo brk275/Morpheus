@@ -3,11 +3,17 @@
 The package configuration is in [`Packager.toml`](../Packager.toml). Its build hook compiles `morpheus-app` in release mode with the `native-calls` feature and uses the lockfile. Run packaging on each target operating system:
 
 ```sh
-cargo install cargo-packager --locked
+cargo install cargo-packager --version 0.11.8 --locked
 cargo packager --release
 ```
 
 The package output goes to `dist/`. This command does not make a public release. The packaged call feature still needs real MatrixRTC interoperability and device testing before a beta can be distributed.
+
+## Unsigned internal package QA
+
+The manual [`package-qa.yml`](../.github/workflows/package-qa.yml) workflow packages the private repository's `main` branch on macOS Apple Silicon and Intel, Windows x64, and Linux x64. It pins Rust 1.99.0 and Cargo Packager 0.11.8, using `Packager.toml`'s release build hook. It produces a DMG on each Mac runner, an NSIS installer on Windows, and both a Debian package and AppImage on Linux. Run it from the GitHub Actions tab or with `gh workflow run package-qa.yml --ref main` after the workflow lands on `main`.
+
+The workflow only runs while the repository is private. It has a read-only token, passes no signing or notarization credentials, and only uploads Actions artifacts named `morpheus-UNSIGNED-INTERNAL-QA-...`. They expire after five days. [GitHub requires repository read access to download artifacts](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/download-workflow-artifacts). Delete these runs and artifacts before changing the repository's visibility, since public repositories expose Actions history and logs. These packages are for install smoke tests and preliminary device permission checks by authorized collaborators; they are not signed, notarized, updater payloads, or release candidates. On Linux, set the downloaded AppImage executable bit with `chmod +x` before running it, because Actions artifact upload does not preserve file permissions.
 
 ## macOS permissions and signing
 

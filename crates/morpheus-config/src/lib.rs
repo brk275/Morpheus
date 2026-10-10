@@ -4,6 +4,7 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -315,14 +316,15 @@ impl ConfigStore {
         })?;
         fs::create_dir_all(parent)?;
         let raw = toml::to_string_pretty(config)?;
-        let staging = self.path.with_extension("toml.tmp");
-        fs::write(&staging, raw)?;
-        // Windows does not replace an existing destination with fs::rename.
-        #[cfg(windows)]
-        if self.path.exists() {
-            fs::remove_file(&self.path)?;
-        }
-        fs::rename(&staging, &self.path)?;
+        // A unique file in the same directory makes concurrent saves safe and
+        // lets persist replace the destination atomically on each platform.
+        // If replacement fails, the previous valid config stays in place.
+        let mut staging = tempfile::NamedTempFile::new_in(parent)?;
+        staging.write_all(raw.as_bytes())?;
+        staging.as_file().sync_all()?;
+        staging
+            .persist(&self.path)
+            .map_err(|error| ConfigError::Io(error.error))?;
         Ok(())
     }
 
@@ -484,6 +486,10 @@ mod tests {
         let created = store.load_or_create().unwrap();
         assert_eq!(created, Config::default());
         assert_eq!(store.load().unwrap(), created);
+        let mut updated = created;
+        updated.layout.room_list_width = 320;
+        store.save(&updated).unwrap();
+        assert_eq!(store.load().unwrap(), updated);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use matrix_rtc_transport::{
     VideoFrame, VideoSourceConfig,
 };
 
-use crate::RtcService;
+use crate::{CallInfo, RtcService, native::CallLease};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MediaError {
@@ -21,6 +21,12 @@ pub enum MediaError {
     WrongMediaKind,
     #[error("the call ended")]
     CallEnded,
+    #[error("the control belongs to a different account or call join")]
+    WrongCall,
+    #[error("the call audio loop is not running")]
+    ControlNotRunning,
+    #[error("the call audio loop is already running")]
+    ControlAlreadyRunning,
     #[error("native device error: {0}")]
     Device(String),
     #[error(transparent)]
@@ -34,25 +40,51 @@ pub struct Publication {
     track: Arc<dyn LocalTrackHandle>,
     audio: Option<AudioSourceConfig>,
     video: Option<VideoSourceConfig>,
+    lease: CallLease,
 }
 
 impl Publication {
+    pub fn call_info(&self) -> &CallInfo {
+        &self.lease.info
+    }
+
+    pub fn account_user_id(&self) -> &str {
+        &self.lease.account_user_id
+    }
+
+    pub fn account_device_id(&self) -> &str {
+        &self.lease.account_device_id
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.lease.is_active()
+    }
+
     pub fn kind(&self) -> MediaStreamKind {
         self.track.kind()
     }
 
     pub fn set_muted(&self, muted: bool) -> Result<(), MediaError> {
+        if !self.is_active() {
+            return Err(MediaError::CallEnded);
+        }
         self.track.set_muted(muted)?;
         Ok(())
     }
 
     pub async fn unpublish(&self) -> Result<(), MediaError> {
+        if !self.is_active() {
+            return Err(MediaError::CallEnded);
+        }
         self.track.unpublish().await?;
         Ok(())
     }
 
     /// Push one captured PCM chunk. The upstream transport applies backpressure.
     pub async fn push_audio(&self, frame: AudioFrame) -> Result<(), MediaError> {
+        if !self.is_active() {
+            return Err(MediaError::CallEnded);
+        }
         let format = self.audio.ok_or(MediaError::WrongMediaKind)?;
         let expected = frame
             .samples_per_channel
@@ -73,6 +105,9 @@ impl Publication {
     /// Push one captured I420 frame. The upstream video path keeps the latest
     /// frame, so callers should pace camera/screen capture themselves.
     pub fn push_video(&self, frame: VideoFrame) -> Result<(), MediaError> {
+        if !self.is_active() {
+            return Err(MediaError::CallEnded);
+        }
         let format = self.video.ok_or(MediaError::WrongMediaKind)?;
         if frame.buffer.width != format.width || frame.buffer.height != format.height {
             return Err(MediaError::FrameFormatMismatch);
@@ -80,6 +115,17 @@ impl Publication {
         validate_i420(&frame.buffer)?;
         self.track.capture_video(frame)?;
         Ok(())
+    }
+}
+
+impl Drop for Publication {
+    fn drop(&mut self) {
+        // A cancelled capture task can drop its publication without awaiting
+        // unpublish. Silence it immediately; callers should still unpublish
+        // explicitly to remove the stream from peers' rosters.
+        if self.is_active() {
+            let _ = self.track.set_muted(true);
+        }
     }
 }
 
@@ -137,6 +183,10 @@ impl RtcService {
         options: PublishOptions,
     ) -> Result<Publication, MediaError> {
         let call = self.call(room_id).ok_or(MediaError::NotJoined)?;
+        let lease = self
+            .call_lease(room_id)
+            .ok_or(MediaError::NotJoined)?
+            .clone();
         let audio = options.audio;
         let video = options.video;
         let track = call.publish(options).await?;
@@ -144,6 +194,7 @@ impl RtcService {
             track,
             audio,
             video,
+            lease,
         })
     }
 }
@@ -178,7 +229,44 @@ fn validate_i420(buffer: &I420Buffer) -> Result<(), MediaError> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    struct FakeVideoTrack(AtomicUsize);
+
+    impl LocalTrackHandle for FakeVideoTrack {
+        fn kind(&self) -> MediaStreamKind {
+            MediaStreamKind::Camera
+        }
+
+        fn set_muted(&self, _: bool) -> Result<(), matrix_rtc_transport::TransportError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn capture_video(&self, _: VideoFrame) -> Result<(), matrix_rtc_transport::TransportError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn tiny_frame() -> VideoFrame {
+        VideoFrame {
+            buffer: I420Buffer {
+                width: 2,
+                height: 2,
+                data_y: vec![16; 4],
+                stride_y: 2,
+                data_u: vec![128],
+                stride_u: 1,
+                data_v: vec![128],
+                stride_v: 1,
+            },
+            rotation: matrix_rtc_transport::VideoRotation::Deg0,
+            timestamp_us: 0,
+        }
+    }
 
     #[test]
     fn rejects_short_chroma_plane_before_libwebrtc() {
@@ -196,5 +284,61 @@ mod tests {
             validate_i420(&buffer),
             Err(MediaError::InvalidVideoPlanes)
         ));
+    }
+
+    #[test]
+    fn old_publication_cannot_capture_or_unmute_after_leave_and_rejoin() {
+        let info = CallInfo {
+            room_id: "!room:example.test".into(),
+            slot_id: "m.call#room".into(),
+            membership_id: "old-member".into(),
+            local_identity: "old-focus-identity".into(),
+        };
+        let old_lease = CallLease::new(info.clone(), "@alice:example.test".into(), "DEVICE".into());
+        let old_track = Arc::new(FakeVideoTrack(AtomicUsize::new(0)));
+        let old = Publication {
+            track: old_track.clone(),
+            audio: None,
+            video: Some(VideoSourceConfig {
+                width: 2,
+                height: 2,
+            }),
+            lease: old_lease.clone(),
+        };
+        old.push_video(tiny_frame()).unwrap();
+        assert_eq!(old_track.0.load(Ordering::SeqCst), 1);
+
+        old_lease.revoke();
+        let new_lease = CallLease::new(
+            CallInfo {
+                membership_id: "new-member".into(),
+                local_identity: "new-focus-identity".into(),
+                ..info
+            },
+            "@alice:example.test".into(),
+            "DEVICE".into(),
+        );
+        let new_track = Arc::new(FakeVideoTrack(AtomicUsize::new(0)));
+        let current = Publication {
+            track: new_track.clone(),
+            audio: None,
+            video: Some(VideoSourceConfig {
+                width: 2,
+                height: 2,
+            }),
+            lease: new_lease,
+        };
+        assert!(matches!(old.set_muted(false), Err(MediaError::CallEnded)));
+        assert!(matches!(
+            old.push_video(tiny_frame()),
+            Err(MediaError::CallEnded)
+        ));
+        assert_eq!(old_track.0.load(Ordering::SeqCst), 1);
+        current.push_video(tiny_frame()).unwrap();
+        assert_eq!(new_track.0.load(Ordering::SeqCst), 1);
+        drop(old);
+        assert_eq!(old_track.0.load(Ordering::SeqCst), 1);
+        drop(current);
+        assert_eq!(new_track.0.load(Ordering::SeqCst), 2);
     }
 }

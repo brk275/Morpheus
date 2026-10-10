@@ -6,12 +6,18 @@
 
 #![recursion_limit = "512"]
 
+mod media;
+pub use media::{
+    AttachmentKind, AttachmentMetadata, AttachmentSendUpdate, DownloadedAttachment,
+    MAX_ATTACHMENT_BYTES, QueuedAttachment,
+};
+
 use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use eyeball_im::Vector;
@@ -90,6 +96,14 @@ pub enum MatrixCoreError {
     InvalidRoomId(String),
     #[error("invalid event ID: {0}")]
     InvalidEventId(String),
+    #[error("invalid media: {0}")]
+    InvalidMedia(String),
+    #[error("attachment exceeds {maximum} bytes (received {actual} bytes)")]
+    MediaTooLarge { maximum: u64, actual: u64 },
+    #[error("this event is not a media attachment")]
+    NotMediaAttachment,
+    #[error("attachment has no size metadata")]
+    MissingMediaSize,
     #[error("invalid user ID: {0}")]
     InvalidUserId(String),
     #[error("account registry is invalid: {0}")]
@@ -183,6 +197,10 @@ pub struct MessageInfo {
     pub event_id: Option<String>,
     pub sender: String,
     pub body: String,
+    /// A display-only basename for file, image, audio, and video messages.
+    /// Media URLs and decryption keys never enter the UI projection.
+    #[serde(default)]
+    pub attachment_name: Option<String>,
     pub reply_preview: Option<String>,
     pub reaction_summary: String,
     pub timestamp_ms: u64,
@@ -302,13 +320,27 @@ pub enum MessageSendState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum QueuedSendOutcome {
     Sent,
+    /// The user explicitly cancelled the retained request.
     Failed,
+    /// The observer ended; the SDK may still hold a persistent request.
+    Unknown,
+}
+
+/// A send error does not remove an SDK request. Callers must keep observing
+/// its transaction instead of asking the user to send a duplicate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueuedSendUpdate {
+    Sent,
+    Retained { recoverable: bool },
+    Cancelled,
     Unknown,
 }
 
 pub struct QueuedMessage {
     transaction_id: String,
+    handle: matrix_sdk::send_queue::SendHandle,
     updates: broadcast::Receiver<RoomSendQueueUpdate>,
+    finished: bool,
 }
 
 impl QueuedMessage {
@@ -316,24 +348,73 @@ impl QueuedMessage {
         &self.transaction_id
     }
 
+    pub async fn abort(&self) -> Result<bool> {
+        self.handle
+            .abort()
+            .await
+            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
+    }
+
+    pub async fn retry_wedged(&self) -> Result<()> {
+        self.handle
+            .unwedge()
+            .await
+            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
+    }
+
+    pub async fn next_update(&mut self) -> QueuedSendUpdate {
+        if self.finished {
+            return QueuedSendUpdate::Unknown;
+        }
+        let update = next_queued_send_update(&mut self.updates, &self.transaction_id).await;
+        self.finished = matches!(
+            update,
+            QueuedSendUpdate::Sent | QueuedSendUpdate::Cancelled | QueuedSendUpdate::Unknown
+        );
+        update
+    }
+
     pub async fn wait_outcome(mut self) -> QueuedSendOutcome {
         loop {
-            match self.updates.recv().await {
-                Ok(RoomSendQueueUpdate::SentEvent { transaction_id, .. })
-                    if transaction_id.as_str() == self.transaction_id =>
-                {
-                    return QueuedSendOutcome::Sent;
-                }
-                Ok(RoomSendQueueUpdate::SendError { transaction_id, .. })
-                | Ok(RoomSendQueueUpdate::CancelledLocalEvent { transaction_id })
-                    if transaction_id.as_str() == self.transaction_id =>
-                {
-                    return QueuedSendOutcome::Failed;
-                }
-                Ok(_) => {}
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return QueuedSendOutcome::Unknown,
+            match self.next_update().await {
+                QueuedSendUpdate::Sent => return QueuedSendOutcome::Sent,
+                QueuedSendUpdate::Retained { .. } => {}
+                QueuedSendUpdate::Cancelled => return QueuedSendOutcome::Failed,
+                QueuedSendUpdate::Unknown => return QueuedSendOutcome::Unknown,
             }
+        }
+    }
+}
+
+async fn next_queued_send_update(
+    updates: &mut broadcast::Receiver<RoomSendQueueUpdate>,
+    transaction_id: &str,
+) -> QueuedSendUpdate {
+    loop {
+        match updates.recv().await {
+            Ok(RoomSendQueueUpdate::SentEvent {
+                transaction_id: event_transaction_id,
+                ..
+            }) if event_transaction_id.as_str() == transaction_id => {
+                return QueuedSendUpdate::Sent;
+            }
+            Ok(RoomSendQueueUpdate::SendError {
+                transaction_id: event_transaction_id,
+                is_recoverable,
+                ..
+            }) if event_transaction_id.as_str() == transaction_id => {
+                return QueuedSendUpdate::Retained {
+                    recoverable: is_recoverable,
+                };
+            }
+            Ok(RoomSendQueueUpdate::CancelledLocalEvent {
+                transaction_id: event_transaction_id,
+            }) if event_transaction_id.as_str() == transaction_id => {
+                return QueuedSendUpdate::Cancelled;
+            }
+            Ok(_) => {}
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => return QueuedSendUpdate::Unknown,
         }
     }
 }
@@ -456,6 +537,7 @@ struct State {
     loaded: HashMap<String, Arc<LoadedAccount>>,
     pending_sso: HashMap<String, PendingSso>,
     sync_task: Option<SyncTask>,
+    queue_recovery_task: Option<JoinHandle<()>>,
 }
 
 struct SyncTask {
@@ -504,6 +586,7 @@ impl AccountManager {
                 loaded: HashMap::new(),
                 pending_sso: HashMap::new(),
                 sync_task: None,
+                queue_recovery_task: None,
             }),
             active_tx,
             sync_tx,
@@ -623,7 +706,7 @@ impl AccountManager {
         state.loaded.insert(id, loaded.clone());
         state.registry = next;
         self.active_tx.send_replace(Some(account.clone()));
-        self.start_sync(&mut state, loaded.client.clone());
+        self.start_sync(&mut state, loaded.client.clone()).await;
         Ok(account)
     }
 
@@ -775,7 +858,7 @@ impl AccountManager {
         state.loaded.insert(id, loaded.clone());
         state.registry = next;
         self.active_tx.send_replace(Some(account.clone()));
-        self.start_sync(&mut state, loaded.client.clone());
+        self.start_sync(&mut state, loaded.client.clone()).await;
         Ok(account)
     }
 
@@ -796,6 +879,12 @@ impl AccountManager {
                 .as_ref()
                 .is_some_and(|sync| !sync.task.is_finished())
         {
+            // Re-selecting the active account is an explicit retry of any
+            // room queue paused by a recoverable send error. No new message
+            // is enqueued, so this cannot duplicate a transaction.
+            if let Some(loaded) = state.loaded.get(id) {
+                loaded.client.send_queue().set_enabled(true).await;
+            }
             return Ok(account);
         }
         let loaded = match state.loaded.get(id) {
@@ -835,7 +924,7 @@ impl AccountManager {
         stop_sync(&mut state).await;
         state.registry = next;
         self.active_tx.send_replace(Some(account.clone()));
-        self.start_sync(&mut state, loaded.client.clone());
+        self.start_sync(&mut state, loaded.client.clone()).await;
         Ok(account)
     }
 
@@ -1203,7 +1292,9 @@ impl AccountManager {
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
         Ok(QueuedMessage {
             transaction_id: handle.transaction_id().to_string(),
+            handle,
             updates,
+            finished: false,
         })
     }
 
@@ -1797,7 +1888,21 @@ impl AccountManager {
         self.sync_tx.send_replace(SyncStatus::Stopped);
     }
 
-    fn start_sync(&self, state: &mut State, client: Client) {
+    async fn start_sync(&self, state: &mut State, client: Client) {
+        // Send queues run independently of /sync. Resume only the selected
+        // account, including persisted messages waiting from a prior session.
+        // Subscribe before resuming so a fast persisted send cannot lose its
+        // recoverable-error signal. Only this selected account gets a retry
+        // worker; stop_sync aborts it before another account is selected.
+        let queue = client.send_queue();
+        let errors = queue.subscribe_errors();
+        let updates = queue.subscribe();
+        queue.set_enabled(true).await;
+        state.queue_recovery_task = Some(tokio::spawn(recover_room_queues(
+            client.clone(),
+            errors,
+            updates,
+        )));
         let sync_policy = self.sync_policy;
         self.sync_tx.send_replace(SyncStatus::Starting);
         let status = self.sync_tx.clone();
@@ -2146,6 +2251,7 @@ fn message_info(item: &TimelineItem) -> Option<MessageInfo> {
         event_id: event.event_id().map(ToString::to_string),
         sender: event.sender().to_string(),
         body: message.body().to_owned(),
+        attachment_name: media::attachment_name(message.msgtype()),
         reply_preview,
         reaction_summary: event
             .reactions()
@@ -2192,7 +2298,7 @@ fn space_node_info(
 
 async fn build_client(homeserver: &str, store_path: &Path, passphrase: &str) -> Result<Client> {
     fs::create_dir_all(store_path)?;
-    Client::builder()
+    let client = Client::builder()
         .homeserver_url(homeserver)
         .sqlite_store(store_path, Some(passphrase))
         // Fetch only missing room keys after recovery, avoiding a full-account backup download.
@@ -2203,13 +2309,87 @@ async fn build_client(homeserver: &str, store_path: &Path, passphrase: &str) -> 
         .handle_refresh_tokens()
         .build()
         .await
-        .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
+        .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
+    // A restored client can contain persisted queued sends. Keep it dormant
+    // until the account is actually selected and sync starts.
+    client.send_queue().enable_upload_progress(true);
+    client.send_queue().set_enabled(false).await;
+    Ok(client)
 }
 
 async fn stop_sync(state: &mut State) {
+    if let Some(loaded) = state
+        .registry
+        .active_account_id
+        .as_ref()
+        .and_then(|id| state.loaded.get(id))
+    {
+        // The SDK lets an already in-flight request finish, then holds all
+        // later queued requests. This is the closest safe pause boundary.
+        loaded.client.send_queue().set_enabled(false).await;
+    }
+    if let Some(recovery) = state.queue_recovery_task.take() {
+        recovery.abort();
+        let _ = recovery.await;
+    }
     if let Some(sync) = state.sync_task.take() {
         let _ = sync.shutdown.send(());
         let _ = sync.task.await;
+    }
+}
+
+/// The pinned SDK pauses a room queue after a recoverable send error. Retry
+/// retained requests with bounded backoff while their account stays selected.
+/// Unrecoverable errors stay wedged for an explicit retry or cancellation.
+async fn recover_room_queues(
+    client: Client,
+    mut errors: broadcast::Receiver<matrix_sdk::send_queue::SendQueueRoomError>,
+    mut updates: broadcast::Receiver<matrix_sdk::send_queue::SendQueueUpdate>,
+) {
+    let mut attempts: HashMap<String, u32> = HashMap::new();
+    let mut due: HashMap<String, Instant> = HashMap::new();
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            received = errors.recv() => match received {
+                Ok(error) if error.is_recoverable => {
+                    let room_id = error.room_id.to_string();
+                    let attempts = attempts.entry(room_id.clone()).or_default();
+                    *attempts = attempts.saturating_add(1).min(6);
+                    // 2, 4, 8, 16, 32, then 60 seconds.
+                    let delay = (1_u64 << *attempts).min(60);
+                    due.insert(room_id, Instant::now() + Duration::from_secs(delay));
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            received = updates.recv() => match received {
+                Ok(update) if matches!(update.update, RoomSendQueueUpdate::SentEvent { .. }) => {
+                    attempts.remove(update.room_id.as_str());
+                    due.remove(update.room_id.as_str());
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            _ = tick.tick() => {
+                if !client.send_queue().is_enabled() {
+                    break;
+                }
+                let now = Instant::now();
+                let ready: Vec<_> = due.iter()
+                    .filter(|(_, deadline)| **deadline <= now)
+                    .map(|(room_id, _)| room_id.clone())
+                    .collect();
+                for room_id in ready {
+                    if let Ok(parsed) = RoomId::parse(&room_id)
+                        && let Some(room) = client.get_room(&parsed)
+                    {
+                        room.send_queue().set_enabled(true);
+                        due.remove(&room_id);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2534,7 +2714,86 @@ mod tests {
     use super::*;
 
     #[test]
-    fn queued_send_outcome_uses_transaction_id_and_survives_lag() {
+    fn only_the_selected_account_has_an_active_send_queue() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let root = std::env::temp_dir().join(format!("morpheus-queue-{}", Uuid::new_v4()));
+            let manager = AccountManager::open(&root).unwrap();
+            let homeserver = "http://127.0.0.1:9";
+            let first = AccountInfo {
+                id: Uuid::new_v4().to_string(),
+                user_id: "@first:localhost".into(),
+                device_id: "FIRST".into(),
+                homeserver: homeserver.into(),
+            };
+            let second = AccountInfo {
+                id: Uuid::new_v4().to_string(),
+                user_id: "@second:localhost".into(),
+                device_id: "SECOND".into(),
+                homeserver: homeserver.into(),
+            };
+            let client_a = Client::builder()
+                .homeserver_url(homeserver)
+                .build()
+                .await
+                .unwrap();
+            let client_b = Client::builder()
+                .homeserver_url(homeserver)
+                .build()
+                .await
+                .unwrap();
+            client_b.send_queue().set_enabled(false).await;
+            {
+                let mut state = manager.state.lock().await;
+                state.registry.accounts = vec![first.clone(), second.clone()];
+                state.registry.active_account_id = Some(first.id.clone());
+                state.loaded.insert(
+                    first.id.clone(),
+                    Arc::new(LoadedAccount::new(
+                        client_a.clone(),
+                        first.id.clone(),
+                        String::new(),
+                    )),
+                );
+                state.loaded.insert(
+                    second.id.clone(),
+                    Arc::new(LoadedAccount::new(
+                        client_b.clone(),
+                        second.id.clone(),
+                        String::new(),
+                    )),
+                );
+            }
+            assert!(client_a.send_queue().is_enabled());
+            assert!(!client_b.send_queue().is_enabled());
+
+            manager.switch_to(&second.id).await.unwrap();
+            assert!(!client_a.send_queue().is_enabled());
+            assert!(client_b.send_queue().is_enabled());
+
+            // Re-selecting an active account is a manual recovery path for
+            // a queue paused after a transient error.
+            client_b.send_queue().set_enabled(false).await;
+            manager.switch_to(&second.id).await.unwrap();
+            assert!(client_b.send_queue().is_enabled());
+
+            manager.switch_to(&first.id).await.unwrap();
+            assert!(client_a.send_queue().is_enabled());
+            assert!(!client_b.send_queue().is_enabled());
+
+            manager.stop().await;
+            assert!(!client_a.send_queue().is_enabled());
+            assert!(!client_b.send_queue().is_enabled());
+            drop(manager);
+            fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    #[test]
+    fn queued_send_updates_keep_retained_transactions_observable() {
         use matrix_sdk::ruma::TransactionId;
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2543,12 +2802,10 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let wanted = TransactionId::new();
+            let wanted_id = wanted.to_string();
             let other = TransactionId::new();
             let (sender, updates) = broadcast::channel(1);
-            let queued = QueuedMessage {
-                transaction_id: wanted.to_string(),
-                updates,
-            };
+            let mut updates = updates;
             sender
                 .send(RoomSendQueueUpdate::CancelledLocalEvent {
                     transaction_id: other,
@@ -2560,28 +2817,59 @@ mod tests {
                     event_id: EventId::parse("$sent:example.org").unwrap(),
                 })
                 .unwrap();
-            assert_eq!(queued.wait_outcome().await, QueuedSendOutcome::Sent);
+            assert_eq!(
+                next_queued_send_update(&mut updates, &wanted_id).await,
+                QueuedSendUpdate::Sent
+            );
 
             let wanted = TransactionId::new();
+            let wanted_id = wanted.to_string();
+            let (sender, mut updates) = broadcast::channel(4);
+            sender
+                .send(RoomSendQueueUpdate::SendError {
+                    transaction_id: wanted.clone(),
+                    error: Arc::new(matrix_sdk::Error::UnknownError(Box::new(
+                        std::io::Error::other("test transient failure"),
+                    ))),
+                    is_recoverable: true,
+                })
+                .unwrap();
+            sender
+                .send(RoomSendQueueUpdate::SentEvent {
+                    transaction_id: wanted,
+                    event_id: EventId::parse("$eventually-sent:example.org").unwrap(),
+                })
+                .unwrap();
+            assert_eq!(
+                next_queued_send_update(&mut updates, &wanted_id).await,
+                QueuedSendUpdate::Retained { recoverable: true }
+            );
+            assert_eq!(
+                next_queued_send_update(&mut updates, &wanted_id).await,
+                QueuedSendUpdate::Sent
+            );
+
+            let wanted = TransactionId::new();
+            let wanted_id = wanted.to_string();
             let (sender, updates) = broadcast::channel(1);
-            let queued = QueuedMessage {
-                transaction_id: wanted.to_string(),
-                updates,
-            };
+            let mut updates = updates;
             sender
                 .send(RoomSendQueueUpdate::CancelledLocalEvent {
                     transaction_id: wanted,
                 })
                 .unwrap();
-            assert_eq!(queued.wait_outcome().await, QueuedSendOutcome::Failed);
+            assert_eq!(
+                next_queued_send_update(&mut updates, &wanted_id).await,
+                QueuedSendUpdate::Cancelled
+            );
 
             let (sender, updates) = broadcast::channel(1);
-            let queued = QueuedMessage {
-                transaction_id: TransactionId::new().to_string(),
-                updates,
-            };
+            let mut updates = updates;
             drop(sender);
-            assert_eq!(queued.wait_outcome().await, QueuedSendOutcome::Unknown);
+            assert_eq!(
+                next_queued_send_update(&mut updates, TransactionId::new().as_str()).await,
+                QueuedSendUpdate::Unknown
+            );
         });
     }
 

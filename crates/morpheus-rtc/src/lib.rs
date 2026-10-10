@@ -22,7 +22,7 @@ mod native;
 mod video_device;
 
 #[cfg(feature = "device-audio")]
-pub use audio_device::{AudioOutput, MicrophoneCapture};
+pub use audio_device::{AudioControls, AudioOutput, AudioState, MicrophoneCapture};
 #[cfg(feature = "native-rtc")]
 pub use matrix_rtc_transport::{
     AudioFrame, I420Buffer, MediaStreamKind, VideoFrame, VideoRotation,
@@ -30,7 +30,10 @@ pub use matrix_rtc_transport::{
 #[cfg(feature = "native-rtc")]
 pub use media::{MediaError, Publication};
 #[cfg(feature = "native-rtc")]
-pub use native::{CallInfo, CallOptions, InteropMode, RtcService, install_crypto_provider};
+pub use native::{
+    CallInfo, CallOptions, InteropMode, ParticipantInfo, ParticipantStreamInfo, RtcService,
+    RtcStreamKind, install_crypto_provider,
+};
 #[cfg(feature = "device-camera")]
 pub use video_device::CameraCapture;
 #[cfg(feature = "device-screen")]
@@ -129,6 +132,10 @@ pub enum RtcError {
     InvalidRoomId,
     #[error("the room is not loaded in this account")]
     RoomNotLoaded,
+    #[error("could not read or write Matrix room state: {0}")]
+    RoomState(String),
+    #[error("invalid Morpheus voice-space marker: {0}")]
+    VoiceSpaceMarker(#[from] VoiceSpaceMarkerError),
     #[error("a call is already active in this room")]
     AlreadyJoined,
     #[error("there is no active call in this room")]

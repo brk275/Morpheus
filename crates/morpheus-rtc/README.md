@@ -32,10 +32,11 @@ panics. The service also calls the helper as a fallback.
 The optional device features connect native OS media to those frame streams:
 
 - `device-audio`: CPAL 48 kHz mono/stereo microphone capture and speaker
-  playback. After `join()`, `run_two_person_audio(room_id)` publishes the
-  microphone, plays the first remote microphone stream, and stops on call end.
-  Cancel the future to stop capture, then call `leave()` on the service.
-  `MicrophoneCapture::devices()` and `AudioOutput::devices()` enumerate names.
+  playback. After `join()`, `run_audio(room_id)` publishes the microphone,
+  mixes subscribed remote microphones with bounded per-participant queues,
+  and stops on call end. Cancel the future to stop capture, then call `leave()`
+  on the service. `MicrophoneCapture::devices()` and
+  `AudioOutput::devices()` enumerate names.
 - `device-camera`: Nokhwa camera capture. `CameraCapture::open(index)` and
   `next_frame()` return I420 frames for a `publish_camera()` publication;
   `cameras()` enumerates available devices.
@@ -47,13 +48,29 @@ The optional device features connect native OS media to those frame streams:
 
 These APIs report native device failures as `MediaError::Device` and reject
 mismatched PCM and I420 frames before entering libwebrtc.
+`RtcService::audio_controls(room_id)` creates a handle bound to the current
+account, device, room, and call membership. Pass it to
+`run_audio_controlled(room_id, &controls)` and retain a clone for UI commands.
+`set_microphone_muted(true)` mutes the native publication immediately;
+unmuting waits until buffered microphone frames are discarded.
+`set_deafened(true)` silences only local speaker playback and clears buffered
+remote PCM; it does not tell peers to stop sending. `applied_state()` and its
+watch receiver report the actual state. Default `run_audio()` still starts
+with an open microphone and speaker, as before. Controls and camera/screen
+`Publication` handles are revoked when the call leaves or the service drops;
+an old handle cannot affect a later join to the same room. A publication also
+exposes its call and account/device identity, and its `set_muted()` and
+`unpublish()` methods forward to the native transport. Dropping a live
+publication mutes it as a cancellation safeguard; call `unpublish()` to remove
+its stream from peers' rosters.
+
 `local_device_support()` reports which adapters were compiled into the binary;
 actual OS availability is checked when a device is opened. The audio loop is a
-two-person proof. It does not mix group audio, select non-default audio devices,
-resample unsupported device formats, or provide echo cancellation. Remote video
-rendering, camera/screen pacing and controls, permission UI, macOS bundle usage
-descriptions, and Windows/Linux runtime verification still need application
-integration. Do not present this as a complete end-user call feature yet.
+native proof. It does not select non-default audio devices, resample unsupported
+device formats, or provide echo cancellation. The app has not yet wired these
+new controls to its call stage. Camera/screen pacing and controls, permission
+UI, and Windows/Linux runtime verification still need application integration.
+Do not present this as a complete end-user call feature yet.
 
 An opt-in macOS test captures real display or window pixels without saving an
 image, and the local MatrixRTC fixture can publish that capture to a second

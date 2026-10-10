@@ -1,10 +1,28 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
-use matrix_rtc_call_sdk::{LiveKitCall, LiveKitCallOptions, close_slot, open_slot};
+use matrix_rtc_call_sdk::{LiveKitCall, LiveKitCallOptions, Participant, close_slot, open_slot};
 use matrix_rtc_core::{LiveKitTransport, SlotEncryption, compat::MembershipFormat};
-use matrix_sdk::{Client, ruma::RoomId};
+use matrix_rtc_transport::MediaStreamKind;
+use matrix_sdk::{
+    Client,
+    ruma::{
+        RoomId,
+        api::{client::state::get_state_event_for_key, error::ErrorKind},
+        events::StateEventType,
+    },
+};
+use serde_json::Value;
 
-use crate::{RtcError, TransportSupport, classify_transports};
+use crate::{
+    RtcError, TransportSupport, VOICE_SPACE_EVENT_TYPE, VOICE_SPACE_STATE_KEY, VoiceSpaceMarker,
+    classify_transports,
+};
 
 /// The membership format to publish. Legacy formats exist for interoperation
 /// with Element Call generations that have not adopted the current MSC4143
@@ -50,6 +68,106 @@ pub struct CallInfo {
     pub local_identity: String,
 }
 
+/// Identity and lifetime of one join on one Matrix account and device.
+/// Handles created for this join become invalid as soon as it leaves.
+#[derive(Clone, Debug)]
+pub(crate) struct CallLease {
+    pub info: CallInfo,
+    pub account_user_id: String,
+    pub account_device_id: String,
+    active: Arc<AtomicBool>,
+}
+
+impl CallLease {
+    pub(crate) fn new(info: CallInfo, account_user_id: String, account_device_id: String) -> Self {
+        Self {
+            info,
+            account_user_id,
+            account_device_id,
+            active: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn revoke(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+
+    pub fn same_join(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.active, &other.active)
+            && self.info == other.info
+            && self.account_user_id == other.account_user_id
+            && self.account_device_id == other.account_device_id
+    }
+}
+
+struct ActiveCall {
+    call: LiveKitCall,
+    lease: CallLease,
+}
+
+/// Morpheus-owned roster vocabulary. The call SDK's participant and stream
+/// structs remain inside this integration boundary while they evolve.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RtcStreamKind {
+    Microphone,
+    Camera,
+    ScreenShare,
+    ScreenShareAudio,
+    Data,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParticipantStreamInfo {
+    pub kind: RtcStreamKind,
+    pub muted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParticipantInfo {
+    /// MatrixRTC membership key, unique for each join.
+    pub member_id: String,
+    pub user_id: String,
+    pub device_id: Option<String>,
+    pub is_local: bool,
+    /// False when this participant advertises no transport this client can use.
+    pub reachable: bool,
+    pub streams: Vec<ParticipantStreamInfo>,
+    pub hand_raised_at_ms: Option<u64>,
+    pub joined_at_ms: Option<u64>,
+}
+
+impl From<Participant> for ParticipantInfo {
+    fn from(participant: Participant) -> Self {
+        Self {
+            member_id: participant.member_id,
+            user_id: participant.user_id,
+            device_id: participant.device_id,
+            is_local: participant.is_local,
+            reachable: participant.reachable,
+            streams: participant
+                .streams
+                .into_iter()
+                .map(|stream| ParticipantStreamInfo {
+                    kind: match stream.kind {
+                        MediaStreamKind::Microphone => RtcStreamKind::Microphone,
+                        MediaStreamKind::Camera => RtcStreamKind::Camera,
+                        MediaStreamKind::ScreenShare => RtcStreamKind::ScreenShare,
+                        MediaStreamKind::ScreenShareAudio => RtcStreamKind::ScreenShareAudio,
+                        MediaStreamKind::Data => RtcStreamKind::Data,
+                    },
+                    muted: stream.muted,
+                })
+                .collect(),
+            hand_raised_at_ms: participant.hand_raised_at_ms,
+            joined_at_ms: participant.joined_at_ms,
+        }
+    }
+}
+
 /// One account's active native MatrixRTC calls.
 ///
 /// The host must run matrix-sdk-ui's SyncService with MSC4354 sticky events,
@@ -60,7 +178,7 @@ pub struct CallInfo {
 /// host still owns permissions, video rendering, and device controls.
 pub struct RtcService {
     client: Client,
-    calls: HashMap<String, LiveKitCall>,
+    calls: HashMap<String, ActiveCall>,
 }
 
 impl RtcService {
@@ -149,6 +267,16 @@ impl RtcService {
             TransportSupport::LiveKit { service_url } => service_url,
             TransportSupport::NoLiveKitTransport => return Err(RtcError::NoLiveKitTransport),
         };
+        let account_user_id = self
+            .client
+            .user_id()
+            .ok_or(RtcError::SignedOut)?
+            .to_string();
+        let account_device_id = self
+            .client
+            .device_id()
+            .ok_or(RtcError::SignedOut)?
+            .to_string();
 
         install_crypto_provider();
         let call = LiveKitCall::join(
@@ -169,24 +297,90 @@ impl RtcService {
             membership_id: call.membership_id().to_owned(),
             local_identity: call.local_identity().to_owned(),
         };
-        self.calls.insert(room_id.to_owned(), call);
+        let lease = CallLease::new(info.clone(), account_user_id, account_device_id);
+        self.calls
+            .insert(room_id.to_owned(), ActiveCall { call, lease });
         Ok(info)
     }
 
     /// Leave a call cleanly. The call is removed even when the Matrix leave
     /// send fails, because the upstream `leave` consumes its call handle.
     pub async fn leave(&mut self, room_id: &str) -> Result<(), RtcError> {
-        let call = self.calls.remove(room_id).ok_or(RtcError::NotJoined)?;
-        call.leave().await?;
+        let active = self.calls.remove(room_id).ok_or(RtcError::NotJoined)?;
+        active.lease.revoke();
+        active.call.leave().await?;
         Ok(())
     }
 
     pub fn call(&self, room_id: &str) -> Option<&LiveKitCall> {
-        self.calls.get(room_id)
+        self.calls.get(room_id).map(|active| &active.call)
     }
 
     pub fn call_mut(&mut self, room_id: &str) -> Option<&mut LiveKitCall> {
-        self.calls.get_mut(room_id)
+        self.calls.get_mut(room_id).map(|active| &mut active.call)
+    }
+
+    pub(crate) fn call_lease(&self, room_id: &str) -> Option<&CallLease> {
+        self.calls.get(room_id).map(|active| &active.lease)
+    }
+
+    /// Latest MatrixRTC signalling roster, including our own membership.
+    /// A caller can use `call(room_id).subscribe_participants()` as its change
+    /// signal, then read this stable Morpheus snapshot after each update.
+    pub fn participants(&self, room_id: &str) -> Result<Vec<ParticipantInfo>, RtcError> {
+        let call = self.calls.get(room_id).ok_or(RtcError::NotJoined)?;
+        Ok(call
+            .call
+            .participants()
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Read the optional Morpheus presentation marker from the homeserver.
+    /// Native sliding sync may omit custom state types, so a cached state
+    /// lookup cannot reliably discover a marker another member just wrote.
+    /// `None` means this room has no shared voice-space designation.
+    /// MatrixRTC slots and room permissions remain authoritative for joining.
+    pub async fn voice_space_marker(
+        &self,
+        room_id: &str,
+    ) -> Result<Option<VoiceSpaceMarker>, RtcError> {
+        let room = self.ensure_loaded_room(room_id)?;
+        let request = get_state_event_for_key::v3::Request::new(
+            room.room_id().to_owned(),
+            StateEventType::from(VOICE_SPACE_EVENT_TYPE),
+            VOICE_SPACE_STATE_KEY.to_owned(),
+        );
+        let response = match self.client.send(request).await {
+            Ok(response) => response,
+            Err(error) if error.client_api_error_kind() == Some(&ErrorKind::NotFound) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(RtcError::RoomState(error.to_string())),
+        };
+        let content: Value = serde_json::from_str(response.event_or_content.get())
+            .map_err(|error| RtcError::RoomState(error.to_string()))?;
+        Ok(Some(VoiceSpaceMarker::parse_content(&content)?))
+    }
+
+    /// Set the shared room hint when the current account has state-event
+    /// power. The user must explicitly request this; a local designation can
+    /// be used in settings instead when room power is unavailable.
+    pub async fn set_voice_space_marker(
+        &self,
+        room_id: &str,
+        enabled: bool,
+    ) -> Result<(), RtcError> {
+        let room = self.ensure_loaded_room(room_id)?;
+        room.send_state_event_raw(
+            VOICE_SPACE_EVENT_TYPE,
+            VOICE_SPACE_STATE_KEY,
+            VoiceSpaceMarker { enabled }.content(),
+        )
+        .await
+        .map_err(|error| RtcError::RoomState(error.to_string()))?;
+        Ok(())
     }
 
     pub fn active_room_ids(&self) -> impl Iterator<Item = &str> {
@@ -225,6 +419,14 @@ impl RtcService {
     }
 }
 
+impl Drop for RtcService {
+    fn drop(&mut self) {
+        for active in self.calls.values() {
+            active.lease.revoke();
+        }
+    }
+}
+
 /// Install rustls's AWS-LC provider before the application's first HTTPS or
 /// WSS request. The Matrix SDK and LiveKit graph enables two providers, so
 /// rustls cannot select one on its own. Safe to call again if the app already
@@ -235,5 +437,54 @@ pub fn install_crypto_provider() {
     // used, unless the application already installed its own provider.
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use matrix_rtc_call_sdk::StreamState;
+
+    use super::*;
+
+    #[test]
+    fn roster_conversion_preserves_membership_and_media_state() {
+        let info = ParticipantInfo::from(Participant {
+            member_id: "membership-1".into(),
+            user_id: "@alice:example.test".into(),
+            device_id: Some("DEVICE".into()),
+            is_local: false,
+            reachable: true,
+            streams: vec![
+                StreamState {
+                    kind: MediaStreamKind::Microphone,
+                    muted: true,
+                },
+                StreamState {
+                    kind: MediaStreamKind::ScreenShare,
+                    muted: false,
+                },
+            ],
+            hand_raised_at_ms: Some(42),
+            joined_at_ms: None,
+        });
+        assert_eq!(info.member_id, "membership-1");
+        assert_eq!(info.user_id, "@alice:example.test");
+        assert_eq!(info.device_id.as_deref(), Some("DEVICE"));
+        assert!(!info.is_local);
+        assert!(info.reachable);
+        assert_eq!(info.hand_raised_at_ms, Some(42));
+        assert_eq!(
+            info.streams,
+            vec![
+                ParticipantStreamInfo {
+                    kind: RtcStreamKind::Microphone,
+                    muted: true,
+                },
+                ParticipantStreamInfo {
+                    kind: RtcStreamKind::ScreenShare,
+                    muted: false,
+                },
+            ]
+        );
     }
 }

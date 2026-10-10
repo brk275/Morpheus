@@ -63,13 +63,21 @@ PATH=/opt/homebrew/opt/rustup/bin:$PATH cargo test --locked -p morpheus-rtc --fe
 The gated test signs in Alice and Bob as separate Matrix devices, bootstraps
 and verifies each disposable user's own cross-signing identity, requires
 sticky sliding sync, opens their encrypted room's standard call slot, joins
-both through `RtcService`, checks each participant roster, publishes synthetic
-microphone PCM and red/green I420 camera and screen tracks, checks that Bob
+both through `RtcService`, checks each participant through Morpheus's roster
+snapshot, publishes synthetic microphone PCM and red/green I420 camera and
+screen tracks, checks that Bob
 imports Alice's media key and decodes audio plus the expected 16:9 color pattern
 from each video kind, then exercises leave and rejoin. It needs no audio, camera,
 or screen-capture hardware. A
 successful run logs out and deletes the temporary client stores; a failed run
 leaves its store for diagnosis.
+
+Before joining, Alice also writes the shared
+`io.github.brk275.morpheus.voice` state event with `{"v":1,"enabled":true}`;
+Bob must read the enabled marker from the room's homeserver. Native sliding
+sync does not reliably include this custom state type, so the reader performs
+an explicit room-state GET. This checks the shared marker's wire path, not its
+voice-space settings or navigation UI.
 
 ### Real macOS display and window capture
 
@@ -140,6 +148,14 @@ with `-` briefly broke `rtc-fixture` registration; the registration script now
 passes it in `--password=value` form, and a fresh fixture succeeded. The
 original red/green test still uses generated pixels unless
 `MORPHEUS_RTC_REAL_SCREEN_CAPTURE=1` is set.
+
+Another fresh-fixture run passed in 18.16 seconds after the shared voice-space
+marker and Morpheus roster assertions were added. Its first attempt exposed
+the missing custom-state event in native sliding sync; the explicit state GET
+fixed that lookup. The call stage now compiles with a participant list and
+remote video tile, but live received-track playback in the app remains
+unverified.
+
 Morpheus rejects an encrypted call before joining when the current
 device lacks the required verification; the app still needs a clear
 verification/recovery action for real accounts.
@@ -148,8 +164,8 @@ This local test does not establish federation between the two Synapse
 homeservers. The authorization service runs in its legacy direct mode for the
 client library's `/get_token` flow; production MatrixRTC service registration,
 federated calls, delegated delayed leave, Element Call interoperability,
-automatic network reconnect, video in the Morpheus call stage, OS-specific
-camera capture, packaged-app window/display sharing with permission UI, and
+automatic network reconnect, live video playback in the Morpheus call stage,
+OS-specific camera capture, packaged-app window/display sharing with permission UI, and
 Linux/Windows call behavior remain separate release gates. The local TLS
 bypass and loopback DNS alias are test-only configuration.
 

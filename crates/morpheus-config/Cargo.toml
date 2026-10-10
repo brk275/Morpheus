@@ -9,8 +9,6 @@ description = "Versioned local configuration for Morpheus"
 [dependencies]
 directories = "6.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
+tempfile = "3"
 thiserror = "2.0.21"
 toml = "1.1.8"
-
-[dev-dependencies]
-tempfile = "3"

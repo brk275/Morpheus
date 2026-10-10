@@ -9,8 +9,10 @@ compatible MatrixRTC transport.
 - `morpheus-app`: Slint views and application controller. It owns presentation
   state, not Matrix access tokens or encryption keys.
 - `morpheus-matrix`: one Matrix SDK client, persistent store, and sync task per
-  signed-in Matrix device. The active account syncs by default. Optional
-  background sync for inactive accounts is planned after the account isolation
+  signed-in Matrix device. The active account syncs and runs its send queue by
+  default. Queued text and encrypted attachments keep their SDK transaction ID
+  after a send error; recoverable room failures retry with bounded backoff.
+  Optional background sync for inactive accounts is planned after the account isolation
   and notification checks.
 - `morpheus-rtc`: native MatrixRTC call integration. The evolving wire protocol
   and pinned RTC dependency remain behind this boundary.
@@ -48,3 +50,11 @@ Matrix SSO launches the system browser and returns through a short-lived
 loopback callback listener. MSC3861 OIDC is a later authentication milestone.
 The app does not embed WebViews. Rich remote HTML and URL previews require
 sanitization and privacy controls before they are enabled in the interface.
+
+Attachment filenames are sanitized before they enter the UI. A downloaded
+attachment is decrypted for the selected account, checked against its declared
+size, and written only to a path selected by the user. The save holds account
+and room navigation guards through an atomic local replacement. The pinned SDK
+buffers the media HTTP response internally, so a malicious underdeclared media
+response can still exceed the nominal 25 MiB limit transiently; this must be
+resolved before public beta acceptance.

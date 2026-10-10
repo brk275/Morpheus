@@ -51,6 +51,12 @@ export struct MemberItem {
     online: bool,
 }
 
+export struct CallParticipantItem {
+    name: string,
+    detail: string,
+    is-local: bool,
+}
+
 component AvatarBadge inherits Rectangle {
     in property <string> initials;
     in property <color> accent;
@@ -236,6 +242,7 @@ export component AppWindow inherits Window {
     in-out property <string> ui-font-family: "Inter";
     in-out property <string> config-error;
     in-out property <string> session-error;
+    in-out property <string> transfer-notice;
     in-out property <string> config-path;
     in-out property <bool> show-sign-in: true;
     in-out property <bool> login-loading: false;
@@ -243,6 +250,10 @@ export component AppWindow inherits Window {
     in-out property <bool> live-session: false;
     in-out property <bool> native-call-enabled: false;
     in-out property <string> native-call-status;
+    in-out property <bool> native-video-visible: false;
+    in-out property <image> native-video-frame;
+    in-out property <string> native-video-source;
+    in-out property <[CallParticipantItem]> native-call-participants;
     in-out property <bool> custom-theme-active: false;
     in-out property <color> custom-rail;
     in-out property <color> custom-sidebar;
@@ -262,6 +273,10 @@ export component AppWindow inherits Window {
     callback submit-room-action(int, string);
     callback respond-invite(string, bool);
     callback send-message(string);
+    callback attach-file();
+    callback cancel-attachment();
+    callback retry-attachment();
+    callback save-attachment(string, string);
     callback send-thread-message(string);
     callback open-thread(string, string, string);
     callback close-thread();
@@ -306,6 +321,12 @@ export component AppWindow inherits Window {
     in-out property <int> pending-account-index: -1;
     in-out property <string> composer-text;
     in-out property <bool> composer-busy: false;
+    in-out property <bool> attachment-busy: false;
+    in-out property <bool> attachment-needs-retry: false;
+    in-out property <string> attachment-status;
+    in-out property <int> attachment-operation: 0;
+    in-out property <string> downloading-event-id;
+    in-out property <int> download-operation: 0;
     in-out property <int> composer-operation: 0;
     in-out property <int> composer-mode: 0; // 0 message, 1 reply, 2 edit
     in-out property <string> composer-target-id;
@@ -850,6 +871,19 @@ export component AppWindow inherits Window {
                         overflow: elide;
                     }
                 }
+                if root.transfer-notice != "" : Rectangle {
+                    height: 30px;
+                    background: #214a46;
+                    Text {
+                        x: 16px; width: parent.width - 32px;
+                        text: root.transfer-notice;
+                        accessible-live-region: polite;
+                        color: #ffffff;
+                        font-size: 11px * root.text-scale;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
 
                 if root.page == 0 : VerticalLayout {
                     vertical-stretch: 1;
@@ -902,7 +936,7 @@ export component AppWindow inherits Window {
                                                         message-input.focus();
                                                     }
                                                 }
-                                                if message.event-id != "" && message.is-own : IconAction {
+                                                if message.event-id != "" && message.is-own && message.attachment == "" : IconAction {
                                                     width: 28px; height: 26px; icon: "✎"; label: "Edit your message";
                                                     ink: root.muted; surface: transparent; hover-surface: root.hover;
                                                     activated => {
@@ -960,7 +994,13 @@ export component AppWindow inherits Window {
                                                     spacing: 10px;
                                                     Text { text: "F"; color: root.accent; font-size: 20px * root.text-scale; vertical-alignment: center; }
                                                     Text { text: message.attachment; color: root.ink; font-size: 12px * root.text-scale; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
-                                                    Text { text: "↗"; color: root.muted; font-size: 16px * root.text-scale; vertical-alignment: center; }
+                                                    IconAction {
+                                                        icon: "↓";
+                                                        label: "Save attachment " + message.attachment;
+                                                        ink: root.accent; surface: transparent; hover-surface: root.hover;
+                                                        enabled: root.live-session && message.event-id != "" && root.downloading-event-id == "";
+                                                        activated => { root.save-attachment(message.event-id, message.attachment); }
+                                                    }
                                                 }
                                             }
                                             if message.reaction != "" : Rectangle {
@@ -978,8 +1018,31 @@ export component AppWindow inherits Window {
                         }
                     }
                     Rectangle {
-                        height: root.composer-mode == 0 ? 78px : 109px;
+                        height: (root.composer-mode == 0 ? 78px : 109px) + (root.attachment-busy ? 29px : 0px);
                         background: root.canvas;
+                        if root.attachment-busy : HorizontalLayout {
+                            x: 22px; y: root.composer-mode == 0 ? 2px : 33px;
+                            width: parent.width - 44px; height: 28px; spacing: 8px;
+                            Text {
+                                text: root.attachment-status;
+                                color: root.muted;
+                                font-size: 11px * root.text-scale;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                                accessible-live-region: polite;
+                            }
+                            if root.attachment-needs-retry : IconAction {
+                                width: 27px; height: 26px; icon: "↻"; label: "Retry queued attachment";
+                                ink: root.accent; surface: transparent; hover-surface: root.hover;
+                                activated => { root.retry-attachment(); }
+                            }
+                            IconAction {
+                                width: 27px; height: 26px; icon: "×"; label: "Cancel attachment upload";
+                                ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                activated => { root.cancel-attachment(); }
+                            }
+                        }
                         if root.composer-mode != 0 : HorizontalLayout {
                             x: 20px; y: 4px; width: parent.width - 40px; height: 27px; spacing: 8px;
                             Text {
@@ -1000,7 +1063,7 @@ export component AppWindow inherits Window {
                         }
                         Rectangle {
                             x: 18px;
-                            y: root.composer-mode == 0 ? 7px : 38px;
+                            y: (root.composer-mode == 0 ? 7px : 38px) + (root.attachment-busy ? 29px : 0px);
                             width: parent.width - 36px;
                             height: 58px;
                             border-radius: 11px;
@@ -1013,10 +1076,8 @@ export component AppWindow inherits Window {
                                 spacing: 6px;
                                 IconAction {
                                     icon: "+"; label: "Attach file"; ink: root.muted; surface: transparent; hover-surface: root.hover;
-                                    activated => {
-                                        if root.live-session { root.session-error = "Attachments are not available in this build"; }
-                                        else { root.composer-text = root.composer-text + " [attachment]"; }
-                                    }
+                                    enabled: root.live-session && root.active-room-id != "" && root.composer-mode == 0 && !root.attachment-busy;
+                                    activated => { root.attach-file(); }
                                 }
                                 Rectangle {
                                     horizontal-stretch: 1;
@@ -1215,7 +1276,7 @@ export component AppWindow inherits Window {
                     vertical-stretch: 1;
                     padding: 24px;
                     spacing: 16px;
-                    Text { text: root.live-session ? "Audio call · " + root.active-room-name : "The Workshop · Lounge"; color: root.ink; font-size: 21px * root.text-scale; font-weight: 760; }
+                    Text { text: root.live-session ? "Room call · " + root.active-room-name : "The Workshop · Lounge"; color: root.ink; font-size: 21px * root.text-scale; font-weight: 760; }
                     Text {
                         text: root.live-session
                             ? (root.native-call-enabled ? root.native-call-status : "Native calls are unavailable in this build")
@@ -1225,16 +1286,82 @@ export component AppWindow inherits Window {
                     }
                     if root.live-session : Rectangle {
                         vertical-stretch: 1; background: root.elevated; border-radius: 14px;
-                        Text {
-                            text: root.native-call-enabled
-                                ? "Native audio is available when this homeserver advertises a compatible MatrixRTC service. Select a room and join its call."
-                                : "This build does not include the native media backend.";
-                            color: root.muted; font-size: 15px * root.text-scale; wrap: word-wrap;
-                            horizontal-alignment: center; vertical-alignment: center;
-                            x: 28px; width: parent.width - 56px;
+                        if root.native-video-visible : Image {
+                            x: 12px; y: 12px;
+                            width: parent.width - 248px; height: parent.height - 24px;
+                            source: root.native-video-frame;
+                            image-fit: contain;
                         }
-                        if root.native-call-enabled : ActionRect {
-                            x: (parent.width - 176px) / 2; y: parent.height - 76px;
+                        if root.native-video-visible : Rectangle {
+                            x: 20px; y: 20px; width: 330px; height: 32px;
+                            background: root.panel; border-radius: 8px;
+                            Text {
+                                x: 10px; width: parent.width - 20px; height: parent.height;
+                                text: root.native-video-source;
+                                color: root.ink; font-size: 12px * root.text-scale;
+                                vertical-alignment: center; overflow: elide;
+                            }
+                        }
+                        if !root.native-video-visible : VerticalLayout {
+                            x: 28px; y: (parent.height - 132px) / 2;
+                            width: parent.width - 276px; height: 132px;
+                            alignment: center; spacing: 12px;
+                            Text {
+                                text: root.call-connected ? "Waiting for participant video" : "Join the room call";
+                                color: root.ink; font-size: 19px * root.text-scale;
+                                font-weight: 700; horizontal-alignment: center;
+                            }
+                            Text {
+                                text: root.native-call-enabled
+                                    ? "Remote cameras and screen shares appear here when a participant publishes them."
+                                    : "This build does not include the native media backend.";
+                                color: root.muted; font-size: 13px * root.text-scale; wrap: word-wrap;
+                                horizontal-alignment: center;
+                            }
+                        }
+                        Rectangle {
+                            x: parent.width - 224px; y: 12px;
+                            width: 212px; height: parent.height - 24px;
+                            background: root.panel; border-radius: 11px;
+                            Text {
+                                x: 12px; y: 10px; width: parent.width - 24px; height: 24px;
+                                text: "PARTICIPANTS · " + root.native-call-participants.length;
+                                color: root.muted; font-size: 10px * root.text-scale;
+                                font-weight: 750; letter-spacing: 1px;
+                                accessible-live-region: polite;
+                            }
+                            if root.native-call-participants.length == 0 : Text {
+                                x: 12px; y: 44px; width: parent.width - 24px;
+                                text: "Nobody is in this call yet";
+                                color: root.muted; font-size: 11px * root.text-scale;
+                                wrap: word-wrap;
+                            }
+                            call-roster := ListView {
+                                x: 10px; y: 42px;
+                                width: parent.width - 20px; height: parent.height - 52px;
+                                horizontal-scrollbar-policy: always-off;
+                                for participant in root.native-call-participants : Rectangle {
+                                    width: call-roster.visible-width; height: 52px;
+                                    background: transparent;
+                                    VerticalLayout {
+                                        padding-left: 4px; padding-right: 4px;
+                                        alignment: center; spacing: 3px;
+                                        Text {
+                                            text: participant.is-local ? "You · " + participant.name : participant.name;
+                                            color: root.ink; font-size: 11px * root.text-scale;
+                                            font-weight: 700; overflow: elide;
+                                        }
+                                        Text {
+                                            text: participant.detail;
+                                            color: root.muted; font-size: 10px * root.text-scale;
+                                            overflow: elide;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if root.native-call-enabled && !root.call-connected : ActionRect {
+                            x: (parent.width - 220px - 176px) / 2; y: parent.height - 76px;
                             width: 176px; height: 42px; border-radius: 9px;
                             background: root.hover; border-color: root.divider; border-width: 1px;
                             focus-color: root.accent;
@@ -1279,7 +1406,7 @@ export component AppWindow inherits Window {
                             ActionRect {
                                 width: 118px; height: 43px; border-radius: 9px; background: root.live-session && !root.native-call-enabled ? root.hover : root.call-connected ? #d65163 : root.accent;
                                 focus-color: root.ink;
-                                label: root.live-session ? (root.call-connected ? "Leave native audio call" : "Join native audio call") : (root.call-connected ? "End call preview" : "Start call preview");
+                                label: root.live-session ? (root.call-connected ? "Leave native call" : "Join native call") : (root.call-connected ? "End call preview" : "Start call preview");
                                 enabled: !root.live-session || root.native-call-enabled;
                                 activated => {
                                     if root.live-session {
@@ -1289,7 +1416,7 @@ export component AppWindow inherits Window {
                                         }
                                     } else { root.call-connected = !root.call-connected; }
                                 }
-                                Text { text: root.live-session ? (root.native-call-enabled ? (root.call-connected ? "Leave audio" : "Join audio") : "Unavailable") : (root.call-connected ? "End preview" : "Start preview"); color: #ffffff; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                                Text { text: root.live-session ? (root.native-call-enabled ? (root.call-connected ? "Leave call" : "Join call") : "Unavailable") : (root.call-connected ? "End preview" : "Start preview"); color: #ffffff; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                             }
                             IconAction { width: 43px; height: 43px; icon: "R"; label: "Return to chat"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.page = 0; } }
                         }

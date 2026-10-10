@@ -1,6 +1,9 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use cpal::{
@@ -11,12 +14,12 @@ use futures_util::StreamExt;
 use matrix_rtc_call_sdk::CallEvent;
 use matrix_rtc_transport::AudioFrame;
 use tokio::{
-    sync::mpsc,
+    sync::{mpsc, watch},
     task::JoinHandle,
     time::{Duration, MissedTickBehavior},
 };
 
-use crate::{MediaError, Publication, RtcService};
+use crate::{CallInfo, MediaError, Publication, RtcService, native::CallLease};
 
 const SAMPLE_RATE: u32 = 48_000;
 const CHUNK_SAMPLES_PER_CHANNEL: usize = 480; // 10 ms
@@ -171,6 +174,7 @@ pub struct AudioOutput {
 struct AudioMixer {
     channels: u32,
     streams: HashMap<String, VecDeque<i16>>,
+    deafened: bool,
 }
 
 impl AudioMixer {
@@ -178,7 +182,14 @@ impl AudioMixer {
         Self {
             channels,
             streams: HashMap::new(),
+            deafened: false,
         }
+    }
+
+    fn set_deafened(&mut self, deafened: bool) {
+        self.deafened = deafened;
+        // Never play audio buffered before the user un-deafens.
+        self.streams.clear();
     }
 
     fn push_frame(&mut self, member_id: &str, frame: &AudioFrame) -> Result<(), MediaError> {
@@ -191,6 +202,9 @@ impl AudioMixer {
         let output_samples = frame.samples_per_channel as usize * self.channels as usize;
         if output_samples > MAX_OUTPUT_BUFFER_SAMPLES {
             return Err(MediaError::FrameFormatMismatch);
+        }
+        if self.deafened {
+            return Ok(());
         }
         let queue = self.streams.entry(member_id.to_owned()).or_default();
         if queue.len() + output_samples > MAX_OUTPUT_BUFFER_SAMPLES {
@@ -205,6 +219,9 @@ impl AudioMixer {
     }
 
     fn next_sample(&mut self) -> i16 {
+        if self.deafened {
+            return 0;
+        }
         self.streams
             .values_mut()
             .map(|queue| i64::from(queue.pop_front().unwrap_or(0)))
@@ -322,9 +339,230 @@ impl AudioOutput {
             .remove_stream(member_id);
         Ok(())
     }
+
+    /// Silence local playback immediately and discard buffered remote audio.
+    /// This is local only; it does not signal a MatrixRTC stream mute to peers.
+    pub fn set_deafened(&self, deafened: bool) -> Result<(), MediaError> {
+        self.mixer
+            .lock()
+            .map_err(|_| MediaError::Device("speaker mixer poisoned".into()))?
+            .set_deafened(deafened);
+        Ok(())
+    }
+}
+
+/// Applied local audio state for one call join. Microphone mute is published
+/// to peers; deafen only silences this device's speaker.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioState {
+    pub microphone_muted: bool,
+    pub deafened: bool,
+}
+
+struct AudioControlState {
+    desired: AudioState,
+    applied: AudioState,
+    microphone: Option<Arc<Publication>>,
+    speaker_mixer: Option<Arc<Mutex<AudioMixer>>>,
+}
+
+/// Commands for one account, room, and MatrixRTC membership. Old controls
+/// cannot operate a subsequent join, even if it is in the same room.
+#[derive(Clone)]
+pub struct AudioControls {
+    lease: CallLease,
+    state: Arc<Mutex<AudioControlState>>,
+    requested: watch::Sender<AudioState>,
+    applied: watch::Sender<AudioState>,
+    running: Arc<AtomicBool>,
+}
+
+impl AudioControls {
+    fn new(lease: CallLease) -> Self {
+        let desired = AudioState {
+            microphone_muted: false,
+            deafened: false,
+        };
+        let applied = AudioState {
+            microphone_muted: true,
+            deafened: false,
+        };
+        let (requested, _) = watch::channel(desired);
+        let (applied_updates, _) = watch::channel(applied);
+        Self {
+            lease,
+            state: Arc::new(Mutex::new(AudioControlState {
+                desired,
+                applied,
+                microphone: None,
+                speaker_mixer: None,
+            })),
+            requested,
+            applied: applied_updates,
+            running: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn call_info(&self) -> &CallInfo {
+        &self.lease.info
+    }
+
+    pub fn account_user_id(&self) -> &str {
+        &self.lease.account_user_id
+    }
+
+    pub fn account_device_id(&self) -> &str {
+        &self.lease.account_device_id
+    }
+
+    pub fn applied_state(&self) -> AudioState {
+        *self.applied.borrow()
+    }
+
+    pub fn subscribe_applied_state(&self) -> watch::Receiver<AudioState> {
+        self.applied.subscribe()
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.lease.is_active() && self.running.load(Ordering::Acquire)
+    }
+
+    fn is_for(&self, lease: &CallLease) -> bool {
+        lease.same_join(&self.lease)
+    }
+
+    /// Mute reaches the published track synchronously. Unmute is queued for
+    /// the capture loop, which discards old microphone frames first. The
+    /// `applied_state` watch reports when that unmute actually takes effect.
+    pub fn set_microphone_muted(&self, muted: bool) -> Result<(), MediaError> {
+        self.ensure_running()?;
+        let mut state = self.lock_state()?;
+        if muted {
+            if let Some(publication) = &state.microphone {
+                publication.set_muted(true)?;
+                state.applied.microphone_muted = true;
+                self.applied.send_replace(state.applied);
+            }
+        }
+        state.desired.microphone_muted = muted;
+        self.requested.send_replace(state.desired);
+        Ok(())
+    }
+
+    /// Stop local speaker playback and clear buffered PCM immediately. Peers
+    /// still send their microphone tracks and receive our microphone normally.
+    pub fn set_deafened(&self, deafened: bool) -> Result<(), MediaError> {
+        self.ensure_running()?;
+        let mut state = self.lock_state()?;
+        if let Some(mixer) = &state.speaker_mixer {
+            mixer
+                .lock()
+                .map_err(|_| MediaError::Device("speaker mixer poisoned".into()))?
+                .set_deafened(deafened);
+            state.applied.deafened = deafened;
+            self.applied.send_replace(state.applied);
+        }
+        state.desired.deafened = deafened;
+        self.requested.send_replace(state.desired);
+        Ok(())
+    }
+
+    fn ensure_running(&self) -> Result<(), MediaError> {
+        if !self.lease.is_active() {
+            return Err(MediaError::CallEnded);
+        }
+        if !self.running.load(Ordering::Acquire) {
+            return Err(MediaError::ControlNotRunning);
+        }
+        Ok(())
+    }
+
+    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, AudioControlState>, MediaError> {
+        self.state
+            .lock()
+            .map_err(|_| MediaError::Device("audio controls poisoned".into()))
+    }
+
+    fn attach(
+        &self,
+        publication: Arc<Publication>,
+        speaker: &AudioOutput,
+        microphone: &mut MicrophoneCapture,
+    ) -> Result<(), MediaError> {
+        // The transport publishes muted, including while the OS devices open.
+        microphone.discard_buffered_frames();
+        let mut state = self.lock_state()?;
+        speaker.set_deafened(state.desired.deafened)?;
+        if !state.desired.microphone_muted {
+            publication.set_muted(false)?;
+        }
+        state.applied = state.desired;
+        state.microphone = Some(publication);
+        state.speaker_mixer = Some(Arc::clone(&speaker.mixer));
+        self.applied.send_replace(state.applied);
+        Ok(())
+    }
+
+    fn apply_pending_unmute(&self, microphone: &mut MicrophoneCapture) -> Result<(), MediaError> {
+        let needs_unmute = {
+            let state = self.lock_state()?;
+            !state.desired.microphone_muted && state.applied.microphone_muted
+        };
+        if needs_unmute {
+            microphone.discard_buffered_frames();
+            let mut state = self.lock_state()?;
+            if !state.desired.microphone_muted && state.applied.microphone_muted {
+                if let Some(publication) = &state.microphone {
+                    publication.set_muted(false)?;
+                    state.applied.microphone_muted = false;
+                    self.applied.send_replace(state.applied);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn should_send_microphone(&self) -> Result<bool, MediaError> {
+        let state = self.lock_state()?;
+        Ok(!state.applied.microphone_muted)
+    }
+}
+
+struct AudioRunGuard<'a>(&'a AudioControls);
+
+impl AudioRunGuard<'_> {
+    fn start(controls: &AudioControls) -> Result<AudioRunGuard<'_>, MediaError> {
+        controls
+            .running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| MediaError::ControlAlreadyRunning)?;
+        Ok(AudioRunGuard(controls))
+    }
+}
+
+impl Drop for AudioRunGuard<'_> {
+    fn drop(&mut self) {
+        self.0.running.store(false, Ordering::Release);
+        if let Ok(mut state) = self.0.state.lock() {
+            if let Some(publication) = state.microphone.take() {
+                let _ = publication.set_muted(true);
+            }
+            state.speaker_mixer = None;
+            state.applied.microphone_muted = true;
+            self.0.applied.send_replace(state.applied);
+        }
+    }
 }
 
 impl RtcService {
+    /// Create local audio controls for this exact join. Pass the handle to
+    /// `run_audio_controlled`; retain a clone for UI actions. A handle from a
+    /// previous leave/rejoin is rejected before any OS device opens.
+    pub fn audio_controls(&self, room_id: &str) -> Result<AudioControls, MediaError> {
+        let lease = self.call_lease(room_id).ok_or(MediaError::NotJoined)?;
+        Ok(AudioControls::new(lease.clone()))
+    }
+
     /// Run the default microphone and speaker for a joined call.
     /// Call this only after an explicit user action that authorizes microphone
     /// capture. It returns when the call ends or the media path fails; dropping
@@ -332,17 +570,40 @@ impl RtcService {
     /// remote microphone gets a bounded playback queue; device switching and
     /// network jitter control are still outside this adapter.
     pub async fn run_audio(&self, room_id: &str) -> Result<(), MediaError> {
+        let controls = self.audio_controls(room_id)?;
+        self.run_audio_controlled(room_id, &controls).await
+    }
+
+    /// Run the same default audio path with live call-bound mute and deafen
+    /// controls. Muting the microphone signals peers through the native
+    /// publication; deafen only affects local playback. This future owns the
+    /// devices and releases them on cancellation, failure, or call end.
+    pub async fn run_audio_controlled(
+        &self,
+        room_id: &str,
+        controls: &AudioControls,
+    ) -> Result<(), MediaError> {
         let call = self.call(room_id).ok_or(MediaError::NotJoined)?;
+        let lease = self.call_lease(room_id).ok_or(MediaError::NotJoined)?;
+        if !controls.is_for(lease) {
+            return Err(MediaError::WrongCall);
+        }
+        if !lease.is_active() {
+            return Err(MediaError::CallEnded);
+        }
+        let _run_guard = AudioRunGuard::start(controls)?;
+        let mut requests = controls.requested.subscribe();
         let mut microphone = MicrophoneCapture::open_default()?;
         let speaker = AudioOutput::open_default()?;
-        let publication = self
-            .publish_microphone(
+        let publication = Arc::new(
+            self.publish_microphone(
                 room_id,
                 microphone.sample_rate(),
                 microphone.channels(),
                 true,
             )
-            .await?;
+            .await?,
+        );
         let _mute_on_drop = MuteOnDrop(&publication);
         let mut events = call.subscribe_call_events();
         let (remote_tx, mut remote_rx) = mpsc::channel(REMOTE_FRAME_CHANNEL_CAPACITY);
@@ -350,19 +611,31 @@ impl RtcService {
         let mut roster_refresh = tokio::time::interval(Duration::from_secs(2));
         roster_refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-        microphone.discard_buffered_frames();
         let result = async {
+            controls.attach(Arc::clone(&publication), &speaker, &mut microphone)?;
+            let _ = *requests.borrow_and_update();
+            controls.apply_pending_unmute(&mut microphone)?;
             remotes.reconcile(call, &speaker)?;
-            publication.set_muted(false)?;
             loop {
                 tokio::select! {
+                    biased;
+                    changed = requests.changed() => {
+                        if changed.is_err() {
+                            break Ok(());
+                        }
+                        let _ = *requests.borrow_and_update();
+                        controls.apply_pending_unmute(&mut microphone)?;
+                    }
                     _ = roster_refresh.tick() => {
                         // A frame stream can close without a matching call
                         // event. Retry subscribed tracks at a bounded rate.
                         remotes.reconcile(call, &speaker)?;
                     }
                     frame = microphone.next_frame() => {
-                        publication.push_audio(frame?).await?;
+                        let frame = frame?;
+                        if controls.should_send_microphone()? {
+                            publication.push_audio(frame).await?;
+                        }
                     }
                     event = events.recv() => {
                         match event {
@@ -704,5 +977,60 @@ mod tests {
             Err(MediaError::FrameFormatMismatch)
         ));
         assert!(mixer.streams.is_empty());
+    }
+
+    #[test]
+    fn deafen_discards_queued_audio_and_new_frames_until_reenabled() {
+        let mut mixer = AudioMixer::new(1);
+        mixer.push_frame("peer", &frame(&[11, 12], 1)).unwrap();
+        mixer.set_deafened(true);
+        assert_eq!(mixer.next_sample(), 0);
+        mixer.push_frame("peer", &frame(&[13, 14], 1)).unwrap();
+        assert!(mixer.streams.is_empty());
+        mixer.set_deafened(false);
+        assert_eq!(mixer.next_sample(), 0);
+        mixer.push_frame("peer", &frame(&[15], 1)).unwrap();
+        assert_eq!(mixer.next_sample(), 15);
+    }
+
+    #[test]
+    fn controls_from_previous_join_reject_new_join_even_in_same_room() {
+        let info = CallInfo {
+            room_id: "!room:example.test".into(),
+            slot_id: "m.call#room".into(),
+            membership_id: "first-membership".into(),
+            local_identity: "first-identity".into(),
+        };
+        let old_lease = CallLease::new(info.clone(), "@alice:example.test".into(), "DEVICE".into());
+        let old = AudioControls::new(old_lease.clone());
+        let _running = AudioRunGuard::start(&old).unwrap();
+        old.set_microphone_muted(true).unwrap();
+
+        // RtcService::leave revokes this lease before the upstream leave await.
+        old_lease.revoke();
+        let second = CallLease::new(
+            CallInfo {
+                membership_id: "second-membership".into(),
+                local_identity: "second-identity".into(),
+                ..info
+            },
+            "@alice:example.test".into(),
+            "DEVICE".into(),
+        );
+        assert!(!old.is_for(&second));
+        assert!(matches!(
+            old.set_microphone_muted(false),
+            Err(MediaError::CallEnded)
+        ));
+        assert!(matches!(old.set_deafened(true), Err(MediaError::CallEnded)));
+        let fresh = AudioControls::new(second.clone());
+        assert!(fresh.is_for(&second));
+        assert!(!fresh.is_running());
+        let same_ids_but_new_lease = CallLease::new(
+            second.info.clone(),
+            "@alice:example.test".into(),
+            "DEVICE".into(),
+        );
+        assert!(!fresh.is_for(&same_ids_but_new_lease));
     }
 }

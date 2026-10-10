@@ -128,6 +128,61 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
   Synapse registration script; it now uses `--password=value`, and the next
   fresh fixture registered successfully. All local services were stopped.
 
+## 2026-10-10 focused follow-up checks
+
+- `ConfigStore::save` now writes a unique temporary file beside `config.toml`,
+  flushes it, and persists it over the destination. The focused configuration
+  suite passed 4/4 tests, including saving over an existing config. This
+  checks the replacement path; forced process termination during a write and
+  Windows filesystem behavior have not been exercised at runtime.
+- A fresh disposable Alice/Bob MatrixRTC test passed in 18.16 seconds after
+  Alice wrote the `io.github.brk275.morpheus.voice` room-state marker and Bob
+  read it. The first attempt exposed that native sliding sync did not include
+  this custom state event; the reader now fetches the state directly from the
+  homeserver. The same passing run checked Morpheus's participant-roster
+  wrapper, encrypted synthetic microphone, camera, and screen tracks, and
+  leave/rejoin. It verifies the marker and roster core against local Synapse,
+  not a voice-space settings or navigation UI.
+- The native call stage now has a participant list and a remote video tile.
+  Its worker selects a remote screen share ahead of a camera, bounds I420-to-RGB
+  conversion to 2.07 million pixels with a 1920-pixel edge limit and about
+  15 frames/s, and clears stale frames by
+  call generation. The native-call app check and six focused app tests passed
+  on macOS. A live RTC frame has not yet been viewed in the Morpheus call UI;
+  this remains a separate acceptance step from the successful transport tests.
+- A gated Alice/Bob encrypted attachment roundtrip passed twice on local
+  Synapse. Alice queued a binary file, Bob downloaded and decrypted identical
+  bytes, and the test checked the filename, MIME type, declared size, file
+  kind, encrypted metadata, account isolation, and absence of a unique payload
+  prefix in both account stores. The final run logged out its disposable
+  devices and removed their temporary stores. Nine focused Matrix core tests
+  passed, including the selected-account send-queue lifecycle. Attachment
+  controls, preview/open behavior, image/video/audio variants, and macOS UI
+  upload/download have not passed acceptance. The SDK buffers download HTTP
+  responses internally, so the 25 MiB post-download cap is not a strict
+  transient-memory bound if a server misstates the size.
+- A follow-up code review found that the SDK retains requests after both
+  recoverable and unrecoverable send errors. Morpheus now preserves the exact
+  transaction and observes its eventual result; the selected account's room
+  queues retry recoverable errors after 2–60 seconds. Re-selecting the active
+  account also resumes paused room queues. A retained error no longer restores
+  a draft or suggests a duplicate send. The focused Matrix suite passed 9/9,
+  including a retained-then-sent event test. Automatic retry during a real
+  network outage has not yet had a fault-injection acceptance run.
+- Native attachment selection and save dialogs, a timeline attachment card,
+  progress, cancellation, and same-transaction retry for a wedged upload are
+  wired in the app. Save uses a user-chosen path and an atomic file replacement;
+  the account and selected-room guards remain held through that write. App
+  native-call check and 8/8 focused app tests passed. The gated encrypted
+  Alice/Bob attachment test passed again with a receiver timeline filename
+  assertion; disposable Synapse servers were stopped afterward. Live GUI
+  click-through and image/video/audio previews remain open.
+- The RTC core now exposes call-bound microphone mute and local deafen
+  controls and rejects stale publication/control handles after leave and
+  rejoin. Its device-audio suite passed 19/19 after the final publication
+  drop-safety change. The app has not wired
+  those controls yet, and live device/cross-platform behavior remains open.
+
 ## GitHub CI
 
 [Run 38012987752](https://github.com/brk275/Morpheus/actions/runs/38012987752)
@@ -142,11 +197,16 @@ Ubuntu and both macOS jobs passed; the Windows tests, desktop check, and
 native-call app build passed. The final run conclusion was success on all four
 jobs. The native audio mixer test runs on macOS Apple Silicon and passed there;
 it is skipped on the other runners. [Run 38023378684](https://github.com/brk275/Morpheus/actions/runs/38023378684)
-checks the subsequent room, keyboard, and video-feasibility commit.
+passed all four jobs for the subsequent room, keyboard, and video-feasibility
+commit.
+[Run 38024603658](https://github.com/brk275/Morpheus/actions/runs/38024603658)
+passed all four jobs for the encrypted-drafts and macOS real-capture commit.
+The focused follow-up changes above have not yet run in GitHub CI.
 
 ## Still required for beta
 
 The current checks do not establish Element Call interoperability, the
-key-backup recovery UI, native video rendering, screen sharing in a call,
-Linux or Windows GUI behavior, screen-reader acceptance, install/update/remove
-behavior, signed packages, or Cinny-level messaging and administration breadth.
+key-backup recovery UI, live received video in the Morpheus call stage,
+packaged-app screen-sharing controls and permissions, Linux or Windows GUI
+behavior, screen-reader acceptance, install/update/remove behavior, signed
+packages, or Cinny-level messaging and administration breadth.
