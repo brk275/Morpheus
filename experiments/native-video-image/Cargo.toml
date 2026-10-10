@@ -1,0 +1,18 @@
+[package]
+name = "morpheus-native-video-image-poc"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+publish = false
+
+# Keep this renderer experiment out of the application workspace and release.
+[workspace]
+resolver = "3"
+
+[patch.crates-io]
+# Match the MatrixRTC SDK's pinned upstream dependency until it is published.
+const_panic = { git = "https://github.com/jplatte/const_panic", rev = "e0b317a9a7bde2d48a7d15b6a60d70e4a41d3b5f" }
+
+[dependencies]
+slint = "=1.18.1"
+morpheus-rtc = { path = "../../crates/morpheus-rtc", features = ["native-rtc"] }

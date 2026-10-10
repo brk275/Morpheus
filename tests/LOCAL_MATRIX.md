@@ -23,7 +23,7 @@ issued by the other server.
 The command prints the path to a mode-0600 `accounts.json` in a mode-0700 temp
 directory. It holds account passwords and room IDs. Keep the file local and
 never commit or paste it. The script is idempotent: `up` reuses these accounts
-and rooms on later runs. It raises local login rate limits to allow automated
+and rooms on later runs. It raises local login and invitation rate limits to allow automated
 tests; the servers remain bound to loopback.
 
 ## Test the Rust account manager
@@ -45,6 +45,22 @@ run leaves its temporary client store for diagnosis.
 The same credentials can be entered in the Morpheus desktop sign-in screen to
 inspect the account switcher and room lists manually. The first two labels in
 the file identify the Alice/Bob users on A; `b_primary` identifies Carol on B.
+
+## Test room actions
+
+With both local servers running and the same protected fixture path set:
+
+```sh
+PATH=/opt/homebrew/opt/rustup/bin:$PATH cargo test --locked -p morpheus-matrix --test room_actions_local -- --nocapture
+```
+
+This separate opt-in test creates private rooms and a private Space, verifies
+that an invitation appears for Bob, checks accept and decline, and joins
+invited rooms by full room ID and by a temporary server alias. It makes new
+disposable rooms on Synapse A, removes the alias, and logs out its test devices.
+The Space assertion covers the successful create request; delayed Space
+classification in the SDK room list is handled by the app's temporary Space
+entry and still needs a dedicated UI test.
 
 ## Test encrypted-history recovery
 

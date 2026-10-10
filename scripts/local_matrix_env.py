@@ -95,6 +95,12 @@ if not re.search(r'^rc_login:', config, re.MULTILINE):
   account: {per_second: 10, burst_count: 100}
   failed_attempts: {per_second: 10, burst_count: 100}
 """
+if not re.search(r'^rc_invites:', config, re.MULTILINE):
+    config += """rc_invites:
+  per_room: {per_second: 10, burst_count: 100}
+  per_user: {per_second: 10, burst_count: 100}
+  per_issuer: {per_second: 10, burst_count: 100}
+"""
 if config != original:
     path.write_text(config)
 print('updated' if config != original else 'unchanged')

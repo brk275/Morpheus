@@ -64,8 +64,10 @@ The gated test signs in Alice and Bob as separate Matrix devices, bootstraps
 and verifies each disposable user's own cross-signing identity, requires
 sticky sliding sync, opens their encrypted room's standard call slot, joins
 both through `RtcService`, checks each participant roster, publishes synthetic
-microphone PCM, checks that Bob imports Alice's media key and receives decoded
-audio, then exercises leave and rejoin. It needs no audio hardware. A
+microphone PCM and red/green I420 camera and screen tracks, checks that Bob
+imports Alice's media key and decodes audio plus the expected 16:9 color pattern
+from each video kind, then exercises leave and rejoin. It needs no audio, camera,
+or screen-capture hardware. A
 successful run logs out and deletes the temporary client stores; a failed run
 leaves its store for diagnosis.
 
@@ -92,7 +94,10 @@ The gated test now bootstraps each disposable identity, refreshes its device
 keys, and signs its own device if needed. On 2026-10-09, the fresh-fixture test
 passed in 17.07 seconds: Bob imported Alice's encrypted media key, subscribed
 to her synthetic microphone, decoded nonzero audio, left, and rejoined the
-same call. Morpheus rejects an encrypted call before joining when the current
+same call. An expanded fresh-fixture run passed in 18.27 seconds: Bob also
+received red/green synthetic I420 camera and `ScreenShare` frames at 640×360.
+The screen stream used generated pixels; it did not capture a display or window.
+Morpheus rejects an encrypted call before joining when the current
 device lacks the required verification; the app still needs a clear
 verification/recovery action for real accounts.
 
@@ -100,8 +105,9 @@ This local test does not establish federation between the two Synapse
 homeservers. The authorization service runs in its legacy direct mode for the
 client library's `/get_token` flow; production MatrixRTC service registration,
 federated calls, delegated delayed leave, Element Call interoperability,
-automatic network reconnect, video, screen sharing, OS-specific capture, and
-Linux/Windows call behavior remain separate release gates. The local TLS
+automatic network reconnect, video in the Morpheus call stage, OS-specific
+camera and screen capture, actual window/display sharing, and Linux/Windows
+call behavior remain separate release gates. The local TLS
 bypass and loopback DNS alias are test-only configuration.
 
 ## Stop

@@ -1,6 +1,6 @@
 //! Opt-in native MatrixRTC acceptance test against scripts/local_matrix_rtc.py.
 //! It uses disposable Alice/Bob devices in a local encrypted room and synthetic
-//! audio, so it needs no real microphone or public Matrix account.
+//! audio and video, so it needs no real capture device or public Matrix account.
 
 #![cfg(feature = "native-rtc")]
 
@@ -9,9 +9,16 @@ use std::{collections::HashMap, fs, path::PathBuf, time::Duration};
 use futures_util::StreamExt;
 use matrix_sdk::{Client, ruma::api::client::uiaa};
 use morpheus_matrix::{AccountManager, SyncBackend, SyncStatus};
-use morpheus_rtc::{AudioFrame, CallOptions, MediaStreamKind, RtcError, RtcService};
+use morpheus_rtc::{
+    AudioFrame, CallOptions, I420Buffer, MediaStreamKind, RtcError, RtcService, VideoFrame,
+    VideoRotation,
+};
 use serde::Deserialize;
+use tokio::sync::oneshot;
 use tokio::time::{sleep, timeout};
+
+const VIDEO_WIDTH: u32 = 640;
+const VIDEO_HEIGHT: u32 = 360;
 
 #[derive(Deserialize)]
 struct Fixture {
@@ -164,8 +171,157 @@ async fn wait_for_peer(rtc: &RtcService, room_id: &str, peer_user_id: &str, pres
     .unwrap_or_else(|_| panic!("Peer {peer_user_id} did not change roster presence to {present}"));
 }
 
+/// A red left half and green right half. The split survives VP8 scaling and
+/// compression; the changed timestamp keeps the native encoder paced at 15fps.
+fn synthetic_video_frame(index: u32) -> VideoFrame {
+    let width = VIDEO_WIDTH as usize;
+    let height = VIDEO_HEIGHT as usize;
+    let chroma_width = width.div_ceil(2);
+    let chroma_height = height.div_ceil(2);
+    let mut data_y = vec![82; width * height];
+    let mut data_u = vec![90; chroma_width * chroma_height];
+    let mut data_v = vec![240; chroma_width * chroma_height];
+    for row in data_y.chunks_exact_mut(width) {
+        row[width / 2..].fill(145);
+    }
+    for row in data_u.chunks_exact_mut(chroma_width) {
+        row[chroma_width / 2..].fill(54);
+    }
+    for row in data_v.chunks_exact_mut(chroma_width) {
+        row[chroma_width / 2..].fill(34);
+    }
+    VideoFrame {
+        buffer: I420Buffer {
+            width: VIDEO_WIDTH,
+            height: VIDEO_HEIGHT,
+            data_y,
+            stride_y: VIDEO_WIDTH,
+            data_u,
+            stride_u: chroma_width as u32,
+            data_v,
+            stride_v: chroma_width as u32,
+        },
+        rotation: VideoRotation::Deg0,
+        timestamp_us: i64::from(index) * 66_667,
+    }
+}
+
+/// Check decoded dimensions and YUV samples well inside each color half. A
+/// receiver may select a lower simulcast layer, so require 16:9 within the
+/// source dimensions rather than a specific layer's pixel count.
+fn decoded_color_pattern(buffer: &I420Buffer) -> Option<(u32, u32)> {
+    let (width, height) = (buffer.width as usize, buffer.height as usize);
+    if width < 160
+        || height < 90
+        || width > VIDEO_WIDTH as usize
+        || height > VIDEO_HEIGHT as usize
+        || width * 9 != height * 16
+    {
+        return None;
+    }
+    let strides = [
+        buffer.stride_y as usize,
+        buffer.stride_u as usize,
+        buffer.stride_v as usize,
+    ];
+    let chroma_width = width.div_ceil(2);
+    let chroma_height = height.div_ceil(2);
+    if strides[0] < width
+        || strides[1] < chroma_width
+        || strides[2] < chroma_width
+        || buffer.data_y.len() < strides[0].checked_mul(height)?
+        || buffer.data_u.len() < strides[1].checked_mul(chroma_height)?
+        || buffer.data_v.len() < strides[2].checked_mul(chroma_height)?
+    {
+        return None;
+    }
+    let sample = |x: usize| {
+        let y = height / 2;
+        (
+            buffer.data_y[y * strides[0] + x],
+            buffer.data_u[(y / 2) * strides[1] + x / 2],
+            buffer.data_v[(y / 2) * strides[2] + x / 2],
+        )
+    };
+    let red = sample(width / 4);
+    let green = sample(width * 3 / 4);
+    let red_detected = (50..=120).contains(&red.0) && red.1 < 135 && red.2 > 175;
+    let green_detected = (105..=190).contains(&green.0) && green.1 < 120 && green.2 < 125;
+    (red_detected && green_detected).then_some((buffer.width, buffer.height))
+}
+
+async fn verify_video_kind(
+    alice_rtc: &RtcService,
+    bob_rtc: &RtcService,
+    room_id: &str,
+    alice_membership_id: &str,
+    kind: MediaStreamKind,
+) {
+    let publication = match kind {
+        MediaStreamKind::Camera => {
+            alice_rtc
+                .publish_camera(room_id, VIDEO_WIDTH, VIDEO_HEIGHT, false)
+                .await
+        }
+        MediaStreamKind::ScreenShare => {
+            alice_rtc
+                .publish_screen(room_id, VIDEO_WIDTH, VIDEO_HEIGHT, false)
+                .await
+        }
+        _ => panic!("Only synthetic video kinds belong in this test"),
+    }
+    .expect("Cannot publish synthetic encrypted video");
+    let (done, mut stop_sending) = oneshot::channel::<()>();
+    let sending = tokio::spawn(async move {
+        for index in 0..375 {
+            publication
+                .push_video(synthetic_video_frame(index))
+                .expect("Synthetic video frame send failed");
+            tokio::select! {
+                _ = &mut stop_sending => break,
+                _ = sleep(Duration::from_millis(66)) => {}
+            }
+        }
+        publication
+    });
+    let remote = timeout(Duration::from_secs(30), async {
+        loop {
+            if let Some(track) = bob_rtc
+                .call(room_id)
+                .expect("Bob call vanished")
+                .remote_track(alice_membership_id, kind)
+            {
+                break track;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("Bob did not subscribe to Alice's {kind:?}"));
+    let mut frames = remote
+        .video_frames()
+        .expect("Remote video has no I420 stream");
+    let dimensions = timeout(Duration::from_secs(30), async {
+        while let Some(frame) = frames.next().await {
+            if let Some(dimensions) = decoded_color_pattern(&frame.buffer) {
+                return dimensions;
+            }
+        }
+        panic!("Remote video stream closed before a colored frame arrived");
+    })
+    .await
+    .unwrap_or_else(|_| panic!("Bob did not decode Alice's red/green {kind:?} pattern"));
+    done.send(()).expect("Synthetic video sender stopped early");
+    let publication = sending.await.expect("Synthetic video sender panicked");
+    publication
+        .unpublish()
+        .await
+        .expect("Cannot unpublish synthetic video");
+    eprintln!("Decoded encrypted {kind:?} I420 pattern at {dimensions:?}.");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn encrypted_two_device_audio_and_reconnect() {
+async fn encrypted_two_device_audio_video_and_reconnect() {
     let Some(path) = std::env::var_os("MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS") else {
         eprintln!("Skipped local RTC acceptance; set MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS to opt in.");
         return;
@@ -335,6 +491,23 @@ async fn encrypted_two_device_audio_and_reconnect() {
         .await
         .expect("Cannot unpublish synthetic audio");
 
+    verify_video_kind(
+        &alice_rtc,
+        &bob_rtc,
+        room_id,
+        &alice_call.membership_id,
+        MediaStreamKind::Camera,
+    )
+    .await;
+    verify_video_kind(
+        &alice_rtc,
+        &bob_rtc,
+        room_id,
+        &alice_call.membership_id,
+        MediaStreamKind::ScreenShare,
+    )
+    .await;
+
     bob_rtc.leave(room_id).await.expect("Bob leave failed");
     wait_for_peer(&alice_rtc, room_id, &bob_account.user_id, false).await;
     let rejoined = timeout(
@@ -366,5 +539,7 @@ async fn encrypted_two_device_audio_and_reconnect() {
     drop(bob_manager);
     drop(alice_manager);
     fs::remove_dir_all(&root).expect("Cannot remove temporary RTC stores");
-    eprintln!("Local encrypted MatrixRTC call, synthetic audio, leave, and rejoin passed.");
+    eprintln!(
+        "Local encrypted MatrixRTC call, synthetic audio, camera, screen stream, leave, and rejoin passed."
+    );
 }

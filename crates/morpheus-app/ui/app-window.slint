@@ -1,4 +1,4 @@
-import { AboutSlint, ListView, Palette, ScrollView } from "std-widgets.slint";
+import { AboutSlint, Button, ListView, Palette, ScrollView } from "std-widgets.slint";
 
 export struct AccountItem {
     name: string,
@@ -76,24 +76,123 @@ component IconAction inherits Rectangle {
     in property <color> surface;
     in property <color> hover-surface;
     in property <bool> selected: false;
+    in property <bool> enabled: true;
     callback activated();
     width: 34px;
     height: 34px;
     border-radius: 9px;
     background: area.has-hover || selected ? hover-surface : surface;
+    forward-focus: keyboard-focus;
     accessible-role: button;
     accessible-label: label;
-    accessible-action-default => { root.activated(); }
-    Text {
+    accessible-enabled: enabled;
+    accessible-action-default => { if root.enabled { root.activated(); } }
+    if root.icon != "✎" && root.icon != "☷" : Text {
         text: root.icon;
         color: root.ink;
         font-size: 18px;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
+    if root.icon == "✎" : Path {
+        x: (parent.width - 18px) / 2;
+        y: (parent.height - 18px) / 2;
+        width: 18px;
+        height: 18px;
+        viewbox-width: 20;
+        viewbox-height: 20;
+        commands: "M 4 16 L 8 15 L 16 7 L 13 4 L 5 12 Z M 12 5 L 15 8";
+        stroke: root.ink;
+        stroke-width: 1.7px;
+        fill: transparent;
+    }
+    if root.icon == "☷" : Path {
+        x: (parent.width - 18px) / 2;
+        y: (parent.height - 18px) / 2;
+        width: 18px;
+        height: 18px;
+        viewbox-width: 20;
+        viewbox-height: 20;
+        commands: "M 3 4 L 17 4 L 17 13 L 10 13 L 6 17 L 6 13 L 3 13 Z M 6 7 L 14 7 M 6 10 L 12 10";
+        stroke: root.ink;
+        stroke-width: 1.7px;
+        fill: transparent;
+    }
     area := TouchArea {
+        enabled: root.enabled;
         mouse-cursor: pointer;
         clicked => { root.activated(); }
+    }
+    keyboard-focus := FocusScope {
+        x: 0px;
+        width: 0px;
+        height: 0px;
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == Key.Space || event.text == Key.Return {
+                root.activated();
+                accept
+            } else { reject }
+        }
+    }
+    if keyboard-focus.has-focus : Rectangle {
+        border-radius: parent.border-radius;
+        border-width: 2px;
+        border-color: root.ink;
+        background: transparent;
+    }
+}
+
+// A custom action keeps its visual children while using the same keyboard path as Slint Button.
+component ActionRect inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <color> focus-color: #a88cff;
+    in property <bool> trap-tab: false;
+    in property <bool> cancel-on-escape: false;
+    out property <bool> has-hover: hit.has-hover;
+    out property <bool> has-focus: keyboard-focus.has-focus;
+    callback activated();
+    callback next-focus();
+    callback previous-focus();
+    callback cancelled();
+    forward-focus: keyboard-focus;
+    accessible-role: button;
+    accessible-label: label;
+    accessible-enabled: enabled;
+    accessible-action-default => { if root.enabled { root.activated(); } }
+    @children
+    hit := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.activated(); }
+    }
+    keyboard-focus := FocusScope {
+        x: 0px;
+        width: 0px;
+        height: 0px;
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == Key.Space || event.text == Key.Return {
+                root.activated();
+                accept
+            } else if root.trap-tab && event.text == Key.Tab && !event.modifiers.shift {
+                root.next-focus();
+                accept
+            } else if root.trap-tab && (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) {
+                root.previous-focus();
+                accept
+            } else if root.cancel-on-escape && event.text == Key.Escape {
+                root.cancelled();
+                accept
+            } else { reject }
+        }
+    }
+    if keyboard-focus.has-focus : Rectangle {
+        border-radius: parent.border-radius;
+        border-width: 2px;
+        border-color: root.focus-color;
+        background: transparent;
     }
 }
 
@@ -111,6 +210,7 @@ export component AppWindow inherits Window {
     in-out property <string> active-space-name: "Home";
     in-out property <[RoomItem]> channels;
     in-out property <[RoomItem]> direct-messages;
+    in-out property <[RoomItem]> invitations;
     in-out property <[RoomItem]> unsorted-channels;
     in-out property <[RoomItem]> unsorted-direct-messages;
     in-out property <[MessageItem]> messages;
@@ -159,6 +259,8 @@ export component AppWindow inherits Window {
     callback switch-account(int);
     callback select-space(string);
     callback open-room(string);
+    callback submit-room-action(int, string);
+    callback respond-invite(string, bool);
     callback send-message(string);
     callback send-thread-message(string);
     callback open-thread(string, string, string);
@@ -186,16 +288,22 @@ export component AppWindow inherits Window {
 
     in-out property <bool> account-menu-open: false;
     in-out property <bool> manage-accounts-open: false;
+    in-out property <bool> room-actions-open: false;
+    in-out property <int> room-action-mode: 0; // 0 private room, 1 join, 2 Space
+    in-out property <string> room-action-input;
+    in-out property <string> room-action-error;
+    in-out property <string> invite-error;
+    in-out property <bool> room-action-busy: false;
+    in-out property <int> room-action-operation: 0;
     in-out property <bool> stress-timeline-active: false;
     property <int> side-panel-tab: 0;
-    property <int> page: 0; // 0 chat, 1 settings, 2 call stage
+    in-out property <int> page: 0; // 0 chat, 1 settings, 2 call stage
     property <bool> mic-muted: false;
     property <bool> camera-off: true;
     in-out property <bool> call-connected: false;
     in-out property <bool> leave-call-dialog: false;
     in-out property <bool> leave-call-busy: false;
     in-out property <int> pending-account-index: -1;
-    property <bool> leave-call-confirm-focused: false;
     in-out property <string> composer-text;
     in-out property <bool> composer-busy: false;
     in-out property <int> composer-operation: 0;
@@ -268,14 +376,14 @@ export component AppWindow inherits Window {
                     VerticalLayout {
                         width: parent.width;
                         spacing: 8px;
-                        for space in root.spaces : Rectangle {
+                        for space in root.spaces : ActionRect {
                             width: 52px;
                             height: 48px;
                             border-radius: 12px;
-                            background: root.active-space-id == space.id && root.page == 0 ? root.hover : space-hit.has-hover ? root.hover : transparent;
-                            accessible-role: button;
-                            accessible-label: "Select space " + space.name;
-                            accessible-action-default => {
+                            background: root.active-space-id == space.id && root.page == 0 ? root.hover : self.has-hover ? root.hover : transparent;
+                            focus-color: root.accent;
+                            label: "Select space " + space.name;
+                            activated => {
                                 root.active-space-id = space.id;
                                 root.active-space-name = space.name;
                                 root.select-space(space.id);
@@ -286,15 +394,6 @@ export component AppWindow inherits Window {
                                 y: 5px;
                                 initials: space.initials;
                                 accent: space.accent;
-                            }
-                            space-hit := TouchArea {
-                                mouse-cursor: pointer;
-                                clicked => {
-                                    root.active-space-id = space.id;
-                                    root.active-space-name = space.name;
-                                    root.select-space(space.id);
-                                    root.page = 0;
-                                }
                             }
                         }
                     }
@@ -356,11 +455,17 @@ export component AppWindow inherits Window {
                             vertical-alignment: center;
                             horizontal-stretch: 1;
                         }
-                        Text {
-                            text: "v";
-                            color: root.muted;
-                            font-size: 17px * root.text-scale;
-                            vertical-alignment: center;
+                        room-action-trigger := Button {
+                            width: 34px;
+                            height: 34px;
+                            text: "+";
+                            accessible-label: "Create or join a Matrix room";
+                            clicked => {
+                                root.room-action-mode = 0;
+                                root.room-action-input = "";
+                                root.room-action-error = "";
+                                root.room-actions-open = true;
+                            }
                         }
                     }
                 }
@@ -418,13 +523,60 @@ export component AppWindow inherits Window {
                                 vertical-alignment: center;
                             }
                         }
-                        for room in root.channels : Rectangle {
+                        if root.invitations.length > 0 : Text {
+                            text: "INVITATIONS · " + root.invitations.length;
+                            color: root.accent;
+                            font-size: 10px * root.text-scale;
+                            font-weight: 750;
+                            letter-spacing: 1px;
+                            height: 29px;
+                            vertical-alignment: bottom;
+                        }
+                        if root.invite-error != "" : Text {
+                            text: root.invite-error;
+                            color: #ff8d9d;
+                            font-size: 11px * root.text-scale;
+                            wrap: word-wrap;
+                            height: 40px;
+                        }
+                        for invite in root.invitations : Rectangle {
+                            height: 58px;
+                            border-radius: 8px;
+                            background: root.elevated;
+                            HorizontalLayout {
+                                padding-left: 9px;
+                                padding-right: 7px;
+                                spacing: 4px;
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    alignment: center;
+                                    spacing: 2px;
+                                    Text { text: invite.name; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; overflow: elide; }
+                                    Text { text: "Room invitation"; color: root.muted; font-size: 10px * root.text-scale; }
+                                }
+                                Button {
+                                    width: 30px; height: 30px;
+                                    text: "✓";
+                                    accessible-label: "Accept invitation to " + invite.name;
+                                    enabled: !root.room-action-busy;
+                                    clicked => { root.respond-invite(invite.id, true); }
+                                }
+                                Button {
+                                    width: 30px; height: 30px;
+                                    text: "×";
+                                    accessible-label: "Decline invitation to " + invite.name;
+                                    enabled: !root.room-action-busy;
+                                    clicked => { root.respond-invite(invite.id, false); }
+                                }
+                            }
+                        }
+                        for room in root.channels : ActionRect {
                             height: max(root.density-mode == 0 ? 30px : root.density-mode == 2 ? 44px : 36px, 22px * root.text-scale);
                             border-radius: 8px;
-                            background: room.id == root.active-room-id && root.page == 0 ? root.hover : row-hit.has-hover ? root.elevated : transparent;
-                            accessible-role: button;
-                            accessible-label: "Open room " + room.name;
-                            accessible-action-default => { root.page = 0; root.open-room(room.id); }
+                            background: room.id == root.active-room-id && root.page == 0 ? root.hover : self.has-hover ? root.elevated : transparent;
+                            focus-color: root.accent;
+                            label: "Open room " + room.name;
+                            activated => { root.page = 0; root.open-room(room.id); }
                             HorizontalLayout {
                                 padding-left: 10px;
                                 padding-right: 9px;
@@ -436,7 +588,6 @@ export component AppWindow inherits Window {
                                     Text { text: room.unread; color: root.accent-ink; font-size: 10px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                                 }
                             }
-                            row-hit := TouchArea { mouse-cursor: pointer; clicked => { root.page = 0; root.open-room(room.id); } }
                         }
                         Text {
                             text: "DIRECT MESSAGES";
@@ -447,13 +598,13 @@ export component AppWindow inherits Window {
                             height: 40px;
                             vertical-alignment: bottom;
                         }
-                        for room in root.direct-messages : Rectangle {
+                        for room in root.direct-messages : ActionRect {
                             height: max(root.density-mode == 0 ? 32px : root.density-mode == 2 ? 47px : 39px, 22px * root.text-scale);
                             border-radius: 8px;
-                            background: room.id == root.active-room-id && root.page == 0 ? root.hover : dm-hit.has-hover ? root.elevated : transparent;
-                            accessible-role: button;
-                            accessible-label: "Open direct message with " + room.name;
-                            accessible-action-default => { root.page = 0; root.open-room(room.id); }
+                            background: room.id == root.active-room-id && root.page == 0 ? root.hover : self.has-hover ? root.elevated : transparent;
+                            focus-color: root.accent;
+                            label: "Open direct message with " + room.name;
+                            activated => { root.page = 0; root.open-room(room.id); }
                             HorizontalLayout {
                                 padding-left: 9px;
                                 padding-right: 9px;
@@ -468,18 +619,17 @@ export component AppWindow inherits Window {
                                     Text { text: room.unread; color: root.accent-ink; font-size: 10px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                                 }
                             }
-                            dm-hit := TouchArea { mouse-cursor: pointer; clicked => { root.page = 0; root.open-room(room.id); } }
                         }
                     }
                 }
                 Rectangle { height: 1px; background: root.divider; }
-                Rectangle {
+                account-trigger := ActionRect {
                     height: 69px;
                     background: root.rail;
-                    accessible-role: button;
-                    accessible-label: "Account menu for " + root.active-account-name + ", " + root.active-account-handle;
+                    focus-color: root.accent;
+                    label: "Account menu for " + root.active-account-name + ", " + root.active-account-handle;
                     accessible-expanded: root.account-menu-open;
-                    accessible-action-default => { root.account-menu-open = !root.account-menu-open; }
+                    activated => { root.account-menu-open = !root.account-menu-open; }
                     HorizontalLayout {
                         padding-left: 11px;
                         padding-right: 11px;
@@ -494,7 +644,6 @@ export component AppWindow inherits Window {
                         }
                         Text { text: "⌃"; color: root.muted; font-size: 16px * root.text-scale; vertical-alignment: center; }
                     }
-                    TouchArea { mouse-cursor: pointer; clicked => { root.account-menu-open = !root.account-menu-open; } }
                 }
             }
 
@@ -529,19 +678,29 @@ export component AppWindow inherits Window {
                         VerticalLayout {
                             width: parent.width;
                             spacing: 2px;
-                    for account in root.account-options : Rectangle {
+                    for account[index] in root.account-options : account-choice := ActionRect {
                         height: 42px;
                         border-radius: 8px;
-                        background: account.index == root.active-account-index ? root.hover : account-hit.has-hover ? root.hover : transparent;
-                        accessible-role: button;
-                        accessible-label: "Switch to " + account.name + ", " + account.handle;
-                        accessible-action-default => {
+                        background: account.index == root.active-account-index ? root.hover : self.has-hover ? root.hover : transparent;
+                        focus-color: root.accent;
+                        cancel-on-escape: true;
+                        label: "Switch to " + account.name + ", " + account.handle;
+                        // Repeater children become focusable after initialization; defer one tick.
+                        Timer {
+                            interval: 1ms;
+                            running: index == 0;
+                            triggered => { self.running = false; account-choice.focus(); }
+                        }
+                        cancelled => { root.account-menu-open = false; account-trigger.focus(); }
+                        activated => {
                             if root.call-connected {
                                 root.pending-account-index = account.index;
                                 root.leave-call-dialog = true;
+                                root.account-menu-open = false;
                             } else {
                                 root.switch-account(account.index);
                                 root.account-menu-open = false;
+                                account-trigger.focus();
                             }
                         }
                         HorizontalLayout {
@@ -558,76 +717,59 @@ export component AppWindow inherits Window {
                             }
                             if account.index == root.active-account-index : Text { text: "✓"; color: root.accent; font-size: 15px * root.text-scale; vertical-alignment: center; }
                         }
-                        account-hit := TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => {
-                                if root.call-connected {
-                                    root.pending-account-index = account.index;
-                                    root.leave-call-dialog = true;
-                                } else {
-                                    root.switch-account(account.index);
-                                    root.account-menu-open = false;
-                                }
-                            }
-                        }
                     }
                         }
                     }
                     Rectangle { height: 1px; background: root.divider; }
-                    Rectangle {
+                    add-account-choice := ActionRect {
                         height: 35px;
                         border-radius: 8px;
-                        background: add-hit.has-hover ? root.hover : transparent;
-                        accessible-role: button;
-                        accessible-label: "Add another Matrix account";
-                        accessible-action-default => {
+                        background: self.has-hover ? root.hover : transparent;
+                        focus-color: root.accent;
+                        cancel-on-escape: true;
+                        label: "Add another Matrix account";
+                        Timer {
+                            interval: 1ms;
+                            running: root.account-options.length == 0;
+                            triggered => { self.running = false; add-account-choice.focus(); }
+                        }
+                        cancelled => { root.account-menu-open = false; account-trigger.focus(); }
+                        activated => {
                             if root.call-connected {
                                 root.pending-account-index = -2;
                                 root.leave-call-dialog = true;
+                                root.account-menu-open = false;
                             } else {
                                 root.add-account();
                                 root.account-menu-open = false;
                             }
                         }
                         Text { x: 9px; text: "+   Add an account"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; }
-                        add-hit := TouchArea {
-                            mouse-cursor: pointer;
-                            clicked => {
-                                if root.call-connected {
-                                    root.pending-account-index = -2;
-                                    root.leave-call-dialog = true;
-                                } else {
-                                    root.add-account();
-                                    root.account-menu-open = false;
-                                }
-                            }
-                        }
                     }
-                    Rectangle {
+                    ActionRect {
                         height: 35px;
                         border-radius: 8px;
-                        background: manage-hit.has-hover ? root.hover : transparent;
-                        accessible-role: button;
-                        accessible-label: "Manage accounts";
-                        accessible-action-default => { root.manage-accounts-open = true; root.manage-accounts(); root.account-menu-open = false; }
+                        background: self.has-hover ? root.hover : transparent;
+                        focus-color: root.accent;
+                        cancel-on-escape: true;
+                        label: "Manage accounts";
+                        cancelled => { root.account-menu-open = false; account-trigger.focus(); }
+                        activated => { root.manage-accounts-open = true; root.manage-accounts(); root.account-menu-open = false; }
                         Text { x: 9px; text: "⚙   Manage accounts"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; }
-                        manage-hit := TouchArea { mouse-cursor: pointer; clicked => { root.manage-accounts-open = true; root.manage-accounts(); root.account-menu-open = false; } }
                     }
-                    Rectangle {
+                    ActionRect {
                         height: 35px;
                         border-radius: 8px;
-                        background: logout-hit.has-hover ? root.hover : transparent;
-                        accessible-role: button;
-                        accessible-label: "Log out of current Matrix account";
-                        accessible-action-default => {
-                            if root.call-connected { root.pending-account-index = -3; root.leave-call-dialog = true; }
+                        background: self.has-hover ? root.hover : transparent;
+                        focus-color: root.accent;
+                        cancel-on-escape: true;
+                        label: "Log out of current Matrix account";
+                        cancelled => { root.account-menu-open = false; account-trigger.focus(); }
+                        activated => {
+                            if root.call-connected { root.pending-account-index = -3; root.leave-call-dialog = true; root.account-menu-open = false; }
                             else { root.log-out(); root.account-menu-open = false; }
                         }
                         Text { x: 9px; text: "↪   Log out"; color: #e47483; font-size: 12px * root.text-scale; vertical-alignment: center; }
-                        logout-hit := TouchArea { mouse-cursor: pointer; clicked => {
-                            if root.call-connected { root.pending-account-index = -3; root.leave-call-dialog = true; }
-                            else { root.log-out(); root.account-menu-open = false; }
-                        } }
                     }
                 }
             }
@@ -701,6 +843,7 @@ export component AppWindow inherits Window {
                         x: 16px;
                         width: parent.width - 32px;
                         text: root.session-error;
+                        accessible-live-region: polite;
                         color: #ffffff;
                         font-size: 11px * root.text-scale;
                         vertical-alignment: center;
@@ -756,6 +899,7 @@ export component AppWindow inherits Window {
                                                         root.composer-target-id = message.event-id;
                                                         root.composer-target-label = message.sender;
                                                         root.composer-text = "";
+                                                        message-input.focus();
                                                     }
                                                 }
                                                 if message.event-id != "" && message.is-own : IconAction {
@@ -767,6 +911,7 @@ export component AppWindow inherits Window {
                                                         root.composer-target-id = message.event-id;
                                                         root.composer-target-label = message.sender;
                                                         root.composer-text = message.body;
+                                                        message-input.focus();
                                                     }
                                                 }
                                                 if message.event-id != "" : IconAction {
@@ -883,7 +1028,7 @@ export component AppWindow inherits Window {
                                         font-size: 13px * root.text-scale;
                                         vertical-alignment: center;
                                     }
-                                    TextInput {
+                                    message-input := TextInput {
                                         x: 3px;
                                         width: parent.width - 6px;
                                         height: parent.height;
@@ -891,7 +1036,7 @@ export component AppWindow inherits Window {
                                         color: root.ink;
                                         font-size: 13px * root.text-scale;
                                         vertical-alignment: center;
-                                        accessible-label: "Message composer";
+                                        accessible-label: root.composer-mode == 1 ? "Reply to " + root.composer-target-label : root.composer-mode == 2 ? "Edit your message" : "Message composer for " + root.active-room-name;
                                         edited => {
                                             root.composer-edited(root.composer-text);
                                         }
@@ -1075,6 +1220,7 @@ export component AppWindow inherits Window {
                         text: root.live-session
                             ? (root.native-call-enabled ? root.native-call-status : "Native calls are unavailable in this build")
                             : (root.call-connected ? "Call preview active · no network connection" : "Call preview · no network connection");
+                        accessible-live-region: polite;
                         color: root.muted; font-size: 12px * root.text-scale;
                     }
                     if root.live-session : Rectangle {
@@ -1087,14 +1233,14 @@ export component AppWindow inherits Window {
                             horizontal-alignment: center; vertical-alignment: center;
                             x: 28px; width: parent.width - 56px;
                         }
-                        if root.native-call-enabled : Rectangle {
+                        if root.native-call-enabled : ActionRect {
                             x: (parent.width - 176px) / 2; y: parent.height - 76px;
                             width: 176px; height: 42px; border-radius: 9px;
                             background: root.hover; border-color: root.divider; border-width: 1px;
-                            accessible-role: button; accessible-label: "Open MatrixRTC call in selected room";
-                            accessible-action-default => { root.open-native-call-slot(); }
+                            focus-color: root.accent;
+                            label: "Open MatrixRTC call in selected room";
+                            activated => { root.open-native-call-slot(); }
                             Text { text: "Open room call"; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
-                            TouchArea { mouse-cursor: pointer; clicked => { root.open-native-call-slot(); } }
                         }
                     }
                     if !root.live-session : HorizontalLayout {
@@ -1130,12 +1276,12 @@ export component AppWindow inherits Window {
                             padding-left: 12px; padding-right: 12px; spacing: 8px; alignment: center;
                             if !root.live-session : IconAction { width: 43px; height: 43px; icon: root.mic-muted ? "✕" : "♩"; label: root.mic-muted ? "Unmute microphone preview" : "Mute microphone preview"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.mic-muted = !root.mic-muted; } }
                             if !root.live-session : IconAction { width: 43px; height: 43px; icon: "V"; label: root.camera-off ? "Turn camera preview on" : "Turn camera preview off"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.camera-off = !root.camera-off; } }
-                            Rectangle {
+                            ActionRect {
                                 width: 118px; height: 43px; border-radius: 9px; background: root.live-session && !root.native-call-enabled ? root.hover : root.call-connected ? #d65163 : root.accent;
-                                accessible-role: button;
-                                accessible-label: root.live-session ? (root.call-connected ? "Leave native audio call" : "Join native audio call") : (root.call-connected ? "End call preview" : "Start call preview");
-                                accessible-enabled: !root.live-session || root.native-call-enabled;
-                                accessible-action-default => {
+                                focus-color: root.ink;
+                                label: root.live-session ? (root.call-connected ? "Leave native audio call" : "Join native audio call") : (root.call-connected ? "End call preview" : "Start call preview");
+                                enabled: !root.live-session || root.native-call-enabled;
+                                activated => {
                                     if root.live-session {
                                         if root.native-call-enabled {
                                             if root.call-connected { root.end-native-call(); }
@@ -1144,12 +1290,6 @@ export component AppWindow inherits Window {
                                     } else { root.call-connected = !root.call-connected; }
                                 }
                                 Text { text: root.live-session ? (root.native-call-enabled ? (root.call-connected ? "Leave audio" : "Join audio") : "Unavailable") : (root.call-connected ? "End preview" : "Start preview"); color: #ffffff; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
-                                TouchArea { enabled: !root.live-session || root.native-call-enabled; mouse-cursor: pointer; clicked => {
-                                    if root.live-session {
-                                        if root.call-connected { root.end-native-call(); }
-                                        else { root.start-native-call(); }
-                                    } else { root.call-connected = !root.call-connected; }
-                                } }
                             }
                             IconAction { width: 43px; height: 43px; icon: "R"; label: "Return to chat"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.page = 0; } }
                         }
@@ -1170,21 +1310,25 @@ export component AppWindow inherits Window {
                     background: root.panel;
                     HorizontalLayout {
                         padding-left: 12px; padding-right: 12px; spacing: 4px;
-                        Rectangle {
+                        ActionRect {
                             width: 101px; height: 34px; border-radius: 8px;
                             background: root.side-panel-tab == 0 ? root.hover : transparent;
-                            accessible-role: button; accessible-label: "Show members";
-                            accessible-action-default => { root.side-panel-tab = 0; }
+                            focus-color: root.accent;
+                            label: "Show members";
+                            accessible-checkable: true;
+                            accessible-checked: root.side-panel-tab == 0;
+                            activated => { root.side-panel-tab = 0; }
                             Text { text: "Members"; color: root.side-panel-tab == 0 ? root.ink : root.muted; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
-                            TouchArea { mouse-cursor: pointer; clicked => { root.side-panel-tab = 0; } }
                         }
-                        Rectangle {
+                        ActionRect {
                             width: 101px; height: 34px; border-radius: 8px;
                             background: root.side-panel-tab == 1 ? root.hover : transparent;
-                            accessible-role: button; accessible-label: "Show thread";
-                            accessible-action-default => { root.side-panel-tab = 1; }
+                            focus-color: root.accent;
+                            label: "Show thread";
+                            accessible-checkable: true;
+                            accessible-checked: root.side-panel-tab == 1;
+                            activated => { root.side-panel-tab = 1; }
                             Text { text: "Thread"; color: root.side-panel-tab == 1 ? root.ink : root.muted; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
-                            TouchArea { mouse-cursor: pointer; clicked => { root.side-panel-tab = 1; } }
                         }
                     }
                 }
@@ -1244,12 +1388,15 @@ export component AppWindow inherits Window {
                             width: parent.width;
                             padding: 12px;
                             spacing: 10px;
-                            Text { text: root.thread-root-sender; color: root.ink; font-size: 12px * root.text-scale; font-weight: 750; }
-                            Text { text: root.thread-root-body; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                            alignment: start;
+                            vertical-stretch: 0;
+                            Text { text: root.thread-root-sender; color: root.ink; font-size: 12px * root.text-scale; font-weight: 750; vertical-stretch: 0; }
+                            Text { text: root.thread-root-body; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; vertical-stretch: 0; }
                             Rectangle { height: 1px; background: root.divider; }
-                            Text { text: "REPLIES · " + root.thread-messages.length; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; }
+                            Text { text: "REPLIES · " + root.thread-messages.length; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; vertical-stretch: 0; }
                             for reply in root.thread-messages : Rectangle {
                                 min-height: 43px;
+                                vertical-stretch: 0;
                                 background: root.elevated;
                                 border-radius: 8px;
                                 VerticalLayout {
@@ -1266,10 +1413,13 @@ export component AppWindow inherits Window {
                             padding-left: 10px; padding-right: 10px; padding-top: 8px; padding-bottom: 8px; spacing: 5px;
                             Rectangle {
                                 horizontal-stretch: 1; background: root.elevated; border-radius: 8px;
-                                TextInput {
+                                thread-input := TextInput {
                                     x: 8px; width: parent.width - 16px; height: parent.height;
                                     text <=> root.thread-composer-text; color: root.ink; font-size: 12px * root.text-scale;
-                                    accessible-label: "Thread reply composer";
+                                    accessible-label: "Reply in thread started by " + root.thread-root-sender;
+                                    property <string> thread-context: root.thread-root-id;
+                                    init => { self.focus(); }
+                                    changed thread-context => { if self.thread-context != "" { self.focus(); } }
                                     accepted => { root.send-thread-message(root.thread-composer-text); }
                                 }
                             }
@@ -1285,25 +1435,132 @@ export component AppWindow inherits Window {
         }
     }
 
-    if root.leave-call-dialog : FocusScope {
-        init => { self.focus(); root.leave-call-confirm-focused = false; }
+    if root.room-actions-open : FocusScope {
+        focus-on-tab-navigation: false;
+        init => { room-action-input.focus(); }
+        capture-key-pressed(event) => {
+            if root.room-action-busy && (event.text == Key.Tab || event.text == Key.Backtab) {
+                accept
+            } else if (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) && room-action-close.has-focus {
+                if root.live-session { room-action-submit.focus(); }
+                else { room-action-cancel.focus(); }
+                accept
+            } else if event.text == Key.Tab && !event.modifiers.shift && (room-action-submit.has-focus || (!root.live-session && room-action-cancel.has-focus)) {
+                room-action-close.focus();
+                accept
+            } else { reject }
+        }
         key-pressed(event) => {
-            if !root.leave-call-busy {
-                if event.text == Key.Escape {
-                    root.leave-call-dialog = false;
-                    root.pending-account-index = -1;
-                } else if event.text == Key.Tab || event.text == Key.Backtab || event.text == Key.LeftArrow || event.text == Key.RightArrow {
-                    root.leave-call-confirm-focused = !root.leave-call-confirm-focused;
-                } else if event.text == Key.Return || event.text == Key.Space {
-                    if root.leave-call-confirm-focused {
-                        root.confirm-leave-call(root.pending-account-index);
-                    } else {
-                        root.leave-call-dialog = false;
-                        root.pending-account-index = -1;
+            if event.text == Key.Escape && !root.room-action-busy {
+                root.room-actions-open = false;
+                room-action-trigger.focus();
+                accept
+            } else { reject }
+        }
+        Rectangle {
+            background: #000000aa;
+            TouchArea { width: parent.width; height: parent.height; }
+            Rectangle {
+                x: (parent.width - 462px) / 2;
+                y: (parent.height - 342px) / 2;
+                width: 462px;
+                height: 342px;
+                border-radius: 14px;
+                border-color: root.divider;
+                border-width: 1px;
+                background: root.canvas;
+                accessible-role: region;
+                accessible-label: "Create or join a Matrix room";
+                VerticalLayout {
+                    padding: 20px;
+                    spacing: 12px;
+                    HorizontalLayout {
+                        height: 31px;
+                        Text { text: "Rooms and Spaces"; color: root.ink; font-size: 19px * root.text-scale; font-weight: 750; horizontal-stretch: 1; }
+                        room-action-close := Button {
+                            width: 34px; height: 31px; text: "×";
+                            enabled: !root.room-action-busy;
+                            accessible-label: "Close room actions";
+                            clicked => { root.room-actions-open = false; room-action-trigger.focus(); }
+                        }
+                    }
+                    HorizontalLayout {
+                        height: 36px;
+                        spacing: 5px;
+                        for label[index] in ["Create room", "Join room", "Create Space"] : Button {
+                            horizontal-stretch: 1;
+                            text: label;
+                            enabled: !root.room-action-busy;
+                            accessible-label: label;
+                            clicked => {
+                                root.room-action-mode = index;
+                                root.room-action-input = "";
+                                root.room-action-error = "";
+                            }
+                        }
+                    }
+                    Text {
+                        text: root.room-action-mode == 1 ? "Enter a complete room ID (!room:server) or alias (#room:server)." : root.room-action-mode == 2 ? "Give your new private Space a name." : "Give your new private room a name.";
+                        color: root.muted;
+                        font-size: 12px * root.text-scale;
+                        wrap: word-wrap;
+                    }
+                    Rectangle {
+                        height: 43px;
+                        background: root.elevated;
+                        border-radius: 8px;
+                        room-action-input := TextInput {
+                            x: 11px; width: parent.width - 22px; height: parent.height;
+                            text <=> root.room-action-input;
+                            color: root.ink;
+                            font-size: 13px * root.text-scale;
+                            enabled: !root.room-action-busy;
+                            accessible-label: root.room-action-mode == 1 ? "Room ID or alias" : "Room or Space name";
+                            accepted => { if !root.room-action-busy { root.submit-room-action(root.room-action-mode, root.room-action-input); } }
+                        }
+                    }
+                    Text {
+                        text: root.live-session ? root.room-action-error : "Preview only · sign in to create or join rooms.";
+                        accessible-live-region: polite;
+                        color: root.live-session && root.room-action-error != "" ? #ff8d9d : root.muted;
+                        font-size: 11px * root.text-scale;
+                        wrap: word-wrap;
+                        height: 40px;
+                    }
+                    Rectangle { vertical-stretch: 1; background: transparent; }
+                    HorizontalLayout {
+                        height: 38px;
+                        spacing: 8px;
+                        alignment: end;
+                        room-action-cancel := Button {
+                            width: 88px;
+                            text: "Cancel";
+                            enabled: !root.room-action-busy;
+                            clicked => { root.room-actions-open = false; room-action-trigger.focus(); }
+                        }
+                        room-action-submit := Button {
+                            width: 134px;
+                            primary: true;
+                            text: root.room-action-busy ? "Working…" : root.room-action-mode == 1 ? "Join room" : root.room-action-mode == 2 ? "Create Space" : "Create room";
+                            accessible-label: root.room-action-mode == 1 ? "Join Matrix room" : root.room-action-mode == 2 ? "Create private Matrix Space" : "Create private Matrix room";
+                            enabled: root.live-session && !root.room-action-busy;
+                            clicked => { root.submit-room-action(root.room-action-mode, root.room-action-input); }
+                        }
                     }
                 }
             }
-            accept
+        }
+    }
+
+    if root.leave-call-dialog : FocusScope {
+        init => { cancel-leave.focus(); }
+        key-pressed(event) => {
+            if event.text == Key.Escape && !root.leave-call-busy {
+                root.leave-call-dialog = false;
+                root.pending-account-index = -1;
+                account-trigger.focus();
+                accept
+            } else { reject }
         }
         Rectangle {
         background: #000000aa;
@@ -1328,27 +1585,31 @@ export component AppWindow inherits Window {
                 HorizontalLayout {
                     spacing: 9px;
                     alignment: end;
-                    Rectangle {
+                    cancel-leave := ActionRect {
                         width: 104px; height: 36px; border-radius: 8px; background: root.panel;
-                        border-color: root.accent; border-width: root.leave-call-confirm-focused ? 0px : 2px;
-                        accessible-role: button; accessible-label: "Cancel account switch";
-                        accessible-enabled: !root.leave-call-busy;
-                        accessible-action-default => { if !root.leave-call-busy { root.leave-call-dialog = false; root.pending-account-index = -1; } }
+                        focus-color: root.accent;
+                        label: "Cancel account switch";
+                        enabled: !root.leave-call-busy;
+                        trap-tab: true;
+                        cancel-on-escape: true;
+                        next-focus => { confirm-leave.focus(); }
+                        previous-focus => { confirm-leave.focus(); }
+                        cancelled => { root.leave-call-dialog = false; root.pending-account-index = -1; account-trigger.focus(); }
+                        activated => { root.leave-call-dialog = false; root.pending-account-index = -1; account-trigger.focus(); }
                         Text { text: "Cancel"; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
-                        TouchArea { enabled: !root.leave-call-busy; mouse-cursor: pointer; clicked => { root.leave-call-dialog = false; root.pending-account-index = -1; } }
                     }
-                    Rectangle {
+                    confirm-leave := ActionRect {
                         width: 153px; height: 36px; border-radius: 8px; background: root.accent;
-                        border-color: root.accent-ink; border-width: root.leave-call-confirm-focused ? 2px : 0px;
-                        accessible-role: button; accessible-label: root.pending-account-index == -2 ? "Leave call and add account" : root.pending-account-index == -3 ? "Leave call and log out" : "Leave call and switch account";
-                        accessible-enabled: !root.leave-call-busy;
-                        accessible-action-default => { if !root.leave-call-busy { root.confirm-leave-call(root.pending-account-index); } }
+                        focus-color: root.accent-ink;
+                        label: root.pending-account-index == -2 ? "Leave call and add account" : root.pending-account-index == -3 ? "Leave call and log out" : "Leave call and switch account";
+                        enabled: !root.leave-call-busy;
+                        trap-tab: true;
+                        cancel-on-escape: true;
+                        next-focus => { cancel-leave.focus(); }
+                        previous-focus => { cancel-leave.focus(); }
+                        cancelled => { root.leave-call-dialog = false; root.pending-account-index = -1; account-trigger.focus(); }
+                        activated => { root.confirm-leave-call(root.pending-account-index); }
                         Text { text: root.leave-call-busy ? "Leaving…" : "Leave call"; color: root.accent-ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
-                        TouchArea {
-                            enabled: !root.leave-call-busy;
-                            mouse-cursor: pointer;
-                            clicked => { root.confirm-leave-call(root.pending-account-index); }
-                        }
                     }
                 }
             }
@@ -1358,6 +1619,27 @@ export component AppWindow inherits Window {
 
     if root.manage-accounts-open && !root.show-sign-in : Rectangle {
         background: #000000aa;
+        FocusScope {
+            width: parent.width;
+            height: parent.height;
+            focus-on-tab-navigation: false;
+            init => { done-manage.focus(); }
+            capture-key-pressed(event) => {
+                if event.text == Key.Tab && !event.modifiers.shift && done-manage.has-focus {
+                    add-manage.focus();
+                    accept
+                } else if (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) && add-manage.has-focus {
+                    done-manage.focus();
+                    accept
+                } else { reject }
+            }
+            key-pressed(event) => {
+                if event.text == Key.Escape {
+                    root.manage-accounts-open = false;
+                    account-trigger.focus();
+                    accept
+                } else { reject }
+            }
         Rectangle {
             x: (parent.width - 460px) / 2;
             y: (parent.height - 430px) / 2;
@@ -1396,23 +1678,28 @@ export component AppWindow inherits Window {
                 }
                 HorizontalLayout {
                     spacing: 8px;
-                    Rectangle {
+                    add-manage := ActionRect {
                         width: 120px; height: 38px; background: root.elevated; border-radius: 8px;
-                        accessible-role: button; accessible-label: "Add Matrix account";
-                        accessible-action-default => { root.manage-accounts-open = false; root.add-account(); }
+                        focus-color: root.accent;
+                        label: "Add Matrix account";
+                        cancel-on-escape: true;
+                        cancelled => { root.manage-accounts-open = false; account-trigger.focus(); }
+                        activated => { root.manage-accounts-open = false; root.add-account(); }
                         Text { text: "Add account"; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
-                        TouchArea { mouse-cursor: pointer; clicked => { root.manage-accounts-open = false; root.add-account(); } }
                     }
                     Rectangle { horizontal-stretch: 1; background: transparent; }
-                    Rectangle {
+                    done-manage := ActionRect {
                         width: 80px; height: 38px; background: root.accent; border-radius: 8px;
-                        accessible-role: button; accessible-label: "Close account manager";
-                        accessible-action-default => { root.manage-accounts-open = false; }
+                        focus-color: root.accent-ink;
+                        label: "Close account manager";
+                        cancel-on-escape: true;
+                        cancelled => { root.manage-accounts-open = false; account-trigger.focus(); }
+                        activated => { root.manage-accounts-open = false; account-trigger.focus(); }
                         Text { text: "Done"; color: root.accent-ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
-                        TouchArea { mouse-cursor: pointer; clicked => { root.manage-accounts-open = false; } }
                     }
                 }
             }
+        }
         }
     }
 

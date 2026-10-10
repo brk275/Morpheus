@@ -20,7 +20,7 @@ use slint::{Color, Model, ModelRc, SharedString, VecModel};
 
 #[cfg(feature = "native-calls")]
 use crate::calls::{CallController, CallStatus};
-use crate::live::{LiveUi, MessageTarget, show_error};
+use crate::live::{LiveUi, MessageTarget, RoomAction, show_error};
 
 slint::include_modules!();
 
@@ -530,6 +530,11 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
         ui.set_thread_root_id("".into());
         ui.set_thread_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new())));
         ui.set_thread_composer_text("".into());
+        ui.set_room_actions_open(false);
+        ui.set_room_action_busy(false);
+        ui.set_room_action_error("".into());
+        ui.set_invite_error("".into());
+        ui.set_room_action_operation(ui.get_room_action_operation().wrapping_add(1));
     }
     ui.set_live_session(false);
     ui.set_stress_timeline_active(state.stress_backup.is_some());
@@ -576,6 +581,7 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
             .map(|r| r.item.clone())
             .collect::<Vec<_>>(),
     )));
+    ui.set_invitations(ModelRc::new(VecModel::from(Vec::<RoomItem>::new())));
     apply_room_sort(ui);
     ui.set_members(ModelRc::new(VecModel::from(account.members.clone())));
 
@@ -1033,6 +1039,103 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let weak = ui.as_weak();
+    let action_live = live.clone();
+    let action_handle = runtime.handle().clone();
+    ui.on_submit_room_action(move |mode, input| {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        if !action_live.is_live.load(Ordering::Acquire) {
+            window.set_room_action_error("Sign in to a Matrix account first".into());
+            return;
+        }
+        if window.get_room_action_busy() {
+            return;
+        }
+        let action = match mode {
+            0 => RoomAction::CreatePrivate,
+            1 => RoomAction::Join,
+            2 => RoomAction::CreateSpace,
+            _ => return,
+        };
+        let account_id = window.get_active_account_local_id().to_string();
+        if account_id.is_empty() {
+            window.set_room_action_error("Choose a Matrix account first".into());
+            return;
+        }
+        let operation = window.get_room_action_operation().wrapping_add(1);
+        window.set_room_action_operation(operation);
+        window.set_room_action_busy(true);
+        window.set_room_action_error("".into());
+        let live = action_live.clone();
+        let weak = weak.clone();
+        let submitted = input.to_string();
+        action_handle.spawn(async move {
+            let result = live
+                .run_room_action(&account_id, action, &submitted, weak.clone())
+                .await;
+            let _ = weak.upgrade_in_event_loop(move |window| {
+                if window.get_active_account_local_id().as_str() != account_id
+                    || window.get_room_action_operation() != operation
+                {
+                    return;
+                }
+                window.set_room_action_busy(false);
+                match result {
+                    Ok(()) => {
+                        window.set_room_actions_open(false);
+                        window.set_room_action_input("".into());
+                        window.set_page(0);
+                    }
+                    Err(error) => window.set_room_action_error(error.to_string().into()),
+                }
+            });
+        });
+    });
+
+    let weak = ui.as_weak();
+    let invite_live = live.clone();
+    let invite_handle = runtime.handle().clone();
+    ui.on_respond_invite(move |room_id, accept| {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        if !invite_live.is_live.load(Ordering::Acquire) {
+            window.set_invite_error("Sign in to respond to invitations".into());
+            return;
+        }
+        if window.get_room_action_busy() {
+            return;
+        }
+        let account_id = window.get_active_account_local_id().to_string();
+        if account_id.is_empty() {
+            return;
+        }
+        let operation = window.get_room_action_operation().wrapping_add(1);
+        window.set_room_action_operation(operation);
+        window.set_room_action_busy(true);
+        window.set_invite_error("".into());
+        let live = invite_live.clone();
+        let weak = weak.clone();
+        invite_handle.spawn(async move {
+            let result = live
+                .respond_to_invite(&account_id, &room_id, accept, weak.clone())
+                .await;
+            let _ = weak.upgrade_in_event_loop(move |window| {
+                if window.get_active_account_local_id().as_str() != account_id
+                    || window.get_room_action_operation() != operation
+                {
+                    return;
+                }
+                window.set_room_action_busy(false);
+                if let Err(error) = result {
+                    window.set_invite_error(error.to_string().into());
+                }
+            });
+        });
+    });
+
+    let weak = ui.as_weak();
     let space_live = live.clone();
     let space_handle = runtime.handle().clone();
     ui.on_select_space(move |space_id| {
@@ -1443,6 +1546,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let live = login_live.clone();
         let ui = weak.clone();
         login_handle.spawn(async move {
+            let _transition = live.account_transition.lock().await;
             match live
                 .manager
                 .add_password_account(&homeserver, &username, &password)
@@ -1469,6 +1573,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let live = sso_live.clone();
         let ui = weak.clone();
         sso_handle.spawn(async move {
+            let _transition = live.account_transition.lock().await;
             match sso::sign_in(live.manager.clone(), homeserver.to_string()).await {
                 Ok(_) => {
                     live.is_live.store(true, Ordering::Release);
@@ -1543,10 +1648,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 return;
             }
+            let transition = live.account_transition.lock().await;
             let Some(active) = live.manager.active_account().await else {
                 return;
             };
-            match live.manager.logout_account(&active.id).await {
+            let result = live.manager.logout_account(&active.id).await;
+            drop(transition);
+            match result {
                 Ok(_) => {
                     live.forget_account_drafts(&active.id);
                     live.clear_feed().await;

@@ -4,15 +4,18 @@ Morpheus is an original, native Rust Matrix desktop client in development. The
 interface is inspired by familiar community-chat navigation, with a distinct
 design, deep configuration, and fast Matrix account switching.
 
-**Status:** pre-alpha. Password sign-in, browser Matrix SSO, account switching,
-Spaces, basic room timelines, plain-text replies and edits, a reaction control,
-text threads, and in-session room drafts are wired into the desktop app. An
-opt-in native audio path exposes controls to open or join a MatrixRTC room call
-on a compatible homeserver. Rich formatting and media, full call controls,
-video, recovery screens, and platform acceptance tests remain in progress. Do
-not rely on this client for important conversations or
-encryption-key recovery yet. The first beta requires the cross-platform checks
-in [the feature matrix](docs/FEATURE_MATRIX.md).
+**Status:** private pre-alpha. Password sign-in, account switching, Spaces,
+room creation and joining, invitations, basic room timelines, plain-text
+replies and edits, reactions, text threads, and in-session room drafts are wired
+into the desktop app. The Matrix SSO token flow is wired but has not passed a
+browser login test. An opt-in native audio path exposes controls to open or join
+a MatrixRTC room call on a compatible homeserver. A local encrypted two-device
+call passed synthetic audio, camera, and screen-track transport on macOS; real
+camera and display capture, call-stage video, and Element Call interoperability
+remain to be verified. Rich formatting and media, full call controls, recovery
+screens, and platform acceptance tests remain in progress. Do not rely on this
+client for important conversations or encryption-key recovery yet. The first
+beta requires the cross-platform checks in [the feature matrix](docs/FEATURE_MATRIX.md).
 
 ![Morpheus desktop preview](docs/screenshots/desktop-preview.png)
 

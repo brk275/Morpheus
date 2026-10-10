@@ -25,6 +25,18 @@ pub enum MessageTarget {
     Thread(String),
 }
 
+#[derive(Clone, Copy)]
+pub enum RoomAction {
+    CreatePrivate,
+    Join,
+    CreateSpace,
+}
+
+struct KnownSpace {
+    name: String,
+    recorded_at: Instant,
+}
+
 pub struct LiveUi {
     pub manager: Arc<AccountManager>,
     pub is_live: Arc<AtomicBool>,
@@ -37,6 +49,8 @@ pub struct LiveUi {
     thread_generation: Arc<AtomicU64>,
     selected_room: Mutex<Option<String>>,
     selected_space: Mutex<Option<String>>,
+    known_spaces: Mutex<HashMap<String, HashMap<String, KnownSpace>>>,
+    pub(crate) account_transition: Mutex<()>,
     space_children: Mutex<HashMap<String, HashSet<String>>>,
     space_scan_key: Mutex<Option<(String, Vec<String>)>>,
     space_scan_failed_at: Mutex<Option<Instant>>,
@@ -57,6 +71,8 @@ impl LiveUi {
             thread_generation: Arc::new(AtomicU64::new(0)),
             selected_room: Mutex::new(None),
             selected_space: Mutex::new(None),
+            known_spaces: Mutex::new(HashMap::new()),
+            account_transition: Mutex::new(()),
             space_children: Mutex::new(HashMap::new()),
             space_scan_key: Mutex::new(None),
             space_scan_failed_at: Mutex::new(None),
@@ -107,6 +123,7 @@ impl LiveUi {
         index: usize,
         ui: Weak<AppWindow>,
     ) -> Result<(), MatrixCoreError> {
+        let _transition = self.account_transition.lock().await;
         self.invalidate_navigation();
         let accounts = self.manager.accounts().await;
         let account = accounts
@@ -124,6 +141,146 @@ impl LiveUi {
         Ok(())
     }
 
+    /// Keep an action tied to the account visible when it was submitted. The
+    /// same guard covers account switches, login, and logout in the app.
+    pub async fn run_room_action(
+        self: &Arc<Self>,
+        account_id: &str,
+        action: RoomAction,
+        input: &str,
+        ui: Weak<AppWindow>,
+    ) -> Result<(), MatrixCoreError> {
+        let _transition = self.account_transition.lock().await;
+        self.require_active_account(account_id).await?;
+        let input = input.trim();
+        if input.is_empty() {
+            return Err(MatrixCoreError::InvalidRegistry(match action {
+                RoomAction::Join => "Enter a complete room ID or alias".into(),
+                _ => "Enter a room or Space name".into(),
+            }));
+        }
+        let room_id = match action {
+            RoomAction::CreatePrivate => self.manager.create_private_room(input).await?,
+            RoomAction::Join => self.manager.join_room(input).await?,
+            RoomAction::CreateSpace => self.manager.create_space(input).await?,
+        };
+        self.require_active_account(account_id).await?;
+        let is_space = match action {
+            RoomAction::CreateSpace => true,
+            RoomAction::CreatePrivate => false,
+            RoomAction::Join => self
+                .manager
+                .rooms_snapshot()
+                .await?
+                .iter()
+                .any(|room| room.room_id == room_id && room.is_space),
+        };
+        if is_space {
+            self.known_spaces
+                .lock()
+                .await
+                .entry(account_id.to_owned())
+                .or_default()
+                .insert(
+                    room_id.clone(),
+                    KnownSpace {
+                        name: input.to_owned(),
+                        recorded_at: Instant::now(),
+                    },
+                );
+        }
+        self.clear_feed().await;
+        if is_space {
+            *self.selected_space.lock().await = Some(room_id);
+            *self.selected_room.lock().await = None;
+        } else {
+            *self.selected_space.lock().await = None;
+            *self.selected_room.lock().await = Some(room_id);
+        }
+        self.invalidate_space_scan().await;
+        self.invalidate_navigation();
+        self.refresh(ui.clone()).await?;
+        tokio::spawn(self.clone().scan_spaces(ui));
+        Ok(())
+    }
+
+    pub async fn respond_to_invite(
+        self: &Arc<Self>,
+        account_id: &str,
+        room_id: &str,
+        accept: bool,
+        ui: Weak<AppWindow>,
+    ) -> Result<(), MatrixCoreError> {
+        let _transition = self.account_transition.lock().await;
+        self.require_active_account(account_id).await?;
+        if accept {
+            // Invited Spaces carry the room type in their stripped state.
+            // Check before joining: a newly joined room may not yet have its
+            // full create event in the local room snapshot.
+            let invite = self
+                .manager
+                .invites_snapshot()
+                .await?
+                .into_iter()
+                .find(|room| room.room_id == room_id);
+            let was_space = invite.as_ref().is_some_and(|room| room.is_space);
+            self.manager.accept_invite(room_id).await?;
+            let is_space = was_space
+                || self
+                    .manager
+                    .rooms_snapshot()
+                    .await?
+                    .iter()
+                    .any(|room| room.room_id == room_id && room.is_space);
+            if is_space {
+                self.known_spaces
+                    .lock()
+                    .await
+                    .entry(account_id.to_owned())
+                    .or_default()
+                    .insert(
+                        room_id.to_owned(),
+                        KnownSpace {
+                            name: invite
+                                .as_ref()
+                                .map_or_else(|| room_id.to_owned(), |room| room.name.clone()),
+                            recorded_at: Instant::now(),
+                        },
+                    );
+            }
+            self.clear_feed().await;
+            if is_space {
+                *self.selected_space.lock().await = Some(room_id.to_owned());
+                *self.selected_room.lock().await = None;
+            } else {
+                *self.selected_space.lock().await = None;
+                *self.selected_room.lock().await = Some(room_id.to_owned());
+            }
+        } else {
+            self.manager.reject_invite(room_id).await?;
+        }
+        self.require_active_account(account_id).await?;
+        self.invalidate_space_scan().await;
+        self.invalidate_navigation();
+        self.refresh(ui.clone()).await?;
+        tokio::spawn(self.clone().scan_spaces(ui));
+        Ok(())
+    }
+
+    async fn require_active_account(&self, account_id: &str) -> Result<(), MatrixCoreError> {
+        if self
+            .manager
+            .active_account()
+            .await
+            .as_ref()
+            .is_none_or(|active| active.id != account_id)
+        {
+            Err(MatrixCoreError::SelectedAccountChanged)
+        } else {
+            Ok(())
+        }
+    }
+
     pub async fn select_space(
         self: &Arc<Self>,
         space_id: String,
@@ -131,10 +288,22 @@ impl LiveUi {
     ) -> Result<(), MatrixCoreError> {
         self.invalidate_navigation();
         if !space_id.is_empty() {
+            let account = self
+                .manager
+                .active_account()
+                .await
+                .ok_or(MatrixCoreError::NoActiveAccount)?;
             let rooms = self.manager.rooms_snapshot().await?;
-            if !rooms
-                .iter()
-                .any(|room| room.is_space && room.room_id == space_id)
+            let known = self
+                .known_spaces
+                .lock()
+                .await
+                .get(&account.id)
+                .is_some_and(|spaces| spaces.contains_key(&space_id));
+            if !known
+                && !rooms
+                    .iter()
+                    .any(|room| room.is_space && room.room_id == space_id)
             {
                 return Err(MatrixCoreError::RoomNotFound(space_id));
             }
@@ -168,12 +337,29 @@ impl LiveUi {
         {
             return Ok(());
         }
+        let known_spaces = {
+            let mut by_account = self.known_spaces.lock().await;
+            let known = by_account.entry(active.id.clone()).or_default();
+            known.retain(
+                |id, value| match rooms.iter().find(|room| room.room_id == *id) {
+                    Some(room) if room.is_space && room.membership == RoomMembership::Joined => {
+                        false
+                    }
+                    _ => value.recorded_at.elapsed() < Duration::from_secs(60),
+                },
+            );
+            known
+                .iter()
+                .map(|(id, value)| (id.clone(), value.name.clone()))
+                .collect::<HashMap<_, _>>()
+        };
         let selected_space = self.selected_space.lock().await.clone().filter(|space_id| {
-            rooms.iter().any(|room| {
-                room.is_space
-                    && room.room_id == *space_id
-                    && room.membership == RoomMembership::Joined
-            })
+            known_spaces.contains_key(space_id)
+                || rooms.iter().any(|room| {
+                    room.is_space
+                        && room.room_id == *space_id
+                        && room.membership == RoomMembership::Joined
+                })
         });
         if self.render_epoch.load(Ordering::Acquire) != render_epoch {
             return Ok(());
@@ -186,7 +372,10 @@ impl LiveUi {
             .cloned()
             .collect::<HashSet<_>>();
         let visible = |room: &RoomInfo| {
-            if room.is_space {
+            if room.is_space
+                || known_spaces.contains_key(&room.room_id)
+                || room.membership != RoomMembership::Joined
+            {
                 return false;
             }
             if let Some(space_id) = selected_space.as_deref() {
@@ -209,12 +398,6 @@ impl LiveUi {
                     .iter()
                     .find(|room| room.membership == RoomMembership::Joined && visible(room))
                     .map(|room| room.room_id.clone())
-            })
-            .or_else(|| {
-                rooms
-                    .iter()
-                    .find(|room| visible(room))
-                    .map(|room| room.room_id.clone())
             });
         if self.render_epoch.load(Ordering::Acquire) != render_epoch {
             return Ok(());
@@ -226,6 +409,7 @@ impl LiveUi {
             rooms,
             selected: selected.clone(),
             selected_space,
+            known_spaces,
             space_children,
             all_space_children,
         };
@@ -261,9 +445,19 @@ impl LiveUi {
                 return;
             }
         };
+        let known_ids = self
+            .known_spaces
+            .lock()
+            .await
+            .get(&account.id)
+            .map(|spaces| spaces.keys().cloned().collect::<HashSet<_>>())
+            .unwrap_or_default();
         let mut space_ids = rooms
             .iter()
-            .filter(|room| room.is_space && room.membership == RoomMembership::Joined)
+            .filter(|room| {
+                (room.is_space || known_ids.contains(&room.room_id))
+                    && room.membership == RoomMembership::Joined
+            })
             .map(|room| room.room_id.clone())
             .collect::<Vec<_>>();
         space_ids.sort();
@@ -652,6 +846,7 @@ struct Snapshot {
     rooms: Vec<RoomInfo>,
     selected: Option<String>,
     selected_space: Option<String>,
+    known_spaces: HashMap<String, String>,
     space_children: HashMap<String, HashSet<String>>,
     all_space_children: HashSet<String>,
 }
@@ -701,8 +896,15 @@ impl DraftStore {
 
 fn apply_snapshot(ui: &AppWindow, view: Snapshot, drafts: &DraftStore) {
     let next_room_id = view.selected.as_deref().unwrap_or("");
-    let selection_changed = ui.get_active_account_local_id().as_str() != view.active.id
-        || ui.get_active_room_id().as_str() != next_room_id;
+    let account_changed = ui.get_active_account_local_id().as_str() != view.active.id;
+    let selection_changed = account_changed || ui.get_active_room_id().as_str() != next_room_id;
+    if account_changed {
+        ui.set_room_actions_open(false);
+        ui.set_room_action_busy(false);
+        ui.set_room_action_error("".into());
+        ui.set_invite_error("".into());
+        ui.set_room_action_operation(ui.get_room_action_operation().wrapping_add(1));
+    }
     if selection_changed {
         ui.set_composer_text(drafts.get(&view.active.id, next_room_id).into());
         ui.set_composer_mode(0);
@@ -753,23 +955,54 @@ fn apply_snapshot(ui: &AppWindow, view: Snapshot, drafts: &DraftStore) {
         .selected_space
         .as_deref()
         .and_then(|id| view.rooms.iter().find(|room| room.room_id == id))
-        .map_or("Home", |room| room.name.as_str());
+        .map(|room| room.name.as_str())
+        .or_else(|| {
+            view.selected_space
+                .as_deref()
+                .and_then(|id| view.known_spaces.get(id).map(String::as_str))
+        })
+        .unwrap_or("Home");
     ui.set_active_space_id(view.selected_space.as_deref().unwrap_or("").into());
     ui.set_active_space_name(active_space_name.into());
-    ui.set_spaces(ModelRc::new(VecModel::from(
-        view.rooms
-            .iter()
-            .filter(|room| room.is_space && room.membership == RoomMembership::Joined)
-            .map(|room| SpaceItem {
-                id: room.room_id.as_str().into(),
-                name: room.name.as_str().into(),
-                initials: initials(&room.name).into(),
-                accent: accent(&room.room_id),
-            })
-            .collect::<Vec<_>>(),
-    )));
+    let mut spaces = view
+        .rooms
+        .iter()
+        .filter(|room| {
+            (room.is_space || view.known_spaces.contains_key(&room.room_id))
+                && room.membership == RoomMembership::Joined
+        })
+        .map(|room| SpaceItem {
+            id: room.room_id.as_str().into(),
+            name: view
+                .known_spaces
+                .get(&room.room_id)
+                .map_or(room.name.as_str(), String::as_str)
+                .into(),
+            initials: initials(
+                view.known_spaces
+                    .get(&room.room_id)
+                    .map_or(room.name.as_str(), String::as_str),
+            )
+            .into(),
+            accent: accent(&room.room_id),
+        })
+        .collect::<Vec<_>>();
+    for (id, name) in &view.known_spaces {
+        if !spaces.iter().any(|space| space.id.as_str() == id) {
+            spaces.push(SpaceItem {
+                id: id.as_str().into(),
+                name: name.as_str().into(),
+                initials: initials(name).into(),
+                accent: accent(id),
+            });
+        }
+    }
+    ui.set_spaces(ModelRc::new(VecModel::from(spaces)));
     let visible = |room: &RoomInfo| {
-        if room.is_space {
+        if room.is_space
+            || view.known_spaces.contains_key(&room.room_id)
+            || room.membership != RoomMembership::Joined
+        {
             return false;
         }
         if let Some(space_id) = view.selected_space.as_deref() {
@@ -780,6 +1013,13 @@ fn apply_snapshot(ui: &AppWindow, view: Snapshot, drafts: &DraftStore) {
             room.is_direct || !view.all_space_children.contains(&room.room_id)
         }
     };
+    ui.set_invitations(ModelRc::new(VecModel::from(
+        view.rooms
+            .iter()
+            .filter(|room| room.membership == RoomMembership::Invited)
+            .map(room_item)
+            .collect::<Vec<_>>(),
+    )));
     ui.set_unsorted_channels(ModelRc::new(VecModel::from(
         view.rooms
             .iter()
