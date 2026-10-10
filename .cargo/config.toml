@@ -1,0 +1,4 @@
+# The pinned native WebRTC library is built with MSVC's static CRT. Build the
+# Rust side with the same runtime to avoid LNK2038/LNK2005 at the app link.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
