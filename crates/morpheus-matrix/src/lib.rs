@@ -18,7 +18,10 @@ pub use discovery::{
 };
 mod search;
 pub use search::MessageSearchResult;
+mod formatting;
+pub use formatting::TextFormat;
 mod admin;
+mod rich_text;
 pub use admin::RoomMemberInfo;
 
 use std::{
@@ -50,8 +53,13 @@ use matrix_sdk::{
             client::{room::create_room, space::get_hierarchy},
         },
         events::{
-            key::verification::VerificationMethod,
-            room::message::{RoomMessageEventContent, RoomMessageEventContentWithoutRelation},
+            InitialStateEvent,
+            key::verification::{VerificationMethod, request::ToDeviceKeyVerificationRequestEvent},
+            room::encryption::RoomEncryptionEventContent,
+            room::message::{
+                MessageFormat, MessageType, RoomMessageEventContent,
+                RoomMessageEventContentWithoutRelation,
+            },
             space::child::SpaceChildEventContent,
         },
         room::RoomType,
@@ -150,6 +158,7 @@ pub struct AccountInfo {
 pub struct RoomInfo {
     pub room_id: String,
     pub name: String,
+    pub topic: Option<String>,
     pub membership: RoomMembership,
     pub is_direct: bool,
     pub is_space: bool,
@@ -213,6 +222,14 @@ pub struct MessageInfo {
     pub event_id: Option<String>,
     pub sender: String,
     pub body: String,
+    /// A narrow, presentation-only Markdown projection of Matrix formatted
+    /// HTML. Unsupported markup leaves this empty so the UI uses `body`.
+    #[serde(default)]
+    pub rich_markdown: Option<String>,
+    /// Plain accessibility text derived from the accepted rich projection.
+    /// Incoming Matrix `body` may differ from `formatted_body`.
+    #[serde(default)]
+    pub rich_accessible: Option<String>,
     /// A display-only basename for file, image, audio, and video messages.
     /// Media URLs and decryption keys never enter the UI projection.
     #[serde(default)]
@@ -294,6 +311,9 @@ pub struct SecurityInfo {
 pub struct VerificationInfo {
     pub flow_id: String,
     pub other_user_id: String,
+    /// Only the request initiator should start the SAS method. The other
+    /// device accepts that method once its start event arrives.
+    pub we_started: bool,
     pub is_ready: bool,
     pub is_done: bool,
     pub is_cancelled: bool,
@@ -537,6 +557,7 @@ struct StoredSecret {
 struct LoadedAccount {
     client: Client,
     timelines: Mutex<HashMap<String, Arc<Timeline>>>,
+    incoming_verification_tx: watch::Sender<Vec<VerificationInfo>>,
     token_task: Mutex<Option<SyncTask>>,
 }
 
@@ -694,6 +715,11 @@ impl AccountManager {
             let _ = fs::remove_dir_all(&store_path);
             return Err(MatrixCoreError::DuplicateAccount);
         }
+        if let Err(error) = start_event_cache(&client) {
+            let _ = client.logout().await;
+            let _ = fs::remove_dir_all(&store_path);
+            return Err(error);
+        }
         if let Err(e) = save_secret(
             &id,
             StoredSecret {
@@ -846,6 +872,11 @@ impl AccountManager {
             let _ = fs::remove_dir_all(&store_path);
             return Err(MatrixCoreError::DuplicateAccount);
         }
+        if let Err(error) = start_event_cache(&client) {
+            let _ = client.logout().await;
+            let _ = fs::remove_dir_all(&store_path);
+            return Err(error);
+        }
         if let Err(e) = save_secret(
             &id,
             StoredSecret {
@@ -925,6 +956,7 @@ impl AccountManager {
                     .restore_session(secret.session, RoomLoadSettings::default())
                     .await
                     .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
+                start_event_cache(&client)?;
                 let loaded = Arc::new(LoadedAccount::new(
                     client,
                     id.into(),
@@ -1177,15 +1209,30 @@ impl AccountManager {
         reply_to: &str,
         body: impl Into<String>,
     ) -> Result<()> {
+        self.send_reply_formatted_for(
+            expected_account_id,
+            room_id,
+            reply_to,
+            body,
+            TextFormat::Plain,
+        )
+        .await
+    }
+
+    pub async fn send_reply_formatted_for(
+        &self,
+        expected_account_id: &str,
+        room_id: &str,
+        reply_to: &str,
+        body: impl Into<String>,
+        format: TextFormat,
+    ) -> Result<()> {
         let state = self.state.lock().await;
         let loaded = selected_loaded_for(&state, expected_account_id)?;
         let timeline = loaded.timeline(room_id).await?;
         let event_id = parse_event_id(reply_to)?;
         timeline
-            .send_reply(
-                RoomMessageEventContentWithoutRelation::text_plain(body.into()),
-                event_id,
-            )
+            .send_reply(formatting::related_text(body.into(), format), event_id)
             .await
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
         Ok(())
@@ -1198,11 +1245,29 @@ impl AccountManager {
         root_event_id: &str,
         body: impl Into<String>,
     ) -> Result<()> {
+        self.send_thread_formatted_for(
+            expected_account_id,
+            room_id,
+            root_event_id,
+            body,
+            TextFormat::Plain,
+        )
+        .await
+    }
+
+    pub async fn send_thread_formatted_for(
+        &self,
+        expected_account_id: &str,
+        room_id: &str,
+        root_event_id: &str,
+        body: impl Into<String>,
+        format: TextFormat,
+    ) -> Result<()> {
         let state = self.state.lock().await;
         let loaded = selected_loaded_for(&state, expected_account_id)?;
         let timeline = loaded.thread_timeline(room_id, root_event_id).await?;
         timeline
-            .send(RoomMessageEventContent::text_plain(body.into()).into())
+            .send(formatting::room_text(body.into(), format).into())
             .await
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
         Ok(())
@@ -1215,6 +1280,24 @@ impl AccountManager {
         event_id: &str,
         body: impl Into<String>,
     ) -> Result<()> {
+        self.edit_formatted_for(
+            expected_account_id,
+            room_id,
+            event_id,
+            body,
+            TextFormat::Plain,
+        )
+        .await
+    }
+
+    pub async fn edit_formatted_for(
+        &self,
+        expected_account_id: &str,
+        room_id: &str,
+        event_id: &str,
+        body: impl Into<String>,
+        format: TextFormat,
+    ) -> Result<()> {
         let state = self.state.lock().await;
         let loaded = selected_loaded_for(&state, expected_account_id)?;
         let timeline = loaded.timeline(room_id).await?;
@@ -1222,9 +1305,7 @@ impl AccountManager {
         timeline
             .edit(
                 &item_id,
-                EditedContent::RoomMessage(RoomMessageEventContentWithoutRelation::text_plain(
-                    body.into(),
-                )),
+                EditedContent::RoomMessage(formatting::related_text(body.into(), format)),
             )
             .await
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
@@ -1280,6 +1361,17 @@ impl AccountManager {
         room_id: &str,
         body: impl Into<String>,
     ) -> Result<QueuedMessage> {
+        self.send_formatted_tracked_for(expected_account_id, room_id, body, TextFormat::Plain)
+            .await
+    }
+
+    pub async fn send_formatted_tracked_for(
+        &self,
+        expected_account_id: &str,
+        room_id: &str,
+        body: impl Into<String>,
+        format: TextFormat,
+    ) -> Result<QueuedMessage> {
         // Hold the switch lock through queueing the send. A switch cannot
         // redirect a command issued for the previously selected account.
         let state = self.state.lock().await;
@@ -1303,7 +1395,7 @@ impl AccountManager {
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
         let timeline = loaded.timeline(room_id).await?;
         let handle = timeline
-            .send(RoomMessageEventContent::text_plain(body.into()).into())
+            .send(formatting::room_text(body.into(), format).into())
             .await
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
         Ok(QueuedMessage {
@@ -1457,6 +1549,24 @@ impl AccountManager {
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
     }
 
+    /// Account-bound pagination for a desktop request that may outlive the
+    /// selected room or account. A late click cannot fetch another account's
+    /// timeline after a switch.
+    pub async fn paginate_backwards_for(
+        &self,
+        expected_account_id: &str,
+        room_id: &str,
+        count: u16,
+    ) -> Result<bool> {
+        let state = self.state.lock().await;
+        let loaded = selected_loaded_for(&state, expected_account_id)?;
+        let timeline = loaded.timeline(room_id).await?;
+        timeline
+            .paginate_backwards(count)
+            .await
+            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
+    }
+
     /// Search locally indexed events in a room. More history is indexed as it
     /// syncs or paginates; this does not query a homeserver search endpoint.
     pub async fn search_room(
@@ -1488,6 +1598,15 @@ impl AccountManager {
         let mut request = create_room::v3::Request::new();
         request.name = Some(name.into());
         request.preset = Some(create_room::v3::RoomPreset::PrivateChat);
+        // Install encryption in the creation request, before any members can
+        // join or messages can be sent. A homeserver rejection fails creation;
+        // never return a cleartext room as a private-room fallback.
+        request.initial_state.push(
+            InitialStateEvent::with_empty_state_key(
+                RoomEncryptionEventContent::with_recommended_defaults(),
+            )
+            .to_raw_any(),
+        );
         let room = loaded
             .client
             .create_room(request)
@@ -1775,6 +1894,54 @@ impl AccountManager {
         Ok(verification_info(&request))
     }
 
+    /// Incoming requests from other devices on the selected Matrix account.
+    /// The event handler only records request IDs; this refreshes each from
+    /// the SDK's crypto state and removes completed or cancelled flows.
+    pub async fn pending_own_verification_requests(&self) -> Result<Vec<VerificationInfo>> {
+        let loaded = self.active_loaded().await?;
+        let known = loaded.incoming_verification_tx.borrow().clone();
+        let mut pending = Vec::new();
+        for candidate in known {
+            let Ok(user_id) = UserId::parse(candidate.other_user_id.as_str()) else {
+                continue;
+            };
+            let Some(request) = loaded
+                .client
+                .encryption()
+                .get_verification_request(&user_id, &candidate.flow_id)
+                .await
+            else {
+                continue;
+            };
+            let info = verification_info(&request);
+            if !info.is_done && !info.is_cancelled {
+                pending.push(info);
+            }
+        }
+        loaded
+            .incoming_verification_tx
+            .send_replace(pending.clone());
+        Ok(pending)
+    }
+
+    /// Subscribe to request arrival for the selected account. Resubscribe
+    /// after an account switch; the receiver belongs to the old client.
+    pub async fn subscribe_incoming_verification_requests(
+        &self,
+    ) -> Result<(String, watch::Receiver<Vec<VerificationInfo>>)> {
+        let state = self.state.lock().await;
+        let id = state
+            .registry
+            .active_account_id
+            .as_ref()
+            .ok_or(MatrixCoreError::NoActiveAccount)?;
+        let loaded = state
+            .loaded
+            .get(id)
+            .ok_or(MatrixCoreError::NoActiveAccount)?;
+        Ok((id.clone(), loaded.incoming_verification_tx.subscribe()))
+    }
+
     pub async fn accept_verification_request(&self, user_id: &str, flow_id: &str) -> Result<()> {
         let state = self.state.lock().await;
         let client = &selected_loaded(&state)?.client;
@@ -1788,8 +1955,24 @@ impl AccountManager {
     pub async fn start_sas_verification(&self, user_id: &str, flow_id: &str) -> Result<()> {
         let state = self.state.lock().await;
         let client = &selected_loaded(&state)?.client;
-        find_verification_request(client, user_id, flow_id)
-            .await?
+        let request = find_verification_request(client, user_id, flow_id).await?;
+        if !request.we_started() {
+            return Err(MatrixCoreError::Sdk(
+                "only the requesting device may start this SAS flow".into(),
+            ));
+        }
+        if client
+            .encryption()
+            .get_verification(&parse_user_id(user_id)?, flow_id)
+            .await
+            .and_then(|verification| verification.sas())
+            .is_some()
+        {
+            // A delayed or repeated UI callback must not create a competing
+            // SAS start event for a request already in progress.
+            return Ok(());
+        }
+        request
             .start_sas()
             .await
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?
@@ -1807,6 +1990,32 @@ impl AccountManager {
             .accept()
             .await
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
+    }
+
+    /// Accept an incoming SAS start after accepting the verification request.
+    /// A missing SAS is normal while the initiating device is still deciding.
+    pub async fn accept_sas_if_available(&self, user_id: &str, flow_id: &str) -> Result<bool> {
+        let state = self.state.lock().await;
+        let client = &selected_loaded(&state)?.client;
+        let request = find_verification_request(client, user_id, flow_id).await?;
+        if request.we_started() {
+            return Err(MatrixCoreError::Sdk(
+                "the requesting device cannot accept its own SAS start".into(),
+            ));
+        }
+        let user_id = parse_user_id(user_id)?;
+        let Some(sas) = client
+            .encryption()
+            .get_verification(&user_id, flow_id)
+            .await
+            .and_then(|verification| verification.sas())
+        else {
+            return Ok(false);
+        };
+        sas.accept()
+            .await
+            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
+        Ok(true)
     }
 
     /// Returns `None` while waiting for the other device. Never auto-confirm
@@ -1869,6 +2078,12 @@ impl AccountManager {
     ) -> Result<RecoveryKey> {
         let state = self.state.lock().await;
         let client = &selected_loaded(&state)?.client;
+        // Cross-signing is bootstrapped by the SDK after login. Export its
+        // secrets into recovery only after that initialization has settled.
+        client
+            .encryption()
+            .wait_for_e2ee_initialization_tasks()
+            .await;
         let recovery = client.encryption().recovery();
         let mut enable = recovery.enable();
         if wait_for_backup_upload {
@@ -1999,6 +2214,40 @@ pub fn room_updates_change_space_graph(updates: &matrix_sdk::sync::RoomUpdates) 
 
 impl LoadedAccount {
     fn new(client: Client, account_id: String, store_passphrase: String) -> Self {
+        let (incoming_verification_tx, _) = watch::channel(Vec::<VerificationInfo>::new());
+        if let Some(own_user_id) = client.user_id().map(ToOwned::to_owned) {
+            let incoming_tx = incoming_verification_tx.clone();
+            client.add_event_handler(
+                move |event: ToDeviceKeyVerificationRequestEvent, client: Client| {
+                    let own_user_id = own_user_id.clone();
+                    let incoming_tx = incoming_tx.clone();
+                    async move {
+                        if event.sender != own_user_id {
+                            return;
+                        }
+                        let Some(request) = client
+                            .encryption()
+                            .get_verification_request(&event.sender, &event.content.transaction_id)
+                            .await
+                        else {
+                            return;
+                        };
+                        let info = verification_info(&request);
+                        if info.is_done || info.is_cancelled {
+                            return;
+                        }
+                        incoming_tx.send_modify(|known| {
+                            if !known
+                                .iter()
+                                .any(|existing| existing.flow_id == info.flow_id)
+                            {
+                                known.push(info);
+                            }
+                        });
+                    }
+                },
+            );
+        }
         let token_client = client.clone();
         let mut changes = client.subscribe_to_session_changes();
         let (shutdown, mut shutdown_receiver) = oneshot::channel();
@@ -2033,6 +2282,7 @@ impl LoadedAccount {
         Self {
             client,
             timelines: Mutex::new(HashMap::new()),
+            incoming_verification_tx,
             token_task: Mutex::new(Some(SyncTask {
                 shutdown,
                 task: token_task,
@@ -2206,6 +2456,7 @@ fn verification_info(request: &VerificationRequest) -> VerificationInfo {
     VerificationInfo {
         flow_id: request.flow_id().into(),
         other_user_id: request.other_user_id().to_string(),
+        we_started: request.we_started(),
         is_ready: request.is_ready(),
         is_done: request.is_done(),
         is_cancelled: request.is_cancelled(),
@@ -2222,6 +2473,7 @@ async fn room_info(room: &Room) -> RoomInfo {
     RoomInfo {
         room_id,
         name,
+        topic: room.topic(),
         membership: room.state().into(),
         is_direct: room.is_direct().await.unwrap_or(false),
         is_space: room.is_space(),
@@ -2262,11 +2514,25 @@ fn message_info(item: &TimelineItem) -> Option<MessageInfo> {
         Some(EventSendState::SendingFailed { .. }) => MessageSendState::Failed,
         Some(EventSendState::Sent { .. }) | None => MessageSendState::Sent,
     };
+    let formatted = match message.msgtype() {
+        MessageType::Text(content) => content.formatted.as_ref(),
+        MessageType::Notice(content) => content.formatted.as_ref(),
+        MessageType::Emote(content) => content.formatted.as_ref(),
+        _ => None,
+    };
+    let rich_markdown = formatted
+        .filter(|content| content.format == MessageFormat::Html)
+        .and_then(|content| rich_text::matrix_html_to_markdown(&content.body));
+    let rich_accessible = rich_markdown
+        .as_deref()
+        .map(rich_text::markdown_to_accessible_text);
     Some(MessageInfo {
         key: item.unique_id().0.clone(),
         event_id: event.event_id().map(ToString::to_string),
         sender: event.sender().to_string(),
         body: message.body().to_owned(),
+        rich_markdown,
+        rich_accessible,
         attachment_name: media::attachment_name(message.msgtype()),
         reply_preview,
         reaction_summary: event
@@ -2323,6 +2589,7 @@ async fn build_client(homeserver: &str, store_path: &Path, passphrase: &str) -> 
         ))
         // Fetch only missing room keys after recovery, avoiding a full-account backup download.
         .with_encryption_settings(EncryptionSettings {
+            auto_enable_cross_signing: true,
             backup_download_strategy: BackupDownloadStrategy::AfterDecryptionFailure,
             ..Default::default()
         })
@@ -2330,17 +2597,22 @@ async fn build_client(homeserver: &str, store_path: &Path, passphrase: &str) -> 
         .build()
         .await
         .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
-    // Indexing starts when the event cache subscribes. Start before sync so
-    // the first message batch is indexed even when no timeline is open.
-    client
-        .event_cache()
-        .subscribe()
-        .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
     // A restored client can contain persisted queued sends. Keep it dormant
     // until the account is actually selected and sync starts.
     client.send_queue().enable_upload_progress(true);
     client.send_queue().set_enabled(false).await;
     Ok(client)
+}
+
+fn start_event_cache(client: &Client) -> Result<()> {
+    // The event-cache redecryptor subscribes to the Olm machine when it
+    // starts. Starting it before login/restore can permanently end that
+    // worker, leaving recovered room keys unable to refresh UTD timeline
+    // items. All callers invoke this after authentication and before sync.
+    client
+        .event_cache()
+        .subscribe()
+        .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
 }
 
 async fn stop_sync(state: &mut State) {

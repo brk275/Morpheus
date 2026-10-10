@@ -45,6 +45,7 @@ xcap = { version = "0.9.8", optional = true }
 
 [dev-dependencies]
 futures-util = "0.3"
+livekit = "=0.7.48"
 morpheus-matrix = { path = "../morpheus-matrix" }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

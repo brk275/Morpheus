@@ -11,6 +11,8 @@ description = "Matrix accounts, sync, rooms, and timelines for Morpheus"
 matrix-sdk = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd", features = ["sqlite", "e2e-encryption", "experimental-search", "experimental-send-custom-to-device", "unstable-msc4354"] }
 matrix-sdk-ui = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd", features = ["unstable-msc4354"] }
 matrix-sdk-crypto = { git = "https://github.com/matrix-org/matrix-rust-sdk", rev = "c6ad52ecc09eaa36601f55effb0a48a533eb87dd" }
+ruma = { version = "=0.17.0", features = ["markdown", "html"] }
+pulldown-cmark = { version = "=0.13.4", default-features = false }
 mime = "0.3"
 eyeball-im = "0.9"
 futures-util = "0.3"

@@ -13,9 +13,9 @@ use chrono::{Local, TimeZone};
 use morpheus_matrix::{
     AccountInfo, AccountManager, DownloadedAttachment, MatrixCoreError, MatrixLinkTarget,
     MessageInfo, MessageSendState, QueuedAttachment, QueuedMessage, RoomInfo, RoomMemberInfo,
-    RoomMembership, SyncBackend, SyncStatus,
+    RoomMembership, SyncBackend, SyncStatus, TextFormat,
 };
-use slint::{Color, ModelRc, SharedString, VecModel, Weak};
+use slint::{Color, Model, ModelRc, StyledText, VecModel, Weak};
 use tokio::{
     runtime::Handle,
     sync::{Mutex, mpsc},
@@ -24,6 +24,7 @@ use tokio::{
 
 use crate::attachments::save_download;
 use crate::drafts::DraftStore;
+use crate::voice_spaces::VoiceSpaces;
 use crate::{
     AccountItem, AccountOption, AppWindow, MemberItem, MessageItem, PublicRoomItem, RoomItem,
     SpaceItem,
@@ -56,6 +57,7 @@ struct MemberRequest {
 
 pub struct LiveUi {
     pub manager: Arc<AccountManager>,
+    pub(crate) voice_spaces: Arc<VoiceSpaces>,
     pub is_live: Arc<AtomicBool>,
     pub(crate) security_gate: Arc<crate::security::SecurityGate>,
     drafts: Arc<DraftStore>,
@@ -80,7 +82,12 @@ pub struct LiveUi {
 }
 
 impl LiveUi {
-    pub fn new(manager: Arc<AccountManager>, runtime: Handle, ui: Weak<AppWindow>) -> Arc<Self> {
+    pub fn new(
+        manager: Arc<AccountManager>,
+        runtime: Handle,
+        ui: Weak<AppWindow>,
+        voice_spaces: Arc<VoiceSpaces>,
+    ) -> Arc<Self> {
         let (draft_write_tx, mut draft_write_rx) = mpsc::channel(1);
         let drafts = Arc::new(DraftStore::default());
         let draft_worker_store = drafts.clone();
@@ -130,6 +137,7 @@ impl LiveUi {
         });
         Arc::new(Self {
             manager,
+            voice_spaces,
             is_live: Arc::new(AtomicBool::new(false)),
             security_gate: Arc::new(crate::security::SecurityGate::default()),
             drafts,
@@ -162,10 +170,20 @@ impl LiveUi {
         self.navigation_epoch.fetch_add(1, Ordering::AcqRel) + 1
     }
 
+    pub(crate) fn current_navigation_epoch(&self) -> u64 {
+        self.navigation_epoch.load(Ordering::Acquire)
+    }
+
     pub fn remember_draft(&self, account_id: &str, room_id: &str, body: &str) {
         if !account_id.is_empty() && !room_id.is_empty() {
             self.drafts.set(account_id, room_id, body);
             self.queue_draft_write();
+        }
+    }
+
+    pub fn remember_markdown(&self, account_id: &str, room_id: &str, enabled: bool) {
+        if !account_id.is_empty() && !room_id.is_empty() {
+            self.drafts.set_markdown(account_id, room_id, enabled);
         }
     }
 
@@ -636,6 +654,11 @@ impl LiveUi {
             return Ok(());
         }
         let member_account_id = active.id.clone();
+        let marker_rooms = rooms
+            .iter()
+            .filter(|room| room.membership == RoomMembership::Joined && !room.is_space)
+            .map(|room| room.room_id.clone())
+            .collect::<Vec<_>>();
         let view = Snapshot {
             accounts,
             active,
@@ -645,6 +668,11 @@ impl LiveUi {
             known_spaces,
             space_children,
             all_space_children,
+            local_voice_rooms: self.voice_spaces.local_rooms(&member_account_id),
+            legacy_element_call_rooms: self
+                .voice_spaces
+                .legacy_element_call_rooms(&member_account_id),
+            shared_voice_rooms: self.voice_spaces.shared_rooms(&member_account_id).await,
         };
         let current_epoch = self.render_epoch.clone();
         let is_live = self.is_live.clone();
@@ -665,9 +693,25 @@ impl LiveUi {
                 false,
             )
             .await;
-            self.open_room(&member_account_id, room_id, navigation_epoch, ui)
+            self.open_room(&member_account_id, room_id, navigation_epoch, ui.clone())
                 .await;
         }
+        let marker_account = member_account_id;
+        let voice_spaces = self.voice_spaces.clone();
+        let live = self.clone();
+        tokio::spawn(async move {
+            if voice_spaces
+                .scan_shared(&live.manager, &marker_account, &marker_rooms)
+                .await
+            {
+                let shared_rooms = voice_spaces.shared_rooms(&marker_account).await;
+                let _ = ui.upgrade_in_event_loop(move |window| {
+                    if window.get_active_account_local_id().as_str() == marker_account {
+                        apply_shared_voice_labels(&window, &shared_rooms);
+                    }
+                });
+            }
+        });
         Ok(())
     }
 
@@ -1095,6 +1139,16 @@ impl LiveUi {
         Ok(())
     }
 
+    pub async fn is_selected_room_for(&self, account_id: &str, room_id: &str) -> bool {
+        self.is_live.load(Ordering::Acquire)
+            && self.selected_room.lock().await.as_deref() == Some(room_id)
+            && self
+                .manager
+                .active_account()
+                .await
+                .is_some_and(|account| account.id == account_id)
+    }
+
     pub async fn require_media_context(
         &self,
         account_id: &str,
@@ -1185,6 +1239,7 @@ impl LiveUi {
         room_id: String,
         body: String,
         target: MessageTarget,
+        format: TextFormat,
     ) -> Result<Option<QueuedMessage>, MatrixCoreError> {
         self.require_selected_room(&room_id).await?;
         match target {
@@ -1195,23 +1250,23 @@ impl LiveUi {
                     .persist_one(&self.manager, &account_id, &room_id)
                     .await?;
                 self.manager
-                    .send_text_tracked_for(&account_id, &room_id, body)
+                    .send_formatted_tracked_for(&account_id, &room_id, body, format)
                     .await
                     .map(Some)
             }
             MessageTarget::Reply(event_id) => self
                 .manager
-                .send_reply_for(&account_id, &room_id, &event_id, body)
+                .send_reply_formatted_for(&account_id, &room_id, &event_id, body, format)
                 .await
                 .map(|_| None),
             MessageTarget::Edit(event_id) => self
                 .manager
-                .edit_text_for(&account_id, &room_id, &event_id, body)
+                .edit_formatted_for(&account_id, &room_id, &event_id, body, format)
                 .await
                 .map(|_| None),
             MessageTarget::Thread(root_event_id) => self
                 .manager
-                .send_thread_text_for(&account_id, &room_id, &root_event_id, body)
+                .send_thread_formatted_for(&account_id, &room_id, &root_event_id, body, format)
                 .await
                 .map(|_| None),
         }
@@ -1309,6 +1364,9 @@ struct Snapshot {
     known_spaces: HashMap<String, String>,
     space_children: HashMap<String, HashSet<String>>,
     all_space_children: HashSet<String>,
+    local_voice_rooms: HashSet<String>,
+    legacy_element_call_rooms: HashSet<String>,
+    shared_voice_rooms: HashSet<String>,
 }
 
 fn apply_snapshot(
@@ -1343,13 +1401,41 @@ fn apply_snapshot(
         ui.set_directory_join_input("".into());
     }
     if selection_changed {
+        ui.set_room_admin_open(false);
+        ui.set_room_admin_operation(ui.get_room_admin_operation().wrapping_add(1));
+        ui.set_room_admin_busy(false);
+        ui.set_room_admin_error("".into());
+        ui.set_room_admin_notice("".into());
+        ui.set_room_admin_event_id("".into());
+        ui.set_voice_designation_operation(ui.get_voice_designation_operation().wrapping_add(1));
+        ui.set_voice_designation_busy(false);
+        ui.set_voice_designation_error("".into());
+        ui.set_voice_designation_notice("".into());
+        ui.set_history_operation(ui.get_history_operation().wrapping_add(1));
+        ui.set_history_loading(false);
+        ui.set_history_at_start(false);
+        ui.set_history_error("".into());
         ui.set_members(ModelRc::new(VecModel::<MemberItem>::from(Vec::new())));
         ui.set_member_loading(!next_room_id.is_empty());
         ui.set_member_error("".into());
+        ui.set_member_action_operation(ui.get_member_action_operation().wrapping_add(1));
+        ui.set_member_action_busy(false);
+        ui.set_member_action_error("".into());
+        ui.set_member_action_notice("".into());
+        ui.set_member_invite_user_id("".into());
+        ui.set_member_selected_user_id("".into());
+        ui.set_member_selected_name("".into());
+        ui.set_member_selected_membership("".into());
+        ui.set_member_selected_power("".into());
+        ui.set_member_selected_self(false);
+        ui.set_member_selected_creator(false);
+        ui.set_member_confirm_open(false);
         crate::reset_attachment_view(ui);
         crate::reset_room_search(ui);
         ui.set_element_call_compatibility(false);
         ui.set_composer_text(drafts.get(&view.active.id, next_room_id).into());
+        ui.set_composer_markdown(drafts.markdown(&view.active.id, next_room_id));
+        ui.set_composer_saved_markdown(false);
         ui.set_composer_mode(0);
         ui.set_composer_target_id("".into());
         ui.set_composer_target_label("".into());
@@ -1460,21 +1546,33 @@ fn apply_snapshot(
         view.rooms
             .iter()
             .filter(|room| room.membership == RoomMembership::Invited)
-            .map(room_item)
+            .map(|room| room_item(room, false, false))
             .collect::<Vec<_>>(),
     )));
     ui.set_unsorted_channels(ModelRc::new(VecModel::from(
         view.rooms
             .iter()
             .filter(|room| !room.is_direct && visible(room))
-            .map(room_item)
+            .map(|room| {
+                room_item(
+                    room,
+                    view.local_voice_rooms.contains(&room.room_id),
+                    view.shared_voice_rooms.contains(&room.room_id),
+                )
+            })
             .collect::<Vec<_>>(),
     )));
     ui.set_unsorted_direct_messages(ModelRc::new(VecModel::from(
         view.rooms
             .iter()
             .filter(|room| room.is_direct && visible(room))
-            .map(room_item)
+            .map(|room| {
+                room_item(
+                    room,
+                    view.local_voice_rooms.contains(&room.room_id),
+                    view.shared_voice_rooms.contains(&room.room_id),
+                )
+            })
             .collect::<Vec<_>>(),
     )));
     crate::apply_room_sort(ui);
@@ -1486,15 +1584,25 @@ fn apply_snapshot(
             }
             ui.set_active_room_id(room.room_id.as_str().into());
             ui.set_active_room_name(room.name.as_str().into());
+            ui.set_active_room_topic_raw(room.topic.as_deref().unwrap_or("").into());
+            ui.set_element_call_compatibility(
+                view.legacy_element_call_rooms.contains(&room.room_id),
+            );
+            ui.set_active_voice_local(view.local_voice_rooms.contains(&room.room_id));
+            ui.set_active_voice_shared(view.shared_voice_rooms.contains(&room.room_id));
             ui.set_active_room_topic(if room.membership == RoomMembership::Invited {
                 "Invitation · join to read messages".into()
             } else {
-                "Matrix room".into()
+                room.topic.as_deref().unwrap_or("No room topic").into()
             });
         }
     } else {
         ui.set_active_room_id("".into());
         ui.set_active_room_name("No rooms yet".into());
+        ui.set_active_room_topic_raw("".into());
+        ui.set_element_call_compatibility(false);
+        ui.set_active_voice_local(false);
+        ui.set_active_voice_shared(false);
         ui.set_active_room_topic("Join or create a Matrix room to begin".into());
         ui.set_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new())));
     }
@@ -1521,13 +1629,38 @@ fn account_item(account: &AccountInfo, selected: bool) -> AccountItem {
     }
 }
 
-fn room_item(room: &RoomInfo) -> RoomItem {
+fn room_item(room: &RoomInfo, voice_local: bool, voice_shared: bool) -> RoomItem {
     RoomItem {
         id: room.room_id.as_str().into(),
         name: room.name.as_str().into(),
         unread: room.unread_notifications.min(i32::MAX as u64) as i32,
         private_room: room.is_direct,
+        voice_space: voice_local || voice_shared,
+        voice_local,
+        voice_shared,
     }
+}
+
+fn apply_shared_voice_labels(ui: &AppWindow, shared_rooms: &HashSet<String>) {
+    let update = |mut room: RoomItem| {
+        room.voice_shared = shared_rooms.contains(room.id.as_str());
+        room.voice_space = room.voice_local || room.voice_shared;
+        room
+    };
+    ui.set_unsorted_channels(ModelRc::new(VecModel::from(
+        ui.get_unsorted_channels()
+            .iter()
+            .map(update)
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_unsorted_direct_messages(ModelRc::new(VecModel::from(
+        ui.get_unsorted_direct_messages()
+            .iter()
+            .map(update)
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_active_voice_shared(shared_rooms.contains(ui.get_active_room_id().as_str()));
+    crate::apply_room_sort(ui);
 }
 
 fn member_item(info: &RoomMemberInfo) -> MemberItem {
@@ -1557,9 +1690,17 @@ fn member_item(info: &RoomMemberInfo) -> MemberItem {
         membership
     );
     MemberItem {
+        user_id: user_id.into(),
         name: name.clone().into(),
         initials: initials(&name).into(),
         detail: detail.into(),
+        membership: info.membership.as_str().into(),
+        power_level_text: info
+            .power_level
+            .map_or_else(String::new, |level| level.to_string())
+            .into(),
+        is_account_user: info.is_account_user,
+        is_creator: info.membership == "join" && info.power_level.is_none(),
         accent: accent(&info.user_id),
         online: false,
     }
@@ -1577,17 +1718,47 @@ fn message_item(info: &MessageInfo) -> MessageItem {
             .map(|time| time.format("%-I:%M %p").to_string())
             .unwrap_or_default(),
     };
+    let display_body = if info.attachment_name.as_deref() == Some(info.body.as_str()) {
+        ""
+    } else {
+        info.body.as_str()
+    };
+    let styled_markdown = if display_body.is_empty() {
+        None
+    } else {
+        info.rich_markdown
+            .as_deref()
+            .and_then(|markdown| StyledText::from_markdown(markdown).ok())
+    };
+    let rich_accessible_body = if styled_markdown.is_some() {
+        info.rich_accessible
+            .as_deref()
+            .filter(|text| !text.is_empty())
+            .unwrap_or(display_body)
+    } else {
+        display_body
+    };
+    // Use the accepted formatted projection as the edit source. The plain
+    // Matrix body may be an unrelated fallback, so editing it would silently
+    // discard visible styling when an unchanged message is saved.
+    let edit_markdown = styled_markdown.is_some();
+    let edit_source = if edit_markdown {
+        info.rich_markdown.as_deref().unwrap_or(display_body)
+    } else {
+        display_body
+    };
+    let rich_body = styled_markdown.unwrap_or_else(|| StyledText::from_plain_text(display_body));
     MessageItem {
         event_id: info.event_id.as_deref().unwrap_or("").into(),
         is_own: info.is_own,
         sender: sender.into(),
         initials: sender_initials.into(),
         time: time.into(),
-        body: if info.attachment_name.as_deref() == Some(info.body.as_str()) {
-            SharedString::default()
-        } else {
-            info.body.as_str().into()
-        },
+        body: display_body.into(),
+        rich_body,
+        rich_accessible_body: rich_accessible_body.into(),
+        edit_source: edit_source.into(),
+        edit_markdown,
         reply_to: info.reply_preview.as_deref().unwrap_or("").into(),
         attachment: info.attachment_name.as_deref().unwrap_or("").into(),
         reaction: info.reaction_summary.as_str().into(),
@@ -1703,5 +1874,40 @@ mod member_tests {
         assert!(!snapshot_closes_sign_in(true, false));
         assert!(snapshot_closes_sign_in(true, true));
         assert!(snapshot_closes_sign_in(false, false));
+    }
+
+    #[test]
+    fn formatted_edit_uses_visible_source_and_matching_accessibility_text() {
+        let info = MessageInfo {
+            key: "message".into(),
+            event_id: Some("$event".into()),
+            sender: "@alice:example.org".into(),
+            body: "different plain fallback".into(),
+            rich_markdown: Some("Visible **bold** text".into()),
+            rich_accessible: Some("Visible bold text".into()),
+            attachment_name: None,
+            reply_preview: None,
+            reaction_summary: String::new(),
+            timestamp_ms: 0,
+            is_own: true,
+            is_local_echo: false,
+            send_state: MessageSendState::Sent,
+        };
+        let item = message_item(&info);
+        assert!(item.edit_markdown);
+        assert_eq!(item.edit_source.as_str(), "Visible **bold** text");
+        assert_eq!(item.rich_accessible_body.as_str(), "Visible bold text");
+
+        let plain = message_item(&MessageInfo {
+            rich_markdown: None,
+            rich_accessible: None,
+            ..info
+        });
+        assert!(!plain.edit_markdown);
+        assert_eq!(plain.edit_source.as_str(), "different plain fallback");
+        assert_eq!(
+            plain.rich_accessible_body.as_str(),
+            "different plain fallback"
+        );
     }
 }

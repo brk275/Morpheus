@@ -49,10 +49,14 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
   core. A new key appears in a one-time reveal/copy dialog with explicit save
   guidance; the input clears after submission or leaving Settings. A shared
   gate prevents queued account changes and normal window close from dropping
-  the only returned key before acknowledgment. The native-call app suite
-  passed 22/22 tests, including gate and close-response checks; the default
-  app check and native binary build passed. Fresh-device recovery through the
-  actual desktop UI and SAS verification still need live acceptance.
+  the only returned key before acknowledgment. The Security panel also has an
+  own-device SAS flow: request verification, wait for the other device, show
+  emoji and decimal comparisons, explicitly acknowledge a human comparison,
+  confirm, or cancel. It never confirms a comparison automatically. The
+  native-call app suite passed 24/24 tests, including gate, close-response,
+  and explicit comparison checks; the default app check and native binary
+  build passed. Fresh-device recovery and two-device SAS verification through
+  the actual desktop UI still need live acceptance.
 - A gated two-Synapse room workflow passed private room and Space creation,
   invitation acceptance and decline, room-ID joining, and joining a registered
   room alias. Repeated runs initially hit Synapse's local invitation rate limit
@@ -61,6 +65,13 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
   account changes. A newly created Space has an account-scoped temporary rail
   item while the SDK's room classification catches up. The Space UI path has
   passed a native compile, but not a live desktop click-through.
+- After native UI QA found new private rooms were cleartext, creation now
+  includes Megolm state in the initial server request. A fresh loopback test
+  passed 1/1 in 8.57 seconds: an independent client read encryption state in
+  four new private rooms and a new DM, with each private room checked before
+  invitation. The formatted two-device test passed 1/1 in 10.29 seconds on a
+  newly created room without a separate encryption step. Existing cleartext
+  rooms and Spaces are not converted by this change.
 - The gated encrypted-room messaging test passed reply, edit, reaction, and
   thread send/read through the Matrix core. Bob received the changes, and
   operations bound to Alice were rejected after switching to Carol. A packaged
@@ -233,11 +244,18 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
   single-in-flight OS thread with a 30-second bound. The app then showed a
   view-only local-audio failure, kept the roster visible, and returned to idle
   immediately on Leave. The bottom-left account switcher guarded the active
-  call. The camera tile did not receive a frame: a third native session saw
-  Bob as reachable, but `streams=[]` and no camera `remote_track` over 20
-  samples while Bob retained his publication and pushed frames. This isolates
-  the failed acceptance to media advertisement/transport in this unencrypted
-  fixture; it does not validate Slint frame rendering or encrypted GUI calls.
+  call. The camera tile did not receive a frame. A separate two-peer native
+  probe kept Bob's camera publication alive and pushed 640×360 frames for 30
+  seconds. Bob's own roster advertised `Camera, muted=false`, while Alice saw
+  Bob with `streams=[]` and no camera `remote_track` in all 30 samples. The
+  pinned RTC transport maps remote members to LiveKit identities using their
+  sender device ID; current-format cleartext membership events provide no
+  attributable device ID. Morpheus now rejects current-format calls in
+  unencrypted rooms before opening or joining, with guidance to use an
+  encrypted room. The same disposable Alice/Bob fixture passed the encrypted
+  native audio/video test in 18.59 seconds, including decoded camera and
+  screen-share I420 frames, leave, and rejoin. This does not yet validate
+  Slint frame rendering or an encrypted GUI call.
   An app-owned Alice/Carol account switch across the two local homeservers
   passed afterward. The final native app suite passed 22/22 tests, including
   call generation and Security transition/close guards.
@@ -298,6 +316,174 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
   uppercase `m.call#ROOM` current-mode native regression failed roster
   discovery, so it is not the default. Element Call's current `matrix_2_0`
   mode did not pass the local fixture; see the [RTC runbook](../tests/LOCAL_MATRIX_RTC.md).
+- A fresh stock Element Call v0.26.1 `matrix_2_0`/`Sticky2025` attempt
+  received and decrypted both membership events, and its SDK calculated two
+  members from them. Its live call-view and session-manager arrays remained
+  empty. The sticky update callback had fired while both events still had
+  type `m.room.encrypted`; after decryption no further update refreshed the
+  live arrays. Morpheus observed the browser participant, but camera
+  subscription timed out at 49.25 seconds, so the interop test failed. A
+  separate explicit `refreshRoom` diagnostic had passed media transport;
+  that intervention is outside stock Element Call behavior. See the
+  [RTC runbook](../tests/LOCAL_MATRIX_RTC.md).
+
+- A separate fresh account on loopback Synapse B, which advertises no
+  MatrixRTC LiveKit transport, created an encrypted private room. An opt-in
+  native test passed 1/1 in 4.74 seconds: discovery, slot opening, and joining
+  each returned `NoLiveKitTransport`. Complete server room-state reads showed
+  no `m.rtc.slot` or `org.matrix.msc4143.rtc.slot` before or after the call
+  attempts. The same account then sent an encrypted chat message; its queue
+  completed, the SDK timeline showed the body, and Synapse stored ciphertext.
+  This checks the chat-preserving service gate on B, not other homeservers or
+  the desktop error view. See the [RTC runbook](../tests/LOCAL_MATRIX_RTC.md).
+
+## 2026-10-10 local administration and recovery checks
+
+- A new ad hoc signed macOS `.app` and isolated profile signed into an existing
+  disposable account. Before recovery it showed Device Unverified and Recovery
+  Incomplete. Importing that account's protected recovery key in the native
+  Security UI completed with Device Verified, Recovery Enabled, and Key backup
+  Enabled. A second fresh unverified app requested own-device SAS; the
+  recovered device accepted, the requester started, and the responder
+  accepted the SAS method. Both displayed identical emoji and three decimal
+  numbers. After a private human comparison, each app explicitly confirmed;
+  both devices reached Verified. The requester briefly displayed “Could not
+  check verification status” after confirmation because the completed request
+  was pruned; manual Refresh showed Verified. The completion UI now checks
+  durable device trust, with a focused test passing; a live retest of this fix
+  remains open. No recovery key, emoji, number, or account secret is recorded
+  here. This was a macOS live UI check; other platforms remain open.
+- A focused loopback Synapse moderation test passed (1 test, 0 failures;
+  22.80-second run after a 9.35-second compile). It
+  exercised room rename/topic, server rejection of an unauthorized rename,
+  power promotion/demotion, redaction of another member's message, invite,
+  kick/reinvite, ban/blocked join, and unban/rejoin. The account-bound
+  invite/kick/ban/unban and rename/topic/redaction wrappers rejected a
+  mismatched selected account.
+- In a separate disposable macOS Slint profile, a room creator invited a
+  guest, raised the guest's exact Matrix power level to 50, kicked and
+  reinvited the guest, banned the guest, then unbanned them. The UI reported
+  each action and direct server reads confirmed the power and membership
+  changes. The destructive actions required confirmation; Cancel, Tab to
+  Confirm, and Escape were exercised. The roster needed a manual Refresh after
+  each action because the SDK snapshot briefly retained older membership
+  state. A bounded settle-and-refresh change is awaiting build and UI retest.
+  Permission failure was covered in the core test, not this UI pass.
+- A second fresh macOS profile created a disposable room, saved its new name
+  and topic through the Room details dialog, sent a message, and opened its
+  redaction confirmation. Escape canceled the first attempt; on reopening,
+  Tab moved from Cancel to Redact and Return confirmed. The UI displayed the
+  saved room details and a redaction success notice. Direct Synapse reads
+  confirmed the exact room name and topic state values, a redacted message
+  event, and absence of the original message body. This checks one macOS UI
+  path; a GUI permission denial, the revised automatic roster refresh, and
+  Windows/Linux paths remain untested.
+- A fresh macOS recovery profile imported an existing backup key and then
+  displayed two historical encrypted events. Loading earlier history before
+  and after the import produced no UI error. The SDK still showed Backup
+  Enabled, Recovery Incomplete, and Device Unverified in this fixture; the
+  second device had not accepted SAS. This is a decryption UI pass, not proof
+  of complete recovery or verified identity.
+- Opt-in Markdown outbound content passed 4/4 focused serialization tests:
+  the Matrix plain `body` retains source text, safe Markdown becomes formatted
+  HTML, raw HTML tags remain literal text, and unsafe link schemes do not
+  survive. The updated native-call app suite passed 28/28, including the
+  completed-SAS-request fallback and notification policy checks. The app
+  binary built on macOS Apple Silicon. This preceded the later native rich
+  timeline renderer.
+- A separate opt-in loopback test passed 1/1 in 9.92 seconds against a fresh
+  encrypted two-person room. Alice sent a formatted main message, reply, and
+  edit; Bob's SDK decrypted each event. The test checked readable Matrix
+  `body`, sanitized `formatted_body`, the reply and replacement relations,
+  and an outer `m.room.encrypted` event on Synapse for all three sends. After
+  switching from Alice to Carol on the second homeserver, stale Alice send,
+  reply, and edit commands were rejected. This verifies the core send path on
+  local Synapse, not a native composer click-through or another platform.
+- After adding native `StyledText` display, four focused converter tests passed
+  for supported formatting, escaped literal markup, safe links/lists, and
+  bounds. A fresh encrypted two-device test passed 1/1 in 10.61 seconds:
+  Bob's decrypted main message and edit both reached the safe rich projection,
+  with the unchanged Matrix plain body still available. That native-call app
+  suite passed 31/31, including the browser-link guard. A live decrypted
+  rich-rendering click-through and other-platform acceptance remain open.
+- A native macOS click-through reused the exact signed canonical-ID QA app and
+  protected two-homeserver session from notification testing, then created a
+  fresh private room on loopback Synapse B and enabled Megolm before sending.
+  The **Md** button changed from “Use Markdown formatting” to “Clear Markdown
+  formatting”; the UI sent `morpheus-ui-md-qa-200a **bold**
+  <script>alert(1)</script>` and showed the source in its timeline. With **Md**
+  off, it sent a second literal-source control message. Direct server reads
+  confirmed both corresponding events (`$uHPp_CFocFIQvSXQtzjkkYEs6jQgv6CijQMWWUMwCpY`
+  and `$uCBqr_O3Iyy1sN6eRbBm6RQmUqjSyCUAqy1baZ2_fKE`) were
+  `m.room.encrypted` with ciphertext and no plaintext formatting fields.
+  The choice was plain in another room, restored to on when returning to the
+  QA room, stayed plain on account A, and restored to on after switching back
+  to account B. This proves the native toggle, send route, and session-local
+  account/room mode scoping; the exact UI-sent ciphertext was not decrypted
+  to inspect its inner `formatted_body`. The separate two-device core test
+  above covers formatted payload and decryption. Windows/Linux UI acceptance
+  remains open.
+- A rebuilt, ad hoc signed macOS QA app used a fresh account-free profile and
+  a deterministic styled sample in the interactive `#general` preview. In a
+  native screenshot, Sam's `great` rendered bold in the timeline. Its
+  accessibility text remained the unmarked plain sentence. Opening Sam's
+  thread initially exposed a plain-text root; after changing the root to the
+  same safe `StyledText` component used by the timeline and replies, a rebuilt
+  screenshot showed `great` bold in both places, with the thread root's plain
+  accessibility label and `REPLIES · 0` composer intact. A final rebuild after
+  adding a display-aligned accessible projection and preserving rich edit
+  source passed the native-call app suite 33/33; another native screenshot
+  showed bold `great` in both places and AX returned the unmarked sentence
+  for both. Clicking Edit on a plain preview message loaded its original
+  source and the “Save edit” control. The copied two-account
+  notification QA profile did not restore in the re-signed bundle: the app
+  stayed at disabled “Signing in…” despite receiving its profile path. No
+  credentials were entered. This verifies native preview rendering and thread
+  layout, not a live encrypted event displayed by the new renderer.
+- A fresh encrypted two-device native MatrixRTC test passed 1/1 in 18.34
+  seconds. After Bob left, Alice's local call reported media-key index 1;
+  after Bob rejoined, he imported Alice's key and decoded newly published
+  camera frames. This checks leave-triggered key rotation and fresh-join
+  media, not recovery from a dropped network transport. The earlier screen
+  and camera assertions in the same test also passed.
+- A later fresh-fixture native RTC run passed 1/1 in 18.72 seconds after
+  closing Alice's LiveKit signalling socket through the pinned test hook.
+  The existing call reported degraded then healthy media connection without
+  leaving its MatrixRTC membership; Bob decoded a new encrypted camera
+  publication after the resume. Leave-triggered key rotation and post-rejoin
+  media passed again. This is signal-resume evidence, not a full network outage
+  or SFU restart check.
+- A signed canonical-ID macOS QA app installed in `~/Applications` signed in
+  to two disposable homeservers. An alternate-room message for active account
+  A generated a `usernoted` request under `io.github.brk275.morpheus`; after
+  temporarily enabling the app in Notifications and Sleep Focus, macOS logged
+  delivery to alert, lock screen, and Notification Center with no Focus
+  suppression. A message in the visible room produced no request; after
+  switching to B, an A message produced none; and after both QA app processes
+  fully quit, a B message produced none. The prior notification and Focus
+  settings were restored and the QA installation removed. This is OS delivery
+  evidence, not a captured banner or preview-content check. Linux/Windows,
+  notification sound, and packaged release behavior remain open.
+- A separate ad hoc signed macOS Apple Silicon debug app used a fresh,
+  account-free offline profile to click through the new Notifications settings.
+  Accessibility state showed desktop notifications change On→Off, sounds
+  On→Off, and message previews Off→On. `config.toml` saved the corresponding
+  `enabled = false`, `sounds = false`, and `show_message_preview = true` values.
+  Adding `  Release   Candidate  ` displayed and saved `Release Candidate`;
+  adding the same phrase in lowercase showed a duplicate error, and a phrase
+  containing U+202E showed the control/direction-character error. The switches
+  and phrase survived Home→Settings navigation and a quit/relaunch of that
+  profile. An external, atomic TOML edit then changed the switches to On, On,
+  Off and added `Watcher QA`; all four changes appeared live in Settings.
+  Referencing a malformed theme pack showed the TOML parse error while the
+  last valid notification controls remained visible; removing the reference
+  cleared the error. That first binary left a highlight validation error
+  visible after the input was cleared. In a later rebuilt, account-free macOS
+  QA app, adding `Release Candidate`, attempting its lowercase duplicate,
+  clearing the input, and navigating Home→Settings showed the duplicate error
+  disappear on edit and stay cleared after navigation; the saved phrase stayed
+  visible. This is preferences UI and file watcher evidence on macOS, not a
+  notification banner, sound, or Linux/Windows acceptance check.
 
 ## GitHub CI
 
@@ -321,11 +507,30 @@ passed all four jobs for the encrypted-drafts and macOS real-capture commit.
 passed all four jobs for the encrypted-attachment and native call-stage commit.
 The newer discovery, streaming media, call-control, and slot changes above
 have not yet run in GitHub CI.
+[Unsigned internal package QA run 38029335100](https://github.com/brk275/Morpheus/actions/runs/38029335100)
+passed macOS Intel, Linux x64, and Windows x64 packaging jobs; its macOS
+Apple Silicon job failed before steps due Actions capacity/budget. The latest
+[CI run 38032533729](https://github.com/brk275/Morpheus/actions/runs/38032533729)
+did not start any platform job because GitHub reported an Actions budget
+preventing further use. Current source therefore has no four-platform CI
+result.
+
+## Native timeline stress preview
+
+An isolated macOS Apple Silicon debug app loaded 10,000 mixed-height synthetic
+messages in the offline preview. The status was visible within 531 ms of the
+UI action plus accessibility observation. Full accessibility trees exposed
+only 5–7 numbered message rows per sampled viewport, including correct
+consecutive ranges at the beginning, around message 5,200, and through
+message 10,000. Ten page scrolls and three scrollbar seeks completed without
+blank sampled views; the full timings, memory comparison, renderer counts,
+and measurement limits are in [the 10,000-row QA record](../tests/TIMELINE_10K.md).
+This synthetic check does not close the real Matrix room performance gate.
 
 ## Still required for beta
 
-The current checks do not establish current-format Element Call interoperability, live
-fresh-device key-backup recovery through the UI, live received video in the Morpheus call stage,
+The current checks do not establish current-format Element Call interoperability,
+live received video in the Morpheus call stage,
 packaged-app screen-sharing controls and permissions, Linux or Windows GUI
 behavior, screen-reader acceptance, install/update/remove behavior, signed
 packages, or Cinny-level messaging and administration breadth.

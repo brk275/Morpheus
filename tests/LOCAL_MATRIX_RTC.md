@@ -67,10 +67,52 @@ both through `RtcService`, checks each participant through Morpheus's roster
 snapshot, publishes synthetic microphone PCM and red/green I420 camera and
 screen tracks, checks that Bob
 imports Alice's media key and decodes audio plus the expected 16:9 color pattern
-from each video kind, then exercises leave and rejoin. It needs no audio, camera,
-or screen-capture hardware. A
+from each video kind. It then closes Alice's LiveKit signalling socket through
+the pinned client's test hook, requires degraded and recovered connection
+events without leaving the call, and decodes newly published encrypted camera
+frames. After Bob leaves, Alice's
+still-running call must activate a new local media-key index. Bob then rejoins,
+imports Alice's key again, and decodes newly published camera frames from the
+rotated sender. This checks leave-triggered key rotation and usable media after
+rejoining. This proves automatic signalling resumption, but does not simulate
+a full network outage or SFU restart. The test also rejects a call in a disposable
+unencrypted room. It needs no audio, camera, or screen-capture hardware. A
 successful run logs out and deletes the temporary client stores; a failed run
 leaves its store for diagnosis.
+
+### Homeserver without a MatrixRTC service (opt-in)
+
+With the two loopback Synapse servers running, create a separate account on
+Synapse B and set the test variable to the protected path printed by the
+fixture command:
+
+```sh
+python3 scripts/local_matrix_env.py rtc-gate-fixture
+MORPHEUS_MATRIX_RTC_GATE_TEST_ACCOUNTS=/path/to/rtc-gate-fixture.json \
+  PATH=/opt/homebrew/opt/rustup/bin:$PATH \
+  cargo test --locked -p morpheus-rtc --features native-rtc \
+    --test unsupported_transport_local -- --nocapture
+```
+
+This test creates a fresh encrypted private room on B, which advertises no
+compatible LiveKit transport. It requires `NoLiveKitTransport` from discovery,
+slot opening, and joining; reads the room's complete state from Synapse before
+and after the attempts to establish that neither the stable nor MSC4143 slot
+event was written; then sends an encrypted chat message and confirms the
+server stored ciphertext. It does not need the local LiveKit service or change
+the existing Alice/Bob/Carol fixtures. The generated account password remains
+in a mode-0600 local fixture. A passing run removes its temporary SDK store;
+the disposable server account and room remain until the test volumes are
+destroyed.
+
+On 2026-10-10, the fresh Synapse B service-gate test passed **1/1 in 4.74
+seconds**. Discovery, `open_slot`, and `join` each returned
+`NoLiveKitTransport`. Full server room-state reads found no stable or unstable
+MatrixRTC slot event before the attempt, after rejection, or after chat.
+The account then sent an encrypted message: its queue completed, the SDK
+timeline showed the body, and Synapse stored a `m.room.encrypted` event with
+ciphertext. This is one local homeserver and client path; other homeserver
+advertisements and desktop call-error presentation still need checking.
 
 ### Element Call browser interoperability (opt-in)
 
@@ -79,7 +121,9 @@ an actual Element Call v0.26.1 browser peer. It uses a fresh disposable
 `rtc-fixture` file for each attempt. The RTC fixture grants both users room
 state power because Element Call's `compatibility` mode publishes
 `org.matrix.msc3401.call.member` as room state. No external Matrix account or
-email address is involved.
+email address is involved. Element Call's `matrix_2_0` mode instead uses
+encrypted sticky memberships; the pinned Rust RTC library calls its
+Element-compatible dialect `Sticky2025`.
 
 Check out the [Element Call v0.26.1 tag](https://github.com/element-hq/element-call/tree/v0.26.1)
 into a separate temporary directory, install its locked dependencies with
@@ -158,6 +202,16 @@ leave, and rejoin on a fresh fixture in 19.04 seconds. The uppercase slot is
 therefore not Morpheus's default until the current-format interop problem is
 resolved.
 
+The opt-in browser harness now opens and joins the **same** uppercase slot for
+`current` mode. For `sticky-2025`, it opens and joins only the Rust core's
+lowercase slot, matching the pinned library's own Element Call interop fixture;
+the compatibility dialect publishes uppercase membership and token requests.
+It reports whether the browser sees the native
+user as a joined room member, whether the native sticky membership decrypted,
+which required member fields are present, and how many memberships the bundled
+JS SDK calculates for the slot. These are diagnostics; they do not turn a
+failed call into a pass.
+
 Element Call's `matrix_2_0` mode has **not** passed here. In a separate run it
 opened LiveKit but sent only a sticky membership tombstone, so Morpheus never
 saw a browser join. Adding the unstable `org.matrix.msc4143.rtc.slot` room-state
@@ -184,6 +238,54 @@ uppercase unstable slot state changed the browser's slot status to `open`, but
 its roster still stayed empty and camera subscription still timed out. This
 alias experiment was removed from the interop harness; no current-mode
 compatibility claim follows from it.
+
+An earlier native Alice/Bob test checked that Bob could import Alice's key and
+decode camera frames after leaving and rejoining with a new membership. That
+run did not directly assert a changed media-key index. The new assertion above
+adds this check; its result is recorded below. Neither run simulates a dropped
+network connection or automatic transport reconnect.
+
+On 2026-10-10, a fresh `matrix_2_0`/`Sticky2025` run isolated a browser
+session refresh problem in this standalone local Element Call setup. Before
+any diagnostic intervention, Element Call had joined the room, received two
+decrypted joined sticky memberships (its own and Morpheus's), and its bundled
+JS SDK could calculate two members from those events. Its *live* call-view and
+session-manager membership arrays nevertheless remained empty through 14
+successful sync responses. Element Call obtained three successful SFU tokens,
+but logged 24 missing media-key messages. A separate browser-only stock run
+showed the same empty live arrays, so this is not a stock interoperability
+pass. Adding a sticky query parameter to `/sync` did not change the result;
+the local Synapse already sent sticky updates in classic sync.
+
+A second fresh stock run on 2026-10-10 paired the unmodified Element Call
+v0.26.1 call path with Morpheus's encrypted `Sticky2025` native peer. The
+browser received both sticky membership events and its SDK could calculate
+two members from them, while the live call-view and session-manager arrays
+both stayed at zero. Instrumentation at `RoomStickyEvents.Update` showed that
+both events still had type `m.room.encrypted` when the update fired; after
+decryption they had type `org.matrix.msc4143.rtc.member`, but no subsequent
+update refreshed the live membership arrays. Morpheus saw the browser in its
+roster, then its camera-subscription assertion timed out at 49.25 seconds.
+This is evidence of a browser SDK refresh timing problem in this fixture,
+not a completed current-format interoperability pass. The browser harness
+was stopped after the failed Rust test; no leave/departure assertion passed in
+this run.
+
+For a transport-only diagnostic, `MORPHEUS_ELEMENT_DIAG_REFRESH=1` makes the
+browser harness call `client.matrixRTC.refreshRoom(room)` once after logging
+the stock status. That changed both live membership arrays from zero to two.
+The paired native test then passed in 14.14 seconds: Morpheus saw the browser
+participant, decoded nonzero encrypted microphone PCM and four red/green
+I420 camera frames, and observed departure. This shows that the
+`Sticky2025` membership, keys, and media transports work after that explicit
+browser refresh. The diagnostic mutates Element Call's runtime state; it does
+not meet the stock Element Call release gate. The current 2026 membership
+format also remains unverified against Element Call v0.26.1.
+
+To repeat this diagnostic, set the Element Call config's `matrix_rtc_mode` to
+`"matrix_2_0"`, set `MORPHEUS_ELEMENT_INTEROP_MODE=sticky-2025` and
+`MORPHEUS_ELEMENT_DIAG_REFRESH=1` in the browser harness environment, and use
+a fresh fixture. Omit the diagnostic variable to check stock behavior.
 
 The app needs an explicit room-call compatibility choice or a trusted
 deployment setting to select `RoomState`. Detecting legacy state alone cannot
@@ -274,6 +376,20 @@ the missing custom-state event in native sliding sync; the explicit state GET
 fixed that lookup. The call stage now compiles with a participant list and
 remote video tile, but live received-track playback in the app remains
 unverified.
+
+On 2026-10-10, the expanded test passed on a fresh disposable fixture in
+18.34 seconds. After Bob left, Alice's running call emitted `KeyImported` for
+its own media-key index 1 (the initial index is 0). Bob then rejoined and
+decoded a newly published encrypted 640×360 camera pattern. This proves a
+leave-triggered key activation and usable media after a new join. It is a
+controlled member departure, not an automatic network reconnect test.
+
+A further fresh-fixture run passed in 18.72 seconds after adding a forced
+LiveKit signalling-socket close. Alice emitted degraded then healthy media
+connection events without changing MatrixRTC membership, and Bob decoded a
+new encrypted camera publication after the resume. The key-rotation and
+post-rejoin camera checks also passed. An actual network outage and SFU restart
+remain open.
 
 Morpheus rejects an encrypted call before joining when the current
 device lacks the required verification; the app still needs a clear

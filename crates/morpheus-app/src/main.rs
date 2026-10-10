@@ -7,10 +7,13 @@ mod attachments;
 mod calls;
 mod drafts;
 mod live;
+mod notifications;
 mod security;
 mod sso;
+mod verification;
 #[cfg(feature = "native-calls")]
 mod video_render;
+mod voice_spaces;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -27,16 +30,19 @@ use directories::ProjectDirs;
 use morpheus_config::{Config, ConfigStore, Density, LoadedConfig, ThemeMode, ThemePack};
 use morpheus_matrix::{
     AccountManager, AttachmentSendUpdate, MatrixLinkTarget, MessageInfo, MessageSearchResult,
-    PublicRoomInfo, PublicRoomsQuery, QueuedSendUpdate, parse_matrix_link_target,
+    PublicRoomInfo, PublicRoomsQuery, QueuedSendUpdate, TextFormat, parse_matrix_link_target,
 };
-use slint::{Color, Model, ModelRc, SharedString, VecModel};
+use slint::{Color, Model, ModelRc, SharedString, StyledText, VecModel};
+use url::Url;
 
 use crate::attachments::{UploadCommand, UploadController, mime_type_for};
 #[cfg(feature = "native-calls")]
 use crate::calls::{AudioUpdate, CallController, CallControllerError, CallJoinMode, CallStatus};
 use crate::live::{LiveUi, MessageTarget, RoomAction, show_error};
+use crate::notifications::DesktopNotifications;
 #[cfg(feature = "native-calls")]
 use crate::video_render::VideoUpdate;
+use crate::voice_spaces::VoiceSpaces;
 
 slint::include_modules!();
 
@@ -91,6 +97,9 @@ fn room(
             name: name.into(),
             unread,
             private_room,
+            voice_space: false,
+            voice_local: false,
+            voice_shared: false,
         },
         topic: topic.into(),
         messages,
@@ -114,6 +123,10 @@ fn message(
         initials: initials.into(),
         time: time.into(),
         body: body.into(),
+        rich_body: StyledText::from_plain_text(body),
+        rich_accessible_body: body.into(),
+        edit_source: body.into(),
+        edit_markdown: false,
         reply_to: reply_to.into(),
         attachment: attachment.into(),
         reaction: reaction.into(),
@@ -123,9 +136,14 @@ fn message(
 
 fn member(name: &str, initials: &str, detail: &str, accent: Color, online: bool) -> MemberItem {
     MemberItem {
+        user_id: "".into(),
         name: name.into(),
         initials: initials.into(),
         detail: detail.into(),
+        membership: "join".into(),
+        power_level_text: "0".into(),
+        is_account_user: false,
+        is_creator: false,
         accent,
         online,
     }
@@ -157,16 +175,25 @@ fn fixtures() -> PreviewState {
                         "♥  4",
                         peach,
                     ),
-                    message(
-                        "Sam",
-                        "SK",
-                        "9:45 AM",
-                        "It looks great. I especially like having a reliable place for account switching. It should feel the same whether I have one account or several.",
-                        "",
-                        "",
-                        "✦  2",
-                        mint,
-                    ),
+                    {
+                        let mut sample = message(
+                            "Sam",
+                            "SK",
+                            "9:45 AM",
+                            "It looks great. I especially like having a reliable place for account switching. It should feel the same whether I have one account or several.",
+                            "",
+                            "",
+                            "✦  2",
+                            mint,
+                        );
+                        sample.rich_body = StyledText::from_markdown(
+                            "It looks **great**. I especially like having a reliable place for account switching. It should feel the same whether I have one account or several.",
+                        )
+                        .expect("Preview formatting should be valid");
+                        sample.edit_source = "It looks **great**. I especially like having a reliable place for account switching. It should feel the same whether I have one account or several.".into();
+                        sample.edit_markdown = true;
+                        sample
+                    },
                     message(
                         "Alex",
                         "AM",
@@ -541,6 +568,8 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
         ui.set_composer_target_id("".into());
         ui.set_composer_target_label("".into());
         ui.set_composer_saved_draft("".into());
+        ui.set_composer_markdown(false);
+        ui.set_composer_saved_markdown(false);
         ui.set_composer_busy(false);
         ui.set_composer_operation(ui.get_composer_operation().wrapping_add(1));
         ui.set_thread_root_id("".into());
@@ -651,12 +680,28 @@ fn preview_event_index(event_id: &str) -> Option<usize> {
     event_id.strip_prefix("preview:")?.parse().ok()
 }
 
+fn safe_message_url(link: &str) -> Option<String> {
+    if link.len() > 2048 || link.chars().any(char::is_control) {
+        return None;
+    }
+    let url = Url::parse(link).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    Some(url.into())
+}
+
 fn finish_composer_submission(
     ui: &AppWindow,
     operation: i32,
     mode: i32,
     target_id: &str,
     submitted: &str,
+    markdown: bool,
     saved_draft: &str,
 ) {
     if ui.get_composer_operation() != operation {
@@ -666,6 +711,7 @@ fn finish_composer_submission(
     if ui.get_composer_mode() != mode
         || ui.get_composer_target_id().as_str() != target_id
         || ui.get_composer_text().as_str() != submitted
+        || ui.get_composer_markdown() != markdown
     {
         return;
     }
@@ -677,6 +723,8 @@ fn finish_composer_submission(
         ui.set_composer_target_label("".into());
         ui.set_composer_saved_draft("".into());
         ui.set_composer_text(saved_draft.into());
+        ui.set_composer_markdown(ui.get_composer_saved_markdown());
+        ui.set_composer_saved_markdown(false);
     }
 }
 
@@ -799,6 +847,20 @@ fn apply_room_sort(ui: &AppWindow) {
     ui.set_direct_messages(ModelRc::new(VecModel::from(direct_messages)));
 }
 
+fn apply_notification_settings(ui: &AppWindow, config: &Config) {
+    ui.set_notifications_enabled(config.notifications.enabled);
+    ui.set_notification_sounds(config.notifications.sounds);
+    ui.set_notification_show_preview(config.notifications.show_message_preview);
+    ui.set_notification_highlight_words(ModelRc::new(VecModel::from(
+        config
+            .notifications
+            .highlight_words
+            .iter()
+            .map(|word| SharedString::from(word.as_str()))
+            .collect::<Vec<_>>(),
+    )));
+}
+
 fn apply_config(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
     let mode = match config.appearance.theme {
         ThemeMode::Dark => 0,
@@ -814,6 +876,7 @@ fn apply_config(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
         Density::Spacious => 2,
     });
     ui.set_sort_unread_first(config.layout.sort_unread_first);
+    apply_notification_settings(ui, config);
     apply_room_sort(ui);
     ui.set_room_list_width(config.layout.room_list_width.into());
     ui.set_details_width(config.layout.details_width.into());
@@ -843,19 +906,84 @@ fn apply_loaded_config(ui: &AppWindow, loaded: &LoadedConfig) {
     ui.set_config_error("".into());
 }
 
-fn save_config_change(ui: &AppWindow, store: &ConfigStore, change: impl FnOnce(&mut Config)) {
+fn save_config_change(
+    ui: &AppWindow,
+    store: &ConfigStore,
+    change: impl FnOnce(&mut Config),
+) -> Option<Config> {
     // Read from disk first so an invalid external edit is never overwritten by a UI action.
     let result = (|| {
         let mut config = store.load()?;
         change(&mut config);
         store.save(&config)?;
-        let theme = store.load_theme(&config)?;
-        Ok::<_, morpheus_config::ConfigError>(LoadedConfig { config, theme })
+        Ok::<_, morpheus_config::ConfigError>(config)
     })();
     match result {
-        Ok(loaded) => apply_loaded_config(ui, &loaded),
-        Err(error) => ui.set_config_error(error.to_string().into()),
+        Ok(config) => {
+            // A missing or malformed theme should leave the last valid
+            // appearance active, but it must not hold back notification
+            // privacy changes from a successfully saved config.
+            apply_notification_settings(ui, &config);
+            match store.load_theme(&config) {
+                Ok(theme) => apply_loaded_config(
+                    ui,
+                    &LoadedConfig {
+                        config: config.clone(),
+                        theme,
+                    },
+                ),
+                Err(error) => ui.set_config_error(error.to_string().into()),
+            }
+            Some(config)
+        }
+        Err(error) => {
+            ui.set_config_error(error.to_string().into());
+            None
+        }
     }
+}
+
+fn save_notification_config_change(
+    ui: &AppWindow,
+    store: &ConfigStore,
+    notifications: &DesktopNotifications,
+    change: impl FnOnce(&mut Config),
+) -> bool {
+    if let Some(config) = save_config_change(ui, store, change) {
+        // A privacy toggle must affect the presenter before the 700 ms file
+        // watcher sees the save; the watcher still handles external edits.
+        notifications.apply_config(&config);
+        true
+    } else {
+        false
+    }
+}
+
+const MAX_HIGHLIGHT_WORD_CHARS: usize = 64;
+const MAX_HIGHLIGHT_WORDS: usize = 32;
+
+fn normalize_highlight_word(input: &str) -> Result<String, &'static str> {
+    if input.chars().any(|character| {
+        character.is_control()
+            || matches!(
+                character,
+                '\u{061c}'
+                    | '\u{200b}'..='\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2060}'..='\u{206f}'
+                    | '\u{feff}'
+            )
+    }) {
+        return Err("Highlight text cannot contain control or direction characters.");
+    }
+    let word = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    if word.is_empty() {
+        return Err("Enter a word or phrase to highlight.");
+    }
+    if word.chars().count() > MAX_HIGHLIGHT_WORD_CHARS {
+        return Err("A highlight can be at most 64 characters.");
+    }
+    Ok(word)
 }
 
 fn show_login_error(ui: &slint::Weak<AppWindow>, message: String) {
@@ -1181,10 +1309,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .to_path_buf()
     };
     let manager = Arc::new(AccountManager::open(data_dir)?);
+    let store = if let Some(root) = &qa_profile {
+        ConfigStore::at(root.join("config.toml"))
+    } else {
+        ConfigStore::standard()?
+    };
+    let voice_spaces = Arc::new(VoiceSpaces::new(store.clone()));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let live = LiveUi::new(manager.clone(), runtime.handle().clone(), ui.as_weak());
+    let live = LiveUi::new(
+        manager.clone(),
+        runtime.handle().clone(),
+        ui.as_weak(),
+        voice_spaces.clone(),
+    );
     security::register(&ui, live.clone(), runtime.handle().clone());
     let uploads = Arc::new(UploadController::default());
     ui.set_native_call_enabled(cfg!(feature = "native-calls"));
@@ -1362,39 +1501,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     runtime.spawn(live.clone().watch_updates(ui.as_weak()));
     runtime.spawn(live.clone().watch_sync(ui.as_weak()));
-    {
-        let live = live.clone();
-        let weak = ui.as_weak();
-        runtime.spawn(async move { live.restore(weak).await });
-    }
-    let store = if let Some(root) = qa_profile {
-        ConfigStore::at(root.join("config.toml"))
-    } else {
-        ConfigStore::standard()?
-    };
     ui.set_config_path(store.path().display().to_string().into());
-    match store.load_or_create() {
-        Ok(config) => match store.load_theme(&config) {
-            Ok(theme) => apply_config(&ui, &config, theme.as_ref()),
-            Err(error) => {
-                apply_config(&ui, &config, None);
-                ui.set_config_error(error.to_string().into());
+    let initial_config = match store.load_or_create() {
+        Ok(config) => {
+            voice_spaces.apply_config(&config);
+            match store.load_theme(&config) {
+                Ok(theme) => apply_config(&ui, &config, theme.as_ref()),
+                Err(error) => {
+                    apply_config(&ui, &config, None);
+                    ui.set_config_error(error.to_string().into());
+                }
             }
-        },
+            config
+        }
         Err(error) => {
             apply_config(&ui, &Config::default(), None);
             ui.set_config_error(error.to_string().into());
+            Config::default()
         }
-    }
+    };
+    let notifications = DesktopNotifications::start(
+        manager.clone(),
+        initial_config,
+        ui.as_weak(),
+        runtime.handle(),
+    );
 
     let watch = store.watch_with_theme(Duration::from_millis(700));
     let weak = ui.as_weak();
+    let watch_live = live.clone();
+    let watch_notifications = notifications.clone();
+    let watch_handle = runtime.handle().clone();
+    let watch_store = store.clone();
     thread::spawn(move || {
-        while let Ok(result) = watch.recv() {
+        while watch.recv().is_ok() {
+            // The watcher result can be older than a Settings save. Read the
+            // latest file on the UI event loop, where Settings callbacks also
+            // run, so an older notification policy cannot overwrite a newer
+            // privacy choice. Theme errors must not block a valid policy.
+            let current_store = watch_store.clone();
+            let current_notifications = watch_notifications.clone();
+            let current_live = watch_live.clone();
+            let current_weak = weak.clone();
+            let current_handle = watch_handle.clone();
             let closed = weak
-                .upgrade_in_event_loop(move |ui| match result {
-                    Ok(loaded) => apply_loaded_config(&ui, &loaded),
-                    Err(error) => ui.set_config_error(error.to_string().into()),
+                .upgrade_in_event_loop(move |ui| match current_store.load() {
+                    Ok(config) => {
+                        current_notifications.apply_config(&config);
+                        apply_notification_settings(&ui, &config);
+                        current_live.voice_spaces.apply_config(&config);
+                        match current_store.load_theme(&config) {
+                            Ok(theme) => apply_loaded_config(
+                                &ui,
+                                &LoadedConfig {
+                                    config: config.clone(),
+                                    theme,
+                                },
+                            ),
+                            Err(error) => ui.set_config_error(error.to_string().into()),
+                        }
+                        let live = current_live.clone();
+                        let weak = current_weak.clone();
+                        current_handle.spawn(async move {
+                            let _ = live.refresh(weak).await;
+                        });
+                    }
+                    Err(error) => {
+                        ui.set_config_error(error.to_string().into());
+                    }
                 })
                 .is_err();
             if closed {
@@ -1402,6 +1576,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
+    {
+        let live = live.clone();
+        let weak = ui.as_weak();
+        runtime.spawn(async move { live.restore(weak).await });
+    }
 
     let state = Rc::new(RefCell::new(fixtures()));
     apply_state(&ui, &state.borrow());
@@ -1665,6 +1844,250 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let weak = ui.as_weak();
+    let voice_live = live.clone();
+    let voice_handle = runtime.handle().clone();
+    #[cfg(feature = "native-calls")]
+    let voice_calls = calls.clone();
+    ui.on_open_voice_space(move |room_id| {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        if !voice_live.is_live.load(Ordering::Acquire) {
+            window.invoke_open_room(room_id);
+            window.set_page(2);
+            return;
+        }
+        let account_id = window.get_active_account_local_id().to_string();
+        let room_id = room_id.to_string();
+        if account_id.is_empty() || room_id.is_empty() {
+            return;
+        }
+        #[cfg(feature = "native-calls")]
+        {
+            let status = voice_calls.status();
+            if status.blocks_account_switch() && call_room_id(&status) != Some(room_id.as_str()) {
+                window.set_session_error(
+                    "Leave the current call before entering another voice space".into(),
+                );
+                return;
+            }
+        }
+        let navigation_epoch = voice_live.invalidate_navigation();
+        reset_room_search(&window);
+        let live = voice_live.clone();
+        let weak = weak.clone();
+        #[cfg(feature = "native-calls")]
+        let calls = voice_calls.clone();
+        voice_handle.spawn(async move {
+            let result = live
+                .select_room_for(&account_id, room_id.clone(), navigation_epoch, weak.clone())
+                .await;
+            match result {
+                Ok(true) => {
+                    let _ = weak.upgrade_in_event_loop(move |window| {
+                        if window.get_active_account_local_id().as_str() != account_id
+                            || window.get_active_room_id().as_str() != room_id
+                            || !live.navigation_is_current(navigation_epoch)
+                        {
+                            return;
+                        }
+                        window.set_page(2);
+                        #[cfg(feature = "native-calls")]
+                        if !calls.status().blocks_account_switch() {
+                            // Joining publishes membership in the room slot;
+                            // it does not ring every room member.
+                            window.invoke_start_native_call();
+                        }
+                    });
+                }
+                Ok(false) => {}
+                Err(error) if live.navigation_is_current(navigation_epoch) => {
+                    show_error(&weak, error.to_string());
+                }
+                Err(_) => {}
+            }
+        });
+    });
+
+    let weak = ui.as_weak();
+    let local_voice_live = live.clone();
+    let local_voice_handle = runtime.handle().clone();
+    ui.on_set_local_voice_space(move |enabled| {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        if !local_voice_live.is_live.load(Ordering::Acquire) || window.get_voice_designation_busy()
+        {
+            return;
+        }
+        let account_id = window.get_active_account_local_id().to_string();
+        let room_id = window.get_active_room_id().to_string();
+        if account_id.is_empty() || room_id.is_empty() {
+            return;
+        }
+        match local_voice_live
+            .voice_spaces
+            .set_local(&account_id, &room_id, enabled)
+        {
+            Ok(_) => {
+                window.set_active_voice_local(enabled);
+                window.set_voice_designation_error("".into());
+                window.set_voice_designation_notice(if enabled {
+                    "Marked as a voice space for this account only".into()
+                } else {
+                    "Local voice-space label removed".into()
+                });
+                let live = local_voice_live.clone();
+                let ui = weak.clone();
+                local_voice_handle.spawn(async move {
+                    let _ = live.refresh(ui).await;
+                });
+            }
+            Err(error) => window.set_voice_designation_error(error.to_string().into()),
+        }
+    });
+
+    let weak = ui.as_weak();
+    let legacy_live = live.clone();
+    ui.on_choose_element_call_legacy(move |enabled| {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        if !legacy_live.is_live.load(Ordering::Acquire) || window.get_call_connected() {
+            return;
+        }
+        let account_id = window.get_active_account_local_id().to_string();
+        let room_id = window.get_active_room_id().to_string();
+        if account_id.is_empty() || room_id.is_empty() {
+            return;
+        }
+        match legacy_live
+            .voice_spaces
+            .set_legacy_element_call(&account_id, &room_id, enabled)
+        {
+            Ok(()) => window.set_element_call_compatibility(enabled),
+            Err(error) => window.set_session_error(
+                directory_plain_text(
+                    &format!("Could not save legacy Element Call choice: {error}"),
+                    240,
+                )
+                .into(),
+            ),
+        }
+    });
+
+    #[cfg(feature = "native-calls")]
+    {
+        let weak = ui.as_weak();
+        let shared_voice_live = live.clone();
+        let shared_voice_handle = runtime.handle().clone();
+        ui.on_set_shared_voice_space(move |enabled| {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            if !shared_voice_live.is_live.load(Ordering::Acquire)
+                || window.get_voice_designation_busy()
+            {
+                return;
+            }
+            let account_id = window.get_active_account_local_id().to_string();
+            let room_id = window.get_active_room_id().to_string();
+            if account_id.is_empty() || room_id.is_empty() {
+                return;
+            }
+            let operation = window.get_voice_designation_operation().wrapping_add(1);
+            window.set_voice_designation_operation(operation);
+            window.set_voice_designation_busy(true);
+            window.set_voice_designation_error("".into());
+            window.set_voice_designation_notice("".into());
+            let live = shared_voice_live.clone();
+            let weak = weak.clone();
+            shared_voice_handle.spawn(async move {
+                let transition = live.account_transition.lock().await;
+                let result = if live.is_selected_room_for(&account_id, &room_id).await {
+                    live.voice_spaces
+                        .set_shared(&live.manager, &account_id, &room_id, enabled)
+                        .await
+                } else {
+                    Err("The selected Matrix room changed".to_owned())
+                };
+                drop(transition);
+                let refresh = result.is_ok();
+                let _ = weak.upgrade_in_event_loop(move |window| {
+                    if window.get_active_account_local_id().as_str() != account_id
+                        || window.get_active_room_id().as_str() != room_id
+                        || window.get_voice_designation_operation() != operation
+                    {
+                        return;
+                    }
+                    window.set_voice_designation_busy(false);
+                    match result {
+                        Ok(()) => {
+                            window.set_active_voice_shared(enabled);
+                            window.set_voice_designation_notice(if enabled {
+                                "Shared voice-space label saved for room members".into()
+                            } else {
+                                "Shared voice-space label removed".into()
+                            });
+                        }
+                        Err(error) => window.set_voice_designation_error(error.into()),
+                    }
+                });
+                if refresh {
+                    let _ = live.refresh(weak).await;
+                }
+            });
+        });
+    }
+
+    let weak = ui.as_weak();
+    let history_live = live.clone();
+    let history_handle = runtime.handle().clone();
+    ui.on_load_older_messages(move || {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        if !window.get_live_session()
+            || window.get_history_loading()
+            || window.get_history_at_start()
+        {
+            return;
+        }
+        let account_id = window.get_active_account_local_id().to_string();
+        let room_id = window.get_active_room_id().to_string();
+        if account_id.is_empty() || room_id.is_empty() {
+            return;
+        }
+        let operation = window.get_history_operation().wrapping_add(1);
+        window.set_history_operation(operation);
+        window.set_history_loading(true);
+        window.set_history_error("".into());
+        let live = history_live.clone();
+        let weak = weak.clone();
+        history_handle.spawn(async move {
+            let result = live
+                .manager
+                .paginate_backwards_for(&account_id, &room_id, 50)
+                .await;
+            let _ = weak.upgrade_in_event_loop(move |window| {
+                if window.get_active_account_local_id().as_str() != account_id
+                    || window.get_active_room_id().as_str() != room_id
+                    || window.get_history_operation() != operation
+                {
+                    return;
+                }
+                window.set_history_loading(false);
+                match result {
+                    Ok(start_reached) => window.set_history_at_start(start_reached),
+                    Err(_) => window.set_history_error(
+                        "Could not load earlier history. Check sync and retry.".into(),
+                    ),
+                }
+            });
+        });
+    });
+
+    let weak = ui.as_weak();
     let members_live = live.clone();
     let members_handle = runtime.handle().clone();
     ui.on_refresh_room_members(move || {
@@ -1684,6 +2107,292 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         members_handle.spawn(async move {
             live.refresh_members_for(account_id, room_id, ui, true)
                 .await;
+        });
+    });
+
+    let weak = ui.as_weak();
+    let member_action_live = live.clone();
+    let member_action_handle = runtime.handle().clone();
+    ui.on_submit_member_action(move |kind, user_id, value| {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        if !member_action_live.is_live.load(Ordering::Acquire) || window.get_member_action_busy() {
+            return;
+        }
+        let account_id = window.get_active_account_local_id().to_string();
+        let room_id = window.get_active_room_id().to_string();
+        let user_id = user_id.trim().to_owned();
+        if account_id.is_empty() || room_id.is_empty() || user_id.is_empty() {
+            window.set_member_action_error("Choose a room and enter a Matrix user ID".into());
+            return;
+        }
+        let label = match kind {
+            0 => "invite",
+            1 => "kick",
+            2 => "ban",
+            3 => "unban",
+            4 => "change power for",
+            _ => return,
+        };
+        let value = value.to_string();
+        let power_level = if kind == 4 {
+            match value.trim().parse::<i64>() {
+                Ok(level) => Some(level),
+                Err(_) => {
+                    window.set_member_action_error("Enter a whole-number power level".into());
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let operation = window.get_member_action_operation().wrapping_add(1);
+        window.set_member_action_operation(operation);
+        window.set_member_action_busy(true);
+        window.set_member_action_error("".into());
+        window.set_member_action_notice("".into());
+        let navigation_epoch = member_action_live.current_navigation_epoch();
+        let live = member_action_live.clone();
+        let weak = weak.clone();
+        member_action_handle.spawn(async move {
+            // A room or account switch can invalidate the action before its
+            // Tokio task reaches the network. The core checks the account ID
+            // again while it holds the selection lock.
+            if !live.navigation_is_current(navigation_epoch) {
+                return;
+            }
+            let manager = live.manager.clone();
+            let result = match kind {
+                0 => {
+                    manager
+                        .invite_user_for(&account_id, &room_id, &user_id)
+                        .await
+                }
+                1 => {
+                    manager
+                        .kick_user_for(&account_id, &room_id, &user_id, None)
+                        .await
+                }
+                2 => {
+                    manager
+                        .ban_user_for(&account_id, &room_id, &user_id, None)
+                        .await
+                }
+                3 => {
+                    manager
+                        .unban_user_for(&account_id, &room_id, &user_id, None)
+                        .await
+                }
+                4 => {
+                    manager
+                        .set_member_power_level_for(
+                            &account_id,
+                            &room_id,
+                            &user_id,
+                            power_level.expect("parsed for power action"),
+                        )
+                        .await
+                }
+                _ => return,
+            };
+            if result.is_ok() && live.navigation_is_current(navigation_epoch) {
+                // The SDK member snapshot may still contain the previous
+                // sync state immediately after the homeserver accepts a
+                // change. Wait briefly for the target state before repainting.
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+                loop {
+                    if !live.navigation_is_current(navigation_epoch) {
+                        break;
+                    }
+                    let settled = manager
+                        .room_members_for(&account_id, &room_id)
+                        .await
+                        .ok()
+                        .is_some_and(|members| {
+                            let member = members.iter().find(|member| member.user_id == user_id);
+                            match kind {
+                                0 => member.is_some_and(|member| {
+                                    member.membership == "invite" || member.membership == "join"
+                                }),
+                                1 | 3 => member.is_none(),
+                                2 => member.is_some_and(|member| member.membership == "ban"),
+                                4 => member.is_some_and(|member| member.power_level == power_level),
+                                _ => false,
+                            }
+                        });
+                    if settled || tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
+                live.refresh_members_for(account_id.clone(), room_id.clone(), weak.clone(), true)
+                    .await;
+            }
+            let _ = weak.upgrade_in_event_loop(move |window| {
+                if window.get_active_account_local_id().as_str() != account_id
+                    || window.get_active_room_id().as_str() != room_id
+                    || window.get_member_action_operation() != operation
+                {
+                    return;
+                }
+                window.set_member_action_busy(false);
+                match result {
+                    Ok(()) => {
+                        if kind == 0 && window.get_member_invite_user_id().as_str() == user_id {
+                            window.set_member_invite_user_id("".into());
+                        }
+                        if kind != 0 && kind != 4 {
+                            window.set_member_selected_user_id("".into());
+                        }
+                        window.set_member_action_notice(
+                            format!("Room member action completed: {label} {user_id}").into(),
+                        );
+                        window.set_member_action_error("".into());
+                    }
+                    Err(error) => {
+                        window.set_member_action_error(
+                            directory_plain_text(
+                                &format!("Could not {label} {user_id}: {error}"),
+                                240,
+                            )
+                            .into(),
+                        );
+                    }
+                }
+            });
+        });
+    });
+
+    let weak = ui.as_weak();
+    let admin_live = live.clone();
+    let admin_handle = runtime.handle().clone();
+    ui.on_submit_room_admin(move |kind, value, _reason| {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        if !admin_live.is_live.load(Ordering::Acquire) || window.get_room_admin_busy() {
+            return;
+        }
+        let account_id = window.get_active_account_local_id().to_string();
+        let room_id = window.get_active_room_id().to_string();
+        if account_id.is_empty()
+            || room_id.is_empty()
+            || window.get_room_admin_account_id().as_str() != account_id
+            || window.get_room_admin_room_id().as_str() != room_id
+        {
+            window.set_room_admin_error("Room or account changed. Reopen room details.".into());
+            return;
+        }
+        if kind == 0 && value.trim().is_empty() {
+            window.set_room_admin_error("Enter a room name".into());
+            return;
+        }
+        if kind == 2 && value.is_empty() {
+            window.set_room_admin_error("Choose a message to redact".into());
+            return;
+        }
+        if !(0..=2).contains(&kind) {
+            return;
+        }
+        let value = value.to_string();
+        let operation = window.get_room_admin_operation().wrapping_add(1);
+        window.set_room_admin_operation(operation);
+        window.set_room_admin_busy(true);
+        window.set_room_admin_error("".into());
+        window.set_room_admin_notice("".into());
+        let navigation_epoch = admin_live.current_navigation_epoch();
+        let live = admin_live.clone();
+        let weak = weak.clone();
+        admin_handle.spawn(async move {
+            if !live.navigation_is_current(navigation_epoch) {
+                return;
+            }
+            let manager = live.manager.clone();
+            let result = match kind {
+                0 => {
+                    manager
+                        .rename_room_for(&account_id, &room_id, value.trim())
+                        .await
+                }
+                1 => {
+                    manager
+                        .set_room_topic_for(&account_id, &room_id, &value)
+                        .await
+                }
+                2 => {
+                    manager
+                        .redact_message_for(&account_id, &room_id, &value, None)
+                        .await
+                }
+                _ => return,
+            };
+            if result.is_ok() && kind != 2 && live.navigation_is_current(navigation_epoch) {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+                loop {
+                    if !live.navigation_is_current(navigation_epoch) {
+                        break;
+                    }
+                    let settled = manager.rooms_snapshot().await.ok().is_some_and(|rooms| {
+                        rooms
+                            .iter()
+                            .find(|room| room.room_id == room_id)
+                            .is_some_and(|room| {
+                                if kind == 0 {
+                                    room.name == value.trim()
+                                } else {
+                                    room.topic.as_deref().unwrap_or("") == value
+                                }
+                            })
+                    });
+                    if settled || tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                }
+            }
+            let refresh = result.is_ok() && live.navigation_is_current(navigation_epoch);
+            let error = result.err().map(|error| {
+                let verb = match kind {
+                    0 => "rename room",
+                    1 => "save room topic",
+                    _ => "redact message",
+                };
+                directory_plain_text(&format!("Could not {verb}: {error}"), 240)
+            });
+            let _ = weak.upgrade_in_event_loop(move |window| {
+                if window.get_active_account_local_id().as_str() != account_id
+                    || window.get_active_room_id().as_str() != room_id
+                    || window.get_room_admin_operation() != operation
+                {
+                    return;
+                }
+                window.set_room_admin_busy(false);
+                if let Some(error) = error {
+                    window.set_room_admin_error(error.into());
+                } else {
+                    window.set_room_admin_notice(match kind {
+                        0 => "Room name saved".into(),
+                        1 => "Room topic saved".into(),
+                        _ => "Message redacted".into(),
+                    });
+                    if kind == 0 {
+                        window.set_active_room_name(value.into());
+                    } else if kind == 1 {
+                        window.set_active_room_topic_raw(value.clone().into());
+                        window.set_active_room_topic(if value.is_empty() {
+                            "No room topic".into()
+                        } else {
+                            value.into()
+                        });
+                    } else {
+                        window.set_room_admin_event_id("".into());
+                    }
+                }
+            });
+            if refresh {
+                let _ = live.refresh(weak).await;
+            }
         });
     });
 
@@ -2166,6 +2875,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let weak = ui.as_weak();
+    let formatting_live = live.clone();
+    ui.on_composer_formatting_changed(move |enabled| {
+        if !formatting_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(ui) = weak.upgrade() {
+            if ui.get_composer_mode() == 0 {
+                formatting_live.remember_markdown(
+                    ui.get_active_account_local_id().as_str(),
+                    ui.get_active_room_id().as_str(),
+                    enabled,
+                );
+            }
+        }
+    });
+
+    let weak = ui.as_weak();
     let attach_live = live.clone();
     let attach_uploads = uploads.clone();
     let attach_handle = runtime.handle().clone();
@@ -2418,6 +3144,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let send_state = state.clone();
     let send_live = live.clone();
     let send_handle = runtime.handle().clone();
+    ui.on_open_message_link(move |link| {
+        if let Some(url) = safe_message_url(link.as_str()) {
+            thread::spawn(move || {
+                let accepted = rfd::MessageDialog::new()
+                    .set_title("Open external link?")
+                    .set_description(format!("The message links to:\n\n{url}"))
+                    .set_buttons(rfd::MessageButtons::OkCancel)
+                    .show()
+                    == rfd::MessageDialogResult::Ok;
+                if accepted {
+                    let _ = webbrowser::open(&url);
+                }
+            });
+        }
+    });
     ui.on_send_message(move |body| {
         let submitted_text = body.to_string();
         let message_text = submitted_text.trim().to_owned();
@@ -2431,6 +3172,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return;
         }
         let mode = ui.get_composer_mode();
+        let markdown = ui.get_composer_markdown();
+        let format = if markdown {
+            TextFormat::Markdown
+        } else {
+            TextFormat::Plain
+        };
         let target_id = ui.get_composer_target_id().to_string();
         let saved_draft = ui.get_composer_saved_draft().to_string();
         if mode != 0 && target_id.is_empty() {
@@ -2466,7 +3213,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let live = send_live.clone();
             let weak = weak.clone();
             send_handle.spawn(async move {
-                match live.send(account_id, room_id, message_text, target).await {
+                match live.send(account_id, room_id, message_text, target, format).await {
                     Ok(queued) => {
                         let tracked = queued.as_ref().is_some_and(|queued| {
                             draft_revision.is_some_and(|revision| {
@@ -2499,6 +3246,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     mode,
                                     &target_id,
                                     &submitted_text,
+                                    markdown,
                                     &saved_draft,
                                 );
                             }
@@ -2668,6 +3416,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     mode,
                     &target_id,
                     &submitted_text,
+                    markdown,
                     &saved_draft,
                 );
             } else {
@@ -2819,6 +3568,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         room_id.clone(),
                         trimmed,
                         MessageTarget::Thread(root_id.clone()),
+                        TextFormat::Plain,
                     )
                     .await;
                 match result {
@@ -3122,6 +3872,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             drop(transition);
             match result {
                 Ok(_) => {
+                    if let Err(error) = live.voice_spaces.clear_logged_out_account(&active.id) {
+                        show_error(&ui, format!("Could not remove local voice labels: {error}"));
+                    }
+                    live.voice_spaces.forget_account(&active.id).await;
                     live.forget_account_drafts(&active.id);
                     live.clear_feed().await;
                     let accounts = live.manager.accounts().await;
@@ -3201,7 +3955,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 3 => ThemeMode::System,
                 _ => return,
             };
-            save_config_change(&ui, &setting_store, |config| {
+            let _ = save_config_change(&ui, &setting_store, |config| {
                 config.appearance.theme = theme;
                 config.appearance.theme_pack = None;
             });
@@ -3212,7 +3966,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let setting_store = store.clone();
     ui.on_change_font_scale(move |percent| {
         if let Some(ui) = weak.upgrade() {
-            save_config_change(&ui, &setting_store, |config| {
+            let _ = save_config_change(&ui, &setting_store, |config| {
                 config.appearance.scale_percent = percent.clamp(75, 200) as u16;
             });
         }
@@ -3228,7 +3982,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 2 => Density::Spacious,
                 _ => return,
             };
-            save_config_change(&ui, &setting_store, |config| {
+            let _ = save_config_change(&ui, &setting_store, |config| {
                 config.appearance.density = density;
             });
         }
@@ -3238,7 +3992,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let setting_store = store.clone();
     ui.on_set_sort_unread_first(move |sort_unread_first| {
         if let Some(ui) = weak.upgrade() {
-            save_config_change(&ui, &setting_store, |config| {
+            let _ = save_config_change(&ui, &setting_store, |config| {
                 config.layout.sort_unread_first = sort_unread_first;
             });
         }
@@ -3248,7 +4002,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let setting_store = store.clone();
     ui.on_set_side_panel(move |visible| {
         if let Some(ui) = weak.upgrade() {
-            save_config_change(&ui, &setting_store, |config| {
+            let _ = save_config_change(&ui, &setting_store, |config| {
                 config.layout.show_member_panel = visible;
             });
         }
@@ -3258,22 +4012,150 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let setting_store = store.clone();
     ui.on_change_room_list_width(move |width| {
         if let Some(ui) = weak.upgrade() {
-            save_config_change(&ui, &setting_store, |config| {
+            let _ = save_config_change(&ui, &setting_store, |config| {
                 config.layout.room_list_width = width.clamp(180, 480) as u16;
             });
         }
     });
 
     let weak = ui.as_weak();
+    let setting_store = store.clone();
     ui.on_change_details_width(move |width| {
         if let Some(ui) = weak.upgrade() {
-            save_config_change(&ui, &store, |config| {
+            let _ = save_config_change(&ui, &setting_store, |config| {
                 config.layout.details_width = width.clamp(200, 520) as u16;
             });
         }
     });
 
+    let weak = ui.as_weak();
+    let setting_store = store.clone();
+    let setting_notifications = notifications.clone();
+    ui.on_set_notifications_enabled(move |enabled| {
+        if let Some(ui) = weak.upgrade() {
+            save_notification_config_change(
+                &ui,
+                &setting_store,
+                &setting_notifications,
+                |config| {
+                    config.notifications.enabled = enabled;
+                },
+            );
+        }
+    });
+
+    let weak = ui.as_weak();
+    let setting_store = store.clone();
+    let setting_notifications = notifications.clone();
+    ui.on_set_notification_sounds(move |sounds| {
+        if let Some(ui) = weak.upgrade() {
+            save_notification_config_change(
+                &ui,
+                &setting_store,
+                &setting_notifications,
+                |config| {
+                    config.notifications.sounds = sounds;
+                },
+            );
+        }
+    });
+
+    let weak = ui.as_weak();
+    let setting_store = store.clone();
+    let setting_notifications = notifications.clone();
+    ui.on_set_notification_show_preview(move |show_preview| {
+        if let Some(ui) = weak.upgrade() {
+            save_notification_config_change(
+                &ui,
+                &setting_store,
+                &setting_notifications,
+                |config| {
+                    config.notifications.show_message_preview = show_preview;
+                },
+            );
+        }
+    });
+
+    let weak = ui.as_weak();
+    let setting_store = store.clone();
+    let setting_notifications = notifications.clone();
+    ui.on_add_highlight_word(move |input| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        let word = match normalize_highlight_word(input.as_str()) {
+            Ok(word) => word,
+            Err(error) => {
+                ui.set_notification_highlight_error(error.into());
+                return;
+            }
+        };
+        let listed = ui.get_notification_highlight_words();
+        if listed.row_count() >= MAX_HIGHLIGHT_WORDS {
+            ui.set_notification_highlight_error("Add at most 32 highlights.".into());
+            return;
+        }
+        if listed
+            .iter()
+            .any(|existing| existing.as_str().to_lowercase() == word.to_lowercase())
+        {
+            ui.set_notification_highlight_error("That highlight is already in the list.".into());
+            return;
+        }
+        let saved = save_notification_config_change(
+            &ui,
+            &setting_store,
+            &setting_notifications,
+            |config| {
+                if config.notifications.highlight_words.len() < MAX_HIGHLIGHT_WORDS
+                    && !config
+                        .notifications
+                        .highlight_words
+                        .iter()
+                        .any(|existing| existing.to_lowercase() == word.to_lowercase())
+                {
+                    config.notifications.highlight_words.push(word.clone());
+                }
+            },
+        );
+        if saved {
+            if ui
+                .get_notification_highlight_words()
+                .iter()
+                .any(|existing| existing.as_str().to_lowercase() == word.to_lowercase())
+            {
+                ui.set_notification_highlight_input("".into());
+                ui.set_notification_highlight_error("".into());
+            } else {
+                ui.set_notification_highlight_error("Add at most 32 highlights.".into());
+            }
+        }
+    });
+
+    let weak = ui.as_weak();
+    let setting_store = store.clone();
+    let setting_notifications = notifications.clone();
+    ui.on_remove_highlight_word(move |word| {
+        if let Some(ui) = weak.upgrade() {
+            let saved = save_notification_config_change(
+                &ui,
+                &setting_store,
+                &setting_notifications,
+                |config| {
+                    config
+                        .notifications
+                        .highlight_words
+                        .retain(|existing| existing != word.as_str());
+                },
+            );
+            if saved {
+                ui.set_notification_highlight_error("".into());
+            }
+        }
+    });
+
     let ui_result = ui.run();
+    notifications.shutdown();
     #[cfg(feature = "native-calls")]
     if let Err(error) = runtime.block_on(calls.end_call()) {
         eprintln!("Could not leave native call during shutdown: {error}");
@@ -3291,6 +4173,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod discovery_tests {
     use super::*;
+
+    #[test]
+    fn highlight_editor_normalizes_input_and_rejects_hidden_controls() {
+        assert_eq!(
+            normalize_highlight_word("  release   candidate  "),
+            Ok("release candidate".into())
+        );
+        assert_eq!(normalize_highlight_word(" café "), Ok("café".into()));
+        assert!(normalize_highlight_word("   ").is_err());
+        assert!(normalize_highlight_word("urgent\nnoise").is_err());
+        assert!(normalize_highlight_word("safe\u{202e}evil").is_err());
+        assert!(normalize_highlight_word("zero\u{200b}width").is_err());
+        assert!(normalize_highlight_word(&"x".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn timeline_link_handler_accepts_only_browser_urls() {
+        assert_eq!(
+            safe_message_url("https://example.org/path"),
+            Some("https://example.org/path".into())
+        );
+        assert_eq!(safe_message_url("javascript:alert(1)"), None);
+        assert_eq!(safe_message_url("https://user:secret@example.org/"), None);
+        assert_eq!(safe_message_url("https://example.org/\nInjected"), None);
+    }
 
     #[cfg(feature = "native-calls")]
     #[test]

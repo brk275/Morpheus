@@ -12,7 +12,7 @@ use matrix_sdk::{
         events::StateEventType,
     },
 };
-use morpheus_matrix::{AccountManager, QueuedSendOutcome, RoomMembership};
+use morpheus_matrix::{AccountManager, MatrixCoreError, QueuedSendOutcome, RoomMembership};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::time::{Instant, sleep, timeout};
@@ -252,8 +252,14 @@ async fn room_settings_redaction_and_moderation_are_enforced() {
         .await
         .expect("Cannot create disposable room");
     wait_for_room(&creator, &room_id, RoomMembership::Joined).await;
+    assert!(matches!(
+        creator
+            .invite_user_for(&bob_account.id, &room_id, &bob.user_id)
+            .await,
+        Err(MatrixCoreError::SelectedAccountChanged)
+    ));
     creator
-        .invite_user(&room_id, &bob.user_id)
+        .invite_user_for(&alice_account.id, &room_id, &bob.user_id)
         .await
         .expect("Cannot invite Bob");
     wait_for_room(&peer, &room_id, RoomMembership::Invited).await;
@@ -281,12 +287,24 @@ async fn room_settings_redaction_and_moderation_are_enforced() {
 
     let renamed = format!("Morpheus renamed {marker}");
     let topic = format!("Disposable moderation topic {marker}");
+    assert!(matches!(
+        creator
+            .rename_room_for(&bob_account.id, &room_id, &renamed)
+            .await,
+        Err(MatrixCoreError::SelectedAccountChanged)
+    ));
+    assert!(matches!(
+        creator
+            .set_room_topic_for(&bob_account.id, &room_id, &topic)
+            .await,
+        Err(MatrixCoreError::SelectedAccountChanged)
+    ));
     creator
-        .rename_room(&room_id, &renamed)
+        .rename_room_for(&alice_account.id, &room_id, &renamed)
         .await
         .expect("Creator cannot rename room");
     creator
-        .set_room_topic(&room_id, &topic)
+        .set_room_topic_for(&alice_account.id, &room_id, &topic)
         .await
         .expect("Creator cannot set topic");
     let name_state = read_state(&alice_client, &room_id, StateEventType::RoomName, "").await;
@@ -294,13 +312,13 @@ async fn room_settings_redaction_and_moderation_are_enforced() {
     assert_eq!(name_state["name"].as_str(), Some(renamed.as_str()));
     assert_eq!(topic_state["topic"].as_str(), Some(topic.as_str()));
     assert!(
-        peer.rename_room(&room_id, "unauthorized rename")
+        peer.rename_room_for(&bob_account.id, &room_id, "unauthorized rename")
             .await
             .is_err(),
         "Default-power member unexpectedly renamed the room"
     );
     assert!(
-        peer.kick_user(&room_id, &alice.user_id, None)
+        peer.kick_user_for(&bob_account.id, &room_id, &alice.user_id, None)
             .await
             .is_err(),
         "Default-power member unexpectedly kicked the creator"
@@ -319,7 +337,7 @@ async fn room_settings_redaction_and_moderation_are_enforced() {
         .expect("Creator cannot grant Bob moderator power");
     wait_for_power(&creator, &alice_account.id, &room_id, &bob.user_id, 50).await;
     let elevated_name = format!("Moderator renamed {marker}");
-    peer.rename_room(&room_id, &elevated_name)
+    peer.rename_room_for(&bob_account.id, &room_id, &elevated_name)
         .await
         .expect("Moderator cannot rename room");
     let name_state = read_state(&alice_client, &room_id, StateEventType::RoomName, "").await;
@@ -336,7 +354,7 @@ async fn room_settings_redaction_and_moderation_are_enforced() {
         .expect("Creator cannot restore Bob's default power");
     wait_for_power(&creator, &alice_account.id, &room_id, &bob.user_id, 0).await;
     assert!(
-        peer.rename_room(&room_id, "unauthorized after demotion")
+        peer.rename_room_for(&bob_account.id, &room_id, "unauthorized after demotion")
             .await
             .is_err(),
         "Demoted member unexpectedly renamed the room"
@@ -355,8 +373,19 @@ async fn room_settings_redaction_and_moderation_are_enforced() {
     );
     let event_id = wait_for_message(&creator, &room_id, &body).await;
     wait_for_message(&peer, &room_id, &body).await;
+    assert!(matches!(
+        creator
+            .redact_message_for(&bob_account.id, &room_id, &event_id, None)
+            .await,
+        Err(MatrixCoreError::SelectedAccountChanged)
+    ));
     creator
-        .redact_message(&room_id, &event_id, Some("Disposable moderation test"))
+        .redact_message_for(
+            &alice_account.id,
+            &room_id,
+            &event_id,
+            Some("Disposable moderation test"),
+        )
         .await
         .expect("Creator cannot redact Bob's message");
     wait_for_server_redaction(&alice_client, &room_id, &event_id, &body).await;
@@ -364,13 +393,24 @@ async fn room_settings_redaction_and_moderation_are_enforced() {
     wait_for_redaction(&peer, &room_id, &event_id, &body).await;
     eprintln!("Room rename, topic, permission rejection, and remote redaction passed.");
 
+    assert!(matches!(
+        creator
+            .kick_user_for(&bob_account.id, &room_id, &bob.user_id, None)
+            .await,
+        Err(MatrixCoreError::SelectedAccountChanged)
+    ));
     creator
-        .kick_user(&room_id, &bob.user_id, Some("Disposable moderation test"))
+        .kick_user_for(
+            &alice_account.id,
+            &room_id,
+            &bob.user_id,
+            Some("Disposable moderation test"),
+        )
         .await
         .expect("Creator cannot kick Bob");
     wait_for_member_state(&alice_client, &room_id, &bob.user_id, "leave").await;
     creator
-        .invite_user(&room_id, &bob.user_id)
+        .invite_user_for(&alice_account.id, &room_id, &bob.user_id)
         .await
         .expect("Cannot invite Bob after kick");
     wait_for_room(&peer, &room_id, RoomMembership::Invited).await;
@@ -379,8 +419,19 @@ async fn room_settings_redaction_and_moderation_are_enforced() {
         .expect("Bob cannot rejoin after kick");
     wait_for_member_state(&alice_client, &room_id, &bob.user_id, "join").await;
 
+    assert!(matches!(
+        creator
+            .ban_user_for(&bob_account.id, &room_id, &bob.user_id, None)
+            .await,
+        Err(MatrixCoreError::SelectedAccountChanged)
+    ));
     creator
-        .ban_user(&room_id, &bob.user_id, Some("Disposable moderation test"))
+        .ban_user_for(
+            &alice_account.id,
+            &room_id,
+            &bob.user_id,
+            Some("Disposable moderation test"),
+        )
         .await
         .expect("Creator cannot ban Bob");
     wait_for_member_state(&alice_client, &room_id, &bob.user_id, "ban").await;
@@ -389,13 +440,24 @@ async fn room_settings_redaction_and_moderation_are_enforced() {
         peer.join_room(&room_id).await.is_err(),
         "Banned member unexpectedly rejoined"
     );
+    assert!(matches!(
+        creator
+            .unban_user_for(&bob_account.id, &room_id, &bob.user_id, None)
+            .await,
+        Err(MatrixCoreError::SelectedAccountChanged)
+    ));
     creator
-        .unban_user(&room_id, &bob.user_id, Some("Disposable moderation test"))
+        .unban_user_for(
+            &alice_account.id,
+            &room_id,
+            &bob.user_id,
+            Some("Disposable moderation test"),
+        )
         .await
         .expect("Creator cannot unban Bob");
     wait_for_member_state(&alice_client, &room_id, &bob.user_id, "leave").await;
     creator
-        .invite_user(&room_id, &bob.user_id)
+        .invite_user_for(&alice_account.id, &room_id, &bob.user_id)
         .await
         .expect("Cannot invite Bob after unban");
     wait_for_room(&peer, &room_id, RoomMembership::Invited).await;

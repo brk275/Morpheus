@@ -76,7 +76,12 @@ key backup/recovery UX remain to be implemented.
   `rename_room`, and `set_room_topic`. `room_members_for` lists joined,
   invited, and banned users with their Matrix power levels;
   `set_member_power_level_for` updates one member's exact level. Server power
-  levels still govern every mutation.
+  levels still govern every mutation. New private rooms carry recommended
+  Megolm encryption state in the create request; the SDK also encrypts new
+  DMs. Encryption covers message content, not room names, membership, or other
+  ordinary Matrix room state visible to the server. Existing cleartext rooms
+  are not silently converted. Private Spaces carry navigation state and do not
+  have room-message encryption by default.
 - `invites_snapshot`, `accept_invite`, and `reject_invite` support invitation
   panels. `create_space`, `space_hierarchy`, `link_space_child`, and
   `unlink_space_child` support paginated Space navigation. The hierarchy

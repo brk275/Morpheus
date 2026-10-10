@@ -196,6 +196,22 @@ try {
     waitUntil: "domcontentloaded",
   });
   await page.getByTestId("lobby_joinCall").waitFor({ timeout: 30_000 });
+  await page.evaluate((id) => {
+    const room = window.matrixclient?.getRoom(id);
+    window.__morpheusStickyUpdates = [];
+    room?.on("RoomStickyEvents.Update", (added, updated, removed) => {
+      const snapshot = (event) => ({
+        encryptedTypeAtUpdate: event.getType() === "m.room.encrypted",
+        rtcTypeAtUpdate: event.getType() === "org.matrix.msc4143.rtc.member",
+        encrypted: event.isEncrypted(),
+      });
+      window.__morpheusStickyUpdates.push({
+        added: added.map(snapshot),
+        updated: updated.map((pair) => snapshot(pair.current)),
+        removed: removed.map(snapshot),
+      });
+    });
+  }, fixture.rooms.encrypted_room);
   await waitForFile(goFile, 120_000);
   await page.getByTestId("lobby_joinCall").click({ noWaitAfter: true });
   await page.getByTestId("incall_leave").waitFor({ timeout: 30_000 });
@@ -203,27 +219,51 @@ try {
 
   await delay(8_000);
   const alice = fixture.accounts.find((entry) => entry.label === "a_primary");
-  const status = await page.evaluate((aliceId) => {
+  const status = await page.evaluate(async (aliceId) => {
     const client = window.matrixclient;
     const room = client?.getRoom(window.rtcSession?.room?.roomId);
     const activeSession = room ? client.matrixRTC.getRoomSession(room) : null;
     const memberships = activeSession?.memberships ?? [];
     const sticky = room ? [...room._unstable_getStickyEvents()] : [];
+    let calculatedMemberships = null;
+    let calculationError = null;
+    if (room && activeSession) {
+      try {
+        calculatedMemberships = await activeSession.constructor
+          .sessionMembershipsForSlot(room, activeSession.slotDescription);
+      } catch (error) {
+        calculationError = error?.name ?? "UnknownError";
+      }
+    }
     return {
       route: window.location.pathname,
       callViewSessionPresent: !!window.rtcSession,
+      callViewMatchesManagerSession: window.rtcSession === activeSession,
+      callViewMemberships: window.rtcSession?.memberships?.length ?? null,
+      syncState: client?.getSyncState() ?? null,
       memberships: memberships.length,
       seesNativePeer: memberships.some((member) => member.userId === aliceId),
+      nativeRoomJoined: room?.hasMembershipState(aliceId, "join") ?? null,
+      calculatedMemberships: calculatedMemberships?.length ?? null,
+      calculationError,
+      sessionSlot: activeSession?.slotId ?? null,
       slotStatus: room ? client.matrixRTC.getRtcSlot(room)?.status ?? null : null,
       sticky: sticky.map((event) => ({
         type: event.getType(),
         slot: event.getContent().slot_id ?? null,
         isNativePeer: event.getSender() === aliceId,
+        encrypted: event.isEncrypted(),
+        decryptionFailed: event.isDecryptionFailure(),
+        hasStickyExpiry: event.unstableStickyExpiresAt !== undefined,
         hasMember: !!event.getContent().member,
+        hasClaimedUser: typeof event.getContent().member?.user_id === "string",
+        hasClaimedDevice: typeof event.getContent().member?.device_id === "string",
+        hasVersions: Array.isArray(event.getContent().versions),
         hasTransport: !!event.getContent().transports,
         hasLegacyTransport: !!event.getContent().rtc_transports,
         isLeave: Object.keys(event.getContent()).every((key) => key === "msc4354_sticky_key"),
       })),
+      stickyUpdateSamples: (window.__morpheusStickyUpdates ?? []).slice(0, 12),
       sources: (window.__morpheusSyntheticSources ?? []).map((source) => ({
         audioContextState: source.context?.state ?? null,
         tracks: source.stream?.getTracks().map((track) => ({
@@ -242,6 +282,21 @@ try {
   }, alice?.user_id);
   console.log("Element Call sanitized media/session status:", JSON.stringify(status));
   console.log("Element Call sanitized key transport counts:", JSON.stringify(diagnostics));
+  // This repairs a stale local MatrixRTC session in the browser test only.
+  // Runs using it diagnose the transport; they are not stock interop passes.
+  if (process.env.MORPHEUS_ELEMENT_DIAG_REFRESH === "1") {
+    const refreshed = await page.evaluate(async () => {
+      const client = window.matrixclient;
+      const room = window.rtcSession?.room;
+      if (!client || !room) return null;
+      await client.matrixRTC.refreshRoom(room);
+      return {
+        callViewMemberships: window.rtcSession?.memberships?.length ?? null,
+        managerMemberships: client.matrixRTC.getRoomSession(room).memberships.length,
+      };
+    });
+    console.log("Element Call explicit-refresh diagnostic:", JSON.stringify(refreshed));
+  }
 
   await waitForFile(doneFile, 120_000);
   await page.getByTestId("incall_leave").click({ noWaitAfter: true });

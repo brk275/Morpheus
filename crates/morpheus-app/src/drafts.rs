@@ -12,6 +12,7 @@ use tokio::sync::Mutex as AsyncMutex;
 #[derive(Default)]
 pub struct DraftStore {
     by_room: Mutex<HashMap<(String, String), CachedDraft>>,
+    markdown_by_room: Mutex<HashMap<(String, String), bool>>,
     write_lock: AsyncMutex<()>,
 }
 
@@ -29,6 +30,24 @@ struct PendingDraft {
 }
 
 impl DraftStore {
+    /// Formatting is a session-local compose choice. The source text remains
+    /// in the encrypted room draft when the app closes.
+    pub fn set_markdown(&self, account_id: &str, room_id: &str, enabled: bool) {
+        self.markdown_by_room
+            .lock()
+            .expect("draft formatting mutex poisoned")
+            .insert((account_id.to_owned(), room_id.to_owned()), enabled);
+    }
+
+    pub fn markdown(&self, account_id: &str, room_id: &str) -> bool {
+        self.markdown_by_room
+            .lock()
+            .expect("draft formatting mutex poisoned")
+            .get(&(account_id.to_owned(), room_id.to_owned()))
+            .copied()
+            .unwrap_or(false)
+    }
+
     pub fn dirty_keys(&self) -> Vec<(String, String)> {
         self.by_room
             .lock()
@@ -142,6 +161,10 @@ impl DraftStore {
             .lock()
             .expect("draft mutex poisoned")
             .retain(|(id, _), _| id != account_id);
+        self.markdown_by_room
+            .lock()
+            .expect("draft formatting mutex poisoned")
+            .retain(|(id, _), _| id != account_id);
     }
 
     pub async fn load_if_missing(
@@ -233,6 +256,10 @@ mod tests {
         drafts.set("account-a", "room-1", "unsent message");
         drafts.set("account-a", "room-2", "another room");
         drafts.set("account-b", "room-1", "another account");
+        drafts.set_markdown("account-a", "room-1", true);
+        assert!(drafts.markdown("account-a", "room-1"));
+        assert!(!drafts.markdown("account-a", "room-2"));
+        assert!(!drafts.markdown("account-b", "room-1"));
 
         // A failed send does not discard the cached text.
         assert_eq!(drafts.get("account-a", "room-1"), "unsent message");
@@ -245,6 +272,7 @@ mod tests {
         drafts.forget_account("account-a");
         assert_eq!(drafts.get("account-a", "room-2"), "");
         assert_eq!(drafts.get("account-b", "room-1"), "another account");
+        assert!(!drafts.markdown("account-a", "room-1"));
     }
 
     #[test]

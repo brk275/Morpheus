@@ -236,7 +236,30 @@ impl RtcService {
         slot_id: &str,
         encrypted: bool,
     ) -> Result<(), RtcError> {
-        self.ensure_loaded_room(room_id)?;
+        let room = self.ensure_loaded_room(room_id)?;
+        let encryption_state = room
+            .latest_encryption_state()
+            .await
+            .map_err(|error| RtcError::EncryptionReadiness(error.to_string()))?;
+        if encryption_state.is_unknown() {
+            return Err(RtcError::UnknownEncryptionState);
+        }
+        // Current MSC4143 cleartext memberships have no attributable sender
+        // device. The pinned LiveKit transport needs that device to map a
+        // membership onto the peer's pseudonymous SFU identity, so opening a
+        // slot here would produce a roster with no remote media.
+        if !encryption_state.is_encrypted() {
+            return Err(RtcError::UnencryptedRoomUnsupported);
+        }
+        // Reject unsupported homeservers before writing a slot that nobody
+        // using Morpheus can join. Joining performs the same discovery again
+        // because the advertised service may change between these actions.
+        if matches!(
+            self.discover_transport().await?,
+            TransportSupport::NoLiveKitTransport
+        ) {
+            return Err(RtcError::NoLiveKitTransport);
+        }
         if encrypted {
             self.ensure_encrypted_call_ready().await?;
         }
@@ -274,13 +297,16 @@ impl RtcService {
         if encryption_state.is_unknown() {
             return Err(RtcError::UnknownEncryptionState);
         }
-        if encryption_state.is_encrypted() {
-            self.ensure_encrypted_call_ready().await?;
+        if !encryption_state.is_encrypted() && options.interop_mode == InteropMode::Current {
+            return Err(RtcError::UnencryptedRoomUnsupported);
         }
         let service_url = match self.discover_transport().await? {
             TransportSupport::LiveKit { service_url } => service_url,
             TransportSupport::NoLiveKitTransport => return Err(RtcError::NoLiveKitTransport),
         };
+        if encryption_state.is_encrypted() {
+            self.ensure_encrypted_call_ready().await?;
+        }
         let account_user_id = self
             .client
             .user_id()

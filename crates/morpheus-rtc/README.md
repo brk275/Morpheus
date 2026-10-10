@@ -23,6 +23,16 @@ events enabled, and the joined room must have an open `m.rtc.slot`. The service
 can open one through `open_slot()` if the user has the room power level. Current,
 2025 sticky, and older room-state membership formats are explicit
 `InteropMode` choices. They are not interchangeable calls.
+`open_slot()` and `join()` check for a compatible advertised LiveKit transport
+before device-verification checks; an unsupported homeserver returns
+`NoLiveKitTransport`, and `open_slot()` writes no slot state. Chat remains
+available there. The separate Synapse B service-gate acceptance test checks
+this against authoritative room state and an encrypted chat send.
+The current format needs an encrypted room: its cleartext membership does not
+carry an attributable sender device, which the pinned LiveKit transport needs
+to identify remote media. `open_slot()` and a default `join()` reject an
+unencrypted room before publishing a call; explicit legacy joins remain a
+separate compatibility path.
 
 Call `install_crypto_provider()` at process startup, before creating or logging
 in a Matrix SDK client. The combined Matrix SDK and LiveKit dependency graph
@@ -67,15 +77,23 @@ its stream from peers' rosters.
 `local_device_support()` reports which adapters were compiled into the binary;
 actual OS availability is checked when a device is opened. The audio loop is a
 native proof. It does not select non-default audio devices, resample unsupported
-device formats, or provide echo cancellation. The app has not yet wired these
-new controls to its call stage. Camera/screen pacing and controls, permission
-UI, and Windows/Linux runtime verification still need application integration.
+device formats, or provide echo cancellation. Mute and deafen controls are
+wired to the call stage with applied-state feedback, but live device acceptance
+remains open. Camera/screen pacing and controls, permission UI, and
+Windows/Linux runtime verification still need application integration.
 Do not present this as a complete end-user call feature yet.
 
 An opt-in macOS test captures real display or window pixels without saving an
 image, and the local MatrixRTC fixture can publish that capture to a second
 encrypted device. See [`tests/LOCAL_MATRIX_RTC.md`](../../tests/LOCAL_MATRIX_RTC.md)
 for commands and the exact verified scope.
+
+The disposable two-device RTC test also waits for a new local media-key index
+after a peer leaves, then requires a fresh peer join to decode new encrypted
+camera frames. This exercises a member-departure key rotation. The same test
+forces LiveKit signalling loss, observes a degraded-to-healthy transition, and
+decodes newly published media after automatic resume. A full network outage
+or SFU restart remains a separate check.
 
 The Element dependency is **AGPL-3.0-only or a paid Element Commercial
 License**. Distribution must comply with the chosen license. Element's RTC

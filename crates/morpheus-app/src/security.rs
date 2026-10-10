@@ -116,6 +116,7 @@ fn apply_status(ui: &AppWindow, info: SecurityInfo) {
 /// logout, or entry into the offline preview.
 pub(crate) fn clear_ui(ui: &AppWindow, gate: &SecurityGate) {
     gate.reset();
+    crate::verification::clear_ui(ui);
     next_operation(ui);
     ui.set_security_device_status("Unknown".into());
     ui.set_security_recovery_status("Unknown".into());
@@ -152,6 +153,7 @@ pub(crate) fn block_account_change(ui: &AppWindow, gate: &SecurityGate) -> bool 
 }
 
 pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
+    crate::verification::register(ui, live.clone(), handle.clone());
     let close_gate = live.security_gate.clone();
     let close_weak = ui.as_weak();
     ui.window().on_close_requested(move || {
@@ -179,6 +181,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
             && ui.get_live_session()
         {
             ui.invoke_refresh_security();
+            ui.invoke_refresh_incoming_verification();
         }
     });
 
@@ -232,6 +235,8 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         };
         if window.get_security_busy()
             || !window.get_live_session()
+            || window.get_sas_stage() != 0
+            || window.get_sas_busy()
             || !window.get_security_can_enable()
             || !window.get_security_recovery_key().is_empty()
         {
@@ -319,6 +324,8 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         window.set_security_recovery_input("".into());
         if window.get_security_busy()
             || !window.get_live_session()
+            || window.get_sas_stage() != 0
+            || window.get_sas_busy()
             || !window.get_security_recovery_key().is_empty()
         {
             return;

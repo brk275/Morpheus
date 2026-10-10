@@ -109,8 +109,151 @@ impl Config {
                     ));
                 }
             }
+            for room_id in &overrides.legacy_element_call_rooms {
+                if !room_id.starts_with('!') || !room_id.contains(':') {
+                    return Err(ConfigError::Invalid(
+                        "account_overrides.legacy_element_call_rooms must contain Matrix room IDs"
+                            .into(),
+                    ));
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Local voice-space presentation is scoped to one signed-in account.
+    /// This is a UI preference; it never changes Matrix room state.
+    pub fn is_local_voice_room(&self, account_id: &str, room_id: &str) -> bool {
+        self.account_overrides
+            .get(account_id)
+            .is_some_and(|overrides| overrides.local_voice_rooms.iter().any(|id| id == room_id))
+    }
+
+    /// Designate a room as a voice space when the user cannot change its
+    /// shared room state. Returns whether the preference actually changed.
+    pub fn set_local_voice_room(
+        &mut self,
+        account_id: &str,
+        room_id: &str,
+        enabled: bool,
+    ) -> Result<bool, ConfigError> {
+        if account_id.is_empty() || !room_id.starts_with('!') || !room_id.contains(':') {
+            return Err(ConfigError::Invalid(
+                "local voice spaces require an account and Matrix room ID".into(),
+            ));
+        }
+        if enabled {
+            let rooms = &mut self
+                .account_overrides
+                .entry(account_id.to_owned())
+                .or_default()
+                .local_voice_rooms;
+            if rooms.iter().any(|id| id == room_id) {
+                return Ok(false);
+            }
+            rooms.push(room_id.to_owned());
+            rooms.sort();
+            return Ok(true);
+        }
+        let Some(overrides) = self.account_overrides.get_mut(account_id) else {
+            return Ok(false);
+        };
+        let before = overrides.local_voice_rooms.len();
+        overrides.local_voice_rooms.retain(|id| id != room_id);
+        let changed = before != overrides.local_voice_rooms.len();
+        if *overrides == AccountOverrides::default() {
+            self.account_overrides.remove(account_id);
+        }
+        Ok(changed)
+    }
+
+    /// Remove local labels when an account is removed, preserving its other
+    /// settings if any remain.
+    pub fn clear_local_voice_rooms(&mut self, account_id: &str) -> bool {
+        let Some(overrides) = self.account_overrides.get_mut(account_id) else {
+            return false;
+        };
+        let changed = !overrides.local_voice_rooms.is_empty();
+        overrides.local_voice_rooms.clear();
+        if *overrides == AccountOverrides::default() {
+            self.account_overrides.remove(account_id);
+        }
+        changed
+    }
+
+    /// Legacy Element Call room-state membership is an explicit local choice
+    /// for one account and room. Standard MatrixRTC remains the default.
+    pub fn is_legacy_element_call_room(&self, account_id: &str, room_id: &str) -> bool {
+        self.account_overrides
+            .get(account_id)
+            .is_some_and(|overrides| {
+                overrides
+                    .legacy_element_call_rooms
+                    .iter()
+                    .any(|id| id == room_id)
+            })
+    }
+
+    pub fn set_legacy_element_call_room(
+        &mut self,
+        account_id: &str,
+        room_id: &str,
+        enabled: bool,
+    ) -> Result<bool, ConfigError> {
+        if account_id.is_empty() || !room_id.starts_with('!') || !room_id.contains(':') {
+            return Err(ConfigError::Invalid(
+                "legacy Element Call mode requires an account and Matrix room ID".into(),
+            ));
+        }
+        if enabled {
+            let rooms = &mut self
+                .account_overrides
+                .entry(account_id.to_owned())
+                .or_default()
+                .legacy_element_call_rooms;
+            if rooms.iter().any(|id| id == room_id) {
+                return Ok(false);
+            }
+            rooms.push(room_id.to_owned());
+            rooms.sort();
+            return Ok(true);
+        }
+        let Some(overrides) = self.account_overrides.get_mut(account_id) else {
+            return Ok(false);
+        };
+        let before = overrides.legacy_element_call_rooms.len();
+        overrides
+            .legacy_element_call_rooms
+            .retain(|id| id != room_id);
+        let changed = before != overrides.legacy_element_call_rooms.len();
+        if *overrides == AccountOverrides::default() {
+            self.account_overrides.remove(account_id);
+        }
+        Ok(changed)
+    }
+
+    pub fn clear_legacy_element_call_rooms(&mut self, account_id: &str) -> bool {
+        let Some(overrides) = self.account_overrides.get_mut(account_id) else {
+            return false;
+        };
+        let changed = !overrides.legacy_element_call_rooms.is_empty();
+        overrides.legacy_element_call_rooms.clear();
+        if *overrides == AccountOverrides::default() {
+            self.account_overrides.remove(account_id);
+        }
+        changed
+    }
+
+    /// Local desktop notifications honor the global switch and the selected
+    /// account's override. Matrix room push rules are evaluated separately by
+    /// the SDK before a notification reaches the desktop presenter.
+    pub fn notifications_enabled_for(&self, account_id: &str) -> bool {
+        self.notifications.enabled
+            && self
+                .account_overrides
+                .get(account_id)
+                .and_then(|overrides| overrides.notifications_enabled)
+                .unwrap_or(true)
     }
 }
 
@@ -240,6 +383,8 @@ pub struct AccountOverrides {
     pub theme: Option<ThemeMode>,
     /// Rooms shown as voice spaces locally when the user cannot set room state.
     pub local_voice_rooms: Vec<String>,
+    /// Account-local rooms that use Element Call's older room-state dialect.
+    pub legacy_element_call_rooms: Vec<String>,
 }
 
 fn default_shortcuts() -> BTreeMap<String, String> {
@@ -588,5 +733,125 @@ mod tests {
             updates.recv_timeout(Duration::from_secs(2)).unwrap(),
             Err(ConfigError::Decode(_))
         ));
+    }
+
+    #[test]
+    fn local_voice_space_designation_is_account_scoped_and_round_trips() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let mut config = Config::default();
+        let room = "!voice:example.org";
+        assert!(config.set_local_voice_room("alice", room, true).unwrap());
+        assert!(!config.set_local_voice_room("alice", room, true).unwrap());
+        assert!(config.is_local_voice_room("alice", room));
+        assert!(!config.is_local_voice_room("carol", room));
+        store.save(&config).unwrap();
+        assert!(store.load().unwrap().is_local_voice_room("alice", room));
+        assert!(config.set_local_voice_room("alice", room, false).unwrap());
+        assert!(!config.set_local_voice_room("alice", room, false).unwrap());
+        assert!(!config.account_overrides.contains_key("alice"));
+        assert!(config.set_local_voice_room("", room, true).is_err());
+        assert!(
+            config
+                .set_local_voice_room("alice", "#alias:example.org", true)
+                .is_err()
+        );
+        config.set_local_voice_room("alice", room, true).unwrap();
+        assert!(config.clear_local_voice_rooms("alice"));
+        assert!(!config.clear_local_voice_rooms("alice"));
+        assert!(!config.account_overrides.contains_key("alice"));
+        config.set_local_voice_room("alice", room, true).unwrap();
+        config
+            .account_overrides
+            .get_mut("alice")
+            .unwrap()
+            .notifications_enabled = Some(false);
+        assert!(config.clear_local_voice_rooms("alice"));
+        assert_eq!(
+            config
+                .account_overrides
+                .get("alice")
+                .unwrap()
+                .notifications_enabled,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn desktop_notification_override_is_account_scoped() {
+        let mut config = Config::default();
+        assert!(config.notifications_enabled_for("alice"));
+        config
+            .account_overrides
+            .entry("alice".into())
+            .or_default()
+            .notifications_enabled = Some(false);
+        assert!(!config.notifications_enabled_for("alice"));
+        assert!(config.notifications_enabled_for("bob"));
+        config.notifications.enabled = false;
+        assert!(!config.notifications_enabled_for("bob"));
+    }
+
+    #[test]
+    fn legacy_element_call_choice_is_room_and_account_scoped() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let mut config = Config::default();
+        let room = "!legacy:example.org";
+        let other_room = "!standard:example.org";
+        assert!(!config.is_legacy_element_call_room("alice", room));
+        assert!(
+            config
+                .set_legacy_element_call_room("alice", room, true)
+                .unwrap()
+        );
+        assert!(
+            !config
+                .set_legacy_element_call_room("alice", room, true)
+                .unwrap()
+        );
+        assert!(config.is_legacy_element_call_room("alice", room));
+        assert!(!config.is_legacy_element_call_room("alice", other_room));
+        assert!(!config.is_legacy_element_call_room("bob", room));
+        store.save(&config).unwrap();
+        assert!(
+            store
+                .load()
+                .unwrap()
+                .is_legacy_element_call_room("alice", room)
+        );
+        assert!(
+            config
+                .set_legacy_element_call_room("alice", room, false)
+                .unwrap()
+        );
+        assert!(!config.is_legacy_element_call_room("alice", room));
+        assert!(
+            config
+                .set_legacy_element_call_room("alice", room, true)
+                .unwrap()
+        );
+        assert!(config.set_legacy_element_call_room("", room, true).is_err());
+        assert!(
+            config
+                .set_legacy_element_call_room("alice", "#alias:example.org", true)
+                .is_err()
+        );
+        config
+            .account_overrides
+            .get_mut("alice")
+            .unwrap()
+            .notifications_enabled = Some(false);
+        assert!(config.clear_legacy_element_call_rooms("alice"));
+        assert!(!config.is_legacy_element_call_room("alice", room));
+        assert_eq!(
+            config
+                .account_overrides
+                .get("alice")
+                .unwrap()
+                .notifications_enabled,
+            Some(false)
+        );
+        assert!(!config.clear_legacy_element_call_rooms("alice"));
     }
 }

@@ -6,10 +6,12 @@ use matrix_sdk::{
     RoomMemberships,
     ruma::{Int, events::room::power_levels::UserPowerLevel},
 };
+use matrix_sdk_ui::timeline::TimelineEventItemId;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AccountManager, MatrixCoreError, Result, account_room, parse_user_id, selected_loaded_for,
+    AccountManager, MatrixCoreError, Result, account_room, parse_event_id, parse_user_id,
+    selected_loaded_for,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -25,6 +27,120 @@ pub struct RoomMemberInfo {
 }
 
 impl AccountManager {
+    /// Invite a user without allowing a delayed UI action to use a different
+    /// account after an account switch.
+    pub async fn invite_user_for(
+        &self,
+        expected_account_id: &str,
+        room_id: &str,
+        user_id: &str,
+    ) -> Result<()> {
+        let user_id = parse_user_id(user_id)?;
+        let state = self.state.lock().await;
+        selected_loaded_for(&state, expected_account_id)?;
+        let room = account_room(&state, expected_account_id, room_id)?;
+        room.invite_user_by_id(&user_id)
+            .await
+            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
+    }
+
+    /// Kick a member from the selected account's room. Matrix enforces the
+    /// caller's power level and any creator protections.
+    pub async fn kick_user_for(
+        &self,
+        expected_account_id: &str,
+        room_id: &str,
+        user_id: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let user_id = parse_user_id(user_id)?;
+        let state = self.state.lock().await;
+        selected_loaded_for(&state, expected_account_id)?;
+        let room = account_room(&state, expected_account_id, room_id)?;
+        room.kick_user(&user_id, reason)
+            .await
+            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
+    }
+
+    pub async fn ban_user_for(
+        &self,
+        expected_account_id: &str,
+        room_id: &str,
+        user_id: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let user_id = parse_user_id(user_id)?;
+        let state = self.state.lock().await;
+        selected_loaded_for(&state, expected_account_id)?;
+        let room = account_room(&state, expected_account_id, room_id)?;
+        room.ban_user(&user_id, reason)
+            .await
+            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
+    }
+
+    pub async fn unban_user_for(
+        &self,
+        expected_account_id: &str,
+        room_id: &str,
+        user_id: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let user_id = parse_user_id(user_id)?;
+        let state = self.state.lock().await;
+        selected_loaded_for(&state, expected_account_id)?;
+        let room = account_room(&state, expected_account_id, room_id)?;
+        room.unban_user(&user_id, reason)
+            .await
+            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
+    }
+
+    pub async fn rename_room_for(
+        &self,
+        expected_account_id: &str,
+        room_id: &str,
+        name: &str,
+    ) -> Result<()> {
+        let state = self.state.lock().await;
+        selected_loaded_for(&state, expected_account_id)?;
+        let room = account_room(&state, expected_account_id, room_id)?;
+        room.set_name(name.into())
+            .await
+            .map(|_| ())
+            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
+    }
+
+    pub async fn set_room_topic_for(
+        &self,
+        expected_account_id: &str,
+        room_id: &str,
+        topic: &str,
+    ) -> Result<()> {
+        let state = self.state.lock().await;
+        selected_loaded_for(&state, expected_account_id)?;
+        let room = account_room(&state, expected_account_id, room_id)?;
+        room.set_room_topic(topic)
+            .await
+            .map(|_| ())
+            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
+    }
+
+    pub async fn redact_message_for(
+        &self,
+        expected_account_id: &str,
+        room_id: &str,
+        event_id: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        let state = self.state.lock().await;
+        let loaded = selected_loaded_for(&state, expected_account_id)?;
+        let timeline = loaded.timeline(room_id).await?;
+        let item_id = TimelineEventItemId::EventId(parse_event_id(event_id)?);
+        timeline
+            .redact(&item_id, reason)
+            .await
+            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
+    }
+
     /// Fetch the joined, invited, and banned membership list for a room.
     /// Unlike a cached-only snapshot, this fetches the full list when the
     /// homeserver provided lazy-loaded members. A result is discarded if the

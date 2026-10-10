@@ -152,6 +152,11 @@ pub enum RtcError {
     UnknownEncryptionState,
     #[cfg(feature = "native-rtc")]
     #[error(
+        "current MatrixRTC calls need an encrypted room to identify remote media devices; use an encrypted room"
+    )]
+    UnencryptedRoomUnsupported,
+    #[cfg(feature = "native-rtc")]
+    #[error(
         "this device is not ready for encrypted calls; complete cross-signing verification or recovery"
     )]
     EncryptionIdentityNotReady,

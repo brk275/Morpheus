@@ -28,6 +28,9 @@ export struct RoomItem {
     name: string,
     unread: int,
     private-room: bool,
+    voice-space: bool,
+    voice-local: bool,
+    voice-shared: bool,
 }
 
 export struct MessageItem {
@@ -37,6 +40,10 @@ export struct MessageItem {
     initials: string,
     time: string,
     body: string,
+    rich-body: styled-text,
+    rich-accessible-body: string,
+    edit-source: string,
+    edit-markdown: bool,
     reply-to: string,
     attachment: string,
     reaction: string,
@@ -44,9 +51,14 @@ export struct MessageItem {
 }
 
 export struct MemberItem {
+    user-id: string,
     name: string,
     initials: string,
     detail: string,
+    membership: string,
+    power-level-text: string,
+    is-account-user: bool,
+    is-creator: bool,
     accent: color,
     online: bool,
 }
@@ -244,6 +256,24 @@ export component AppWindow inherits Window {
     in-out property <[MemberItem]> members;
     in-out property <bool> member-loading: false;
     in-out property <string> member-error;
+    in-out property <string> member-invite-user-id;
+    in-out property <string> member-selected-user-id;
+    in-out property <string> member-selected-name;
+    in-out property <string> member-selected-membership;
+    in-out property <string> member-selected-power;
+    in-out property <bool> member-selected-self: false;
+    in-out property <bool> member-selected-creator: false;
+    in-out property <bool> member-action-busy: false;
+    in-out property <string> member-action-error;
+    in-out property <string> member-action-notice;
+    in-out property <int> member-action-operation: 0;
+    in-out property <bool> member-confirm-open: false;
+    in-out property <int> member-confirm-kind: -1;
+    in-out property <string> member-confirm-user-id;
+    in-out property <string> member-confirm-name;
+    in-out property <string> member-confirm-value;
+    in-out property <string> member-confirm-account-id;
+    in-out property <string> member-confirm-room-id;
     in-out property <int> active-account-index: 0;
     in-out property <string> active-account-local-id;
     in-out property <string> active-account-name;
@@ -254,10 +284,35 @@ export component AppWindow inherits Window {
     in-out property <string> active-room-id;
     in-out property <string> active-room-name;
     in-out property <string> active-room-topic;
+    in-out property <string> active-room-topic-raw;
+    in-out property <bool> room-admin-open: false;
+    in-out property <int> room-admin-mode: 0; // 0 room details, 2 message redaction
+    in-out property <string> room-admin-name-input;
+    in-out property <string> room-admin-topic-input;
+    in-out property <string> room-admin-event-id;
+    in-out property <string> room-admin-event-preview;
+    in-out property <string> room-admin-account-id;
+    in-out property <string> room-admin-room-id;
+    in-out property <bool> room-admin-busy: false;
+    in-out property <string> room-admin-error;
+    in-out property <string> room-admin-notice;
+    in-out property <int> room-admin-operation: 0;
+    in-out property <bool> active-voice-local: false;
+    in-out property <bool> active-voice-shared: false;
+    in-out property <bool> voice-designation-busy: false;
+    in-out property <string> voice-designation-error;
+    in-out property <string> voice-designation-notice;
+    in-out property <int> voice-designation-operation: 0;
     in-out property <int> theme-mode: 0;
     in-out property <int> font-scale-percent: 100;
     in-out property <int> density-mode: 1;
     in-out property <bool> sort-unread-first: false;
+    in-out property <bool> notifications-enabled: true;
+    in-out property <bool> notification-sounds: true;
+    in-out property <bool> notification-show-preview: false;
+    in-out property <[string]> notification-highlight-words;
+    in-out property <string> notification-highlight-input;
+    in-out property <string> notification-highlight-error;
     in-out property <int> room-list-width: 262;
     in-out property <int> details-width: 250;
     in-out property <bool> show-side-panel: true;
@@ -282,6 +337,20 @@ export component AppWindow inherits Window {
     in-out property <string> security-recovery-key;
     in-out property <bool> security-key-revealed: false;
     in-out property <int> security-operation: 0;
+    in-out property <int> sas-stage: 0;
+    in-out property <bool> sas-request-initiator: false;
+    in-out property <bool> sas-busy: false;
+    in-out property <bool> sas-compared: false;
+    in-out property <string> sas-flow-id;
+    in-out property <string> sas-other-user-id;
+    in-out property <string> sas-emoji;
+    in-out property <string> sas-decimals;
+    in-out property <string> sas-error;
+    in-out property <string> sas-notice;
+    in-out property <int> sas-operation: 0;
+    in-out property <string> sas-incoming-flow-id;
+    in-out property <string> sas-incoming-user-id;
+    in-out property <bool> sas-incoming-loading: false;
     in-out property <bool> native-call-enabled: false;
     in-out property <bool> element-call-compatibility: false;
     in-out property <string> native-call-status;
@@ -338,10 +407,18 @@ export component AppWindow inherits Window {
     callback switch-account(int);
     callback select-space(string);
     callback open-room(string);
+    callback open-voice-space(string);
+    callback set-local-voice-space(bool);
+    callback set-shared-voice-space(bool);
+    callback choose-element-call-legacy(bool);
+    callback load-older-messages();
     callback refresh-room-members();
+    callback submit-member-action(int, string, string);
+    callback submit-room-admin(int, string, string);
     callback submit-room-action(int, string);
     callback respond-invite(string, bool);
     callback send-message(string);
+    callback open-message-link(string);
     callback attach-file();
     callback cancel-attachment();
     callback retry-attachment();
@@ -360,9 +437,15 @@ export component AppWindow inherits Window {
     callback set-side-panel(bool);
     callback change-room-list-width(int);
     callback change-details-width(int);
+    callback set-notifications-enabled(bool);
+    callback set-notification-sounds(bool);
+    callback set-notification-show-preview(bool);
+    callback add-highlight-word(string);
+    callback remove-highlight-word(string);
     callback submit-login(string, string, string);
     callback submit-sso(string);
     callback composer-edited(string);
+    callback composer-formatting-changed(bool);
     callback preview-demo();
     callback toggle-stress-timeline();
     callback start-native-call();
@@ -382,6 +465,13 @@ export component AppWindow inherits Window {
     callback recover-account(string);
     callback copy-recovery-key();
     callback dismiss-recovery-key();
+    callback request-own-verification();
+    callback refresh-incoming-verification();
+    callback accept-incoming-verification();
+    callback refresh-sas-verification();
+    callback start-sas-verification();
+    callback confirm-sas-verification();
+    callback cancel-sas-verification();
 
     in-out property <bool> account-menu-open: false;
     in-out property <bool> manage-accounts-open: false;
@@ -395,7 +485,13 @@ export component AppWindow inherits Window {
     in-out property <bool> stress-timeline-active: false;
     property <int> side-panel-tab: 0;
     in-out property <int> page: 0; // 0 chat, 1 settings, 2 call stage
-    changed page => { if root.page != 1 { root.security-recovery-input = ""; } }
+    changed page => {
+        if root.page != 1 {
+            root.security-recovery-input = "";
+            root.sas-compared = false;
+            root.notification-highlight-error = "";
+        }
+    }
     property <bool> mic-muted: false;
     property <bool> camera-off: true;
     in-out property <bool> call-connected: false;
@@ -405,6 +501,8 @@ export component AppWindow inherits Window {
     in-out property <bool> leave-call-busy: false;
     in-out property <int> pending-account-index: -1;
     in-out property <string> composer-text;
+    in-out property <bool> composer-markdown: false;
+    in-out property <bool> composer-saved-markdown: false;
     in-out property <bool> composer-busy: false;
     in-out property <bool> attachment-busy: false;
     in-out property <bool> attachment-needs-retry: false;
@@ -413,6 +511,10 @@ export component AppWindow inherits Window {
     in-out property <string> downloading-event-id;
     in-out property <int> download-operation: 0;
     in-out property <int> composer-operation: 0;
+    in-out property <bool> history-loading: false;
+    in-out property <bool> history-at-start: false;
+    in-out property <string> history-error;
+    in-out property <int> history-operation: 0;
     in-out property <int> composer-mode: 0; // 0 message, 1 reply, 2 edit
     in-out property <string> composer-target-id;
     in-out property <string> composer-target-label;
@@ -420,6 +522,8 @@ export component AppWindow inherits Window {
     in-out property <string> thread-root-id;
     in-out property <string> thread-root-sender;
     in-out property <string> thread-root-body;
+    in-out property <styled-text> thread-root-rich-body;
+    in-out property <string> thread-root-rich-accessible-body;
     in-out property <string> thread-composer-text;
     property <string> login-homeserver: "https://matrix.org";
     property <string> login-username;
@@ -681,14 +785,18 @@ export component AppWindow inherits Window {
                             border-radius: 8px;
                             background: room.id == root.active-room-id && root.page == 0 ? root.hover : self.has-hover ? root.elevated : transparent;
                             focus-color: root.accent;
-                            label: "Open room " + room.name;
-                            activated => { root.page = 0; root.open-room(room.id); }
+                            label: room.voice-space ? "Enter voice space " + room.name : "Open room " + room.name;
+                            activated => {
+                                if room.voice-space && root.live-session { root.open-voice-space(room.id); }
+                                else { root.page = 0; root.open-room(room.id); }
+                            }
                             HorizontalLayout {
                                 padding-left: 10px;
                                 padding-right: 9px;
                                 spacing: 8px;
-                                Text { text: room.private-room ? "⌑" : "#"; color: root.muted; font-size: 18px * root.text-scale; vertical-alignment: center; }
+                                Text { text: room.voice-space ? "◖" : (room.private-room ? "⌑" : "#"); color: room.voice-space ? #78c8b1 : root.muted; font-size: 18px * root.text-scale; vertical-alignment: center; }
                                 Text { text: room.name; color: room.unread > 0 ? root.ink : root.muted; font-size: 13px * root.text-scale; font-weight: room.unread > 0 ? 700 : 500; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                                if room.voice-space : Text { text: "VOICE"; color: #78c8b1; font-size: 9px * root.text-scale; font-weight: 750; vertical-alignment: center; }
                                 if room.unread > 0 : Rectangle {
                                     width: 20px; height: 20px; border-radius: 10px; background: root.accent;
                                     Text { text: room.unread; color: root.accent-ink; font-size: 10px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
@@ -709,17 +817,21 @@ export component AppWindow inherits Window {
                             border-radius: 8px;
                             background: room.id == root.active-room-id && root.page == 0 ? root.hover : self.has-hover ? root.elevated : transparent;
                             focus-color: root.accent;
-                            label: "Open direct message with " + room.name;
-                            activated => { root.page = 0; root.open-room(room.id); }
+                            label: room.voice-space ? "Enter voice space with " + room.name : "Open direct message with " + room.name;
+                            activated => {
+                                if room.voice-space && root.live-session { root.open-voice-space(room.id); }
+                                else { root.page = 0; root.open-room(room.id); }
+                            }
                             HorizontalLayout {
                                 padding-left: 9px;
                                 padding-right: 9px;
                                 spacing: 9px;
                                 Rectangle {
                                     width: 25px; height: 25px; border-radius: 9px; background: root.accent;
-                                    Text { text: "@"; color: root.accent-ink; font-size: 13px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                                    Text { text: room.voice-space ? "◖" : "@"; color: root.accent-ink; font-size: 13px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
                                 }
                                 Text { text: room.name; color: room.unread > 0 ? root.ink : root.muted; font-size: 13px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                                if room.voice-space : Text { text: "VOICE"; color: #78c8b1; font-size: 9px * root.text-scale; font-weight: 750; vertical-alignment: center; }
                                 if room.unread > 0 : Rectangle {
                                     width: 20px; height: 20px; border-radius: 10px; background: root.accent;
                                     Text { text: room.unread; color: root.accent-ink; font-size: 10px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
@@ -917,6 +1029,20 @@ export component AppWindow inherits Window {
                             overflow: elide;
                         }
                         if root.page == 0 : IconAction {
+                            icon: "⚙"; label: "Edit room name and topic"; ink: root.muted; surface: root.canvas; hover-surface: root.hover;
+                            enabled: root.live-session && root.active-room-id != "";
+                            activated => {
+                                root.room-admin-mode = 0;
+                                root.room-admin-name-input = root.active-room-name;
+                                root.room-admin-topic-input = root.active-room-topic-raw;
+                                root.room-admin-account-id = root.active-account-local-id;
+                                root.room-admin-room-id = root.active-room-id;
+                                root.room-admin-error = "";
+                                root.room-admin-notice = "";
+                                root.room-admin-open = true;
+                            }
+                        }
+                        if root.page == 0 : IconAction {
                             icon: "S"; label: "Search messages in this room"; ink: root.muted; surface: root.canvas; hover-surface: root.hover;
                             selected: root.show-side-panel && root.side-panel-tab == 2;
                             enabled: root.live-session && root.active-room-id != "";
@@ -990,6 +1116,67 @@ export component AppWindow inherits Window {
                             Text { text: root.active-room-topic; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         }
                     }
+                    if root.live-session && root.active-room-id != "" : HorizontalLayout {
+                        height: 39px;
+                        padding-left: 24px;
+                        padding-right: 24px;
+                        spacing: 8px;
+                        Text {
+                            text: root.active-voice-local || root.active-voice-shared ? "◖ VOICE" : "Voice";
+                            color: root.active-voice-local || root.active-voice-shared ? #78c8b1 : root.muted;
+                            font-size: 11px * root.text-scale;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Button {
+                            text: root.active-voice-local ? "✓ Mine" : "Mine";
+                            enabled: !root.voice-designation-busy;
+                            accessible-label: root.active-voice-local ? "Remove this room from my local voice spaces" : "Mark this room as a voice space only for my account";
+                            clicked => { root.set-local-voice-space(!root.active-voice-local); }
+                        }
+                        if root.native-call-enabled : Button {
+                            text: root.active-voice-shared ? "✓ Shared" : "Share";
+                            enabled: !root.voice-designation-busy;
+                            accessible-label: root.active-voice-shared ? "Remove shared voice-space marker from this Matrix room" : "Share a voice-space marker with this Matrix room";
+                            clicked => { root.set-shared-voice-space(!root.active-voice-shared); }
+                        }
+                        if root.active-voice-local || root.active-voice-shared : Button {
+                            text: "Join";
+                            enabled: !root.voice-designation-busy;
+                            accessible-label: "Join this room's MatrixRTC voice space without ringing members";
+                            clicked => { root.open-voice-space(root.active-room-id); }
+                        }
+                    }
+                    if root.voice-designation-error != "" || root.voice-designation-notice != "" : Text {
+                        height: 25px;
+                        text: root.voice-designation-error != "" ? root.voice-designation-error : root.voice-designation-notice;
+                        color: root.voice-designation-error != "" ? #ff8d9d : #78c8b1;
+                        font-size: 11px * root.text-scale;
+                        accessible-live-region: polite;
+                        overflow: elide;
+                    }
+                    if root.live-session && root.active-room-id != "" : HorizontalLayout {
+                        height: 36px;
+                        padding-left: 24px;
+                        padding-right: 24px;
+                        spacing: 10px;
+                        Button {
+                            text: root.history-loading ? "Loading earlier messages…" : root.history-at-start ? "Start of room history" : "Load earlier messages";
+                            enabled: !root.history-loading && !root.history-at-start;
+                            accessible-label: root.history-at-start ? "Start of room history reached" : "Load earlier messages in this Matrix room";
+                            clicked => { root.load-older-messages(); }
+                        }
+                        if root.history-error != "" : Text {
+                            text: root.history-error;
+                            color: #e47483;
+                            font-size: 11px * root.text-scale;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                            accessible-live-region: polite;
+                        }
+                    }
                     timeline-list := ListView {
                         vertical-stretch: 1;
                         horizontal-scrollbar-policy: always-off;
@@ -1019,11 +1206,15 @@ export component AppWindow inherits Window {
                                                     width: 28px; height: 26px; icon: "↩"; label: "Reply to " + message.sender;
                                                     ink: root.muted; surface: transparent; hover-surface: root.hover;
                                                     activated => {
-                                                        if root.composer-mode == 0 { root.composer-saved-draft = root.composer-text; }
+                                                        if root.composer-mode == 0 {
+                                                            root.composer-saved-draft = root.composer-text;
+                                                            root.composer-saved-markdown = root.composer-markdown;
+                                                        }
                                                         root.composer-mode = 1;
                                                         root.composer-target-id = message.event-id;
                                                         root.composer-target-label = message.sender;
                                                         root.composer-text = "";
+                                                        root.composer-markdown = false;
                                                         message-input.focus();
                                                     }
                                                 }
@@ -1031,11 +1222,15 @@ export component AppWindow inherits Window {
                                                     width: 28px; height: 26px; icon: "✎"; label: "Edit your message";
                                                     ink: root.muted; surface: transparent; hover-surface: root.hover;
                                                     activated => {
-                                                        if root.composer-mode == 0 { root.composer-saved-draft = root.composer-text; }
+                                                        if root.composer-mode == 0 {
+                                                            root.composer-saved-draft = root.composer-text;
+                                                            root.composer-saved-markdown = root.composer-markdown;
+                                                        }
                                                         root.composer-mode = 2;
                                                         root.composer-target-id = message.event-id;
                                                         root.composer-target-label = message.sender;
-                                                        root.composer-text = message.body;
+                                                        root.composer-text = message.edit-source;
+                                                        root.composer-markdown = message.edit-markdown;
                                                         message-input.focus();
                                                     }
                                                 }
@@ -1051,11 +1246,28 @@ export component AppWindow inherits Window {
                                                         root.thread-root-id = message.event-id;
                                                         root.thread-root-sender = message.sender;
                                                         root.thread-root-body = message.body;
+                                                        root.thread-root-rich-body = message.rich-body;
+                                                        root.thread-root-rich-accessible-body = message.rich-accessible-body;
                                                         root.thread-composer-text = "";
                                                         root.thread-messages = [];
                                                         root.side-panel-tab = 1;
                                                         root.show-side-panel = true;
                                                         root.open-thread(message.event-id, message.sender, message.body);
+                                                    }
+                                                }
+                                                if message.event-id != "" : IconAction {
+                                                    width: 28px; height: 26px; icon: "⌫"; label: "Redact message from " + message.sender;
+                                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                                    enabled: root.live-session && !root.room-admin-busy;
+                                                    activated => {
+                                                        root.room-admin-mode = 2;
+                                                        root.room-admin-event-id = message.event-id;
+                                                        root.room-admin-event-preview = message.sender + ": " + message.body;
+                                                        root.room-admin-account-id = root.active-account-local-id;
+                                                        root.room-admin-room-id = root.active-room-id;
+                                                        root.room-admin-error = "";
+                                                        root.room-admin-notice = "";
+                                                        root.room-admin-open = true;
                                                     }
                                                 }
                                             }
@@ -1065,13 +1277,15 @@ export component AppWindow inherits Window {
                                                 background: root.hover;
                                                 Text { x: 8px; text: "Reply to " + message.reply-to; color: root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; overflow: elide; }
                                             }
-                                            Text {
+                                            StyledText {
                                                 width: max(100px, timeline-list.visible-width - 110px);
-                                                text: message.body;
-                                                color: root.ink;
-                                                font-size: 13px * root.text-scale;
-                                                wrap: word-wrap;
-                                                line-height-factor: 1.25;
+                                                text: message.rich-body;
+                                                default-color: root.ink;
+                                                default-font-size: 13px * root.text-scale;
+                                                link-color: root.accent;
+                                                accessible-role: text;
+                                                accessible-label: message.rich-accessible-body;
+                                                link-clicked(url) => { root.open-message-link(url); }
                                             }
                                             if message.attachment != "" : Rectangle {
                                                 height: 49px;
@@ -1148,7 +1362,9 @@ export component AppWindow inherits Window {
                                     root.composer-target-id = "";
                                     root.composer-target-label = "";
                                     root.composer-text = root.composer-saved-draft;
+                                    root.composer-markdown = root.composer-saved-markdown;
                                     root.composer-saved-draft = "";
+                                    root.composer-saved-markdown = false;
                                 }
                             }
                         }
@@ -1169,6 +1385,22 @@ export component AppWindow inherits Window {
                                     icon: "+"; label: "Attach file"; ink: root.muted; surface: transparent; hover-surface: root.hover;
                                     enabled: root.live-session && root.active-room-id != "" && root.composer-mode == 0 && !root.attachment-busy;
                                     activated => { root.attach-file(); }
+                                }
+                                IconAction {
+                                    width: 38px;
+                                    icon: "Md";
+                                    label: root.composer-markdown ? "Clear Markdown formatting" : "Use Markdown formatting";
+                                    selected: root.composer-markdown;
+                                    ink: root.composer-markdown ? root.accent : root.muted;
+                                    surface: transparent; hover-surface: root.hover;
+                                    enabled: root.active-room-id != "" && !root.composer-busy;
+                                    activated => {
+                                        root.composer-markdown = !root.composer-markdown;
+                                        if root.composer-mode == 0 {
+                                            root.composer-formatting-changed(root.composer-markdown);
+                                        }
+                                        message-input.focus();
+                                    }
                                 }
                                 Rectangle {
                                     horizontal-stretch: 1;
@@ -1517,6 +1749,88 @@ export component AppWindow inherits Window {
                             }
                         }
                         Rectangle { height: 1px; background: root.divider; }
+                        Text { text: "Notifications"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
+                        Text { text: "Notifications are shown for the active account while Morpheus runs. These preferences are shared by all accounts; room rules still come from Matrix."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                        ActionRect {
+                            height: 68px; border-radius: 10px; background: root.elevated; focus-color: root.accent;
+                            label: "Desktop notifications";
+                            accessible-checkable: true; accessible-checked: root.notifications-enabled;
+                            activated => { root.set-notifications-enabled(!root.notifications-enabled); }
+                            HorizontalLayout {
+                                padding-left: 16px; padding-right: 16px; spacing: 12px;
+                                VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 3px;
+                                    Text { text: "Desktop notifications"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+                                    Text { text: root.notifications-enabled ? "On" : "Off"; color: root.muted; font-size: 11px * root.text-scale; }
+                                }
+                                Text { text: root.notifications-enabled ? "✓" : "○"; color: root.accent; font-size: 20px * root.text-scale; vertical-alignment: center; }
+                            }
+                        }
+                        ActionRect {
+                            height: 68px; border-radius: 10px; background: root.elevated; focus-color: root.accent;
+                            label: "Notification sounds";
+                            accessible-checkable: true; accessible-checked: root.notification-sounds;
+                            activated => { root.set-notification-sounds(!root.notification-sounds); }
+                            HorizontalLayout {
+                                padding-left: 16px; padding-right: 16px; spacing: 12px;
+                                VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 3px;
+                                    Text { text: "Sounds"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+                                    Text { text: "Play when the Matrix push rule requests a sound"; color: root.muted; font-size: 11px * root.text-scale; }
+                                }
+                                Text { text: root.notification-sounds ? "✓" : "○"; color: root.accent; font-size: 20px * root.text-scale; vertical-alignment: center; }
+                            }
+                        }
+                        ActionRect {
+                            height: 68px; border-radius: 10px; background: root.elevated; focus-color: root.accent;
+                            label: "Show message previews in desktop notifications";
+                            accessible-checkable: true; accessible-checked: root.notification-show-preview;
+                            activated => { root.set-notification-show-preview(!root.notification-show-preview); }
+                            HorizontalLayout {
+                                padding-left: 16px; padding-right: 16px; spacing: 12px;
+                                VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 3px;
+                                    Text { text: "Message previews"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+                                    Text { text: "May show decrypted text on your desktop"; color: root.muted; font-size: 11px * root.text-scale; }
+                                }
+                                Text { text: root.notification-show-preview ? "✓" : "○"; color: root.accent; font-size: 20px * root.text-scale; vertical-alignment: center; }
+                            }
+                        }
+                        Text { text: "Highlight words and phrases"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+                        Text { text: "Local matches mark an approved notification as a highlight. They do not override muted rooms."; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+                        HorizontalLayout {
+                            height: 38px; spacing: 8px;
+                            Rectangle {
+                                horizontal-stretch: 1; background: root.panel; border-radius: 8px; border-color: root.divider; border-width: 1px;
+                                TextInput {
+                                    x: 10px; width: parent.width - 20px; height: parent.height;
+                                    text <=> root.notification-highlight-input;
+                                    color: root.ink; font-size: 12px * root.text-scale;
+                                    accessible-label: "New highlight word or phrase";
+                                    edited => { root.notification-highlight-error = ""; }
+                                    accepted => { root.add-highlight-word(root.notification-highlight-input); }
+                                }
+                            }
+                            Button {
+                                width: 78px; text: "Add"; enabled: root.notification-highlight-input != "";
+                                accessible-label: "Add highlight word or phrase";
+                                clicked => { root.add-highlight-word(root.notification-highlight-input); }
+                            }
+                        }
+                        if root.notification-highlight-error != "" : Text {
+                            text: root.notification-highlight-error; color: #e47483;
+                            font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite;
+                        }
+                        for word in root.notification-highlight-words : Rectangle {
+                            height: 36px; border-radius: 8px; background: root.elevated;
+                            HorizontalLayout {
+                                padding-left: 12px; padding-right: 8px; spacing: 8px;
+                                Text { text: word; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                                IconAction {
+                                    icon: "×"; label: "Remove highlight " + word;
+                                    ink: root.muted; surface: root.elevated; hover-surface: root.hover;
+                                    activated => { root.remove-highlight-word(word); }
+                                }
+                            }
+                        }
+                        Rectangle { height: 1px; background: root.divider; }
                         Text { text: "Accounts"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Select your account in the bottom-left corner to switch instantly."; color: root.muted; font-size: 13px * root.text-scale; wrap: word-wrap; }
                         Rectangle { height: 1px; background: root.divider; }
@@ -1538,6 +1852,112 @@ export component AppWindow inherits Window {
                             }
                             if root.security-error != "" : Text { text: root.security-error; color: #e47483; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
                             if root.security-notice != "" : Text { text: root.security-notice; color: root.accent; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+                            Timer {
+                                interval: 3s;
+                                running: root.page == 1 && !root.sas-busy && (root.sas-stage == 1 || root.sas-stage == 3 || root.sas-stage == 5);
+                                triggered => { root.refresh-sas-verification(); }
+                            }
+                            Timer {
+                                interval: 3s;
+                                running: root.page == 1 && root.sas-stage == 0 && !root.sas-incoming-loading && !root.security-busy;
+                                triggered => { root.refresh-incoming-verification(); }
+                            }
+                            Rectangle {
+                                height: (root.sas-stage == 4 ? 380px : root.sas-stage == 0 ? (root.sas-incoming-flow-id == "" ? 160px : 222px) : 250px) * root.text-scale;
+                                border-radius: 10px; background: root.elevated;
+                                VerticalLayout {
+                                    padding: 14px; spacing: 7px;
+                                    Text { text: "Verify this device"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+                                    if root.sas-stage == 0 : Text {
+                                        text: "Start here, then approve on another signed-in, verified device of this account. Compare the values on both devices before confirming.";
+                                        color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                                    }
+                                    if root.sas-stage == 0 && root.sas-incoming-flow-id != "" : HorizontalLayout {
+                                        spacing: 8px;
+                                        Text {
+                                            text: "Another device on this account requested verification.";
+                                            color: root.accent; font-size: 11px * root.text-scale;
+                                            wrap: word-wrap; horizontal-stretch: 1;
+                                            accessible-live-region: polite;
+                                        }
+                                        Button {
+                                            text: root.sas-busy ? "Accepting…" : "Review request";
+                                            enabled: !root.sas-busy && !root.security-busy;
+                                            accessible-label: "Accept incoming verification request from another device on this account";
+                                            clicked => { root.accept-incoming-verification(); }
+                                        }
+                                    }
+                                    if root.sas-stage == 0 : Button {
+                                        width: 178px; text: root.sas-busy ? "Starting…" : "Verify with another device";
+                                        enabled: !root.sas-busy && !root.security-busy && root.security-recovery-key == "" && root.security-device-status == "Unverified";
+                                        accessible-label: "Request SAS verification from another device on this Matrix account";
+                                        clicked => { root.request-own-verification(); }
+                                    }
+                                    if root.sas-stage != 0 : Text {
+                                        text: root.sas-stage == 1 ? (root.sas-request-initiator
+                                            ? "Approve the verification request on your other device. Morpheus checks for its response while Settings is open."
+                                            : "Request accepted. Waiting for the requesting device to start the comparison.")
+                                            : root.sas-stage == 2 ? "The other device accepted. Start the short authentication string comparison."
+                                            : root.sas-stage == 3 ? "Waiting for the other device to accept the comparison. Keep both devices open."
+                                            : root.sas-stage == 4 ? "Compare every shown emoji or all three numbers with the other device. Confirm only if they match exactly."
+                                            : "Your confirmation was sent. Waiting for the other device to finish.";
+                                        color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite;
+                                    }
+                                    if root.sas-stage == 4 && root.sas-emoji != "" : Text {
+                                        text: root.sas-emoji; color: root.ink; font-size: 14px * root.text-scale;
+                                        wrap: word-wrap; accessible-label: "SAS emoji comparison: " + root.sas-emoji;
+                                    }
+                                    if root.sas-stage == 4 && root.sas-decimals != "" : Text {
+                                        text: "Numbers: " + root.sas-decimals; color: root.ink;
+                                        font-family: "monospace"; font-size: 14px * root.text-scale;
+                                        accessible-label: "SAS number comparison: " + root.sas-decimals;
+                                    }
+                                    if root.sas-stage == 4 : ActionRect {
+                                        height: 38px; border-radius: 7px;
+                                        background: root.sas-compared ? root.hover : root.panel;
+                                        border-color: root.sas-compared ? root.accent : root.divider;
+                                        border-width: 1px; focus-color: root.accent;
+                                        label: "I compared these values on both devices and they match exactly";
+                                        accessible-checkable: true; accessible-checked: root.sas-compared;
+                                        enabled: !root.sas-busy;
+                                        activated => { root.sas-compared = !root.sas-compared; }
+                                        Text {
+                                            x: 10px; width: parent.width - 20px; height: parent.height;
+                                            text: (root.sas-compared ? "✓ " : "○ ") + "I compared both devices; the values match";
+                                            color: root.ink; font-size: 11px * root.text-scale; vertical-alignment: center;
+                                        }
+                                    }
+                                    if root.sas-error != "" : Text { text: root.sas-error; color: #e47483; font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+                                    if root.sas-notice != "" : Text { text: root.sas-notice; color: root.accent; font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+                                    if root.sas-stage != 0 : HorizontalLayout {
+                                        spacing: 8px;
+                                        if root.sas-stage == 1 || root.sas-stage == 3 || root.sas-stage == 5 : Button {
+                                            text: root.sas-busy ? "Checking…" : "Check status";
+                                            enabled: !root.sas-busy;
+                                            accessible-label: "Check device verification progress";
+                                            clicked => { root.refresh-sas-verification(); }
+                                        }
+                                        if root.sas-stage == 2 : Button {
+                                            text: root.sas-busy ? "Starting…" : "Start comparison";
+                                            enabled: !root.sas-busy;
+                                            accessible-label: "Start or accept SAS comparison on this device";
+                                            clicked => { root.start-sas-verification(); }
+                                        }
+                                        if root.sas-stage == 4 : Button {
+                                            text: root.sas-busy ? "Confirming…" : "Confirm match";
+                                            primary: true; enabled: root.sas-compared && !root.sas-busy;
+                                            accessible-label: "Confirm that SAS values match on both devices";
+                                            clicked => { root.confirm-sas-verification(); }
+                                        }
+                                        Button {
+                                            text: root.sas-stage == 4 ? "Values differ / cancel" : "Cancel verification";
+                                            enabled: !root.sas-busy;
+                                            accessible-label: root.sas-stage == 4 ? "The SAS values differ; cancel verification" : "Cancel this verification request";
+                                            clicked => { root.cancel-sas-verification(); }
+                                        }
+                                    }
+                                }
+                            }
                             Rectangle {
                                 height: 108px; border-radius: 10px; background: root.elevated;
                                 VerticalLayout {
@@ -1546,7 +1966,7 @@ export component AppWindow inherits Window {
                                     Text { text: "Creates a recovery key for encrypted history. Save it in a password manager or another private place; Morpheus shows it only once."; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
                                     Button {
                                         width: 170px; text: root.security-busy ? "Working…" : "Create recovery key";
-                                        primary: true; enabled: root.security-can-enable && !root.security-busy && !root.security-loading && root.security-recovery-key == "";
+                                        primary: true; enabled: root.security-can-enable && !root.security-busy && !root.security-loading && root.security-recovery-key == "" && root.sas-stage == 0 && !root.sas-busy;
                                         accessible-label: "Create and reveal a one-time Matrix recovery key";
                                         clicked => { root.enable-recovery(); }
                                     }
@@ -1566,6 +1986,7 @@ export component AppWindow inherits Window {
                                             TextInput {
                                                 x: 10px; width: parent.width - 20px; height: parent.height;
                                                 text <=> root.security-recovery-input; input-type: password;
+                                                enabled: root.sas-stage == 0 && !root.sas-busy && !root.security-busy;
                                                 color: root.ink; font-size: 12px * root.text-scale;
                                                 accessible-label: "Recovery key or passphrase";
                                                 accepted => {
@@ -1579,7 +2000,7 @@ export component AppWindow inherits Window {
                                         }
                                         Button {
                                             width: 96px; text: root.security-busy ? "Working…" : "Recover";
-                                            enabled: !root.security-busy && !root.security-loading && root.security-recovery-input != "";
+                                            enabled: root.sas-stage == 0 && !root.sas-busy && !root.security-busy && !root.security-loading && root.security-recovery-input != "";
                                             accessible-label: "Recover this Matrix device with the entered key or passphrase";
                                             clicked => {
                                                 let secret = root.security-recovery-input;
@@ -1609,7 +2030,7 @@ export component AppWindow inherits Window {
                     spacing: 16px;
                     Text {
                         text: root.live-session
-                            ? "Room call · " + (root.call-connected ? root.native-call-room-display : root.active-room-name)
+                            ? ((root.active-voice-local || root.active-voice-shared ? "Voice space · " : "Room call · ") + (root.call-connected ? root.native-call-room-display : root.active-room-name))
                             : "The Workshop · Lounge";
                         color: root.ink; font-size: 21px * root.text-scale;
                         font-weight: 760; overflow: elide;
@@ -1639,19 +2060,19 @@ export component AppWindow inherits Window {
                         background: root.element-call-compatibility ? root.hover : root.panel;
                         border-color: root.element-call-compatibility ? root.accent : root.divider;
                         border-width: 1px; focus-color: root.accent;
-                        label: "Element Call compatibility for legacy room-state calls";
+                        label: "Use legacy Element Call mode for this room and account";
                         accessible-checkable: true;
                         accessible-checked: root.element-call-compatibility;
                         enabled: !root.call-connected && root.active-room-id != "";
-                        activated => { root.element-call-compatibility = !root.element-call-compatibility; }
+                        activated => { root.choose-element-call-legacy(!root.element-call-compatibility); }
                         VerticalLayout {
                             padding-left: 14px; padding-right: 14px; alignment: center; spacing: 3px;
                             Text {
-                                text: (root.element-call-compatibility ? "✓ " : "○ ") + "Element Call compatibility";
+                                text: (root.element-call-compatibility ? "✓ " : "○ ") + "Legacy Element Call for this room";
                                 color: root.ink; font-size: 12px * root.text-scale; font-weight: 700;
                             }
                             Text {
-                                text: "Legacy room-state membership; room power may be required. No call slot is opened.";
+                                text: "Saved for this account. Older room-state calls only; room power may be required.";
                                 color: root.muted; font-size: 11px * root.text-scale; overflow: elide;
                             }
                         }
@@ -1909,6 +2330,46 @@ export component AppWindow inherits Window {
                         color: root.muted; font-size: 11px * root.text-scale;
                         horizontal-alignment: center; vertical-alignment: center;
                     }
+                    if root.live-session && root.active-room-id != "" : Text {
+                        height: 21px; text: "INVITE BY MATRIX USER ID";
+                        color: root.muted; font-size: 10px * root.text-scale;
+                        font-weight: 700;
+                    }
+                    if root.live-session && root.active-room-id != "" : HorizontalLayout {
+                        height: 42px; padding-left: 10px; padding-right: 10px; spacing: 6px;
+                        Rectangle {
+                            horizontal-stretch: 1; background: root.elevated;
+                            border-radius: 7px; border-color: root.divider; border-width: 1px;
+                            TextInput {
+                                x: 7px; width: parent.width - 14px; height: parent.height;
+                                text <=> root.member-invite-user-id;
+                                color: root.ink; font-size: 11px * root.text-scale;
+                                enabled: !root.member-action-busy;
+                                accessible-label: "Matrix user ID to invite to this room";
+                                accepted => {
+                                    if root.member-invite-user-id != "" && !root.member-action-busy {
+                                        root.submit-member-action(0, root.member-invite-user-id, "");
+                                    }
+                                }
+                            }
+                        }
+                        Button {
+                            width: 62px; text: "Invite";
+                            enabled: !root.member-action-busy && root.member-invite-user-id != "";
+                            accessible-label: "Invite Matrix user to this room";
+                            clicked => { root.submit-member-action(0, root.member-invite-user-id, ""); }
+                        }
+                    }
+                    if root.member-action-error != "" : Text {
+                        height: 44px; text: root.member-action-error;
+                        color: #e47483; font-size: 11px * root.text-scale;
+                        wrap: word-wrap; accessible-live-region: polite;
+                    }
+                    if root.member-action-notice != "" : Text {
+                        height: 26px; text: root.member-action-notice;
+                        color: root.accent; font-size: 11px * root.text-scale;
+                        overflow: elide; accessible-live-region: polite;
+                    }
                     member-list := ListView {
                         vertical-stretch: 1;
                         horizontal-scrollbar-policy: always-off;
@@ -1923,7 +2384,123 @@ export component AppWindow inherits Window {
                                     Text { text: member.name; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; overflow: elide; }
                                     Text { text: member.detail; color: root.muted; font-size: 10px * root.text-scale; overflow: elide; }
                                 }
+                                if root.live-session : Button {
+                                    width: 57px; text: "Manage";
+                                    enabled: !root.member-action-busy;
+                                    accessible-label: "Manage room member " + member.name;
+                                    clicked => {
+                                        root.member-selected-user-id = member.user-id;
+                                        root.member-selected-name = member.name;
+                                        root.member-selected-membership = member.membership;
+                                        root.member-selected-power = member.power-level-text;
+                                        root.member-selected-self = member.is-account-user;
+                                        root.member-selected-creator = member.is-creator;
+                                        root.member-action-error = "";
+                                        root.member-action-notice = "";
+                                    }
+                                }
                                 if !root.live-session : Rectangle { width: 7px; height: 7px; border-radius: 4px; background: member.online ? #64c9a7 : root.muted; }
+                            }
+                        }
+                    }
+                    if root.live-session && root.member-selected-user-id != "" : Rectangle {
+                        height: root.member-selected-membership == "ban" ? 133px : 184px;
+                        background: root.elevated; border-color: root.divider; border-width: 1px;
+                        VerticalLayout {
+                            padding: 9px; spacing: 5px;
+                            HorizontalLayout {
+                                Text {
+                                    text: "Manage " + root.member-selected-name;
+                                    color: root.ink; font-size: 11px * root.text-scale; font-weight: 700;
+                                    horizontal-stretch: 1; overflow: elide;
+                                }
+                                member-manage-close := Button {
+                                    width: 27px; height: 25px; text: "×";
+                                    accessible-label: "Close member controls";
+                                    clicked => { root.member-selected-user-id = ""; }
+                                }
+                            }
+                            Text {
+                                text: root.member-selected-user-id;
+                                color: root.muted; font-size: 10px * root.text-scale;
+                                overflow: elide;
+                            }
+                            if root.member-selected-membership != "ban" : HorizontalLayout {
+                                height: 34px; spacing: 5px;
+                                Rectangle {
+                                    horizontal-stretch: 1; background: root.panel;
+                                    border-radius: 7px; border-color: root.divider; border-width: 1px;
+                                    TextInput {
+                                        x: 7px; width: parent.width - 14px; height: parent.height;
+                                        text <=> root.member-selected-power;
+                                        color: root.ink; font-size: 11px * root.text-scale;
+                                        enabled: !root.member-action-busy && !root.member-selected-creator;
+                                        accessible-label: "Power level for selected room member";
+                                    }
+                                }
+                                Button {
+                                    width: 72px; text: "Set power";
+                                    enabled: !root.member-action-busy && !root.member-selected-creator && root.member-selected-power != "";
+                                    accessible-label: "Review power level change for " + root.member-selected-name;
+                                    clicked => {
+                                        root.member-confirm-kind = 4;
+                                        root.member-confirm-user-id = root.member-selected-user-id;
+                                        root.member-confirm-name = root.member-selected-name;
+                                        root.member-confirm-value = root.member-selected-power;
+                                        root.member-confirm-account-id = root.active-account-local-id;
+                                        root.member-confirm-room-id = root.active-room-id;
+                                        root.member-confirm-open = true;
+                                    }
+                                }
+                            }
+                            HorizontalLayout {
+                                height: 34px; spacing: 6px;
+                                if root.member-selected-membership == "ban" : Button {
+                                    text: "Unban";
+                                    enabled: !root.member-action-busy;
+                                    accessible-label: "Review unban of " + root.member-selected-name;
+                                    clicked => {
+                                        root.member-confirm-kind = 3;
+                                        root.member-confirm-user-id = root.member-selected-user-id;
+                                        root.member-confirm-name = root.member-selected-name;
+                                        root.member-confirm-value = "";
+                                        root.member-confirm-account-id = root.active-account-local-id;
+                                        root.member-confirm-room-id = root.active-room-id;
+                                        root.member-confirm-open = true;
+                                    }
+                                }
+                                if root.member-selected-membership != "ban" : Button {
+                                    text: "Kick";
+                                    enabled: !root.member-action-busy && !root.member-selected-self && !root.member-selected-creator;
+                                    accessible-label: "Review kick of " + root.member-selected-name;
+                                    clicked => {
+                                        root.member-confirm-kind = 1;
+                                        root.member-confirm-user-id = root.member-selected-user-id;
+                                        root.member-confirm-name = root.member-selected-name;
+                                        root.member-confirm-value = "";
+                                        root.member-confirm-account-id = root.active-account-local-id;
+                                        root.member-confirm-room-id = root.active-room-id;
+                                        root.member-confirm-open = true;
+                                    }
+                                }
+                                if root.member-selected-membership != "ban" : Button {
+                                    text: "Ban";
+                                    enabled: !root.member-action-busy && !root.member-selected-self && !root.member-selected-creator;
+                                    accessible-label: "Review ban of " + root.member-selected-name;
+                                    clicked => {
+                                        root.member-confirm-kind = 2;
+                                        root.member-confirm-user-id = root.member-selected-user-id;
+                                        root.member-confirm-name = root.member-selected-name;
+                                        root.member-confirm-value = "";
+                                        root.member-confirm-account-id = root.active-account-local-id;
+                                        root.member-confirm-room-id = root.active-room-id;
+                                        root.member-confirm-open = true;
+                                    }
+                                }
+                            }
+                            Text {
+                                text: "The homeserver checks your room permissions.";
+                                color: root.muted; font-size: 10px * root.text-scale;
                             }
                         }
                     }
@@ -1962,7 +2539,15 @@ export component AppWindow inherits Window {
                             alignment: start;
                             vertical-stretch: 0;
                             Text { text: root.thread-root-sender; color: root.ink; font-size: 12px * root.text-scale; font-weight: 750; vertical-stretch: 0; }
-                            Text { text: root.thread-root-body; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; vertical-stretch: 0; }
+                            StyledText {
+                                text: root.thread-root-rich-body;
+                                default-color: root.ink;
+                                default-font-size: 12px * root.text-scale;
+                                link-color: root.accent;
+                                accessible-role: text;
+                                accessible-label: root.thread-root-rich-accessible-body;
+                                link-clicked(url) => { root.open-message-link(url); }
+                            }
                             Rectangle { height: 1px; background: root.divider; }
                             Text { text: "REPLIES · " + root.thread-messages.length; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; vertical-stretch: 0; }
                             for reply in root.thread-messages : Rectangle {
@@ -1973,7 +2558,15 @@ export component AppWindow inherits Window {
                                 VerticalLayout {
                                     padding: 9px; spacing: 4px;
                                     Text { text: reply.sender + " · " + reply.time; color: root.accent; font-size: 11px * root.text-scale; font-weight: 700; }
-                                    Text { text: reply.body; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                                    StyledText {
+                                        text: reply.rich-body;
+                                        default-color: root.ink;
+                                        default-font-size: 12px * root.text-scale;
+                                        link-color: root.accent;
+                                        accessible-role: text;
+                                        accessible-label: reply.rich-accessible-body;
+                                        link-clicked(url) => { root.open-message-link(url); }
+                                    }
                                 }
                             }
                         }
@@ -2229,6 +2822,227 @@ export component AppWindow inherits Window {
                             accessible-label: root.room-action-mode == 1 ? "Join Matrix room" : root.room-action-mode == 2 ? "Create private Matrix Space" : "Create private Matrix room";
                             enabled: root.live-session && !root.room-action-busy;
                             clicked => { root.submit-room-action(root.room-action-mode, root.room-action-input); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.room-admin-open : FocusScope {
+        init => { admin-close.focus(); }
+        key-pressed(event) => {
+            if event.text == Key.Escape && !root.room-admin-busy {
+                root.room-admin-open = false;
+                account-trigger.focus();
+                accept
+            } else { reject }
+        }
+        Rectangle {
+            background: #000000aa;
+            TouchArea { width: parent.width; height: parent.height; }
+            Rectangle {
+                x: (parent.width - 480px) / 2;
+                y: (parent.height - (root.room-admin-mode == 2 ? 325px : 430px)) / 2;
+                width: 480px;
+                height: root.room-admin-mode == 2 ? 325px : 430px;
+                background: root.canvas;
+                border-color: root.divider;
+                border-width: 1px;
+                border-radius: 14px;
+                accessible-role: region;
+                accessible-label: root.room-admin-mode == 2 ? "Confirm message redaction" : "Edit Matrix room details";
+                VerticalLayout {
+                    padding: 20px;
+                    spacing: 12px;
+                    Text {
+                        text: root.room-admin-mode == 2 ? "Redact this message?" : "Room details";
+                        color: root.ink;
+                        font-size: 19px * root.text-scale;
+                        font-weight: 750;
+                    }
+                    if root.room-admin-mode == 2 : Text {
+                        text: root.room-admin-event-preview;
+                        color: root.muted;
+                        font-size: 12px * root.text-scale;
+                        wrap: word-wrap;
+                        overflow: elide;
+                        height: 48px;
+                    }
+                    if root.room-admin-mode == 2 : Text {
+                        text: "This removes the message content for room members. Your homeserver decides whether you have permission.";
+                        color: root.muted;
+                        font-size: 12px * root.text-scale;
+                        wrap: word-wrap;
+                        height: 43px;
+                    }
+                    if root.room-admin-mode == 0 : Text {
+                        text: "Room name";
+                        color: root.ink;
+                        font-size: 12px * root.text-scale;
+                    }
+                    if root.room-admin-mode == 0 : Rectangle {
+                        height: 42px;
+                        background: root.elevated;
+                        border-radius: 8px;
+                        TextInput {
+                            x: 10px; width: parent.width - 20px; height: parent.height;
+                            text <=> root.room-admin-name-input;
+                            enabled: !root.room-admin-busy;
+                            color: root.ink;
+                            font-size: 13px * root.text-scale;
+                            accessible-label: "Matrix room name";
+                        }
+                    }
+                    if root.room-admin-mode == 0 : Button {
+                        width: 128px; height: 35px; text: "Save name";
+                        enabled: !root.room-admin-busy && root.room-admin-name-input != "";
+                        clicked => {
+                            if root.room-admin-account-id == root.active-account-local-id
+                                && root.room-admin-room-id == root.active-room-id {
+                                root.submit-room-admin(0, root.room-admin-name-input, "");
+                            }
+                        }
+                    }
+                    if root.room-admin-mode == 0 : Text {
+                        text: "Room topic";
+                        color: root.ink;
+                        font-size: 12px * root.text-scale;
+                    }
+                    if root.room-admin-mode == 0 : Rectangle {
+                        height: 42px;
+                        background: root.elevated;
+                        border-radius: 8px;
+                        TextInput {
+                            x: 10px; width: parent.width - 20px; height: parent.height;
+                            text <=> root.room-admin-topic-input;
+                            enabled: !root.room-admin-busy;
+                            color: root.ink;
+                            font-size: 13px * root.text-scale;
+                            accessible-label: "Matrix room topic; blank clears it";
+                        }
+                    }
+                    if root.room-admin-mode == 0 : Button {
+                        width: 128px; height: 35px; text: "Save topic";
+                        enabled: !root.room-admin-busy;
+                        clicked => {
+                            if root.room-admin-account-id == root.active-account-local-id
+                                && root.room-admin-room-id == root.active-room-id {
+                                root.submit-room-admin(1, root.room-admin-topic-input, "");
+                            }
+                        }
+                    }
+                    if root.room-admin-error != "" : Text {
+                        text: root.room-admin-error;
+                        color: #ff8d9d;
+                        font-size: 11px * root.text-scale;
+                        wrap: word-wrap;
+                        accessible-live-region: polite;
+                        height: 38px;
+                    }
+                    if root.room-admin-notice != "" : Text {
+                        text: root.room-admin-notice;
+                        color: root.accent;
+                        font-size: 11px * root.text-scale;
+                        accessible-live-region: polite;
+                    }
+                    Rectangle { vertical-stretch: 1; background: transparent; }
+                    HorizontalLayout {
+                        alignment: end;
+                        spacing: 9px;
+                        admin-close := Button {
+                            width: 94px; height: 36px;
+                            text: root.room-admin-mode == 2 ? "Cancel" : "Close";
+                            enabled: !root.room-admin-busy;
+                            clicked => { root.room-admin-open = false; account-trigger.focus(); }
+                        }
+                        if root.room-admin-mode == 2 : Button {
+                            width: 145px; height: 36px;
+                            primary: true;
+                            text: root.room-admin-busy ? "Redacting…" : "Redact message";
+                            enabled: !root.room-admin-busy;
+                            clicked => {
+                                if root.room-admin-account-id == root.active-account-local-id
+                                    && root.room-admin-room-id == root.active-room-id {
+                                    root.submit-room-admin(2, root.room-admin-event-id, "");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.member-confirm-open : FocusScope {
+        init => { cancel-member-action.focus(); }
+        key-pressed(event) => {
+            if event.text == Key.Escape && !root.member-action-busy {
+                root.member-confirm-open = false;
+                account-trigger.focus();
+                accept
+            } else { reject }
+        }
+        Rectangle {
+            background: #000000aa;
+            TouchArea { width: parent.width; height: parent.height; }
+            Rectangle {
+                x: (parent.width - 430px) / 2;
+                y: (parent.height - 220px) / 2;
+                width: 430px; height: 220px;
+                background: root.elevated; border-color: root.divider;
+                border-width: 1px; border-radius: 14px;
+                accessible-role: region;
+                accessible-label: "Confirm room member action";
+                VerticalLayout {
+                    padding: 20px; spacing: 12px;
+                    Text {
+                        text: root.member-confirm-kind == 1 ? "Kick " + root.member-confirm-name + "?"
+                            : root.member-confirm-kind == 2 ? "Ban " + root.member-confirm-name + "?"
+                            : root.member-confirm-kind == 3 ? "Unban " + root.member-confirm-name + "?"
+                            : "Change power for " + root.member-confirm-name + "?";
+                        color: root.ink; font-size: 18px * root.text-scale;
+                        font-weight: 750; wrap: word-wrap;
+                    }
+                    Text {
+                        text: root.member-confirm-kind == 4
+                            ? "Set this member's Matrix room power level to " + root.member-confirm-value + "."
+                            : root.member-confirm-kind == 1
+                            ? "Remove this member from the room. They may rejoin if room rules allow it."
+                            : root.member-confirm-kind == 2
+                            ? "Remove this member and prevent them from rejoining until unbanned."
+                            : "Allow this member to join the room again.";
+                        color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap;
+                    }
+                    Rectangle { vertical-stretch: 1; background: transparent; }
+                    HorizontalLayout {
+                        alignment: end; spacing: 9px;
+                        cancel-member-action := ActionRect {
+                            width: 98px; height: 36px; border-radius: 8px;
+                            background: root.panel; label: "Cancel member action";
+                            trap-tab: true; cancel-on-escape: true;
+                            next-focus => { confirm-member-action.focus(); }
+                            previous-focus => { confirm-member-action.focus(); }
+                            cancelled => { root.member-confirm-open = false; account-trigger.focus(); }
+                            activated => { root.member-confirm-open = false; account-trigger.focus(); }
+                            Text { text: "Cancel"; color: root.ink; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                        confirm-member-action := ActionRect {
+                            width: 128px; height: 36px; border-radius: 8px;
+                            background: root.accent; label: "Confirm room member action";
+                            trap-tab: true; cancel-on-escape: true;
+                            next-focus => { cancel-member-action.focus(); }
+                            previous-focus => { cancel-member-action.focus(); }
+                            cancelled => { root.member-confirm-open = false; account-trigger.focus(); }
+                            activated => {
+                                if root.member-confirm-account-id == root.active-account-local-id
+                                    && root.member-confirm-room-id == root.active-room-id {
+                                    root.submit-member-action(root.member-confirm-kind, root.member-confirm-user-id, root.member-confirm-value);
+                                }
+                                root.member-confirm-open = false;
+                                account-trigger.focus();
+                            }
+                            Text { text: "Confirm"; color: root.accent-ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                         }
                     }
                 }

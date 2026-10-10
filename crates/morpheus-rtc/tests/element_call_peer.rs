@@ -13,7 +13,8 @@ use morpheus_rtc::{CallOptions, InteropMode, MediaStreamKind, RtcService};
 use serde::Deserialize;
 use tokio::time::{sleep, timeout};
 
-const SLOT_ID: &str = "m.call#ROOM";
+const ELEMENT_ROOM_SLOT_ID: &str = "m.call#ROOM";
+const NATIVE_ROOM_SLOT_ID: &str = "m.call#room";
 
 #[derive(Deserialize)]
 struct Fixture {
@@ -32,6 +33,21 @@ struct TestAccount {
 
 async fn bootstrap_identity(client: &Client, account: &TestAccount) {
     let encryption = client.encryption();
+    encryption.wait_for_e2ee_initialization_tasks().await;
+    let user_id = client.user_id().expect("Alice has no user ID");
+    let existing_identity = encryption
+        .request_user_identity(user_id)
+        .await
+        .expect("Cannot refresh Alice identity before bootstrap");
+    let existing_device = encryption
+        .get_own_device()
+        .await
+        .expect("Cannot read Alice device before bootstrap");
+    if existing_identity.is_some_and(|identity| identity.is_verified())
+        && existing_device.is_some_and(|device| device.is_verified_with_cross_signing())
+    {
+        return;
+    }
     let initial = timeout(
         Duration::from_secs(30),
         encryption.bootstrap_cross_signing(None),
@@ -55,7 +71,6 @@ async fn bootstrap_identity(client: &Client, account: &TestAccount) {
         .expect("Cross-signing bootstrap timed out")
         .expect("Cross-signing bootstrap failed");
     }
-    let user_id = client.user_id().expect("Alice has no user ID");
     let identity = encryption
         .request_user_identity(user_id)
         .await
@@ -194,15 +209,29 @@ async fn element_call_browser_peer_encrypted_media_and_departure() {
         Ok("current") | Err(_) => InteropMode::Current,
         Ok(other) => panic!("Unknown MORPHEUS_ELEMENT_INTEROP_MODE: {other}"),
     };
-    let options = if interop_mode == InteropMode::RoomState {
-        CallOptions::room_state_compatibility()
-    } else {
-        rtc.open_slot(room_id, SLOT_ID, true)
-            .await
-            .expect("Cannot open Element Call-compatible encrypted slot");
-        CallOptions {
-            interop_mode,
-            ..CallOptions::default()
+    let options = match interop_mode {
+        InteropMode::RoomState => CallOptions::room_state_compatibility(),
+        InteropMode::Sticky2025 => {
+            // This matches the pinned RTC library's Element Call interop
+            // fixture: its internal session and slot state stay lowercase,
+            // while the compatibility dialect spells member/token uppercase.
+            // Element Call treats an absent uppercase slot as implicitly open.
+            rtc.open_slot(room_id, NATIVE_ROOM_SLOT_ID, true)
+                .await
+                .expect("Cannot open native encrypted slot");
+            CallOptions {
+                slot_id: NATIVE_ROOM_SLOT_ID.to_owned(),
+                interop_mode,
+            }
+        }
+        InteropMode::Current => {
+            rtc.open_slot(room_id, ELEMENT_ROOM_SLOT_ID, true)
+                .await
+                .expect("Cannot open Element Call encrypted slot");
+            CallOptions {
+                slot_id: ELEMENT_ROOM_SLOT_ID.to_owned(),
+                interop_mode,
+            }
         }
     };
     let call = rtc

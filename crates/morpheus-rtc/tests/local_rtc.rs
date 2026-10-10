@@ -7,6 +7,8 @@
 use std::{collections::HashMap, fs, path::PathBuf, time::Duration};
 
 use futures_util::StreamExt;
+use livekit::SimulateScenario;
+use matrix_rtc_call_sdk::CallEvent;
 use matrix_sdk::{Client, ruma::api::client::uiaa};
 use morpheus_matrix::{AccountManager, SyncBackend, SyncStatus};
 #[cfg(feature = "device-screen")]
@@ -74,7 +76,7 @@ async fn wait_for_room(manager: &AccountManager, room_id: &str) {
         }
     })
     .await
-    .expect("Encrypted room was not loaded");
+    .expect("RTC fixture room was not loaded");
 }
 
 async fn bootstrap_test_identity(client: &Client, account: &TestAccount) {
@@ -83,6 +85,23 @@ async fn bootstrap_test_identity(client: &Client, account: &TestAccount) {
     // These disposable accounts are fresh, so set that identity up before the
     // call instead of weakening key delivery for the test.
     let encryption = client.encryption();
+    encryption.wait_for_e2ee_initialization_tasks().await;
+    let user_id = client.user_id().expect("Signed-in client has no user ID");
+    let existing_identity = encryption
+        .request_user_identity(user_id)
+        .await
+        .expect("Cannot refresh own cross-signing identity before bootstrap");
+    let existing_device = encryption
+        .get_own_device()
+        .await
+        .expect("Cannot read own device before bootstrap");
+    if existing_identity.is_some_and(|identity| identity.is_verified())
+        && existing_device.is_some_and(|device| device.is_verified_with_cross_signing())
+    {
+        // AccountManager may already have initialized and signed a fresh
+        // password-login device. Do not rotate its identity a second time.
+        return;
+    }
     let initial = timeout(
         Duration::from_secs(30),
         encryption.bootstrap_cross_signing(None),
@@ -106,7 +125,6 @@ async fn bootstrap_test_identity(client: &Client, account: &TestAccount) {
         .expect("Cross-signing bootstrap timed out")
         .expect("Cross-signing bootstrap failed");
     }
-    let user_id = client.user_id().expect("Signed-in client has no user ID");
     // The bootstrap uploads the signing keys and device signature, but the
     // local device view can still contain its pre-bootstrap keys. Refresh it
     // from /keys/query before asserting that the signature chain is usable.
@@ -471,6 +489,10 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
         .rooms
         .get("encrypted_room")
         .expect("Missing encrypted room");
+    let unencrypted_room_id = fixture
+        .rooms
+        .get("unencrypted_room")
+        .expect("Missing unencrypted guard room");
     let root = std::env::temp_dir().join(format!(
         "morpheus-rtc-{}-{}",
         std::process::id(),
@@ -500,18 +522,34 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
     wait_for_sticky_sync(&bob_manager).await;
     wait_for_room(&alice_manager, room_id).await;
     wait_for_room(&bob_manager, room_id).await;
+    wait_for_room(&alice_manager, unencrypted_room_id).await;
+    wait_for_room(&bob_manager, unencrypted_room_id).await;
 
     let alice_client = alice_manager
         .active_client()
         .await
         .expect("No Alice client");
     let bob_client = bob_manager.active_client().await.expect("No Bob client");
-    let unverified_call = RtcService::new(alice_client.clone());
+    let mut unencrypted_call = RtcService::new(alice_client.clone());
+    timeout(Duration::from_secs(30), async {
+        loop {
+            match unencrypted_call
+                .open_slot(unencrypted_room_id, "m.call#room", false)
+                .await
+            {
+                Err(RtcError::UnknownEncryptionState) => sleep(Duration::from_millis(200)).await,
+                Err(RtcError::UnencryptedRoomUnsupported) => break,
+                other => panic!("Unencrypted current-format slot was not rejected: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("Unencrypted room state did not load");
     assert!(matches!(
-        unverified_call
-            .open_slot(room_id, "m.call#room", true)
+        unencrypted_call
+            .join(unencrypted_room_id, CallOptions::default())
             .await,
-        Err(RtcError::EncryptionIdentityNotReady)
+        Err(RtcError::UnencryptedRoomUnsupported)
     ));
     bootstrap_test_identity(&alice_client, alice).await;
     bootstrap_test_identity(&bob_client, bob).await;
@@ -653,13 +691,99 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
         MediaStreamKind::ScreenShare,
     )
     .await;
+
+    // Force the pinned LiveKit client to lose its signalling socket. The
+    // existing call must resume without leaving its MatrixRTC membership, and
+    // newly published encrypted media must still decode afterward.
+    let mut connection_events = alice_rtc
+        .call(room_id)
+        .expect("Alice call vanished before signal reconnect")
+        .subscribe_call_events();
+    alice_rtc
+        .call(room_id)
+        .expect("Alice call vanished before signal reconnect")
+        .session()
+        .room()
+        .simulate_scenario(SimulateScenario::SignalReconnect)
+        .await
+        .expect("Cannot simulate LiveKit signalling reconnect");
+    timeout(Duration::from_secs(45), async {
+        let mut saw_degraded = false;
+        loop {
+            match connection_events.recv().await {
+                Ok(CallEvent::MediaConnectionState { degraded: true }) => {
+                    saw_degraded = true;
+                }
+                Ok(CallEvent::MediaConnectionState { degraded: false }) if saw_degraded => break,
+                Ok(CallEvent::Ended { reason }) => {
+                    panic!("Alice call ended during signalling reconnect: {reason:?}")
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    panic!("Alice reconnect event stream lagged by {skipped} events")
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("Alice reconnect event stream closed")
+                }
+            }
+        }
+    })
+    .await
+    .expect("Alice did not return to a healthy media connection after signal loss");
+    eprintln!(
+        "Alice's LiveKit signalling connection degraded and resumed without leaving the call."
+    );
+    verify_video_kind(
+        &alice_rtc,
+        &bob_rtc,
+        room_id,
+        &alice_call.membership_id,
+        MediaStreamKind::Camera,
+    )
+    .await;
     #[cfg(feature = "device-screen")]
     if std::env::var("MORPHEUS_RTC_REAL_SCREEN_CAPTURE").as_deref() == Ok("1") {
         verify_real_screen_capture(&alice_rtc, &bob_rtc, room_id, &alice_call.membership_id).await;
     }
 
+    // The first key for a join is index 0. Keep this receiver open before Bob
+    // leaves so the next local key import must come from the live call's
+    // departure-triggered rotation, not from a later test subscription.
+    let mut alice_events = alice_rtc
+        .call(room_id)
+        .expect("Alice call vanished before key rotation")
+        .subscribe_call_events();
     bob_rtc.leave(room_id).await.expect("Bob leave failed");
     wait_for_peer(&alice_rtc, room_id, &bob_account.user_id, false).await;
+    let rotated_key_index = timeout(Duration::from_secs(40), async {
+        loop {
+            match alice_events.recv().await {
+                Ok(CallEvent::KeyImported {
+                    member_id,
+                    identity,
+                    key_index,
+                }) if member_id == alice_call.membership_id
+                    && identity == alice_call.local_identity
+                    && key_index != 0 =>
+                {
+                    return key_index;
+                }
+                Ok(CallEvent::Ended { reason }) => {
+                    panic!("Alice call ended before key rotation: {reason:?}")
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    panic!("Alice key-rotation event stream lagged by {skipped} events")
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    panic!("Alice key-rotation event stream closed")
+                }
+            }
+        }
+    })
+    .await
+    .expect("Alice did not activate a new media-key index after Bob left");
+    eprintln!("Alice activated media-key index {rotated_key_index} after Bob left.");
     let rejoined = timeout(
         Duration::from_secs(join_timeout),
         bob_rtc.join(room_id, CallOptions::default()),
@@ -669,6 +793,28 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
     .expect("Bob rejoin failed");
     assert_ne!(bob_call.membership_id, rejoined.membership_id);
     wait_for_peer(&alice_rtc, room_id, &bob_account.user_id, true).await;
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if bob_rtc
+                .call(room_id)
+                .expect("Bob rejoined call vanished")
+                .imported_key_for(&alice_call.local_identity)
+            {
+                return;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("Bob did not import Alice's media key after rejoining");
+    verify_video_kind(
+        &alice_rtc,
+        &bob_rtc,
+        room_id,
+        &alice_call.membership_id,
+        MediaStreamKind::Camera,
+    )
+    .await;
     bob_rtc
         .leave(room_id)
         .await
@@ -690,6 +836,6 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
     drop(alice_manager);
     fs::remove_dir_all(&root).expect("Cannot remove temporary RTC stores");
     eprintln!(
-        "Local encrypted MatrixRTC call, synthetic audio, camera, screen stream, leave, and rejoin passed."
+        "Local encrypted MatrixRTC call, synthetic audio, camera, screen stream, leave-triggered media-key rotation, rejoin, and post-rejoin video passed."
     );
 }

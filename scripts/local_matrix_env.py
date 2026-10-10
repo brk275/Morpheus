@@ -288,15 +288,15 @@ def verify(data: dict) -> None:
         raise RuntimeError("Server A accepted server B token")
 
 
-def save_recovery_fixture(path: Path, data: dict, *, create: bool = False) -> None:
-    """Keep a recovery run's secrets separate from the app QA fixture."""
+def save_private_fixture(path: Path, data: dict, *, create: bool = False) -> None:
+    """Keep one-off test secrets separate from the app QA fixture."""
     HOME.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(HOME, 0o700)
     if create:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         temporary = path
     else:
-        fd, name = tempfile.mkstemp(prefix=".recovery-", dir=HOME)
+        fd, name = tempfile.mkstemp(prefix=".fixture-", dir=HOME)
         temporary = Path(name)
     try:
         with os.fdopen(fd, "w") as file:
@@ -334,7 +334,7 @@ def recovery_fixture() -> None:
     path = HOME / f"recovery-{nonce}.json"
     # Persist the generated passwords before mutating Synapse, so an interrupted
     # registration never leaves a test account whose credential was discarded.
-    save_recovery_fixture(path, data, create=True)
+    save_private_fixture(path, data, create=True)
 
     alice, bob = accounts
     register(alice)
@@ -350,7 +350,7 @@ def recovery_fixture() -> None:
         }],
     })
     data["rooms"]["encrypted_room"] = room_id
-    save_recovery_fixture(path, data)
+    save_private_fixture(path, data)
     bob_token = login(bob)["access_token"]
     api(
         endpoint(server),
@@ -372,6 +372,30 @@ def recovery_fixture() -> None:
     )
     if encryption.get("algorithm") != "m.megolm.v1.aes-sha2":
         raise RuntimeError("Recovery fixture room lacks Megolm state")
+    print(path)
+
+
+def rtc_gate_fixture() -> None:
+    """Create a fresh account on Synapse B, which has no MatrixRTC service."""
+    server = SERVERS[1]
+    if not exists("container", str(server["container"])):
+        raise RuntimeError("Start local Synapse B with `up` before creating an RTC gate fixture")
+    api(endpoint(server), "/_matrix/client/versions")
+
+    nonce = secrets.token_hex(8)
+    username = f"rtcgateway{nonce}"
+    account = {
+        "label": "b_gate",
+        "username": username,
+        "user_id": f"@{username}:{server['server_name']}",
+        "homeserver_url": endpoint(server),
+        "password": secrets.token_urlsafe(32),
+    }
+    path = HOME / f"rtc-gate-{nonce}.json"
+    # Save the password before registration so an interrupted run can still be
+    # recovered. Never mutate the shared accounts.json fixture.
+    save_private_fixture(path, {"image": IMAGE, "accounts": [account]}, create=True)
+    register(account)
     print(path)
 
 
@@ -413,14 +437,16 @@ def destroy() -> None:
         CREDS.unlink()
     for fixture in HOME.glob("recovery-*.json"):
         fixture.unlink()
+    for fixture in HOME.glob("rtc-gate-*.json"):
+        fixture.unlink()
     print("Local Matrix test data and credentials removed; shared image retained.")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("up", "recovery-fixture", "status", "down", "destroy"))
+    parser.add_argument("command", choices=("up", "recovery-fixture", "rtc-gate-fixture", "status", "down", "destroy"))
     args = parser.parse_args()
-    {"up": up, "recovery-fixture": recovery_fixture, "status": status, "down": down, "destroy": destroy}[args.command]()
+    {"up": up, "recovery-fixture": recovery_fixture, "rtc-gate-fixture": rtc_gate_fixture, "status": status, "down": down, "destroy": destroy}[args.command]()
 
 
 if __name__ == "__main__":

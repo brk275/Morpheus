@@ -54,13 +54,19 @@ With both local servers running and the same protected fixture path set:
 PATH=/opt/homebrew/opt/rustup/bin:$PATH cargo test --locked -p morpheus-matrix --test room_actions_local -- --nocapture
 ```
 
-This separate opt-in test creates private rooms and a private Space, verifies
-that an invitation appears for Bob, checks accept and decline, and joins
-invited rooms by full room ID and by a temporary server alias. It makes new
-disposable rooms on Synapse A, removes the alias, and logs out its test devices.
-The Space assertion covers the successful create request; delayed Space
-classification in the SDK room list is handled by the app's temporary Space
-entry and still needs a dedicated UI test.
+This separate opt-in test creates private rooms, a DM, and a private Space.
+An independent signed-in client reads each new room's `m.room.encryption` state
+directly from Synapse and checks the Megolm algorithm before testing invite
+accept/decline and joins by room ID and temporary alias. Creation fails if a
+homeserver rejects the encryption state; Morpheus does not return a cleartext
+private room as a fallback. The test makes disposable rooms on Synapse A,
+removes the alias, and logs out its test devices. It does not test encryption
+of a Space: Space child links are navigation state visible to participating
+servers and clients, and Morpheus currently creates private Spaces without
+room-message encryption. Ordinary room metadata such as names and membership
+also remains visible to the homeserver. Delayed Space classification in the
+SDK room list is handled by the app's temporary Space entry and still needs a
+dedicated UI test.
 
 ## Test room settings and moderation
 

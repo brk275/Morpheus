@@ -455,13 +455,28 @@ def rtc_fixture() -> None:
     )
     with urllib.request.urlopen(request, timeout=10) as response:
         json.load(response)
+    # Keep a cleartext room in the fixture to verify that current-format
+    # MatrixRTC rejects it before creating a call with an unmappable peer
+    # identity. Encrypted media acceptance uses the room above.
+    unencrypted_room_id = matrix_env.create_room(alice, {
+        "name": f"Morpheus RTC unencrypted guard {nonce}",
+        "preset": "private_chat",
+        "invite": [bob["user_id"]],
+    })
+    data["rooms"]["unencrypted_room"] = unencrypted_room_id
+    private_file(path, json.dumps(data, indent=2) + "\n")
+    matrix_env.api(
+        matrix_env.endpoint(server),
+        "/_matrix/client/v3/rooms/" + urllib.parse.quote(unencrypted_room_id, safe="") + "/join",
+        token=matrix_env.login(bob)["access_token"], body={},
+    )
     for account in accounts:
         joined = matrix_env.api(
             matrix_env.endpoint(server), "/_matrix/client/v3/joined_rooms",
             token=matrix_env.login(account)["access_token"],
         )["joined_rooms"]
-        if room_id not in joined:
-            raise RuntimeError(f"RTC room absent for {account['label']}")
+        if room_id not in joined or unencrypted_room_id not in joined:
+            raise RuntimeError(f"RTC fixture room absent for {account['label']}")
     print(path)
 
 

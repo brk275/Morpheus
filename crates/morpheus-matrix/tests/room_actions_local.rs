@@ -5,7 +5,11 @@ use std::{fs, path::PathBuf, time::Duration};
 
 use matrix_sdk::{
     Client,
-    ruma::{RoomAliasId, RoomId},
+    ruma::{
+        EventEncryptionAlgorithm, RoomAliasId, RoomId,
+        api::client::state::get_state_event_for_key,
+        events::{StateEventType, room::encryption::RoomEncryptionEventContent},
+    },
 };
 use morpheus_matrix::{AccountManager, RoomMembership};
 use serde::Deserialize;
@@ -60,6 +64,20 @@ async fn wait_for_membership(
     }
 }
 
+async fn assert_server_room_encrypted(client: &Client, room_id: &str) {
+    let response = client
+        .send(get_state_event_for_key::v3::Request::new(
+            RoomId::parse(room_id).expect("Created room ID is invalid"),
+            StateEventType::RoomEncryption,
+            String::new(),
+        ))
+        .await
+        .expect("Created private room lacks server encryption state");
+    let content: RoomEncryptionEventContent = serde_json::from_str(response.event_or_content.get())
+        .expect("Created private room has invalid encryption state");
+    assert_eq!(content.algorithm, EventEncryptionAlgorithm::MegolmV1AesSha2);
+}
+
 #[test]
 fn create_join_and_respond_to_invites() {
     let Some(credentials_path) = std::env::var_os("MORPHEUS_MATRIX_TEST_ACCOUNTS") else {
@@ -99,12 +117,17 @@ fn create_join_and_respond_to_invites() {
             .add_password_account(&bob.homeserver_url, &bob.username, &bob.password)
             .await
             .expect("Cannot sign in invitee");
+        let creator_client = creator
+            .active_client()
+            .await
+            .expect("Creator client missing");
         eprintln!("Room test: both accounts signed in");
 
         let declined = creator
             .create_private_room(&format!("Morpheus decline {}", Uuid::new_v4()))
             .await
             .expect("Cannot create private room");
+        assert_server_room_encrypted(&creator_client, &declined).await;
         wait_for_membership(&creator, &declined, Some(RoomMembership::Joined)).await;
         creator
             .invite_user(&declined, &bob.user_id)
@@ -122,6 +145,7 @@ fn create_join_and_respond_to_invites() {
             .create_private_room(&format!("Morpheus accept {}", Uuid::new_v4()))
             .await
             .expect("Cannot create second private room");
+        assert_server_room_encrypted(&creator_client, &accepted).await;
         creator
             .invite_user(&accepted, &bob.user_id)
             .await
@@ -138,6 +162,7 @@ fn create_join_and_respond_to_invites() {
             .create_private_room(&format!("Morpheus join {}", Uuid::new_v4()))
             .await
             .expect("Cannot create third private room");
+        assert_server_room_encrypted(&creator_client, &joined).await;
         creator
             .invite_user(&joined, &bob.user_id)
             .await
@@ -157,6 +182,7 @@ fn create_join_and_respond_to_invites() {
             .create_private_room(&format!("Morpheus alias {}", Uuid::new_v4()))
             .await
             .expect("Cannot create alias test room");
+        assert_server_room_encrypted(&creator_client, &aliased).await;
         creator
             .invite_user(&aliased, &bob.user_id)
             .await
@@ -174,6 +200,14 @@ fn create_join_and_respond_to_invites() {
             .send()
             .await
             .expect("Cannot sign in alias owner");
+        let dm = creator
+            .create_dm(&bob.user_id)
+            .await
+            .expect("Cannot create direct room");
+        for room_id in [&declined, &accepted, &joined, &aliased, &dm] {
+            assert_server_room_encrypted(&alias_owner, room_id).await;
+        }
+        eprintln!("Private rooms and DM have server-confirmed Megolm state.");
         let server_name = alice
             .user_id
             .rsplit_once(':')
@@ -231,6 +265,6 @@ fn create_join_and_respond_to_invites() {
     });
     fs::remove_dir_all(&root).expect("Cannot remove local test stores");
     eprintln!(
-        "Local room actions passed: private room/Space, invite accept/decline, room-ID and alias joins."
+        "Local room actions passed: encrypted private rooms/DM, private Space, invite accept/decline, room-ID and alias joins."
     );
 }
