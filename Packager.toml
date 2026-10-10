@@ -12,8 +12,8 @@ resources = ["themes/aurora.toml", "LICENSE"]
 
 [deb]
 depends = [
-  "libc6 (>= 2.35)",
-  "libstdc++6",
+  "libc6 (>= 2.39)",
+  "libstdc++6 (>= 12.1.0)",
   "libgcc-s1",
   "libfontconfig1",
   "libasound2t64 | libasound2",

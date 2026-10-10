@@ -61,9 +61,11 @@ The preview shell and unit tests alone do not satisfy this gate.
 - [ ] Verify the macOS DMG mounts without a full-AGPL agreement and the
       installed macOS, Windows, and Linux packages contain a readable license
       and required source notices.
-- [ ] Install and launch the Linux Debian package and AppImage on Ubuntu 22.04
+- [ ] Install and launch the Linux Debian package and AppImage on Ubuntu 24.04
       under Wayland and X11; confirm the generated `Depends` and ELF glibc and
       libstdc++ symbol requirements match that baseline.
+- [ ] Establish and verify a Linux package build path for distributions older
+      than Ubuntu 24.04 before claiming support for them.
 - [ ] Test upgrades from installed older builds, failed or interrupted updates,
       recovery or rollback, retained account data, and update behavior during
       a call on every applicable platform.
