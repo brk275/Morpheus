@@ -1,0 +1,1250 @@
+//! Native desktop shell with a live Matrix session and an explicit offline preview.
+#![recursion_limit = "512"]
+
+#[cfg(feature = "native-calls")]
+mod calls;
+mod live;
+mod sso;
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::{Arc, atomic::Ordering};
+use std::thread;
+use std::time::Duration;
+
+use directories::ProjectDirs;
+use morpheus_config::{Config, ConfigStore, LoadedConfig, ThemeMode, ThemePack};
+use morpheus_matrix::AccountManager;
+use slint::{Color, ModelRc, SharedString, VecModel};
+
+#[cfg(feature = "native-calls")]
+use crate::calls::{CallController, CallStatus};
+use crate::live::{LiveUi, show_error};
+
+slint::include_modules!();
+
+#[derive(Clone)]
+struct PreviewRoom {
+    item: RoomItem,
+    topic: SharedString,
+    messages: Vec<MessageItem>,
+}
+
+#[derive(Clone)]
+struct PreviewAccount {
+    item: AccountItem,
+    channels: Vec<PreviewRoom>,
+    directs: Vec<PreviewRoom>,
+    members: Vec<MemberItem>,
+}
+
+struct PreviewState {
+    accounts: Vec<PreviewAccount>,
+    active_account: usize,
+    active_room: String,
+    stress_backup: Option<Vec<MessageItem>>,
+}
+
+fn rgb(red: u8, green: u8, blue: u8) -> Color {
+    Color::from_rgb_u8(red, green, blue)
+}
+
+fn account(name: &str, handle: &str, initials: &str, status: &str, accent: Color) -> AccountItem {
+    AccountItem {
+        name: name.into(),
+        handle: handle.into(),
+        initials: initials.into(),
+        status: status.into(),
+        accent,
+    }
+}
+
+fn room(
+    id: &str,
+    name: &str,
+    unread: i32,
+    private_room: bool,
+    topic: &str,
+    messages: Vec<MessageItem>,
+) -> PreviewRoom {
+    PreviewRoom {
+        item: RoomItem {
+            id: id.into(),
+            name: name.into(),
+            unread,
+            private_room,
+        },
+        topic: topic.into(),
+        messages,
+    }
+}
+
+fn message(
+    sender: &str,
+    initials: &str,
+    time: &str,
+    body: &str,
+    reply_to: &str,
+    attachment: &str,
+    reaction: &str,
+    accent: Color,
+) -> MessageItem {
+    MessageItem {
+        sender: sender.into(),
+        initials: initials.into(),
+        time: time.into(),
+        body: body.into(),
+        reply_to: reply_to.into(),
+        attachment: attachment.into(),
+        reaction: reaction.into(),
+        accent,
+    }
+}
+
+fn member(name: &str, initials: &str, detail: &str, accent: Color, online: bool) -> MemberItem {
+    MemberItem {
+        name: name.into(),
+        initials: initials.into(),
+        detail: detail.into(),
+        accent,
+        online,
+    }
+}
+
+fn fixtures() -> PreviewState {
+    let violet = rgb(168, 140, 255);
+    let peach = rgb(243, 159, 120);
+    let mint = rgb(120, 200, 177);
+    let blue = rgb(100, 165, 232);
+
+    let workshop = PreviewAccount {
+        item: account("Alex", "@alex:example.org", "AM", "Available", violet),
+        channels: vec![
+            room(
+                "#general",
+                "general",
+                0,
+                false,
+                "Start here, share ideas, and find your people.",
+                vec![
+                    message(
+                        "Jules",
+                        "JN",
+                        "9:41 AM",
+                        "Morning everyone! I finished the first pass on the desktop layout. The space rail is intentionally quiet, so channels and conversation can carry the visual weight.",
+                        "",
+                        "",
+                        "♥  4",
+                        peach,
+                    ),
+                    message(
+                        "Sam",
+                        "SK",
+                        "9:45 AM",
+                        "It looks great. I especially like having a reliable place for account switching. It should feel the same whether I have one account or several.",
+                        "",
+                        "",
+                        "✦  2",
+                        mint,
+                    ),
+                    message(
+                        "Alex",
+                        "AM",
+                        "9:48 AM",
+                        "The bottom-left card opens upward over the room list. I kept the active identity visible, including the full Matrix ID, so switching contexts is harder to miss.",
+                        "Sam: It looks great.",
+                        "",
+                        "",
+                        violet,
+                    ),
+                    message(
+                        "Morgan",
+                        "MR",
+                        "10:02 AM",
+                        "Here is the palette study. Dark, light, and high contrast use the same layout and can switch at runtime.",
+                        "",
+                        "palette-study.png · 1.8 MB",
+                        "♥  3",
+                        blue,
+                    ),
+                    message(
+                        "Jules",
+                        "JN",
+                        "10:42 AM",
+                        "I put together a few notes on message density. This longer example is here to make sure lines wrap naturally and that each message row grows with its content. The timeline should never make a conversation feel squeezed into identical blocks.",
+                        "",
+                        "",
+                        "",
+                        peach,
+                    ),
+                    message(
+                        "Sam",
+                        "SK",
+                        "10:47 AM",
+                        "A good thread panel needs room to breathe too. We can keep the conversation visible while opening context on the right.",
+                        "Jules: I put together a few notes",
+                        "",
+                        "✦  1",
+                        mint,
+                    ),
+                ],
+            ),
+            room(
+                "#design",
+                "design",
+                3,
+                false,
+                "Share concepts, critique, and polished work.",
+                vec![
+                    message(
+                        "Morgan",
+                        "MR",
+                        "Yesterday",
+                        "The updated color tokens are ready for review. Contrast stays strong in all three themes.",
+                        "",
+                        "theme-tokens.txt · 4 KB",
+                        "",
+                        blue,
+                    ),
+                    message(
+                        "Alex",
+                        "AM",
+                        "Today",
+                        "The account card and member rail are in place. Next I am testing the conversation at narrow desktop widths.",
+                        "",
+                        "",
+                        "♥  2",
+                        violet,
+                    ),
+                    message(
+                        "Jules",
+                        "JN",
+                        "Today",
+                        "I would keep a generous reading width in the center. A long message should wrap without changing the height of its neighbors.",
+                        "",
+                        "",
+                        "",
+                        peach,
+                    ),
+                ],
+            ),
+            room(
+                "#releases",
+                "releases",
+                1,
+                false,
+                "Builds, notes, and release discussions.",
+                vec![message(
+                    "Sam",
+                    "SK",
+                    "Today",
+                    "The next preview should include the account picker, theme controls, room switching, and composer interactions.",
+                    "",
+                    "",
+                    "✓  3",
+                    mint,
+                )],
+            ),
+            room(
+                "#lounge",
+                "lounge",
+                0,
+                false,
+                "Take a break and talk about anything.",
+                vec![
+                    message(
+                        "Jules",
+                        "JN",
+                        "Yesterday",
+                        "Who's up for a voice chat after the review?",
+                        "",
+                        "",
+                        "",
+                        peach,
+                    ),
+                    message(
+                        "Morgan",
+                        "MR",
+                        "Yesterday",
+                        "Count me in. The lounge call stage is looking good.",
+                        "",
+                        "",
+                        "",
+                        blue,
+                    ),
+                ],
+            ),
+        ],
+        directs: vec![
+            room(
+                "@jules",
+                "Jules",
+                2,
+                true,
+                "Direct message with Jules",
+                vec![
+                    message(
+                        "Jules",
+                        "JN",
+                        "10:12 AM",
+                        "Can you send me the layout notes before lunch?",
+                        "",
+                        "",
+                        "",
+                        peach,
+                    ),
+                    message(
+                        "Alex",
+                        "AM",
+                        "10:18 AM",
+                        "Absolutely. I will attach the current draft here.",
+                        "",
+                        "desktop-layout.md · 12 KB",
+                        "",
+                        violet,
+                    ),
+                ],
+            ),
+            room(
+                "@sam",
+                "Sam",
+                0,
+                true,
+                "Direct message with Sam",
+                vec![message(
+                    "Sam",
+                    "SK",
+                    "Yesterday",
+                    "The new sidebar feels much easier to scan.",
+                    "",
+                    "",
+                    "",
+                    mint,
+                )],
+            ),
+        ],
+        members: vec![
+            member("Alex", "AM", "Online", violet, true),
+            member("Jules", "JN", "Online", peach, true),
+            member("Sam", "SK", "Online", mint, true),
+            member("Morgan", "MR", "Away", blue, false),
+            member("Riley", "RL", "Offline", rgb(231, 139, 164), false),
+        ],
+    };
+
+    let personal = PreviewAccount {
+        item: account(
+            "Alex · personal",
+            "@alex:personal.example",
+            "AP",
+            "Away",
+            blue,
+        ),
+        channels: vec![
+            room(
+                "#friends",
+                "friends",
+                2,
+                false,
+                "A small place to catch up.",
+                vec![
+                    message(
+                        "Riley",
+                        "RL",
+                        "11:18 AM",
+                        "Are you free for coffee this weekend?",
+                        "",
+                        "",
+                        "",
+                        rgb(231, 139, 164),
+                    ),
+                    message(
+                        "Alex · personal",
+                        "AP",
+                        "11:24 AM",
+                        "Yes! Saturday afternoon works.",
+                        "",
+                        "",
+                        "♥  1",
+                        blue,
+                    ),
+                ],
+            ),
+            room(
+                "#photos",
+                "photos",
+                0,
+                false,
+                "Photos and moments.",
+                vec![message(
+                    "Riley",
+                    "RL",
+                    "Monday",
+                    "A few shots from the coast.",
+                    "",
+                    "coast-weekend.jpg · 2.4 MB",
+                    "♥  6",
+                    rgb(231, 139, 164),
+                )],
+            ),
+        ],
+        directs: vec![room(
+            "@riley",
+            "Riley",
+            1,
+            true,
+            "Direct message with Riley",
+            vec![message(
+                "Riley",
+                "RL",
+                "11:18 AM",
+                "I'll send the details later today.",
+                "",
+                "",
+                "",
+                rgb(231, 139, 164),
+            )],
+        )],
+        members: vec![
+            member("Alex · personal", "AP", "Away", blue, false),
+            member("Riley", "RL", "Online", rgb(231, 139, 164), true),
+        ],
+    };
+
+    let community = PreviewAccount {
+        item: account(
+            "Community team",
+            "@team:community.example",
+            "CT",
+            "Available",
+            mint,
+        ),
+        channels: vec![
+            room(
+                "#welcome",
+                "welcome",
+                0,
+                false,
+                "Introductions and community news.",
+                vec![
+                    message(
+                        "Community team",
+                        "CT",
+                        "8:00 AM",
+                        "Welcome! Introduce yourself and tell us what you are making.",
+                        "",
+                        "",
+                        "✦  5",
+                        mint,
+                    ),
+                    message(
+                        "Nico",
+                        "NC",
+                        "9:15 AM",
+                        "Hi all. I am here to learn about building on Matrix.",
+                        "",
+                        "",
+                        "",
+                        peach,
+                    ),
+                ],
+            ),
+            room(
+                "#support",
+                "support",
+                4,
+                false,
+                "Questions, answers, and friendly help.",
+                vec![
+                    message(
+                        "Nico",
+                        "NC",
+                        "Today",
+                        "Where can I find the client setup guide?",
+                        "",
+                        "",
+                        "",
+                        peach,
+                    ),
+                    message(
+                        "Community team",
+                        "CT",
+                        "Today",
+                        "The getting started guide is pinned in this room. Ask here if anything is unclear.",
+                        "",
+                        "",
+                        "✓  2",
+                        mint,
+                    ),
+                ],
+            ),
+        ],
+        directs: vec![room(
+            "@nico",
+            "Nico",
+            0,
+            true,
+            "Direct message with Nico",
+            vec![message(
+                "Nico",
+                "NC",
+                "Yesterday",
+                "Thanks for the welcome!",
+                "",
+                "",
+                "",
+                peach,
+            )],
+        )],
+        members: vec![
+            member("Community team", "CT", "Online", mint, true),
+            member("Nico", "NC", "Online", peach, true),
+            member("Morgan", "MR", "Away", blue, false),
+        ],
+    };
+
+    PreviewState {
+        accounts: vec![workshop, personal, community],
+        active_account: 0,
+        active_room: "#general".to_owned(),
+        stress_backup: None,
+    }
+}
+
+fn apply_state(ui: &AppWindow, state: &PreviewState) {
+    ui.set_live_session(false);
+    ui.set_stress_timeline_active(state.stress_backup.is_some());
+    let account = &state.accounts[state.active_account];
+    ui.set_accounts(ModelRc::new(VecModel::from(
+        state
+            .accounts
+            .iter()
+            .map(|a| a.item.clone())
+            .collect::<Vec<_>>(),
+    )));
+    let account_options = std::iter::once(state.active_account)
+        .chain((0..state.accounts.len()).filter(|index| *index != state.active_account))
+        .map(|index| {
+            let item = &state.accounts[index].item;
+            AccountOption {
+                index: index as i32,
+                name: item.name.clone(),
+                handle: item.handle.clone(),
+                initials: item.initials.clone(),
+                accent: item.accent,
+            }
+        })
+        .collect::<Vec<_>>();
+    ui.set_account_options(ModelRc::new(VecModel::from(account_options)));
+    ui.set_active_account_index(state.active_account as i32);
+    ui.set_active_account_local_id("".into());
+    ui.set_active_account_name(account.item.name.clone());
+    ui.set_active_account_handle(account.item.handle.clone());
+    ui.set_active_account_initials(account.item.initials.clone());
+    ui.set_active_account_status(account.item.status.clone());
+    ui.set_active_account_accent(account.item.accent);
+    ui.set_channels(ModelRc::new(VecModel::from(
+        account
+            .channels
+            .iter()
+            .map(|r| r.item.clone())
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_direct_messages(ModelRc::new(VecModel::from(
+        account
+            .directs
+            .iter()
+            .map(|r| r.item.clone())
+            .collect::<Vec<_>>(),
+    )));
+    ui.set_members(ModelRc::new(VecModel::from(account.members.clone())));
+
+    if state.active_room == "#discover" {
+        ui.set_active_room_id("#discover".into());
+        ui.set_active_room_name("Explore".into());
+        ui.set_active_room_topic("Discover rooms and spaces from your Matrix homeserver.".into());
+        ui.set_messages(ModelRc::new(VecModel::from(vec![message(
+            "Morpheus",
+            "M",
+            "Now",
+            "This preview shows where directory results will appear once a Matrix account is connected.",
+            "",
+            "",
+            "",
+            rgb(168, 140, 255),
+        )])));
+        return;
+    }
+
+    let active_room = account
+        .channels
+        .iter()
+        .chain(&account.directs)
+        .find(|room| room.item.id.as_str() == state.active_room);
+
+    if let Some(room) = active_room {
+        ui.set_active_room_id(room.item.id.clone());
+        ui.set_active_room_name(room.item.name.clone());
+        ui.set_active_room_topic(room.topic.clone());
+        ui.set_messages(ModelRc::new(VecModel::from(room.messages.clone())));
+    }
+}
+
+fn switch_account(state: &mut PreviewState, index: usize) {
+    if let Some(account) = state.accounts.get(index) {
+        state.active_account = index;
+        state.active_room = account
+            .channels
+            .first()
+            .or_else(|| account.directs.first())
+            .map(|room| room.item.id.to_string())
+            .unwrap_or_default();
+    }
+}
+
+fn make_stress_messages() -> Vec<MessageItem> {
+    const BODIES: [&str; 4] = [
+        "Short message for checking compact rows.",
+        "This longer message wraps across the conversation width. It helps check that scrolling remains smooth when a room contains years of varied discussion and different text lengths.",
+        "A decision from the project chat: keep the room list configurable, allow a narrow details panel, and make account switching easy to find from the bottom-left card.",
+        "A deliberately long example message with more than one line. The timeline needs to calculate each row's actual height while only creating delegates for messages near the visible area. Replies, attachments, and reactions create several distinct row shapes for this preview.",
+    ];
+    (0..10_000)
+        .map(|index| {
+            let index = index as usize;
+            message(
+                if index % 3 == 0 { "Alex" } else { "Morgan" },
+                if index % 3 == 0 { "AM" } else { "MR" },
+                &format!("#{:05}", index + 1),
+                BODIES[index % BODIES.len()],
+                if index % 7 == 0 {
+                    "Earlier message"
+                } else {
+                    ""
+                },
+                if index % 11 == 0 {
+                    "design-notes.pdf"
+                } else {
+                    ""
+                },
+                if index % 5 == 0 { "✦  3" } else { "" },
+                if index % 3 == 0 {
+                    rgb(168, 140, 255)
+                } else {
+                    rgb(100, 165, 232)
+                },
+            )
+        })
+        .collect()
+}
+
+fn color_from_hex(value: &str) -> Color {
+    let rgb = u32::from_str_radix(value.strip_prefix('#').unwrap_or_default(), 16).unwrap_or(0);
+    Color::from_rgb_u8((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
+}
+
+fn apply_config(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
+    let mode = match config.appearance.theme {
+        ThemeMode::Dark => 0,
+        ThemeMode::Light => 1,
+        ThemeMode::HighContrast => 2,
+        ThemeMode::System => 3,
+    };
+    ui.set_theme_mode(mode);
+    ui.set_room_list_width(config.layout.room_list_width.into());
+    ui.set_details_width(config.layout.details_width.into());
+    ui.set_show_side_panel(config.layout.show_member_panel);
+    ui.set_ui_font_family(config.appearance.font_family.as_str().into());
+    if let Some(theme) = theme {
+        let colors = &theme.colors;
+        ui.set_custom_rail(color_from_hex(&colors.rail));
+        ui.set_custom_sidebar(color_from_hex(&colors.sidebar));
+        ui.set_custom_canvas(color_from_hex(&colors.canvas));
+        ui.set_custom_panel(color_from_hex(&colors.panel));
+        ui.set_custom_elevated(color_from_hex(&colors.elevated));
+        ui.set_custom_hover(color_from_hex(&colors.hover));
+        ui.set_custom_ink(color_from_hex(&colors.ink));
+        ui.set_custom_muted(color_from_hex(&colors.muted));
+        ui.set_custom_divider(color_from_hex(&colors.divider));
+        ui.set_custom_accent(color_from_hex(&colors.accent));
+        ui.set_custom_accent_ink(color_from_hex(&colors.accent_ink));
+        ui.set_custom_theme_active(true);
+    } else {
+        ui.set_custom_theme_active(false);
+    }
+}
+
+fn apply_loaded_config(ui: &AppWindow, loaded: &LoadedConfig) {
+    apply_config(ui, &loaded.config, loaded.theme.as_ref());
+    ui.set_config_error("".into());
+}
+
+fn save_config_change(ui: &AppWindow, store: &ConfigStore, change: impl FnOnce(&mut Config)) {
+    // Read from disk first so an invalid external edit is never overwritten by a UI action.
+    let result = (|| {
+        let mut config = store.load()?;
+        change(&mut config);
+        store.save(&config)?;
+        let theme = store.load_theme(&config)?;
+        Ok::<_, morpheus_config::ConfigError>(LoadedConfig { config, theme })
+    })();
+    match result {
+        Ok(loaded) => apply_loaded_config(ui, &loaded),
+        Err(error) => ui.set_config_error(error.to_string().into()),
+    }
+}
+
+fn show_login_error(ui: &slint::Weak<AppWindow>, message: String) {
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        ui.set_login_loading(false);
+        ui.set_login_error(message.into());
+    });
+}
+
+#[cfg(feature = "native-calls")]
+fn call_status_label(status: &CallStatus) -> String {
+    match status {
+        CallStatus::Idle => "Select a room, then open or join its audio call".into(),
+        CallStatus::Starting { .. } => "Joining MatrixRTC audio…".into(),
+        CallStatus::Joined { .. } => "Connected · native microphone and speaker".into(),
+        CallStatus::Ending { .. } => "Leaving call…".into(),
+        CallStatus::Failed { reason, .. } => format!("Call failed: {reason}"),
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(feature = "native-calls")]
+    morpheus_rtc::install_crypto_provider();
+    let ui = AppWindow::new()?;
+    ui.set_login_loading(true);
+    let data_dir = ProjectDirs::from("io.github", "brk275", "Morpheus")
+        .ok_or("No application data directory is available")?
+        .data_dir()
+        .to_path_buf();
+    let manager = Arc::new(AccountManager::open(data_dir)?);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let live = LiveUi::new(manager.clone());
+    ui.set_native_call_enabled(cfg!(feature = "native-calls"));
+    ui.set_native_call_status("Select a room to check call availability".into());
+    #[cfg(feature = "native-calls")]
+    let calls = Arc::new(CallController::new(manager.clone()));
+    #[cfg(feature = "native-calls")]
+    {
+        let calls = calls.clone();
+        let weak = ui.as_weak();
+        runtime.spawn(async move {
+            let mut status = calls.subscribe_status();
+            loop {
+                let current = status.borrow_and_update().clone();
+                let connected = current.blocks_account_switch();
+                let label = call_status_label(&current);
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    ui.set_call_connected(connected);
+                    ui.set_native_call_status(label.into());
+                });
+                if status.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    runtime.spawn(live.clone().watch_updates(ui.as_weak()));
+    runtime.spawn(live.clone().watch_sync(ui.as_weak()));
+    {
+        let live = live.clone();
+        let weak = ui.as_weak();
+        runtime.spawn(async move { live.restore(weak).await });
+    }
+    let store = ConfigStore::standard()?;
+    ui.set_config_path(store.path().display().to_string().into());
+    match store.load_or_create() {
+        Ok(config) => match store.load_theme(&config) {
+            Ok(theme) => apply_config(&ui, &config, theme.as_ref()),
+            Err(error) => {
+                apply_config(&ui, &config, None);
+                ui.set_config_error(error.to_string().into());
+            }
+        },
+        Err(error) => {
+            apply_config(&ui, &Config::default(), None);
+            ui.set_config_error(error.to_string().into());
+        }
+    }
+
+    let watch = store.watch_with_theme(Duration::from_millis(700));
+    let weak = ui.as_weak();
+    thread::spawn(move || {
+        while let Ok(result) = watch.recv() {
+            let closed = weak
+                .upgrade_in_event_loop(move |ui| match result {
+                    Ok(loaded) => apply_loaded_config(&ui, &loaded),
+                    Err(error) => ui.set_config_error(error.to_string().into()),
+                })
+                .is_err();
+            if closed {
+                break;
+            }
+        }
+    });
+
+    let state = Rc::new(RefCell::new(fixtures()));
+    apply_state(&ui, &state.borrow());
+
+    #[cfg(feature = "native-calls")]
+    {
+        let weak = ui.as_weak();
+        let calls = calls.clone();
+        let handle = runtime.handle().clone();
+        ui.on_open_native_call_slot(move || {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            let room_id = window.get_active_room_id().to_string();
+            let calls = calls.clone();
+            let weak = weak.clone();
+            handle.spawn(async move {
+                match calls.open_slot(&room_id).await {
+                    Ok(()) => {
+                        let _ = weak.upgrade_in_event_loop(|ui| {
+                            ui.set_native_call_status(
+                                "Room call opened · join audio when ready".into(),
+                            );
+                        });
+                    }
+                    Err(error) => show_error(&weak, error.to_string()),
+                }
+            });
+        });
+    }
+    #[cfg(feature = "native-calls")]
+    {
+        let weak = ui.as_weak();
+        let calls = calls.clone();
+        let handle = runtime.handle().clone();
+        ui.on_start_native_call(move || {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            let room_id = window.get_active_room_id().to_string();
+            let calls = calls.clone();
+            let weak = weak.clone();
+            handle.spawn(async move {
+                if let Err(error) = calls.start_two_person_audio(&room_id).await {
+                    show_error(&weak, error.to_string());
+                }
+            });
+        });
+    }
+    #[cfg(feature = "native-calls")]
+    {
+        let weak = ui.as_weak();
+        let calls = calls.clone();
+        let handle = runtime.handle().clone();
+        ui.on_end_native_call(move || {
+            let calls = calls.clone();
+            let weak = weak.clone();
+            handle.spawn(async move {
+                if let Err(error) = calls.end_call().await {
+                    show_error(&weak, error.to_string());
+                }
+            });
+        });
+    }
+
+    let weak = ui.as_weak();
+    let switch_state = state.clone();
+    let switch_live = live.clone();
+    let switch_handle = runtime.handle().clone();
+    #[cfg(feature = "native-calls")]
+    let switch_calls = calls.clone();
+    ui.on_switch_account(move |index| {
+        if switch_live.is_live.load(Ordering::Acquire) {
+            if let Ok(index) = usize::try_from(index) {
+                switch_live.invalidate_navigation();
+                let live = switch_live.clone();
+                let ui = weak.clone();
+                #[cfg(feature = "native-calls")]
+                let calls = switch_calls.clone();
+                switch_handle.spawn(async move {
+                    #[cfg(feature = "native-calls")]
+                    if let Err(error) = calls.end_call().await {
+                        show_error(&ui, error.to_string());
+                        return;
+                    }
+                    if let Err(error) = live.select_account(index, ui.clone()).await {
+                        show_error(&ui, error.to_string());
+                    }
+                });
+            }
+            return;
+        }
+        if let Some(ui) = weak.upgrade() {
+            let mut state = switch_state.borrow_mut();
+            if let Ok(index) = usize::try_from(index) {
+                switch_account(&mut state, index);
+                apply_state(&ui, &state);
+            }
+        }
+    });
+
+    let weak = ui.as_weak();
+    let room_state = state.clone();
+    let room_live = live.clone();
+    let room_handle = runtime.handle().clone();
+    ui.on_open_room(move |room_id| {
+        if room_live.is_live.load(Ordering::Acquire) {
+            room_live.invalidate_navigation();
+            let live = room_live.clone();
+            let ui = weak.clone();
+            room_handle.spawn(async move {
+                live.open_room(room_id.to_string(), ui.clone()).await;
+                if let Err(error) = live.refresh(ui.clone()).await {
+                    show_error(&ui, error.to_string());
+                }
+            });
+            return;
+        }
+        if let Some(ui) = weak.upgrade() {
+            let mut state = room_state.borrow_mut();
+            state.active_room = room_id.to_string();
+            apply_state(&ui, &state);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let space_live = live.clone();
+    let space_handle = runtime.handle().clone();
+    ui.on_select_space(move |space_id| {
+        if !space_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        space_live.invalidate_navigation();
+        let live = space_live.clone();
+        let ui = weak.clone();
+        space_handle.spawn(async move {
+            if let Err(error) = live.select_space(space_id.to_string(), ui.clone()).await {
+                show_error(&ui, error.to_string());
+            }
+        });
+    });
+
+    let weak = ui.as_weak();
+    let draft_live = live.clone();
+    ui.on_composer_edited(move |body| {
+        if !draft_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(ui) = weak.upgrade() {
+            draft_live.remember_draft(
+                ui.get_active_account_local_id().as_str(),
+                ui.get_active_room_id().as_str(),
+                body.as_str(),
+            );
+        }
+    });
+
+    let weak = ui.as_weak();
+    let send_state = state.clone();
+    let send_live = live.clone();
+    let send_handle = runtime.handle().clone();
+    ui.on_send_message(move |body| {
+        let submitted_text = body.to_string();
+        let message_text = submitted_text.trim().to_owned();
+        if message_text.is_empty() {
+            return;
+        }
+        if send_live.is_live.load(Ordering::Acquire) {
+            if let Some(ui) = weak.upgrade() {
+                let account_id = ui.get_active_account_local_id().to_string();
+                let room_id = ui.get_active_room_id().to_string();
+                let account_for_ui = account_id.clone();
+                let room_for_ui = room_id.clone();
+                let live = send_live.clone();
+                let weak = weak.clone();
+                send_handle.spawn(async move {
+                    match live.send(account_id, room_id, message_text).await {
+                        Ok(()) => {
+                            live.clear_draft_if_unchanged(
+                                &account_for_ui,
+                                &room_for_ui,
+                                &submitted_text,
+                            );
+                            let _ = weak.upgrade_in_event_loop(move |ui| {
+                                if ui.get_active_account_local_id().as_str() == account_for_ui
+                                    && ui.get_active_room_id().as_str() == room_for_ui
+                                    && ui.get_composer_text().as_str() == submitted_text
+                                {
+                                    ui.set_composer_text("".into());
+                                }
+                            });
+                        }
+                        Err(error) => show_error(&weak, error.to_string()),
+                    }
+                });
+            }
+            return;
+        }
+        if let Some(ui) = weak.upgrade() {
+            let mut state = send_state.borrow_mut();
+            let active_room = state.active_room.clone();
+            let active_account = state.active_account;
+            let account = &mut state.accounts[active_account];
+            let item = account.item.clone();
+            if let Some(room) = account
+                .channels
+                .iter_mut()
+                .chain(&mut account.directs)
+                .find(|room| room.item.id.as_str() == active_room)
+            {
+                room.messages.push(message(
+                    item.name.as_str(),
+                    item.initials.as_str(),
+                    "Now",
+                    &message_text,
+                    "",
+                    "",
+                    "",
+                    item.accent,
+                ));
+                apply_state(&ui, &state);
+                if ui.get_composer_text().as_str() == submitted_text {
+                    ui.set_composer_text("".into());
+                }
+            }
+        }
+    });
+
+    let weak = ui.as_weak();
+    #[cfg(feature = "native-calls")]
+    let add_calls = calls.clone();
+    #[cfg(feature = "native-calls")]
+    let add_handle = runtime.handle().clone();
+    ui.on_add_account(move || {
+        #[cfg(feature = "native-calls")]
+        if add_calls.status().blocks_account_switch() {
+            let calls = add_calls.clone();
+            let ui = weak.clone();
+            add_handle.spawn(async move {
+                match calls.end_call().await {
+                    Ok(()) => {
+                        let _ = ui.upgrade_in_event_loop(|ui| {
+                            ui.set_login_error("".into());
+                            ui.set_show_sign_in(true);
+                        });
+                    }
+                    Err(error) => show_error(&ui, error.to_string()),
+                }
+            });
+            return;
+        }
+        if let Some(ui) = weak.upgrade() {
+            ui.set_login_error("".into());
+            ui.set_show_sign_in(true);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let preview_live = live.clone();
+    let preview_handle = runtime.handle().clone();
+    let preview_state = state.clone();
+    ui.on_preview_demo(move || {
+        if let Some(ui) = weak.upgrade() {
+            if ui.get_login_loading() {
+                return;
+            }
+            preview_live.invalidate_navigation();
+            preview_live.is_live.store(false, Ordering::Release);
+            let live = preview_live.clone();
+            preview_handle.spawn(async move {
+                live.clear_feed().await;
+                live.manager.stop().await;
+            });
+            ui.set_login_error("".into());
+            ui.set_session_error("Interactive preview · no Matrix connection".into());
+            ui.set_show_sign_in(false);
+            ui.set_composer_text("".into());
+            apply_state(&ui, &preview_state.borrow());
+        }
+    });
+
+    let weak = ui.as_weak();
+    let login_live = live.clone();
+    let login_handle = runtime.handle().clone();
+    ui.on_submit_login(move |homeserver, username, password| {
+        login_live.invalidate_navigation();
+        let live = login_live.clone();
+        let ui = weak.clone();
+        login_handle.spawn(async move {
+            match live
+                .manager
+                .add_password_account(&homeserver, &username, &password)
+                .await
+            {
+                Ok(_) => {
+                    live.is_live.store(true, Ordering::Release);
+                    if let Err(error) = live.refresh(ui.clone()).await {
+                        show_login_error(&ui, error.to_string());
+                    } else {
+                        tokio::spawn(live.clone().scan_spaces(ui));
+                    }
+                }
+                Err(error) => show_login_error(&ui, error.to_string()),
+            }
+        });
+    });
+
+    let weak = ui.as_weak();
+    let sso_live = live.clone();
+    let sso_handle = runtime.handle().clone();
+    ui.on_submit_sso(move |homeserver| {
+        sso_live.invalidate_navigation();
+        let live = sso_live.clone();
+        let ui = weak.clone();
+        sso_handle.spawn(async move {
+            match sso::sign_in(live.manager.clone(), homeserver.to_string()).await {
+                Ok(_) => {
+                    live.is_live.store(true, Ordering::Release);
+                    if let Err(error) = live.refresh(ui.clone()).await {
+                        show_login_error(&ui, error.to_string());
+                    } else {
+                        tokio::spawn(live.clone().scan_spaces(ui));
+                    }
+                }
+                Err(error) => show_login_error(&ui, error),
+            }
+        });
+    });
+
+    let weak = ui.as_weak();
+    let stress_state = state.clone();
+    let stress_live = live.clone();
+    ui.on_toggle_stress_timeline(move || {
+        if stress_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(ui) = weak.upgrade() {
+            let mut state = stress_state.borrow_mut();
+            let backup = state.stress_backup.take();
+            let mut old_messages = None;
+            let Some(room) = state.accounts[0].channels.first_mut() else {
+                return;
+            };
+            if let Some(backup) = backup {
+                room.messages = backup;
+            } else {
+                old_messages = Some(std::mem::replace(
+                    &mut room.messages,
+                    make_stress_messages(),
+                ));
+            }
+            let room_id = room.item.id.to_string();
+            state.stress_backup = old_messages;
+            state.active_account = 0;
+            state.active_room = room_id;
+            apply_state(&ui, &state);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let logout_live = live.clone();
+    let logout_handle = runtime.handle().clone();
+    #[cfg(feature = "native-calls")]
+    let logout_calls = calls.clone();
+    ui.on_log_out(move || {
+        if !logout_live.is_live.load(Ordering::Acquire) {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_show_sign_in(true);
+            }
+            return;
+        }
+        logout_live.invalidate_navigation();
+        let live = logout_live.clone();
+        let ui = weak.clone();
+        #[cfg(feature = "native-calls")]
+        let calls = logout_calls.clone();
+        logout_handle.spawn(async move {
+            #[cfg(feature = "native-calls")]
+            if let Err(error) = calls.end_call().await {
+                show_error(&ui, error.to_string());
+                return;
+            }
+            let Some(active) = live.manager.active_account().await else {
+                return;
+            };
+            match live.manager.logout_account(&active.id).await {
+                Ok(_) => {
+                    live.forget_account_drafts(&active.id);
+                    live.clear_feed().await;
+                    let accounts = live.manager.accounts().await;
+                    if accounts.is_empty() {
+                        live.is_live.store(false, Ordering::Release);
+                        let _ = ui.upgrade_in_event_loop(|ui| {
+                            ui.set_show_sign_in(true);
+                            ui.set_session_error("".into());
+                        });
+                    } else if let Err(error) = live.select_account(0, ui.clone()).await {
+                        show_error(&ui, error.to_string());
+                    }
+                }
+                Err(error) => show_error(&ui, error.to_string()),
+            }
+        });
+    });
+
+    let weak = ui.as_weak();
+    let setting_store = store.clone();
+    ui.on_choose_theme(move |index| {
+        if let Some(ui) = weak.upgrade() {
+            let theme = match index {
+                0 => ThemeMode::Dark,
+                1 => ThemeMode::Light,
+                2 => ThemeMode::HighContrast,
+                3 => ThemeMode::System,
+                _ => return,
+            };
+            save_config_change(&ui, &setting_store, |config| {
+                config.appearance.theme = theme;
+                config.appearance.theme_pack = None;
+            });
+        }
+    });
+
+    let weak = ui.as_weak();
+    let setting_store = store.clone();
+    ui.on_set_side_panel(move |visible| {
+        if let Some(ui) = weak.upgrade() {
+            save_config_change(&ui, &setting_store, |config| {
+                config.layout.show_member_panel = visible;
+            });
+        }
+    });
+
+    let weak = ui.as_weak();
+    let setting_store = store.clone();
+    ui.on_change_room_list_width(move |width| {
+        if let Some(ui) = weak.upgrade() {
+            save_config_change(&ui, &setting_store, |config| {
+                config.layout.room_list_width = width.clamp(180, 480) as u16;
+            });
+        }
+    });
+
+    let weak = ui.as_weak();
+    ui.on_change_details_width(move |width| {
+        if let Some(ui) = weak.upgrade() {
+            save_config_change(&ui, &store, |config| {
+                config.layout.details_width = width.clamp(200, 520) as u16;
+            });
+        }
+    });
+
+    ui.run()?;
+    #[cfg(feature = "native-calls")]
+    if let Err(error) = runtime.block_on(calls.end_call()) {
+        eprintln!("Could not leave native call during shutdown: {error}");
+    }
+    runtime.block_on(manager.stop());
+    Ok(())
+}

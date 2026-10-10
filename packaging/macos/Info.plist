@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Morpheus uses your microphone to let you speak in Matrix voice and video calls.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Morpheus uses your camera when you choose to share video in a Matrix call.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Morpheus records a window or display when you choose to share your screen in a Matrix call.</string>
+</dict>
+</plist>

@@ -1,0 +1,18 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/morpheus-app",
+    "crates/morpheus-config",
+    "crates/morpheus-matrix",
+    "crates/morpheus-rtc",
+]
+
+[workspace.package]
+edition = "2024"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/brk275/Morpheus"
+
+[patch.crates-io]
+# Required by the pinned MatrixRTC SDK revision until its upstream dependency
+# pin is released on crates.io.
+const_panic = { git = "https://github.com/jplatte/const_panic", rev = "e0b317a9a7bde2d48a7d15b6a60d70e4a41d3b5f" }

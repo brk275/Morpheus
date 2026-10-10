@@ -1,0 +1,15 @@
+schema_version = 1
+name = "Aurora"
+
+[colors]
+rail = "#10131B"
+sidebar = "#171B26"
+canvas = "#1E2330"
+panel = "#191E2A"
+elevated = "#272D3B"
+hover = "#32394B"
+ink = "#FFFFFF"
+muted = "#A7AFC1"
+divider = "#303747"
+accent = "#A88CFF"
+accent_ink = "#FFFFFF"

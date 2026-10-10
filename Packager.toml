@@ -1,0 +1,20 @@
+name = "morpheus-app"
+product-name = "Morpheus"
+identifier = "io.github.brk275.morpheus"
+version = "0.1.0"
+description = "A native, customizable Matrix desktop client"
+homepage = "https://github.com/brk275/Morpheus"
+license-file = "LICENSE"
+out-dir = "dist"
+binaries-dir = "target/release"
+before-packaging-command = "cargo build --release --locked -p morpheus-app --features native-calls"
+icons = ["assets/icon.png", "assets/icon.icns", "assets/icon.ico"]
+resources = ["themes/aurora.toml"]
+
+[macos]
+info-plist-path = "packaging/macos/Info.plist"
+entitlements = "packaging/macos/entitlements.plist"
+
+[[binaries]]
+path = "morpheus-app"
+main = true

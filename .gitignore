@@ -1,0 +1,12 @@
+/target/
+**/.DS_Store
+*.log
+*.tmp
+.env
+.env.*
+!.env.example
+/.idea/
+/.vscode/
+/dist/
+/release/
+/assets/icon.iconset/

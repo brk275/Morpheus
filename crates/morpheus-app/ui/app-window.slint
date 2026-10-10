@@ -1,0 +1,1333 @@
+import { AboutSlint, ListView, Palette, ScrollView } from "std-widgets.slint";
+
+export struct AccountItem {
+    name: string,
+    handle: string,
+    initials: string,
+    status: string,
+    accent: color,
+}
+
+export struct AccountOption {
+    index: int,
+    name: string,
+    handle: string,
+    initials: string,
+    accent: color,
+}
+
+export struct SpaceItem {
+    id: string,
+    name: string,
+    initials: string,
+    accent: color,
+}
+
+export struct RoomItem {
+    id: string,
+    name: string,
+    unread: int,
+    private-room: bool,
+}
+
+export struct MessageItem {
+    sender: string,
+    initials: string,
+    time: string,
+    body: string,
+    reply-to: string,
+    attachment: string,
+    reaction: string,
+    accent: color,
+}
+
+export struct MemberItem {
+    name: string,
+    initials: string,
+    detail: string,
+    accent: color,
+    online: bool,
+}
+
+component AvatarBadge inherits Rectangle {
+    in property <string> initials;
+    in property <color> accent;
+    in property <color> ink: #ffffff;
+    width: 38px;
+    height: 38px;
+    border-radius: 13px;
+    background: accent;
+    Text {
+        text: root.initials;
+        color: root.ink;
+        font-size: 12px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+component IconAction inherits Rectangle {
+    in property <string> icon;
+    in property <string> label;
+    in property <color> ink;
+    in property <color> surface;
+    in property <color> hover-surface;
+    in property <bool> selected: false;
+    callback activated();
+    width: 34px;
+    height: 34px;
+    border-radius: 9px;
+    background: area.has-hover || selected ? hover-surface : surface;
+    accessible-role: button;
+    accessible-label: label;
+    accessible-action-default => { root.activated(); }
+    Text {
+        text: root.icon;
+        color: root.ink;
+        font-size: 18px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    area := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.activated(); }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Morpheus";
+    preferred-width: 1310px;
+    preferred-height: 820px;
+    min-width: 940px;
+    min-height: 620px;
+
+    in-out property <[AccountItem]> accounts;
+    in-out property <[AccountOption]> account-options;
+    in-out property <[SpaceItem]> spaces;
+    in-out property <string> active-space-id;
+    in-out property <string> active-space-name: "Home";
+    in-out property <[RoomItem]> channels;
+    in-out property <[RoomItem]> direct-messages;
+    in-out property <[MessageItem]> messages;
+    in-out property <[MemberItem]> members;
+    in-out property <int> active-account-index: 0;
+    in-out property <string> active-account-local-id;
+    in-out property <string> active-account-name;
+    in-out property <string> active-account-handle;
+    in-out property <string> active-account-initials;
+    in-out property <string> active-account-status;
+    in-out property <color> active-account-accent: #8e7dff;
+    in-out property <string> active-room-id;
+    in-out property <string> active-room-name;
+    in-out property <string> active-room-topic;
+    in-out property <int> theme-mode: 0;
+    in-out property <int> room-list-width: 262;
+    in-out property <int> details-width: 250;
+    in-out property <bool> show-side-panel: true;
+    in-out property <string> ui-font-family: "Inter";
+    in-out property <string> config-error;
+    in-out property <string> session-error;
+    in-out property <string> config-path;
+    in-out property <bool> show-sign-in: true;
+    in-out property <bool> login-loading: false;
+    in-out property <string> login-error;
+    in-out property <bool> live-session: false;
+    in-out property <bool> native-call-enabled: false;
+    in-out property <string> native-call-status;
+    in-out property <bool> custom-theme-active: false;
+    in-out property <color> custom-rail;
+    in-out property <color> custom-sidebar;
+    in-out property <color> custom-canvas;
+    in-out property <color> custom-panel;
+    in-out property <color> custom-elevated;
+    in-out property <color> custom-hover;
+    in-out property <color> custom-ink;
+    in-out property <color> custom-muted;
+    in-out property <color> custom-divider;
+    in-out property <color> custom-accent;
+    in-out property <color> custom-accent-ink;
+
+    callback switch-account(int);
+    callback select-space(string);
+    callback open-room(string);
+    callback send-message(string);
+    callback add-account();
+    callback manage-accounts();
+    callback log-out();
+    callback choose-theme(int);
+    callback set-side-panel(bool);
+    callback change-room-list-width(int);
+    callback change-details-width(int);
+    callback submit-login(string, string, string);
+    callback submit-sso(string);
+    callback composer-edited(string);
+    callback preview-demo();
+    callback toggle-stress-timeline();
+    callback start-native-call();
+    callback end-native-call();
+    callback open-native-call-slot();
+
+    property <bool> account-menu-open: false;
+    in-out property <bool> manage-accounts-open: false;
+    in-out property <bool> stress-timeline-active: false;
+    property <int> side-panel-tab: 0;
+    property <int> page: 0; // 0 chat, 1 settings, 2 call stage
+    property <bool> mic-muted: false;
+    property <bool> camera-off: true;
+    in-out property <bool> call-connected: false;
+    property <bool> leave-call-dialog: false;
+    property <int> pending-account-index: -1;
+    in-out property <string> composer-text;
+    property <string> login-homeserver: "https://matrix.org";
+    property <string> login-username;
+    property <string> login-password;
+
+    property <bool> light-palette: root.theme-mode == 1 || (root.theme-mode == 3 && Palette.color-scheme == ColorScheme.light);
+    property <color> rail: custom-theme-active ? custom-rail : light-palette ? #e7ebf3 : theme-mode == 2 ? #000000 : #10131b;
+    property <color> sidebar: custom-theme-active ? custom-sidebar : light-palette ? #f1f3f8 : theme-mode == 2 ? #101010 : #171b26;
+    property <color> canvas: custom-theme-active ? custom-canvas : light-palette ? #ffffff : theme-mode == 2 ? #000000 : #1e2330;
+    property <color> panel: custom-theme-active ? custom-panel : light-palette ? #f8f9fc : theme-mode == 2 ? #101010 : #191e2a;
+    property <color> elevated: custom-theme-active ? custom-elevated : light-palette ? #ffffff : theme-mode == 2 ? #181818 : #272d3b;
+    property <color> hover: custom-theme-active ? custom-hover : light-palette ? #e3e8f2 : theme-mode == 2 ? #333333 : #32394b;
+    property <color> ink: custom-theme-active ? custom-ink : light-palette ? #182132 : #ffffff;
+    property <color> muted: custom-theme-active ? custom-muted : light-palette ? #637083 : theme-mode == 2 ? #ffffff : #a7afc1;
+    property <color> divider: custom-theme-active ? custom-divider : light-palette ? #dfe4ee : theme-mode == 2 ? #ffffff : #303747;
+    property <color> accent: custom-theme-active ? custom-accent : theme-mode == 2 ? #ffff00 : #a88cff;
+    property <color> accent-ink: custom-theme-active ? custom-accent-ink : theme-mode == 2 ? #000000 : #ffffff;
+    default-font-family: root.ui-font-family;
+    background: canvas;
+
+    HorizontalLayout {
+        spacing: 0px;
+
+        // Space and navigation rail.
+        Rectangle {
+            width: 70px;
+            background: root.rail;
+            VerticalLayout {
+                padding: 9px;
+                spacing: 10px;
+                Rectangle {
+                    height: 48px;
+                    border-radius: 15px;
+                    background: root.accent;
+                    Text {
+                        text: "M";
+                        color: root.accent-ink;
+                        font-size: 23px;
+                        font-weight: 800;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                Rectangle { height: 1px; background: root.divider; }
+                IconAction {
+                    width: 52px;
+                    height: 48px;
+                    icon: "⌂";
+                    label: "Home and all rooms";
+                    ink: root.page == 0 && root.active-space-id == "" ? root.accent : root.muted;
+                    surface: root.rail;
+                    hover-surface: root.hover;
+                    selected: root.page == 0 && root.active-space-id == "";
+                    activated => { root.active-space-id = ""; root.active-space-name = "Home"; root.select-space(""); root.page = 0; }
+                }
+                ScrollView {
+                    vertical-stretch: 1;
+                    horizontal-scrollbar-policy: always-off;
+                    VerticalLayout {
+                        width: parent.width;
+                        spacing: 8px;
+                        for space in root.spaces : Rectangle {
+                            width: 52px;
+                            height: 48px;
+                            border-radius: 12px;
+                            background: root.active-space-id == space.id && root.page == 0 ? root.hover : space-hit.has-hover ? root.hover : transparent;
+                            accessible-role: button;
+                            accessible-label: "Select space " + space.name;
+                            accessible-action-default => {
+                                root.active-space-id = space.id;
+                                root.active-space-name = space.name;
+                                root.select-space(space.id);
+                                root.page = 0;
+                            }
+                            AvatarBadge {
+                                x: (parent.width - 38px) / 2;
+                                y: 5px;
+                                initials: space.initials;
+                                accent: space.accent;
+                            }
+                            space-hit := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    root.active-space-id = space.id;
+                                    root.active-space-name = space.name;
+                                    root.select-space(space.id);
+                                    root.page = 0;
+                                }
+                            }
+                        }
+                    }
+                }
+                Rectangle { height: 1px; background: root.divider; }
+                IconAction {
+                    width: 52px;
+                    height: 48px;
+                    icon: "S";
+                    label: "Explore spaces";
+                    ink: root.muted;
+                    surface: root.rail;
+                    hover-surface: root.hover;
+                    activated => { root.page = 0; root.open-room("#discover"); }
+                }
+                IconAction {
+                    width: 52px;
+                    height: 48px;
+                    icon: "C";
+                    label: "Open call stage";
+                    ink: root.page == 2 ? root.accent : root.muted;
+                    surface: root.rail;
+                    hover-surface: root.hover;
+                    selected: root.page == 2;
+                    activated => { root.page = 2; }
+                }
+                IconAction {
+                    width: 52px;
+                    height: 48px;
+                    icon: "⚙";
+                    label: "Open settings";
+                    ink: root.page == 1 ? root.accent : root.muted;
+                    surface: root.rail;
+                    hover-surface: root.hover;
+                    selected: root.page == 1;
+                    activated => { root.page = 1; }
+                }
+            }
+        }
+
+        // Room list and Discord-style account control.
+        Rectangle {
+            width: root.room-list-width * 1px;
+            background: root.sidebar;
+            VerticalLayout {
+                spacing: 0px;
+                Rectangle {
+                    height: 62px;
+                    background: root.sidebar;
+                    HorizontalLayout {
+                        padding-left: 18px;
+                        padding-right: 14px;
+                        spacing: 8px;
+                        Text {
+                            text: "Morpheus";
+                            color: root.ink;
+                            font-size: 17px;
+                            font-weight: 750;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                        }
+                        Text {
+                            text: "v";
+                            color: root.muted;
+                            font-size: 17px;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+                Rectangle { height: 1px; background: root.divider; }
+                Rectangle {
+                    height: 57px;
+                    background: root.sidebar;
+                    Rectangle {
+                        x: 12px;
+                        y: 10px;
+                        width: parent.width - 24px;
+                        height: 37px;
+                        border-radius: 9px;
+                        background: root.elevated;
+                        Text {
+                            x: 12px;
+                            text: "Search rooms";
+                            color: root.muted;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                        }
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.page = 0; root.open-room("#discover"); }
+                        }
+                    }
+                }
+                ScrollView {
+                    vertical-stretch: 1;
+                    horizontal-scrollbar-policy: always-off;
+                    VerticalLayout {
+                        width: parent.width;
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        padding-bottom: 18px;
+                        spacing: 3px;
+                        Text {
+                            text: root.active-space-id == "" ? "YOUR ROOMS" : "SPACE ROOMS";
+                            color: root.muted;
+                            font-size: 10px;
+                            font-weight: 750;
+                            letter-spacing: 1px;
+                            height: 29px;
+                            vertical-alignment: bottom;
+                        }
+                        Rectangle {
+                            height: 30px;
+                            background: transparent;
+                            Text {
+                                x: 8px;
+                                text: "v   " + (root.active-space-id == "" ? "Home" : root.active-space-name);
+                                color: root.ink;
+                                font-size: 13px;
+                                font-weight: 650;
+                                vertical-alignment: center;
+                            }
+                        }
+                        for room in root.channels : Rectangle {
+                            height: 36px;
+                            border-radius: 8px;
+                            background: room.id == root.active-room-id && root.page == 0 ? root.hover : row-hit.has-hover ? root.elevated : transparent;
+                            accessible-role: button;
+                            accessible-label: "Open room " + room.name;
+                            accessible-action-default => { root.page = 0; root.open-room(room.id); }
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 9px;
+                                spacing: 8px;
+                                Text { text: room.private-room ? "⌑" : "#"; color: root.muted; font-size: 18px; vertical-alignment: center; }
+                                Text { text: room.name; color: room.unread > 0 ? root.ink : root.muted; font-size: 13px; font-weight: room.unread > 0 ? 700 : 500; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                                if room.unread > 0 : Rectangle {
+                                    width: 20px; height: 20px; border-radius: 10px; background: root.accent;
+                                    Text { text: room.unread; color: root.accent-ink; font-size: 10px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                                }
+                            }
+                            row-hit := TouchArea { mouse-cursor: pointer; clicked => { root.page = 0; root.open-room(room.id); } }
+                        }
+                        Text {
+                            text: "DIRECT MESSAGES";
+                            color: root.muted;
+                            font-size: 10px;
+                            font-weight: 750;
+                            letter-spacing: 1px;
+                            height: 40px;
+                            vertical-alignment: bottom;
+                        }
+                        for room in root.direct-messages : Rectangle {
+                            height: 39px;
+                            border-radius: 8px;
+                            background: room.id == root.active-room-id && root.page == 0 ? root.hover : dm-hit.has-hover ? root.elevated : transparent;
+                            accessible-role: button;
+                            accessible-label: "Open direct message with " + room.name;
+                            accessible-action-default => { root.page = 0; root.open-room(room.id); }
+                            HorizontalLayout {
+                                padding-left: 9px;
+                                padding-right: 9px;
+                                spacing: 9px;
+                                Rectangle {
+                                    width: 25px; height: 25px; border-radius: 9px; background: root.accent;
+                                    Text { text: "@"; color: root.accent-ink; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                                }
+                                Text { text: room.name; color: room.unread > 0 ? root.ink : root.muted; font-size: 13px; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                                if room.unread > 0 : Rectangle {
+                                    width: 20px; height: 20px; border-radius: 10px; background: root.accent;
+                                    Text { text: room.unread; color: root.accent-ink; font-size: 10px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                                }
+                            }
+                            dm-hit := TouchArea { mouse-cursor: pointer; clicked => { root.page = 0; root.open-room(room.id); } }
+                        }
+                    }
+                }
+                Rectangle { height: 1px; background: root.divider; }
+                Rectangle {
+                    height: 69px;
+                    background: root.rail;
+                    accessible-role: button;
+                    accessible-label: "Account menu for " + root.active-account-name + ", " + root.active-account-handle;
+                    accessible-expanded: root.account-menu-open;
+                    accessible-action-default => { root.account-menu-open = !root.account-menu-open; }
+                    HorizontalLayout {
+                        padding-left: 11px;
+                        padding-right: 11px;
+                        spacing: 10px;
+                        AvatarBadge { initials: root.active-account-initials; accent: root.active-account-accent; }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 2px;
+                            horizontal-stretch: 1;
+                            Text { text: root.active-account-name; color: root.ink; font-size: 13px; font-weight: 700; overflow: elide; }
+                            Text { text: root.active-account-handle; color: root.muted; font-size: 11px; overflow: elide; }
+                        }
+                        Text { text: "⌃"; color: root.muted; font-size: 16px; vertical-alignment: center; }
+                    }
+                    TouchArea { mouse-cursor: pointer; clicked => { root.account-menu-open = !root.account-menu-open; } }
+                }
+            }
+
+            // Drawn after the sidebar so it opens upward over the room list.
+            if root.account-menu-open : Rectangle {
+                x: 9px;
+                y: parent.height - self.height - 74px;
+                width: parent.width - 18px;
+                height: root.account-options.length > 5 ? 430px : 170px + root.account-options.length * 44px;
+                background: root.elevated;
+                border-color: root.divider;
+                border-width: 1px;
+                border-radius: 12px;
+                drop-shadow-color: #00000044;
+                drop-shadow-blur: 18px;
+                drop-shadow-offset-y: 7px;
+                VerticalLayout {
+                    padding: 8px;
+                    spacing: 2px;
+                    Text {
+                        text: "SWITCH ACCOUNT";
+                        color: root.muted;
+                        font-size: 10px;
+                        font-weight: 750;
+                        letter-spacing: 1px;
+                        height: 22px;
+                        vertical-alignment: center;
+                    }
+                    ScrollView {
+                        vertical-stretch: 1;
+                        horizontal-scrollbar-policy: always-off;
+                        VerticalLayout {
+                            width: parent.width;
+                            spacing: 2px;
+                    for account in root.account-options : Rectangle {
+                        height: 42px;
+                        border-radius: 8px;
+                        background: account.index == root.active-account-index ? root.hover : account-hit.has-hover ? root.hover : transparent;
+                        accessible-role: button;
+                        accessible-label: "Switch to " + account.name + ", " + account.handle;
+                        accessible-action-default => {
+                            if root.call-connected {
+                                root.pending-account-index = account.index;
+                                root.leave-call-dialog = true;
+                            } else {
+                                root.switch-account(account.index);
+                                root.account-menu-open = false;
+                            }
+                        }
+                        HorizontalLayout {
+                            padding-left: 5px;
+                            padding-right: 5px;
+                            spacing: 9px;
+                            AvatarBadge { width: 30px; height: 30px; border-radius: 10px; initials: account.initials; accent: account.accent; }
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 1px;
+                                horizontal-stretch: 1;
+                                Text { text: account.name; color: root.ink; font-size: 12px; font-weight: 650; overflow: elide; }
+                                Text { text: account.handle; color: root.muted; font-size: 10px; overflow: elide; }
+                            }
+                            if account.index == root.active-account-index : Text { text: "✓"; color: root.accent; font-size: 15px; vertical-alignment: center; }
+                        }
+                        account-hit := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                if root.call-connected {
+                                    root.pending-account-index = account.index;
+                                    root.leave-call-dialog = true;
+                                } else {
+                                    root.switch-account(account.index);
+                                    root.account-menu-open = false;
+                                }
+                            }
+                        }
+                    }
+                        }
+                    }
+                    Rectangle { height: 1px; background: root.divider; }
+                    Rectangle {
+                        height: 35px;
+                        border-radius: 8px;
+                        background: add-hit.has-hover ? root.hover : transparent;
+                        accessible-role: button;
+                        accessible-label: "Add another Matrix account";
+                        accessible-action-default => {
+                            if root.call-connected {
+                                root.pending-account-index = -2;
+                                root.leave-call-dialog = true;
+                            } else {
+                                root.add-account();
+                                root.account-menu-open = false;
+                            }
+                        }
+                        Text { x: 9px; text: "+   Add an account"; color: root.ink; font-size: 12px; vertical-alignment: center; }
+                        add-hit := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                if root.call-connected {
+                                    root.pending-account-index = -2;
+                                    root.leave-call-dialog = true;
+                                } else {
+                                    root.add-account();
+                                    root.account-menu-open = false;
+                                }
+                            }
+                        }
+                    }
+                    Rectangle {
+                        height: 35px;
+                        border-radius: 8px;
+                        background: manage-hit.has-hover ? root.hover : transparent;
+                        accessible-role: button;
+                        accessible-label: "Manage accounts";
+                        accessible-action-default => { root.manage-accounts-open = true; root.manage-accounts(); root.account-menu-open = false; }
+                        Text { x: 9px; text: "⚙   Manage accounts"; color: root.ink; font-size: 12px; vertical-alignment: center; }
+                        manage-hit := TouchArea { mouse-cursor: pointer; clicked => { root.manage-accounts-open = true; root.manage-accounts(); root.account-menu-open = false; } }
+                    }
+                    Rectangle {
+                        height: 35px;
+                        border-radius: 8px;
+                        background: logout-hit.has-hover ? root.hover : transparent;
+                        accessible-role: button;
+                        accessible-label: "Log out of current Matrix account";
+                        accessible-action-default => {
+                            if root.call-connected { root.pending-account-index = -3; root.leave-call-dialog = true; }
+                            else { root.log-out(); root.account-menu-open = false; }
+                        }
+                        Text { x: 9px; text: "↪   Log out"; color: #e47483; font-size: 12px; vertical-alignment: center; }
+                        logout-hit := TouchArea { mouse-cursor: pointer; clicked => {
+                            if root.call-connected { root.pending-account-index = -3; root.leave-call-dialog = true; }
+                            else { root.log-out(); root.account-menu-open = false; }
+                        } }
+                    }
+                }
+            }
+        }
+
+        // Conversation, settings, and call stage share the main canvas.
+        Rectangle {
+            horizontal-stretch: 1;
+            background: root.canvas;
+            VerticalLayout {
+                spacing: 0px;
+                Rectangle {
+                    height: 62px;
+                    background: root.canvas;
+                    HorizontalLayout {
+                        padding-left: 22px;
+                        padding-right: 16px;
+                        spacing: 11px;
+                        Text {
+                            text: root.page == 1 ? "⚙" : root.page == 2 ? "☏" : "#";
+                            color: root.muted;
+                            font-size: 20px;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.page == 1 ? "Settings" : root.page == 2 ? "Voice & video" : root.active-room-name;
+                            color: root.ink;
+                            font-size: 16px;
+                            font-weight: 750;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { width: 1px; height: 24px; background: root.divider; }
+                        Text {
+                            text: root.page == 0 ? root.active-room-topic : root.page == 1 ? "Make Morpheus yours" : "The Workshop";
+                            color: root.muted;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                        }
+                        if root.page == 0 : IconAction {
+                            icon: "C"; label: "Open call stage"; ink: root.muted; surface: root.canvas; hover-surface: root.hover;
+                            activated => { root.page = 2; }
+                        }
+                        if root.page == 0 : IconAction {
+                            icon: "P"; label: root.show-side-panel ? "Hide details panel" : "Show details panel";
+                            ink: root.muted; surface: root.canvas; hover-surface: root.hover;
+                            selected: root.show-side-panel;
+                            activated => { root.set-side-panel(!root.show-side-panel); }
+                        }
+                    }
+                }
+                Rectangle { height: 1px; background: root.divider; }
+                if root.config-error != "" : Rectangle {
+                    height: 39px;
+                    background: #9f3f50;
+                    Text {
+                        x: 16px;
+                        width: parent.width - 32px;
+                        text: "Settings file: " + root.config-error;
+                        color: #ffffff;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+                if root.session-error != "" : Rectangle {
+                    height: 34px;
+                    background: #613743;
+                    Text {
+                        x: 16px;
+                        width: parent.width - 32px;
+                        text: root.session-error;
+                        color: #ffffff;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+
+                if root.page == 0 : VerticalLayout {
+                    vertical-stretch: 1;
+                    spacing: 0px;
+                    Rectangle {
+                        height: 76px;
+                        background: root.canvas;
+                        VerticalLayout {
+                            padding-left: 24px;
+                            padding-right: 24px;
+                            spacing: 5px;
+                            Text { text: "Welcome to #" + root.active-room-name; color: root.ink; font-size: 24px; font-weight: 780; }
+                            Text { text: root.active-room-topic; color: root.muted; font-size: 12px; wrap: word-wrap; }
+                        }
+                    }
+                    timeline-list := ListView {
+                        vertical-stretch: 1;
+                        horizontal-scrollbar-policy: always-off;
+                        for message[index] in root.messages : Rectangle {
+                                width: timeline-list.visible-width;
+                                background: message-hover.has-hover ? root.elevated : transparent;
+                                min-height: 65px;
+                                VerticalLayout {
+                                    padding-left: 24px;
+                                    padding-right: 24px;
+                                    padding-top: 9px;
+                                    padding-bottom: 10px;
+                                    spacing: 5px;
+                                    HorizontalLayout {
+                                        spacing: 10px;
+                                        AvatarBadge { width: 36px; height: 36px; border-radius: 12px; initials: message.initials; accent: message.accent; }
+                                        VerticalLayout {
+                                            horizontal-stretch: 1;
+                                            spacing: 5px;
+                                            HorizontalLayout {
+                                                spacing: 8px;
+                                                Text { text: message.sender; color: root.ink; font-size: 13px; font-weight: 750; }
+                                                Text { text: message.time; color: root.muted; font-size: 10px; vertical-alignment: center; }
+                                            }
+                                            if message.reply-to != "" : Rectangle {
+                                                height: 25px;
+                                                border-radius: 5px;
+                                                background: root.hover;
+                                                Text { x: 8px; text: "Reply to " + message.reply-to; color: root.muted; font-size: 11px; vertical-alignment: center; overflow: elide; }
+                                            }
+                                            Text {
+                                                width: max(100px, timeline-list.visible-width - 110px);
+                                                text: message.body;
+                                                color: root.ink;
+                                                font-size: 13px;
+                                                wrap: word-wrap;
+                                                line-height-factor: 1.25;
+                                            }
+                                            if message.attachment != "" : Rectangle {
+                                                height: 49px;
+                                                border-radius: 8px;
+                                                border-color: root.divider;
+                                                border-width: 1px;
+                                                background: root.panel;
+                                                HorizontalLayout {
+                                                    padding-left: 12px;
+                                                    padding-right: 12px;
+                                                    spacing: 10px;
+                                                    Text { text: "F"; color: root.accent; font-size: 20px; vertical-alignment: center; }
+                                                    Text { text: message.attachment; color: root.ink; font-size: 12px; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
+                                                    Text { text: "↗"; color: root.muted; font-size: 16px; vertical-alignment: center; }
+                                                }
+                                            }
+                                            if message.reaction != "" : Rectangle {
+                                                width: 59px;
+                                                height: 24px;
+                                                border-radius: 8px;
+                                                border-color: root.divider;
+                                                border-width: 1px;
+                                                background: root.panel;
+                                                Text { text: message.reaction; color: root.ink; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; }
+                                            }
+                                        }
+                                    }
+                                }
+                                message-hover := TouchArea { mouse-cursor: default; }
+                        }
+                    }
+                    Rectangle {
+                        height: 78px;
+                        background: root.canvas;
+                        Rectangle {
+                            x: 18px;
+                            y: 7px;
+                            width: parent.width - 36px;
+                            height: 58px;
+                            border-radius: 11px;
+                            border-color: root.divider;
+                            border-width: 1px;
+                            background: root.elevated;
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 8px;
+                                spacing: 6px;
+                                IconAction {
+                                    icon: "+"; label: "Attach file"; ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                    activated => {
+                                        if root.live-session { root.session-error = "Attachments are not available in this build"; }
+                                        else { root.composer-text = root.composer-text + " [attachment]"; }
+                                    }
+                                }
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                    clip: true;
+                                    if root.composer-text == "" : Text {
+                                        x: 3px;
+                                        text: "Message #" + root.active-room-name;
+                                        color: root.muted;
+                                        font-size: 13px;
+                                        vertical-alignment: center;
+                                    }
+                                    TextInput {
+                                        x: 3px;
+                                        width: parent.width - 6px;
+                                        height: parent.height;
+                                        text <=> root.composer-text;
+                                        color: root.ink;
+                                        font-size: 13px;
+                                        vertical-alignment: center;
+                                        accessible-label: "Message composer";
+                                        edited => {
+                                            root.composer-edited(root.composer-text);
+                                        }
+                                        accepted => {
+                                            root.send-message(root.composer-text);
+                                        }
+                                    }
+                                }
+                                IconAction {
+                                    icon: "➤"; label: "Send message"; ink: root.accent;
+                                    surface: transparent; hover-surface: root.hover;
+                                    activated => { root.send-message(root.composer-text); }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if root.page == 1 : ScrollView {
+                    vertical-stretch: 1;
+                    horizontal-scrollbar-policy: always-off;
+                    VerticalLayout {
+                        width: parent.width;
+                        padding: 26px;
+                        spacing: 18px;
+                        Text { text: "Appearance"; color: root.ink; font-size: 24px; font-weight: 780; }
+                        Text { text: "Choose a theme that feels right in every room."; color: root.muted; font-size: 13px; }
+                        HorizontalLayout {
+                            spacing: 12px;
+                            for choice[index] in ["Dark", "Light", "High contrast", "System"] : Rectangle {
+                                width: 128px;
+                                height: 100px;
+                                background: index == root.theme-mode ? root.hover : root.elevated;
+                                border-color: index == root.theme-mode ? root.accent : root.divider;
+                                border-width: index == root.theme-mode ? 2px : 1px;
+                                border-radius: 11px;
+                                accessible-role: button;
+                                accessible-label: "Use " + choice + " theme";
+                                accessible-action-default => { root.choose-theme(index); }
+                                VerticalLayout {
+                                    padding: 14px;
+                                    spacing: 9px;
+                                    Rectangle {
+                                        height: 42px;
+                                        border-radius: 6px;
+                                        background: index == 1 ? #e6eaf2 : #11151f;
+                                        Rectangle {
+                                            x: 8px; y: 8px; width: 30px; height: 26px; border-radius: 4px;
+                                            background: index == 2 ? #ffff00 : #a88cff;
+                                        }
+                                    }
+                                    Text { text: choice; color: root.ink; font-size: 12px; font-weight: 700; overflow: elide; }
+                                }
+                                TouchArea { mouse-cursor: pointer; clicked => { root.choose-theme(index); } }
+                            }
+                        }
+                        Rectangle { height: 1px; background: root.divider; }
+                        Text { text: "Layout"; color: root.ink; font-size: 20px; font-weight: 750; }
+                        Rectangle {
+                            height: 70px; border-radius: 10px; background: root.elevated;
+                            HorizontalLayout {
+                                padding-left: 16px; padding-right: 16px; spacing: 12px;
+                                VerticalLayout {
+                                    alignment: center; horizontal-stretch: 1; spacing: 3px;
+                                    Text { text: "Members & thread panel"; color: root.ink; font-size: 13px; font-weight: 700; }
+                                    Text { text: "Show room context beside the conversation"; color: root.muted; font-size: 11px; }
+                                }
+                                IconAction {
+                                    icon: root.show-side-panel ? "✓" : "+";
+                                    label: root.show-side-panel ? "Hide side panel" : "Show side panel";
+                                    ink: root.accent; surface: root.panel; hover-surface: root.hover;
+                                    activated => { root.set-side-panel(!root.show-side-panel); }
+                                }
+                            }
+                        }
+                        Rectangle {
+                            height: 70px; border-radius: 10px; background: root.elevated;
+                            HorizontalLayout {
+                                padding-left: 16px; padding-right: 16px; spacing: 9px;
+                                VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 3px;
+                                    Text { text: "Room list width"; color: root.ink; font-size: 13px; font-weight: 700; }
+                                    Text { text: root.room-list-width + " px"; color: root.muted; font-size: 11px; }
+                                }
+                                IconAction { icon: "−"; label: "Narrow room list"; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-room-list-width(root.room-list-width - 20); } }
+                                IconAction { icon: "+"; label: "Widen room list"; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-room-list-width(root.room-list-width + 20); } }
+                            }
+                        }
+                        Rectangle {
+                            height: 70px; border-radius: 10px; background: root.elevated;
+                            HorizontalLayout {
+                                padding-left: 16px; padding-right: 16px; spacing: 9px;
+                                VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 3px;
+                                    Text { text: "Details panel width"; color: root.ink; font-size: 13px; font-weight: 700; }
+                                    Text { text: root.details-width + " px"; color: root.muted; font-size: 11px; }
+                                }
+                                IconAction { icon: "−"; label: "Narrow details panel"; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-details-width(root.details-width - 20); } }
+                                IconAction { icon: "+"; label: "Widen details panel"; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-details-width(root.details-width + 20); } }
+                            }
+                        }
+                        Rectangle {
+                            height: 70px; border-radius: 10px; background: root.elevated;
+                            HorizontalLayout {
+                                padding-left: 16px; padding-right: 16px; spacing: 9px;
+                                VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 3px;
+                                    Text { text: "Timeline performance preview"; color: root.ink; font-size: 13px; font-weight: 700; }
+                                    Text { text: root.stress-timeline-active ? "10,000 synthetic messages loaded" : "Test variable-height messages at scale"; color: root.muted; font-size: 11px; }
+                                }
+                                IconAction {
+                                    icon: root.stress-timeline-active ? "✓" : "10k";
+                                    label: root.stress-timeline-active ? "Restore preview messages" : "Load 10,000 preview messages";
+                                    ink: root.accent; surface: root.panel; hover-surface: root.hover;
+                                    activated => { root.toggle-stress-timeline(); }
+                                }
+                            }
+                        }
+                        Rectangle { height: 1px; background: root.divider; }
+                        Text { text: "Accounts"; color: root.ink; font-size: 20px; font-weight: 750; }
+                        Text { text: "Select your account in the bottom-left corner to switch instantly."; color: root.muted; font-size: 13px; wrap: word-wrap; }
+                        Rectangle { height: 1px; background: root.divider; }
+                        Text { text: "Advanced customization"; color: root.ink; font-size: 20px; font-weight: 750; }
+                        Text { text: "Edit your settings and theme pack files. Valid changes appear here automatically."; color: root.muted; font-size: 12px; wrap: word-wrap; }
+                        Text { text: root.config-path; color: root.muted; font-size: 11px; wrap: word-wrap; }
+                        Rectangle { height: 1px; background: root.divider; }
+                        Text { text: "About"; color: root.ink; font-size: 20px; font-weight: 750; }
+                        Text { text: "Morpheus is an open-source Matrix desktop client."; color: root.muted; font-size: 12px; wrap: word-wrap; }
+                        Text { text: "Interface powered by Slint · slint.dev"; color: root.muted; font-size: 12px; wrap: word-wrap; }
+                        AboutSlint { }
+                    }
+                }
+
+                if root.page == 2 : VerticalLayout {
+                    vertical-stretch: 1;
+                    padding: 24px;
+                    spacing: 16px;
+                    Text { text: root.live-session ? "Audio call · " + root.active-room-name : "The Workshop · Lounge"; color: root.ink; font-size: 21px; font-weight: 760; }
+                    Text {
+                        text: root.live-session
+                            ? (root.native-call-enabled ? root.native-call-status : "Native calls are unavailable in this build")
+                            : (root.call-connected ? "Call preview active · no network connection" : "Call preview · no network connection");
+                        color: root.muted; font-size: 12px;
+                    }
+                    if root.live-session : Rectangle {
+                        vertical-stretch: 1; background: root.elevated; border-radius: 14px;
+                        Text {
+                            text: root.native-call-enabled
+                                ? "Native audio is available when this homeserver advertises a compatible MatrixRTC service. Select a room and join its call."
+                                : "This build does not include the native media backend.";
+                            color: root.muted; font-size: 15px; wrap: word-wrap;
+                            horizontal-alignment: center; vertical-alignment: center;
+                            x: 28px; width: parent.width - 56px;
+                        }
+                        if root.native-call-enabled : Rectangle {
+                            x: (parent.width - 176px) / 2; y: parent.height - 76px;
+                            width: 176px; height: 42px; border-radius: 9px;
+                            background: root.hover; border-color: root.divider; border-width: 1px;
+                            accessible-role: button; accessible-label: "Open MatrixRTC call in selected room";
+                            accessible-action-default => { root.open-native-call-slot(); }
+                            Text { text: "Open room call"; color: root.ink; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                            TouchArea { mouse-cursor: pointer; clicked => { root.open-native-call-slot(); } }
+                        }
+                    }
+                    if !root.live-session : HorizontalLayout {
+                        vertical-stretch: 1;
+                        spacing: 12px;
+                        Rectangle {
+                            horizontal-stretch: 1; background: root.elevated; border-radius: 14px;
+                            AvatarBadge { x: (parent.width - 74px) / 2; y: (parent.height - 74px) / 2 - 16px; width: 74px; height: 74px; border-radius: 24px; initials: "AM"; accent: #a88cff; }
+                            Text { y: parent.height - 43px; text: "Alex"; color: root.ink; font-size: 13px; font-weight: 700; horizontal-alignment: center; }
+                        }
+                        Rectangle {
+                            horizontal-stretch: 1; background: root.elevated; border-radius: 14px;
+                            AvatarBadge { x: (parent.width - 74px) / 2; y: (parent.height - 74px) / 2 - 16px; width: 74px; height: 74px; border-radius: 24px; initials: "JN"; accent: #f39f78; }
+                            Text { y: parent.height - 43px; text: "Jules"; color: root.ink; font-size: 13px; font-weight: 700; horizontal-alignment: center; }
+                        }
+                    }
+                    if !root.live-session : HorizontalLayout {
+                        vertical-stretch: 1;
+                        spacing: 12px;
+                        Rectangle {
+                            horizontal-stretch: 1; background: root.elevated; border-radius: 14px;
+                            AvatarBadge { x: (parent.width - 74px) / 2; y: (parent.height - 74px) / 2 - 16px; width: 74px; height: 74px; border-radius: 24px; initials: "SK"; accent: #78c8b1; }
+                            Text { y: parent.height - 43px; text: "Sam"; color: root.ink; font-size: 13px; font-weight: 700; horizontal-alignment: center; }
+                        }
+                        Rectangle {
+                            horizontal-stretch: 1; background: root.panel; border-radius: 14px;
+                            Text { text: "Your camera is off"; color: root.muted; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+                    Rectangle {
+                        height: 62px; background: root.panel; border-radius: 12px;
+                        HorizontalLayout {
+                            padding-left: 12px; padding-right: 12px; spacing: 8px; alignment: center;
+                            if !root.live-session : IconAction { width: 43px; height: 43px; icon: root.mic-muted ? "✕" : "♩"; label: root.mic-muted ? "Unmute microphone preview" : "Mute microphone preview"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.mic-muted = !root.mic-muted; } }
+                            if !root.live-session : IconAction { width: 43px; height: 43px; icon: "V"; label: root.camera-off ? "Turn camera preview on" : "Turn camera preview off"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.camera-off = !root.camera-off; } }
+                            Rectangle {
+                                width: 118px; height: 43px; border-radius: 9px; background: root.live-session && !root.native-call-enabled ? root.hover : root.call-connected ? #d65163 : root.accent;
+                                accessible-role: button;
+                                accessible-label: root.live-session ? (root.call-connected ? "Leave native audio call" : "Join native audio call") : (root.call-connected ? "End call preview" : "Start call preview");
+                                accessible-enabled: !root.live-session || root.native-call-enabled;
+                                accessible-action-default => {
+                                    if root.live-session {
+                                        if root.native-call-enabled {
+                                            if root.call-connected { root.end-native-call(); }
+                                            else { root.start-native-call(); }
+                                        }
+                                    } else { root.call-connected = !root.call-connected; }
+                                }
+                                Text { text: root.live-session ? (root.native-call-enabled ? (root.call-connected ? "Leave audio" : "Join audio") : "Unavailable") : (root.call-connected ? "End preview" : "Start preview"); color: #ffffff; font-size: 13px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                                TouchArea { enabled: !root.live-session || root.native-call-enabled; mouse-cursor: pointer; clicked => {
+                                    if root.live-session {
+                                        if root.call-connected { root.end-native-call(); }
+                                        else { root.start-native-call(); }
+                                    } else { root.call-connected = !root.call-connected; }
+                                } }
+                            }
+                            IconAction { width: 43px; height: 43px; icon: "R"; label: "Return to chat"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.page = 0; } }
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.show-side-panel && root.page == 0 : Rectangle {
+            width: root.details-width * 1px;
+            background: root.panel;
+            border-color: root.divider;
+            border-width: 1px;
+            VerticalLayout {
+                spacing: 0px;
+                Rectangle {
+                    height: 62px;
+                    background: root.panel;
+                    HorizontalLayout {
+                        padding-left: 12px; padding-right: 12px; spacing: 4px;
+                        Rectangle {
+                            width: 101px; height: 34px; border-radius: 8px;
+                            background: root.side-panel-tab == 0 ? root.hover : transparent;
+                            accessible-role: button; accessible-label: "Show members";
+                            accessible-action-default => { root.side-panel-tab = 0; }
+                            Text { text: "Members"; color: root.side-panel-tab == 0 ? root.ink : root.muted; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                            TouchArea { mouse-cursor: pointer; clicked => { root.side-panel-tab = 0; } }
+                        }
+                        Rectangle {
+                            width: 101px; height: 34px; border-radius: 8px;
+                            background: root.side-panel-tab == 1 ? root.hover : transparent;
+                            accessible-role: button; accessible-label: "Show thread";
+                            accessible-action-default => { root.side-panel-tab = 1; }
+                            Text { text: "Thread"; color: root.side-panel-tab == 1 ? root.ink : root.muted; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                            TouchArea { mouse-cursor: pointer; clicked => { root.side-panel-tab = 1; } }
+                        }
+                    }
+                }
+                Rectangle { height: 1px; background: root.divider; }
+                if root.side-panel-tab == 0 : ScrollView {
+                    vertical-stretch: 1;
+                    horizontal-scrollbar-policy: always-off;
+                    VerticalLayout {
+                        width: parent.width;
+                        padding: 12px;
+                        spacing: 10px;
+                        Text { text: "IN THIS ROOM — " + root.members.length; color: root.muted; font-size: 10px; font-weight: 750; letter-spacing: 1px; height: 22px; vertical-alignment: center; }
+                        for member in root.members : Rectangle {
+                            height: 43px;
+                            background: transparent;
+                            HorizontalLayout {
+                                spacing: 9px;
+                                AvatarBadge { width: 32px; height: 32px; border-radius: 11px; initials: member.initials; accent: member.accent; }
+                                VerticalLayout {
+                                    alignment: center; horizontal-stretch: 1; spacing: 2px;
+                                    Text { text: member.name; color: root.ink; font-size: 12px; font-weight: 700; overflow: elide; }
+                                    Text { text: member.detail; color: root.muted; font-size: 10px; overflow: elide; }
+                                }
+                                Rectangle { width: 7px; height: 7px; border-radius: 4px; background: member.online ? #64c9a7 : root.muted; }
+                            }
+                        }
+                    }
+                }
+                if root.side-panel-tab == 1 : VerticalLayout {
+                    vertical-stretch: 1;
+                    padding: 17px;
+                    spacing: 12px;
+                    Text { text: "Thread"; color: root.ink; font-size: 19px; font-weight: 750; }
+                    Text { text: "A closer look at the conversation."; color: root.muted; font-size: 12px; wrap: word-wrap; }
+                    Rectangle { height: 1px; background: root.divider; }
+                    Text { text: "Jules · 10:42 AM"; color: root.ink; font-size: 12px; font-weight: 700; }
+                    Text { text: "I put together a few notes on the layout. The sidebar can stay compact while the conversation takes the lead."; color: root.muted; font-size: 12px; wrap: word-wrap; }
+                    Rectangle { height: 1px; background: root.divider; }
+                    Text { text: "Sam · 10:47 AM"; color: root.ink; font-size: 12px; font-weight: 700; }
+                    Text { text: "The account switcher belongs right beside the current identity. This feels natural."; color: root.muted; font-size: 12px; wrap: word-wrap; }
+                    Rectangle { vertical-stretch: 1; background: transparent; }
+                    Text { text: "Thread replies are shown here."; color: root.muted; font-size: 11px; }
+                }
+            }
+        }
+    }
+
+    if root.leave-call-dialog : Rectangle {
+        background: #000000aa;
+        Rectangle {
+            x: (parent.width - 392px) / 2;
+            y: (parent.height - 214px) / 2;
+            width: 392px;
+            height: 214px;
+            background: root.elevated;
+            border-color: root.divider;
+            border-width: 1px;
+            border-radius: 14px;
+            accessible-role: region;
+            accessible-label: root.live-session ? "Leave call before changing accounts" : "End call preview before changing accounts";
+            VerticalLayout {
+                padding: 22px;
+                spacing: 13px;
+                Text { text: root.live-session ? "Leave call?" : "Leave call preview?"; color: root.ink; font-size: 19px; font-weight: 750; }
+                Text { text: root.live-session ? "Leave the current call before switching accounts or logging out." : "End the current preview before switching accounts or logging out."; color: root.muted; font-size: 12px; wrap: word-wrap; }
+                Rectangle { vertical-stretch: 1; background: transparent; }
+                HorizontalLayout {
+                    spacing: 9px;
+                    alignment: end;
+                    Rectangle {
+                        width: 104px; height: 36px; border-radius: 8px; background: root.panel;
+                        accessible-role: button; accessible-label: "Cancel account switch";
+                        accessible-action-default => { root.leave-call-dialog = false; root.pending-account-index = -1; }
+                        Text { text: "Cancel"; color: root.ink; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { mouse-cursor: pointer; clicked => { root.leave-call-dialog = false; root.pending-account-index = -1; } }
+                    }
+                    Rectangle {
+                        width: 153px; height: 36px; border-radius: 8px; background: root.accent;
+                        accessible-role: button; accessible-label: root.pending-account-index == -3 ? "End preview and log out" : "End preview and switch account";
+                        accessible-action-default => {
+                            root.call-connected = false;
+                            if root.pending-account-index == -2 { root.add-account(); }
+                            else if root.pending-account-index == -3 { root.log-out(); }
+                            else if root.pending-account-index >= 0 { root.switch-account(root.pending-account-index); }
+                            root.leave-call-dialog = false;
+                            root.pending-account-index = -1;
+                            root.account-menu-open = false;
+                        }
+                        Text { text: root.pending-account-index == -3 ? "End & log out" : "End & switch"; color: root.accent-ink; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => {
+                                root.call-connected = false;
+                                if root.pending-account-index == -2 { root.add-account(); }
+                                else if root.pending-account-index == -3 { root.log-out(); }
+                                else if root.pending-account-index >= 0 { root.switch-account(root.pending-account-index); }
+                                root.leave-call-dialog = false;
+                                root.pending-account-index = -1;
+                                root.account-menu-open = false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.manage-accounts-open && !root.show-sign-in : Rectangle {
+        background: #000000aa;
+        Rectangle {
+            x: (parent.width - 460px) / 2;
+            y: (parent.height - 430px) / 2;
+            width: 460px;
+            height: 430px;
+            border-radius: 14px;
+            border-color: root.divider;
+            border-width: 1px;
+            background: root.canvas;
+            accessible-role: region;
+            accessible-label: "Manage Matrix accounts";
+            VerticalLayout {
+                padding: 20px;
+                spacing: 10px;
+                Text { text: "Manage accounts"; color: root.ink; font-size: 21px; font-weight: 760; }
+                Text { text: "The current account appears first. Each account keeps its own rooms and session."; color: root.muted; font-size: 12px; wrap: word-wrap; }
+                ScrollView {
+                    vertical-stretch: 1;
+                    horizontal-scrollbar-policy: always-off;
+                    VerticalLayout {
+                        width: parent.width;
+                        spacing: 7px;
+                        for account in root.account-options : Rectangle {
+                            height: 56px; border-radius: 9px; background: root.elevated;
+                            HorizontalLayout {
+                                padding-left: 10px; padding-right: 10px; spacing: 10px;
+                                AvatarBadge { width: 35px; height: 35px; border-radius: 11px; initials: account.initials; accent: account.accent; }
+                                VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 2px;
+                                    Text { text: account.name; color: root.ink; font-size: 12px; font-weight: 700; }
+                                    Text { text: account.handle; color: root.muted; font-size: 10px; }
+                                }
+                                if account.index == root.active-account-index : Text { text: "CURRENT"; color: root.accent; font-size: 10px; font-weight: 700; vertical-alignment: center; }
+                            }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle {
+                        width: 120px; height: 38px; background: root.elevated; border-radius: 8px;
+                        accessible-role: button; accessible-label: "Add Matrix account";
+                        accessible-action-default => { root.manage-accounts-open = false; root.add-account(); }
+                        Text { text: "Add account"; color: root.ink; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { mouse-cursor: pointer; clicked => { root.manage-accounts-open = false; root.add-account(); } }
+                    }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    Rectangle {
+                        width: 80px; height: 38px; background: root.accent; border-radius: 8px;
+                        accessible-role: button; accessible-label: "Close account manager";
+                        accessible-action-default => { root.manage-accounts-open = false; }
+                        Text { text: "Done"; color: root.accent-ink; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        TouchArea { mouse-cursor: pointer; clicked => { root.manage-accounts-open = false; } }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.show-sign-in : Rectangle {
+        background: root.rail;
+        Rectangle {
+            x: (parent.width - 448px) / 2;
+            y: (parent.height - 528px) / 2;
+            width: 448px;
+            height: 576px;
+            border-radius: 18px;
+            border-color: root.divider;
+            border-width: 1px;
+            background: root.canvas;
+            accessible-role: form;
+            accessible-label: "Sign in to Matrix";
+            VerticalLayout {
+                padding: 28px;
+                spacing: 11px;
+                Rectangle {
+                    width: 48px; height: 48px; border-radius: 15px; background: root.accent;
+                    Text { text: "M"; color: root.accent-ink; font-size: 22px; font-weight: 800; horizontal-alignment: center; vertical-alignment: center; }
+                }
+                Text { text: "Welcome to Morpheus"; color: root.ink; font-size: 22px; font-weight: 770; }
+                Text { text: "Sign in with an existing Matrix account."; color: root.muted; font-size: 12px; }
+                Rectangle { height: 6px; background: transparent; }
+                Text { text: "HOMESERVER"; color: root.muted; font-size: 10px; font-weight: 750; letter-spacing: 1px; }
+                Rectangle {
+                    height: 42px; background: root.elevated; border-radius: 8px; border-color: root.divider; border-width: 1px; clip: true;
+                    TextInput { x: 11px; width: parent.width - 22px; height: parent.height; text <=> root.login-homeserver; color: root.ink; font-size: 13px; vertical-alignment: center; accessible-label: "Homeserver URL"; }
+                }
+                Text { text: "MATRIX ID OR USERNAME"; color: root.muted; font-size: 10px; font-weight: 750; letter-spacing: 1px; }
+                Rectangle {
+                    height: 42px; background: root.elevated; border-radius: 8px; border-color: root.divider; border-width: 1px; clip: true;
+                    TextInput { x: 11px; width: parent.width - 22px; height: parent.height; text <=> root.login-username; color: root.ink; font-size: 13px; vertical-alignment: center; accessible-label: "Matrix ID or username"; }
+                }
+                Text { text: "PASSWORD"; color: root.muted; font-size: 10px; font-weight: 750; letter-spacing: 1px; }
+                Rectangle {
+                    height: 42px; background: root.elevated; border-radius: 8px; border-color: root.divider; border-width: 1px; clip: true;
+                    TextInput {
+                        x: 11px; width: parent.width - 22px; height: parent.height;
+                        text <=> root.login-password; input-type: password;
+                        color: root.ink; font-size: 13px; vertical-alignment: center;
+                        accessible-label: "Password";
+                        accepted => {
+                            if !root.login-loading {
+                                let password = root.login-password;
+                                root.login-password = "";
+                                root.login-loading = true;
+                                root.submit-login(root.login-homeserver, root.login-username, password);
+                            }
+                        }
+                    }
+                }
+                if root.login-error != "" : Text { text: root.login-error; color: #e47483; font-size: 11px; wrap: word-wrap; }
+                if root.config-error != "" : Text { text: "Settings file: " + root.config-error; color: #e47483; font-size: 11px; wrap: word-wrap; }
+                Rectangle { vertical-stretch: 1; background: transparent; }
+                Rectangle {
+                    height: 43px; border-radius: 9px; background: root.accent;
+                    accessible-role: button;
+                    accessible-label: root.login-loading ? "Signing in" : "Sign in to Matrix";
+                    accessible-enabled: !root.login-loading;
+                    accessible-action-default => {
+                        if !root.login-loading {
+                            let password = root.login-password;
+                            root.login-password = "";
+                            root.login-loading = true;
+                            root.submit-login(root.login-homeserver, root.login-username, password);
+                        }
+                    }
+                    Text { text: root.login-loading ? "Signing in…" : "Sign in"; color: root.accent-ink; font-size: 13px; font-weight: 750; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea {
+                        enabled: !root.login-loading;
+                        mouse-cursor: pointer;
+                        clicked => {
+                            let password = root.login-password;
+                            root.login-password = "";
+                            root.login-loading = true;
+                            root.submit-login(root.login-homeserver, root.login-username, password);
+                        }
+                    }
+                }
+                Rectangle {
+                    height: 40px; border-radius: 9px; background: root.elevated;
+                    border-color: root.divider; border-width: 1px;
+                    accessible-role: button;
+                    accessible-label: "Sign in with browser using Matrix SSO";
+                    accessible-enabled: !root.login-loading;
+                    accessible-action-default => {
+                        if !root.login-loading {
+                            root.login-loading = true;
+                            root.submit-sso(root.login-homeserver);
+                        }
+                    }
+                    Text { text: "Sign in with browser · Matrix SSO"; color: root.ink; font-size: 12px; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                    TouchArea {
+                        enabled: !root.login-loading; mouse-cursor: pointer;
+                        clicked => {
+                            root.login-loading = true;
+                            root.submit-sso(root.login-homeserver);
+                        }
+                    }
+                }
+                Rectangle {
+                    height: 38px; border-radius: 8px; background: preview-hit.has-hover ? root.hover : transparent;
+                    accessible-role: button; accessible-label: "Open interactive preview without signing in";
+                    accessible-enabled: !root.login-loading;
+                    accessible-action-default => { if !root.login-loading { root.preview-demo(); } }
+                    Text { text: "Explore the interactive preview"; color: root.muted; font-size: 12px; horizontal-alignment: center; vertical-alignment: center; }
+                    preview-hit := TouchArea { enabled: !root.login-loading; mouse-cursor: pointer; clicked => { root.preview-demo(); } }
+                }
+            }
+        }
+    }
+}
