@@ -29,6 +29,11 @@ Spaces are a graph. Home contains DMs and rooms outside visible Spaces. A room
 can appear in multiple Space lists.
 
 Drop-in voice spaces are ordinary Matrix rooms with standard MatrixRTC calls.
+The native default room slot is `m.call#room`, matching the pinned RTC core and
+its passing two-device test. Element Call v0.26.1 uses `m.call#ROOM` for its
+newer room slot; that current-format interoperation remains unresolved.
+Morpheus exposes an explicit `RoomState` compatibility option for the older
+Element Call membership carrier, which passed encrypted browser-peer testing.
 Morpheus may add a state event with type `io.github.brk275.morpheus.voice`, an
 empty state key, and content `{"v":1,"enabled":true}` to mark shared voice
 presentation. The marker never grants access or replaces Matrix power levels.
@@ -41,7 +46,10 @@ older homeservers usable. Both feed the same room/timeline presentation model.
 ## Local data and security
 
 Configuration lives in the platform's standard config directory. Cached room
-state and encryption stores live in separate per-account data directories.
+state, encryption stores, and the local message search index live in separate
+per-account data directories. The SDK encrypts each account's search index
+with that account's store passphrase. Search queries run locally against
+indexed events; older history becomes searchable as it syncs or paginates.
 Tokens live in the operating-system credential vault; if the vault cannot store
 a token, the user signs in again next launch. The app never stores a token in
 TOML or diagnostics.
@@ -52,9 +60,19 @@ The app does not embed WebViews. Rich remote HTML and URL previews require
 sanitization and privacy controls before they are enabled in the interface.
 
 Attachment filenames are sanitized before they enter the UI. A downloaded
-attachment is decrypted for the selected account, checked against its declared
-size, and written only to a path selected by the user. The save holds account
-and room navigation guards through an atomic local replacement. The pinned SDK
-buffers the media HTTP response internally, so a malicious underdeclared media
-response can still exceed the nominal 25 MiB limit transiently; this must be
-resolved before public beta acceptance.
+attachment is decrypted for the selected account and rejects an oversized
+declared size when present. It is written only to a path selected by the user.
+The save holds account and room navigation guards through an atomic local
+replacement. Morpheus builds the media request with Ruma and downloads through
+a dedicated HTTP client with automatic redirects disabled. Each 307/308 target
+is checked before the next request; cross-origin targets must be public-looking
+HTTPS domain names, and the Matrix access token is never forwarded to them.
+Cross-origin requests use a separate no-proxy client whose DNS resolver rejects
+any answer set containing a private or otherwise non-public IP address. Reqwest
+connects to those checked socket addresses, and each new connection resolves
+and checks again; the original homeserver retains normal proxy support. CDN
+fetches that require a system proxy fail closed. The client checks each streamed
+chunk before adding it to the 25 MiB download buffer, verifies the ciphertext
+hash during decryption, and does not cache the result. The IPv6 public-prefix
+allowlist needs maintenance as IANA allocates new ranges. Live public CDN
+redirect, token-refresh, and packaged app save checks remain open.

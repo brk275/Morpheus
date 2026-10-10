@@ -290,7 +290,7 @@ mod tests {
     fn old_publication_cannot_capture_or_unmute_after_leave_and_rejoin() {
         let info = CallInfo {
             room_id: "!room:example.test".into(),
-            slot_id: "m.call#room".into(),
+            slot_id: "m.call#ROOM".into(),
             membership_id: "old-member".into(),
             local_identity: "old-focus-identity".into(),
         };

@@ -291,7 +291,7 @@ def probe() -> None:
         DISCOVERY_URL + "/get_token",
         data=json.dumps({
             "room_id": fixture["rooms"]["encrypted_room"],
-            "slot_id": "m.call#room",
+            "slot_id": "m.call#ROOM",
             "openid_token": openid,
             "member": {
                 "id": str(uuid.uuid4()),
@@ -438,6 +438,23 @@ def rtc_fixture() -> None:
         "/_matrix/client/v3/rooms/" + urllib.parse.quote(room_id, safe="") + "/join",
         token=matrix_env.login(bob)["access_token"], body={},
     )
+    # Element Call's compatibility mode writes msc3401 membership as room
+    # state. Give this disposable test peer enough power to publish it.
+    alice_token = matrix_env.login(alice)["access_token"]
+    power_path = (
+        "/_matrix/client/v3/rooms/" + urllib.parse.quote(room_id, safe="")
+        + "/state/m.room.power_levels/"
+    )
+    power = matrix_env.api(matrix_env.endpoint(server), power_path, token=alice_token)
+    power.setdefault("users", {})[bob["user_id"]] = 100
+    request = urllib.request.Request(
+        matrix_env.endpoint(server) + power_path,
+        data=json.dumps(power).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {alice_token}"},
+        method="PUT",
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        json.load(response)
     for account in accounts:
         joined = matrix_env.api(
             matrix_env.endpoint(server), "/_matrix/client/v3/joined_rooms",

@@ -52,7 +52,7 @@ jobs:
             libpipewire-0.3-dev libssl-dev libudev-dev libwayland-dev \
             libx11-dev libx11-xcb-dev libxcb1-dev libxcb-shape0-dev \
             libxcb-xfixes0-dev libxcursor-dev libxkbcommon-dev \
-            libxkbcommon-x11-dev libxrandr-dev pkg-config
+            libxkbcommon-x11-dev libxi6 libxrandr-dev pkg-config xvfb
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -62,6 +62,17 @@ jobs:
         run: cargo install cargo-packager --version 0.11.8 --locked
       - name: Build unsigned QA package
         run: cargo packager --release --formats ${{ matrix.formats }}
+      - name: Smoke test Linux AppImage under Xvfb
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set +e
+          timeout 12s xvfb-run -a -s '-screen 0 1280x800x24' dist/*.AppImage
+          result=$?
+          if [ "$result" -ne 124 ]; then
+            echo "The Linux AppImage exited before the smoke window (status $result)"
+            exit 1
+          fi
       - name: Upload unsigned internal QA package
         uses: actions/upload-artifact@v4
         with:

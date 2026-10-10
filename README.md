@@ -5,21 +5,25 @@ interface is inspired by familiar community-chat navigation, with a distinct
 design, deep configuration, and fast Matrix account switching.
 
 **Status:** private pre-alpha. Password sign-in, account switching, Spaces,
-room creation and joining, invitations, basic room timelines, plain-text
-replies and edits, reactions, text threads, encrypted per-room drafts, and
-native attachment selection and save controls are wired into the desktop app.
-Encrypted attachment transfer passed a local core roundtrip; the desktop
-controls still need live UI acceptance. The Matrix SSO token flow is wired but has
-not passed a browser login test. An opt-in native call path exposes controls to
-open or join a MatrixRTC room call on a compatible homeserver, plus a remote
-video tile and participant roster. Local encrypted two-device calls passed
-synthetic audio and camera transport, a shared voice-space marker, and real
-macOS display/window screen-track transport. Live call-stage rendering, real
-camera capture, packaged-app permissions, and Element Call interoperability
-remain to be verified. Rich formatting, media previews, full call controls, recovery
-screens, and platform acceptance tests remain in progress. Do not rely on this
-client for important conversations or encryption-key recovery yet. The first
-beta requires the cross-platform checks in [the feature matrix](docs/FEATURE_MATRIX.md).
+room creation and joining, invitations, public room discovery, basic room
+timelines, plain-text replies and edits, reactions, text threads, encrypted
+per-room drafts, local message search, and native attachment selection and
+save controls are wired into the desktop app. Encrypted attachment transfer
+and persisted search passed disposable two-homeserver tests; the desktop
+attachment controls still need live UI acceptance. The Matrix SSO token flow
+is wired but has not passed a browser login test. An opt-in native call path
+exposes room calls, a remote video tile, participant roster, mute/deafen, and
+an explicit legacy Element Call compatibility choice. Local encrypted
+two-device calls passed synthetic audio and camera transport, a shared
+voice-space marker, and real macOS display/window screen-track transport. A
+real Element Call v0.26.1 browser peer passed encrypted microphone/video
+receive and departure in the legacy room-state mode. Current Element Call
+mode, live remote-frame rendering, packaged-app permissions, and three-platform
+runtime behavior remain unverified. Rich formatting, media previews, full
+call controls, recovery screens, and platform acceptance tests remain in
+progress. Do not rely on this client for important conversations or
+encryption-key recovery yet. The first beta requires the cross-platform
+checks in [the feature matrix](docs/FEATURE_MATRIX.md).
 
 ![Morpheus desktop preview](docs/screenshots/desktop-preview.png)
 

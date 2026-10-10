@@ -5401,6 +5401,7 @@ dependencies = [
 name = "morpheus-app"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "chrono",
  "directories",
  "futures-util",
@@ -5415,6 +5416,7 @@ dependencies = [
  "tokio",
  "url",
  "webbrowser",
+ "zeroize",
 ]
 
 [[package]]
@@ -5437,6 +5439,7 @@ dependencies = [
  "keyring",
  "libsqlite3-sys",
  "matrix-sdk",
+ "matrix-sdk-crypto",
  "matrix-sdk-ui",
  "mime",
  "serde",

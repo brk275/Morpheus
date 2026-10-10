@@ -1,17 +1,20 @@
 //! Native desktop shell with a live Matrix session and an explicit offline preview.
 #![recursion_limit = "512"]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod attachments;
 #[cfg(feature = "native-calls")]
 mod calls;
 mod drafts;
 mod live;
+mod security;
 mod sso;
 #[cfg(feature = "native-calls")]
 mod video_render;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
 #[cfg(feature = "native-calls")]
 use std::sync::atomic::AtomicU64;
@@ -19,14 +22,18 @@ use std::sync::{Arc, atomic::Ordering};
 use std::thread;
 use std::time::Duration;
 
+use chrono::{Local, TimeZone};
 use directories::ProjectDirs;
 use morpheus_config::{Config, ConfigStore, Density, LoadedConfig, ThemeMode, ThemePack};
-use morpheus_matrix::{AccountManager, AttachmentSendUpdate, QueuedSendUpdate};
+use morpheus_matrix::{
+    AccountManager, AttachmentSendUpdate, MatrixLinkTarget, MessageInfo, MessageSearchResult,
+    PublicRoomInfo, PublicRoomsQuery, QueuedSendUpdate, parse_matrix_link_target,
+};
 use slint::{Color, Model, ModelRc, SharedString, VecModel};
 
 use crate::attachments::{UploadCommand, UploadController, mime_type_for};
 #[cfg(feature = "native-calls")]
-use crate::calls::{CallController, CallStatus};
+use crate::calls::{AudioUpdate, CallController, CallControllerError, CallJoinMode, CallStatus};
 use crate::live::{LiveUi, MessageTarget, RoomAction, show_error};
 #[cfg(feature = "native-calls")]
 use crate::video_render::VideoUpdate;
@@ -544,6 +551,8 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
         ui.set_room_action_error("".into());
         ui.set_invite_error("".into());
         ui.set_room_action_operation(ui.get_room_action_operation().wrapping_add(1));
+        reset_room_search(ui);
+        ui.set_element_call_compatibility(false);
     }
     ui.set_live_session(false);
     ui.set_stress_timeline_active(state.stress_backup.is_some());
@@ -593,6 +602,8 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
     ui.set_invitations(ModelRc::new(VecModel::from(Vec::<RoomItem>::new())));
     apply_room_sort(ui);
     ui.set_members(ModelRc::new(VecModel::from(account.members.clone())));
+    ui.set_member_loading(false);
+    ui.set_member_error("".into());
 
     if state.active_room == "#discover" {
         ui.set_active_room_id("#discover".into());
@@ -854,17 +865,231 @@ fn show_login_error(ui: &slint::Weak<AppWindow>, message: String) {
     });
 }
 
+fn directory_plain_text(value: &str, max_chars: usize) -> String {
+    let mut text = String::new();
+    for character in value.chars().take(max_chars) {
+        text.push(
+            if character.is_control()
+                || matches!(
+                    character,
+                    '\u{061c}'
+                        | '\u{200b}'..='\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2060}'..='\u{206f}'
+                        | '\u{feff}'
+                )
+            {
+                ' '
+            } else {
+                character
+            },
+        );
+    }
+    text.trim().to_owned()
+}
+
+fn search_time(timestamp_ms: u64) -> String {
+    i64::try_from(timestamp_ms)
+        .ok()
+        .and_then(|timestamp| Local.timestamp_millis_opt(timestamp).single())
+        .map(|time| time.format("%b %-d, %-I:%M %p").to_string())
+        .unwrap_or_else(|| "Unknown time".into())
+}
+
+fn search_result_item(result: MessageSearchResult) -> MessageSearchItem {
+    let body = directory_plain_text(&result.body, 500);
+    let sender = directory_plain_text(&result.sender, 100);
+    MessageSearchItem {
+        room_id: result.room_id.into(),
+        event_id: result.event_id.into(),
+        sender: if sender.is_empty() {
+            "Unknown sender".into()
+        } else {
+            sender.into()
+        },
+        time: search_time(result.timestamp_ms).into(),
+        preview: body.chars().take(150).collect::<String>().into(),
+        body: body.into(),
+    }
+}
+
+fn search_context_item(info: MessageInfo, room_id: &str) -> MessageSearchItem {
+    let body = directory_plain_text(&info.body, 500);
+    let sender = directory_plain_text(&info.sender, 100);
+    MessageSearchItem {
+        room_id: room_id.into(),
+        event_id: info.event_id.unwrap_or_default().into(),
+        sender: if sender.is_empty() {
+            "Unknown sender".into()
+        } else {
+            sender.into()
+        },
+        time: search_time(info.timestamp_ms).into(),
+        preview: body.chars().take(150).collect::<String>().into(),
+        body: body.into(),
+    }
+}
+
+fn reset_room_search(ui: &AppWindow) {
+    ui.set_room_search_operation(ui.get_room_search_operation().wrapping_add(1));
+    ui.set_room_search_context_operation(ui.get_room_search_context_operation().wrapping_add(1));
+    ui.set_room_search_loading(false);
+    ui.set_room_search_context_loading(false);
+    ui.set_room_search_query("".into());
+    ui.set_room_search_error("".into());
+    ui.set_room_search_context_error("".into());
+    ui.set_room_search_searched(false);
+    ui.set_room_search_results(ModelRc::new(
+        VecModel::from(Vec::<MessageSearchItem>::new()),
+    ));
+    ui.set_room_search_context(ModelRc::new(
+        VecModel::from(Vec::<MessageSearchItem>::new()),
+    ));
+    ui.set_room_search_selected_event_id("".into());
+    ui.set_room_search_selected_sender("".into());
+    ui.set_room_search_selected_time("".into());
+    ui.set_room_search_selected_body("".into());
+}
+
+fn public_room_item(room: PublicRoomInfo, route_server: &str) -> PublicRoomItem {
+    let id = room.room_id;
+    let alias = room.canonical_alias.unwrap_or_default();
+    let title = room
+        .name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| if alias.is_empty() { &id } else { &alias });
+    let title = directory_plain_text(title, 120);
+    let title = if title.is_empty() {
+        directory_plain_text(if alias.is_empty() { &id } else { &alias }, 120)
+    } else {
+        title
+    };
+    PublicRoomItem {
+        id: id.into(),
+        title: title.into(),
+        alias: directory_plain_text(&alias, 160).into(),
+        canonical_alias: alias.into(),
+        topic: directory_plain_text(room.topic.as_deref().unwrap_or(""), 240).into(),
+        members: format!("{} members", room.joined_members).into(),
+        is_space: room.is_space,
+        route_server: route_server.into(),
+    }
+}
+
+fn matrix_id_server(id: &str) -> Option<&str> {
+    let id = id.strip_prefix('!').or_else(|| id.strip_prefix('#'))?;
+    id.split_once(':')
+        .map(|(_, server)| server)
+        .filter(|server| !server.is_empty())
+}
+
+fn room_join_target(
+    input: &str,
+    canonical_alias: &str,
+    route_server: &str,
+) -> Result<MatrixLinkTarget, String> {
+    if input.trim().is_empty() {
+        return Err("Enter a room ID, alias, or Matrix link".into());
+    }
+    let mut target = parse_matrix_link_target(input).map_err(|error| error.to_string())?;
+    match &mut target {
+        MatrixLinkTarget::Room {
+            room_or_alias_id,
+            via_servers,
+            ..
+        } => {
+            let add_server = |server: &str, via_servers: &mut Vec<String>| {
+                if !server.is_empty() && !via_servers.iter().any(|known| known == server) {
+                    via_servers.push(server.to_owned());
+                }
+            };
+            let had_link_routes = !via_servers.is_empty();
+            add_server(route_server, via_servers);
+            if let Some(server) = matrix_id_server(canonical_alias) {
+                add_server(server, via_servers);
+            }
+            if !had_link_routes {
+                if let Some(server) = matrix_id_server(room_or_alias_id) {
+                    add_server(server, via_servers);
+                }
+            }
+            Ok(target)
+        }
+        MatrixLinkTarget::User { .. } => {
+            Err("That link identifies a user. Enter a room link or alias.".into())
+        }
+    }
+}
+
+/// Development-only account and config root for disposable desktop QA. The
+/// normal application paths are unchanged when this variable is absent.
+fn qa_profile_root() -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
+    #[cfg(debug_assertions)]
+    {
+        let Some(value) = std::env::var_os("MORPHEUS_QA_PROFILE_DIR") else {
+            return Ok(None);
+        };
+        let path = PathBuf::from(value);
+        if !path.is_absolute() {
+            return Err("MORPHEUS_QA_PROFILE_DIR must be an absolute path".into());
+        }
+        Ok(Some(path))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        Ok(None)
+    }
+}
+
 #[cfg(feature = "native-calls")]
 fn call_status_label(status: &CallStatus) -> String {
     match status {
         CallStatus::Idle => "Select a room, then open or join its audio call".into(),
+        CallStatus::OpeningSlot { .. } => "Opening MatrixRTC room call…".into(),
         CallStatus::Starting { .. } => "Joining MatrixRTC audio…".into(),
-        CallStatus::Joined { .. } => "Connected · native microphone and speaker".into(),
+        CallStatus::Joined { .. } => "Room call joined".into(),
         CallStatus::Ending { .. } => "Leaving call…".into(),
         CallStatus::CleanupFailed { reason, .. } => {
-            format!("Could not confirm call leave: {reason}. Confirm Leave again to continue.")
+            format!(
+                "Local media stopped; server leave unconfirmed: {}. Review before continuing.",
+                directory_plain_text(reason, 180)
+            )
         }
-        CallStatus::Failed { reason, .. } => format!("Call failed: {reason}"),
+        CallStatus::Failed { reason, .. } => {
+            format!("Call failed: {}", directory_plain_text(reason, 180))
+        }
+    }
+}
+
+#[cfg(feature = "native-calls")]
+fn call_room_id(status: &CallStatus) -> Option<&str> {
+    match status {
+        CallStatus::OpeningSlot { room_id, .. }
+        | CallStatus::Starting { room_id, .. }
+        | CallStatus::Ending { room_id, .. }
+        | CallStatus::CleanupFailed { room_id, .. } => Some(room_id),
+        CallStatus::Joined { call, .. } => Some(&call.room_id),
+        CallStatus::Idle | CallStatus::Failed { .. } => None,
+    }
+}
+
+#[cfg(feature = "native-calls")]
+fn call_room_display(
+    room_id: &str,
+    previous_room_id: &str,
+    previous_display: &str,
+    active_room_id: &str,
+    active_room_name: &str,
+) -> String {
+    if room_id.is_empty() {
+        String::new()
+    } else if previous_room_id == room_id && !previous_display.is_empty() {
+        previous_display.to_owned()
+    } else if active_room_id == room_id {
+        directory_plain_text(active_room_name, 140)
+    } else {
+        directory_plain_text(room_id, 260)
     }
 }
 
@@ -916,10 +1141,12 @@ fn clear_native_video(ui: &AppWindow) {
 
 #[cfg(feature = "native-calls")]
 fn ask_to_leave_call(ui: &slint::Weak<AppWindow>, calls: &CallController, action: i32) -> bool {
-    if !calls.status().blocks_account_switch() {
+    let status = calls.status();
+    if !status.blocks_account_switch() {
         return false;
     }
     if let Some(ui) = ui.upgrade() {
+        ui.set_native_leave_unconfirmed(matches!(status, CallStatus::CleanupFailed { .. }));
         ui.set_pending_account_index(action);
         ui.set_leave_call_dialog(true);
     }
@@ -944,20 +1171,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     morpheus_rtc::install_crypto_provider();
     let ui = AppWindow::new()?;
     ui.set_login_loading(true);
-    let data_dir = ProjectDirs::from("io.github", "brk275", "Morpheus")
-        .ok_or("No application data directory is available")?
-        .data_dir()
-        .to_path_buf();
+    let qa_profile = qa_profile_root()?;
+    let data_dir = if let Some(root) = &qa_profile {
+        root.join("data")
+    } else {
+        ProjectDirs::from("io.github", "brk275", "Morpheus")
+            .ok_or("No application data directory is available")?
+            .data_dir()
+            .to_path_buf()
+    };
     let manager = Arc::new(AccountManager::open(data_dir)?);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     let live = LiveUi::new(manager.clone(), runtime.handle().clone(), ui.as_weak());
+    security::register(&ui, live.clone(), runtime.handle().clone());
     let uploads = Arc::new(UploadController::default());
     ui.set_native_call_enabled(cfg!(feature = "native-calls"));
     ui.set_native_call_status("Select a room to check call availability".into());
     #[cfg(feature = "native-calls")]
     let calls = Arc::new(CallController::new(manager.clone()));
+    #[cfg(feature = "native-calls")]
+    let applied_audio_token = Arc::new(AtomicU64::new(0));
     #[cfg(feature = "native-calls")]
     {
         let calls = calls.clone();
@@ -967,12 +1202,83 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 let current = status.borrow_and_update().clone();
                 let connected = current.blocks_account_switch();
+                let joined = matches!(current, CallStatus::Joined { .. });
+                let leave_unconfirmed = matches!(current, CallStatus::CleanupFailed { .. });
                 let label = call_status_label(&current);
+                let room_id = call_room_id(&current).unwrap_or("").to_owned();
+                let calls_for_ui = calls.clone();
                 let _ = weak.upgrade_in_event_loop(move |ui| {
+                    if calls_for_ui.status() != current {
+                        return;
+                    }
+                    let room_display = call_room_display(
+                        &room_id,
+                        ui.get_native_call_room_id().as_str(),
+                        ui.get_native_call_room_display().as_str(),
+                        ui.get_active_room_id().as_str(),
+                        ui.get_active_room_name().as_str(),
+                    );
                     ui.set_call_connected(connected);
+                    ui.set_native_call_joined(joined);
+                    ui.set_native_leave_unconfirmed(leave_unconfirmed);
                     ui.set_native_call_status(label.into());
+                    ui.set_native_call_room_id(room_id.into());
+                    ui.set_native_call_room_display(room_display.into());
                 });
                 if status.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    #[cfg(feature = "native-calls")]
+    {
+        let calls = calls.clone();
+        let weak = ui.as_weak();
+        let applied_token = applied_audio_token.clone();
+        runtime.spawn(async move {
+            let mut audio = calls.subscribe_audio();
+            loop {
+                let update = audio.borrow_and_update().clone();
+                let calls_for_ui = calls.clone();
+                let applied_token = applied_token.clone();
+                let closed = weak
+                    .upgrade_in_event_loop(move |ui| {
+                        let current = calls_for_ui.audio_token();
+                        if update.token() != current {
+                            if applied_token.load(Ordering::SeqCst) != current {
+                                ui.set_native_audio_ready(false);
+                                ui.set_native_audio_failed(false);
+                                ui.set_native_microphone_muted(true);
+                                ui.set_native_deafened(false);
+                                applied_token.store(current, Ordering::SeqCst);
+                            }
+                            return;
+                        }
+                        match update {
+                            AudioUpdate::Unavailable { .. } => {
+                                ui.set_native_audio_ready(false);
+                                ui.set_native_audio_failed(false);
+                                ui.set_native_microphone_muted(true);
+                                ui.set_native_deafened(false);
+                            }
+                            AudioUpdate::Failed { .. } => {
+                                ui.set_native_audio_ready(false);
+                                ui.set_native_audio_failed(true);
+                                ui.set_native_microphone_muted(true);
+                                ui.set_native_deafened(false);
+                            }
+                            AudioUpdate::Applied { state, .. } => {
+                                ui.set_native_audio_ready(true);
+                                ui.set_native_audio_failed(false);
+                                ui.set_native_microphone_muted(state.microphone_muted);
+                                ui.set_native_deafened(state.deafened);
+                            }
+                        }
+                        applied_token.store(current, Ordering::SeqCst);
+                    })
+                    .is_err();
+                if closed || audio.changed().await.is_err() {
                     break;
                 }
             }
@@ -1061,7 +1367,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let weak = ui.as_weak();
         runtime.spawn(async move { live.restore(weak).await });
     }
-    let store = ConfigStore::standard()?;
+    let store = if let Some(root) = qa_profile {
+        ConfigStore::at(root.join("config.toml"))
+    } else {
+        ConfigStore::standard()?
+    };
     ui.set_config_path(store.path().display().to_string().into());
     match store.load_or_create() {
         Ok(config) => match store.load_theme(&config) {
@@ -1100,24 +1410,65 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let weak = ui.as_weak();
         let calls = calls.clone();
+        let call_live = live.clone();
         let handle = runtime.handle().clone();
         ui.on_open_native_call_slot(move || {
             let Some(window) = weak.upgrade() else {
                 return;
             };
+            if !window.get_live_session() || window.get_element_call_compatibility() {
+                return;
+            }
+            let account_id = window.get_active_account_local_id().to_string();
             let room_id = window.get_active_room_id().to_string();
+            if account_id.is_empty() || room_id.is_empty() {
+                return;
+            }
+            let calls = calls.clone();
+            let call_live = call_live.clone();
+            let weak = weak.clone();
+            handle.spawn(async move {
+                let _transition = call_live.account_transition.lock().await;
+                let result = calls.open_slot(&account_id, &room_id).await;
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    if ui.get_active_account_local_id().as_str() != account_id
+                        || ui.get_active_room_id().as_str() != room_id
+                        || ui.get_element_call_compatibility()
+                    {
+                        return;
+                    }
+                    match result {
+                        Ok(()) => ui.set_native_call_status(
+                            "Room call opened · join audio when ready".into(),
+                        ),
+                        Err(error) => ui.set_session_error(error.to_string().into()),
+                    }
+                });
+            });
+        });
+    }
+    #[cfg(feature = "native-calls")]
+    {
+        let weak = ui.as_weak();
+        let calls = calls.clone();
+        let applied_audio_token = applied_audio_token.clone();
+        let handle = runtime.handle().clone();
+        ui.on_toggle_native_microphone(move || {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            if !window.get_native_audio_ready() {
+                return;
+            }
+            let token = applied_audio_token.load(Ordering::SeqCst);
+            let muted = !window.get_native_microphone_muted();
             let calls = calls.clone();
             let weak = weak.clone();
             handle.spawn(async move {
-                match calls.open_slot(&room_id).await {
-                    Ok(()) => {
-                        let _ = weak.upgrade_in_event_loop(|ui| {
-                            ui.set_native_call_status(
-                                "Room call opened · join audio when ready".into(),
-                            );
-                        });
+                if let Err(error) = calls.set_microphone_muted(token, muted).await {
+                    if !matches!(error, CallControllerError::StaleCall) {
+                        show_error(&weak, error.to_string());
                     }
-                    Err(error) => show_error(&weak, error.to_string()),
                 }
             });
         });
@@ -1126,17 +1477,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let weak = ui.as_weak();
         let calls = calls.clone();
+        let applied_audio_token = applied_audio_token.clone();
+        let handle = runtime.handle().clone();
+        ui.on_toggle_native_deafen(move || {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            if !window.get_native_audio_ready() {
+                return;
+            }
+            let token = applied_audio_token.load(Ordering::SeqCst);
+            let deafened = !window.get_native_deafened();
+            let calls = calls.clone();
+            let weak = weak.clone();
+            handle.spawn(async move {
+                if let Err(error) = calls.set_deafened(token, deafened).await {
+                    if !matches!(error, CallControllerError::StaleCall) {
+                        show_error(&weak, error.to_string());
+                    }
+                }
+            });
+        });
+    }
+    #[cfg(feature = "native-calls")]
+    {
+        let weak = ui.as_weak();
+        let calls = calls.clone();
+        let call_live = live.clone();
         let handle = runtime.handle().clone();
         ui.on_start_native_call(move || {
             let Some(window) = weak.upgrade() else {
                 return;
             };
+            if !window.get_live_session() || window.get_call_connected() {
+                return;
+            }
+            let account_id = window.get_active_account_local_id().to_string();
             let room_id = window.get_active_room_id().to_string();
+            if account_id.is_empty() || room_id.is_empty() {
+                return;
+            }
+            let mode = if window.get_element_call_compatibility() {
+                CallJoinMode::ElementCallRoomState
+            } else {
+                CallJoinMode::Standard
+            };
             let calls = calls.clone();
+            let call_live = call_live.clone();
             let weak = weak.clone();
             handle.spawn(async move {
-                if let Err(error) = calls.start_two_person_audio(&room_id).await {
-                    show_error(&weak, error.to_string());
+                let _transition = call_live.account_transition.lock().await;
+                if let Err(error) = calls.start_audio(&account_id, &room_id, mode).await {
+                    let _ = weak.upgrade_in_event_loop(move |ui| {
+                        if ui.get_active_account_local_id().as_str() == account_id
+                            && ui.get_active_room_id().as_str() == room_id
+                        {
+                            ui.set_session_error(error.to_string().into());
+                        }
+                    });
                 }
             });
         });
@@ -1165,6 +1563,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let switch_calls = calls.clone();
     ui.on_switch_account(move |index| {
         if switch_live.is_live.load(Ordering::Acquire) {
+            if let Some(window) = weak.upgrade()
+                && security::block_account_change(&window, &switch_live.security_gate)
+            {
+                return;
+            }
             #[cfg(feature = "native-calls")]
             if ask_to_leave_call(&weak, &switch_calls, index) {
                 return;
@@ -1172,20 +1575,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Ok(index) = usize::try_from(index) {
                 switch_live.invalidate_navigation();
                 let live = switch_live.clone();
+                let security_gate = switch_live.security_gate.clone();
                 let ui = weak.clone();
                 #[cfg(feature = "native-calls")]
                 let calls = switch_calls.clone();
                 switch_handle.spawn(async move {
                     #[cfg(feature = "native-calls")]
-                    if calls.status().blocks_account_switch() {
-                        let _ = ui.upgrade_in_event_loop(move |window| {
-                            window.set_pending_account_index(index as i32);
-                            window.set_leave_call_dialog(true);
-                        });
-                        return;
-                    }
-                    if let Err(error) = live.select_account(index, ui.clone()).await {
-                        show_error(&ui, error.to_string());
+                    let result = live
+                        .select_account_guarded(index, ui.clone(), || {
+                            !calls.status().blocks_account_switch() && !security_gate.blocked()
+                        })
+                        .await;
+                    #[cfg(not(feature = "native-calls"))]
+                    let result = live
+                        .select_account_guarded(index, ui.clone(), || !security_gate.blocked())
+                        .await;
+                    match result {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            if security_gate.blocked() {
+                                let _ = ui.upgrade_in_event_loop(move |window| {
+                                    security::block_account_change(&window, &security_gate);
+                                });
+                            } else {
+                                let _ = ui.upgrade_in_event_loop(move |window| {
+                                    window.set_pending_account_index(index as i32);
+                                    window.set_leave_call_dialog(true);
+                                });
+                            }
+                        }
+                        Err(error) => show_error(&ui, error.to_string()),
                     }
                 });
             }
@@ -1206,13 +1625,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let room_handle = runtime.handle().clone();
     ui.on_open_room(move |room_id| {
         if room_live.is_live.load(Ordering::Acquire) {
-            room_live.invalidate_navigation();
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            let account_id = window.get_active_account_local_id().to_string();
+            if account_id.is_empty() {
+                return;
+            }
+            let navigation_epoch = room_live.invalidate_navigation();
+            reset_room_search(&window);
             let live = room_live.clone();
             let ui = weak.clone();
             room_handle.spawn(async move {
-                live.open_room(room_id.to_string(), ui.clone()).await;
-                if let Err(error) = live.refresh(ui.clone()).await {
-                    show_error(&ui, error.to_string());
+                if let Err(error) = live
+                    .select_room_for(
+                        &account_id,
+                        room_id.to_string(),
+                        navigation_epoch,
+                        ui.clone(),
+                    )
+                    .await
+                {
+                    if live.navigation_is_current(navigation_epoch) {
+                        let _ = ui.upgrade_in_event_loop(move |window| {
+                            if window.get_active_account_local_id().as_str() == account_id {
+                                window.set_session_error(error.to_string().into());
+                            }
+                        });
+                    }
                 }
             });
             return;
@@ -1223,6 +1663,344 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             apply_state(&ui, &state);
         }
     });
+
+    let weak = ui.as_weak();
+    let members_live = live.clone();
+    let members_handle = runtime.handle().clone();
+    ui.on_refresh_room_members(move || {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        if !members_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        let account_id = window.get_active_account_local_id().to_string();
+        let room_id = window.get_active_room_id().to_string();
+        if account_id.is_empty() || room_id.is_empty() {
+            return;
+        }
+        let live = members_live.clone();
+        let ui = weak.clone();
+        members_handle.spawn(async move {
+            live.refresh_members_for(account_id, room_id, ui, true)
+                .await;
+        });
+    });
+
+    let weak = ui.as_weak();
+    ui.on_open_discovery(move || {
+        if let Some(window) = weak.upgrade() {
+            if window.get_live_session() {
+                window.invoke_query_public_rooms(false);
+            }
+        }
+    });
+
+    let weak = ui.as_weak();
+    let search_live = live.clone();
+    let search_handle = runtime.handle().clone();
+    ui.on_query_room_messages(move || {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        if !search_live.is_live.load(Ordering::Acquire) {
+            window.set_room_search_error("Sign in to search messages".into());
+            return;
+        }
+        if window.get_room_search_loading() {
+            return;
+        }
+        let account_id = window.get_active_account_local_id().to_string();
+        let room_id = window.get_active_room_id().to_string();
+        if account_id.is_empty() || room_id.is_empty() {
+            window.set_room_search_error("Choose a Matrix room first".into());
+            return;
+        }
+        let query = window.get_room_search_query().trim().to_owned();
+        if query.is_empty() {
+            window.set_room_search_error("Enter a word or phrase to search".into());
+            return;
+        }
+        let operation = window.get_room_search_operation().wrapping_add(1);
+        window.set_room_search_operation(operation);
+        window.set_room_search_context_operation(
+            window.get_room_search_context_operation().wrapping_add(1),
+        );
+        window.set_room_search_loading(true);
+        window.set_room_search_searched(false);
+        window.set_room_search_error("".into());
+        window.set_room_search_context_error("".into());
+        window.set_room_search_context_loading(false);
+        window.set_room_search_selected_event_id("".into());
+        window.set_room_search_selected_sender("".into());
+        window.set_room_search_selected_time("".into());
+        window.set_room_search_selected_body("".into());
+        window.set_room_search_results(ModelRc::new(VecModel::from(
+            Vec::<MessageSearchItem>::new(),
+        )));
+        window.set_room_search_context(ModelRc::new(VecModel::from(
+            Vec::<MessageSearchItem>::new(),
+        )));
+        let manager = search_live.manager.clone();
+        let weak = weak.clone();
+        search_handle.spawn(async move {
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                manager.search_messages_for(&account_id, &room_id, &query, 25, 0),
+            )
+            .await
+            .map_err(|_| "Message search timed out".to_owned())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            let _ = weak.upgrade_in_event_loop(move |window| {
+                if window.get_active_account_local_id().as_str() != account_id
+                    || window.get_active_room_id().as_str() != room_id
+                    || window.get_room_search_operation() != operation
+                    || !window.get_live_session()
+                {
+                    return;
+                }
+                window.set_room_search_loading(false);
+                window.set_room_search_searched(true);
+                match result {
+                    Ok(results) => window.set_room_search_results(ModelRc::new(VecModel::from(
+                        results
+                            .into_iter()
+                            .map(search_result_item)
+                            .collect::<Vec<_>>(),
+                    ))),
+                    Err(error) => {
+                        window.set_room_search_error(directory_plain_text(&error, 220).into())
+                    }
+                }
+            });
+        });
+    });
+
+    let weak = ui.as_weak();
+    let context_live = live.clone();
+    let context_handle = runtime.handle().clone();
+    ui.on_open_search_result(move |event_id| {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        if !context_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        let account_id = window.get_active_account_local_id().to_string();
+        let room_id = window.get_active_room_id().to_string();
+        if account_id.is_empty()
+            || room_id.is_empty()
+            || !window
+                .get_room_search_results()
+                .iter()
+                .any(|result| result.room_id.as_str() == room_id && result.event_id == event_id)
+        {
+            return;
+        }
+        let event_id = event_id.to_string();
+        let operation = window.get_room_search_context_operation().wrapping_add(1);
+        window.set_room_search_context_operation(operation);
+        window.set_room_search_context_loading(true);
+        window.set_room_search_context_error("".into());
+        window.set_room_search_context(ModelRc::new(VecModel::from(
+            Vec::<MessageSearchItem>::new(),
+        )));
+        let manager = context_live.manager.clone();
+        let weak = weak.clone();
+        context_handle.spawn(async move {
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                manager.search_result_context_for(&account_id, &room_id, &event_id, 3),
+            )
+            .await
+            .map_err(|_| "Message context timed out".to_owned())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            let _ = weak.upgrade_in_event_loop(move |window| {
+                if window.get_active_account_local_id().as_str() != account_id
+                    || window.get_active_room_id().as_str() != room_id
+                    || window.get_room_search_selected_event_id().as_str() != event_id
+                    || window.get_room_search_context_operation() != operation
+                    || !window.get_live_session()
+                {
+                    return;
+                }
+                window.set_room_search_context_loading(false);
+                match result {
+                    Ok(context) => window.set_room_search_context(ModelRc::new(VecModel::from(
+                        context
+                            .into_iter()
+                            .map(|message| search_context_item(message, &room_id))
+                            .collect::<Vec<_>>(),
+                    ))),
+                    Err(error) => window
+                        .set_room_search_context_error(directory_plain_text(&error, 220).into()),
+                }
+            });
+        });
+    });
+
+    let weak = ui.as_weak();
+    let directory_live = live.clone();
+    let directory_handle = runtime.handle().clone();
+    ui.on_query_public_rooms(move |append| {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        if !directory_live.is_live.load(Ordering::Acquire) {
+            window.set_directory_error("Sign in to search public rooms".into());
+            return;
+        }
+        if window.get_directory_loading() {
+            return;
+        }
+        let account_id = window.get_active_account_local_id().to_string();
+        if account_id.is_empty() {
+            window.set_directory_error("Choose a Matrix account first".into());
+            return;
+        }
+        let since = if append {
+            let next = window.get_directory_next_batch().to_string();
+            if next.is_empty() {
+                return;
+            }
+            Some(next)
+        } else {
+            window
+                .set_directory_results(ModelRc::new(VecModel::from(Vec::<PublicRoomItem>::new())));
+            window.set_directory_next_batch("".into());
+            window.set_directory_searched(false);
+            None
+        };
+        let search = window.get_directory_search().trim().to_owned();
+        let server = window.get_directory_server().trim().to_owned();
+        let route_server = server.clone();
+        let query = PublicRoomsQuery {
+            search_term: (!search.is_empty()).then_some(search),
+            server: (!server.is_empty()).then_some(server),
+            since,
+            limit: 25,
+        };
+        let operation = window.get_directory_operation().wrapping_add(1);
+        window.set_directory_operation(operation);
+        window.set_directory_error("".into());
+        window.set_directory_loading(true);
+        let manager = directory_live.manager.clone();
+        let weak = weak.clone();
+        directory_handle.spawn(async move {
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                manager.public_rooms_for(&account_id, query),
+            )
+            .await
+            .map_err(|_| "Public room search timed out".to_owned())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            let _ = weak.upgrade_in_event_loop(move |window| {
+                if window.get_active_account_local_id().as_str() != account_id
+                    || window.get_directory_operation() != operation
+                {
+                    return;
+                }
+                window.set_directory_loading(false);
+                window.set_directory_searched(true);
+                match result {
+                    Ok(page) => {
+                        let mut rooms = if append {
+                            window.get_directory_results().iter().collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        };
+                        let mut seen = rooms
+                            .iter()
+                            .map(|room| room.id.to_string())
+                            .collect::<HashSet<_>>();
+                        for room in page.rooms {
+                            let item = public_room_item(room, &route_server);
+                            if seen.insert(item.id.to_string()) {
+                                rooms.push(item);
+                            }
+                        }
+                        window.set_directory_results(ModelRc::new(VecModel::from(rooms)));
+                        window.set_directory_next_batch(page.next_batch.unwrap_or_default().into());
+                    }
+                    Err(error) => window.set_directory_error(error.into()),
+                }
+            });
+        });
+    });
+
+    let weak = ui.as_weak();
+    let directory_live = live.clone();
+    let directory_handle = runtime.handle().clone();
+    ui.on_join_discovery_target(
+        move |input, canonical_alias, route_server, display_name, is_space| {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            if !directory_live.is_live.load(Ordering::Acquire) {
+                window.set_directory_join_error("Sign in to join a Matrix room".into());
+                return;
+            }
+            if window.get_directory_join_busy() {
+                return;
+            }
+            let account_id = window.get_active_account_local_id().to_string();
+            if account_id.is_empty() {
+                window.set_directory_join_error("Choose a Matrix account first".into());
+                return;
+            }
+            let target = match room_join_target(&input, &canonical_alias, &route_server) {
+                Ok(target) => target,
+                Err(error) => {
+                    window.set_directory_join_error(error.into());
+                    return;
+                }
+            };
+            let operation = window.get_directory_join_operation().wrapping_add(1);
+            window.set_directory_join_operation(operation);
+            window.set_directory_join_error("".into());
+            window.set_directory_join_busy(true);
+            window.set_directory_joining_room_id(input.clone());
+            let space_hint = (!display_name.is_empty()).then_some(is_space);
+            let live = directory_live.clone();
+            let weak = weak.clone();
+            directory_handle.spawn(async move {
+                let result = tokio::time::timeout(
+                    Duration::from_secs(60),
+                    live.join_matrix_target(
+                        &account_id,
+                        &target,
+                        space_hint,
+                        &display_name,
+                        weak.clone(),
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    "Join timed out. It may have completed; refresh your rooms before retrying."
+                        .to_owned()
+                })
+                .and_then(|result| result.map_err(|error| error.to_string()));
+                let _ = weak.upgrade_in_event_loop(move |window| {
+                    if window.get_active_account_local_id().as_str() != account_id
+                        || window.get_directory_join_operation() != operation
+                    {
+                        return;
+                    }
+                    window.set_directory_join_busy(false);
+                    window.set_directory_joining_room_id("".into());
+                    match result {
+                        Ok(()) => {
+                            window.set_directory_join_input("".into());
+                            if window.get_page() == 3 {
+                                window.set_page(0);
+                            }
+                        }
+                        Err(error) => window.set_directory_join_error(error.into()),
+                    }
+                });
+            });
+        },
+    );
 
     let weak = ui.as_weak();
     let action_live = live.clone();
@@ -1239,9 +2017,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return;
         }
         let action = match mode {
-            0 => RoomAction::CreatePrivate,
-            1 => RoomAction::Join,
-            2 => RoomAction::CreateSpace,
+            0 => Some(RoomAction::CreatePrivate),
+            1 => None,
+            2 => Some(RoomAction::CreateSpace),
             _ => return,
         };
         let account_id = window.get_active_account_local_id().to_string();
@@ -1257,9 +2035,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let weak = weak.clone();
         let submitted = input.to_string();
         action_handle.spawn(async move {
-            let result = live
-                .run_room_action(&account_id, action, &submitted, weak.clone())
-                .await;
+            let result = match action {
+                Some(action) => live
+                    .run_room_action(&account_id, action, &submitted, weak.clone())
+                    .await
+                    .map_err(|error| error.to_string()),
+                None => match room_join_target(&submitted, "", "") {
+                    Ok(target) => live
+                        .join_matrix_target(&account_id, &target, None, "", weak.clone())
+                        .await
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error),
+                },
+            };
             let _ = weak.upgrade_in_event_loop(move |window| {
                 if window.get_active_account_local_id().as_str() != account_id
                     || window.get_room_action_operation() != operation
@@ -1273,7 +2061,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         window.set_room_action_input("".into());
                         window.set_page(0);
                     }
-                    Err(error) => window.set_room_action_error(error.to_string().into()),
+                    Err(error) => window.set_room_action_error(error.into()),
                 }
             });
         });
@@ -1328,12 +2116,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !space_live.is_live.load(Ordering::Acquire) {
             return;
         }
-        space_live.invalidate_navigation();
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        let account_id = window.get_active_account_local_id().to_string();
+        if account_id.is_empty() {
+            return;
+        }
+        let navigation_epoch = space_live.invalidate_navigation();
         let live = space_live.clone();
         let ui = weak.clone();
         space_handle.spawn(async move {
-            if let Err(error) = live.select_space(space_id.to_string(), ui.clone()).await {
-                show_error(&ui, error.to_string());
+            if let Err(error) = live
+                .select_space_for(
+                    &account_id,
+                    space_id.to_string(),
+                    navigation_epoch,
+                    ui.clone(),
+                )
+                .await
+            {
+                if live.navigation_is_current(navigation_epoch) {
+                    let _ = ui.upgrade_in_event_loop(move |window| {
+                        if window.get_active_account_local_id().as_str() == account_id {
+                            window.set_session_error(error.to_string().into());
+                        }
+                    });
+                }
             }
         });
     });
@@ -1886,11 +2695,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let live = reaction_live.clone();
             let weak = weak.clone();
             reaction_handle.spawn(async move {
+                let error_account_id = account_id.clone();
+                let error_room_id = room_id.clone();
                 if let Err(error) = live
                     .toggle_reaction(account_id, room_id, event_id, reaction)
                     .await
                 {
-                    show_error(&weak, error.to_string());
+                    let message = directory_plain_text(&error.to_string(), 240);
+                    let _ = weak.upgrade_in_event_loop(move |window| {
+                        if window.get_active_account_local_id().as_str() == error_account_id
+                            && window.get_active_room_id().as_str() == error_room_id
+                        {
+                            window.set_session_error(message.into());
+                        }
+                    });
                 }
             });
             return;
@@ -1935,11 +2753,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let generation = live.begin_thread_request();
             let weak = weak.clone();
             thread_handle.spawn(async move {
+                let error_account_id = account_id.clone();
+                let error_room_id = room_id.clone();
+                let error_live = live.clone();
                 if let Err(error) = live
                     .open_thread(account_id, room_id, event_id, generation, weak.clone())
                     .await
                 {
-                    show_error(&weak, error.to_string());
+                    let message = directory_plain_text(&error.to_string(), 240);
+                    let _ = weak.upgrade_in_event_loop(move |window| {
+                        if error_live.thread_request_is_current(generation)
+                            && window.get_active_account_local_id().as_str() == error_account_id
+                            && window.get_active_room_id().as_str() == error_room_id
+                        {
+                            window.set_session_error(message.into());
+                        }
+                    });
                 }
             });
             return;
@@ -2004,7 +2833,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         });
                     }
-                    Err(error) => show_error(&weak, error.to_string()),
+                    Err(error) => {
+                        let message = directory_plain_text(&error.to_string(), 240);
+                        let _ = weak.upgrade_in_event_loop(move |ui| {
+                            if ui.get_active_account_local_id().as_str() == account_id
+                                && ui.get_active_room_id().as_str() == room_id
+                                && ui.get_thread_root_id().as_str() == root_id
+                            {
+                                ui.set_session_error(message.into());
+                            }
+                        });
+                    }
                 }
             });
             return;
@@ -2033,9 +2872,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let weak = ui.as_weak();
+    let add_security_gate = live.security_gate.clone();
     #[cfg(feature = "native-calls")]
     let add_calls = calls.clone();
     ui.on_add_account(move || {
+        if let Some(window) = weak.upgrade()
+            && security::block_account_change(&window, &add_security_gate)
+        {
+            return;
+        }
         #[cfg(feature = "native-calls")]
         if ask_to_leave_call(&weak, &add_calls, -2) {
             return;
@@ -2055,6 +2900,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if ui.get_login_loading() {
                 return;
             }
+            if security::block_account_change(&ui, &preview_live.security_gate) {
+                return;
+            }
             preview_live.invalidate_navigation();
             preview_live.is_live.store(false, Ordering::Release);
             let live = preview_live.clone();
@@ -2064,6 +2912,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
             ui.set_login_error("".into());
             ui.set_session_error("Interactive preview · no Matrix connection".into());
+            security::clear_ui(&ui, &preview_live.security_gate);
             ui.set_show_sign_in(false);
             ui.set_composer_text("".into());
             apply_state(&ui, &preview_state.borrow());
@@ -2073,12 +2922,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     let login_live = live.clone();
     let login_handle = runtime.handle().clone();
+    #[cfg(feature = "native-calls")]
+    let login_calls = calls.clone();
     ui.on_submit_login(move |homeserver, username, password| {
+        if let Some(window) = weak.upgrade()
+            && security::block_account_change(&window, &login_live.security_gate)
+        {
+            window.set_login_loading(false);
+            return;
+        }
         login_live.invalidate_navigation();
         let live = login_live.clone();
+        let security_gate = login_live.security_gate.clone();
         let ui = weak.clone();
+        #[cfg(feature = "native-calls")]
+        let calls = login_calls.clone();
         login_handle.spawn(async move {
             let _transition = live.account_transition.lock().await;
+            if security_gate.blocked() {
+                show_login_error(
+                    &ui,
+                    "Finish the current security operation or save its recovery key first".into(),
+                );
+                return;
+            }
+            #[cfg(feature = "native-calls")]
+            if calls.status().blocks_account_switch() {
+                show_login_error(
+                    &ui,
+                    "Leave the active call before signing in to another account".into(),
+                );
+                return;
+            }
             if let Err(error) = live.flush_drafts().await {
                 show_login_error(&ui, format!("Could not save current draft: {error}"));
                 return;
@@ -2093,6 +2968,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Err(error) = live.refresh(ui.clone()).await {
                         show_login_error(&ui, error.to_string());
                     } else {
+                        let _ = ui.upgrade_in_event_loop(|window| {
+                            window.set_login_loading(false);
+                            window.set_login_error("".into());
+                            window.set_show_sign_in(false);
+                        });
                         tokio::spawn(live.clone().scan_spaces(ui));
                     }
                 }
@@ -2104,12 +2984,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     let sso_live = live.clone();
     let sso_handle = runtime.handle().clone();
+    #[cfg(feature = "native-calls")]
+    let sso_calls = calls.clone();
     ui.on_submit_sso(move |homeserver| {
+        if let Some(window) = weak.upgrade()
+            && security::block_account_change(&window, &sso_live.security_gate)
+        {
+            window.set_login_loading(false);
+            return;
+        }
         sso_live.invalidate_navigation();
         let live = sso_live.clone();
+        let security_gate = sso_live.security_gate.clone();
         let ui = weak.clone();
+        #[cfg(feature = "native-calls")]
+        let calls = sso_calls.clone();
         sso_handle.spawn(async move {
             let _transition = live.account_transition.lock().await;
+            if security_gate.blocked() {
+                show_login_error(
+                    &ui,
+                    "Finish the current security operation or save its recovery key first".into(),
+                );
+                return;
+            }
+            #[cfg(feature = "native-calls")]
+            if calls.status().blocks_account_switch() {
+                show_login_error(
+                    &ui,
+                    "Leave the active call before signing in to another account".into(),
+                );
+                return;
+            }
             if let Err(error) = live.flush_drafts().await {
                 show_login_error(&ui, format!("Could not save current draft: {error}"));
                 return;
@@ -2120,6 +3026,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Err(error) = live.refresh(ui.clone()).await {
                         show_login_error(&ui, error.to_string());
                     } else {
+                        let _ = ui.upgrade_in_event_loop(|window| {
+                            window.set_login_loading(false);
+                            window.set_login_error("".into());
+                            window.set_show_sign_in(false);
+                        });
                         tokio::spawn(live.clone().scan_spaces(ui));
                     }
                 }
@@ -2170,16 +3081,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             return;
         }
+        if let Some(window) = weak.upgrade()
+            && security::block_account_change(&window, &logout_live.security_gate)
+        {
+            return;
+        }
         #[cfg(feature = "native-calls")]
         if ask_to_leave_call(&weak, &logout_calls, -3) {
             return;
         }
         logout_live.invalidate_navigation();
         let live = logout_live.clone();
+        let security_gate = logout_live.security_gate.clone();
         let ui = weak.clone();
         #[cfg(feature = "native-calls")]
         let calls = logout_calls.clone();
         logout_handle.spawn(async move {
+            let transition = live.account_transition.lock().await;
+            if security_gate.blocked() {
+                let _ = ui.upgrade_in_event_loop(move |window| {
+                    security::block_account_change(&window, &security_gate);
+                });
+                return;
+            }
             #[cfg(feature = "native-calls")]
             if calls.status().blocks_account_switch() {
                 let _ = ui.upgrade_in_event_loop(|window| {
@@ -2188,7 +3112,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 return;
             }
-            let transition = live.account_transition.lock().await;
             let Some(active) = live.manager.active_account().await else {
                 return;
             };
@@ -2204,7 +3127,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let accounts = live.manager.accounts().await;
                     if accounts.is_empty() {
                         live.is_live.store(false, Ordering::Release);
-                        let _ = ui.upgrade_in_event_loop(|ui| {
+                        let security_gate = live.security_gate.clone();
+                        let _ = ui.upgrade_in_event_loop(move |ui| {
+                            reset_room_search(&ui);
+                            security::clear_ui(&ui, &security_gate);
+                            ui.set_live_session(false);
                             ui.set_show_sign_in(true);
                             ui.set_session_error("".into());
                         });
@@ -2244,7 +3171,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let calls = confirm_calls.clone();
             let weak = weak.clone();
             confirm_handle.spawn(async move {
-                let result = calls.end_call().await.map_err(|error| error.to_string());
+                let result = if matches!(calls.status(), CallStatus::CleanupFailed { .. }) {
+                    calls.abandon_failed_leave().await
+                } else {
+                    calls.end_call().await
+                }
+                .map_err(|error| error.to_string());
                 let _ = weak.upgrade_in_event_loop(move |ui| match result {
                     Ok(()) => continue_account_action(&ui, action),
                     Err(error) => {
@@ -2354,4 +3286,102 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(Box::new(error));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    #[cfg(feature = "native-calls")]
+    #[test]
+    fn call_stage_uses_joined_room_even_after_chat_navigation() {
+        let call = morpheus_rtc::CallInfo {
+            room_id: "!room-a:example.org".into(),
+            slot_id: "m.call#room".into(),
+            membership_id: "membership".into(),
+            local_identity: "alice".into(),
+        };
+        let status = CallStatus::Joined {
+            account_id: "account-a".into(),
+            call,
+        };
+        let selected_chat_room = "!room-b:example.org";
+        assert_ne!(call_room_id(&status), Some(selected_chat_room));
+        assert_eq!(call_room_id(&status), Some("!room-a:example.org"));
+        assert_eq!(
+            call_room_display(
+                "!room-a:example.org",
+                "",
+                "",
+                "!room-a:example.org",
+                "Morpheus stage QA"
+            ),
+            "Morpheus stage QA"
+        );
+        assert_eq!(
+            call_room_display(
+                "!room-a:example.org",
+                "!room-a:example.org",
+                "Morpheus stage QA",
+                selected_chat_room,
+                "Other room"
+            ),
+            "Morpheus stage QA"
+        );
+    }
+
+    #[test]
+    fn join_target_preserves_link_routes_and_rejects_user_links() {
+        let target = room_join_target(
+            "https://matrix.to/#/%23lobby:example.org?via=one.org",
+            "",
+            "two.org",
+        )
+        .unwrap();
+        assert_eq!(
+            target,
+            MatrixLinkTarget::Room {
+                room_or_alias_id: "#lobby:example.org".into(),
+                event_id: None,
+                via_servers: vec!["one.org".into(), "two.org".into()],
+            }
+        );
+        assert!(room_join_target("@alice:example.org", "", "").is_err());
+        assert_eq!(
+            room_join_target("!room:example.org:8448", "#alias:alias.org", "").unwrap(),
+            MatrixLinkTarget::Room {
+                room_or_alias_id: "!room:example.org:8448".into(),
+                event_id: None,
+                via_servers: vec!["alias.org".into(), "example.org:8448".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn directory_metadata_is_bounded_plain_text() {
+        assert_eq!(directory_plain_text("Room\nName", 32), "Room Name");
+        assert_eq!(
+            directory_plain_text("safe\u{202e}evil\u{200b}text", 32),
+            "safe evil text"
+        );
+        assert_eq!(directory_plain_text(&"a".repeat(500), 120).len(), 120);
+    }
+
+    #[test]
+    fn search_result_display_sanitizes_untrusted_text_without_changing_ids() {
+        let item = search_result_item(MessageSearchResult {
+            room_id: "!room:example.org".into(),
+            event_id: "$event:example.org".into(),
+            sender: "@alice\u{202e}:example.org".into(),
+            body: format!("Hello\n\u{200b}world {}", "x".repeat(600)),
+            timestamp_ms: 0,
+            relevance_score: 1.0,
+        });
+        assert_eq!(item.room_id.as_str(), "!room:example.org");
+        assert_eq!(item.event_id.as_str(), "$event:example.org");
+        assert_eq!(item.sender.as_str(), "@alice :example.org");
+        assert!(item.body.as_str().starts_with("Hello  world"));
+        assert!(item.body.as_str().chars().count() <= 500);
+        assert!(item.preview.as_str().chars().count() <= 150);
+    }
 }

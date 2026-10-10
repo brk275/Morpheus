@@ -64,10 +64,19 @@ key backup/recovery UX remain to be implemented.
 - `send_text`, `send_reply`, `send_thread_text`, `edit_text`, `toggle_reaction`,
   and `redact_message` use SDK timelines and local echo/send queues.
 - `thread_timeline` and `paginate_backwards` support thread panels and
-  historical messages. `search_room` queries the local SDK index.
+  historical messages. `search_messages_for` and `search_all_messages_for`
+  query each account's encrypted local SDK index; `search_result_context_for`
+  loads neighboring messages around a result. Search is limited to history the
+  client has already indexed.
+- `public_rooms_for` pages a homeserver's public directory;
+  `resolve_room_alias_for`, `parse_matrix_link_target`, and
+  `join_matrix_room_for` support room aliases and Matrix links.
 - Room operations include `create_private_room`, `create_dm`, `join_room`,
   `leave_room`, `invite_user`, `kick_user`, `ban_user`, `unban_user`,
-  `rename_room`, and `set_room_topic`. Server power levels still govern them.
+  `rename_room`, and `set_room_topic`. `room_members_for` lists joined,
+  invited, and banned users with their Matrix power levels;
+  `set_member_power_level_for` updates one member's exact level. Server power
+  levels still govern every mutation.
 - `invites_snapshot`, `accept_invite`, and `reject_invite` support invitation
   panels. `create_space`, `space_hierarchy`, `link_space_child`, and
   `unlink_space_child` support paginated Space navigation. The hierarchy
@@ -90,8 +99,9 @@ verification UI is not implemented.
 and encrypted room-key backup. Its `RecoveryKey` is not Debug/serializable and
 zeroizes on drop; the app should display `reveal()` once and ask the user to
 save it. `recover_account(key_or_passphrase)` imports secrets and repairs
-backup on a new device. These wrappers have been type-checked but need an
-end-to-end two-device test before distribution. Never log a recovery key.
+backup on a new device. A disposable two-device test recovered encrypted
+history on a fresh device; the desktop recovery flow still needs acceptance
+testing. Never log a recovery key.
 
 The sync runner checks `/versions` for MSC4186, then runs SDK UI `SyncService`
 with the `unstable-msc4354` sticky extension. It retries transient failures.

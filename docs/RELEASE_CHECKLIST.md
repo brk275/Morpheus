@@ -61,9 +61,15 @@ The preview shell and unit tests alone do not satisfy this gate.
 - [ ] Verify the macOS DMG mounts without a full-AGPL agreement and the
       installed macOS, Windows, and Linux packages contain a readable license
       and required source notices.
+- [ ] Verify the Windows package contains a GUI-subsystem executable and
+      launches without a console window.
 - [ ] Install and launch the Linux Debian package and AppImage on Ubuntu 24.04
       under Wayland and X11; confirm the generated `Depends` and ELF glibc and
       libstdc++ symbol requirements match that baseline.
+- [ ] Include `libxi6` in a rebuilt Debian package and verify a clean X11
+      installation launches without manually installing extra libraries.
+- [ ] Put a real maintainer name and working email address in the Debian
+      package's `Maintainer` field.
 - [ ] Establish and verify a Linux package build path for distributions older
       than Ubuntu 24.04 before claiming support for them.
 - [ ] Test upgrades from installed older builds, failed or interrupted updates,

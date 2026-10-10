@@ -62,6 +62,62 @@ The Space assertion covers the successful create request; delayed Space
 classification in the SDK room list is handled by the app's temporary Space
 entry and still needs a dedicated UI test.
 
+## Test room settings and moderation
+
+With both local servers running and the same protected fixture path set:
+
+```sh
+PATH=/opt/homebrew/opt/rustup/bin:$PATH cargo test --locked -p morpheus-matrix --test moderation_local -- --nocapture
+```
+
+This opt-in test creates a disposable room on Synapse A and checks that Alice
+can rename it and set its topic while default-power Bob cannot rename or kick
+the creator. Alice grants Bob moderator power, Bob renames the room, the server
+rejects Bob's attempt to promote himself above his own level, and Alice
+restores Bob's default power. Bob's next rename is rejected. The test then
+checks a server-confirmed redaction of Bob's message in both clients, kick and
+reinvite, ban and blocked rejoin, and unban and rejoin. It fetches authoritative
+room state and the redacted event from Synapse instead of relying only on
+local timeline snapshots. A passing run logs out the temporary test devices
+and deletes their stores. A failure may leave a disposable room and store for
+diagnosis. This checks Matrix core behavior against one loopback homeserver;
+moderation UI and federation remain separate acceptance work.
+
+## Test public discovery and Matrix links
+
+With both local servers running and the same protected fixture path set:
+
+```sh
+PATH=/opt/homebrew/opt/rustup/bin:$PATH cargo test --locked -p morpheus-matrix --test discovery_local -- --nocapture
+```
+
+This opt-in test publishes disposable public rooms, searches with pagination,
+resolves an alias, and joins a room from a `matrix.to` link with a routing
+server. It checks that a directory response cannot cross the selected-account
+boundary and that an account on homeserver B sees its own directory. The
+loopback fixture explicitly permits public-room publication and removes the
+rooms from the directory after a passing run. Its servers do not federate, so
+remote-server directory queries and federated joins remain untested.
+
+## Test local encrypted message search
+
+With the same protected fixture path set:
+
+```sh
+PATH=/opt/homebrew/opt/rustup/bin:$PATH cargo test --locked -p morpheus-matrix --test search_local -- --nocapture
+```
+
+This opt-in test sends a unique message in Alice and Bob's encrypted room,
+waits for its remote echo, and searches Alice's local index within the room
+and across her joined rooms. It loads an event-focused timeline around the
+result and checks that Carol on the separate homeserver cannot
+read Alice's results. Each account's index is stored encrypted under its own
+data directory; the test checks persistence across restart and scans the
+store for the unique plaintext body. Search is limited to locally indexed
+history and does not send message text to a server search endpoint.
+Set `MORPHEUS_MATRIX_SEARCH_CLASSIC=1` for a separate run using the forced
+classic `/sync` adapter; omit it for automatic native sliding sync.
+
 ## Test encrypted attachments
 
 With both local servers running and the protected fixture path set:
@@ -80,9 +136,10 @@ run logs out both test devices, removes their OS-vault entries, and deletes
 their temporary stores. A failed run can leave a temporary store for diagnosis.
 
 Uploads are capped at 25 MiB before entering the SDK. Downloads reject absent
-or excessive declared sizes and check the returned bytes again. The pinned
-SDK buffers the HTTP response before that second check, so a server that lies
-about size can transiently exceed the cap. The test covers the Matrix core;
+or excessive declared sizes, then enforce the cap as HTTP chunks arrive through
+the SDK's configured client. A unit test rejects an oversized stream, and the
+encrypted Alice/Bob roundtrip passed after this change. An adversarial
+homeserver response is still untested. The test covers the Matrix core;
 the app's attach/save dialogs, upload controls, timeline card, and preview/open
 behavior remain separate live UI acceptance work. Send queues run for the
 selected account and pause on an account switch; an already in-flight upload

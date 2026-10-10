@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 
 use chrono::{Local, TimeZone};
 use morpheus_matrix::{
-    AccountInfo, AccountManager, DownloadedAttachment, MatrixCoreError, MessageInfo,
-    MessageSendState, QueuedAttachment, QueuedMessage, RoomInfo, RoomMembership, SyncBackend,
-    SyncStatus,
+    AccountInfo, AccountManager, DownloadedAttachment, MatrixCoreError, MatrixLinkTarget,
+    MessageInfo, MessageSendState, QueuedAttachment, QueuedMessage, RoomInfo, RoomMemberInfo,
+    RoomMembership, SyncBackend, SyncStatus,
 };
 use slint::{Color, ModelRc, SharedString, VecModel, Weak};
 use tokio::{
@@ -24,7 +24,10 @@ use tokio::{
 
 use crate::attachments::save_download;
 use crate::drafts::DraftStore;
-use crate::{AccountItem, AccountOption, AppWindow, MemberItem, MessageItem, RoomItem, SpaceItem};
+use crate::{
+    AccountItem, AccountOption, AppWindow, MemberItem, MessageItem, PublicRoomItem, RoomItem,
+    SpaceItem,
+};
 
 pub enum MessageTarget {
     Room,
@@ -36,7 +39,6 @@ pub enum MessageTarget {
 #[derive(Clone, Copy)]
 pub enum RoomAction {
     CreatePrivate,
-    Join,
     CreateSpace,
 }
 
@@ -45,13 +47,24 @@ struct KnownSpace {
     recorded_at: Instant,
 }
 
+struct MemberRequest {
+    account_id: String,
+    room_id: String,
+    started: Instant,
+    epoch: u64,
+}
+
 pub struct LiveUi {
     pub manager: Arc<AccountManager>,
     pub is_live: Arc<AtomicBool>,
+    pub(crate) security_gate: Arc<crate::security::SecurityGate>,
     drafts: Arc<DraftStore>,
     draft_write_tx: mpsc::Sender<()>,
     generation: Arc<AtomicU64>,
     render_epoch: Arc<AtomicU64>,
+    navigation_epoch: Arc<AtomicU64>,
+    member_epoch: Arc<AtomicU64>,
+    member_request: Mutex<Option<MemberRequest>>,
     feed: Mutex<Option<JoinHandle<()>>>,
     feed_key: Mutex<Option<(String, String)>>,
     thread_feed: Mutex<Option<JoinHandle<()>>>,
@@ -118,10 +131,14 @@ impl LiveUi {
         Arc::new(Self {
             manager,
             is_live: Arc::new(AtomicBool::new(false)),
+            security_gate: Arc::new(crate::security::SecurityGate::default()),
             drafts,
             draft_write_tx,
             generation: Arc::new(AtomicU64::new(0)),
             render_epoch: Arc::new(AtomicU64::new(0)),
+            navigation_epoch: Arc::new(AtomicU64::new(0)),
+            member_epoch: Arc::new(AtomicU64::new(0)),
+            member_request: Mutex::new(None),
             feed: Mutex::new(None),
             feed_key: Mutex::new(None),
             thread_feed: Mutex::new(None),
@@ -139,8 +156,10 @@ impl LiveUi {
 
     /// Cancel queued presentation work as soon as the user requests a new
     /// account, room, or Space, before the async operation starts running.
-    pub fn invalidate_navigation(&self) {
+    pub fn invalidate_navigation(&self) -> u64 {
         self.render_epoch.fetch_add(1, Ordering::AcqRel);
+        self.member_epoch.fetch_add(1, Ordering::AcqRel);
+        self.navigation_epoch.fetch_add(1, Ordering::AcqRel) + 1
     }
 
     pub fn remember_draft(&self, account_id: &str, room_id: &str, body: &str) {
@@ -223,7 +242,22 @@ impl LiveUi {
         index: usize,
         ui: Weak<AppWindow>,
     ) -> Result<(), MatrixCoreError> {
+        self.select_account_guarded(index, ui, || true).await?;
+        Ok(())
+    }
+
+    /// Check the call switch gate while holding the same transition lock that
+    /// call entry uses. A check before awaiting this lock can become stale.
+    pub async fn select_account_guarded(
+        self: &Arc<Self>,
+        index: usize,
+        ui: Weak<AppWindow>,
+        can_switch: impl FnOnce() -> bool,
+    ) -> Result<bool, MatrixCoreError> {
         let _transition = self.account_transition.lock().await;
+        if !can_switch() {
+            return Ok(false);
+        }
         self.invalidate_navigation();
         let accounts = self.manager.accounts().await;
         let account = accounts
@@ -239,7 +273,7 @@ impl LiveUi {
         self.is_live.store(true, Ordering::Release);
         self.refresh(ui.clone()).await?;
         tokio::spawn(self.clone().scan_spaces(ui));
-        Ok(())
+        Ok(true)
     }
 
     /// Keep an action tied to the account visible when it was submitted. The
@@ -255,21 +289,56 @@ impl LiveUi {
         self.require_active_account(account_id).await?;
         let input = input.trim();
         if input.is_empty() {
-            return Err(MatrixCoreError::InvalidRegistry(match action {
-                RoomAction::Join => "Enter a complete room ID or alias".into(),
-                _ => "Enter a room or Space name".into(),
-            }));
+            return Err(MatrixCoreError::InvalidRegistry(
+                "Enter a room or Space name".into(),
+            ));
         }
         let room_id = match action {
             RoomAction::CreatePrivate => self.manager.create_private_room(input).await?,
-            RoomAction::Join => self.manager.join_room(input).await?,
             RoomAction::CreateSpace => self.manager.create_space(input).await?,
         };
+        self.complete_room_action(
+            account_id,
+            room_id,
+            Some(matches!(action, RoomAction::CreateSpace)),
+            input,
+            ui,
+        )
+        .await
+    }
+
+    /// Join a parsed room ID, alias, or Matrix link and navigate to it. The
+    /// directory may already know this is a Space before local sync does.
+    pub async fn join_matrix_target(
+        self: &Arc<Self>,
+        account_id: &str,
+        target: &MatrixLinkTarget,
+        space_hint: Option<bool>,
+        display_name: &str,
+        ui: Weak<AppWindow>,
+    ) -> Result<(), MatrixCoreError> {
+        let _transition = self.account_transition.lock().await;
         self.require_active_account(account_id).await?;
-        let is_space = match action {
-            RoomAction::CreateSpace => true,
-            RoomAction::CreatePrivate => false,
-            RoomAction::Join => self
+        let room_id = self
+            .manager
+            .join_matrix_room_for(account_id, target)
+            .await?;
+        self.complete_room_action(account_id, room_id, space_hint, display_name, ui)
+            .await
+    }
+
+    async fn complete_room_action(
+        self: &Arc<Self>,
+        account_id: &str,
+        room_id: String,
+        space_hint: Option<bool>,
+        display_name: &str,
+        ui: Weak<AppWindow>,
+    ) -> Result<(), MatrixCoreError> {
+        self.require_active_account(account_id).await?;
+        let is_space = match space_hint {
+            Some(true) => true,
+            Some(false) | None => self
                 .manager
                 .rooms_snapshot()
                 .await?
@@ -285,7 +354,11 @@ impl LiveUi {
                 .insert(
                     room_id.clone(),
                     KnownSpace {
-                        name: input.to_owned(),
+                        name: if display_name.is_empty() {
+                            room_id.clone()
+                        } else {
+                            display_name.to_owned()
+                        },
                         recorded_at: Instant::now(),
                     },
                 );
@@ -382,24 +455,54 @@ impl LiveUi {
         }
     }
 
-    pub async fn select_space(
+    pub async fn select_room_for(
         self: &Arc<Self>,
-        space_id: String,
+        account_id: &str,
+        room_id: String,
+        navigation_epoch: u64,
         ui: Weak<AppWindow>,
-    ) -> Result<(), MatrixCoreError> {
-        self.invalidate_navigation();
+    ) -> Result<bool, MatrixCoreError> {
+        let _transition = self.account_transition.lock().await;
+        if !self.navigation_is_current(navigation_epoch)
+            || self.require_active_account(account_id).await.is_err()
+        {
+            return Ok(false);
+        }
+        self.clear_feed().await;
+        {
+            let mut selected = self.selected_room.lock().await;
+            if !self.navigation_is_current(navigation_epoch) {
+                return Ok(false);
+            }
+            *selected = Some(room_id);
+        }
+        if !self.navigation_is_current(navigation_epoch) {
+            return Ok(false);
+        }
+        self.refresh(ui).await?;
+        Ok(true)
+    }
+
+    pub async fn select_space_for(
+        self: &Arc<Self>,
+        account_id: &str,
+        space_id: String,
+        navigation_epoch: u64,
+        ui: Weak<AppWindow>,
+    ) -> Result<bool, MatrixCoreError> {
+        let _transition = self.account_transition.lock().await;
+        if !self.navigation_is_current(navigation_epoch)
+            || self.require_active_account(account_id).await.is_err()
+        {
+            return Ok(false);
+        }
         if !space_id.is_empty() {
-            let account = self
-                .manager
-                .active_account()
-                .await
-                .ok_or(MatrixCoreError::NoActiveAccount)?;
             let rooms = self.manager.rooms_snapshot().await?;
             let known = self
                 .known_spaces
                 .lock()
                 .await
-                .get(&account.id)
+                .get(account_id)
                 .is_some_and(|spaces| spaces.contains_key(&space_id));
             if !known
                 && !rooms
@@ -409,10 +512,22 @@ impl LiveUi {
                 return Err(MatrixCoreError::RoomNotFound(space_id));
             }
         }
+        if !self.navigation_is_current(navigation_epoch) {
+            return Ok(false);
+        }
         *self.selected_space.lock().await = (!space_id.is_empty()).then_some(space_id);
         *self.selected_room.lock().await = None;
         self.clear_feed().await;
-        self.refresh(ui).await
+        if !self.navigation_is_current(navigation_epoch) {
+            return Ok(false);
+        }
+        self.refresh(ui).await?;
+        Ok(true)
+    }
+
+    pub(crate) fn navigation_is_current(&self, navigation_epoch: u64) -> bool {
+        self.is_live.load(Ordering::Acquire)
+            && self.navigation_epoch.load(Ordering::Acquire) == navigation_epoch
     }
 
     pub async fn refresh(self: &Arc<Self>, ui: Weak<AppWindow>) -> Result<(), MatrixCoreError> {
@@ -420,6 +535,7 @@ impl LiveUi {
             return Ok(());
         }
         let render_epoch = self.render_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let navigation_epoch = self.navigation_epoch.load(Ordering::Acquire);
         let accounts = self.manager.accounts().await;
         let active = self
             .manager
@@ -519,6 +635,7 @@ impl LiveUi {
         if self.render_epoch.load(Ordering::Acquire) != render_epoch {
             return Ok(());
         }
+        let member_account_id = active.id.clone();
         let view = Snapshot {
             accounts,
             active,
@@ -532,17 +649,130 @@ impl LiveUi {
         let current_epoch = self.render_epoch.clone();
         let is_live = self.is_live.clone();
         let drafts = self.drafts.clone();
+        let security_gate = self.security_gate.clone();
         let _ = ui.upgrade_in_event_loop(move |ui| {
             if is_live.load(Ordering::Acquire)
                 && current_epoch.load(Ordering::Acquire) == render_epoch
             {
-                apply_snapshot(&ui, view, &drafts);
+                apply_snapshot(&ui, view, &drafts, &security_gate);
             }
         });
         if let Some(room_id) = selected {
-            self.open_room(room_id, ui).await;
+            self.refresh_members_for(
+                member_account_id.clone(),
+                room_id.clone(),
+                ui.clone(),
+                false,
+            )
+            .await;
+            self.open_room(&member_account_id, room_id, navigation_epoch, ui)
+                .await;
         }
         Ok(())
+    }
+
+    /// Fetch members for the visible account and room. Sync can trigger many
+    /// presentation refreshes, so refresh at most once per short interval
+    /// unless the user explicitly requests it.
+    pub async fn refresh_members_for(
+        self: &Arc<Self>,
+        account_id: String,
+        room_id: String,
+        ui: Weak<AppWindow>,
+        force: bool,
+    ) {
+        if !self.is_live.load(Ordering::Acquire)
+            || self.selected_room.lock().await.as_deref() != Some(room_id.as_str())
+            || self
+                .manager
+                .active_account()
+                .await
+                .is_none_or(|account| account.id != account_id)
+        {
+            return;
+        }
+        let epoch = {
+            let mut request = self.member_request.lock().await;
+            if !force
+                && request.as_ref().is_some_and(|previous| {
+                    previous.account_id == account_id
+                        && previous.room_id == room_id
+                        && previous.epoch == self.member_epoch.load(Ordering::Acquire)
+                        && previous.started.elapsed() < Duration::from_secs(30)
+                })
+            {
+                return;
+            }
+            let epoch = self.member_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+            *request = Some(MemberRequest {
+                account_id: account_id.clone(),
+                room_id: room_id.clone(),
+                started: Instant::now(),
+                epoch,
+            });
+            epoch
+        };
+        let loading_account = account_id.clone();
+        let loading_room = room_id.clone();
+        let _ = ui.upgrade_in_event_loop(move |window| {
+            if window.get_active_account_local_id().as_str() == loading_account
+                && window.get_active_room_id().as_str() == loading_room
+            {
+                window.set_member_loading(true);
+                window.set_member_error("".into());
+            }
+        });
+        let live = self.clone();
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                live.manager.room_members_for(&account_id, &room_id),
+            )
+            .await;
+            if !live.is_live.load(Ordering::Acquire)
+                || live.member_epoch.load(Ordering::Acquire) != epoch
+                || live.selected_room.lock().await.as_deref() != Some(room_id.as_str())
+                || live
+                    .manager
+                    .active_account()
+                    .await
+                    .is_none_or(|account| account.id != account_id)
+            {
+                return;
+            }
+            let (items, error) = match result {
+                Ok(Ok(members)) => (
+                    Some(members.iter().map(member_item).collect::<Vec<_>>()),
+                    None,
+                ),
+                Ok(Err(error)) => (
+                    None,
+                    Some(crate::directory_plain_text(
+                        &format!("Could not load members: {error}"),
+                        240,
+                    )),
+                ),
+                Err(_) => (
+                    None,
+                    Some("Loading members timed out. Retry to refresh.".to_owned()),
+                ),
+            };
+            let _ = ui.upgrade_in_event_loop(move |window| {
+                if live.member_epoch.load(Ordering::Acquire) != epoch
+                    || window.get_active_account_local_id().as_str() != account_id
+                    || window.get_active_room_id().as_str() != room_id
+                {
+                    return;
+                }
+                window.set_member_loading(false);
+                if let Some(items) = items {
+                    window.set_members(ModelRc::new(VecModel::from(items)));
+                    window.set_member_error("".into());
+                } else if let Some(error) = error {
+                    window.set_member_error(error.into());
+                }
+            });
+        });
     }
 
     /// Load the account's Space graph after showing its cached rooms. A room
@@ -665,21 +895,20 @@ impl LiveUi {
         *self.space_scan_failed_at.lock().await = None;
     }
 
-    pub async fn open_room(self: &Arc<Self>, room_id: String, ui: Weak<AppWindow>) {
-        if self.selected_room.lock().await.as_deref() != Some(room_id.as_str()) {
-            self.clear_thread().await;
-            let _ = ui.upgrade_in_event_loop(|ui| {
-                ui.set_thread_root_id("".into());
-                ui.set_thread_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new())));
-                ui.set_thread_composer_text("".into());
-            });
+    async fn open_room(
+        self: &Arc<Self>,
+        account_id: &str,
+        room_id: String,
+        navigation_epoch: u64,
+        ui: Weak<AppWindow>,
+    ) {
+        if !self.navigation_is_current(navigation_epoch)
+            || self.require_active_account(account_id).await.is_err()
+            || self.selected_room.lock().await.as_deref() != Some(room_id.as_str())
+        {
+            return;
         }
-        *self.selected_room.lock().await = Some(room_id.clone());
-        let account_id = match self.manager.active_account().await {
-            Some(account) => account.id,
-            None => return,
-        };
-        let requested_key = (account_id, room_id.clone());
+        let requested_key = (account_id.to_owned(), room_id.clone());
         {
             let key = self.feed_key.lock().await;
             let feed = self.feed.lock().await;
@@ -693,11 +922,19 @@ impl LiveUi {
         let feed = match self.manager.message_feed(&room_id).await {
             Ok(feed) => feed,
             Err(error) => {
-                show_error(&ui, error.to_string());
+                if self.navigation_is_current(navigation_epoch)
+                    && self.require_active_account(account_id).await.is_ok()
+                {
+                    show_error(&ui, error.to_string());
+                }
                 return;
             }
         };
-        if self.generation.load(Ordering::Acquire) != generation {
+        if self.generation.load(Ordering::Acquire) != generation
+            || !self.navigation_is_current(navigation_epoch)
+            || self.require_active_account(account_id).await.is_err()
+            || self.selected_room.lock().await.as_deref() != Some(room_id.as_str())
+        {
             return;
         }
         if let Some(previous) = self.feed.lock().await.take() {
@@ -706,17 +943,30 @@ impl LiveUi {
         *self.feed_key.lock().await = Some(requested_key);
         let mut updates = feed.subscribe();
         let feed_generation = self.generation.clone();
+        let feed_navigation_epoch = self.navigation_epoch.clone();
         let is_live = self.is_live.clone();
+        let feed_account_id = account_id.to_owned();
+        let feed_room_id = room_id;
         let handle = tokio::spawn(async move {
             let _feed = feed;
             loop {
                 let messages = updates.borrow_and_update().clone();
                 let ui_for_update = ui.clone();
                 let current_generation = feed_generation.clone();
+                let current_navigation_epoch = feed_navigation_epoch.clone();
                 let live_flag = is_live.clone();
+                let account_id = feed_account_id.clone();
+                let room_id = feed_room_id.clone();
                 let _ = ui_for_update.upgrade_in_event_loop(move |ui| {
                     if live_flag.load(Ordering::Acquire)
                         && current_generation.load(Ordering::Acquire) == generation
+                        && current_navigation_epoch.load(Ordering::Acquire) == navigation_epoch
+                        && visible_feed_target(
+                            ui.get_active_account_local_id().as_str(),
+                            ui.get_active_room_id().as_str(),
+                            &account_id,
+                            &room_id,
+                        )
                     {
                         ui.set_messages(ModelRc::new(VecModel::from(
                             messages.iter().map(message_item).collect::<Vec<_>>(),
@@ -815,6 +1065,10 @@ impl LiveUi {
 
     pub fn begin_thread_request(&self) -> u64 {
         self.thread_generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    pub fn thread_request_is_current(&self, generation: u64) -> bool {
+        self.thread_generation.load(Ordering::Acquire) == generation
     }
 
     pub async fn clear_thread(&self) {
@@ -1057,19 +1311,44 @@ struct Snapshot {
     all_space_children: HashSet<String>,
 }
 
-fn apply_snapshot(ui: &AppWindow, view: Snapshot, drafts: &DraftStore) {
+fn apply_snapshot(
+    ui: &AppWindow,
+    view: Snapshot,
+    drafts: &DraftStore,
+    security_gate: &crate::security::SecurityGate,
+) {
     let next_room_id = view.selected.as_deref().unwrap_or("");
     let account_changed = ui.get_active_account_local_id().as_str() != view.active.id;
+    let close_sign_in = snapshot_closes_sign_in(ui.get_live_session(), account_changed);
     let selection_changed = account_changed || ui.get_active_room_id().as_str() != next_room_id;
     if account_changed {
+        crate::security::clear_ui(ui, security_gate);
         ui.set_room_actions_open(false);
         ui.set_room_action_busy(false);
         ui.set_room_action_error("".into());
         ui.set_invite_error("".into());
         ui.set_room_action_operation(ui.get_room_action_operation().wrapping_add(1));
+        ui.set_directory_operation(ui.get_directory_operation().wrapping_add(1));
+        ui.set_directory_join_operation(ui.get_directory_join_operation().wrapping_add(1));
+        ui.set_directory_loading(false);
+        ui.set_directory_join_busy(false);
+        ui.set_directory_joining_room_id("".into());
+        ui.set_directory_searched(false);
+        ui.set_directory_results(ModelRc::new(VecModel::from(Vec::<PublicRoomItem>::new())));
+        ui.set_directory_next_batch("".into());
+        ui.set_directory_error("".into());
+        ui.set_directory_join_error("".into());
+        ui.set_directory_search("".into());
+        ui.set_directory_server("".into());
+        ui.set_directory_join_input("".into());
     }
     if selection_changed {
+        ui.set_members(ModelRc::new(VecModel::<MemberItem>::from(Vec::new())));
+        ui.set_member_loading(!next_room_id.is_empty());
+        ui.set_member_error("".into());
         crate::reset_attachment_view(ui);
+        crate::reset_room_search(ui);
+        ui.set_element_call_compatibility(false);
         ui.set_composer_text(drafts.get(&view.active.id, next_room_id).into());
         ui.set_composer_mode(0);
         ui.set_composer_target_id("".into());
@@ -1199,7 +1478,6 @@ fn apply_snapshot(ui: &AppWindow, view: Snapshot, drafts: &DraftStore) {
             .collect::<Vec<_>>(),
     )));
     crate::apply_room_sort(ui);
-    ui.set_members(ModelRc::new(VecModel::<MemberItem>::from(Vec::new())));
     ui.set_stress_timeline_active(false);
     if let Some(room_id) = view.selected {
         if let Some(room) = view.rooms.iter().find(|room| room.room_id == room_id) {
@@ -1220,10 +1498,15 @@ fn apply_snapshot(ui: &AppWindow, view: Snapshot, drafts: &DraftStore) {
         ui.set_active_room_topic("Join or create a Matrix room to begin".into());
         ui.set_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new())));
     }
-    ui.set_login_loading(false);
-    ui.set_login_error("".into());
     ui.set_live_session(true);
-    ui.set_show_sign_in(false);
+    if account_changed && ui.get_page() == 1 {
+        ui.invoke_refresh_security();
+    }
+    if close_sign_in {
+        ui.set_login_loading(false);
+        ui.set_login_error("".into());
+        ui.set_show_sign_in(false);
+    }
 }
 
 fn account_item(account: &AccountInfo, selected: bool) -> AccountItem {
@@ -1244,6 +1527,41 @@ fn room_item(room: &RoomInfo) -> RoomItem {
         name: room.name.as_str().into(),
         unread: room.unread_notifications.min(i32::MAX as u64) as i32,
         private_room: room.is_direct,
+    }
+}
+
+fn member_item(info: &RoomMemberInfo) -> MemberItem {
+    let user_id = crate::directory_plain_text(&info.user_id, 260);
+    let name = info
+        .display_name
+        .as_deref()
+        .map(|value| crate::directory_plain_text(value, 100))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| crate::directory_plain_text(&display_user(&info.user_id), 100));
+    let membership = match info.membership.as_str() {
+        "join" => match info.power_level {
+            None => "Creator".to_owned(),
+            Some(level) if level >= 100 => format!("Admin ({level})"),
+            Some(level) if level >= 50 => format!("Moderator ({level})"),
+            Some(level) if level > 0 => format!("Power {level}"),
+            _ => "Member".to_owned(),
+        },
+        "invite" => "Invited".to_owned(),
+        "ban" => "Banned".to_owned(),
+        _ => "Member".to_owned(),
+    };
+    let detail = format!(
+        "{} · {}{}",
+        user_id,
+        if info.is_account_user { "You · " } else { "" },
+        membership
+    );
+    MemberItem {
+        name: name.clone().into(),
+        initials: initials(&name).into(),
+        detail: detail.into(),
+        accent: accent(&info.user_id),
+        online: false,
     }
 }
 
@@ -1310,4 +1628,80 @@ fn accent(value: &str) -> Color {
 
 pub fn show_error(ui: &Weak<AppWindow>, error: String) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_session_error(error.into()));
+}
+
+fn visible_feed_target(
+    visible_account: &str,
+    visible_room: &str,
+    expected_account: &str,
+    expected_room: &str,
+) -> bool {
+    visible_account == expected_account && visible_room == expected_room
+}
+
+fn snapshot_closes_sign_in(was_live: bool, account_changed: bool) -> bool {
+    !was_live || account_changed
+}
+
+#[cfg(test)]
+mod member_tests {
+    use super::*;
+
+    #[test]
+    fn member_rows_sanitize_untrusted_identity_and_do_not_claim_presence() {
+        let item = member_item(&RoomMemberInfo {
+            user_id: "@alice:example.org".into(),
+            display_name: Some("Alice\u{202e}Admin\u{200b}".into()),
+            avatar_mxc: None,
+            membership: "join".into(),
+            power_level: Some(50),
+            is_account_user: true,
+        });
+        assert_eq!(item.name.as_str(), "Alice Admin");
+        assert_eq!(
+            item.detail.as_str(),
+            "@alice:example.org · You · Moderator (50)"
+        );
+        assert!(!item.online);
+
+        let invited = member_item(&RoomMemberInfo {
+            user_id: "@bob:example.org".into(),
+            display_name: None,
+            avatar_mxc: None,
+            membership: "invite".into(),
+            power_level: Some(0),
+            is_account_user: false,
+        });
+        assert_eq!(invited.name.as_str(), "bob");
+        assert_eq!(invited.detail.as_str(), "@bob:example.org · Invited");
+    }
+
+    #[test]
+    fn feed_updates_require_the_visible_account_and_room() {
+        assert!(visible_feed_target(
+            "account-a",
+            "!room-a",
+            "account-a",
+            "!room-a"
+        ));
+        assert!(!visible_feed_target(
+            "account-b",
+            "!room-a",
+            "account-a",
+            "!room-a"
+        ));
+        assert!(!visible_feed_target(
+            "account-a",
+            "!room-b",
+            "account-a",
+            "!room-a"
+        ));
+    }
+
+    #[test]
+    fn background_refresh_keeps_add_account_form_open() {
+        assert!(!snapshot_closes_sign_in(true, false));
+        assert!(snapshot_closes_sign_in(true, true));
+        assert!(snapshot_closes_sign_in(false, false));
+    }
 }

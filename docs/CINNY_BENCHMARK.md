@@ -52,13 +52,18 @@ formatting, media, and device-management changes.
 - [ ] DM and ordinary room calls ring appropriately; voice spaces allow drop-in
       joins without ringing every member and show a participant roster. A
       shared voice-space room-state marker and Morpheus roster snapshot passed
-      a local two-device test. The native call-stage roster compiles, but
-      voice-space navigation and live roster UI acceptance remain open.
+      a local two-device test. A native two-person call-stage roster passed an
+      isolated macOS app check; voice-space navigation and drop-in acceptance
+      remain open.
 - [ ] Encrypted voice and video, reconnect, device selection, and screen share
       interoperate with Element Call on compatible homeservers. Local encrypted
       transport has carried synthetic camera/audio and real macOS display and
-      window pixels. The remote tile compiles; received-frame playback in that
-      tile, publish controls, reconnect, and Element Call interop are unverified.
+      window pixels. An opt-in legacy room-state call exchanged encrypted
+      microphone and video with an Element Call v0.26.1 browser peer. Its
+      current `matrix_2_0` mode still fails the local interop fixture. The
+      remote tile compiles; an unencrypted-room live probe found no remote
+      camera track despite a publishing peer. Received-frame playback in the
+      tile, publication controls, and reconnect remain unverified.
 - [ ] Settings, themes, accessibility, and platform packaging work on macOS,
       Windows, and Linux.
 

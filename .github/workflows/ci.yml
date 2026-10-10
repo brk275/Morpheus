@@ -33,7 +33,7 @@ jobs:
             libfontconfig1-dev libgbm-dev libglib2.0-dev libpipewire-0.3-dev libssl-dev libudev-dev \
             libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev \
-            libxkbcommon-dev libxkbcommon-x11-dev libxrandr-dev pkg-config
+            libxkbcommon-dev libxkbcommon-x11-dev libxi6 libxrandr-dev pkg-config xvfb
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -49,6 +49,19 @@ jobs:
         run: cargo check --locked -p morpheus-app -p morpheus-matrix
       - name: Build desktop with native call and device adapters
         run: cargo build --locked -p morpheus-app --features native-calls
+      - name: Smoke test Linux desktop startup under Xvfb
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set +e
+          timeout 12s xvfb-run -a -s '-screen 0 1280x800x24' target/debug/morpheus-app
+          result=$?
+          if [ "$result" -ne 124 ]; then
+            echo "Morpheus exited before the Linux desktop smoke window (status $result)"
+            exit 1
+          fi
+      - name: Test desktop controller and call guards
+        run: cargo test --locked -p morpheus-app --features native-calls --bin morpheus-app
       - name: Test native audio mixer
         if: matrix.os == 'macos-15'
         run: cargo test --locked -p morpheus-rtc --features native-devices --lib audio_device::tests

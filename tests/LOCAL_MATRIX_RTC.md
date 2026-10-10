@@ -72,6 +72,125 @@ or screen-capture hardware. A
 successful run logs out and deletes the temporary client stores; a failed run
 leaves its store for diagnosis.
 
+### Element Call browser interoperability (opt-in)
+
+The separate `element_call_peer` test pairs Morpheus's native RTC engine with
+an actual Element Call v0.26.1 browser peer. It uses a fresh disposable
+`rtc-fixture` file for each attempt. The RTC fixture grants both users room
+state power because Element Call's `compatibility` mode publishes
+`org.matrix.msc3401.call.member` as room state. No external Matrix account or
+email address is involved.
+
+Check out the [Element Call v0.26.1 tag](https://github.com/element-hq/element-call/tree/v0.26.1)
+into a separate temporary directory, install its locked dependencies with
+`corepack pnpm install --frozen-lockfile`, and install Chromium with
+`corepack pnpm exec playwright install chromium`. Set that checkout's
+`public/config.json` for the local fixture:
+
+```json
+{
+  "default_server_config": {
+    "m.homeserver": {
+      "base_url": "http://127.0.0.1:18008",
+      "server_name": "morpheus-a.test"
+    }
+  },
+  "matrix_rtc_mode": "compatibility",
+  "livekit": { "livekit_service_url": "http://127.0.0.1:18010" }
+}
+```
+
+Start its local HTTPS Vite server with `corepack pnpm dev:full --host
+127.0.0.1 --port 5173 --strictPort`. The browser test connects to
+`https://127.0.0.1:5173` and accepts only this development certificate. Set
+the following environment variables in two terminals, using the same fresh
+fixture path and private coordination directory in both:
+
+```sh
+export MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS=/path/to/fresh/rtc-fixture.json
+export MORPHEUS_ELEMENT_CALL_CHECKOUT=/path/to/element-call-v0.26.1
+export MORPHEUS_ELEMENT_INTEROP_MODE=room-state
+export MORPHEUS_ELEMENT_PEER_GO_FILE=/path/to/private-coordination/go
+export MORPHEUS_ELEMENT_PEER_DONE_FILE=/path/to/private-coordination/done
+```
+
+Create the coordination directory mode 0700 and remove old `go`/`done` files.
+Run `node scripts/element_call_peer.mjs` first, then run the native side:
+
+```sh
+cargo test --locked -p morpheus-rtc --features native-rtc \
+  --test element_call_peer -- --nocapture
+```
+
+The browser harness uses a canvas with red/green halves and a Web Audio tone
+as synthetic camera and microphone tracks. The local macOS browser can enumerate
+fake devices, but its hardware `getUserMedia` call does not resolve even on a
+blank localhost page. The harness replaces only that browser API; Element Call's
+real MatrixRTC signaling, encryption, and LiveKit code still carry the tracks.
+The native side checks roster arrival, decoded audio/video, and departure. A
+passing test establishes only those behaviors in this local fixture, not
+hardware capture, public homeserver compatibility, or cross-platform behavior.
+
+On 2026-10-10, Element Call v0.26.1 (commit `9f7c35c`, matrix-js-sdk 42.2.0)
+passed the `compatibility`-mode run against a fresh local room: Morpheus saw
+the browser in its roster, subscribed to its microphone and camera, decoded
+nonzero PCM and three red/green I420 frames, and saw the browser leave. The
+native test passed in 12.08 seconds and the browser exited successfully. The
+browser's disposable device was bootstrapped and cross-signed before joining.
+After the default slot was restored to lowercase, a second fresh-fixture run
+also passed with the explicit `RoomState` helper in 16.48 seconds: encrypted
+microphone PCM, red/green I420 video, and browser departure all succeeded.
+Without that step, both peers saw each other and Morpheus subscribed to the
+tracks, but neither audio nor video yielded decoded frames in 45 seconds.
+
+The `compatibility` format uses an empty `call_id` in
+`org.matrix.msc3401.call.member` state. The pinned Rust RTC core represents
+that room session as lowercase `m.call#room`; Element Call's current room slot
+is uppercase `m.call#ROOM`. `CallOptions::room_state_compatibility()` selects the
+legacy carrier explicitly. Morpheus's current default remains lowercase for
+the pinned RTC core's native room slot. The disposable fixture gives Bob room
+state power so his compatibility membership does not fail with `M_FORBIDDEN`.
+
+A native Alice/Bob current-mode regression with uppercase `m.call#ROOM` failed
+to show Bob in Alice's roster. Restoring the pinned core's lowercase default
+and opening that same slot passed encrypted synthetic audio, camera, screen,
+leave, and rejoin on a fresh fixture in 19.04 seconds. The uppercase slot is
+therefore not Morpheus's default until the current-format interop problem is
+resolved.
+
+Element Call's `matrix_2_0` mode has **not** passed here. In a separate run it
+opened LiveKit but sent only a sticky membership tombstone, so Morpheus never
+saw a browser join. Adding the unstable `org.matrix.msc4143.rtc.slot` room-state
+event manually did not cure that failure. The local homeserver also returned
+404 for the MSC4195 delegated-leave endpoint and the authorization service
+returned 400 for its delegated-leave request. These are separate protocol
+integration gaps; the successful legacy-format test does not verify current
+sticky-event interoperability. Element Call's
+[`openIDSFU.ts`](https://github.com/element-hq/element-call/blob/v0.26.1/src/livekit/openIDSFU.ts)
+and the [matrix-js-sdk session manager](https://github.com/matrix-org/matrix-js-sdk/blob/v42.2.0/src/matrixrtc/MatrixRTCSessionManager.ts)
+both use the uppercase room slot in the current mode.
+
+A further 2026-10-10 loopback test isolated two wire differences. With
+`Sticky2025`, the pinned Rust RTC engine normalizes Element Call's uppercase
+`m.call#ROOM` membership to its internal lowercase `m.call#room` slot. When
+only the uppercase slot was open, native join failed with “slot
+`m.call#room` is not open.” Opening both spellings let Morpheus observe the
+browser's joined sticky membership, but the browser's MatrixRTC roster stayed
+empty and native camera subscription timed out. The browser's raw sticky store
+contained both joined memberships and logged 24 missing media-key messages.
+Rust `open_slot` wrote `m.rtc.slot` state; the Element Call build read only
+`org.matrix.msc4143.rtc.slot`, so it reported no slot. Publishing an additional
+uppercase unstable slot state changed the browser's slot status to `open`, but
+its roster still stayed empty and camera subscription still timed out. This
+alias experiment was removed from the interop harness; no current-mode
+compatibility claim follows from it.
+
+The app needs an explicit room-call compatibility choice or a trusted
+deployment setting to select `RoomState`. Detecting legacy state alone cannot
+choose the mode safely: the room may be empty when Morpheus starts the call,
+legacy state memberships remain until their stated expiry, and changing modes
+changes the membership carrier, key exchange, and SFU token endpoint.
+
 Before joining, Alice also writes the shared
 `io.github.brk275.morpheus.voice` state event with `{"v":1,"enabled":true}`;
 Bob must read the enabled marker from the room's homeserver. Native sliding
@@ -163,7 +282,7 @@ verification/recovery action for real accounts.
 This local test does not establish federation between the two Synapse
 homeservers. The authorization service runs in its legacy direct mode for the
 client library's `/get_token` flow; production MatrixRTC service registration,
-federated calls, delegated delayed leave, Element Call interoperability,
+federated calls, delegated delayed leave, current-format Element Call interoperability,
 automatic network reconnect, live video playback in the Morpheus call stage,
 OS-specific camera capture, packaged-app window/display sharing with permission UI, and
 Linux/Windows call behavior remain separate release gates. The local TLS

@@ -24,6 +24,7 @@ depends = [
   "libxkbcommon-x11-0",
   "libwayland-client0",
   "libx11-6",
+  "libxi6",
   "libxcb1",
   "libxcursor1",
   "libxrandr2",

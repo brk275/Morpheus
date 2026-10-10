@@ -363,12 +363,18 @@ impl ConfigStore {
         let (sender, receiver) = mpsc::channel();
         let store = self.clone();
         thread::spawn(move || {
-            let mut last_signature: Option<(Option<String>, Option<String>)> = None;
+            let mut last_signature: Option<(
+                Result<String, String>,
+                Option<Result<String, String>>,
+            )> = None;
             loop {
                 thread::sleep(interval);
-                let config_raw = fs::read_to_string(store.path()).ok();
+                let config_raw =
+                    fs::read_to_string(store.path()).map_err(|error| error.to_string());
                 let config = config_raw
-                    .as_deref()
+                    .as_ref()
+                    .ok()
+                    .map(String::as_str)
                     .map(toml::from_str::<Config>)
                     .transpose();
                 let theme_raw = config
@@ -378,8 +384,9 @@ impl ConfigStore {
                     .and_then(|config| config.validate().ok().map(|_| config))
                     .and_then(|config| config.appearance.theme_pack.as_ref())
                     .and_then(|name| {
-                        store.themes_dir().ok().and_then(|directory| {
-                            fs::read_to_string(directory.join(format!("{name}.toml"))).ok()
+                        store.themes_dir().ok().map(|directory| {
+                            fs::read_to_string(directory.join(format!("{name}.toml")))
+                                .map_err(|error| error.to_string())
                         })
                     });
                 let signature = (config_raw, theme_raw);
@@ -558,5 +565,28 @@ mod tests {
         ));
         config.appearance.theme_pack = Some("../escape".into());
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn theme_watcher_reports_invalid_edit_after_missing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let mut config = Config::default();
+        config.appearance.theme_pack = Some("missing".into());
+        store.save(&config).unwrap();
+
+        let updates = store.watch_with_theme(Duration::from_millis(10));
+        assert!(matches!(
+            updates.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Err(ConfigError::Io(_))
+        ));
+
+        let themes = store.themes_dir().unwrap();
+        fs::create_dir_all(&themes).unwrap();
+        fs::write(themes.join("missing.toml"), "not valid = [").unwrap();
+        assert!(matches!(
+            updates.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Err(ConfigError::Decode(_))
+        ));
     }
 }

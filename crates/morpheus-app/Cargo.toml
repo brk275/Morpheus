@@ -16,6 +16,7 @@ morpheus-config = { path = "../morpheus-config" }
 morpheus-matrix = { path = "../morpheus-matrix" }
 morpheus-rtc = { path = "../morpheus-rtc", features = ["native-devices"], optional = true }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+arboard = { version = "=3.6.1", default-features = false }
 directories = "6"
 futures-util = "0.3"
 mime_guess = "=2.0.5"
@@ -24,6 +25,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
 url = "2"
 webbrowser = "=1.2.4"
+zeroize = "=1.9.1"
 
 [build-dependencies]
 slint-build = "=1.18.1"

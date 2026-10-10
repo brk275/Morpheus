@@ -101,6 +101,12 @@ if not re.search(r'^rc_invites:', config, re.MULTILINE):
   per_user: {per_second: 10, burst_count: 100}
   per_issuer: {per_second: 10, burst_count: 100}
 """
+# This fixture is loopback-only. Synapse otherwise denies all public-room
+# publication, leaving directory discovery impossible to exercise.
+if not re.search(r'^room_list_publication_rules:', config, re.MULTILINE):
+    config += """room_list_publication_rules:
+  - action: allow
+"""
 if config != original:
     path.write_text(config)
 print('updated' if config != original else 'unchanged')

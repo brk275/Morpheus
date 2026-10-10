@@ -2,15 +2,30 @@
 //! and the persistent send queue; this module limits local input and keeps
 //! encrypted media keys out of the public UI model.
 
-use std::{fs::File, io::Read, path::Path, time::Duration};
+use std::{
+    borrow::Cow,
+    fs::File,
+    io::{self, Read},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
+    path::Path,
+    time::Duration,
+};
 
+use futures_util::{Stream, StreamExt};
 use matrix_sdk::{
+    Client,
     attachment::{
         AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo, BaseVideoInfo,
     },
-    media::{MediaFormat, MediaRequestParameters},
+    bytes::Bytes,
+    reqwest::{self, StatusCode, dns, header},
     ruma::{
         UInt,
+        api::{
+            Metadata, OutgoingRequestExt,
+            auth_scheme::SendAccessToken,
+            client::{authenticated_media, media},
+        },
         events::{
             AnySyncMessageLikeEvent, AnySyncTimelineEvent,
             room::{
@@ -21,9 +36,11 @@ use matrix_sdk::{
     },
     send_queue::{RoomSendQueueUpdate, SendHandle},
 };
+use matrix_sdk_crypto::AttachmentDecryptor;
 use mime::Mime;
 use serde::{Deserialize, Serialize};
 use tokio::{sync::broadcast, task};
+use url::{Host, Url};
 
 use crate::{AccountManager, MatrixCoreError, QueuedSendOutcome, Result, account_room};
 
@@ -31,6 +48,8 @@ use crate::{AccountManager, MatrixCoreError, QueuedSendOutcome, Result, account_
 /// upload limit; the SDK reports that independently.
 pub const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 const MEDIA_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_MEDIA_REDIRECTS: usize = 5;
+const MAX_MATRIX_ERROR_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -250,11 +269,10 @@ impl AccountManager {
         Ok(resolved.metadata)
     }
 
-    /// Download and decrypt an attachment for the selected account. Missing
-    /// or excessive event size metadata is rejected before calling the SDK.
-    /// The pinned SDK currently buffers the HTTP response internally, so a
-    /// malicious server that lies about size can exceed this cap transiently;
-    /// the returned plaintext is checked again and no download is cached.
+    /// Download and decrypt an attachment for the selected account. The Matrix
+    /// SDK's media convenience API buffers an unbounded HTTP body, so use a
+    /// dedicated redirect-checked client and Ruma's endpoint construction.
+    /// Each incoming chunk is checked before allocation exceeds the limit.
     pub async fn download_attachment_for(
         &self,
         expected_account_id: &str,
@@ -269,22 +287,10 @@ impl AccountManager {
             account_room(&state, expected_account_id, room_id)?
         };
         let resolved = resolve_attachment(&room, event_id).await?;
-        let size = resolved
-            .metadata
-            .declared_size
-            .ok_or(MatrixCoreError::MissingMediaSize)?;
-        check_size(size)?;
-        let request = MediaRequestParameters {
-            source: resolved.source,
-            format: MediaFormat::File,
-        };
-        let bytes = tokio::time::timeout(
-            MEDIA_TIMEOUT,
-            room.client().media().get_media_content(&request, false),
-        )
-        .await
-        .map_err(|_| MatrixCoreError::Sdk("media download timed out".into()))?
-        .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
+        if let Some(size) = resolved.metadata.declared_size {
+            check_size(size)?;
+        }
+        let bytes = download_bounded_media(&room.client(), &resolved.source).await?;
         check_size(bytes.len() as u64)?;
         self.assert_active(expected_account_id).await?;
         Ok(DownloadedAttachment {
@@ -308,6 +314,350 @@ impl AccountManager {
             Err(MatrixCoreError::SelectedAccountChanged)
         }
     }
+}
+
+async fn download_bounded_media(client: &Client, source: &MediaSource) -> Result<Vec<u8>> {
+    let uri = match source {
+        MediaSource::Plain(uri) => uri,
+        MediaSource::Encrypted(file) => &file.url,
+    };
+    let supported = client
+        .supported_versions()
+        .await
+        .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
+    let base_url = client.homeserver();
+    let authenticated =
+        authenticated_media::get_content::v1::Request::PATH_BUILDER.is_supported(&supported);
+    // The SDK's reqwest client follows redirects automatically. A final-URL
+    // check is too late to prevent a request to an unsafe target. Use separate
+    // clients so the trusted homeserver retains normal proxy support while
+    // every off-origin CDN connection uses only DNS-vetted public addresses.
+    let first_party_http = reqwest::Client::builder()
+        .user_agent("matrix-rust-sdk")
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
+    let public_cdn_http = reqwest::Client::builder()
+        .user_agent("matrix-rust-sdk")
+        .min_tls_version(reqwest::tls::Version::TLS_1_2)
+        .redirect(reqwest::redirect::Policy::none())
+        // A system/environment proxy resolves the CDN hostname itself and
+        // would bypass our resolver. Fail closed for CDN fetches instead.
+        .no_proxy()
+        .dns_resolver(PublicMediaResolver)
+        .build()
+        .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
+    let mut refresh_attempt = 0;
+    let response = 'retry_after_refresh: loop {
+        let request = if authenticated {
+            let token = client.access_token().ok_or_else(|| {
+                MatrixCoreError::Sdk("authenticated media requires a session".into())
+            })?;
+            authenticated_media::get_content::v1::Request::from_uri(uri)
+                .map_err(|error| MatrixCoreError::InvalidMedia(error.to_string()))?
+                .try_into_http_request::<Vec<u8>>(
+                    base_url.as_str(),
+                    SendAccessToken::IfRequired(&token),
+                    Cow::Borrowed(&supported),
+                )
+                .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?
+        } else {
+            #[allow(deprecated)]
+            let request = media::get_content::v3::Request::from_url(uri)
+                .map_err(|error| MatrixCoreError::InvalidMedia(error.to_string()))?;
+            request
+                .try_into_http_request::<Vec<u8>>(
+                    base_url.as_str(),
+                    SendAccessToken::None,
+                    Cow::Borrowed(&supported),
+                )
+                .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?
+        };
+        let mut url = Url::parse(&request.uri().to_string())
+            .map_err(|error| MatrixCoreError::InvalidMedia(error.to_string()))?;
+        let initial_url = url.clone();
+        let mut crossed_origin = false;
+        for redirects in 0..=MAX_MEDIA_REDIRECTS {
+            // Never forward an access token to a CDN. The unauthenticated CDN
+            // URL is supplied by the homeserver's 307/308 Location header.
+            let media_http = if crossed_origin {
+                &public_cdn_http
+            } else {
+                &first_party_http
+            };
+            let mut get = media_http.get(url.clone()).timeout(MEDIA_TIMEOUT);
+            if !crossed_origin && url.origin() == initial_url.origin() {
+                get = get.headers(request.headers().clone());
+            }
+            let response = get.send().await.map_err(|error| {
+                // reqwest may include a signed CDN URL in its Display
+                // output. Never surface its query string in UI or logs.
+                let detail = if error.is_timeout() {
+                    "media request timed out"
+                } else if error.is_connect() {
+                    "media connection failed"
+                } else {
+                    "media network request failed"
+                };
+                MatrixCoreError::Sdk(detail.into())
+            })?;
+            if authenticated
+                && refresh_attempt == 0
+                && redirects == 0
+                && response.status() == StatusCode::UNAUTHORIZED
+            {
+                if is_unknown_token(response).await {
+                    client
+                        .refresh_access_token()
+                        .await
+                        .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
+                    refresh_attempt += 1;
+                    continue 'retry_after_refresh;
+                }
+                return Err(MatrixCoreError::Sdk(
+                    "media download was rejected with HTTP 401".into(),
+                ));
+            }
+            if matches!(
+                response.status(),
+                StatusCode::TEMPORARY_REDIRECT | StatusCode::PERMANENT_REDIRECT
+            ) {
+                if !authenticated {
+                    return Err(MatrixCoreError::InvalidMedia(
+                        "legacy media endpoint redirected despite allow_redirect=false".into(),
+                    ));
+                }
+                if redirects == MAX_MEDIA_REDIRECTS {
+                    return Err(MatrixCoreError::InvalidMedia(
+                        "too many media redirects".into(),
+                    ));
+                }
+                let location = response
+                    .headers()
+                    .get(header::LOCATION)
+                    .ok_or_else(|| {
+                        MatrixCoreError::InvalidMedia("media redirect has no Location".into())
+                    })?
+                    .to_str()
+                    .map_err(|_| {
+                        MatrixCoreError::InvalidMedia("invalid media redirect Location".into())
+                    })?;
+                let next = url
+                    .join(location)
+                    .map_err(|error| MatrixCoreError::InvalidMedia(error.to_string()))?;
+                validate_media_redirect(&initial_url, &next)?;
+                crossed_origin |= next.origin() != initial_url.origin();
+                url = next;
+                continue;
+            }
+            if response.status().is_redirection() {
+                return Err(MatrixCoreError::InvalidMedia(
+                    "unsupported media redirect response".into(),
+                ));
+            }
+            if !response.status().is_success() {
+                return Err(MatrixCoreError::Sdk(format!(
+                    "media server returned HTTP {}",
+                    response.status().as_u16()
+                )));
+            }
+            break 'retry_after_refresh response;
+        }
+        unreachable!("bounded media redirect loop always returns or errors")
+    };
+    if let Some(length) = response.content_length() {
+        check_size(length)?;
+    }
+    let ciphertext = collect_bounded_stream(response.bytes_stream()).await?;
+    match source {
+        MediaSource::Plain(_) => Ok(ciphertext),
+        MediaSource::Encrypted(file) => task::spawn_blocking({
+            let file = file.as_ref().clone();
+            move || {
+                let mut source = std::io::Cursor::new(ciphertext);
+                let mut decryptor = AttachmentDecryptor::new(&mut source, file.into())
+                    .map_err(|error| MatrixCoreError::InvalidMedia(error.to_string()))?;
+                let mut plaintext = Vec::new();
+                decryptor.read_to_end(&mut plaintext)?;
+                check_size(plaintext.len() as u64)?;
+                Ok::<_, MatrixCoreError>(plaintext)
+            }
+        })
+        .await
+        .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?,
+    }
+}
+
+/// A cross-origin redirect is only useful for a public HTTPS CDN. The URL
+/// check rejects obvious local targets; PublicMediaResolver also checks the
+/// addresses returned for that hostname at the point of connection.
+fn validate_media_redirect(initial: &Url, next: &Url) -> Result<()> {
+    if next.username() != "" || next.password().is_some() || next.fragment().is_some() {
+        return Err(MatrixCoreError::InvalidMedia(
+            "unsafe media redirect URL".into(),
+        ));
+    }
+    if next.origin() == initial.origin() {
+        return Ok(());
+    }
+    if next.scheme() != "https" {
+        return Err(MatrixCoreError::InvalidMedia(
+            "media redirect must use HTTPS".into(),
+        ));
+    }
+    let Some(Host::Domain(domain)) = next.host() else {
+        return Err(MatrixCoreError::InvalidMedia(
+            "media redirect cannot target an IP address".into(),
+        ));
+    };
+    let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+    if !domain.contains('.')
+        || [
+            "localhost",
+            "local",
+            "lan",
+            "internal",
+            "test",
+            "invalid",
+            "example",
+            "onion",
+        ]
+        .iter()
+        .any(|suffix| domain == *suffix || domain.ends_with(&format!(".{suffix}")))
+    {
+        return Err(MatrixCoreError::InvalidMedia(
+            "media redirect targets a local host".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Reqwest's connector uses these exact SocketAddrs to establish a connection,
+/// so a hostname cannot be resolved again after the check. A fresh resolution
+/// on a later connection is checked again, including after a DNS rebinding.
+struct PublicMediaResolver;
+
+impl dns::Resolve for PublicMediaResolver {
+    fn resolve(&self, name: dns::Name) -> dns::Resolving {
+        Box::pin(resolve_public_media_host(name.as_str().to_owned()))
+    }
+}
+
+async fn resolve_public_media_host(
+    hostname: String,
+) -> std::result::Result<dns::Addrs, Box<dyn std::error::Error + Send + Sync>> {
+    // Match reqwest's default getaddrinfo resolver without blocking Tokio's
+    // executor. Hyper connects to the returned addresses, not to `hostname`.
+    let addresses: Vec<SocketAddr> = task::spawn_blocking(move || {
+        (hostname.as_str(), 0)
+            .to_socket_addrs()
+            .map(Iterator::collect)
+    })
+    .await??;
+    Ok(Box::new(
+        checked_public_media_addresses(addresses)?.into_iter(),
+    ))
+}
+
+fn checked_public_media_addresses(addresses: Vec<SocketAddr>) -> io::Result<Vec<SocketAddr>> {
+    if addresses.is_empty() || addresses.iter().any(|addr| !is_public_media_ip(addr.ip())) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "media CDN DNS returned a non-public address",
+        ));
+    }
+    Ok(addresses)
+}
+
+fn is_public_media_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_public_media_ipv4(address),
+        IpAddr::V6(address) => is_public_media_ipv6(address),
+    }
+}
+
+fn is_public_media_ipv4(address: Ipv4Addr) -> bool {
+    let [a, b, c, _] = address.octets();
+    !matches!(
+        (a, b, c),
+        // Unspecified, RFC1918, carrier-grade NAT, loopback, link-local.
+        (0 | 10 | 127, _, _)
+            | (100, 64..=127, _)
+            | (169, 254, _)
+            | (172, 16..=31, _)
+            | (192, 168, _)
+            // IANA protocol assignments, documentation, relay and anycast
+            // special-purpose blocks, benchmarking, multicast and reserved.
+            | (192, 0, 0 | 2)
+            | (192, 31, 196)
+            | (192, 52, 193)
+            | (192, 88, 99)
+            | (192, 175, 48)
+            | (198, 18 | 19, _)
+            | (198, 51, 100)
+            | (203, 0, 113)
+            | (224..=255, _, _)
+    )
+}
+
+fn is_public_media_ipv6(address: Ipv6Addr) -> bool {
+    let segments = address.segments();
+    // Conservative allowlist of current RIR-allocated global-unicast space.
+    // The rest of 2000::/3 is still reserved by IANA. In particular this
+    // excludes IPv4-mapped/NAT64, ULA, link-local, multicast, 6to4, and
+    // documentation addresses. Update when IANA allocates new prefixes:
+    // https://www.iana.org/assignments/ipv6-unicast-address-assignments/
+    match segments[0] {
+        0x2001 => {
+            matches!(
+                segments[1],
+                0x0200..=0x0fff | 0x1200..=0x4dff | 0x5000..=0x5fff | 0x8000..=0xbfff
+            ) && segments[1] != 0x0db8
+        }
+        0x2003 => segments[1] < 0x4000,
+        0x2400..=0x241f
+        | 0x2600..=0x260f
+        | 0x2630..=0x263f
+        | 0x2800..=0x280f
+        | 0x2a00..=0x2a1f
+        | 0x2c00..=0x2c0f => true,
+        0x2610 | 0x2620 => segments[1] <= 0x01ff,
+        _ => false,
+    }
+}
+
+async fn is_unknown_token(response: reqwest::Response) -> bool {
+    let mut stream = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            return false;
+        };
+        if body.len().saturating_add(chunk.len()) > MAX_MATRIX_ERROR_BYTES {
+            return false;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|json| json.get("errcode")?.as_str().map(str::to_owned))
+        .is_some_and(|code| code == "M_UNKNOWN_TOKEN")
+}
+
+async fn collect_bounded_stream<S, E>(stream: S) -> Result<Vec<u8>>
+where
+    S: Stream<Item = std::result::Result<Bytes, E>>,
+{
+    futures_util::pin_mut!(stream);
+    let mut result = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| MatrixCoreError::Sdk("media body transfer failed".into()))?;
+        let next_size = result.len().saturating_add(chunk.len());
+        check_size(next_size as u64)?;
+        result.extend_from_slice(&chunk);
+    }
+    Ok(result)
 }
 
 async fn resolve_attachment(
@@ -509,6 +859,147 @@ fn is_windows_reserved_name(filename: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::stream;
+
+    #[test]
+    fn media_redirects_validate_targets_before_request() {
+        let initial =
+            Url::parse("https://homeserver.example.org/_matrix/client/v1/media/download/a/b")
+                .unwrap();
+        assert!(
+            validate_media_redirect(
+                &initial,
+                &Url::parse("https://homeserver.example.org/media-proxy/a").unwrap(),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_media_redirect(
+                &initial,
+                &Url::parse("https://cdn.example.net/object/a").unwrap(),
+            )
+            .is_ok()
+        );
+        for target in [
+            "http://cdn.example.net/object/a",
+            "https://127.0.0.1/object/a",
+            "https://[::1]/object/a",
+            "https://localhost/object/a",
+            "https://gateway.internal/object/a",
+            "https://user:password@cdn.example.net/object/a",
+            "https://cdn.example.net/object/a#fragment",
+        ] {
+            assert!(
+                validate_media_redirect(&initial, &Url::parse(target).unwrap()).is_err(),
+                "{target}"
+            );
+        }
+    }
+
+    #[test]
+    fn cdn_dns_accepts_only_public_addresses() {
+        for address in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "93.184.216.34",
+            "2001:4860:4860::8888",
+            "2606:4700:4700::1111",
+            "2a00:1450:4009::200e",
+        ] {
+            assert!(is_public_media_ip(address.parse().unwrap()), "{address}");
+        }
+        for address in [
+            "0.0.0.0",
+            "10.1.2.3",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "172.16.0.1",
+            "192.0.0.1",
+            "192.0.2.5",
+            "192.168.1.1",
+            "198.18.0.1",
+            "198.51.100.1",
+            "203.0.113.5",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "::ffff:127.0.0.1",
+            "64:ff9b::c0a8:0101",
+            "100::1",
+            "2001::1",
+            "2001:db8::1",
+            "2002:c0a8:101::1",
+            "3000::1",
+            "3fff::1",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
+        ] {
+            assert!(!is_public_media_ip(address.parse().unwrap()), "{address}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cdn_resolver_rejects_loopback_at_connection_resolution() {
+        assert!(resolve_public_media_host("localhost".into()).await.is_err());
+        assert!(resolve_public_media_host("127.0.0.1".into()).await.is_err());
+        let public = "1.1.1.1:0".parse().unwrap();
+        let private = "127.0.0.1:0".parse().unwrap();
+        assert_eq!(
+            checked_public_media_addresses(vec![public]).unwrap(),
+            vec![public]
+        );
+        assert!(checked_public_media_addresses(vec![public, private]).is_err());
+        assert!(checked_public_media_addresses(vec![]).is_err());
+    }
+
+    #[tokio::test]
+    async fn guarded_cdn_client_never_connects_to_loopback() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(PublicMediaResolver)
+            .build()
+            .unwrap();
+        assert!(
+            client
+                .get(format!(
+                    "http://localhost:{}/",
+                    listener.local_addr().unwrap().port()
+                ))
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_download_rejects_an_oversized_body() {
+        let chunks = [
+            Ok::<Bytes, std::io::Error>(Bytes::from(vec![0x41; MAX_ATTACHMENT_BYTES])),
+            Ok(Bytes::from_static(b"extra")),
+        ];
+        assert!(matches!(
+            collect_bounded_stream(stream::iter(chunks)).await,
+            Err(MatrixCoreError::MediaTooLarge { actual, .. }) if actual == (MAX_ATTACHMENT_BYTES + 5) as u64
+        ));
+        assert_eq!(
+            collect_bounded_stream(stream::iter([Ok::<Bytes, std::io::Error>(
+                Bytes::from_static(b"within limit"),
+            )]))
+            .await
+            .unwrap(),
+            b"within limit"
+        );
+    }
 
     #[test]
     fn file_read_rejects_oversized_input() {

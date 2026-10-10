@@ -54,8 +54,22 @@ pub struct CallOptions {
 impl Default for CallOptions {
     fn default() -> Self {
         Self {
+            // The pinned RTC core's current room-wide slot sentinel.
             slot_id: "m.call#room".to_owned(),
             interop_mode: InteropMode::Current,
+        }
+    }
+}
+
+impl CallOptions {
+    /// Join the pre-sticky Element Call room-state dialect. Its empty legacy
+    /// `call_id` maps to the RTC core's lowercase `room` sentinel. Element
+    /// Call's current-mode uppercase `ROOM` slot has separate interoperability
+    /// requirements and is not enabled by this option.
+    pub fn room_state_compatibility() -> Self {
+        Self {
+            slot_id: "m.call#room".to_owned(),
+            interop_mode: InteropMode::RoomState,
         }
     }
 }
@@ -445,6 +459,19 @@ mod tests {
     use matrix_rtc_call_sdk::StreamState;
 
     use super::*;
+
+    #[test]
+    fn default_slot_matches_pinned_rtc_room_slot() {
+        assert_eq!(CallOptions::default().slot_id, "m.call#room");
+    }
+
+    #[test]
+    fn legacy_room_state_options_use_the_pre_sticky_room_sentinel() {
+        let options = CallOptions::room_state_compatibility();
+        assert_eq!(options.interop_mode, InteropMode::RoomState);
+        assert_eq!(options.slot_id, "m.call#room");
+        assert_eq!(CallOptions::default().slot_id, "m.call#room");
+    }
 
     #[test]
     fn roster_conversion_preserves_membership_and_media_state() {

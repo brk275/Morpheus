@@ -11,6 +11,15 @@ pub use media::{
     AttachmentKind, AttachmentMetadata, AttachmentSendUpdate, DownloadedAttachment,
     MAX_ATTACHMENT_BYTES, QueuedAttachment,
 };
+mod discovery;
+pub use discovery::{
+    MatrixLinkTarget, PublicRoomInfo, PublicRoomsPage, PublicRoomsQuery, ResolvedRoomAlias,
+    parse_matrix_link_target,
+};
+mod search;
+pub use search::MessageSearchResult;
+mod admin;
+pub use admin::RoomMemberInfo;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -48,6 +57,7 @@ use matrix_sdk::{
         room::RoomType,
         serde::Raw,
     },
+    search_index::SearchIndexStoreKind,
     send_queue::RoomSendQueueUpdate,
     store::RoomLoadSettings,
 };
@@ -94,6 +104,12 @@ pub enum MatrixCoreError {
     RoomNotFound(String),
     #[error("invalid room ID: {0}")]
     InvalidRoomId(String),
+    #[error("invalid Matrix room link: {0}")]
+    InvalidMatrixLink(String),
+    #[error("invalid public room directory request: {0}")]
+    InvalidDirectoryQuery(String),
+    #[error("invalid message search query: {0}")]
+    InvalidSearchQuery(String),
     #[error("invalid event ID: {0}")]
     InvalidEventId(String),
     #[error("invalid media: {0}")]
@@ -102,10 +118,10 @@ pub enum MatrixCoreError {
     MediaTooLarge { maximum: u64, actual: u64 },
     #[error("this event is not a media attachment")]
     NotMediaAttachment,
-    #[error("attachment has no size metadata")]
-    MissingMediaSize,
     #[error("invalid user ID: {0}")]
     InvalidUserId(String),
+    #[error("invalid room power level: {0}")]
+    InvalidPowerLevel(String),
     #[error("account registry is invalid: {0}")]
     InvalidRegistry(String),
     #[error("stored Matrix session is invalid or does not match this account")]
@@ -2301,6 +2317,10 @@ async fn build_client(homeserver: &str, store_path: &Path, passphrase: &str) -> 
     let client = Client::builder()
         .homeserver_url(homeserver)
         .sqlite_store(store_path, Some(passphrase))
+        .search_index_store(SearchIndexStoreKind::EncryptedDirectory(
+            store_path.join("search"),
+            passphrase.to_owned(),
+        ))
         // Fetch only missing room keys after recovery, avoiding a full-account backup download.
         .with_encryption_settings(EncryptionSettings {
             backup_download_strategy: BackupDownloadStrategy::AfterDecryptionFailure,
@@ -2309,6 +2329,12 @@ async fn build_client(homeserver: &str, store_path: &Path, passphrase: &str) -> 
         .handle_refresh_tokens()
         .build()
         .await
+        .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
+    // Indexing starts when the event cache subscribes. Start before sync so
+    // the first message batch is indexed even when no timeline is open.
+    client
+        .event_cache()
+        .subscribe()
         .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
     // A restored client can contain persisted queued sends. Keep it dormant
     // until the account is actually selected and sync starts.

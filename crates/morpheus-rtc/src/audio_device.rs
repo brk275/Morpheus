@@ -26,6 +26,17 @@ const CHUNK_SAMPLES_PER_CHANNEL: usize = 480; // 10 ms
 const MAX_OUTPUT_BUFFER_SAMPLES: usize = SAMPLE_RATE as usize; // 500 ms stereo
 const MAX_REMOTE_STREAMS: usize = 64;
 const REMOTE_FRAME_CHANNEL_CAPACITY: usize = 128;
+// A hung platform device open must not accumulate one blocked thread per
+// retry, or keep Tokio's blocking pool alive when the app quits.
+static DEVICE_OPEN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+struct DeviceOpenGuard;
+
+impl Drop for DeviceOpenGuard {
+    fn drop(&mut self) {
+        DEVICE_OPEN_IN_PROGRESS.store(false, Ordering::SeqCst);
+    }
+}
 
 /// Native microphone PCM capture. Frames are 10 ms at 48 kHz, with one or two
 /// channels matching the selected input device. Keep this value alive while
@@ -593,8 +604,53 @@ impl RtcService {
         }
         let _run_guard = AudioRunGuard::start(controls)?;
         let mut requests = controls.requested.subscribe();
-        let mut microphone = MicrophoneCapture::open_default()?;
-        let speaker = AudioOutput::open_default()?;
+        // CoreAudio can block inside AudioUnitSetProperty while opening the
+        // microphone (for example while macOS resolves device permissions).
+        // Keeping that synchronous call on the Tokio worker also starves the
+        // call's roster and remote video futures. Open both devices on a
+        // blocking thread and bound the wait so the call can leave cleanly.
+        if DEVICE_OPEN_IN_PROGRESS
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(MediaError::Device(
+                "audio device setup is still in progress".into(),
+            ));
+        }
+        let opening_lease = lease.clone();
+        let (device_tx, device_rx) = tokio::sync::oneshot::channel();
+        let opened = std::thread::Builder::new()
+            .name("morpheus-audio-open".into())
+            .spawn(move || {
+                let _opening = DeviceOpenGuard;
+                let result = (|| {
+                    if !opening_lease.is_active() {
+                        return Err(MediaError::CallEnded);
+                    }
+                    let microphone = MicrophoneCapture::open_default()?;
+                    if !opening_lease.is_active() {
+                        return Err(MediaError::CallEnded);
+                    }
+                    let speaker = AudioOutput::open_default()?;
+                    if !opening_lease.is_active() {
+                        return Err(MediaError::CallEnded);
+                    }
+                    Ok((microphone, speaker))
+                })();
+                let _ = device_tx.send(result);
+            });
+        if opened.is_err() {
+            DEVICE_OPEN_IN_PROGRESS.store(false, Ordering::SeqCst);
+            return Err(MediaError::Device(
+                "could not start audio device setup".into(),
+            ));
+        }
+        // The OS thread is deliberately detached. If CoreAudio never returns,
+        // Tokio shutdown and the rest of the call UI still make progress.
+        let (mut microphone, speaker) = tokio::time::timeout(Duration::from_secs(30), device_rx)
+            .await
+            .map_err(|_| MediaError::Device("audio device initialization timed out".into()))?
+            .map_err(|_| MediaError::Device("audio device setup task failed".into()))??;
         let publication = Arc::new(
             self.publish_microphone(
                 room_id,
@@ -997,7 +1053,7 @@ mod tests {
     fn controls_from_previous_join_reject_new_join_even_in_same_room() {
         let info = CallInfo {
             room_id: "!room:example.test".into(),
-            slot_id: "m.call#room".into(),
+            slot_id: "m.call#ROOM".into(),
             membership_id: "first-membership".into(),
             local_identity: "first-identity".into(),
         };
