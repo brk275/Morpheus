@@ -9,6 +9,8 @@ use std::{collections::HashMap, fs, path::PathBuf, time::Duration};
 use futures_util::StreamExt;
 use matrix_sdk::{Client, ruma::api::client::uiaa};
 use morpheus_matrix::{AccountManager, SyncBackend, SyncStatus};
+#[cfg(feature = "device-screen")]
+use morpheus_rtc::ScreenCapture;
 use morpheus_rtc::{
     AudioFrame, CallOptions, I420Buffer, MediaStreamKind, RtcError, RtcService, VideoFrame,
     VideoRotation,
@@ -320,6 +322,131 @@ async fn verify_video_kind(
     eprintln!("Decoded encrypted {kind:?} I420 pattern at {dimensions:?}.");
 }
 
+#[cfg(feature = "device-screen")]
+fn nonblank_frame(buffer: &I420Buffer) -> bool {
+    let (width, height, stride) = (
+        buffer.width as usize,
+        buffer.height as usize,
+        buffer.stride_y as usize,
+    );
+    if width == 0
+        || height == 0
+        || stride < width
+        || buffer.data_y.len() < stride.saturating_mul(height)
+    {
+        return false;
+    }
+    let mut levels = [false; 256];
+    let mut has_visible_luma = false;
+    for row in 0..height {
+        for &luma in &buffer.data_y[row * stride..row * stride + width] {
+            levels[luma as usize] = true;
+            has_visible_luma |= luma > 20;
+        }
+    }
+    has_visible_luma && levels.into_iter().filter(|present| *present).count() >= 4
+}
+
+/// The separate real_capture test proves that native pixels enter I420. This
+/// optional extension proves that an actual capture also crosses the encrypted
+/// MatrixRTC screen track and decodes on Bob's device. Pixels stay local to the
+/// disposable loopback call and are never written to a file or test log.
+#[cfg(feature = "device-screen")]
+async fn verify_real_screen_capture(
+    alice_rtc: &RtcService,
+    bob_rtc: &RtcService,
+    room_id: &str,
+    alice_membership_id: &str,
+) {
+    let source = std::env::var("MORPHEUS_CAPTURE_SOURCE").unwrap_or_else(|_| "display".into());
+    let index = std::env::var("MORPHEUS_CAPTURE_INDEX")
+        .ok()
+        .map(|value| value.parse::<usize>().expect("Invalid capture index"))
+        .unwrap_or(0);
+    let capture = match source.as_str() {
+        "display" => ScreenCapture::open(index),
+        "window" => ScreenCapture::open_window(index),
+        _ => panic!("MORPHEUS_CAPTURE_SOURCE must be display or window"),
+    }
+    .expect("Cannot open the selected native capture source");
+    let first = capture
+        .next_frame_sized(VIDEO_WIDTH, VIDEO_HEIGHT)
+        .expect("Cannot capture native screen frame");
+    assert!(nonblank_frame(&first.buffer), "Native capture was blank");
+
+    timeout(Duration::from_secs(15), async {
+        while bob_rtc
+            .call(room_id)
+            .expect("Bob call vanished")
+            .remote_track(alice_membership_id, MediaStreamKind::ScreenShare)
+            .is_some()
+        {
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("Previous synthetic screen track did not close");
+    let publication = alice_rtc
+        .publish_screen(room_id, VIDEO_WIDTH, VIDEO_HEIGHT, false)
+        .await
+        .expect("Cannot publish real native screen capture");
+    let sending = async {
+        publication
+            .push_video(first)
+            .expect("Cannot send first native capture frame");
+        loop {
+            sleep(Duration::from_millis(125)).await;
+            let frame = capture
+                .next_frame_sized(VIDEO_WIDTH, VIDEO_HEIGHT)
+                .expect("Native capture stopped during publication");
+            publication
+                .push_video(frame)
+                .expect("Cannot send native capture frame");
+        }
+    };
+    let receiving = async {
+        let remote = timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(track) = bob_rtc
+                    .call(room_id)
+                    .expect("Bob call vanished")
+                    .remote_track(alice_membership_id, MediaStreamKind::ScreenShare)
+                {
+                    break track;
+                }
+                sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("Bob did not subscribe to the native screen track");
+        let mut frames = remote
+            .video_frames()
+            .expect("Native screen track has no I420 stream");
+        timeout(Duration::from_secs(20), async {
+            while let Some(frame) = frames.next().await {
+                if frame.buffer.width > 0
+                    && frame.buffer.height > 0
+                    && nonblank_frame(&frame.buffer)
+                {
+                    return;
+                }
+            }
+            panic!("Native screen stream closed before Bob decoded a nonblank frame");
+        })
+        .await
+        .expect("Bob did not decode nonblank native screen pixels");
+    };
+    tokio::select! {
+        () = sending => unreachable!("Screen sender cannot finish on its own"),
+        () = receiving => {},
+    }
+    publication
+        .unpublish()
+        .await
+        .expect("Cannot unpublish native screen capture");
+    eprintln!("Bob decoded nonblank encrypted native {source} pixels at 640×360.");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn encrypted_two_device_audio_video_and_reconnect() {
     let Some(path) = std::env::var_os("MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS") else {
@@ -507,6 +634,10 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
         MediaStreamKind::ScreenShare,
     )
     .await;
+    #[cfg(feature = "device-screen")]
+    if std::env::var("MORPHEUS_RTC_REAL_SCREEN_CAPTURE").as_deref() == Ok("1") {
+        verify_real_screen_capture(&alice_rtc, &bob_rtc, room_id, &alice_call.membership_id).await;
+    }
 
     bob_rtc.leave(room_id).await.expect("Bob leave failed");
     wait_for_peer(&alice_rtc, room_id, &bob_account.user_id, false).await;

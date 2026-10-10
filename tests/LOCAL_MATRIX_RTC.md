@@ -71,6 +71,40 @@ or screen-capture hardware. A
 successful run logs out and deletes the temporary client stores; a failed run
 leaves its store for diagnosis.
 
+### Real macOS display and window capture
+
+The separate capture test is opt-in because macOS may request Screen Recording
+permission. It reads two frames, letterboxes them to 640×360 I420, checks that
+they are nonblank and have valid planes and increasing timestamps, and saves no
+pixels. It can use either the first display or the first application window:
+
+```sh
+MORPHEUS_REAL_CAPTURE=1 cargo test --locked -p morpheus-rtc --features device-screen --test real_capture -- --nocapture
+MORPHEUS_REAL_CAPTURE=1 MORPHEUS_CAPTURE_SOURCE=window cargo test --locked -p morpheus-rtc --features device-screen --test real_capture -- --nocapture
+```
+
+Set `MORPHEUS_CAPTURE_INDEX` to select a different zero-based display or window.
+The index is resolved from a fresh OS enumeration, so a disappearing or
+reordered window can make the test fail. A permission denial, protected window,
+blank source, or unavailable capture session is a test failure when opted in.
+
+To additionally carry real captured pixels through native MatrixRTC, start the
+local RTC fixture and create a **fresh** `rtc-fixture` file as above. Then run
+the existing test with `device-screen` and
+`MORPHEUS_RTC_REAL_SCREEN_CAPTURE=1`:
+
+```sh
+MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS=/path/to/fresh/rtc-fixture.json \
+MORPHEUS_RTC_REAL_SCREEN_CAPTURE=1 \
+cargo test --locked -p morpheus-rtc --features device-screen --test local_rtc -- --nocapture
+```
+
+Add `MORPHEUS_CAPTURE_SOURCE=window` to share a window rather than a display.
+The test publishes 640×360 I420 frames to Alice's encrypted `ScreenShare`
+track and requires Bob to decode nonblank pixels. It does not write image
+content to files or logs. The capture test runs inside the current macOS
+user's permission context and is not a packaged-app permission test.
+
 For a bounded connectivity check, set `MORPHEUS_RTC_JOIN_TIMEOUT_SECS=12`.
 The default is 60 seconds per join. The test exits with a failure when a join
 times out.
@@ -96,7 +130,16 @@ passed in 17.07 seconds: Bob imported Alice's encrypted media key, subscribed
 to her synthetic microphone, decoded nonzero audio, left, and rejoined the
 same call. An expanded fresh-fixture run passed in 18.27 seconds: Bob also
 received red/green synthetic I420 camera and `ScreenShare` frames at 640×360.
-The screen stream used generated pixels; it did not capture a display or window.
+On 2026-10-10, the separate real-capture test passed for a display and a
+window. Two subsequent fresh-fixture MatrixRTC runs also passed: Bob decoded
+nonblank encrypted 640×360 display pixels (20.03 seconds) and window pixels
+(18.32 seconds), then both tests completed participant leave and rejoin. The
+display path passed once more in 19.83 seconds after narrowing the decoded
+nonblank check to visible rows. A randomly generated test password beginning
+with `-` briefly broke `rtc-fixture` registration; the registration script now
+passes it in `--password=value` form, and a fresh fixture succeeded. The
+original red/green test still uses generated pixels unless
+`MORPHEUS_RTC_REAL_SCREEN_CAPTURE=1` is set.
 Morpheus rejects an encrypted call before joining when the current
 device lacks the required verification; the app still needs a clear
 verification/recovery action for real accounts.
@@ -106,8 +149,8 @@ homeservers. The authorization service runs in its legacy direct mode for the
 client library's `/get_token` flow; production MatrixRTC service registration,
 federated calls, delegated delayed leave, Element Call interoperability,
 automatic network reconnect, video in the Morpheus call stage, OS-specific
-camera and screen capture, actual window/display sharing, and Linux/Windows
-call behavior remain separate release gates. The local TLS
+camera capture, packaged-app window/display sharing with permission UI, and
+Linux/Windows call behavior remain separate release gates. The local TLS
 bypass and loopback DNS alias are test-only configuration.
 
 ## Stop

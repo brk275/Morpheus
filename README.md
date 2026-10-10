@@ -6,13 +6,14 @@ design, deep configuration, and fast Matrix account switching.
 
 **Status:** private pre-alpha. Password sign-in, account switching, Spaces,
 room creation and joining, invitations, basic room timelines, plain-text
-replies and edits, reactions, text threads, and in-session room drafts are wired
+replies and edits, reactions, text threads, and encrypted per-room drafts are wired
 into the desktop app. The Matrix SSO token flow is wired but has not passed a
 browser login test. An opt-in native audio path exposes controls to open or join
-a MatrixRTC room call on a compatible homeserver. A local encrypted two-device
-call passed synthetic audio, camera, and screen-track transport on macOS; real
-camera and display capture, call-stage video, and Element Call interoperability
-remain to be verified. Rich formatting and media, full call controls, recovery
+a MatrixRTC room call on a compatible homeserver. Local encrypted two-device
+calls passed synthetic audio and camera transport plus real macOS display and
+window screen-track transport. Real camera capture, packaged-app permissions,
+call-stage video, and Element Call interoperability remain to be verified.
+Rich formatting and media, full call controls, recovery
 screens, and platform acceptance tests remain in progress. Do not rely on this
 client for important conversations or encryption-key recovery yet. The first
 beta requires the cross-platform checks in [the feature matrix](docs/FEATURE_MATRIX.md).
@@ -49,7 +50,9 @@ a call. Browser sign-in uses the Matrix SSO login-token flow; MSC3861 OIDC is
 not implemented yet. The default build has a labeled call preview; the
 `native-calls` feature enables experimental microphone audio on homeservers
 that provide a compatible MatrixRTC/LiveKit service. Calls require the SDK's
-sticky sliding-sync path. In-session drafts are discarded when the app exits.
+sticky sliding-sync path. Live room drafts use the account's encrypted Matrix
+store and survive restart. A send that finishes after Morpheus quits can leave
+a stale draft because pending transaction metadata is not yet restored.
 See [architecture](docs/ARCHITECTURE.md) for the intended boundaries.
 
 The package configuration is in [Packager.toml](Packager.toml). Install

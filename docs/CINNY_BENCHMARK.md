@@ -26,7 +26,10 @@ formatting, media, and device-management changes.
 - [ ] Search rooms, users, and message history; show results in their room and
       timeline context.
 - [ ] Preserve per-room drafts, including across restart; failed sends keep the
-      original text. Current Morpheus drafts are session-only.
+      original text. Morpheus room drafts now survive restart in encrypted
+      account storage, and a server rejection restores unchanged composer text.
+      Pending sends completed after app exit can leave a stale draft; thread
+      drafts and full UI acceptance are still pending.
 - [ ] Render long and mixed-height timelines with virtualization and keyboard
       navigation; benchmark a 10,000-message room.
 

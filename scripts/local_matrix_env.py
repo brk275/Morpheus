@@ -206,7 +206,8 @@ def register(account: dict) -> None:
     server = next(item for item in SERVERS if endpoint(item) == account["homeserver_url"])
     docker(
         "exec", str(server["container"]), "register_new_matrix_user",
-        "--no-admin", "-u", account["username"], "-p", account["password"],
+        "--no-admin", "-u", account["username"],
+        f"--password={account['password']}",
         "-c", "/data/homeserver.yaml", "http://localhost:8008",
     )
     if login(account)["user_id"] != account["user_id"]:

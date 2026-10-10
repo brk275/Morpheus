@@ -17,7 +17,7 @@ use std::{
 use eyeball_im::Vector;
 use futures_util::StreamExt;
 use matrix_sdk::{
-    Client, RoomState,
+    Client, ComposerDraft, ComposerDraftType, RoomState,
     authentication::matrix::MatrixSession,
     config::SyncSettings,
     encryption::{
@@ -42,6 +42,7 @@ use matrix_sdk::{
         room::RoomType,
         serde::Raw,
     },
+    send_queue::RoomSendQueueUpdate,
     store::RoomLoadSettings,
 };
 use matrix_sdk_ui::sync_service::{Error as ServiceError, State as ServiceState, SyncService};
@@ -294,6 +295,47 @@ pub enum MessageSendState {
     Pending,
     Failed,
     Sent,
+}
+
+/// Outcome of a single queued room message, associated by its SDK
+/// transaction ID rather than by message body or room timeline position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueuedSendOutcome {
+    Sent,
+    Failed,
+    Unknown,
+}
+
+pub struct QueuedMessage {
+    transaction_id: String,
+    updates: broadcast::Receiver<RoomSendQueueUpdate>,
+}
+
+impl QueuedMessage {
+    pub fn transaction_id(&self) -> &str {
+        &self.transaction_id
+    }
+
+    pub async fn wait_outcome(mut self) -> QueuedSendOutcome {
+        loop {
+            match self.updates.recv().await {
+                Ok(RoomSendQueueUpdate::SentEvent { transaction_id, .. })
+                    if transaction_id.as_str() == self.transaction_id =>
+                {
+                    return QueuedSendOutcome::Sent;
+                }
+                Ok(RoomSendQueueUpdate::SendError { transaction_id, .. })
+                | Ok(RoomSendQueueUpdate::CancelledLocalEvent { transaction_id })
+                    if transaction_id.as_str() == self.transaction_id =>
+                {
+                    return QueuedSendOutcome::Failed;
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => return QueuedSendOutcome::Unknown,
+            }
+        }
+    }
 }
 
 /// A selected account's live message list. Drop it when the room or account
@@ -1119,6 +1161,20 @@ impl AccountManager {
         room_id: &str,
         body: impl Into<String>,
     ) -> Result<()> {
+        self.send_text_tracked_for(expected_account_id, room_id, body)
+            .await
+            .map(|_| ())
+    }
+
+    /// Queue a message and return a receiver for the server's result. The
+    /// subscription starts before queueing, so a fast homeserver response is
+    /// still associated with this exact transaction ID.
+    pub async fn send_text_tracked_for(
+        &self,
+        expected_account_id: &str,
+        room_id: &str,
+        body: impl Into<String>,
+    ) -> Result<QueuedMessage> {
         // Hold the switch lock through queueing the send. A switch cannot
         // redirect a command issued for the previously selected account.
         let state = self.state.lock().await;
@@ -1134,12 +1190,63 @@ impl AccountManager {
             .loaded
             .get(id)
             .ok_or(MatrixCoreError::NoActiveAccount)?;
+        let room = account_room(&state, expected_account_id, room_id)?;
+        let (_, updates) = room
+            .send_queue()
+            .subscribe()
+            .await
+            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
         let timeline = loaded.timeline(room_id).await?;
-        timeline
+        let handle = timeline
             .send(RoomMessageEventContent::text_plain(body.into()).into())
             .await
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
-        Ok(())
+        Ok(QueuedMessage {
+            transaction_id: handle.transaction_id().to_string(),
+            updates,
+        })
+    }
+
+    /// Read a room draft from this account's encrypted Matrix SQLite store.
+    /// The account must already be loaded on this device. A missing draft is
+    /// represented by an empty string, matching the native composer.
+    pub async fn load_composer_draft_for(&self, account_id: &str, room_id: &str) -> Result<String> {
+        let state = self.state.lock().await;
+        let room = account_room(&state, account_id, room_id)?;
+        room.load_composer_draft(None)
+            .await
+            .map(|draft| draft.map_or_else(String::new, |draft| draft.plain_text))
+            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
+    }
+
+    /// Save or clear a room draft in that account's encrypted Matrix SQLite
+    /// store. Holding the account lock excludes logout while the write runs;
+    /// a delayed write cannot recreate data after an account is removed.
+    pub async fn save_composer_draft_for(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        body: &str,
+    ) -> Result<()> {
+        let state = self.state.lock().await;
+        let room = account_room(&state, account_id, room_id)?;
+        if body.is_empty() {
+            room.clear_composer_draft(None)
+                .await
+                .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
+        } else {
+            room.save_composer_draft(
+                ComposerDraft {
+                    plain_text: body.to_owned(),
+                    html_text: None,
+                    draft_type: ComposerDraftType::NewMessage,
+                    attachments: Vec::new(),
+                },
+                None,
+            )
+            .await
+            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
+        }
     }
 
     pub async fn send_reply(
@@ -1923,6 +2030,26 @@ fn selected_room(state: &State, room_id: &str) -> Result<Room> {
         .ok_or_else(|| MatrixCoreError::RoomNotFound(room_id.into()))
 }
 
+fn account_room(state: &State, account_id: &str, room_id: &str) -> Result<Room> {
+    if !state
+        .registry
+        .accounts
+        .iter()
+        .any(|account| account.id == account_id)
+    {
+        return Err(MatrixCoreError::AccountNotFound(account_id.into()));
+    }
+    let loaded = state
+        .loaded
+        .get(account_id)
+        .ok_or_else(|| MatrixCoreError::AccountNotFound(account_id.into()))?;
+    let id = RoomId::parse(room_id).map_err(|e| MatrixCoreError::InvalidRoomId(e.to_string()))?;
+    loaded
+        .client
+        .get_room(&id)
+        .ok_or_else(|| MatrixCoreError::RoomNotFound(room_id.into()))
+}
+
 fn parse_event_id(raw: &str) -> Result<matrix_sdk::ruma::OwnedEventId> {
     EventId::parse(raw).map_err(|e| MatrixCoreError::InvalidEventId(e.to_string()))
 }
@@ -2405,6 +2532,58 @@ async fn delete_secret(id: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_send_outcome_uses_transaction_id_and_survives_lag() {
+        use matrix_sdk::ruma::TransactionId;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let wanted = TransactionId::new();
+            let other = TransactionId::new();
+            let (sender, updates) = broadcast::channel(1);
+            let queued = QueuedMessage {
+                transaction_id: wanted.to_string(),
+                updates,
+            };
+            sender
+                .send(RoomSendQueueUpdate::CancelledLocalEvent {
+                    transaction_id: other,
+                })
+                .unwrap();
+            sender
+                .send(RoomSendQueueUpdate::SentEvent {
+                    transaction_id: wanted,
+                    event_id: EventId::parse("$sent:example.org").unwrap(),
+                })
+                .unwrap();
+            assert_eq!(queued.wait_outcome().await, QueuedSendOutcome::Sent);
+
+            let wanted = TransactionId::new();
+            let (sender, updates) = broadcast::channel(1);
+            let queued = QueuedMessage {
+                transaction_id: wanted.to_string(),
+                updates,
+            };
+            sender
+                .send(RoomSendQueueUpdate::CancelledLocalEvent {
+                    transaction_id: wanted,
+                })
+                .unwrap();
+            assert_eq!(queued.wait_outcome().await, QueuedSendOutcome::Failed);
+
+            let (sender, updates) = broadcast::channel(1);
+            let queued = QueuedMessage {
+                transaction_id: TransactionId::new().to_string(),
+                updates,
+            };
+            drop(sender);
+            assert_eq!(queued.wait_outcome().await, QueuedSendOutcome::Unknown);
+        });
+    }
 
     #[test]
     fn homeserver_must_not_send_password_over_plain_http() {

@@ -3,6 +3,7 @@
 
 #[cfg(feature = "native-calls")]
 mod calls;
+mod drafts;
 mod live;
 mod sso;
 
@@ -15,7 +16,7 @@ use std::time::Duration;
 
 use directories::ProjectDirs;
 use morpheus_config::{Config, ConfigStore, Density, LoadedConfig, ThemeMode, ThemePack};
-use morpheus_matrix::AccountManager;
+use morpheus_matrix::{AccountManager, QueuedSendOutcome};
 use slint::{Color, Model, ModelRc, SharedString, VecModel};
 
 #[cfg(feature = "native-calls")]
@@ -843,7 +844,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    let live = LiveUi::new(manager.clone());
+    let live = LiveUi::new(manager.clone(), runtime.handle().clone(), ui.as_weak());
     ui.set_native_call_enabled(cfg!(feature = "native-calls"));
     ui.set_native_call_status("Select a room to check call availability".into());
     #[cfg(feature = "native-calls")]
@@ -1211,22 +1212,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let account_for_ui = account_id.clone();
             let room_for_ui = room_id.clone();
+            let draft_revision = if mode == 0 {
+                // Capture the exact UI submission before any asynchronous
+                // work; a later edit must not be cleared by this send.
+                send_live.remember_draft(&account_id, &room_id, &submitted_text);
+                send_live.draft_revision(&account_id, &room_id)
+            } else {
+                None
+            };
             let live = send_live.clone();
             let weak = weak.clone();
             send_handle.spawn(async move {
                 match live.send(account_id, room_id, message_text, target).await {
-                    Ok(()) => {
+                    Ok(queued) => {
+                        let tracked = queued.as_ref().is_some_and(|queued| {
+                            draft_revision.is_some_and(|revision| {
+                                live.mark_queued_draft(
+                                    &account_for_ui,
+                                    &room_for_ui,
+                                    &submitted_text,
+                                    revision,
+                                    queued.transaction_id(),
+                                )
+                            })
+                        });
+                        let watcher_ui = weak.clone();
+                        let watcher_live = live.clone();
+                        let watcher_account = account_for_ui.clone();
+                        let watcher_room = room_for_ui.clone();
+                        let watcher_text = submitted_text.clone();
                         let _ = weak.upgrade_in_event_loop(move |ui| {
                             if ui.get_active_account_local_id().as_str() == account_for_ui
                                 && ui.get_active_room_id().as_str() == room_for_ui
                                 && ui.get_composer_operation() == operation
                             {
-                                if mode == 0 {
-                                    live.clear_draft_if_unchanged(
-                                        &account_for_ui,
-                                        &room_for_ui,
-                                        &submitted_text,
-                                    );
+                                if mode == 0 && !tracked {
+                                    ui.set_composer_busy(false);
+                                    return;
                                 }
                                 finish_composer_submission(
                                     &ui,
@@ -1238,6 +1260,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                             }
                         });
+                        if let Some(queued) = queued.filter(|_| tracked) {
+                            tokio::spawn(async move {
+                                let transaction_id = queued.transaction_id().to_owned();
+                                let outcome = queued.wait_outcome().await;
+                                let sent = outcome == QueuedSendOutcome::Sent;
+                                let restored = watcher_live.resolve_queued_draft(
+                                    &watcher_account,
+                                    &watcher_room,
+                                    &transaction_id,
+                                    sent,
+                                );
+                                if !sent {
+                                    let _ = watcher_ui.upgrade_in_event_loop(move |ui| {
+                                        if ui.get_active_account_local_id().as_str()
+                                            == watcher_account
+                                            && ui.get_active_room_id().as_str() == watcher_room
+                                        {
+                                            if restored
+                                                && ui.get_composer_mode() == 0
+                                                && ui.get_composer_text().is_empty()
+                                            {
+                                                ui.set_composer_text(watcher_text.into());
+                                            }
+                                            let message = match outcome {
+                                                QueuedSendOutcome::Failed => {
+                                                    "Message failed to send; draft retained"
+                                                }
+                                                QueuedSendOutcome::Unknown => {
+                                                    "Could not confirm send; check the room before retrying"
+                                                }
+                                                QueuedSendOutcome::Sent => unreachable!(),
+                                            };
+                                            ui.set_session_error(message.into());
+                                        }
+                                    });
+                                }
+                            });
+                        }
                     }
                     Err(error) => {
                         let error = error.to_string();
@@ -1461,7 +1521,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .await;
                 match result {
-                    Ok(()) => {
+                    Ok(_) => {
                         let _ = weak.upgrade_in_event_loop(move |ui| {
                             if ui.get_active_account_local_id().as_str() == account_id
                                 && ui.get_active_room_id().as_str() == room_id
@@ -1547,6 +1607,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ui = weak.clone();
         login_handle.spawn(async move {
             let _transition = live.account_transition.lock().await;
+            if let Err(error) = live.flush_drafts().await {
+                show_login_error(&ui, format!("Could not save current draft: {error}"));
+                return;
+            }
             match live
                 .manager
                 .add_password_account(&homeserver, &username, &password)
@@ -1574,6 +1638,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ui = weak.clone();
         sso_handle.spawn(async move {
             let _transition = live.account_transition.lock().await;
+            if let Err(error) = live.flush_drafts().await {
+                show_login_error(&ui, format!("Could not save current draft: {error}"));
+                return;
+            }
             match sso::sign_in(live.manager.clone(), homeserver.to_string()).await {
                 Ok(_) => {
                     live.is_live.store(true, Ordering::Release);
@@ -1652,6 +1720,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(active) = live.manager.active_account().await else {
                 return;
             };
+            // Logout deletes this account's encrypted store. Flush is not
+            // needed: in-flight draft writes share the manager's state lock,
+            // and writes after deletion reject the missing account ID.
             let result = live.manager.logout_account(&active.id).await;
             drop(transition);
             match result {
@@ -1798,11 +1869,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    ui.run()?;
+    let ui_result = ui.run();
     #[cfg(feature = "native-calls")]
     if let Err(error) = runtime.block_on(calls.end_call()) {
         eprintln!("Could not leave native call during shutdown: {error}");
     }
+    let draft_result = runtime.block_on(live.flush_drafts());
     runtime.block_on(manager.stop());
+    ui_result?;
+    if let Err(error) = draft_result {
+        eprintln!("Could not save drafts during shutdown: {error}");
+        return Err(Box::new(error));
+    }
     Ok(())
 }

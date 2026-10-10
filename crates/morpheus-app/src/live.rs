@@ -3,19 +3,24 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{
-    Arc, Mutex as StdMutex,
+    Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 
 use chrono::{Local, TimeZone};
 use morpheus_matrix::{
-    AccountInfo, AccountManager, MatrixCoreError, MessageInfo, MessageSendState, RoomInfo,
-    RoomMembership, SyncBackend, SyncStatus,
+    AccountInfo, AccountManager, MatrixCoreError, MessageInfo, MessageSendState, QueuedMessage,
+    RoomInfo, RoomMembership, SyncBackend, SyncStatus,
 };
 use slint::{Color, ModelRc, SharedString, VecModel, Weak};
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::{
+    runtime::Handle,
+    sync::{Mutex, mpsc},
+    task::JoinHandle,
+};
 
+use crate::drafts::DraftStore;
 use crate::{AccountItem, AccountOption, AppWindow, MemberItem, MessageItem, RoomItem, SpaceItem};
 
 pub enum MessageTarget {
@@ -41,6 +46,7 @@ pub struct LiveUi {
     pub manager: Arc<AccountManager>,
     pub is_live: Arc<AtomicBool>,
     drafts: Arc<DraftStore>,
+    draft_write_tx: mpsc::Sender<()>,
     generation: Arc<AtomicU64>,
     render_epoch: Arc<AtomicU64>,
     feed: Mutex<Option<JoinHandle<()>>>,
@@ -58,11 +64,59 @@ pub struct LiveUi {
 }
 
 impl LiveUi {
-    pub fn new(manager: Arc<AccountManager>) -> Arc<Self> {
+    pub fn new(manager: Arc<AccountManager>, runtime: Handle, ui: Weak<AppWindow>) -> Arc<Self> {
+        let (draft_write_tx, mut draft_write_rx) = mpsc::channel(1);
+        let drafts = Arc::new(DraftStore::default());
+        let draft_worker_store = drafts.clone();
+        let draft_worker_manager = manager.clone();
+        runtime.spawn(async move {
+            let mut error_reported = false;
+            while draft_write_rx.recv().await.is_some() {
+                // A single bounded worker coalesces typing bursts. Account
+                // switches and app shutdown call flush_drafts directly.
+                let mut closed = false;
+                loop {
+                    match tokio::time::timeout(Duration::from_millis(250), draft_write_rx.recv())
+                        .await
+                    {
+                        Ok(Some(())) => {}
+                        Ok(None) => {
+                            closed = true;
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let mut failed = false;
+                for (account_id, room_id) in draft_worker_store.dirty_keys() {
+                    match draft_worker_store
+                        .persist_one(&draft_worker_manager, &account_id, &room_id)
+                        .await
+                    {
+                        Ok(()) => {}
+                        Err(MatrixCoreError::AccountNotFound(_)) => {}
+                        Err(error) => {
+                            failed = true;
+                            if !error_reported {
+                                show_error(
+                                    &ui,
+                                    format!("Could not save draft on this device: {error}"),
+                                );
+                            }
+                        }
+                    }
+                }
+                error_reported = failed;
+                if closed {
+                    break;
+                }
+            }
+        });
         Arc::new(Self {
             manager,
             is_live: Arc::new(AtomicBool::new(false)),
-            drafts: Arc::new(DraftStore::default()),
+            drafts,
+            draft_write_tx,
             generation: Arc::new(AtomicU64::new(0)),
             render_epoch: Arc::new(AtomicU64::new(0)),
             feed: Mutex::new(None),
@@ -89,16 +143,59 @@ impl LiveUi {
     pub fn remember_draft(&self, account_id: &str, room_id: &str, body: &str) {
         if !account_id.is_empty() && !room_id.is_empty() {
             self.drafts.set(account_id, room_id, body);
+            self.queue_draft_write();
         }
     }
 
-    pub fn clear_draft_if_unchanged(&self, account_id: &str, room_id: &str, submitted: &str) {
-        self.drafts
-            .clear_if_unchanged(account_id, room_id, submitted);
+    pub fn draft_revision(&self, account_id: &str, room_id: &str) -> Option<u64> {
+        self.drafts.revision(account_id, room_id)
+    }
+
+    pub fn mark_queued_draft(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        submitted: &str,
+        expected_revision: u64,
+        transaction_id: &str,
+    ) -> bool {
+        self.drafts.mark_queued(
+            account_id,
+            room_id,
+            submitted,
+            expected_revision,
+            transaction_id,
+        )
+    }
+
+    pub fn resolve_queued_draft(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        transaction_id: &str,
+        sent: bool,
+    ) -> bool {
+        let changed = self
+            .drafts
+            .resolve_queued(account_id, room_id, transaction_id, sent);
+        if changed && sent {
+            self.queue_draft_write();
+        }
+        changed
     }
 
     pub fn forget_account_drafts(&self, account_id: &str) {
         self.drafts.forget_account(account_id);
+    }
+
+    pub async fn flush_drafts(&self) -> Result<(), MatrixCoreError> {
+        self.drafts.flush_dirty(&self.manager).await
+    }
+
+    fn queue_draft_write(&self) {
+        // One queued signal is enough: the worker scans the latest dirty
+        // cache, coalescing fast typing without creating a task per keypress.
+        let _ = self.draft_write_tx.try_send(());
     }
 
     pub async fn restore(self: &Arc<Self>, ui: Weak<AppWindow>) {
@@ -129,6 +226,7 @@ impl LiveUi {
         let account = accounts
             .get(index)
             .ok_or_else(|| MatrixCoreError::AccountNotFound(index.to_string()))?;
+        self.flush_drafts().await?;
         self.clear_feed().await;
         self.manager.switch_to(&account.id).await?;
         *self.selected_room.lock().await = None;
@@ -403,6 +501,21 @@ impl LiveUi {
             return Ok(());
         }
         *self.selected_room.lock().await = selected.clone();
+        if let Some(room_id) = selected.as_deref() {
+            if let Err(error) = self
+                .drafts
+                .load_if_missing(&self.manager, &active.id, room_id)
+                .await
+            {
+                show_error(
+                    &ui,
+                    format!("Could not restore draft on this device: {error}"),
+                );
+            }
+        }
+        if self.render_epoch.load(Ordering::Acquire) != render_epoch {
+            return Ok(());
+        }
         let view = Snapshot {
             accounts,
             active,
@@ -731,29 +844,35 @@ impl LiveUi {
         room_id: String,
         body: String,
         target: MessageTarget,
-    ) -> Result<(), MatrixCoreError> {
+    ) -> Result<Option<QueuedMessage>, MatrixCoreError> {
         self.require_selected_room(&room_id).await?;
         match target {
             MessageTarget::Room => {
+                // Keep the original text durable until the send queue reports
+                // a server acknowledgement or rejection.
+                self.drafts
+                    .persist_one(&self.manager, &account_id, &room_id)
+                    .await?;
                 self.manager
-                    .send_text_for(&account_id, &room_id, body)
+                    .send_text_tracked_for(&account_id, &room_id, body)
                     .await
+                    .map(Some)
             }
-            MessageTarget::Reply(event_id) => {
-                self.manager
-                    .send_reply_for(&account_id, &room_id, &event_id, body)
-                    .await
-            }
-            MessageTarget::Edit(event_id) => {
-                self.manager
-                    .edit_text_for(&account_id, &room_id, &event_id, body)
-                    .await
-            }
-            MessageTarget::Thread(root_event_id) => {
-                self.manager
-                    .send_thread_text_for(&account_id, &room_id, &root_event_id, body)
-                    .await
-            }
+            MessageTarget::Reply(event_id) => self
+                .manager
+                .send_reply_for(&account_id, &room_id, &event_id, body)
+                .await
+                .map(|_| None),
+            MessageTarget::Edit(event_id) => self
+                .manager
+                .edit_text_for(&account_id, &room_id, &event_id, body)
+                .await
+                .map(|_| None),
+            MessageTarget::Thread(root_event_id) => self
+                .manager
+                .send_thread_text_for(&account_id, &room_id, &root_event_id, body)
+                .await
+                .map(|_| None),
         }
     }
 
@@ -849,49 +968,6 @@ struct Snapshot {
     known_spaces: HashMap<String, String>,
     space_children: HashMap<String, HashSet<String>>,
     all_space_children: HashSet<String>,
-}
-
-/// Drafts contain message text only and live in process memory. In particular,
-/// they never enter config.toml or the account credential vault.
-#[derive(Default)]
-struct DraftStore {
-    by_room: StdMutex<HashMap<(String, String), String>>,
-}
-
-impl DraftStore {
-    fn set(&self, account_id: &str, room_id: &str, body: &str) {
-        let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
-        let key = (account_id.to_owned(), room_id.to_owned());
-        if body.is_empty() {
-            drafts.remove(&key);
-        } else {
-            drafts.insert(key, body.to_owned());
-        }
-    }
-
-    fn get(&self, account_id: &str, room_id: &str) -> String {
-        self.by_room
-            .lock()
-            .expect("draft mutex poisoned")
-            .get(&(account_id.to_owned(), room_id.to_owned()))
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    fn clear_if_unchanged(&self, account_id: &str, room_id: &str, submitted: &str) {
-        let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
-        let key = (account_id.to_owned(), room_id.to_owned());
-        if drafts.get(&key).is_some_and(|draft| draft == submitted) {
-            drafts.remove(&key);
-        }
-    }
-
-    fn forget_account(&self, account_id: &str) {
-        self.by_room
-            .lock()
-            .expect("draft mutex poisoned")
-            .retain(|(id, _), _| id != account_id);
-    }
 }
 
 fn apply_snapshot(ui: &AppWindow, view: Snapshot, drafts: &DraftStore) {
@@ -1142,31 +1218,4 @@ fn accent(value: &str) -> Color {
 
 pub fn show_error(ui: &Weak<AppWindow>, error: String) {
     let _ = ui.upgrade_in_event_loop(move |ui| ui.set_session_error(error.into()));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::DraftStore;
-
-    #[test]
-    fn drafts_are_scoped_to_account_and_room_and_preserve_new_edits() {
-        let drafts = DraftStore::default();
-        drafts.set("account-a", "room-1", "first message");
-        drafts.set("account-a", "room-2", "another room");
-        drafts.set("account-b", "room-1", "another account");
-
-        assert_eq!(drafts.get("account-a", "room-1"), "first message");
-        assert_eq!(drafts.get("account-a", "room-2"), "another room");
-        assert_eq!(drafts.get("account-b", "room-1"), "another account");
-
-        drafts.set("account-a", "room-1", "edited while sending");
-        drafts.clear_if_unchanged("account-a", "room-1", "first message");
-        assert_eq!(drafts.get("account-a", "room-1"), "edited while sending");
-        drafts.clear_if_unchanged("account-a", "room-1", "edited while sending");
-        assert_eq!(drafts.get("account-a", "room-1"), "");
-
-        drafts.forget_account("account-a");
-        assert_eq!(drafts.get("account-a", "room-2"), "");
-        assert_eq!(drafts.get("account-b", "room-1"), "another account");
-    }
 }

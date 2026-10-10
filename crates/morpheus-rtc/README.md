@@ -39,8 +39,11 @@ The optional device features connect native OS media to those frame streams:
 - `device-camera`: Nokhwa camera capture. `CameraCapture::open(index)` and
   `next_frame()` return I420 frames for a `publish_camera()` publication;
   `cameras()` enumerates available devices.
-- `device-screen`: XCap display enumeration and capture. `ScreenCapture`
-  supplies I420 frames for `publish_screen()`; the caller paces captures.
+- `device-screen`: XCap display and application-window enumeration and
+  capture. `ScreenCapture::open()` selects a display; `open_window()` selects
+  a window. `next_frame_sized(width, height)` preserves the source aspect ratio
+  with black bars and returns a fixed-size I420 frame for `publish_screen()`;
+  the caller paces captures. `next_frame()` returns the native source size.
 
 These APIs report native device failures as `MediaError::Device` and reject
 mismatched PCM and I420 frames before entering libwebrtc.
@@ -51,6 +54,11 @@ resample unsupported device formats, or provide echo cancellation. Remote video
 rendering, camera/screen pacing and controls, permission UI, macOS bundle usage
 descriptions, and Windows/Linux runtime verification still need application
 integration. Do not present this as a complete end-user call feature yet.
+
+An opt-in macOS test captures real display or window pixels without saving an
+image, and the local MatrixRTC fixture can publish that capture to a second
+encrypted device. See [`tests/LOCAL_MATRIX_RTC.md`](../../tests/LOCAL_MATRIX_RTC.md)
+for commands and the exact verified scope.
 
 The Element dependency is **AGPL-3.0-only or a paid Element Commercial
 License**. Distribution must comply with the chosen license. Element's RTC

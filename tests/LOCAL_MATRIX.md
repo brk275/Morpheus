@@ -62,6 +62,26 @@ The Space assertion covers the successful create request; delayed Space
 classification in the SDK room list is handled by the app's temporary Space
 entry and still needs a dedicated UI test.
 
+## Test encrypted composer drafts
+
+With both local servers running and the protected fixture path set:
+
+```sh
+PATH=/opt/homebrew/opt/rustup/bin:$PATH cargo test --locked -p morpheus-matrix --test drafts_local -- --nocapture
+```
+
+This opt-in test saves different drafts for Alice and Carol, switches accounts,
+restarts the client, checks both drafts, clears one, and verifies logout removes
+that account's store. It also scans the local account data for the draft bodies
+as raw bytes. The Matrix SDK's passphrase-protected SQLite state store holds
+the drafts; the passphrase remains in the OS credential vault.
+
+Morpheus retains a queued message's encrypted draft until the room send queue
+reports server acceptance. A send failure restores unchanged text. If the app
+exits before the send result arrives, the draft is retained, but the pending
+transaction marker is currently process-local. A send that completes after
+restart can therefore leave a stale draft for the user to clear.
+
 ## Test encrypted-history recovery
 
 After `up`, create a **fresh** Alice/Bob pair and encrypted room on Synapse A:

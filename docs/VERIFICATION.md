@@ -64,6 +64,14 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
   QA found missing glyphs for Edit and Thread; those actions now use drawn
   Slint paths, and the thread panel keeps its reply count and short reply rows
   directly below the root message in the rebuilt macOS preview.
+- A gated two-Synapse draft test saved different room drafts for accounts on
+  separate homeservers, restarted the account manager, restored both drafts,
+  cleared one, and removed each account. A raw scan of its account-data files
+  found neither unique draft body in plaintext. Focused draft tests covered
+  keeping text through queue acceptance, restoring it on server send failure
+  when unchanged, and preserving a newer edit. Pending transaction metadata
+  is currently in memory: if Morpheus exits after queueing but before send
+  confirmation, a message sent after restart can leave a stale encrypted draft.
 - A stable-path, ad hoc signed macOS QA bundle stalled in the OS credential-vault
   read on two launches. A SecurityAgent process appeared, but no prompt was
   exposed through the available app UI. The 30-second vault-read timeout then
@@ -105,6 +113,20 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
   proof displayed moving synthetic frames and rotation on macOS; it did not
   consume the received RTC track. See [the video feasibility note](VIDEO_FEASIBILITY.md) and
   [the RTC test runbook](../tests/LOCAL_MATRIX_RTC.md).
+- A follow-up macOS capture proof used real display and application-window
+  pixels. The capture adapter produced nonblank 640×360 I420 frames without
+  saving image files. In two fresh disposable-device loopback MatrixRTC runs,
+  Bob decoded a nonblank encrypted screen track from the selected display
+  (20.03 seconds) and window (18.32 seconds), respectively; both runs also
+  retained synthetic camera/audio and leave/rejoin checks. These tests used the
+  development binary and a local call service. Packaged-app permission prompts,
+  continuous capture controls, Morpheus call-stage rendering, Element Call
+  interoperability, and Linux/Windows capture remain unverified.
+  After tightening the decoded-frame check to visible rows, a fresh display
+  call passed again in 19.83 seconds. During setup, a generated password
+  beginning with `-` exposed an argument-parsing bug in the disposable
+  Synapse registration script; it now uses `--password=value`, and the next
+  fresh fixture registered successfully. All local services were stopped.
 
 ## GitHub CI
 
@@ -117,9 +139,10 @@ because the pinned WebRTC library uses the static MSVC CRT while Rust had used
 the dynamic CRT. A target-specific static-CRT build flag was checked in
 [run 38021445771](https://github.com/brk275/Morpheus/actions/runs/38021445771):
 Ubuntu and both macOS jobs passed; the Windows tests, desktop check, and
-native-call app build passed. Windows post-job cache upload was still running
-when this entry was written. The native audio mixer test runs on macOS Apple
-Silicon and passed there; it is skipped on the other runners.
+native-call app build passed. The final run conclusion was success on all four
+jobs. The native audio mixer test runs on macOS Apple Silicon and passed there;
+it is skipped on the other runners. [Run 38023378684](https://github.com/brk275/Morpheus/actions/runs/38023378684)
+checks the subsequent room, keyboard, and video-feasibility commit.
 
 ## Still required for beta
 
