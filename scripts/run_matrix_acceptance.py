@@ -21,6 +21,10 @@ import tempfile
 import time
 
 from fixture_paths import external_path, private_directory, write_private
+from element_peer_fixture import VERSION as ELEMENT_VERSION, IMAGE_DIGEST as ELEMENT_IMAGE_DIGEST
+from run_element_acceptance import diagnostics as element_diagnostics, evidence as element_evidence
+from matrix_fixture_diagnostics import is_progress_line, matrix_fixture_diagnostics
+from element_process_namespace import namespace_command, stop_owned, wait_owned
 
 
 REPO = Path(__file__).resolve().parent.parent
@@ -96,6 +100,8 @@ def fixture_from_output(output: str, root: Path) -> Path:
     # fixed progress codes on stderr. This runner deliberately captures both.
     lines = []
     for line in output.strip().splitlines():
+        if is_progress_line(line):
+            continue
         match = OAUTH_STAGE.fullmatch(line)
         if match and match[1] in OAUTH_STAGES:
             continue
@@ -125,15 +131,19 @@ class Acceptance:
         self.results = []
         self.sequence = 0
 
-    def run(self, label: str, args: list[str], *, extra=None, test=False, oauth_checks=(),
-            stdin=None, seconds=900) -> str:
+    def run(self, label: str, args: list[str], *, extra=None, test=False, oauth_checks=(), element_checks=False,
+            stdin=None, seconds=900, pid_namespace=False) -> str:
         self.sequence += 1
         log = self.logs / f"{self.sequence:02d}-{label}.log"
         started = time.monotonic()
         print(f"Starting {label}", flush=True)
+        timed_out = False
+        if pid_namespace:
+            if stdin is not None:
+                raise RuntimeError("Contained commands require non-TTY stdin")
+            args = namespace_command(args, self.root / f"namespace-{self.sequence:02d}", self.env | (extra or {}))
         # Create the private log before the child can write anything to it.
         fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        timed_out = False
         with os.fdopen(fd, "wb") as output:
             process = subprocess.Popen(
                 args, cwd=REPO, env=self.env | (extra or {}),
@@ -141,13 +151,22 @@ class Acceptance:
                 stdout=output, stderr=subprocess.STDOUT, start_new_session=True,
             )
             try:
-                process.communicate(stdin, timeout=seconds)
+                if pid_namespace:
+                    wait_owned(process, seconds)
+                else:
+                    process.communicate(stdin, timeout=seconds)
             except subprocess.TimeoutExpired:
                 # Cargo and fixture scripts spawn children. Stop the whole
                 # owned group so a timed-out test cannot outlive its services.
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait()
+                if not pid_namespace:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
                 timed_out = True
+            finally:
+                if pid_namespace:
+                    # Keep the sudo leader unreaped through the group kill.
+                    # PID1 death also kills detached browser/native sessions.
+                    stop_owned(process)
         output = log.read_text(errors="replace")
         # Scan bytes through stdin: avoid reading the adjacent credential files
         # and avoid source allowlists/inline exclusions applying to fresh logs.
@@ -165,6 +184,10 @@ class Acceptance:
             failed = re.findall(r"^test ([A-Za-z0-9_:]+) \.\.\. FAILED$", output, re.MULTILINE)
             locations = re.findall(r"panicked at (crates/[A-Za-z0-9_./-]+\.rs:\d+:\d+)", output)
             evidence = {"check": label, "failed_tests": failed, "panic_locations": locations}
+            if fixture_diagnostics := matrix_fixture_diagnostics(output):
+                if timed_out:
+                    fixture_diagnostics["failure"] = "deadline"
+                evidence["matrix_fixture_diagnostics"] = fixture_diagnostics
             # This exact boolean-only marker says whether a fresh device could
             # already decrypt the old membership. Never print event/account
             # identifiers, arbitrary server text, ciphertext, or raw logs.
@@ -177,6 +200,11 @@ class Acceptance:
                 if timed_out:
                     diagnostics["failure"] = "deadline"
                 evidence["oauth_diagnostics"] = diagnostics
+            if element_checks:
+                evidence["element_checks"] = element_evidence(output)
+                evidence["element_diagnostics"] = element_diagnostics(output)
+                if timed_out:
+                    evidence["element_diagnostics"]["failure"] = "deadline"
             print(json.dumps(evidence), flush=True)
             if timed_out:
                 raise RuntimeError(f"{label} exceeded its {seconds}-second deadline")
@@ -186,6 +214,10 @@ class Acceptance:
             record["passed"] = passed_tests(output)
         if oauth_checks:
             record["oauth_checks"] = oauth_evidence(output, oauth_checks)
+        if element_checks:
+            record["element_checks"] = element_evidence(output, complete=True)
+            record["element_peer"] = {"version": ELEMENT_VERSION, "image_digest": ELEMENT_IMAGE_DIGEST,
+                                      "protocol": "matrix_2_0_sticky2025", "baseline": "presynced"}
         print(json.dumps(record | {"status": "passed"}), flush=True)
         self.results.append(record)
         write_private(self.root / "results.json", json.dumps(self.results, indent=2) + "\n")
@@ -251,6 +283,31 @@ class Acceptance:
                     raise
                 print("OAuth fixture cleanup incomplete; private state retained", file=sys.stderr)
 
+    def element_case(self):
+        self.run("element-process-containment", [sys.executable, "scripts/element_process_namespace.py",
+                 "--check", str(self.root / "element-containment-probe")], seconds=60)
+        fixture = fixture_from_output(self.script("local_matrix_rtc", "rtc-fixture"), self.root)
+        root = self.root / "element-interop"
+        failed = False
+        try:
+            self.run("element-call-rc-sticky2025-presynced", [
+                sys.executable, "scripts/run_element_acceptance.py", "--root", str(root),
+                "--fixture", str(fixture), "--gitleaks", self.gitleaks,
+            ], element_checks=True, seconds=1800, pid_namespace=True)
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            # A separate cleanup also covers a killed helper, using only its
+            # private nonce ownership record. It never touches shared services.
+            try:
+                self.run("element-fixture-down", [sys.executable, "scripts/element_peer_fixture.py", "down",
+                         "--root", str(root / "service"), "--keep-data"], seconds=100)
+            except (RuntimeError, OSError):
+                if not failed:
+                    raise
+                print("Element peer cleanup incomplete; private state retained", file=sys.stderr)
+
     def start_keyring(self):
         # This D-Bus session and empty-password keyring exist only on a fresh
         # ephemeral runner. No desktop user's existing vault is unlocked.
@@ -275,8 +332,16 @@ class Acceptance:
                 for item in self.results:
                     if "passed" in item:
                         output.write(f"| {item['check']} | {item['passed']} | {item['seconds']} |\n")
+                    elif "element_checks" in item:
+                        output.write(f"| {item['check']} | {len(item['element_checks'])} protocol assertions | {item['seconds']} |\n")
+                if any("element_checks" in item for item in self.results):
+                    output.write(f"\nElement peer passed: `{ELEMENT_VERSION}`, `{ELEMENT_IMAGE_DIGEST}`. "
+                                 "Only its pre-synced Sticky2025 mode was tested, with two-way synthetic video, "
+                                 "browser-to-native audio, roster and departure. This does not verify stable "
+                                 "v0.26.1 Matrix 2.0, Morpheus's Current default, fresh-device late join, "
+                                 "native-to-browser audio, or full call release acceptance.\n")
                 output.write("\nNo fixture credentials or installers were uploaded. Physical-device, UI, "
-                             "OS-browser handoff, Element Call, and installed-package gates remain separate.\n")
+                             "OS-browser handoff, broader Element Call interoperability, and installed-package gates remain separate.\n")
 
 
 def main():
@@ -318,6 +383,7 @@ def main():
         acceptance.test("unsupported_transport_local", gate, rtc=True,
                         extra={"MORPHEUS_MATRIX_RTC_GATE_TEST_ACCOUNTS": str(gate)})
         acceptance.rtc_cases()
+        acceptance.element_case()
     finally:
         acceptance.summary()
         # Only these containers belong to this fresh, explicitly checked run.

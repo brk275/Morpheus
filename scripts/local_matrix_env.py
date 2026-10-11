@@ -23,9 +23,11 @@ import urllib.request
 from pathlib import Path
 
 from fixture_paths import external_path, fixture_home, private_directory, write_private
+from matrix_fixture_diagnostics import STAGES
 
 
-IMAGE = "ghcr.io/element-hq/synapse:v1.162.0"
+# Immutable published multi-architecture image, shared with the OAuth fixture.
+IMAGE = "ghcr.io/element-hq/synapse:v1.162.0@sha256:6b84a7bbac36f080b2d2e51e0289cf1b08b349598ea44a558df38d558f2c2311"
 NETWORK = "morpheus-matrix-test"
 FIXTURE_HOME = fixture_home()
 CREDS = FIXTURE_HOME / "accounts.json"
@@ -36,11 +38,60 @@ SERVERS = (
 TOKENS: dict[str, dict] = {}
 
 
+def stage(value: str) -> None:
+    if value not in STAGES:
+        raise ValueError("Unknown Matrix fixture stage")
+    print("MORPHEUS_MATRIX_FIXTURE_STAGE " + value, file=sys.stderr, flush=True)
+
+
+class DockerFailure(RuntimeError):
+    def __init__(self, result: subprocess.CompletedProcess[str]):
+        # Docker can echo an argv password or credentials in a registry error.
+        # Classify a few known failures; never retain or print arbitrary text.
+        message = (result.stderr or "").lower()
+        self.category = "docker"
+        for category, patterns in (
+            ("docker_disk", ("no space left on device",)),
+            ("docker_permission", ("permission denied",)),
+            ("docker_registry", ("manifest unknown", "unauthorized", "denied:", "too many requests")),
+            ("docker_network", ("network is unreachable", "temporary failure in name resolution", "i/o timeout")),
+        ):
+            if any(pattern in message for pattern in patterns):
+                self.category = category
+                break
+        self.returncode = result.returncode
+        super().__init__("Disposable fixture Docker operation failed")
+
+
+def report_failure(error: BaseException) -> None:
+    category, number = "fixture_operation", None
+    if isinstance(error, DockerFailure):
+        category = error.category
+        number = ("docker_exit", error.returncode)
+    elif isinstance(error, urllib.error.HTTPError):
+        category, number = "http", ("http_status", error.code)
+    elif isinstance(error, (urllib.error.URLError, http.client.HTTPException)):
+        category = "network"
+    elif isinstance(error, subprocess.TimeoutExpired):
+        category = "deadline"
+    elif isinstance(error, OSError):
+        category, number = "os", ("os_errno", error.errno)
+    elif isinstance(error, (KeyError, ValueError)):
+        category = "invalid_data"
+    try:
+        print("MORPHEUS_MATRIX_FIXTURE_FAILURE " + category, file=sys.stderr, flush=True)
+        if number is not None and isinstance(number[1], int) and 0 <= number[1] <= 599:
+            print(f"MORPHEUS_MATRIX_FIXTURE_NUMBER {number[0]}={number[1]}", file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        # A closed/broken diagnostic stream must not replace the original
+        # fixture failure with a secondary traceback or exception payload.
+        pass
+
+
 def docker(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(["docker", *args], text=True, capture_output=True)
     if check and result.returncode:
-        # Registration can put a password in argv. Never include argv in errors.
-        raise RuntimeError(f"Docker command failed: {result.stderr.strip()[-1000:]}")
+        raise DockerFailure(result)
     return result
 
 
@@ -123,13 +174,17 @@ print('updated' if config != original else 'unchanged')
 
 
 def start_servers() -> None:
+    stage("disk_check")
     if shutil.disk_usage(FIXTURE_HOME.parent).free < 2 * 1024**3:
         raise RuntimeError("At least 2 GiB free space is required before starting local Synapse")
+    stage("network")
     if not exists("network", NETWORK):
         docker("network", "create", NETWORK)
     for server in SERVERS:
+        stage(f"volume_{server['name']}")
         if not exists("volume", str(server["volume"])):
             docker("volume", "create", str(server["volume"]))
+            stage(f"generate_{server['name']}")
             docker(
                 "run", "--rm",
                 "--mount", f"type=volume,src={server['volume']},dst=/data",
@@ -137,7 +192,9 @@ def start_servers() -> None:
                 "-e", "SYNAPSE_REPORT_STATS=no",
                 IMAGE, "generate",
             )
+        stage(f"configure_{server['name']}")
         changed = configure(server)
+        stage(f"start_{server['name']}")
         if exists("container", str(server["container"])):
             state = docker("inspect", "--format", "{{.State.Running}}", str(server["container"])).stdout.strip()
             if state != "true":
@@ -152,6 +209,7 @@ def start_servers() -> None:
                 "--mount", f"type=volume,src={server['volume']},dst=/data",
                 IMAGE,
             )
+        stage(f"ready_{server['name']}")
         wait_ready(server)
 
 
@@ -287,6 +345,7 @@ def save_private_fixture(path: Path, data: dict, *, create: bool = False) -> Non
 
 def recovery_fixture() -> None:
     """Create a fresh encrypted-room pair without changing accounts.json."""
+    stage("recovery")
     server = SERVERS[0]
     if not exists("container", str(server["container"])):
         raise RuntimeError("Start local Synapse A with `up` before creating a recovery fixture")
@@ -352,6 +411,7 @@ def recovery_fixture() -> None:
 
 def rtc_gate_fixture() -> None:
     """Create a fresh account on Synapse B, which has no MatrixRTC service."""
+    stage("rtc_gate")
     server = SERVERS[1]
     if not exists("container", str(server["container"])):
         raise RuntimeError("Start local Synapse B with `up` before creating an RTC gate fixture")
@@ -376,10 +436,14 @@ def rtc_gate_fixture() -> None:
 
 def up() -> None:
     start_servers()
+    stage("credentials")
     data = credential_data()
+    stage("registration")
     for account in data["accounts"]:
         register(account)
+    stage("seed_rooms")
     seed_rooms(data)
+    stage("verify")
     verify(data)
     print("Two loopback Synapse homeservers are ready and account/room checks passed.")
     for server in SERVERS:
@@ -388,6 +452,7 @@ def up() -> None:
 
 
 def status() -> None:
+    stage("status")
     for server in SERVERS:
         state = docker("inspect", "--format", "{{.State.Status}}", str(server["container"]), check=False)
         print(f"{server['server_name']}: {state.stdout.strip() if state.returncode == 0 else 'absent'} ({endpoint(server)})")
@@ -395,6 +460,7 @@ def status() -> None:
 
 
 def down() -> None:
+    stage("cleanup")
     for server in SERVERS:
         if exists("container", str(server["container"])):
             docker("rm", "-f", str(server["container"]))
@@ -427,6 +493,7 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except (RuntimeError, subprocess.SubprocessError, urllib.error.URLError, OSError, KeyError) as error:
-        print(f"Local Matrix environment failed: {error}", file=sys.stderr)
+    except (RuntimeError, subprocess.SubprocessError, urllib.error.URLError,
+            http.client.HTTPException, OSError, KeyError, ValueError) as error:
+        report_failure(error)
         raise SystemExit(1)

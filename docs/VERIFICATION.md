@@ -64,7 +64,7 @@ unfinished browser-login store behind. Its final outcome gate rejected the
 candidate despite the model step's `continue-on-error` presentation. The fix
 keeps the cleanup marker locked and present until the database payload can be
 removed, with regressions for a real Windows delete-denied handle, interrupted
-deletion, unknown files, and symlinks. This fix awaits hosted verification.
+deletion, unknown files, and symlinks. The next run below verifies this fix.
 
 Linux passed 32 Matrix, 65 desktop, and 35 native RTC/device tests, its native
 build, and Xvfb startup. The first real Wayland portal open failed before frames
@@ -92,6 +92,55 @@ store deletion/registry sequencing, OAuth fixture isolation and diagnostics, and
 the pinned Wayland backend adaptation. The Wayland harness now rejects a
 zero-test success and requires its exact named capture test to pass. No native
 build or service was started locally for this batch.
+
+[Run 38104445127](https://github.com/brk275/Morpheus/actions/runs/38104445127)
+tested `10f472e4266ffdb57744685b6faa19fabab8c335` on all four standard public
+runners. Security/scope, Windows, and both Mac jobs passed. Each of these native
+jobs passed 37 Matrix, 50 desktop, and 31 native RTC/device tests, plus the
+configuration, protocol, and vendor suites. The Windows cancellation cleanup
+and fresh-registry recheck regressions passed. Live opt-in wrappers remain
+excluded from this evidence. All four native job logs passed credential scans.
+
+Linux passed 37 Matrix, 65 desktop, and 36 native RTC/device tests, all vendor
+suites, its native build, and Xvfb startup. The adapted Wayland backend received
+CreateSession, SelectSources, and Start and announced an SHM buffer format;
+the capture test still failed without an identifiable test phase or panic in
+the sanitized evidence. No native signal or memory-lifetime cause is confirmed.
+The independent live Matrix harness then failed during `local_matrix_env-up`,
+before chat, OAuth, or RTC acceptance could run. The old log did not identify
+which fixture operation failed. The candidate failed its final gates.
+
+The next diagnostic batch records fixed Wayland test stages in a private file
+that survives a libtest abort, bounded child exit/signal facts, and known panic
+categories. The Matrix fixture reports fixed stages and failure categories,
+plus numeric Docker/HTTP/OS statuses. Arbitrary service output, credentials,
+and response bodies remain private. Synapse is now pinned to the same published
+immutable image digest as the OAuth fixture. These changes improve failure
+evidence; they do not establish that either Linux failure is fixed.
+
+The next batch also adds four editable shortcut actions, a keyboard room picker
+limited to the current Home or Space, portable binding validation, and shared
+settings/TOML reload behavior. Independent review caught and corrected a
+Shift+digit binding that Slint would deliver as a different logical character.
+Native shortcut tests and actual keyboard/screen-reader acceptance are pending.
+
+The [stock Element Call fixture](ELEMENT_CALL_ACCEPTANCE.md) pins an unmodified
+official RC and requires the two live rosters, distinct decoded video in both
+directions, browser-to-native audio, and departure. It explicitly tests a
+pre-synced Sticky2025 baseline. No result is claimed yet, and it does not verify
+the production Current default or the previously failing stable peer.
+
+Before this batch's hosted validation, 158 Python checks passed and five
+Linux/hosted process checks were skipped locally. Rust formatting, Actionlint,
+JavaScript syntax, Python compilation, and whitespace checks passed. Review
+fixed terminal-exit handling and owned-child cleanup in the Element harness.
+A mandatory hosted regression must prove that killing its guarded namespace
+wrapper also removes detached descendants before any real peer is launched.
+The final namespace teardown and native/UI checks remain unverified locally.
+During development, one cached Slint build-script invocation generated Rust
+source in an automatically deleted temporary directory; it did not run Cargo,
+a native compiler/linker, native tests, the app, or Matrix/RTC services. Later
+UI edits still require the hosted compiler and keyboard acceptance.
 
 Live Linux protocol tests and installed-package checks remain pending. Prior
 candidate results below do not verify these changed inputs. OIDC provider/browser

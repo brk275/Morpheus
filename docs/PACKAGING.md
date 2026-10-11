@@ -96,7 +96,7 @@ The Linux QA executable built on Ubuntu 24.04 required `GLIBC_2.39` and `GLIBCXX
 - The Windows x64 job in run `38029335100` produced a 35,087,286-byte NSIS installer. Extracting it showed the app, uninstaller, theme, and AGPL license; the license matches the source after Windows line-ending normalization. The installer stub is a GUI executable, but the packaged app still uses the PE console subsystem at this older commit. Current source adds the Windows GUI subsystem attribute, which needs a fresh package and Windows install/launch/uninstall acceptance.
 - The macOS ARM job in run `38029335100` never obtained a runner. GitHub annotated it as blocked by an Actions budget, with a separate macOS ARM capacity notice. This is not a package build result. Check the account's Actions budget before another private run.
 
-The generated DEB currently lacks a `Maintainer` control field, which triggers a `dpkg-query` warning. Cargo Packager takes this field from top-level `authors`; set it to a project maintainer identity and working project contact address before distribution. A personal identity is not required.
+Earlier private QA generated a DEB without a `Maintainer` control field. Actual Debian builds now fail preflight until a project maintainer identity and working public project email are configured in top-level `authors`. A personal identity is not required. `package.py --check` validates configuration parsing only; it does not pass this build preflight or establish package readiness.
 
 ## macOS permissions and signing
 

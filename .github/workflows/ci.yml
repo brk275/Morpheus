@@ -43,6 +43,7 @@ jobs:
           python3 -m unittest discover -s scripts -p 'test_*.py' -v
           python3 -m compileall -q scripts
           node --check scripts/element_call_peer.mjs
+          node --check scripts/element_call_stock_peer.mjs
           python3 scripts/package.py --check
       - name: Scan committed history for credentials
         shell: bash
@@ -109,6 +110,16 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libxi6 libxrandr-dev meson ninja-build pkg-config wayland-protocols xvfb \
             dbus-x11 gnome-keyring libsecret-tools libglib2.0-bin \
             sway swaybg pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-wlr
+          # Ubuntu 24.04 Chromium dependencies from pinned Playwright 1.62.1.
+          # Install before the peer drops privileges inside its PID namespace.
+          sudo apt-get install -y \
+            libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
+            libcairo2 libcups2t64 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0t64 \
+            libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 \
+            libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 \
+            fonts-noto-color-emoji fonts-unifont libfontconfig1 libfreetype6 \
+            xfonts-cyrillic xfonts-scalable fonts-liberation fonts-ipafont-gothic \
+            fonts-wqy-zenhei fonts-tlwg-loma-otf fonts-freefont-ttf
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action
         with:

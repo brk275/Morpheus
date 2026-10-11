@@ -11,6 +11,7 @@ mod live;
 mod local_video;
 mod notifications;
 mod security;
+mod shortcuts;
 mod sso;
 mod updater;
 mod verification;
@@ -867,6 +868,7 @@ fn apply_notification_settings(ui: &AppWindow, config: &Config) {
 }
 
 fn apply_config(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
+    shortcuts::apply_config(ui, config);
     let mode = match config.appearance.theme {
         ThemeMode::Dark => 0,
         ThemeMode::Light => 1,
@@ -929,6 +931,7 @@ fn save_config_change(
             // appearance active, but it must not hold back notification
             // privacy changes from a successfully saved config.
             apply_notification_settings(ui, &config);
+            shortcuts::apply_config(ui, &config);
             match store.load_theme(&config) {
                 Ok(theme) => apply_loaded_config(
                     ui,
@@ -1715,6 +1718,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Config::default()
         }
     };
+    shortcuts::register(&ui, store.clone());
     let notifications = DesktopNotifications::start(
         manager.clone(),
         initial_config,
@@ -1744,6 +1748,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(config) => {
                         current_notifications.apply_config(&config);
                         apply_notification_settings(&ui, &config);
+                        shortcuts::apply_config(&ui, &config);
                         current_live.voice_spaces.apply_config(&config);
                         match current_store.load_theme(&config) {
                             Ok(theme) => apply_loaded_config(

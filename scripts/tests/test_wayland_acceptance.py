@@ -17,6 +17,41 @@ SPEC.loader.exec_module(MODULE)
 
 
 class WaylandFixtureTests(unittest.TestCase):
+    def test_capture_reports_bounded_exit_and_signal_without_native_error_text(self):
+        output = (
+            "process didn't exit successfully: /private/executable --private-argument "
+            "(signal: 6, SIGABRT: private native abort detail)\n"
+            "panic in a function that cannot unwind\nlibspa::buffer::Data::chunk\n"
+            "unsafe precondition(s) violated: private pointer content\n"
+        )
+        facts = MODULE.capture_test_facts(output, 101, "first_frame_1")
+        self.assertEqual(facts["command_exit_code"], 101)
+        self.assertEqual(facts["test_signal"], 6)
+        self.assertEqual(facts["last_stage"], "first_frame_1")
+        self.assertTrue(facts["non_unwinding_panic"])
+        self.assertTrue(facts["pointer_precondition_panic"])
+        self.assertTrue(facts["libspa_chunk_frame"])
+        rendered = MODULE.json.dumps(facts)
+        for private in ("private", "/executable", "SIGABRT", "pointer content"):
+            self.assertNotIn(private, rendered)
+        self.assertEqual(MODULE.capture_test_facts("", -11)["command_signal"], 11)
+        self.assertEqual(MODULE.capture_test_facts("(exit status: 101)", 101)["test_exit_code"], 101)
+        invalid = MODULE.capture_test_facts("(signal: 99, SIGOTHER) (exit status: 999)", 999, "private-stage")
+        self.assertNotIn("test_signal", invalid)
+        self.assertNotIn("test_exit_code", invalid)
+        self.assertNotIn("command_exit_code", invalid)
+        self.assertEqual(invalid["last_stage"], "unknown")
+
+    def test_capture_stage_accepts_only_bounded_known_phase(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "stage"
+            self.assertEqual(MODULE.capture_stage(path), "unavailable")
+            path.write_text("opening_display_1")
+            self.assertEqual(MODULE.capture_stage(path), "opening_display_1")
+            for content in (b"private desktop ID", b"x" * 1000, b"\xff\xfe"):
+                path.write_bytes(content)
+                self.assertIn(MODULE.capture_stage(path), {"unknown", "unavailable"})
+
     def test_failed_capture_diagnostics_do_not_echo_panic_payload(self):
         output = (
             "thread 'private test name' panicked at crates/morpheus-rtc/tests/wayland_capture.rs:63:77:\n"

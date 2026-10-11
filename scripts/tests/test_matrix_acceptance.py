@@ -5,14 +5,89 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import subprocess
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from run_matrix_acceptance import Acceptance, OAUTH_PHASES, fixture_from_output, oauth_diagnostics, oauth_evidence, passed_tests
+from run_element_acceptance import CHECKS as ELEMENT_CHECKS
 
 
 class LiveEvidenceTests(unittest.TestCase):
+    def test_element_containment_is_required_before_any_fixture_or_peer(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            with patch.object(runner, "run", side_effect=RuntimeError("containment")) as run, \
+                    patch.object(runner, "script") as script, self.assertRaisesRegex(RuntimeError, "containment"):
+                runner.element_case()
+            self.assertEqual(run.call_args.args[0], "element-process-containment")
+            script.assert_not_called()
+
+    def test_contained_timeout_uses_unreaped_anchor_cleanup_without_communicate(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            process = Mock(returncode=None)
+            def cleanup(child):
+                self.assertIs(child, process)
+                self.assertIsNone(child.returncode)
+                child.returncode = -9
+            with patch("run_matrix_acceptance.namespace_command", return_value=["namespace-wrapper"]) as command, \
+                    patch("run_matrix_acceptance.subprocess.Popen", return_value=process) as popen, \
+                    patch("run_matrix_acceptance.wait_owned", side_effect=subprocess.TimeoutExpired("contained", 1)), \
+                    patch("run_matrix_acceptance.stop_owned", side_effect=cleanup) as stop, \
+                    patch("run_matrix_acceptance.subprocess.run", return_value=subprocess.CompletedProcess([], 0)), \
+                    contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, "deadline"):
+                runner.run("element-timeout", ["original"], seconds=1, pid_namespace=True, element_checks=True)
+            command.assert_called_once()
+            stop.assert_called_once_with(process)
+            process.communicate.assert_not_called()
+            self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
+            self.assertTrue(popen.call_args.kwargs["start_new_session"])
+            self.assertEqual(runner.results, [])
+
+    @unittest.skipIf(os.name == "nt", "Linux hosted harness")
+    def test_matrix_fixture_failure_publishes_only_fixed_stage_and_status(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            visible = io.StringIO()
+            output = "\n".join((
+                "MORPHEUS_MATRIX_FIXTURE_STAGE generate_a",
+                "MORPHEUS_MATRIX_FIXTURE_FAILURE docker_registry",
+                "MORPHEUS_MATRIX_FIXTURE_NUMBER docker_exit=125",
+                "MORPHEUS_MATRIX_FIXTURE_STAGE opaque_credential",
+                "MORPHEUS_MATRIX_FIXTURE_NUMBER http_status=999",
+                "private-password-and-url",
+            ))
+            with patch("run_matrix_acceptance.subprocess.run", return_value=subprocess.CompletedProcess([], 0)), contextlib.redirect_stdout(visible), self.assertRaises(RuntimeError):
+                runner.run("local_matrix_env-up", [sys.executable, "-c", f"print({output!r}); raise SystemExit(1)"])
+            self.assertIn('"matrix_fixture_diagnostics": {"stage": "generate_a", "failure": "docker_registry", "docker_exit": 125}', visible.getvalue())
+            for private in ("opaque_credential", "private-password", "http_status", "999"):
+                self.assertNotIn(private, visible.getvalue())
+            self.assertEqual(runner.results, [])
+
+    @unittest.skipIf(os.name == "nt", "Linux hosted harness")
+    def test_element_success_requires_all_protocol_facts_without_leaking_child_text(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            facts = "\n".join(f"MORPHEUS_ELEMENT_CHECK {name}=true" for name in ELEMENT_CHECKS)
+            visible = io.StringIO()
+            with patch("run_matrix_acceptance.subprocess.run", return_value=subprocess.CompletedProcess([], 0)), contextlib.redirect_stdout(visible):
+                runner.run("element-call-rc-sticky2025-presynced", [sys.executable, "-c", f"print({facts!r}); print('opaque-private-value')"], element_checks=True)
+            self.assertEqual(runner.results[0]["element_checks"], dict.fromkeys(ELEMENT_CHECKS, True))
+            self.assertEqual(runner.results[0]["element_peer"]["baseline"], "presynced")
+            self.assertNotIn("opaque-private-value", visible.getvalue())
+            with patch("run_matrix_acceptance.subprocess.run", return_value=subprocess.CompletedProcess([], 0)), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+                runner.run("element-incomplete", [sys.executable, "-c", "print('MORPHEUS_ELEMENT_CHECK browser_roster=true')"], element_checks=True)
+            self.assertEqual(len(runner.results), 1)
+
+    def test_summary_does_not_claim_element_ran_before_its_check(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "unused-scanner")
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(root / "summary.md")}):
+                runner.summary()
+            self.assertNotIn("Element peer passed", (root / "summary.md").read_text())
+
     def test_requires_tests_to_run(self):
         for output in ("", "test result: ok. 0 passed; 0 failed; 0 ignored;",
                        "test result: ok. 1 passed; 0 failed; 1 ignored;",
@@ -178,6 +253,11 @@ class LiveEvidenceTests(unittest.TestCase):
             fixture.chmod(0o600)
             self.assertEqual(fixture_from_output(str(fixture) + "\n", root), fixture.resolve())
             self.assertEqual(fixture_from_output("MORPHEUS_OAUTH_STAGE registration\n" + str(fixture) + "\n", root), fixture.resolve())
+            self.assertEqual(fixture_from_output("MORPHEUS_MATRIX_FIXTURE_STAGE recovery\n" + str(fixture) + "\n", root), fixture.resolve())
+            for unknown in ("MORPHEUS_MATRIX_FIXTURE_STAGE private_credential",
+                            "MORPHEUS_MATRIX_FIXTURE_STAGE recovery trailing-secret"):
+                with self.subTest(progress=unknown), self.assertRaises(RuntimeError):
+                    fixture_from_output(unknown + "\n" + str(fixture), root)
             with self.assertRaises(RuntimeError):
                 fixture_from_output("MORPHEUS_OAUTH_STAGE opaque_credential\n" + str(fixture), root)
             with self.assertRaises(RuntimeError):

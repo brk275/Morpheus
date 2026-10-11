@@ -28,6 +28,15 @@ class ScopeTests(unittest.TestCase):
                 self.assertEqual(classify([path])["native_matrix"]["os"], ["ubuntu-24.04"])
         self.assertFalse(classify(["scripts/tests/test_local_matrix_auth.py"])["native"])
 
+    def test_stock_element_fixture_only_selects_linux(self):
+        for path in ("scripts/run_element_acceptance.py", "scripts/element_call_stock_peer.mjs",
+                     "scripts/element_peer_fixture.py", "scripts/element-peer/package.json",
+                     "scripts/element-peer/package-lock.json", "crates/morpheus-rtc/tests/element_call_peer.rs",
+                     "scripts/element_process_namespace.py", "scripts/tests/test_element_process_namespace.py",
+                     "scripts/matrix_fixture_diagnostics.py", "scripts/tests/test_matrix_fixture_diagnostics.py"):
+            with self.subTest(path=path):
+                self.assertEqual(classify([path])["native_matrix"]["os"], ["ubuntu-24.04"])
+
     def test_shared_native_or_lock_change_selects_all(self):
         for path in ["Cargo.lock", "Packager.toml", "crates/morpheus-rtc/src/video_device.rs", "vendor/nokhwa/src/lib.rs"]:
             with self.subTest(path=path):

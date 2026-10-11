@@ -240,6 +240,34 @@ component ActionRect inherits Rectangle {
     }
 }
 
+component ShortcutSetting inherits Rectangle {
+    in property <string> label;
+    in-out property <string> binding;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> surface;
+    in property <color> accent;
+    in property <float> text-scale: 1;
+    callback edited();
+    height: 52px;
+    background: transparent;
+    HorizontalLayout {
+        spacing: 12px;
+        Text { text: root.label; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; }
+        Rectangle {
+            width: 200px; height: 38px; background: root.surface; border-radius: 7px;
+            border-width: shortcut-input.has-focus ? 2px : 0px; border-color: root.accent;
+            if root.binding == "" : Text { x: 9px; text: "Disabled"; color: root.muted; font-size: 12px * root.text-scale; vertical-alignment: center; }
+            shortcut-input := TextInput {
+                x: 9px; width: parent.width - 18px; height: parent.height;
+                text <=> root.binding; color: root.ink; font-size: 12px * root.text-scale;
+                single-line: true; accessible-label: root.label + " keyboard shortcut; blank disables";
+                edited => { root.edited(); }
+            }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "Morpheus";
     preferred-width: 1310px;
@@ -327,6 +355,26 @@ export component AppWindow inherits Window {
     in-out property <string> session-error;
     in-out property <string> transfer-notice;
     in-out property <string> config-path;
+    in-out property <string> shortcut-quick-switcher;
+    in-out property <string> shortcut-search;
+    in-out property <string> shortcut-next-unread;
+    in-out property <string> shortcut-previous-unread;
+    in-out property <string> shortcut-edit-quick-switcher;
+    in-out property <string> shortcut-edit-search;
+    in-out property <string> shortcut-edit-next-unread;
+    in-out property <string> shortcut-edit-previous-unread;
+    in-out property <bool> shortcuts-dirty: false;
+    in-out property <string> shortcut-error;
+    in-out property <string> shortcut-notice;
+    in-out property <bool> quick-switcher-open: false;
+    in-out property <string> quick-switcher-query;
+    in-out property <[RoomItem]> quick-switcher-results;
+    in-out property <int> quick-switcher-index: -1;
+    in-out property <int> quick-switcher-match-count: 0;
+    in-out property <string> quick-switcher-account-id;
+    in-out property <int> quick-switcher-account-index: -1;
+    in-out property <string> quick-switcher-space-id;
+    property <int> search-focus-request: 0;
     in-out property <bool> show-sign-in: true;
     in-out property <bool> login-loading: false;
     in-out property <string> login-error;
@@ -465,6 +513,30 @@ export component AppWindow inherits Window {
     callback set-notification-show-preview(bool);
     callback add-highlight-word(string);
     callback remove-highlight-word(string);
+    callback dispatch-shortcut(string, bool, bool, bool, bool) -> bool;
+    callback save-shortcuts();
+    callback reset-shortcuts();
+    callback open-quick-switcher();
+    callback close-quick-switcher();
+    close-quick-switcher => {
+        root.quick-switcher-open = false;
+        quick-switch-trigger.focus();
+    }
+    callback filter-quick-switcher();
+    callback choose-quick-room(int);
+    callback focus-room-search();
+    focus-room-search => {
+        root.page = 0;
+        root.show-side-panel = true;
+        root.side-panel-tab = 2;
+        root.search-focus-request += 1;
+    }
+    callback shortcuts-edited();
+    shortcuts-edited => {
+        root.shortcuts-dirty = true;
+        root.shortcut-error = "";
+        root.shortcut-notice = "";
+    }
     callback submit-login(string, string, string);
     callback submit-sso(string);
     callback composer-edited(string);
@@ -559,6 +631,12 @@ export component AppWindow inherits Window {
     property <string> login-username;
     property <string> login-password;
 
+    // A picker snapshot never survives a change of account or Space.
+    changed active-account-local-id => { root.quick-switcher-open = false; }
+    changed active-account-index => { root.quick-switcher-open = false; }
+    changed active-space-id => { root.quick-switcher-open = false; }
+    changed show-sign-in => { if !root.show-sign-in { shortcut-scope.focus(); } }
+
     property <bool> light-palette: root.theme-mode == 1 || (root.theme-mode == 3 && Palette.color-scheme == ColorScheme.light);
     property <float> text-scale: root.font-scale-percent / 100.0;
     property <color> rail: custom-theme-active ? custom-rail : light-palette ? #e7ebf3 : theme-mode == 2 ? #000000 : #10131b;
@@ -574,6 +652,17 @@ export component AppWindow inherits Window {
     property <color> accent-ink: custom-theme-active ? custom-accent-ink : theme-mode == 2 ? #000000 : #ffffff;
     default-font-family: root.ui-font-family;
     background: canvas;
+
+    shortcut-scope := FocusScope {
+    width: parent.width;
+    height: parent.height;
+    focus-on-tab-navigation: false;
+    init => { self.focus(); }
+    // Bubble after child controls: cursor movement, selection, IME, and text
+    // editing take precedence over application commands. Never capture Tab/Escape.
+    key-pressed(event) => {
+        if root.dispatch-shortcut(event.text, event.modifiers.control, event.modifiers.alt, event.modifiers.shift, event.modifiers.meta) { accept } else { reject }
+    }
 
     HorizontalLayout {
         spacing: 0px;
@@ -742,6 +831,13 @@ export component AppWindow inherits Window {
                         padding-right: 10px;
                         padding-bottom: 18px;
                         spacing: 3px;
+                        quick-switch-trigger := Button {
+                            height: 32px;
+                            text: "Switch room";
+                            enabled: root.page != 1 && !root.show-sign-in;
+                            accessible-label: "Switch between rooms in the current Home or Space";
+                            clicked => { root.open-quick-switcher(); }
+                        }
                         Text {
                             text: root.active-space-id == "" ? "YOUR ROOMS" : "SPACE ROOMS";
                             color: root.muted;
@@ -2043,6 +2139,27 @@ export component AppWindow inherits Window {
                             }
                         }
                         Rectangle { height: 1px; background: root.divider; }
+                        Text { text: "Keyboard shortcuts"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
+                        Text {
+                            text: "Mod is Command on macOS and Ctrl elsewhere. Meta is Command on macOS and Windows/Super elsewhere. Combine Mod, Ctrl, Meta, Alt, or Shift with A–Z, 0–9, arrows, Home, End, PageUp, PageDown, or F1–F12. Include a modifier other than Shift. Blank disables an action. Shift+digits, Alt+letters/digits, and editing or window shortcuts are reserved.";
+                            color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap;
+                        }
+                        ShortcutSetting { label: "Switch room"; binding <=> root.shortcut-edit-quick-switcher; ink: root.ink; muted: root.muted; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; edited => { root.shortcuts-edited(); } }
+                        ShortcutSetting { label: "Search current room"; binding <=> root.shortcut-edit-search; ink: root.ink; muted: root.muted; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; edited => { root.shortcuts-edited(); } }
+                        ShortcutSetting { label: "Next unread room"; binding <=> root.shortcut-edit-next-unread; ink: root.ink; muted: root.muted; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; edited => { root.shortcuts-edited(); } }
+                        ShortcutSetting { label: "Previous unread room"; binding <=> root.shortcut-edit-previous-unread; ink: root.ink; muted: root.muted; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; edited => { root.shortcuts-edited(); } }
+                        Text {
+                            text: "Room switching and unread navigation use the current Home or Space. Shortcuts pause in Settings and dialogs. Text editing takes priority, including arrow movement in the composer. Search requires a signed-in room. Changes also appear in config.toml; omit an action there to disable it.";
+                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            spacing: 10px; alignment: end;
+                            Button { text: "Restore defaults"; clicked => { root.reset-shortcuts(); } }
+                            Button { text: "Save shortcuts"; primary: true; enabled: root.shortcuts-dirty; clicked => { root.save-shortcuts(); } }
+                        }
+                        if root.shortcut-error != "" : Text { text: root.shortcut-error; color: #e58e9b; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: assertive; }
+                        if root.shortcut-notice != "" : Text { text: root.shortcut-notice; color: root.accent; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+                        Rectangle { height: 1px; background: root.divider; }
                         Text { text: "Advanced customization"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Edit your settings and theme pack files. Valid changes appear here automatically."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         Text { text: root.config-path; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
@@ -2712,7 +2829,9 @@ export component AppWindow inherits Window {
                                     text <=> root.room-search-query; color: root.ink; font-size: 12px * root.text-scale;
                                     enabled: root.live-session && root.active-room-id != "" && !root.room-search-loading;
                                     accessible-label: "Search terms for current room";
+                                    property <int> focus-request: root.search-focus-request;
                                     init => { if root.live-session { self.focus(); } }
+                                    changed focus-request => { if root.live-session && self.enabled { self.focus(); } }
                                     accepted => { root.query-room-messages(); }
                                 }
                             }
@@ -2807,6 +2926,85 @@ export component AppWindow inherits Window {
                                 Text { text: result.preview; color: root.ink; font-size: 11px * root.text-scale; overflow: elide; }
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.quick-switcher-open : FocusScope {
+        focus-on-tab-navigation: false;
+        init => { quick-room-input.focus(); }
+        capture-key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.close-quick-switcher();
+                accept
+            } else if (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) && quick-room-input.has-focus {
+                close-quick-switcher.focus();
+                accept
+            } else if event.text == Key.Tab && !event.modifiers.shift && close-quick-switcher.has-focus {
+                quick-room-input.focus();
+                accept
+            } else if quick-room-input.has-focus && !event.modifiers.control && !event.modifiers.meta && !event.modifiers.alt && !event.modifiers.shift && root.quick-switcher-results.length > 0 && event.text == Key.DownArrow {
+                root.quick-switcher-index = mod(root.quick-switcher-index + 1, root.quick-switcher-results.length);
+                accept
+            } else if quick-room-input.has-focus && !event.modifiers.control && !event.modifiers.meta && !event.modifiers.alt && !event.modifiers.shift && root.quick-switcher-results.length > 0 && event.text == Key.UpArrow {
+                root.quick-switcher-index = mod(root.quick-switcher-index + root.quick-switcher-results.length - 1, root.quick-switcher-results.length);
+                accept
+            } else { reject }
+        }
+        Rectangle {
+            background: #000000aa;
+            TouchArea { width: parent.width; height: parent.height; }
+            Rectangle {
+                x: (parent.width - 530px) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 530px; height: min(580px, parent.height - 40px); background: root.canvas;
+                border-radius: 14px; border-color: root.accent; border-width: 1px;
+                accessible-role: region;
+                accessible-label: "Switch room in " + root.active-space-name;
+                VerticalLayout {
+                    padding: 20px; spacing: 6px;
+                    Text { text: "Switch room · " + root.active-space-name; color: root.ink; font-size: 18px * root.text-scale; font-weight: 750; }
+                    Rectangle {
+                        height: 38px; background: root.elevated; border-radius: 8px;
+                        if root.quick-switcher-query == "" : Text { x: 10px; text: "Room name or Matrix room ID"; color: root.muted; font-size: 12px * root.text-scale; vertical-alignment: center; }
+                        quick-room-input := TextInput {
+                            x: 10px; width: parent.width - 20px; height: parent.height;
+                            text <=> root.quick-switcher-query; color: root.ink; font-size: 12px * root.text-scale;
+                            single-line: true; accessible-label: "Filter rooms; arrows select, Enter opens, Escape closes";
+                            edited => { root.filter-quick-switcher(); }
+                            accepted => { root.choose-quick-room(root.quick-switcher-index); }
+                        }
+                    }
+                    Text {
+                        text: root.quick-switcher-match-count == 0 ? "No matching rooms" : root.quick-switcher-match-count > 6 ? "Showing 6 matches; type more to narrow the list" : root.quick-switcher-match-count + " matching rooms";
+                        color: root.muted; font-size: 11px * root.text-scale; accessible-live-region: polite;
+                    }
+                    VerticalLayout {
+                        spacing: 3px; alignment: start;
+                        for room[index] in root.quick-switcher-results : ActionRect {
+                            height: 36px; border-radius: 7px;
+                            background: index == root.quick-switcher-index ? root.hover : root.elevated;
+                            focus-color: root.accent;
+                            label: "Open " + room.name + " · " + room.id;
+                            activated => { root.choose-quick-room(index); }
+                            HorizontalLayout {
+                                padding-left: 10px; padding-right: 10px; spacing: 8px;
+                                Text { text: room.name; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                                Text { text: room.unread > 0 ? room.unread + " unread" : ""; color: root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; }
+                            }
+                        }
+                    }
+                    Text {
+                        text: root.quick-switcher-index >= 0 && root.quick-switcher-index < root.quick-switcher-results.length ? "Selected: " + root.quick-switcher-results[root.quick-switcher-index].name : "";
+                        color: root.muted; font-size: 11px * root.text-scale; overflow: elide;
+                        accessible-live-region: polite;
+                    }
+                    Rectangle { vertical-stretch: 1; background: transparent; }
+                    close-quick-switcher := Button {
+                        text: "Close";
+                        clicked => { root.close-quick-switcher(); }
                     }
                 }
             }
@@ -3617,4 +3815,5 @@ export component AppWindow inherits Window {
             }
         }
     }
+    } // shortcut-scope
 }

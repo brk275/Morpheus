@@ -94,13 +94,7 @@ impl Config {
                 "appearance.theme_pack must be a theme name, not a path".into(),
             ));
         }
-        for (action, shortcut) in &self.shortcuts {
-            if action.trim().is_empty() || shortcut.trim().is_empty() {
-                return Err(ConfigError::Invalid(
-                    "shortcuts must have non-empty actions and key combinations".into(),
-                ));
-            }
-        }
+        validate_shortcuts(&self.shortcuts)?;
         for overrides in self.account_overrides.values() {
             for room_id in &overrides.local_voice_rooms {
                 if !room_id.starts_with('!') || !room_id.contains(':') {
@@ -387,13 +381,236 @@ pub struct AccountOverrides {
     pub legacy_element_call_rooms: Vec<String>,
 }
 
-fn default_shortcuts() -> BTreeMap<String, String> {
+pub fn default_shortcuts() -> BTreeMap<String, String> {
     BTreeMap::from([
         ("quick_switcher".into(), "Mod+K".into()),
         ("search".into(), "Mod+F".into()),
         ("next_unread".into(), "Alt+Down".into()),
         ("previous_unread".into(), "Alt+Up".into()),
     ])
+}
+
+/// Supported commands, shared by the TOML validator and the desktop dispatcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutAction {
+    QuickSwitcher,
+    Search,
+    NextUnread,
+    PreviousUnread,
+}
+
+impl ShortcutAction {
+    pub const ALL: [Self; 4] = [
+        Self::QuickSwitcher,
+        Self::Search,
+        Self::NextUnread,
+        Self::PreviousUnread,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::QuickSwitcher => "quick_switcher",
+            Self::Search => "search",
+            Self::NextUnread => "next_unread",
+            Self::PreviousUnread => "previous_unread",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|action| action.name() == name)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutKey {
+    Character(char),
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Function(u8),
+}
+
+/// Physical modifiers. The Slint adapter accounts for its macOS Ctrl/Meta remapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ShortcutModifiers {
+    pub control: bool,
+    pub meta: bool,
+    pub alt: bool,
+    pub shift: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shortcut {
+    primary: bool,
+    modifiers: ShortcutModifiers,
+    pub key: ShortcutKey,
+}
+
+impl Shortcut {
+    /// A combination contains modifiers followed by one key. `Mod` is Command
+    /// on macOS and Control elsewhere. Missing actions are disabled; empty or
+    /// malformed values are errors, so a typo cannot silently disable a binding.
+    pub fn parse(value: &str) -> Result<Self, ConfigError> {
+        let invalid = |reason: &str| ConfigError::Invalid(format!("shortcut {value:?}: {reason}"));
+        if value.len() > 64 || !value.is_ascii() || value.chars().any(char::is_control) {
+            return Err(invalid("use a short ASCII key combination"));
+        }
+        let parts: Vec<_> = value.split('+').map(str::trim).collect();
+        let (key, modifiers) = parts.split_last().ok_or_else(|| invalid("missing key"))?;
+        let key_name = key.to_ascii_uppercase();
+        let key = match key_name.as_str() {
+            "UP" => ShortcutKey::Up,
+            "DOWN" => ShortcutKey::Down,
+            "LEFT" => ShortcutKey::Left,
+            "RIGHT" => ShortcutKey::Right,
+            "HOME" => ShortcutKey::Home,
+            "END" => ShortcutKey::End,
+            "PAGEUP" => ShortcutKey::PageUp,
+            "PAGEDOWN" => ShortcutKey::PageDown,
+            name if name.len() == 1 && name.as_bytes()[0].is_ascii_alphanumeric() => {
+                ShortcutKey::Character(name.as_bytes()[0] as char)
+            }
+            name if (1..=12).any(|number| name == format!("F{number}")) => {
+                ShortcutKey::Function(name[1..].parse().expect("validated function key"))
+            }
+            _ => {
+                return Err(invalid(
+                    "key must be A–Z, 0–9, an arrow, Home, End, PageUp, PageDown, or F1–F12",
+                ));
+            }
+        };
+        let mut shortcut = Self {
+            primary: false,
+            modifiers: ShortcutModifiers::default(),
+            key,
+        };
+        for part in modifiers {
+            let flag = match part.to_ascii_lowercase().as_str() {
+                "mod" => &mut shortcut.primary,
+                "ctrl" => &mut shortcut.modifiers.control,
+                "meta" => &mut shortcut.modifiers.meta,
+                "alt" => &mut shortcut.modifiers.alt,
+                "shift" => &mut shortcut.modifiers.shift,
+                _ => return Err(invalid("modifiers are Mod, Ctrl, Meta, Alt, and Shift")),
+            };
+            if *flag {
+                return Err(invalid("a modifier occurs twice"));
+            }
+            *flag = true;
+        }
+        if shortcut.primary && (shortcut.modifiers.control || shortcut.modifiers.meta) {
+            return Err(invalid("Mod cannot be combined with Ctrl or Meta"));
+        }
+        if !(shortcut.primary
+            || shortcut.modifiers.control
+            || shortcut.modifiers.meta
+            || shortcut.modifiers.alt)
+        {
+            return Err(invalid(
+                "include Mod, Ctrl, Meta, or Alt; typing keys are reserved",
+            ));
+        }
+        if let ShortcutKey::Character(character) = shortcut.key {
+            // Slint exposes the logical text (Shift+1 is "!" on a US layout),
+            // not a physical scan code. A digit spelling cannot portably match.
+            if character.is_ascii_digit() && shortcut.modifiers.shift {
+                return Err(invalid(
+                    "Shift with a digit is layout-dependent; use a letter or function key",
+                ));
+            }
+            // Alt letters can be text/dead keys on macOS; Ctrl+Alt is AltGr on
+            // several Windows/Linux layouts. Keep those combinations for typing.
+            if shortcut.modifiers.alt {
+                return Err(invalid(
+                    "Alt with a letter or digit is reserved for text input",
+                ));
+            }
+            if matches!(
+                character,
+                'A' | 'C' | 'V' | 'X' | 'Y' | 'Z' | 'Q' | 'W' | 'H' | 'M'
+            ) {
+                return Err(invalid(
+                    "this key combination is reserved for editing or window controls",
+                ));
+            }
+        }
+        if shortcut.modifiers.alt && shortcut.key == ShortcutKey::Function(4) {
+            return Err(invalid("Alt+F4 is reserved for closing the window"));
+        }
+        Ok(shortcut)
+    }
+
+    pub fn modifiers(&self, macos: bool) -> ShortcutModifiers {
+        let mut modifiers = self.modifiers;
+        if self.primary {
+            if macos {
+                modifiers.meta = true;
+            } else {
+                modifiers.control = true;
+            }
+        }
+        modifiers
+    }
+
+    pub fn canonical(&self) -> String {
+        let mut parts = Vec::new();
+        for (enabled, name) in [
+            (self.primary, "Mod"),
+            (self.modifiers.control, "Ctrl"),
+            (self.modifiers.meta, "Meta"),
+            (self.modifiers.alt, "Alt"),
+            (self.modifiers.shift, "Shift"),
+        ] {
+            if enabled {
+                parts.push(name.to_owned());
+            }
+        }
+        parts.push(match self.key {
+            ShortcutKey::Character(character) => character.to_string(),
+            ShortcutKey::Up => "Up".into(),
+            ShortcutKey::Down => "Down".into(),
+            ShortcutKey::Left => "Left".into(),
+            ShortcutKey::Right => "Right".into(),
+            ShortcutKey::Home => "Home".into(),
+            ShortcutKey::End => "End".into(),
+            ShortcutKey::PageUp => "PageUp".into(),
+            ShortcutKey::PageDown => "PageDown".into(),
+            ShortcutKey::Function(number) => format!("F{number}"),
+        });
+        parts.join("+")
+    }
+}
+
+pub fn validate_shortcuts(values: &BTreeMap<String, String>) -> Result<(), ConfigError> {
+    let mut bindings: Vec<(&str, Shortcut)> = Vec::new();
+    for (name, value) in values {
+        if ShortcutAction::parse(name).is_none() {
+            return Err(ConfigError::Invalid(format!(
+                "unknown shortcut action {name:?}"
+            )));
+        }
+        let shortcut = Shortcut::parse(value)?;
+        for (other_name, other) in &bindings {
+            // A config is portable: reject an alias conflict on either platform,
+            // even when the file is currently being edited on the other one.
+            if other.key == shortcut.key
+                && [false, true]
+                    .into_iter()
+                    .any(|macos| other.modifiers(macos) == shortcut.modifiers(macos))
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "shortcuts {other_name} and {name} conflict"
+                )));
+            }
+        }
+        bindings.push((name, shortcut));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -630,6 +847,109 @@ impl ThemeColors {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shortcut_parser_normalizes_keys_and_resolves_platform_modifiers() {
+        let shortcut = Shortcut::parse(" shift + mOd + k ").unwrap();
+        assert_eq!(shortcut.canonical(), "Mod+Shift+K");
+        assert_eq!(shortcut.key, ShortcutKey::Character('K'));
+        assert_eq!(
+            shortcut.modifiers(false),
+            ShortcutModifiers {
+                control: true,
+                shift: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            shortcut.modifiers(true),
+            ShortcutModifiers {
+                meta: true,
+                shift: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            Shortcut::parse("alt+pagedown").unwrap().canonical(),
+            "Alt+PageDown"
+        );
+        assert_eq!(Shortcut::parse("Ctrl+F12").unwrap().canonical(), "Ctrl+F12");
+        validate_shortcuts(&default_shortcuts()).unwrap();
+    }
+
+    #[test]
+    fn shortcut_validation_preserves_typing_modal_keys_and_window_controls() {
+        for invalid in [
+            "",
+            "K",
+            "Shift+K",
+            "Mod+",
+            "Mod+K+F",
+            "Mod+Mod+K",
+            "Mod+Ctrl+K",
+            "Command+K",
+            "Mod+F13",
+            "Mod+Escape",
+            "Alt+Tab",
+            "Mod+Enter",
+            "Alt+A",
+            "Ctrl+Alt+2",
+            "Mod+C",
+            "Ctrl+Shift+Z",
+            "Mod+Shift+1",
+            "Meta+Shift+0",
+            "Meta+W",
+            "Alt+F4",
+            "Mod+Ｋ",
+            "Mod+K\n",
+        ] {
+            assert!(Shortcut::parse(invalid).is_err(), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn shortcuts_reject_unknown_actions_and_conflicts_on_either_platform() {
+        let mut config = Config::default();
+        config
+            .shortcuts
+            .insert("run_command".into(), "Mod+R".into());
+        assert!(config.validate().is_err());
+        config.shortcuts.remove("run_command");
+        for conflict in ["mod+k", "Ctrl+K", "Meta+K"] {
+            config.shortcuts.insert("search".into(), conflict.into());
+            assert!(config.validate().is_err(), "accepted conflict {conflict}");
+        }
+        config
+            .shortcuts
+            .insert("search".into(), "Mod+Shift+K".into());
+        config.validate().unwrap();
+        config.shortcuts.clear();
+        config.validate().unwrap(); // A deliberately empty table disables all commands.
+    }
+
+    #[test]
+    fn invalid_shortcut_save_preserves_the_last_valid_file_and_reload_recovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let mut config = store.load_or_create().unwrap();
+        let original = fs::read(store.path()).unwrap();
+        config.shortcuts.insert("search".into(), "Mod+K".into());
+        assert!(store.save(&config).is_err());
+        assert_eq!(fs::read(store.path()).unwrap(), original);
+        config.shortcuts.insert("search".into(), "Mod+J".into());
+        store.save(&config).unwrap();
+        assert_eq!(store.load().unwrap().shortcuts["search"], "Mod+J");
+        fs::write(store.path(), "[shortcuts]\nsearch = 'Mod+Tab'\n").unwrap();
+        assert!(store.load().is_err());
+        // Validation never repairs/overwrites an external malformed edit.
+        assert!(
+            fs::read_to_string(store.path())
+                .unwrap()
+                .contains("Mod+Tab")
+        );
+        store.save(&config).unwrap();
+        assert_eq!(store.load().unwrap(), config);
+    }
 
     #[test]
     fn creates_and_round_trips_default() {

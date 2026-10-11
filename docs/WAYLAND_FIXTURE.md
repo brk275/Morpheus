@@ -82,4 +82,8 @@ application identifiers, session paths, or node IDs. Bounded log scans mark
 truncation explicitly; absence of a matched flag is not proof that a phase did
 not occur outside the scanned region.
 Captured libtest output also stays private on failure. Only fixed result/phase
-facts and the known fixture source's numeric panic line may be reported.
+facts, bounded command/child exit codes or signal numbers, fixed library-panic
+categories, and the known fixture source's numeric panic line may be reported.
+A private stage file preserves the last fixed test phase even when a native
+abort prevents libtest from flushing captured output. Neither a missing panic
+marker nor an exit code alone establishes the underlying cause.

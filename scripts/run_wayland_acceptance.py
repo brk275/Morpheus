@@ -56,6 +56,23 @@ DIAGNOSTIC_STAGES = frozenset({
     "backend_build", "compositor", "media_services", "portal", "outputs", "test_discovery", "capture_test",
 })
 DIAGNOSTIC_LOG_LIMIT = 4 * 1024 * 1024
+CAPTURE_STAGES = frozenset({
+    "before_test", "capabilities", "opening_display_1", "opening_display_2",
+    "first_frame_1", "first_frame_2", "checking_pixels_1", "checking_pixels_2",
+    "stopping_display_1", "stopping_display_2", "reopening_display", "reopen_frame",
+    "changing_source", "awaiting_changed_frame", "removing_source", "awaiting_source_loss",
+    "stopping_lost_source", "restoring_source", "denying_selection", "cancelling_selection",
+    "complete",
+})
+
+
+def capture_stage(path: Path) -> str:
+    try:
+        with path.open("rb") as source:
+            value = source.read(65).decode("ascii").strip()
+    except (OSError, UnicodeError):
+        return "unavailable"
+    return value if value in CAPTURE_STAGES else "unknown"
 
 
 def diagnostic_facts(root: Path, stage: str, services: dict[str, subprocess.Popen]) -> dict:
@@ -100,13 +117,38 @@ def capture_test_passed(output: str) -> bool:
     return target_passed is not None and summary_passed is not None
 
 
-def capture_test_facts(output: str, status: int | None) -> dict:
+def capture_test_facts(output: str, status: int | None, stage: str = "unknown") -> dict:
     """Do not publish libtest panic payloads, even when the test fails."""
     facts = {
         "command": "timed_out" if status is None else "succeeded" if status == 0 else "failed",
         "required_test_passed": capture_test_passed(output),
         "zero_tests_passed": "test result: ok. 0 passed;" in output,
+        "last_stage": stage if stage in CAPTURE_STAGES else "unknown",
     }
+    # Cargo commonly exits 101 when its child dies by signal. Keep the
+    # wrapper status and the child's reported termination distinct. Never
+    # echo the cargo command, native error line, process ID or signal text.
+    if status is not None and 0 <= status <= 255:
+        facts["command_exit_code"] = status
+    elif status is not None and -64 <= status < 0:
+        facts["command_signal"] = -status
+    reported_signal = re.search(r"\(signal: ([1-9][0-9]?), SIG[A-Z0-9]+(?::|\))", output)
+    if reported_signal and int(reported_signal[1]) <= 64:
+        facts["test_signal"] = int(reported_signal[1])
+    reported_exit = re.search(r"\(exit status: ([0-9]{1,3})\)", output)
+    if reported_exit and int(reported_exit[1]) <= 255:
+        facts["test_exit_code"] = int(reported_exit[1])
+    for category, markers in {
+        "non_unwinding_panic": ("panic in a function that cannot unwind", "non-unwinding panic"),
+        "borrow_panic": ("already borrowed", "RefCell already"),
+        "pointer_precondition_panic": ("unsafe precondition(s) violated", "misaligned pointer dereference", "null pointer dereference"),
+        "runtime_context_panic": ("there is no reactor running", "Cannot drop a runtime in a context"),
+        "stack_overflow": ("has overflowed its stack", "fatal runtime error: stack overflow"),
+        "pipewire_library_frame": ("pipewire::stream::", "pipewire::buffer::", "pipewire-0.10.1/src/"),
+        "libspa_library_frame": ("libspa::", "libspa-0.10.1/src/"),
+        "libspa_chunk_frame": ("libspa::buffer::Data::chunk",),
+    }.items():
+        facts[category] = any(marker in output for marker in markers)
     for phase, marker in {
         "create_session": "creating the screen-sharing session:",
         "select_sources": "selecting the screen-sharing source:",
@@ -188,6 +230,7 @@ def private_environment(root: Path) -> dict[str, str]:
         "WLR_RENDERER": "pixman", "WLR_HEADLESS_OUTPUTS": "2",
         "WLR_LIBINPUT_NO_DEVICES": "1", "MORPHEUS_WAYLAND_ACCEPTANCE": "1",
         "MORPHEUS_WAYLAND_CHOOSER_MODE": str(root / "chooser-mode"),
+        "MORPHEUS_WAYLAND_STAGE_PATH": str(root / "capture-stage"),
     })
     return env
 
@@ -364,6 +407,9 @@ def session(root: Path) -> int:
                 print(listing_output[-24000:], file=sys.stderr)
                 raise RuntimeError("Wayland acceptance test did not compile or was not discovered")
             stage = "capture_test"
+            stage_path = root / "capture-stage"
+            stage_path.write_text("before_test", encoding="ascii")
+            stage_path.chmod(0o600)
             test_log = files.enter_context((root / "capture-test.log").open("wb"))
             os.chmod(root / "capture-test.log", 0o600)
             test = subprocess.Popen(command + ["--", "--ignored", "--exact", TARGET_TEST, "--test-threads=1"], cwd=REPO, stdout=test_log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -375,7 +421,7 @@ def session(root: Path) -> int:
                 status = None
             test_output = (root / "capture-test.log").read_text(errors="replace")
             if status != 0 or not capture_test_passed(test_output):
-                print("Wayland capture test facts: " + json.dumps(capture_test_facts(test_output, status), sort_keys=True), file=sys.stderr)
+                print("Wayland capture test facts: " + json.dumps(capture_test_facts(test_output, status, capture_stage(stage_path)), sort_keys=True), file=sys.stderr)
                 raise RuntimeError("Wayland portal acceptance did not execute and pass its required test")
             print("Actual Wayland display selection/stream/cancel tests passed; native window and GNOME/KDE remain unverified.")
             return 0

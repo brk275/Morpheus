@@ -4,17 +4,67 @@
 
 #![cfg(feature = "native-rtc")]
 
-use std::{fs, time::Duration};
+use std::{fs, io::Write, time::Duration};
 
 use futures_util::StreamExt;
 use matrix_sdk::{Client, ruma::api::client::uiaa};
 use morpheus_matrix::{AccountManager, SyncBackend, SyncStatus};
-use morpheus_rtc::{CallOptions, InteropMode, MediaStreamKind, RtcService};
+use morpheus_rtc::{
+    CallOptions, I420Buffer, InteropMode, MediaStreamKind, RtcService, VideoFrame, VideoRotation,
+};
 use serde::Deserialize;
 use tokio::time::{sleep, timeout};
 
 const ELEMENT_ROOM_SLOT_ID: &str = "m.call#ROOM";
 const NATIVE_ROOM_SLOT_ID: &str = "m.call#room";
+
+fn write_marker(path: impl AsRef<std::path::Path>, value: &[u8]) {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .expect("Cannot create fresh private interop marker")
+        .write_all(value)
+        .expect("Cannot write private interop marker");
+}
+
+async fn wait_for_marker(path: &std::path::Path) {
+    timeout(Duration::from_secs(120), async {
+        while !path.is_file() {
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("Stock browser coordination timed out");
+}
+
+// Deliberately distinct from the browser's red/green camera fixture. Browser
+// canvas readback cannot mistake its own preview for this remote video.
+fn native_video_frame(index: u32) -> VideoFrame {
+    let mut data_y = vec![16; 640 * 360];
+    for row in data_y.chunks_exact_mut(640) {
+        row[..320].fill(235);
+    }
+    VideoFrame {
+        buffer: I420Buffer {
+            width: 640,
+            height: 360,
+            data_y,
+            stride_y: 640,
+            data_u: vec![128; 320 * 180],
+            stride_u: 320,
+            data_v: vec![128; 320 * 180],
+            stride_v: 320,
+        },
+        rotation: VideoRotation::Deg0,
+        timestamp_us: i64::from(index) * 66_667,
+    }
+}
 
 #[derive(Deserialize)]
 struct Fixture {
@@ -135,6 +185,10 @@ fn has_red_green_halves(buffer: &morpheus_rtc::I420Buffer) -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn element_call_browser_peer_encrypted_media_and_departure() {
+    assert!(
+        std::env::var_os("MORPHEUS_ELEMENT_DIAG_REFRESH").is_none(),
+        "Diagnostic browser refresh cannot establish stock interoperability"
+    );
     let Some(fixture_path) = std::env::var_os("MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS") else {
         eprintln!("Skipped Element Call peer test; set MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS.");
         return;
@@ -145,6 +199,15 @@ async fn element_call_browser_peer_encrypted_media_and_departure() {
     };
     let done_path = std::env::var_os("MORPHEUS_ELEMENT_PEER_DONE_FILE")
         .expect("Set MORPHEUS_ELEMENT_PEER_DONE_FILE");
+    let stock_root = std::env::var_os("MORPHEUS_ELEMENT_PEER_ROOT").map(std::path::PathBuf::from);
+    if let Some(root) = &stock_root {
+        assert_eq!(
+            std::env::var("MORPHEUS_ELEMENT_INTEROP_MODE").as_deref(),
+            Ok("sticky-2025")
+        );
+        wait_for_marker(&root.join("browser-ready")).await;
+        eprintln!("MORPHEUS_ELEMENT_CHECK native_presynced_baseline=true");
+    }
     let fixture: Fixture =
         serde_json::from_slice(&fs::read(fixture_path).expect("Cannot read protected RTC fixture"))
             .expect("Invalid RTC fixture");
@@ -162,7 +225,12 @@ async fn element_call_browser_peer_encrypted_media_and_departure() {
         .rooms
         .get("encrypted_room")
         .expect("Encrypted RTC room missing");
-    let root = std::env::temp_dir().join(format!("morpheus-element-peer-{}", std::process::id()));
+    let root = stock_root
+        .as_ref()
+        .map(|root| root.join("native-profile"))
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("morpheus-element-peer-{}", std::process::id()))
+        });
     fs::create_dir_all(&root).expect("Cannot create private Alice store");
     #[cfg(unix)]
     {
@@ -238,7 +306,29 @@ async fn element_call_browser_peer_encrypted_media_and_departure() {
         .join(room_id, options)
         .await
         .expect("Morpheus cannot join Element Call-compatible slot");
-    fs::write(&go_path, b"ready\n").expect("Cannot signal browser to join");
+    let outgoing_video = if stock_root.is_some() {
+        let publication = rtc
+            .publish_camera(room_id, 640, 360, false)
+            .await
+            .expect("Cannot publish native interop camera");
+        let (stop, mut stopped) = tokio::sync::oneshot::channel::<()>();
+        let sender = tokio::spawn(async move {
+            for index in 0..3_600 {
+                publication
+                    .push_video(native_video_frame(index))
+                    .expect("Native interop camera send failed");
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    _ = sleep(Duration::from_millis(66)) => {},
+                }
+            }
+            publication
+        });
+        Some((stop, sender))
+    } else {
+        None
+    };
+    write_marker(&go_path, b"ready\n");
     eprintln!("Morpheus joined Element Call's room call; waiting for browser peer.");
     let browser_member = timeout(Duration::from_secs(90), async {
         loop {
@@ -256,6 +346,7 @@ async fn element_call_browser_peer_encrypted_media_and_departure() {
     .await
     .expect("Element Call browser never appeared in Morpheus roster");
     eprintln!("Element Call browser appeared in Morpheus roster.");
+    eprintln!("MORPHEUS_ELEMENT_CHECK native_roster=true");
 
     let audio = timeout(Duration::from_secs(45), async {
         loop {
@@ -318,8 +409,14 @@ async fn element_call_browser_peer_encrypted_media_and_departure() {
         "Morpheus did not decode Element Call red/green video"
     );
     eprintln!("Morpheus decoded Element Call encrypted audio and synthetic red/green video.");
+    eprintln!("MORPHEUS_ELEMENT_CHECK native_audio=true");
+    eprintln!("MORPHEUS_ELEMENT_CHECK native_video=true");
 
-    fs::write(&done_path, b"leave\n").expect("Cannot signal browser departure");
+    if let Some(root) = &stock_root {
+        wait_for_marker(&root.join("browser-observed")).await;
+    }
+
+    write_marker(&done_path, b"leave\n");
     timeout(Duration::from_secs(45), async {
         loop {
             if rtc
@@ -335,6 +432,16 @@ async fn element_call_browser_peer_encrypted_media_and_departure() {
     })
     .await
     .expect("Element Call departure never reached Morpheus roster");
+    eprintln!("MORPHEUS_ELEMENT_CHECK native_departure=true");
+    if let Some((stop, sender)) = outgoing_video {
+        stop.send(()).expect("Native interop camera stopped early");
+        sender
+            .await
+            .expect("Native interop camera sender panicked")
+            .unpublish()
+            .await
+            .expect("Cannot unpublish native interop camera");
+    }
     rtc.leave(room_id).await.expect("Morpheus leave failed");
     drop(rtc);
     manager

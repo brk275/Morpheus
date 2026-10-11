@@ -1,0 +1,8 @@
+{
+  "name": "morpheus-element-peer-fixture",
+  "private": true,
+  "version": "0.0.0",
+  "dependencies": {
+    "playwright-core": "1.62.1"
+  }
+}
