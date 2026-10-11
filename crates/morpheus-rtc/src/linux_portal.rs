@@ -18,6 +18,7 @@ use pipewire::{
     main_loop::MainLoopRc,
     properties,
     spa::{
+        buffer::ChunkFlags,
         param::{
             ParamType,
             format::{FormatProperties, MediaSubtype, MediaType},
@@ -506,32 +507,33 @@ impl PortalCapture {
                     return;
                 };
                 let chunk = data_buffer.chunk();
-                let (offset, length, stride) = (
+                let (offset, length, stride, flags) = (
                     chunk.offset() as usize,
                     chunk.size() as usize,
                     chunk.stride(),
+                    chunk.flags(),
                 );
-                if length == 0 {
-                    return;
-                }
                 let size = data.format.size();
-                let result = data_buffer
-                    .data()
-                    .ok_or(MediaError::FrameFormatMismatch)
-                    .and_then(|bytes| {
-                        unpack_frame(
-                            bytes,
-                            offset,
-                            length,
-                            stride,
-                            size.width,
-                            size.height,
-                            data.format.format(),
-                        )
-                    });
+                let result = decode_frame_chunk(flags, length, || {
+                    data_buffer
+                        .data()
+                        .ok_or(MediaError::FrameFormatMismatch)
+                        .and_then(|bytes| {
+                            unpack_frame(
+                                bytes,
+                                offset,
+                                length,
+                                stride,
+                                size.width,
+                                size.height,
+                                data.format.format(),
+                            )
+                        })
+                });
                 let mut state = frame_state.borrow_mut();
                 match result {
-                    Ok(image) => state.latest = Some(image),
+                    Ok(Some(image)) => state.latest = Some(image),
+                    Ok(None) => {}
                     Err(_) => state.failed = true,
                 }
             })
@@ -636,6 +638,21 @@ impl Drop for PortalCapture {
     fn drop(&mut self) {
         let _ = self.stream.disconnect();
     }
+}
+
+fn decode_frame_chunk(
+    flags: ChunkFlags,
+    length: usize,
+    decode: impl FnOnce() -> Result<xcap::image::RgbaImage, MediaError>,
+) -> Result<Option<xcap::image::RgbaImage>, MediaError> {
+    // xdpw can queue a failed capture with its previous nonzero chunk size.
+    // Drop this frame before accessing mapped pixels or replacing the last
+    // frame. Corruption is per-chunk; xdpw can immediately capture another.
+    // Session and stream state changes independently signal source loss.
+    if flags.contains(ChunkFlags::CORRUPTED) || length == 0 {
+        return Ok(None);
+    }
+    decode().map(Some)
 }
 
 /// A chunk can start inside the mapped allocation and contain padded rows.
@@ -752,6 +769,38 @@ mod tests {
         let data = [9, 9, 30, 20, 10, 0, 8, 8, 60, 50, 40, 0];
         let image = unpack_frame(&data, 2, 10, 6, 1, 2, VideoFormat::BGRx).unwrap();
         assert_eq!(image.as_raw(), &[10, 20, 30, 255, 40, 50, 60, 255]);
+    }
+
+    #[test]
+    fn corrupted_metadata_never_reads_otherwise_valid_pixels() {
+        let pixels = [30, 20, 10, 0];
+        let image = decode_frame_chunk(ChunkFlags::empty(), pixels.len(), || {
+            unpack_frame(&pixels, 0, 4, 4, 1, 1, VideoFormat::BGRx)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(image.as_raw(), &[10, 20, 30, 255]);
+        assert!(
+            decode_frame_chunk(ChunkFlags::empty(), 0, || {
+                panic!("empty chunk reached pixel mapping");
+            })
+            .unwrap()
+            .is_none()
+        );
+        // Both a nonzero stale size and an empty corrupt chunk must be dropped
+        // before the callback asks libspa for the mapped data slice.
+        for length in [0, pixels.len()] {
+            let result = decode_frame_chunk(ChunkFlags::CORRUPTED, length, || {
+                panic!("corrupted chunk reached pixel mapping");
+            });
+            assert!(result.unwrap().is_none());
+        }
+        let subsequent = decode_frame_chunk(ChunkFlags::empty(), 4, || {
+            unpack_frame(&[60, 50, 40, 0], 0, 4, 4, 1, 1, VideoFormat::BGRx)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(subsequent.as_raw(), &[40, 50, 60, 255]);
     }
 
     #[test]

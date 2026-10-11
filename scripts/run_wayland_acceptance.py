@@ -27,6 +27,10 @@ import time
 # Import by sibling path as well when this script is loaded by unit tests.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from wayland_fixture_backend import prepare_backend
+from element_process_namespace import (
+    assert_contained, containment_check, namespace_command, read_control,
+    stop_owned, wait_owned,
+)
 
 REPO = Path(__file__).resolve().parents[1]
 TARGET_TEST = "wayland_selected_display_streams_changes_and_stops"
@@ -57,13 +61,38 @@ DIAGNOSTIC_STAGES = frozenset({
 })
 DIAGNOSTIC_LOG_LIMIT = 4 * 1024 * 1024
 CAPTURE_STAGES = frozenset({
-    "before_test", "capabilities", "opening_display_1", "opening_display_2",
+    "before_test", "pipewire_binding_origin", "pipewire_initializer",
+    "capabilities", "opening_display_1", "opening_display_2",
     "first_frame_1", "first_frame_2", "checking_pixels_1", "checking_pixels_2",
     "stopping_display_1", "stopping_display_2", "reopening_display", "reopen_frame",
     "changing_source", "awaiting_changed_frame", "removing_source", "awaiting_source_loss",
     "stopping_lost_source", "restoring_source", "denying_selection", "cancelling_selection",
     "complete",
 })
+
+
+def binding_facts(path: Path) -> dict:
+    """Allow only bounded counts; loader paths/addresses never leave the test."""
+    try:
+        with path.open("rb") as source:
+            raw = source.read(257)
+        if len(raw) > 256:
+            return {"status": "invalid"}
+        value = json.loads(raw)
+    except (OSError, ValueError):
+        return {"status": "unavailable"}
+    keys = {"checked", "system_pipewire", "executable", "other", "unavailable"}
+    if (not isinstance(value, dict) or set(value) != keys
+            or any(type(count) is not int or not 0 <= count <= 33 for count in value.values())
+            or value["checked"] != 33
+            or sum(value[key] for key in keys - {"checked"}) != 33):
+        return {"status": "invalid"}
+    return {"status": "valid", **value}
+
+
+def bindings_passed(facts: dict) -> bool:
+    return facts == {"status": "valid", "checked": 33, "system_pipewire": 33,
+                     "executable": 0, "other": 0, "unavailable": 0}
 
 
 def capture_stage(path: Path) -> str:
@@ -231,6 +260,7 @@ def private_environment(root: Path) -> dict[str, str]:
         "WLR_LIBINPUT_NO_DEVICES": "1", "MORPHEUS_WAYLAND_ACCEPTANCE": "1",
         "MORPHEUS_WAYLAND_CHOOSER_MODE": str(root / "chooser-mode"),
         "MORPHEUS_WAYLAND_STAGE_PATH": str(root / "capture-stage"),
+        "MORPHEUS_WAYLAND_BINDING_PATH": str(root / "binding-facts"),
     })
     return env
 
@@ -299,7 +329,7 @@ def stop_owned_groups(processes: list[subprocess.Popen]) -> None:
 
 
 def process_identity(pid: int) -> str | None:
-    """Linux start time prevents the timeout fallback from killing reused PIDs."""
+    """Read-only identity observations for process-tree regression assertions."""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
         return stat.rsplit(")", 1)[1].split()[19]
@@ -307,27 +337,17 @@ def process_identity(pid: int) -> str | None:
         return None
 
 
-def register_groups(root: Path, processes: list[subprocess.Popen]) -> None:
-    records = [{"pid": process.pid, "start": process_identity(process.pid)} for process in processes]
-    temporary = root / "owned-groups.tmp"
-    temporary.write_text(json.dumps(records), encoding="utf-8")
-    temporary.replace(root / "owned-groups.json")
-
-
-def force_registered_groups(root: Path) -> None:
-    try:
-        records = json.loads((root / "owned-groups.json").read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return
-    for record in records:
-        pid, started = record["pid"], record["start"]
-        if started is not None and process_identity(pid) == started:
-            with contextlib.suppress(ProcessLookupError):
-                if os.getpgid(pid) == pid:
-                    os.killpg(pid, signal.SIGKILL)
+def assert_session_namespace() -> None:
+    """The D-Bus child must remain inside the previously guarded PID namespace."""
+    control = read_control(Path(os.environ.get("MORPHEUS_ELEMENT_NAMESPACE_CONTROL", "")))
+    namespace = os.readlink("/proc/self/ns/pid")
+    if (namespace == control.get("outer_namespace")
+            or namespace != os.readlink("/proc/1/ns/pid")):
+        raise RuntimeError("Wayland process containment failed")
 
 
 def session(root: Path) -> int:
+    assert_session_namespace()
     runtime = Path(os.environ["XDG_RUNTIME_DIR"])
     processes: list[subprocess.Popen] = []
     services: dict[str, subprocess.Popen] = {}
@@ -340,7 +360,6 @@ def session(root: Path) -> int:
             processes.append(process)
             if service:
                 services[name] = process
-            register_groups(root, processes)
             return process
 
         def build_command(name: str, command: list[str]):
@@ -399,7 +418,6 @@ def session(root: Path) -> int:
             listing_log = files.enter_context((root / "test-list.log").open("wb"))
             listing = subprocess.Popen(command + ["--", "--list"], cwd=REPO, stdout=listing_log, stderr=subprocess.STDOUT, start_new_session=True)
             processes.append(listing)
-            register_groups(root, processes)
             listing_status = wait_owned_process(listing, timeout=300)
             listing_output = (root / "test-list.log").read_text(errors="replace")
             if listing_status or f"{TARGET_TEST}: test" not in listing_output:
@@ -410,17 +428,21 @@ def session(root: Path) -> int:
             stage_path = root / "capture-stage"
             stage_path.write_text("before_test", encoding="ascii")
             stage_path.chmod(0o600)
+            binding_path = root / "binding-facts"
+            binding_path.write_text("{}", encoding="ascii")
+            binding_path.chmod(0o600)
             test_log = files.enter_context((root / "capture-test.log").open("wb"))
             os.chmod(root / "capture-test.log", 0o600)
             test = subprocess.Popen(command + ["--", "--ignored", "--exact", TARGET_TEST, "--test-threads=1"], cwd=REPO, stdout=test_log, stderr=subprocess.STDOUT, start_new_session=True)
             processes.append(test)
-            register_groups(root, processes)
             try:
                 status = wait_owned_process(test, timeout=180)
             except subprocess.TimeoutExpired:
                 status = None
             test_output = (root / "capture-test.log").read_text(errors="replace")
-            if status != 0 or not capture_test_passed(test_output):
+            origins = binding_facts(binding_path)
+            print("Wayland PipeWire binding facts: " + json.dumps(origins, sort_keys=True))
+            if status != 0 or not capture_test_passed(test_output) or not bindings_passed(origins):
                 print("Wayland capture test facts: " + json.dumps(capture_test_facts(test_output, status, capture_stage(stage_path)), sort_keys=True), file=sys.stderr)
                 raise RuntimeError("Wayland portal acceptance did not execute and pass its required test")
             print("Actual Wayland display selection/stream/cancel tests passed; native window and GNOME/KDE remain unverified.")
@@ -430,41 +452,36 @@ def session(root: Path) -> int:
             raise
         finally:
             stop_owned_groups(processes)
-            (root / "cleanup.done").touch(mode=0o600)
 
 
-def run_session(command: list[str], env: dict[str, str], root: Path, timeout: float = 840) -> int:
-    process = subprocess.Popen(command, cwd=REPO, env=env, start_new_session=True)
+def run_session(command: list[str], env: dict[str, str], timeout: float = 840) -> int:
+    process = subprocess.Popen(command, cwd=REPO, env=env, stdin=subprocess.DEVNULL,
+                               start_new_session=True)
     try:
-        return process.wait(timeout=timeout)
+        return wait_owned(process, timeout)
     finally:
-        # The inside-session Python catches TERM and closes its separately
-        # owned service/cargo groups before this outer group is force-killed.
-        if process.poll() is None:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGTERM)
-            try:
-                process.wait(timeout=12)
-            except subprocess.TimeoutExpired:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=3)
-        # dbus-run-session may exit before its Python child's finally block.
-        # Keep the private runtime and logs alive until cleanup completes.
-        deadline = time.monotonic() + 12
-        while not (root / "cleanup.done").exists() and time.monotonic() < deadline:
-            time.sleep(0.1)
-        if not (root / "cleanup.done").exists():
-            force_registered_groups(root)
+        # The unreaped sudo child anchors this group until KILL. The mandatory
+        # preflight proves this exact non-TTY path kills namespace PID1 too;
+        # Linux then tears down even detached service/cargo descendants.
+        # Never signal process IDs recovered from a stale registry file.
+        stop_owned(process)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inside-session", type=Path)
+    parser.add_argument("--contained-session", type=Path)
     parser.add_argument("--chooser", type=Path)
     args = parser.parse_args()
     if args.chooser:
         return chooser(args.chooser)
+    if args.contained_session:
+        assert_contained()
+        # Already unprivileged, capability-free PID1. D-Bus and the desktop
+        # clients must see the same /proc IDs for portal ownership checks.
+        os.execv("/usr/bin/dbus-run-session", ["/usr/bin/dbus-run-session", "--",
+                   sys.executable, str(Path(__file__).resolve()), "--inside-session",
+                   str(args.contained_session)])
     if args.inside_session:
         return session(args.inside_session)
     if sys.platform != "linux":
@@ -476,7 +493,11 @@ def main() -> int:
         root = Path(directory)
         root.chmod(0o700)
         configs(root)
-        return run_session(["dbus-run-session", "--", sys.executable, str(Path(__file__).resolve()), "--inside-session", str(root)], private_environment(root), root)
+        containment_check(root / "containment-probe")
+        env = private_environment(root)
+        command = namespace_command([sys.executable, str(Path(__file__).resolve()),
+                                     "--contained-session", str(root)], root / "namespace", env)
+        return run_session(command, env)
 
 
 if __name__ == "__main__":

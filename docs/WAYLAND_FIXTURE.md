@@ -51,6 +51,18 @@ The overall session deadline is 840 seconds, leaving cleanup time inside the
 15-minute workflow step; test discovery has a 300-second deadline after the
 preceding native build has already populated dependencies.
 
+The fixture requires a disposable GitHub-hosted Linux job with passwordless
+`sudo`, `unshare` and `setpriv`. It reuses the reviewed PID namespace wrapper
+from the Element fixture. Before any desktop services start, a real preflight
+kills the same non-TTY wrapper and requires both namespace PID1 and a detached
+child to disappear. Repository Python, compiler, desktop and native test code
+run only after UID/GID, supplementary groups and capabilities have been
+restricted by the wrapper. The outer parent keeps its direct child unreaped
+until group cleanup. If normal inside-session cleanup cannot run, namespace
+termination also stops separately sessioned descendants; no stored PID or
+start-time snapshot is used as a signal target. Runtime capture stage, exit and
+signal facts remain independent of this containment check.
+
 Additional build dependencies, beyond the existing fixture/runtime packages:
 
 ```text
@@ -59,6 +71,19 @@ wayland-protocols libwayland-dev libpipewire-0.3-dev
 ```
 
 ## What a pass establishes
+
+Before the first PipeWire initializer, the native test checks the resolved
+addresses of all 33 functions that collide with the pinned WebRTC dlopen stub
+exports. Every one must resolve to the root-owned Ubuntu system PipeWire
+library; executable stubs or other/unknown libraries fail before initialization.
+The helper requires this evidence in addition to the named capture test and
+prints only fixed category counts. Separate `pipewire_binding_origin` and
+`pipewire_initializer` stages survive a native abort. The
+[vendored build patch](../vendor/webrtc-sys/MORPHEUS_PATCH.md) verifies and
+isolates all 33 WebRTC definitions and 46 internal references in `OUT_DIR`.
+The prior SIGSEGV at `opening_display_1` did not record binding origins, so the
+symbol-collision fix still requires hosted confirmation; no capture pass is
+inferred from source inspection.
 
 The existing acceptance test still verifies the selected second display,
 changing frame contents, repeated start/stop, source departure, refusal to
@@ -87,3 +112,12 @@ categories, and the known fixture source's numeric panic line may be reported.
 A private stage file preserves the last fixed test phase even when a native
 abort prevents libtest from flushing captured output. Neither a missing panic
 marker nor an exit code alone establishes the underlying cause.
+
+The capture adapter drops PipeWire chunks marked `CORRUPTED` before reading
+their pixels, even when the backend retains a previous nonzero chunk size.
+This does not end an otherwise healthy stream: xdpw retries after an individual
+failed frame. Existing portal closure and stream state checks handle source
+loss. The metadata regression covers valid pixel decoding, no access to corrupt
+nonempty or empty chunks, and a subsequent valid frame. This correctness fix and the
+fixture cleanup change are not evidence of the cause of an earlier native
+capture failure; the actual hosted stream check still has to pass.

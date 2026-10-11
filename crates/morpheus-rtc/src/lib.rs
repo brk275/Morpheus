@@ -10,6 +10,12 @@
 use serde_json::Value;
 use url::Url;
 
+// Exercise the same pure inventory contract used by the Linux build script.
+#[cfg(all(test, target_os = "linux", feature = "native-rtc"))]
+#[allow(dead_code)]
+#[path = "../../../vendor/webrtc-sys/pipewire_isolation.rs"]
+mod pipewire_archive_contract;
+
 mod voice_space;
 
 #[cfg(feature = "device-audio")]

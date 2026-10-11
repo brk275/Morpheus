@@ -5,9 +5,130 @@
 
 use morpheus_rtc::{I420Buffer, ScreenCapture};
 use std::{
+    ffi::{CStr, c_void},
+    os::unix::fs::MetadataExt,
+    path::Path,
     process::Command,
     time::{Duration, Instant},
 };
+
+#[derive(Clone, Copy)]
+enum BindingOrigin {
+    SystemPipeWire = 0,
+    Executable = 1,
+    Other = 2,
+    Unavailable = 3,
+}
+
+fn binding_origin(address: *const c_void) -> BindingOrigin {
+    let mut info = std::mem::MaybeUninit::<libc::Dl_info>::zeroed();
+    // These are linked function addresses, never calls through private ABI.
+    if unsafe { libc::dladdr(address, info.as_mut_ptr()) } == 0 {
+        return BindingOrigin::Unavailable;
+    }
+    let info = unsafe { info.assume_init() };
+    if info.dli_fname.is_null() {
+        return BindingOrigin::Unavailable;
+    }
+    let Ok(name) = (unsafe { CStr::from_ptr(info.dli_fname) }).to_str() else {
+        return BindingOrigin::Unavailable;
+    };
+    let Ok(path) = std::fs::canonicalize(name) else {
+        return BindingOrigin::Unavailable;
+    };
+    if std::env::current_exe()
+        .ok()
+        .and_then(|path| path.canonicalize().ok())
+        .as_ref()
+        == Some(&path)
+    {
+        return BindingOrigin::Executable;
+    }
+    let expected_directory = Path::new("/usr/lib/x86_64-linux-gnu");
+    let expected_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| {
+            name.strip_prefix("libpipewire-0.3.so.")
+                .is_some_and(|version| {
+                    !version.is_empty()
+                        && version
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || byte == b'.')
+                })
+        });
+    // The free Ubuntu fixture uses the distribution's ordinary root-owned
+    // library. Do not accept a similarly named library in a build/temp path.
+    let trusted_file = std::fs::metadata(&path).is_ok_and(|metadata| {
+        metadata.is_file() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0
+    });
+    if path.parent() == Some(expected_directory) && expected_name && trusted_file {
+        BindingOrigin::SystemPipeWire
+    } else {
+        BindingOrigin::Other
+    }
+}
+
+fn verify_pipewire_bindings() {
+    use pipewire::sys as pw;
+    macro_rules! addresses {
+        ($($name:ident),+ $(,)?) => { [$(pw::$name as *const () as *const c_void),+] };
+    }
+    // Complete collision inventory, checked against the pinned archive map
+    // by the portable fixture tests. All resolutions precede pw_init.
+    let addresses = addresses![
+        pw_context_connect,
+        pw_context_connect_fd,
+        pw_context_destroy,
+        pw_context_new,
+        pw_core_disconnect,
+        pw_deinit,
+        pw_get_library_version,
+        pw_init,
+        pw_loop_destroy,
+        pw_loop_new,
+        pw_properties_new_string,
+        pw_proxy_destroy,
+        pw_stream_add_listener,
+        pw_stream_connect,
+        pw_stream_dequeue_buffer,
+        pw_stream_destroy,
+        pw_stream_disconnect,
+        pw_stream_get_node_id,
+        pw_stream_get_state,
+        pw_stream_new,
+        pw_stream_queue_buffer,
+        pw_stream_set_active,
+        pw_stream_state_as_string,
+        pw_stream_update_params,
+        pw_thread_loop_destroy,
+        pw_thread_loop_get_loop,
+        pw_thread_loop_lock,
+        pw_thread_loop_new,
+        pw_thread_loop_signal,
+        pw_thread_loop_start,
+        pw_thread_loop_stop,
+        pw_thread_loop_unlock,
+        pw_thread_loop_wait,
+    ];
+    let mut counts = [0_u32; 4];
+    for address in addresses {
+        counts[binding_origin(address) as usize] += 1;
+    }
+    let facts = serde_json::json!({
+        "checked": addresses.len(), "system_pipewire": counts[0],
+        "executable": counts[1], "other": counts[2], "unavailable": counts[3],
+    });
+    let path =
+        std::env::var_os("MORPHEUS_WAYLAND_BINDING_PATH").expect("private binding facts file");
+    std::fs::write(path, serde_json::to_vec(&facts).unwrap())
+        .expect("record private binding facts");
+    assert_eq!(
+        counts,
+        [33, 0, 0, 0],
+        "PipeWire function origin was not the expected system library"
+    );
+}
 
 fn stage(value: &'static str) {
     // Libtest may lose its captured output if a native callback aborts. This
@@ -50,6 +171,12 @@ fn wayland_selected_display_streams_changes_and_stops() {
         Ok("1")
     );
     assert!(std::env::var_os("DISPLAY").is_none(), "must not use X11");
+    stage("pipewire_binding_origin");
+    verify_pipewire_bindings();
+    stage("pipewire_initializer");
+    // Invoke the same public initializer used by PortalCapture only after the
+    // origin check. Its internal Once keeps normal capture initialization safe.
+    pipewire::init();
     stage("capabilities");
     let displays = ScreenCapture::display_sources().expect("display portal capability");
     assert_eq!(displays.len(), 1);

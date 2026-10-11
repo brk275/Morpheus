@@ -54,3 +54,8 @@ livekit = "=0.7.48"
 morpheus-matrix = { path = "../morpheus-matrix" }
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+libc = "0.2"
+sha2 = "0.10"
+webrtc-sys-build = "=0.3.18"

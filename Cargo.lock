@@ -5805,6 +5805,7 @@ version = "0.1.0"
 dependencies = [
  "cpal",
  "futures-util",
+ "libc",
  "livekit",
  "matrix-rtc-call-sdk",
  "matrix-rtc-core",
@@ -5816,10 +5817,12 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.21",
  "tokio",
  "url",
  "uuid",
+ "webrtc-sys-build",
  "xcap",
  "zbus 5.19.0",
 ]
@@ -10658,8 +10661,6 @@ dependencies = [
 [[package]]
 name = "webrtc-sys"
 version = "0.3.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "070ad07ed7f1f6a296d8b4bd7fdf14d6ab69c356aa4670c74e25abc459b3e7a1"
 dependencies = [
  "cc",
  "cxx",
@@ -10667,6 +10668,7 @@ dependencies = [
  "glob",
  "log",
  "pkg-config",
+ "sha2 0.10.9",
  "webrtc-sys-build",
 ]
 

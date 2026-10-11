@@ -182,6 +182,64 @@ matrix; package/install verification still requires an explicit dispatch for
 the affected platforms. This source follow-up does not satisfy installed
 signed-update, physical-device, screen-reader, or beta release acceptance.
 
+### Hosted result and focused follow-up
+
+[Run 38107865401](https://github.com/brk275/Morpheus/actions/runs/38107865401)
+tested `95f61dab0bbc0b4c33a159a9b449170a63afef2a` on all four standard public
+runners. Security/scope, Windows, Apple Silicon and Intel Mac passed. Each
+native target passed 12 configuration, 37 Matrix and eight RTC protocol tests.
+Windows and both Macs passed 65 desktop and 31 native RTC/device tests; Linux
+passed 80 desktop and 36 native RTC/device tests. The native app built on every
+target, Linux Xvfb startup passed, and all vendor security suites passed. This
+includes the updater controller/security and shortcut regressions. The opt-in
+test wrappers without configured fixtures do not count as live acceptance.
+
+Linux failed its live gates. Its capture test exited via SIGSEGV (signal 11)
+at `opening_display_1`, before recording a first frame. The portal backend had
+received CreateSession, SelectSources and Start and announced SHM; all five
+desktop services remained running. These facts narrow the failure but do not
+by themselves identify the crashing function. The independent Matrix fixture
+failed at `ready_a` with OS error 104, a connection reset, before live chat,
+OAuth or RTC tests. Its disposable credential-vault checks and service cleanup
+passed. All four native logs passed credential scans. No installers were built
+or uploaded; the overall run failed.
+
+The readiness follow-up retries an unwrapped `ConnectionResetError` within the
+existing 120-second deadline in both Matrix and OAuth startup waits. Empty or
+malformed responses also wait between attempts, and per-request timeouts cannot
+exceed the remaining deadline. Exact OAuth issuer and redirect/proxy policies
+are unchanged. Four new mocked regressions passed, including persistent reset
+timeout and propagation of unrelated OS errors; the 47 existing OAuth/Matrix
+helper tests and six diagnostic tests also passed. Independent source review
+cleared the change. Actual service readiness still requires the next Linux run.
+
+The next source batch also adds an explicit per-account/room Element Call
+Matrix 2.0 choice and separately selected installed AppImage update and keyboard
+harnesses. Their source review and offline tests are recorded in their focused
+documents; none has yet passed installed or live interoperability acceptance.
+
+Read-only inspection of the pinned WebRTC archive found weak PipeWire stubs
+that can collide with the system API. The [isolation patch](../vendor/webrtc-sys/MORPHEUS_PATCH.md)
+verifies the exact archive, renames all stub definitions and references in a
+build copy, and removes optional LLVM address-significance metadata whose
+indexes cannot safely be assumed unchanged. The Wayland fixture must verify
+all 33 actual linked addresses before initialization, then still pass real
+capture. This is a reviewed correction candidate, not proof of the crash's
+cause or resolution. Separately, corrupted frame chunks are dropped before
+pixel access, and namespace containment replaces the fixture's stale-PID
+cleanup fallback.
+
+Before hosted verification, the combined follow-up passed 207 Python checks;
+five platform-specific checks were skipped on macOS. Rust formatting, locked
+offline Cargo metadata, Actionlint, JavaScript syntax, Python compilation,
+package configuration and whitespace checks for Morpheus edits passed. The
+new vendored WebRTC source retains upstream whitespace unchanged; comparison
+with the pinned registry source confirms only the documented patch files differ.
+Independent reviews
+covered protocol selection, package/update harnesses, readiness, capture
+cleanup and archive isolation. No local native build, archive transformation,
+link, source generation, native test or Matrix/RTC service ran for this batch.
+
 ## Public source publication, 2026-10-10
 
 - Published `brk275/Morpheus` as public pre-alpha source at

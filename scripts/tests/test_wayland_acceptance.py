@@ -17,6 +17,49 @@ SPEC.loader.exec_module(MODULE)
 
 
 class WaylandFixtureTests(unittest.TestCase):
+    def test_binding_facts_require_all_system_library_resolutions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "facts"
+            self.assertFalse(MODULE.bindings_passed(MODULE.binding_facts(path)))
+            counts = {"checked": 33, "system_pipewire": 33, "executable": 0,
+                      "other": 0, "unavailable": 0}
+            path.write_text(MODULE.json.dumps(counts))
+            self.assertTrue(MODULE.bindings_passed(MODULE.binding_facts(path)))
+            # A single executable stub rejects the run even if capture/libtest
+            # were otherwise marked passed by a future refactor.
+            counts.update(system_pipewire=32, executable=1)
+            path.write_text(MODULE.json.dumps(counts))
+            self.assertFalse(MODULE.bindings_passed(MODULE.binding_facts(path)))
+            self.assertEqual(MODULE.binding_facts(path)["executable"], 1)
+
+    def test_binding_facts_reject_private_text_and_unbounded_or_invalid_counts(self):
+        valid = {"checked": 33, "system_pipewire": 33, "executable": 0,
+                 "other": 0, "unavailable": 0}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "facts"
+            for value in ({**valid, "path": "/private/loader.so"},
+                          {**valid, "checked": True}, {**valid, "checked": 34},
+                          {**valid, "system_pipewire": 32},
+                          {**valid, "other": "private"}, ["private"]):
+                path.write_text(MODULE.json.dumps(value))
+                self.assertEqual(MODULE.binding_facts(path), {"status": "invalid"})
+            path.write_bytes(b"x" * 1000)
+            self.assertEqual(MODULE.binding_facts(path), {"status": "invalid"})
+            path.write_bytes(b"\xff\xfe")
+            self.assertEqual(MODULE.binding_facts(path), {"status": "unavailable"})
+
+    def test_runtime_binding_probe_covers_complete_pinned_archive_inventory(self):
+        repo = Path(__file__).resolve().parents[2]
+        inventory = (repo / "vendor/webrtc-sys/pipewire-symbols.txt").read_text().splitlines()
+        names = {line.split()[1] for line in inventory}
+        self.assertEqual(len(names), 33)
+        self.assertEqual(sum(line.endswith(" W") for line in inventory), 33)
+        self.assertEqual(sum(line.endswith(" U") for line in inventory), 46)
+        source = (repo / "crates/morpheus-rtc/tests/wayland_capture.rs").read_text()
+        addresses = source.split("let addresses = addresses![", 1)[1].split("];", 1)[0]
+        self.assertEqual(set(MODULE.re.findall(r"\bpw_[a-z_]+\b", addresses)), names)
+        self.assertLess(source.index("verify_pipewire_bindings();"), source.index("pipewire::init();"))
+
     def test_capture_reports_bounded_exit_and_signal_without_native_error_text(self):
         output = (
             "process didn't exit successfully: /private/executable --private-argument "
@@ -131,21 +174,71 @@ class WaylandFixtureTests(unittest.TestCase):
                 MODULE.stop_owned_groups([process])
         kill.assert_not_called()
 
-    def test_timeout_fallback_never_signals_reused_pid(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "owned-groups.json").write_text('[{"pid": 1234, "start": "old"}]')
-            with mock.patch.object(MODULE, "process_identity", return_value="new"), mock.patch.object(MODULE.os, "killpg") as kill:
-                MODULE.force_registered_groups(root)
-            kill.assert_not_called()
+    def test_outer_session_keeps_waitable_anchor_until_namespace_cleanup(self):
+        process = mock.Mock(pid=1234, returncode=None)
+        with mock.patch.object(MODULE.subprocess, "Popen", return_value=process) as spawn, \
+                mock.patch.object(MODULE, "wait_owned", return_value=7) as wait, \
+                mock.patch.object(MODULE, "stop_owned") as stop:
+            self.assertEqual(MODULE.run_session(["contained-wrapper"], {"fixture": "yes"}), 7)
+        self.assertEqual(spawn.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertTrue(spawn.call_args.kwargs["start_new_session"])
+        wait.assert_called_once_with(process, 840)
+        stop.assert_called_once_with(process)
+        process.poll.assert_not_called()
+        process.wait.assert_not_called()
 
-    def test_timeout_fallback_requires_its_original_group_leader(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "owned-groups.json").write_text('[{"pid": 1234, "start": "same"}]')
-            with mock.patch.object(MODULE, "process_identity", return_value="same"), mock.patch.object(MODULE.os, "getpgid", return_value=9999), mock.patch.object(MODULE.os, "killpg") as kill:
-                MODULE.force_registered_groups(root)
-            kill.assert_not_called()
+    def test_outer_timeout_cleans_namespace_without_reading_stale_pid_registry(self):
+        process = mock.Mock(pid=1234, returncode=None)
+        with mock.patch.object(MODULE.subprocess, "Popen", return_value=process), \
+                mock.patch.object(MODULE, "wait_owned", side_effect=subprocess.TimeoutExpired("contained", 1)), \
+                mock.patch.object(MODULE, "stop_owned") as stop, \
+                mock.patch.object(MODULE, "process_identity") as identity, \
+                mock.patch.object(MODULE.os, "killpg") as numeric_kill:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                MODULE.run_session(["contained-wrapper"], {}, timeout=1)
+        stop.assert_called_once_with(process)
+        identity.assert_not_called()
+        numeric_kill.assert_not_called()
+        process.poll.assert_not_called()
+        process.wait.assert_not_called()
+
+    def test_inside_session_refuses_host_namespace_before_starting_services(self):
+        with mock.patch.object(MODULE, "read_control", return_value={"outer_namespace": "pid:[111]"}), \
+                mock.patch.object(MODULE.os, "readlink", return_value="pid:[111]"), \
+                mock.patch.object(MODULE, "prepare_backend") as backend:
+            with self.assertRaisesRegex(RuntimeError, "containment failed"):
+                MODULE.session(Path("unused"))
+        backend.assert_not_called()
+
+    def test_inside_session_requires_same_namespace_as_init(self):
+        with mock.patch.object(MODULE, "read_control", return_value={"outer_namespace": "pid:[111]"}), \
+                mock.patch.object(MODULE.os, "readlink", side_effect=["pid:[222]", "pid:[333]"]):
+            with self.assertRaisesRegex(RuntimeError, "containment failed"):
+                MODULE.assert_session_namespace()
+
+    def test_main_requires_actual_containment_preflight_before_session_launch(self):
+        order = []
+        with mock.patch.object(MODULE.sys, "argv", ["wayland-acceptance"]), \
+                mock.patch.object(MODULE.sys, "platform", "linux"), \
+                mock.patch.object(MODULE.shutil, "which", return_value="available"), \
+                mock.patch.object(MODULE, "containment_check", side_effect=lambda _: order.append("probe")), \
+                mock.patch.object(MODULE, "namespace_command", side_effect=lambda *args: order.append("wrap") or ["wrapped"]) as wrap, \
+                mock.patch.object(MODULE, "run_session", side_effect=lambda *args: order.append("run") or 0):
+            self.assertEqual(MODULE.main(), 0)
+        self.assertEqual(order, ["probe", "wrap", "run"])
+        self.assertIn("--contained-session", wrap.call_args.args[0])
+
+    def test_failed_containment_preflight_never_starts_fixture(self):
+        with mock.patch.object(MODULE.sys, "argv", ["wayland-acceptance"]), \
+                mock.patch.object(MODULE.sys, "platform", "linux"), \
+                mock.patch.object(MODULE.shutil, "which", return_value="available"), \
+                mock.patch.object(MODULE, "containment_check", side_effect=RuntimeError("containment failed")), \
+                mock.patch.object(MODULE, "namespace_command") as wrap, \
+                mock.patch.object(MODULE, "run_session") as run:
+            with self.assertRaisesRegex(RuntimeError, "containment failed"):
+                MODULE.main()
+        wrap.assert_not_called()
+        run.assert_not_called()
 
     def test_fixture_only_authorizes_chosen_output_and_has_no_x11(self):
         with tempfile.TemporaryDirectory(prefix="fixture with spaces ") as directory:

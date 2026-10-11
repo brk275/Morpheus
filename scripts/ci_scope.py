@@ -32,6 +32,8 @@ LINUX_ACCEPTANCE_INPUTS = {
     "scripts/prepare_appimage_update.py",
     "crates/morpheus-rtc/src/linux_portal.rs",
     "crates/morpheus-rtc/tests/wayland_capture.rs",
+    "vendor/webrtc-sys/pipewire_isolation.rs",
+    "vendor/webrtc-sys/pipewire-symbols.txt",
     "crates/morpheus-app/src/updater/linux_transaction.rs",
     "crates/morpheus-app/src/updater/linux_transaction_tests.rs",
 }

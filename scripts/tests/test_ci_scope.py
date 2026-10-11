@@ -29,6 +29,14 @@ class ScopeTests(unittest.TestCase):
         actual = classify(["vendor/nokhwa-bindings-macos/src/lib.rs"])["native_matrix"]["os"]
         self.assertEqual(actual, list(MACOS))
 
+    def test_pipewire_isolation_inputs_only_select_linux(self):
+        for path in ("vendor/webrtc-sys/pipewire_isolation.rs", "vendor/webrtc-sys/pipewire-symbols.txt"):
+            with self.subTest(path=path):
+                self.assertEqual(classify([path])["native_matrix"]["os"], ["ubuntu-24.04"])
+        # The build script and remaining upstream source also affect Mac/Windows.
+        self.assertEqual(classify(["vendor/webrtc-sys/build.rs"])["native_matrix"]["os"], list(PLATFORMS))
+        self.assertEqual(classify(["vendor/webrtc-sys/src/lib.rs"])["native_matrix"]["os"], list(PLATFORMS))
+
     def test_delegated_oauth_acceptance_only_selects_linux(self):
         for path in ("scripts/local_matrix_auth.py", "crates/morpheus-matrix/tests/oauth_local.rs"):
             with self.subTest(path=path):
