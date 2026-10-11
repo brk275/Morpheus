@@ -14,6 +14,216 @@ import run_matrix_acceptance as acceptance_module
 from run_element_acceptance import CHECKS as ELEMENT_CHECKS
 
 
+class StartupOwnershipTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def preflight(self, responses):
+        visible = io.StringIO()
+        runner = Mock()
+        with (patch.object(acceptance_module, "Acceptance", return_value=runner,
+                           side_effect=RuntimeError("reached acceptance creation")) as factory,
+              patch.object(acceptance_module.shutil, "which", return_value="mock-command"),
+              patch.object(acceptance_module.subprocess, "run", side_effect=responses) as inventory,
+              patch.object(acceptance_module.tempfile, "mkdtemp", return_value="/private/preflight-root") as temporary,
+              patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner"]),
+              patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "RUNNER_OS": "Linux", "DBUS_SESSION_BUS_ADDRESS": "mock"}),
+              contextlib.redirect_stdout(visible), contextlib.redirect_stderr(visible)):
+            yield factory, runner, inventory, temporary, visible
+
+    def test_each_preexisting_owned_resource_rejects_ownership_without_cleanup(self):
+        for index, names in enumerate((acceptance_module.FIXTURE_CONTAINERS,
+                                       acceptance_module.FIXTURE_VOLUMES,
+                                       (acceptance_module.FIXTURE_NETWORK,))):
+            for name in names:
+                results = [subprocess.CompletedProcess([], 0, "", "") for _ in range(index)]
+                results.append(subprocess.CompletedProcess([], 0, name + "\nprivate-unrelated\n", "private-diagnostic"))
+                with self.subTest(kind=index, resource=name), self.preflight(results) as (factory, runner, _, temporary, visible):
+                    with self.assertRaisesRegex(RuntimeError, "Pre-existing Matrix fixture found") as caught:
+                        acceptance_module.main()
+                factory.assert_not_called()
+                temporary.assert_not_called()
+                runner.script.assert_not_called()
+                self.assertNotIn("private", visible.getvalue() + str(caught.exception))
+
+    def test_query_failure_or_timeout_rejects_ownership_without_cleanup(self):
+        failures = (
+            subprocess.CompletedProcess([], 1, "private-inventory", "private-daemon-error"),
+            OSError("private-socket-error"),
+            subprocess.TimeoutExpired(["private-command"], 30, output="private-output", stderr="private-error"),
+            UnicodeDecodeError("utf-8", b"private-\xff", 8, 9, "private-decoding-error"),
+        )
+        for index in range(3):
+            for failure in failures:
+                results = [subprocess.CompletedProcess([], 0, "", "") for _ in range(index)] + [failure]
+                with self.subTest(kind=index, failure=type(failure).__name__), self.preflight(results) as (factory, runner, inventory, temporary, visible):
+                    with self.assertRaisesRegex(RuntimeError, "Could not verify absence") as caught:
+                        acceptance_module.main()
+                factory.assert_not_called()
+                temporary.assert_not_called()
+                runner.script.assert_not_called()
+                self.assertEqual(inventory.call_count, index + 1)
+                self.assertNotIn("private", visible.getvalue() + str(caught.exception))
+
+    def test_only_checked_absence_allows_creation_and_uses_bounded_private_name_queries(self):
+        results = [subprocess.CompletedProcess([], 0, "private-unrelated-resource\n", "") for _ in range(3)]
+        with self.preflight(results) as (factory, _, inventory, temporary, visible):
+            with self.assertRaisesRegex(RuntimeError, "reached acceptance creation"):
+                acceptance_module.main()
+        factory.assert_called_once()
+        temporary.assert_called_once()
+        self.assertEqual([item.args[0] for item in inventory.call_args_list], [
+            ["docker", "container", "ls", "--all", "--format", "{{.Names}}"],
+            ["docker", "volume", "ls", "--format", "{{.Name}}"],
+            ["docker", "network", "ls", "--format", "{{.Name}}"],
+        ])
+        self.assertTrue(all(item.kwargs == {"capture_output": True, "text": True, "timeout": 30}
+                            for item in inventory.call_args_list))
+        self.assertEqual(visible.getvalue(), "")
+
+
+class FinalizationTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def mocked_main(self, *, body_error=None, summary_error=None, cleanup_errors=None,
+                    absence_error=None, stderr=None):
+        cleanup_errors = cleanup_errors or {}
+        runner = Mock()
+        runner.start_keyring.side_effect = body_error
+        runner.summary.side_effect = summary_error
+        runner.verify_fixture_absence.side_effect = absence_error
+
+        def script(name, command):
+            if command == "down" and name in cleanup_errors:
+                raise cleanup_errors[name]
+            return "private-fixture"
+
+        runner.script.side_effect = script
+        visible = io.StringIO() if stderr is None else stderr
+        with tempfile.TemporaryDirectory() as folder, contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(acceptance_module, "Acceptance", return_value=runner))
+            stack.enter_context(patch.object(acceptance_module.shutil, "which", return_value="mock-command"))
+            stack.enter_context(patch.object(acceptance_module.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")))
+            stack.enter_context(patch.object(acceptance_module.tempfile, "mkdtemp", return_value=folder))
+            stack.enter_context(patch.object(acceptance_module, "fixture_from_output", return_value=Path(folder) / "fixture.json"))
+            stack.enter_context(patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner"]))
+            stack.enter_context(patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "RUNNER_OS": "Linux", "DBUS_SESSION_BUS_ADDRESS": "mock"}))
+            stack.enter_context(contextlib.redirect_stderr(visible))
+            yield runner, visible
+
+    def assert_both_cleanups(self, runner):
+        self.assertEqual(
+            [item.args for item in runner.script.call_args_list if item.args[1] == "down"],
+            [("local_matrix_rtc", "down"), ("local_matrix_env", "down")],
+        )
+        runner.verify_fixture_absence.assert_called_once_with()
+        self.assertEqual(runner.mock_calls[-1][0], "verify_fixture_absence")
+
+    def test_successful_body_and_cleanup_return_success(self):
+        with self.mocked_main() as (runner, visible):
+            self.assertIsNone(acceptance_module.main())
+        self.assert_both_cleanups(runner)
+        self.assertEqual(visible.getvalue(), "")
+
+    def test_each_cleanup_failure_is_fatal_after_both_attempts_and_never_formats_payload(self):
+        class UnprintableFailure(RuntimeError):
+            def __str__(self):
+                raise AssertionError("private exception must not be formatted")
+
+        for names in (("local_matrix_rtc",), ("local_matrix_env",),
+                      ("local_matrix_rtc", "local_matrix_env")):
+            with self.subTest(names=names), self.mocked_main(
+                    cleanup_errors={name: UnprintableFailure() for name in names}) as (runner, visible):
+                with self.assertRaisesRegex(RuntimeError, "service cleanup did not complete"):
+                    acceptance_module.main()
+            self.assert_both_cleanups(runner)
+            self.assertEqual(visible.getvalue(), "".join(f"Cleanup incomplete: {name}\n" for name in names))
+
+    def test_original_body_exception_or_interrupt_survives_summary_and_cleanup_failures(self):
+        for original in (RuntimeError("original body failure"), KeyboardInterrupt()):
+            with self.subTest(kind=type(original).__name__), self.mocked_main(
+                    body_error=original, summary_error=OSError("private-summary"),
+                    cleanup_errors={"local_matrix_rtc": KeyboardInterrupt(),
+                                    "local_matrix_env": RuntimeError("private-cleanup")},
+                    absence_error=RuntimeError("private inventory")) as (runner, visible):
+                with self.assertRaises(type(original)) as caught:
+                    acceptance_module.main()
+            self.assertIs(caught.exception, original)
+            self.assert_both_cleanups(runner)
+            self.assertNotIn("private", visible.getvalue())
+            self.assertIn("Acceptance summary could not be written", visible.getvalue())
+
+    def test_summary_failure_stays_distinct_and_still_cleans_both_services(self):
+        with self.mocked_main(summary_error=OSError("private-summary")) as (runner, visible):
+            with self.assertRaisesRegex(RuntimeError, "summary could not be written"):
+                acceptance_module.main()
+        self.assert_both_cleanups(runner)
+        self.assertEqual(visible.getvalue(), "Acceptance summary could not be written\n")
+
+    def test_cleanup_interrupt_does_not_skip_second_service(self):
+        with self.mocked_main(cleanup_errors={"local_matrix_rtc": KeyboardInterrupt()}) as (runner, _):
+            with self.assertRaisesRegex(RuntimeError, "service cleanup did not complete"):
+                acceptance_module.main()
+        self.assert_both_cleanups(runner)
+
+    def test_unverified_absence_is_fatal_even_when_both_down_commands_succeed(self):
+        with self.mocked_main(absence_error=RuntimeError("private daemon detail")) as (runner, visible):
+            with self.assertRaisesRegex(RuntimeError, "service cleanup did not complete"):
+                acceptance_module.main()
+        self.assert_both_cleanups(runner)
+        self.assertEqual(visible.getvalue(), "Cleanup incomplete: fixture_absence\n")
+
+    def test_broken_diagnostic_stream_does_not_replace_original_failure(self):
+        original = RuntimeError("original body failure")
+        closed = io.StringIO()
+        closed.close()
+        with self.mocked_main(body_error=original, summary_error=OSError("private-summary"),
+                              cleanup_errors={"local_matrix_rtc": RuntimeError("private-cleanup")},
+                              stderr=closed) as (runner, _):
+            with self.assertRaises(RuntimeError) as caught:
+                acceptance_module.main()
+        self.assertIs(caught.exception, original)
+        self.assert_both_cleanups(runner)
+
+
+class FixtureAbsenceTests(unittest.TestCase):
+    def test_clean_checked_inventories_ignore_unowned_resources_without_printing_them(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            visible = io.StringIO()
+            with (patch.object(runner, "run", side_effect=["private-unrelated-container\n", "private-unrelated-network\n"]) as run,
+                  contextlib.redirect_stdout(visible), contextlib.redirect_stderr(visible)):
+                runner.verify_fixture_absence()
+        self.assertEqual(visible.getvalue(), "")
+        self.assertEqual([item.args[1] for item in run.call_args_list], [
+            ["docker", "container", "ls", "--all", "--format", "{{.Names}}"],
+            ["docker", "network", "ls", "--format", "{{.Name}}"],
+        ])
+        self.assertTrue(all(item.kwargs == {"seconds": 30} for item in run.call_args_list))
+
+    def test_every_owned_container_or_network_remaining_rejects_cleanup(self):
+        cases = [(name + "\n", "") for name in acceptance_module.FIXTURE_CONTAINERS]
+        cases.append(("", acceptance_module.FIXTURE_NETWORK + "\n"))
+        for outputs in cases:
+            with self.subTest(outputs=outputs), tempfile.TemporaryDirectory() as folder:
+                runner = Acceptance(Path(folder), "unused-scanner")
+                with patch.object(runner, "run", side_effect=outputs) as run:
+                    with self.assertRaisesRegex(RuntimeError, "resources remain"):
+                        runner.verify_fixture_absence()
+                self.assertEqual(run.call_count, 2)
+
+    def test_failed_inventory_cannot_be_treated_as_empty_and_both_queries_are_attempted(self):
+        for outputs in ((RuntimeError("private daemon output"), ""),
+                        ("", OSError("private Docker socket")),
+                        (RuntimeError("private daemon output"), OSError("private Docker socket"))):
+            with self.subTest(failed_queries=sum(isinstance(item, BaseException) for item in outputs)), tempfile.TemporaryDirectory() as folder:
+                runner = Acceptance(Path(folder), "unused-scanner")
+                visible = io.StringIO()
+                with (patch.object(runner, "run", side_effect=outputs) as run,
+                      contextlib.redirect_stdout(visible), contextlib.redirect_stderr(visible),
+                      self.assertRaisesRegex(RuntimeError, "absence could not be verified") as caught):
+                    runner.verify_fixture_absence()
+                self.assertEqual(run.call_count, 2)
+                self.assertNotIn("private", visible.getvalue() + str(caught.exception))
+
+
 class LiveEvidenceTests(unittest.TestCase):
     def test_rtc_bootstrap_follows_independent_checks_and_failure_stays_fatal(self):
         for failed in (False, True):
@@ -26,7 +236,7 @@ class LiveEvidenceTests(unittest.TestCase):
                 runner.script.side_effect = script
                 with (patch.object(acceptance_module, "Acceptance", return_value=runner),
                       patch.object(acceptance_module.shutil, "which", return_value="mock-command"),
-                      patch.object(acceptance_module.subprocess, "run", return_value=subprocess.CompletedProcess([], 1)),
+                      patch.object(acceptance_module.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")),
                       patch.object(acceptance_module.tempfile, "mkdtemp", return_value=folder),
                       patch.object(acceptance_module, "fixture_from_output", return_value=Path(folder) / "fixture.json"),
                       patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner"]),
@@ -44,8 +254,8 @@ class LiveEvidenceTests(unittest.TestCase):
                     indexes = [i for i, item in enumerate(calls) if item[0] == "test" and item.args[0] == name]
                     self.assertTrue(indexes)
                     self.assertTrue(all(i < rtc_up for i in indexes))
-                self.assertEqual(calls[-3:], [call.summary(), call.script("local_matrix_rtc", "down"),
-                                             call.script("local_matrix_env", "down")])
+                self.assertEqual(calls[-4:], [call.summary(), call.script("local_matrix_rtc", "down"),
+                                             call.script("local_matrix_env", "down"), call.verify_fixture_absence()])
                 if failed:
                     runner.rtc_cases.assert_not_called()
                     runner.element_case.assert_not_called()

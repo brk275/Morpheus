@@ -281,6 +281,15 @@ skips, Rust formatting, Actionlint, Python compilation, JavaScript syntax,
 package configuration and whitespace checks. No local native build, source
 generation, native test, archive transformation or Matrix/RTC service ran.
 
+A subsequent Linux harness correction makes cleanup failures fatal, preserves
+the original test failure or interrupt, and still attempts both service stops
+when summary writing fails. Checked Docker inventories must prove fixture
+absence before the harness takes ownership and after cleanup. An unavailable
+daemon cannot count as an absent fixture. Retained test volumes and private
+fixture data remain on the ephemeral runner; this check does not claim they
+were wiped. All 33 focused Python harness checks passed with mocked lifecycle
+and Docker operations; actual hosted execution of this correction is pending.
+
 ### Thread drafts and Windows capture follow-up
 
 Per-thread drafts now share the encrypted SDK store and the existing flush

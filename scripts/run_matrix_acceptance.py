@@ -28,6 +28,12 @@ from element_process_namespace import namespace_command, stop_owned, wait_owned
 
 
 REPO = Path(__file__).resolve().parent.parent
+FIXTURE_CONTAINERS = (
+    "morpheus-synapse-a", "morpheus-synapse-b", "morpheus-rtc-livekit",
+    "morpheus-rtc-auth", "morpheus-rtc-federation", "morpheus-rtc-sfu-loopback",
+)
+FIXTURE_VOLUMES = ("morpheus-synapse-a-data", "morpheus-synapse-b-data")
+FIXTURE_NETWORK = "morpheus-matrix-test"
 CHAT_TESTS = (
     "live_local", "drafts_local", "room_actions_local", "formatted_local",
     "media_local", "discovery_local", "moderation_local", "search_local",
@@ -321,6 +327,34 @@ class Acceptance:
             raise RuntimeError("Disposable OS credential vault failed its round trip")
         self.run("vault-clear", ["secret-tool", "clear", "morpheus-ci", "probe"], seconds=30)
 
+    def verify_fixture_absence(self):
+        """Prove cleanup using checked inventories, not unchecked inspect failures.
+
+        Raw Docker output uses the same private logs and credential scanning
+        as the acceptance commands. Retained volumes and private fixture data
+        are intentional; this checks only the owned containers and network.
+        """
+        query_failed = False
+        resource_remains = False
+        for label, command, names in (
+            ("verify-fixture-container-cleanup",
+             ["docker", "container", "ls", "--all", "--format", "{{.Names}}"],
+             FIXTURE_CONTAINERS),
+            ("verify-fixture-network-cleanup",
+             ["docker", "network", "ls", "--format", "{{.Name}}"],
+             (FIXTURE_NETWORK,)),
+        ):
+            try:
+                output = self.run(label, command, seconds=30)
+            except (RuntimeError, OSError):
+                query_failed = True
+                continue
+            resource_remains |= bool(set(output.splitlines()).intersection(names))
+        if query_failed:
+            raise RuntimeError("Disposable Matrix fixture absence could not be verified")
+        if resource_remains:
+            raise RuntimeError("Disposable Matrix fixture resources remain after cleanup")
+
     def summary(self):
         summary = os.environ.get("GITHUB_STEP_SUMMARY")
         if summary:
@@ -355,18 +389,24 @@ def main():
     for command in ("docker", "cargo", "gnome-keyring-daemon", "secret-tool", args.gitleaks):
         if not shutil.which(command):
             raise RuntimeError(f"Required command unavailable: {command}")
-    # Refuse to claim or stop a pre-existing fixture on a reused/self-hosted host.
-    for kind, names in {
-        "container": ("morpheus-synapse-a", "morpheus-synapse-b", "morpheus-rtc-livekit",
-                      "morpheus-rtc-auth", "morpheus-rtc-federation", "morpheus-rtc-sfu-loopback"),
-        "volume": ("morpheus-synapse-a-data", "morpheus-synapse-b-data"),
-        "network": ("morpheus-matrix-test",),
-    }.items():
-        for name in names:
-            if subprocess.run(["docker", kind, "inspect", name], capture_output=True).returncode == 0:
-                raise RuntimeError("Pre-existing Matrix fixture found; refusing to modify it")
+    # Prove absence before taking cleanup ownership. An unavailable daemon is
+    # not evidence of absence, and arbitrary inventory/daemon output is private.
+    for command, names in (
+        (["docker", "container", "ls", "--all", "--format", "{{.Names}}"], FIXTURE_CONTAINERS),
+        (["docker", "volume", "ls", "--format", "{{.Name}}"], FIXTURE_VOLUMES),
+        (["docker", "network", "ls", "--format", "{{.Name}}"], (FIXTURE_NETWORK,)),
+    ):
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError, UnicodeError):
+            raise RuntimeError("Could not verify absence of a pre-existing Matrix fixture") from None
+        if result.returncode:
+            raise RuntimeError("Could not verify absence of a pre-existing Matrix fixture")
+        if set(result.stdout.splitlines()).intersection(names):
+            raise RuntimeError("Pre-existing Matrix fixture found; refusing to modify it")
     root = Path(tempfile.mkdtemp(prefix="morpheus-hosted-acceptance-", dir=os.environ.get("RUNNER_TEMP")))
     acceptance = Acceptance(root, args.gitleaks)
+    body_failed = False
     try:
         acceptance.start_keyring()
         acceptance.script("local_matrix_env", "up")
@@ -387,15 +427,42 @@ def main():
                         extra={"MORPHEUS_MATRIX_RTC_GATE_TEST_ACCOUNTS": str(gate)})
         acceptance.rtc_cases()
         acceptance.element_case()
+    except BaseException:
+        body_failed = True
+        raise
     finally:
-        acceptance.summary()
+        summary_failed = False
+        try:
+            acceptance.summary()
+        except BaseException:
+            summary_failed = True
         # Only these containers belong to this fresh, explicitly checked run.
-        # Always attempt both cleanups; preserve the original test failure.
+        # Summary errors and interrupts must not prevent either cleanup. Keep
+        # any original body exception; otherwise cleanup failure is fatal.
+        cleanup_failures = []
         for name in ("local_matrix_rtc", "local_matrix_env"):
             try:
                 acceptance.script(name, "down")
-            except (RuntimeError, OSError) as error:
-                print(f"Cleanup incomplete: {error}", file=sys.stderr)
+            except BaseException:
+                cleanup_failures.append(name)
+        try:
+            acceptance.verify_fixture_absence()
+        except BaseException:
+            cleanup_failures.append("fixture_absence")
+        try:
+            if summary_failed:
+                print("Acceptance summary could not be written", file=sys.stderr)
+            for name in cleanup_failures:
+                # Labels are fixed literals above, never exception payloads.
+                print(f"Cleanup incomplete: {name}", file=sys.stderr)
+        except (OSError, ValueError):
+            # A broken diagnostic stream cannot replace the original failure.
+            pass
+        if not body_failed:
+            if cleanup_failures:
+                raise RuntimeError("Disposable Matrix service cleanup did not complete") from None
+            if summary_failed:
+                raise RuntimeError("Matrix acceptance summary could not be written") from None
 
 
 if __name__ == "__main__":
