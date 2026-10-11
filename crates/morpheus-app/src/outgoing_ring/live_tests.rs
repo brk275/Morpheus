@@ -25,7 +25,7 @@ use morpheus_rtc::{
 };
 use serde::Deserialize;
 
-use crate::incoming_ring::{IncomingOffer, ledger::OfferLedger};
+use crate::incoming_ring::{AdmissionFailure, IncomingOffer, ledger::OfferLedger};
 use crate::voice_spaces::VoiceSpaces;
 
 use super::*;
@@ -99,6 +99,27 @@ fn fact(name: &'static str) {
 
 fn require(condition: bool) -> Result<(), ()> {
     if condition { Ok(()) } else { Err(()) }
+}
+
+/// Only unexpected errors on paths that must succeed use this diagnostic.
+/// Expected replay/withdrawal rejections remain silent and keep their checks.
+fn admission_failure(error: AdmissionFailure) {
+    let result = match error {
+        AdmissionFailure::Account => "account",
+        AdmissionFailure::Sync => "sync",
+        AdmissionFailure::Receipt => "receipt",
+        AdmissionFailure::Replay => "replay",
+        AdmissionFailure::Expired => "expired",
+        AdmissionFailure::Membership => "membership",
+        AdmissionFailure::Trust => "trust",
+        AdmissionFailure::Policy => "policy",
+        AdmissionFailure::Quiet => "quiet",
+        AdmissionFailure::Transport => "transport",
+        AdmissionFailure::Unavailable => "unavailable",
+        AdmissionFailure::TimedOut => "timed_out",
+        AdmissionFailure::Revoked => "revoked",
+    };
+    eprintln!("\nMORPHEUS_RING_ADMISSION result={result}");
 }
 
 /// Retain only the last fixed observation. Cancellation or a failure emits it;
@@ -626,14 +647,14 @@ impl Session {
             &mut ledger,
         )
         .await
-        .map_err(|_| ())?;
+        .map_err(admission_failure)?;
         require(offer.mode() == case.mode)?;
         let original_deadline = offer.deadline();
         phase(&mut self.stage, Stage::Revalidate);
         offer
             .revalidate(&self.bob, &preferences)
             .await
-            .map_err(|_| ())?;
+            .map_err(admission_failure)?;
         require(offer.deadline() <= original_deadline)?;
         require(
             IncomingOffer::admit(

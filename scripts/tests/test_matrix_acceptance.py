@@ -745,6 +745,10 @@ class OutgoingRingTests(unittest.TestCase):
         self.assertEqual(observer_results, acceptance_module.RING_OBSERVER_RESULTS)
         self.assertIn('Self(Some("not_sampled"))', source)
         self.assertIn('\\nMORPHEUS_RING_OBSERVER result={result}', source)
+        self.assertEqual(set(re.findall(r'AdmissionFailure::\w+ => "([a-z_]+)"', source)),
+                         acceptance_module.RING_ADMISSION_RESULTS)
+        self.assertIn('\\nMORPHEUS_RING_ADMISSION result={result}', source)
+        self.assertEqual(source.count('.map_err(admission_failure)?'), 2)
 
     def output(self):
         facts = "\n".join(f"MORPHEUS_RING_CHECK {name}=true" for name in sorted(acceptance_module.RING_CHECKS))
@@ -829,6 +833,33 @@ class OutgoingRingTests(unittest.TestCase):
                 self.assertEqual(acceptance_module.ring_diagnostics(line + "\n"), {"checks": {}})
         self.assertEqual(acceptance_module.ring_diagnostics(valid + "\n" + "\n".join(malformed)), {
             "checks": {}, "observer_result": "current_event_mismatch",
+        })
+
+    def test_admission_diagnostics_preserve_only_fixed_categories_and_poison_a_pass(self):
+        for category in acceptance_module.RING_ADMISSION_RESULTS:
+            with self.subTest(category=category):
+                marker = f"MORPHEUS_RING_ADMISSION result={category}\n"
+                self.assertEqual(acceptance_module.ring_diagnostics(marker), {
+                    "checks": {}, "admission_result": category,
+                })
+                for output in (marker + self.output(), self.output() + marker):
+                    with self.assertRaises(RuntimeError):
+                        acceptance_module.ring_passed_tests(output)
+
+    def test_admission_diagnostics_reject_suffixes_unknown_payloads_and_prefixed_lines(self):
+        valid = "MORPHEUS_RING_ADMISSION result=policy"
+        malformed = (
+            valid + " private-event", "private-prefix " + valid,
+            "MORPHEUS_RING_ADMISSION result=private_server_error",
+            "MORPHEUS_RING_ADMISSION result=Policy",
+            "MORPHEUS_RING_ADMISSION event_id=policy",
+            "MORPHEUS_RING_ADMISSION result=policy\\nprivate-payload",
+        )
+        for line in malformed:
+            with self.subTest(line=line):
+                self.assertEqual(acceptance_module.ring_diagnostics(line + "\n"), {"checks": {}})
+        self.assertEqual(acceptance_module.ring_diagnostics(valid + "\n" + "\n".join(malformed)), {
+            "checks": {}, "admission_result": "policy",
         })
 
     def test_four_cases_use_fresh_fixtures_and_the_same_exact_ignored_app_test(self):
@@ -942,6 +973,34 @@ class OutgoingRingTests(unittest.TestCase):
 
 
 class ScopedContinuationTests(unittest.TestCase):
+    def test_failed_admission_publishes_fixed_category_only_after_scan(self):
+        output = ("running 1 test\nMORPHEUS_RING_STAGE admission\n"
+                  "MORPHEUS_RING_ADMISSION result=trust\n"
+                  "MORPHEUS_RING_FAILURE admission\n"
+                  "MORPHEUS_RING_ADMISSION result=private-server-data\n"
+                  "MORPHEUS_RING_CHECK cleanup=true\nprivate-account-event-key\n")
+        for scanner_code in (0, 1):
+            with self.subTest(scanner_code=scanner_code), tempfile.TemporaryDirectory() as folder:
+                runner = Acceptance(Path(folder), "scanner")
+                with self.contained_child(runner, output, scanner_code=scanner_code) as (
+                    visible, _, _, _, _, scanner,
+                ), self.assertRaises(RuntimeError):
+                    runner.run("outgoing-ring-current-dm", ["test"],
+                               ring_case=("current", "dm"), pid_namespace=True)
+                scanner.assert_called_once()
+                self.assertNotIn("private-server-data", visible.getvalue())
+                self.assertNotIn("private-account-event-key", visible.getvalue())
+                if scanner_code == 0:
+                    evidence = json.loads(next(
+                        line for line in visible.getvalue().splitlines() if line.startswith("{")
+                    ))
+                    self.assertEqual(evidence["ring_diagnostics"], {
+                        "checks": {"cleanup": True}, "stage": "admission",
+                        "failure": "admission", "admission_result": "trust",
+                    })
+                else:
+                    self.assertNotIn("admission_result", visible.getvalue())
+
     def test_failed_observer_publishes_fixed_stage_and_result_only_after_scan(self):
         output = ("running 1 test\nMORPHEUS_RING_STAGE observer_roster\n"
                   "MORPHEUS_RING_OBSERVER result=slot_unavailable\n"

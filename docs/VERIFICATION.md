@@ -5,6 +5,37 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
 ## Current hosted acceptance, 2026-10-11
 
+### Incoming admission policy regression and correction
+
+[Run 38132968786](https://github.com/brk275/Morpheus/actions/runs/38132968786)
+tested `dcab6296bda12da362e54d6044c29d9de21eed29`. Scope passed 381 helper
+checks with one skip, including the real HTTPS cookie login/callback flow.
+Linux, Apple Silicon, Intel Mac and Windows compiled the new admission path and built
+the native app. Linux also passed Xvfb startup. All four desktop suites then failed the same
+`missing_or_malformed_push_rules_do_not_use_defaults` assertion: Linux had 118
+other passes and each non-Linux suite 103, each with one explicitly ignored test.
+All completed logs scanned clean and every cache/checkout post-step completed.
+
+Pinned Ruma's derived Serde visitor accepts `global: []` as an empty `Ruleset`.
+It also accepts positional arrays for some nested policy structs. The new
+correction requires Matrix JSON object envelopes for push content, global
+rules, individual rules and conditions, plus ignore-list content and entries.
+It retains Ruma's typed field validation, optional fields, unknown extensions
+and valid empty policy; an empty policy still denies notifications. The
+regressions keep the original malformed-input assertion and add nested shape,
+valid-rule round-trip and empty-policy behavior checks. Native execution of
+the correction remains pending. Unexpected admission and revalidation errors
+now retain a fixed failure category in the hosted fixture; expected replay and
+withdrawal rejections remain silent. All 83 targeted Python checks and workflow
+validation passed locally. No native test or fixture service ran locally.
+
+The desktop unit failure prevented the later native-device, vendor, SDK,
+Wayland and live Matrix/RTC gates from running on Linux. This run therefore
+provides no new live observer, incoming admission, late-join or capture proof.
+The next workflow retains a failed desktop-unit outcome while collecting
+independent checks from the already-built app, then explicitly fails the final
+gate. Native-device and vendored-security failures still stop subsequent work.
+
 ### Passive observer and capture evidence run
 
 [Run 38129843715](https://github.com/brk275/Morpheus/actions/runs/38129843715)

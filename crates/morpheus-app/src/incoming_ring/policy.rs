@@ -173,11 +173,20 @@ fn require_not_ignored(
 ) -> Result<(), PolicyFailure> {
     // A synced account may legitimately have no ignore-list event. A read or
     // decoding error is different and must not become an empty list.
+    let Some(raw) = raw else {
+        return Ok(());
+    };
+    let content = policy_object(raw)?;
+    let users = content
+        .get("ignored_users")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(PolicyFailure::PolicyUnavailable)?;
+    if users.values().any(|user| !user.is_object()) {
+        return Err(PolicyFailure::PolicyUnavailable);
+    }
     let ignored = raw
-        .map(Raw::deserialize)
-        .transpose()
-        .map_err(|_| PolicyFailure::PolicyUnavailable)?
-        .unwrap_or_default();
+        .deserialize()
+        .map_err(|_| PolicyFailure::PolicyUnavailable)?;
     if ignored.ignored_users.contains_key(sender) {
         Err(PolicyFailure::IgnoredSender)
     } else {
@@ -185,11 +194,51 @@ fn require_not_ignored(
     }
 }
 
+fn policy_object<T>(
+    raw: &Raw<T>,
+) -> Result<serde_json::Map<String, serde_json::Value>, PolicyFailure> {
+    // Serde's derived struct visitors also accept positional JSON arrays.
+    // Matrix account-data content is an object, including empty policy data.
+    serde_json::from_str(raw.json().get()).map_err(|_| PolicyFailure::PolicyUnavailable)
+}
+
 fn strict_push_rules(raw: Option<&Raw<PushRulesEventContent>>) -> Result<Ruleset, PolicyFailure> {
     // `Account::push_rules` falls back to server defaults on malformed data.
     // Incoming calls instead wait until actual valid policy is available.
-    raw.ok_or(PolicyFailure::PolicyUnavailable)?
-        .deserialize()
+    let raw = raw.ok_or(PolicyFailure::PolicyUnavailable)?;
+    let content = policy_object(raw)?;
+    let global = content
+        .get("global")
+        .and_then(serde_json::Value::as_object)
+        .ok_or(PolicyFailure::PolicyUnavailable)?;
+    // In pinned Ruma, every Ruleset field defaults, so `global: []` becomes
+    // an empty ruleset. Individual rules and condition helpers also accept
+    // struct sequences. Check their JSON envelopes before typed validation;
+    // optional categories/conditions and unknown extensions stay supported.
+    for kind in [
+        "content",
+        "override",
+        "room",
+        "sender",
+        "underride",
+        "postcontent",
+    ] {
+        let Some(rules) = global.get(kind) else {
+            continue;
+        };
+        for rule in rules.as_array().ok_or(PolicyFailure::PolicyUnavailable)? {
+            let rule = rule.as_object().ok_or(PolicyFailure::PolicyUnavailable)?;
+            if matches!(kind, "override" | "underride" | "postcontent")
+                && let Some(conditions) = rule.get("conditions")
+                && conditions
+                    .as_array()
+                    .is_none_or(|conditions| conditions.iter().any(|value| !value.is_object()))
+            {
+                return Err(PolicyFailure::PolicyUnavailable);
+            }
+        }
+    }
+    raw.deserialize()
         .map(|content| content.global)
         .map_err(|_| PolicyFailure::PolicyUnavailable)
 }
@@ -455,7 +504,9 @@ mod tests {
         );
         for malformed in [
             json!({}),
+            json!([{}]),
             json!({"ignored_users": []}),
+            json!({"ignored_users": {"@other:example.org": []}}),
             json!({"ignored_users": {"invalid": {}}}),
         ] {
             assert_eq!(
@@ -463,6 +514,16 @@ mod tests {
                 Err(PolicyFailure::PolicyUnavailable)
             );
         }
+        assert_eq!(
+            require_not_ignored(
+                Some(&raw(json!({
+                    "ignored_users": {"@other:example.org": {"com.example.note": []}},
+                    "com.example.extension": []
+                }))),
+                caller
+            ),
+            Ok(())
+        );
     }
 
     #[test]
@@ -473,7 +534,10 @@ mod tests {
         ));
         for malformed in [
             json!({}),
+            json!([{}]),
+            json!(null),
             json!({"global": []}),
+            json!({"global": null}),
             json!({"global": {"override": "bad"}}),
         ] {
             assert!(matches!(
@@ -482,6 +546,112 @@ mod tests {
             ));
         }
         assert!(strict_push_rules(Some(&raw(json!({"global": {}})))).is_ok());
+    }
+
+    #[test]
+    fn sequence_shaped_push_rule_entries_are_not_policy() {
+        // These positions match the pinned derived struct field order. They
+        // must not become rules merely because Serde accepts that encoding.
+        for (kind, rule) in [
+            ("content", json!([["notify"], false, true, "rule", "*"])),
+            ("override", json!([["notify"], false, true, "rule", []])),
+            ("underride", json!([["notify"], false, true, "rule", []])),
+            ("postcontent", json!([["notify"], false, true, "rule", []])),
+            (
+                "room",
+                json!([["notify"], false, true, "!room:example.org"]),
+            ),
+            (
+                "sender",
+                json!([["notify"], false, true, "@caller:example.org"]),
+            ),
+        ] {
+            let mut content = json!({"global": {}});
+            content["global"][kind] = json!([rule]);
+            assert!(matches!(
+                strict_push_rules(Some(&raw(content))),
+                Err(PolicyFailure::PolicyUnavailable)
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_nested_push_conditions_and_fields_are_not_policy() {
+        let rule = || {
+            json!({
+                "actions": ["notify"], "default": false, "enabled": true, "rule_id": "rule"
+            })
+        };
+        for conditions in [
+            json!(null),
+            json!({}),
+            json!([null]),
+            json!([["contains_display_name"]]),
+            json!([{"kind": "event_match", "pattern": "*"}]),
+        ] {
+            let mut malformed = rule();
+            malformed["conditions"] = conditions;
+            assert!(matches!(
+                strict_push_rules(Some(&raw(json!({"global": {"override": [malformed]}})))),
+                Err(PolicyFailure::PolicyUnavailable)
+            ));
+        }
+        // Shape validation supplements Ruma; it must not replace validation
+        // of required fields or accept malformed action values.
+        for (field, value) in [("actions", json!([[]])), ("enabled", json!("true"))] {
+            let mut malformed = rule();
+            malformed[field] = value;
+            assert!(matches!(
+                strict_push_rules(Some(&raw(json!({"global": {"override": [malformed]}})))),
+                Err(PolicyFailure::PolicyUnavailable)
+            ));
+        }
+    }
+
+    #[test]
+    fn valid_serialized_rules_and_optional_extensions_remain_policy() {
+        let defaults = Ruleset::server_default(user_id!("@recipient:example.org"));
+        let expected = serde_json::to_value(&defaults).unwrap();
+        let parsed = strict_push_rules(Some(&raw(json!({"global": expected.clone()})))).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), expected);
+
+        // Empty/omitted categories and omitted conditions are legitimate.
+        // Unknown extension fields are not interpreted as standard rules.
+        let parsed = strict_push_rules(Some(&raw(json!({
+            "global": {
+                "override": [{
+                    "actions": [], "default": false, "enabled": true, "rule_id": "quiet",
+                    "com.example.extension": []
+                }],
+                "room": [], "com.example.extension": []
+            },
+            "com.example.extension": []
+        }))))
+        .unwrap();
+        let rule = parsed.override_.iter().next().unwrap();
+        assert!(rule.conditions.is_empty());
+        assert!(rule.actions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn valid_empty_push_policy_denies_instead_of_using_server_defaults() {
+        for content in [
+            json!({"global": {}}),
+            json!({"global": {"content": [], "override": [], "room": [], "sender": [], "underride": []}}),
+        ] {
+            let rules = strict_push_rules(Some(&raw(content))).unwrap();
+            assert!(rules.iter().next().is_none());
+            assert_eq!(
+                evaluate_policy(
+                    context(100),
+                    rules,
+                    user_id!("@caller:example.org"),
+                    &event(json!({"user_ids": ["@recipient:example.org"], "room": true})),
+                )
+                .await,
+                Err(PolicyFailure::NotificationDenied)
+            );
+        }
     }
 
     #[test]

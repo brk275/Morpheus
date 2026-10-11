@@ -157,6 +157,11 @@ jobs:
             exit 1
           fi
       - name: Test desktop controller and call guards
+        id: desktop-tests
+        # The independently built app can still exercise disposable fixtures
+        # after a unit assertion fails. Keep that evidence and reject the
+        # candidate at the final gate instead of rebuilding just to reach it.
+        continue-on-error: true
         run: cargo test --locked -p morpheus-app --features native-calls --bin morpheus-app
       - name: Test native device and call guards
         run: cargo test --locked -p morpheus-rtc --features native-devices --lib
@@ -208,8 +213,8 @@ jobs:
           dbus-run-session -- python3 scripts/run_matrix_acceptance.py \
             --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks"
       - name: Enforce collected acceptance results
-        if: ${{ !cancelled() && (steps.model-tests.outcome == 'failure' || steps.wayland-tests.outcome == 'failure' || steps.windows-capture-tests.outcome == 'failure' || steps.sdk-receipt-tests.outcome == 'failure') }}
+        if: ${{ !cancelled() && (steps.model-tests.outcome == 'failure' || steps.desktop-tests.outcome == 'failure' || steps.wayland-tests.outcome == 'failure' || steps.windows-capture-tests.outcome == 'failure' || steps.sdk-receipt-tests.outcome == 'failure') }}
         shell: bash
         run: |
-          echo "Protocol model, native capture, or SDK receipt acceptance tests failed; this candidate is not verified."
+          echo "Protocol model, desktop controller, native capture, or SDK receipt acceptance tests failed; this candidate is not verified."
           exit 1

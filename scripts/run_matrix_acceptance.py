@@ -126,6 +126,11 @@ RING_OBSERVER_RESULTS = frozenset((
     "current_event_mismatch", "membership_still_present", "membership_expired", "leave_unavailable",
 ))
 RING_OBSERVER = re.compile(r"^MORPHEUS_RING_OBSERVER result=([a-z_]+)$", re.MULTILINE)
+RING_ADMISSION_RESULTS = frozenset((
+    "account", "sync", "receipt", "replay", "expired", "membership", "trust", "policy",
+    "quiet", "transport", "unavailable", "timed_out", "revoked",
+))
+RING_ADMISSION = re.compile(r"^MORPHEUS_RING_ADMISSION result=([a-z_]+)$", re.MULTILINE)
 RING_CASES = tuple((mode, target) for mode in ("current", "sticky-2025") for target in ("dm", "room"))
 CHAT_CHECKS = (*CHAT_TESTS, "search_local-classic")
 OAUTH_LABELS = tuple("oauth-local-" + phase.replace("_", "-") for phase in OAUTH_PHASES)
@@ -221,6 +226,9 @@ def ring_diagnostics(output: str) -> dict:
     observer = [value for value in RING_OBSERVER.findall(output) if value in RING_OBSERVER_RESULTS]
     if observer:
         diagnostics["observer_result"] = observer[-1]
+    admission = [value for value in RING_ADMISSION.findall(output) if value in RING_ADMISSION_RESULTS]
+    if admission:
+        diagnostics["admission_result"] = admission[-1]
     results = RING_RESULT.findall(output)
     if results:
         diagnostics["passed"] = all(value == "true" for value in results)
@@ -235,6 +243,7 @@ def ring_passed_tests(output: str) -> int:
             or any(checks.get(name) is not True for name in RING_CHECKS)
             or "failure" in ring_diagnostics(output)
             or "observer_result" in ring_diagnostics(output)
+            or "admission_result" in ring_diagnostics(output)
             or RING_RESULT.findall(output) != ["true"]):
         raise RuntimeError("Outgoing ring acceptance evidence is incomplete")
     return 1
