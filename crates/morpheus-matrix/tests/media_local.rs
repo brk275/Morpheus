@@ -4,9 +4,10 @@
 
 use std::{collections::HashMap, fs, path::Path, time::Duration};
 
+use matrix_sdk::ruma::RoomId;
 use morpheus_matrix::{AccountManager, AttachmentKind, AttachmentSendUpdate, MatrixCoreError};
 use serde::Deserialize;
-use tokio::time::{Instant, sleep, timeout};
+use tokio::time::{Instant, sleep, timeout, timeout_at};
 use uuid::Uuid;
 
 #[derive(Deserialize)]
@@ -70,6 +71,40 @@ fn contains_plaintext(path: &Path, needle: &[u8]) -> bool {
     false
 }
 
+// Original public 1×1 PNG: RGBA [13, 29, 47, 255], with standard PNG CRCs.
+// No external asset, media decoder or dependency is needed by this API fixture.
+const PREVIEW_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xe0, 0x95, 0xd5, 0xff,
+    0x0f, 0x00, 0x01, 0xed, 0x01, 0x59, 0x8a, 0xb4, 0xa8, 0xad, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+// The caller's existing absolute deadline bounds both enqueue and observation.
+// Retained requests are never re-enqueued as a substitute for acknowledgement.
+async fn queue_preview_image(
+    sender: &AccountManager,
+    account_id: &str,
+    room_id: &str,
+    path: &Path,
+) -> Result<String, ()> {
+    let mut queued = sender
+        .send_attachment_for(account_id, room_id, path, "image/png")
+        .await
+        .map_err(|_| ())?;
+    loop {
+        match queued.next_update().await {
+            AttachmentSendUpdate::Sent { event_id } => return Ok(event_id),
+            AttachmentSendUpdate::Progress { .. }
+            | AttachmentSendUpdate::Retained { recoverable: true } => {}
+            AttachmentSendUpdate::Retained { recoverable: false }
+            | AttachmentSendUpdate::Cancelled
+            | AttachmentSendUpdate::Unknown => return Err(()),
+        }
+    }
+}
+
 #[test]
 fn encrypted_file_roundtrips_between_disposable_accounts() {
     let Some(credentials_path) = std::env::var_os("MORPHEUS_MATRIX_TEST_ACCOUNTS") else {
@@ -89,6 +124,8 @@ fn encrypted_file_roundtrips_between_disposable_accounts() {
     }
     let filename = format!("encrypted-{}.bin", Uuid::new_v4());
     let file_path = root.join(&filename);
+    let preview_path = root.join("original-preview.png");
+    fs::write(&preview_path, PREVIEW_PNG).expect("Cannot create original preview fixture");
     let payload = format!("morpheus-private-media-{}", Uuid::new_v4())
         .repeat(512)
         .into_bytes();
@@ -196,6 +233,80 @@ fn encrypted_file_roundtrips_between_disposable_accounts() {
             mismatch,
             Err(MatrixCoreError::SelectedAccountChanged)
         ));
+        // Share the existing final receive/download deadline. The hosted
+        // media_local command and its cleanup budget are not extended.
+        timeout_at(deadline, async {
+            let plain_room = fixture.rooms.get("a_room").ok_or(())?;
+            wait_for_room(&sender, plain_room).await;
+            let sender_client = sender.active_client().await.map_err(|_| ())?;
+            let receiver_client = receiver.active_client().await.map_err(|_| ())?;
+            let plain = sender_client
+                .get_room(&RoomId::parse(plain_room).map_err(|_| ())?)
+                .ok_or(())?;
+            let encrypted = receiver_client
+                .get_room(&RoomId::parse(room_id).map_err(|_| ())?)
+                .ok_or(())?;
+            let plain_state = plain.latest_encryption_state().await.map_err(|_| ())?;
+            let encrypted_state = encrypted.latest_encryption_state().await.map_err(|_| ())?;
+            // Check live room state, not just names or fixture conventions.
+            assert!(!plain_state.is_unknown() && !plain_state.is_encrypted());
+            assert!(!encrypted_state.is_unknown() && encrypted_state.is_encrypted());
+            let sender_selection = sender.account_selection(&sender_account.id).ok_or(())?;
+            let receiver_selection = receiver.account_selection(&receiver_account.id).ok_or(())?;
+
+            let image_event =
+                queue_preview_image(&sender, &sender_account.id, room_id, &preview_path).await?;
+            assert!(matches!(
+                receiver
+                    .download_image_preview_for(&receiver_selection, room_id, &image_event, false,)
+                    .await,
+                Err(MatrixCoreError::InvalidMedia(_))
+            ));
+            // This is an actual current selection from the other manager,
+            // rather than a malformed event or hand-built fake token.
+            assert!(matches!(
+                receiver
+                    .download_image_preview_for(&sender_selection, room_id, &image_event, true,)
+                    .await,
+                Err(MatrixCoreError::SelectedAccountChanged)
+            ));
+            // Wait only for real decryption/key availability; never send a
+            // duplicate or inject crypto material to make the assertion pass.
+            let image = loop {
+                if let Ok(download) = receiver
+                    .download_image_preview_for(&receiver_selection, room_id, &image_event, true)
+                    .await
+                {
+                    break download.into_plaintext().map_err(|_| ())?;
+                }
+                sleep(Duration::from_millis(300)).await;
+            };
+            assert_eq!(image.bytes, PREVIEW_PNG);
+            assert_eq!(image.metadata.kind, AttachmentKind::Image);
+            assert_eq!(image.metadata.mime_type, "image/png");
+            assert!(image.metadata.encrypted);
+            assert!(matches!(
+                receiver
+                    .download_image_preview_for(&receiver_selection, room_id, &event_id, true,)
+                    .await,
+                Err(MatrixCoreError::InvalidMedia(_))
+            ));
+            let plain_event =
+                queue_preview_image(&sender, &sender_account.id, plain_room, &preview_path).await?;
+            let plain_image = sender
+                .download_image_preview_for(&sender_selection, plain_room, &plain_event, false)
+                .await
+                .map_err(|_| ())?
+                .into_plaintext()
+                .map_err(|_| ())?;
+            assert_eq!(plain_image.bytes, PREVIEW_PNG);
+            assert_eq!(plain_image.metadata.kind, AttachmentKind::Image);
+            assert!(!plain_image.metadata.encrypted);
+            Ok::<(), ()>(())
+        })
+        .await
+        .expect("Image preview checks exceeded the existing media deadline")
+        .expect("Image preview API acceptance failed");
         sender.stop().await;
         receiver.stop().await;
 
@@ -203,6 +314,7 @@ fn encrypted_file_roundtrips_between_disposable_accounts() {
         // checking the encrypted SDK stores. Then log out the disposable
         // devices so their OS-vault entries do not accumulate across runs.
         fs::remove_file(&file_path).expect("Cannot remove test input");
+        fs::remove_file(&preview_path).expect("Cannot remove preview fixture input");
         assert!(!contains_plaintext(&root.join("sender"), &payload[..80]));
         assert!(!contains_plaintext(&root.join("receiver"), &payload[..80]));
         sender

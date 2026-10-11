@@ -47,6 +47,8 @@ use crate::{AccountManager, MatrixCoreError, QueuedSendOutcome, Result, account_
 /// Limits one in-memory upload or download. Homeservers may impose a lower
 /// upload limit; the SDK reports that independently.
 pub const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+/// Explicit native image previews have a smaller input budget than Save.
+pub const MAX_IMAGE_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
 const MEDIA_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_MEDIA_REDIRECTS: usize = 5;
 const MAX_MATRIX_ERROR_BYTES: usize = 4096;
@@ -77,6 +79,26 @@ pub struct AttachmentMetadata {
 pub struct DownloadedAttachment {
     pub metadata: AttachmentMetadata,
     pub bytes: Vec<u8>,
+}
+
+/// Opaque, memory-only preview input. It contains media secrets and therefore
+/// deliberately implements neither Debug nor Serialize. Consume it on the
+/// caller's single bounded decoder worker; dropping a network future never
+/// leaves a detached SDK decryption job behind.
+pub struct ImagePreviewDownload {
+    metadata: AttachmentMetadata,
+    source: MediaSource,
+    ciphertext: Vec<u8>,
+}
+
+impl ImagePreviewDownload {
+    pub fn into_plaintext(self) -> Result<DownloadedAttachment> {
+        let bytes = decrypt_media(self.source, self.ciphertext, MAX_IMAGE_PREVIEW_BYTES)?;
+        Ok(DownloadedAttachment {
+            metadata: self.metadata,
+            bytes,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -195,6 +217,9 @@ impl QueuedAttachment {
 struct ResolvedAttachment {
     metadata: AttachmentMetadata,
     source: MediaSource,
+    // Message encryption is independent of the attachment's own MediaSource
+    // and current room state. Any encrypted context requires preview opt-in.
+    event_was_encrypted: bool,
 }
 
 impl AccountManager {
@@ -299,6 +324,65 @@ impl AccountManager {
         })
     }
 
+    /// Resolve only a real Matrix image event in the selected account. The
+    /// caller owns cancellation/deadlines and current privacy-policy checks.
+    /// No source URL or decryption key crosses this opaque API.
+    pub async fn download_image_preview_for(
+        &self,
+        selection: &crate::AccountSelection,
+        room_id: &str,
+        event_id: &str,
+        allow_encrypted: bool,
+    ) -> Result<ImagePreviewDownload> {
+        let room = {
+            let state = self.state.lock().await;
+            if !selection.is_current()
+                || state.registry.active_account_id.as_deref() != Some(selection.account_id())
+            {
+                return Err(MatrixCoreError::SelectedAccountChanged);
+            }
+            account_room(&state, selection.account_id(), room_id)?
+        };
+        let encryption = room
+            .latest_encryption_state()
+            .await
+            .map_err(|_| MatrixCoreError::InvalidMedia("Cannot check room encryption".into()))?;
+        if !selection.is_current() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        if encryption.is_unknown() {
+            return Err(MatrixCoreError::InvalidMedia(
+                "Cannot check room encryption".into(),
+            ));
+        }
+        let encrypted_room = encryption.is_encrypted();
+        if encrypted_room && !allow_encrypted {
+            return Err(MatrixCoreError::InvalidMedia(
+                "Encrypted image previews are disabled".into(),
+            ));
+        }
+        let resolved = resolve_attachment(&room, event_id).await?;
+        validate_preview_metadata(
+            &resolved.metadata,
+            encrypted_room,
+            resolved.event_was_encrypted,
+            allow_encrypted,
+        )?;
+        if !selection.is_current() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        let ciphertext =
+            fetch_bounded_media(&room.client(), &resolved.source, MAX_IMAGE_PREVIEW_BYTES).await?;
+        if !selection.is_current() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        Ok(ImagePreviewDownload {
+            metadata: resolved.metadata,
+            source: resolved.source,
+            ciphertext,
+        })
+    }
+
     async fn assert_active(&self, expected_account_id: &str) -> Result<()> {
         if self
             .state
@@ -316,7 +400,11 @@ impl AccountManager {
     }
 }
 
-async fn download_bounded_media(client: &Client, source: &MediaSource) -> Result<Vec<u8>> {
+async fn fetch_bounded_media(
+    client: &Client,
+    source: &MediaSource,
+    maximum: usize,
+) -> Result<Vec<u8>> {
     let uri = match source {
         MediaSource::Plain(uri) => uri,
         MediaSource::Encrypted(file) => &file.url,
@@ -467,26 +555,60 @@ async fn download_bounded_media(client: &Client, source: &MediaSource) -> Result
         unreachable!("bounded media redirect loop always returns or errors")
     };
     if let Some(length) = response.content_length() {
-        check_size(length)?;
+        check_size_limit(length, maximum)?;
     }
-    let ciphertext = collect_bounded_stream(response.bytes_stream()).await?;
+    collect_bounded_stream_limit(response.bytes_stream(), maximum).await
+}
+
+async fn download_bounded_media(client: &Client, source: &MediaSource) -> Result<Vec<u8>> {
+    let ciphertext = fetch_bounded_media(client, source, MAX_ATTACHMENT_BYTES).await?;
+    if matches!(source, MediaSource::Plain(_)) {
+        return Ok(ciphertext);
+    }
+    let source = source.clone();
+    task::spawn_blocking(move || decrypt_media(source, ciphertext, MAX_ATTACHMENT_BYTES))
+        .await
+        .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?
+}
+
+fn decrypt_media(source: MediaSource, ciphertext: Vec<u8>, maximum: usize) -> Result<Vec<u8>> {
+    check_size_limit(ciphertext.len() as u64, maximum)?;
     match source {
         MediaSource::Plain(_) => Ok(ciphertext),
-        MediaSource::Encrypted(file) => task::spawn_blocking({
-            let file = file.as_ref().clone();
-            move || {
-                let mut source = std::io::Cursor::new(ciphertext);
-                let mut decryptor = AttachmentDecryptor::new(&mut source, file.into())
-                    .map_err(|error| MatrixCoreError::InvalidMedia(error.to_string()))?;
-                let mut plaintext = Vec::new();
-                decryptor.read_to_end(&mut plaintext)?;
-                check_size(plaintext.len() as u64)?;
-                Ok::<_, MatrixCoreError>(plaintext)
-            }
-        })
-        .await
-        .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?,
+        MediaSource::Encrypted(file) => {
+            let mut source = std::io::Cursor::new(ciphertext);
+            let decryptor = AttachmentDecryptor::new(&mut source, file.as_ref().clone().into())
+                .map_err(|_| MatrixCoreError::InvalidMedia("Cannot decrypt media".into()))?;
+            let mut plaintext = Vec::new();
+            decryptor
+                .take(maximum as u64 + 1)
+                .read_to_end(&mut plaintext)?;
+            check_size_limit(plaintext.len() as u64, maximum)?;
+            Ok(plaintext)
+        }
     }
+}
+
+fn validate_preview_metadata(
+    metadata: &AttachmentMetadata,
+    encrypted_room: bool,
+    encrypted_event: bool,
+    allow_encrypted: bool,
+) -> Result<()> {
+    if metadata.kind != AttachmentKind::Image {
+        return Err(MatrixCoreError::InvalidMedia(
+            "Only image messages can be previewed".into(),
+        ));
+    }
+    if (encrypted_room || encrypted_event || metadata.encrypted) && !allow_encrypted {
+        return Err(MatrixCoreError::InvalidMedia(
+            "Encrypted image previews are disabled".into(),
+        ));
+    }
+    if let Some(size) = metadata.declared_size {
+        check_size_limit(size, MAX_IMAGE_PREVIEW_BYTES)?;
+    }
+    Ok(())
 }
 
 /// A cross-origin redirect is only useful for a public HTTPS CDN. The URL
@@ -645,7 +767,15 @@ async fn is_unknown_token(response: reqwest::Response) -> bool {
         .is_some_and(|code| code == "M_UNKNOWN_TOKEN")
 }
 
+#[cfg(test)]
 async fn collect_bounded_stream<S, E>(stream: S) -> Result<Vec<u8>>
+where
+    S: Stream<Item = std::result::Result<Bytes, E>>,
+{
+    collect_bounded_stream_limit(stream, MAX_ATTACHMENT_BYTES).await
+}
+
+async fn collect_bounded_stream_limit<S, E>(stream: S, maximum: usize) -> Result<Vec<u8>>
 where
     S: Stream<Item = std::result::Result<Bytes, E>>,
 {
@@ -654,7 +784,10 @@ where
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| MatrixCoreError::Sdk("media body transfer failed".into()))?;
         let next_size = result.len().saturating_add(chunk.len());
-        check_size(next_size as u64)?;
+        check_size_limit(next_size as u64, maximum)?;
+        result
+            .try_reserve_exact(chunk.len())
+            .map_err(|_| MatrixCoreError::InvalidMedia("Media allocation failed".into()))?;
         result.extend_from_slice(&chunk);
     }
     Ok(result)
@@ -669,6 +802,7 @@ async fn resolve_attachment(
         .load_or_fetch_event(&id, None)
         .await
         .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
+    let event_was_encrypted = event.encryption_info().is_some();
     let raw = event
         .raw()
         .deserialize()
@@ -676,7 +810,11 @@ async fn resolve_attachment(
     match raw {
         AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
             SyncRoomMessageEvent::Original(event),
-        )) => from_message(event_id, &event.content.msgtype),
+        )) => {
+            let mut resolved = from_message(event_id, &event.content.msgtype)?;
+            resolved.event_was_encrypted = event_was_encrypted;
+            Ok(resolved)
+        }
         _ => Err(MatrixCoreError::NotMediaAttachment),
     }
 }
@@ -726,6 +864,7 @@ fn from_message(event_id: &str, message: &MessageType) -> Result<ResolvedAttachm
         _ => return Err(MatrixCoreError::NotMediaAttachment),
     };
     Ok(ResolvedAttachment {
+        event_was_encrypted: false,
         metadata: AttachmentMetadata {
             event_id: event_id.into(),
             filename: safe_filename(filename),
@@ -770,9 +909,13 @@ fn attachment_info(mime_type: &Mime, size: UInt) -> AttachmentInfo {
 }
 
 fn check_size(size: u64) -> Result<()> {
-    if size > MAX_ATTACHMENT_BYTES as u64 {
+    check_size_limit(size, MAX_ATTACHMENT_BYTES)
+}
+
+fn check_size_limit(size: u64, maximum: usize) -> Result<()> {
+    if size > maximum as u64 {
         Err(MatrixCoreError::MediaTooLarge {
-            maximum: MAX_ATTACHMENT_BYTES as u64,
+            maximum: maximum as u64,
             actual: size,
         })
     } else {
@@ -1033,5 +1176,85 @@ mod tests {
         assert_eq!(safe_filename("com0.txt"), "com0.txt");
         assert!(parse_mime("image/png").is_ok());
         assert!(parse_mime("not a MIME type").is_err());
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    #[test]
+    fn preview_requires_image_and_each_encryption_context_opt_in() {
+        let mut metadata = AttachmentMetadata {
+            event_id: "$fixture".into(),
+            filename: "image.png".into(),
+            mime_type: "image/png".into(),
+            declared_size: None,
+            kind: AttachmentKind::Image,
+            encrypted: false,
+        };
+        assert!(validate_preview_metadata(&metadata, false, false, false).is_ok());
+        // Decrypted message metadata cannot lose privacy protection merely
+        // because room state and the embedded MXC source are both cleartext.
+        assert!(validate_preview_metadata(&metadata, false, true, false).is_err());
+        assert!(validate_preview_metadata(&metadata, false, true, true).is_ok());
+        assert!(validate_preview_metadata(&metadata, true, false, false).is_err());
+        metadata.encrypted = true;
+        assert!(validate_preview_metadata(&metadata, false, false, false).is_err());
+        assert!(validate_preview_metadata(&metadata, true, true, true).is_ok());
+        metadata.kind = AttachmentKind::File;
+        assert!(validate_preview_metadata(&metadata, true, true, true).is_err());
+    }
+    #[test]
+    fn preview_decryption_consumes_eof_hash_and_rejects_tampering() {
+        use matrix_sdk::ruma::{events::room::EncryptedFile, mxc_uri};
+        use matrix_sdk_crypto::AttachmentEncryptor;
+        let mut input = std::io::Cursor::new(b"bounded private preview");
+        let mut encryptor = AttachmentEncryptor::new(&mut input);
+        let mut ciphertext = Vec::new();
+        encryptor.read_to_end(&mut ciphertext).unwrap();
+        let info = encryptor.finish();
+        let source = MediaSource::Encrypted(Box::new(EncryptedFile::new(
+            mxc_uri!("mxc://example.org/preview-fixture").to_owned(),
+            info.encryption_info,
+            info.hashes,
+        )));
+        let plaintext =
+            decrypt_media(source.clone(), ciphertext.clone(), ciphertext.len()).unwrap();
+        assert_eq!(plaintext, b"bounded private preview");
+        let last = ciphertext.len() - 1;
+        ciphertext[last] ^= 1;
+        assert!(decrypt_media(source.clone(), ciphertext.clone(), ciphertext.len()).is_err());
+        assert!(matches!(
+            decrypt_media(source, ciphertext, last),
+            Err(MatrixCoreError::MediaTooLarge { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn preview_stream_enforces_smaller_limit_without_declared_size() {
+        let chunks = futures_util::stream::iter([
+            Ok::<_, std::io::Error>(Bytes::from_static(b"abcd")),
+            Ok(Bytes::from_static(b"ef")),
+        ]);
+        assert!(matches!(
+            collect_bounded_stream_limit(chunks, 5).await,
+            Err(MatrixCoreError::MediaTooLarge {
+                maximum: 5,
+                actual: 6
+            })
+        ));
+        assert_eq!(
+            collect_bounded_stream_limit(
+                futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"abcd"))]),
+                4
+            )
+            .await
+            .unwrap(),
+            b"abcd"
+        );
+        assert!(
+            check_size_limit(MAX_IMAGE_PREVIEW_BYTES as u64 + 1, MAX_IMAGE_PREVIEW_BYTES).is_err()
+        );
+        assert!(check_size(MAX_IMAGE_PREVIEW_BYTES as u64 + 1).is_ok());
     }
 }

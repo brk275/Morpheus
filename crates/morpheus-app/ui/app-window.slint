@@ -75,6 +75,7 @@ export struct MessageItem {
     edit-markdown: bool,
     reply-to: string,
     attachment: string,
+    attachment-is-image: bool,
     reaction: string,
     accent: color,
 }
@@ -677,6 +678,23 @@ export component AppWindow inherits Window {
     callback cancel-attachment();
     callback retry-attachment();
     callback save-attachment(string, string);
+    callback preview-image-attachment(string, string);
+    callback close-image-preview();
+    callback dismiss-image-preview();
+    dismiss-image-preview => {
+        root.close-image-preview();
+        shortcut-scope.focus();
+    }
+    callback set-encrypted-image-previews(bool);
+    in-out property <bool> image-preview-open: false;
+    in-out property <bool> image-preview-loaded: false;
+    in-out property <image> image-preview-image;
+    in-out property <string> image-preview-title;
+    in-out property <string> image-preview-status;
+    in-out property <string> image-preview-token;
+    in-out property <string> image-preview-account-id;
+    in-out property <string> image-preview-room-id;
+    in-out property <bool> image-previews-encrypted-enabled: false;
     callback send-thread-message(string);
     callback open-thread(string, string, string);
     callback close-thread();
@@ -807,6 +825,7 @@ export component AppWindow inherits Window {
     property <int> side-panel-tab: 0;
     in-out property <int> page: 0; // 0 chat, 1 settings, 2 call stage
     changed page => {
+        root.close-image-preview();
         if root.page != 1 {
             root.security-recovery-input = "";
             root.sas-compared = false;
@@ -837,7 +856,7 @@ export component AppWindow inherits Window {
     property <int> composer-focus-request: 0;
 
     in-out property <int> thread-mention-index: 0;
-    out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open;
+    out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open && !root.image-preview-open;
     changed mention-ui-allowed => { if !root.mention-ui-allowed { root.mention-context-changed(); } }
     // Input IDs live inside conditional subtrees; callbacks cross that boundary.
     in-out property <int> composer-caret: -1;
@@ -881,12 +900,12 @@ export component AppWindow inherits Window {
     property <string> login-password;
 
     // A picker snapshot never survives a change of account or Space.
-    changed active-account-local-id => { root.quick-switcher-open = false; root.incoming-call-notice = ""; root.mention-context-changed(); }
+    changed active-account-local-id => { root.close-image-preview(); root.quick-switcher-open = false; root.incoming-call-notice = ""; root.mention-context-changed(); }
     changed active-account-index => { root.quick-switcher-open = false; root.mention-context-changed(); }
-    changed active-room-id => { root.mention-context-changed(); }
-    changed thread-root-id => { root.mention-context-changed(); }
+    changed active-room-id => { root.close-image-preview(); root.mention-context-changed(); }
+    changed thread-root-id => { root.close-image-preview(); root.mention-context-changed(); }
     changed active-space-id => { root.quick-switcher-open = false; }
-    changed show-sign-in => { if !root.show-sign-in { shortcut-scope.focus(); } }
+    changed show-sign-in => { if root.show-sign-in { root.close-image-preview(); } if !root.show-sign-in { shortcut-scope.focus(); } }
 
     property <bool> light-palette: root.theme-mode == 1 || (root.theme-mode == 3 && Palette.color-scheme == ColorScheme.light);
     property <float> text-scale: root.font-scale-percent / 100.0;
@@ -1718,6 +1737,24 @@ export component AppWindow inherits Window {
                                                 accessible-label: message.rich-accessible-body;
                                                 link-clicked(url) => { root.open-message-link(url); }
                                             }
+                                            if message.attachment-is-image && message.event-id != "" : ActionRect {
+                                                height: 67px; border-radius: 10px;
+                                                background: self.has-hover ? root.hover : root.elevated;
+                                                border-width: 1px; border-color: root.divider; focus-color: root.accent;
+                                                label: "Preview image " + message.attachment;
+                                                enabled: root.live-session;
+                                                activated => { root.preview-image-attachment(message.event-id, message.attachment); }
+                                                HorizontalLayout {
+                                                    padding: 11px; spacing: 12px;
+                                                    Rectangle { width: 45px; border-radius: 8px; background: root.panel;
+                                                        Text { text: "▧"; color: root.accent; font-size: 27px; horizontal-alignment: center; vertical-alignment: center; }
+                                                    }
+                                                    VerticalLayout { spacing: 3px;
+                                                        Text { text: message.attachment; color: root.ink; font-size: 12px * root.text-scale; overflow: elide; }
+                                                        Text { text: "Open image · loads only when clicked"; color: root.muted; font-size: 10px * root.text-scale; }
+                                                    }
+                                                }
+                                            }
                                             if message.attachment != "" : Rectangle {
                                                 height: 49px;
                                                 border-radius: 8px;
@@ -2486,6 +2523,17 @@ export component AppWindow inherits Window {
                             }
                         }
                         Rectangle { height: 1px; background: root.divider; }
+                        Text { text: "Image previews"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
+                        Text { text: "Images load only when clicked and stay in memory. Closing the viewer or switching rooms/accounts clears them. PNG and baseline JPEG only; animation, WebP, audio and video previews are not available yet."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                        ActionRect {
+                            height: 40px * root.text-scale; border-radius: 8px; background: self.has-hover ? root.hover : root.elevated;
+                            focus-color: root.accent;
+                            label: "Allow image previews in encrypted rooms";
+                            accessible-checkable: true; accessible-checked: root.image-previews-encrypted-enabled;
+                            activated => { root.set-encrypted-image-previews(!root.image-previews-encrypted-enabled); }
+                            Text { x: 12px; width: parent.width - 24px; text: (root.image-previews-encrypted-enabled ? "✓  " : "□  ") + "Allow previews in encrypted rooms"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; }
+                        }
+                        Rectangle { height: 1px; background: root.divider; }
                         Text { text: "Call audio devices"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Saved for your next call. Your current call keeps its selection until you leave. An unavailable selected device shows an error. System default follows your operating system's audio routing."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         Text { text: "Microphone"; color: root.ink; font-size: 13px * root.text-scale; }
@@ -3210,6 +3258,11 @@ export component AppWindow inherits Window {
                                         accessible-label: reply.rich-accessible-body;
                                         link-clicked(url) => { root.open-message-link(url); }
                                     }
+                                    if reply.attachment-is-image && reply.event-id != "" : Button {
+                                        text: "Preview image"; accessible-label: "Preview image " + reply.attachment;
+                                        enabled: root.live-session;
+                                        clicked => { root.preview-image-attachment(reply.event-id, reply.attachment); }
+                                    }
                                 }
                             }
                         }
@@ -3408,6 +3461,43 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    if root.image-preview-open && root.image-preview-account-id == root.active-account-local-id && root.image-preview-room-id == root.active-room-id : FocusScope {
+        focus-on-tab-navigation: false;
+        init => { image-preview-close.focus(); }
+        capture-key-pressed(event) => {
+            if event.text == Key.Escape { root.dismiss-image-preview(); accept }
+            else if event.text == Key.Tab || event.text == Key.Backtab { image-preview-close.focus(); accept }
+            else { reject }
+        }
+        Rectangle {
+            background: #000000cc;
+            TouchArea { width: parent.width; height: parent.height; }
+            Rectangle {
+                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                width: min(980px, parent.width - 48px); height: min(760px, parent.height - 48px);
+                border-radius: 14px; border-width: 1px; border-color: root.accent; background: root.canvas;
+                accessible-role: region; accessible-label: "Image preview " + root.image-preview-title;
+                VerticalLayout {
+                    padding: 16px; spacing: 12px;
+                    HorizontalLayout {
+                        Text { text: root.image-preview-title; color: root.ink; font-size: 15px * root.text-scale; font-weight: 700; overflow: elide; horizontal-stretch: 1; }
+                        image-preview-close := Button { text: "Close"; accessible-label: "Close image preview"; clicked => { root.dismiss-image-preview(); } }
+                    }
+                    Rectangle {
+                        background: #11131b; vertical-stretch: 1; border-radius: 9px;
+                        if root.image-preview-loaded : Image {
+                            width: parent.width; height: parent.height; source: root.image-preview-image; image-fit: contain;
+                            accessible-role: image; accessible-label: "Attachment " + root.image-preview-title;
+                        }
+                        if !root.image-preview-loaded : Text { text: "▧"; color: root.muted; font-size: 54px; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Text { text: root.image-preview-status; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap;
+                        accessible-label: "Image preview status: " + root.image-preview-status; accessible-live-region: polite; }
                 }
             }
         }

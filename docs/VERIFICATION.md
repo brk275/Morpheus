@@ -5,6 +5,51 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
 ## Current hosted acceptance, 2026-10-11
 
+### ID comparison build failure and image-preview candidate: `7357111`
+
+[Run 38156725671](https://github.com/brk275/Morpheus/actions/runs/38156725671)
+tested `73571113b2cd273fe2b9acd1c0d7cc1c0c66fcc2`. Scope passed 484 helper
+checks with one skip and scanned all 46 reachable commits with zero findings.
+All four native targets completed with the same `E0283` ambiguity at
+`crates/morpheus-matrix/src/lib.rs:4141` in the inherited-mention user-ID filter.
+Their compilation stopped before Rust tests, native preview capture or live
+acceptance. All four complete native logs scanned with zero findings. Every
+native job restored its cache and reported “Cache up-to-date”; no new cache save
+was established. All cache, checkout and completion post-steps finished successfully.
+No native suite passed on this revision, and no installer was uploaded.
+
+The reviewed one-site correction binds explicit `UserId` references. It changes no
+mention targeting or trust rule. Its hosted compilation and all previously
+unexecuted composer/picker and expanded live fixtures remain pending.
+
+The next candidate also adds [native image previews](IMAGE_PREVIEWS.md) for
+explicit attachment clicks in room and thread views. Authenticated Matrix event
+resolution supplies a bounded in-memory download; unknown room encryption fails
+closed, and encrypted room, message or media-source context independently requires
+the default-off TOML/Settings opt-in.
+PNG and single-scan baseline JPEG have pre-header dimension/metadata checks,
+an 8 MiB input limit, 4096-pixel side limit and 4,194,304-pixel limit. One owned
+worker retains its permit through decryption/decoding after cancellation, while
+account/view revocation prevents stale publication. No preview disk cache is
+created. Close/Escape return keyboard focus; programmatic closes do not steal it.
+
+Thirteen new Rust test sources cover decoder pixels and malformed input,
+metadata/allocation guards, ciphertext integrity, streamed size limits, privacy,
+worker ownership, cancellation and stale results. They have not executed. Direct
+rustfmt, private-baseline patch/whitespace checks and a narrow source scan passed;
+independent source review found no remaining concrete blocker. Dependency changes
+add three direct edges to already locked packages without new versions. These
+checks do not establish native, real attachment or accessibility acceptance.
+Animation, progressive JPEG, WebP, SVG, 16-bit PNG, audio/video previews and
+EXIF-orientation/ICC handling remain outside this slice. The beta/release gates
+remain open.
+
+The existing `media_local` selector also adds source-only assertions using a real
+queued original PNG: encrypted/plain room-state checks, encrypted-preview opt-out
+and opt-in byte equality, nonimage and foreign-selection rejection, and plain-image
+opt-out compatibility, within its existing deadline. These unexecuted API checks
+do not verify the app decoder, viewer, keyboard or accessibility behavior.
+
 ### Composer build failure and reviewed follow-up: `56688d0`
 
 [Run 38154958727](https://github.com/brk275/Morpheus/actions/runs/38154958727)

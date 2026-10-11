@@ -6111,6 +6111,7 @@ dependencies = [
  "chrono",
  "directories",
  "futures-util",
+ "image",
  "libc",
  "matrix-sdk",
  "mime_guess",
@@ -6129,6 +6130,8 @@ dependencies = [
  "url",
  "webbrowser",
  "zeroize",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

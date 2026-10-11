@@ -10,6 +10,7 @@ mod call_membership;
 mod calls;
 mod composer_mentions;
 mod drafts;
+mod image_previews;
 #[cfg(feature = "native-calls")]
 mod incoming_ring;
 mod live;
@@ -150,6 +151,7 @@ fn message(
         edit_markdown: false,
         reply_to: reply_to.into(),
         attachment: attachment.into(),
+        attachment_is_image: false,
         reaction: reaction.into(),
         accent,
     }
@@ -751,6 +753,7 @@ fn finish_composer_submission(
 }
 
 fn reset_attachment_view(ui: &AppWindow) {
+    ui.invoke_close_image_preview();
     // A queued upload may continue in its room after navigation. Its event
     // loop update must not repaint the newly selected account or room.
     ui.set_attachment_operation(ui.get_attachment_operation().wrapping_add(1));
@@ -886,6 +889,7 @@ fn apply_notification_settings(ui: &AppWindow, config: &Config) {
 fn apply_config(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
     shortcuts::apply_config(ui, config);
     audio_devices::apply_config(ui, config);
+    image_previews::apply_config(ui, config);
     let mode = match config.appearance.theme {
         ThemeMode::Dark => 0,
         ThemeMode::Light => 1,
@@ -950,6 +954,7 @@ fn save_config_change(
             apply_notification_settings(ui, &config);
             shortcuts::apply_config(ui, &config);
             audio_devices::apply_config(ui, &config);
+            image_previews::apply_config(ui, &config);
             match store.load_theme(&config) {
                 Ok(theme) => apply_loaded_config(
                     ui,
@@ -1518,6 +1523,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     security::register(&ui, live.clone(), runtime.handle().clone());
     let uploads = Arc::new(UploadController::default());
+    let image_previews =
+        image_previews::ImagePreviews::register(&ui, live.clone(), store.clone(), runtime.handle());
     ui.set_native_call_enabled(cfg!(feature = "native-calls"));
     ui.set_native_call_status("Select a room to check call availability".into());
     let update_activity = updater::UpdateActivity::default();
@@ -1825,6 +1832,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         apply_notification_settings(&ui, &config);
                         shortcuts::apply_config(&ui, &config);
                         audio_devices::apply_config(&ui, &config);
+                        image_previews::apply_config(&ui, &config);
                         current_live.voice_spaces.apply_config(&config);
                         match current_store.load_theme(&config) {
                             Ok(theme) => apply_loaded_config(
@@ -2247,6 +2255,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "native-calls")]
     let switch_calls = calls.clone();
     ui.on_switch_account(move |index| {
+        if let Some(ui) = weak.upgrade() {
+            ui.invoke_close_image_preview();
+        }
         if switch_live.is_live.load(Ordering::Acquire) {
             if let Some(window) = weak.upgrade()
                 && security::block_account_change(&window, &switch_live.security_gate)
@@ -2309,6 +2320,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let room_live = live.clone();
     let room_handle = runtime.handle().clone();
     ui.on_open_room(move |room_id| {
+        if let Some(ui) = weak.upgrade() {
+            ui.invoke_close_image_preview();
+        }
         if room_live.is_live.load(Ordering::Acquire) {
             let Some(window) = weak.upgrade() else {
                 return;
@@ -4124,6 +4138,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "native-calls")]
     let logout_calls = calls.clone();
     ui.on_log_out(move || {
+        if let Some(ui) = weak.upgrade() {
+            ui.invoke_close_image_preview();
+        }
         if !logout_live.is_live.load(Ordering::Acquire) {
             if let Some(ui) = weak.upgrade() {
                 ui.set_show_sign_in(true);
@@ -4464,6 +4481,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let ui_result = ui.run();
+    image_previews.shutdown(&ui);
     #[cfg(feature = "native-calls")]
     incoming_calls.shutdown();
     notifications.shutdown();

@@ -12,7 +12,7 @@ use authentication::{PendingSso, StoredSession};
 mod media;
 pub use media::{
     AttachmentKind, AttachmentMetadata, AttachmentSendUpdate, DownloadedAttachment,
-    MAX_ATTACHMENT_BYTES, QueuedAttachment,
+    ImagePreviewDownload, MAX_ATTACHMENT_BYTES, MAX_IMAGE_PREVIEW_BYTES, QueuedAttachment,
 };
 mod discovery;
 pub use discovery::{
@@ -246,6 +246,9 @@ pub struct MessageInfo {
     /// Media URLs and decryption keys never enter the UI projection.
     #[serde(default)]
     pub attachment_name: Option<String>,
+    /// Display hint only; preview download revalidates the actual event kind.
+    #[serde(default)]
+    pub attachment_is_image: bool,
     pub reply_preview: Option<String>,
     pub reaction_summary: String,
     pub timestamp_ms: u64,
@@ -2497,6 +2500,7 @@ fn message_info(item: &TimelineItem) -> Option<MessageInfo> {
         rich_markdown,
         rich_accessible,
         attachment_name: media::attachment_name(message.msgtype()),
+        attachment_is_image: matches!(message.msgtype(), MessageType::Image(_)),
         reply_preview,
         reaction_summary: event
             .reactions()
@@ -4138,7 +4142,10 @@ mod composed_adapter {
             .mentions
             .user_ids
             .iter()
-            .filter(|id| id.as_ref() != room.own_user_id() && !body.contains(id.as_str()))
+            .filter(|id| {
+                let id: &UserId = id.as_ref();
+                id != room.own_user_id() && !body.contains(id.as_str())
+            })
             .collect();
         if hidden.is_empty() {
             return Ok(None);

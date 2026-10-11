@@ -22,7 +22,7 @@ receive and departure in the legacy room-state mode. A stock Element Call v0.28.
 (`Sticky2025`) protocol fixture. Fresh-device native peers passed Current and
 Sticky2025 membership renewal in Linux CI. Fresh-device Element interoperability,
 live remote-frame rendering, packaged-app permissions, and three-platform
-runtime behavior remain unverified. Rich formatting, media previews, full
+runtime behavior remain unverified. Rich formatting, broader media previews, full
 call controls, recovery screens, and platform acceptance tests remain in
 progress. Do not rely on this client for important conversations or
 encryption-key recovery yet. The first beta requires the cross-platform
@@ -30,10 +30,17 @@ checks in [the feature matrix](docs/FEATURE_MATRIX.md).
 
 The composer candidate adds explicit mention selection, typed Plain/Markdown
 drafts, mention-aware replies, threads and edits, and a searchable 44-entry
-starter emoji picker. Its latest hosted build failed on Matrix SDK API mismatches;
-reviewed repairs, new regressions and expanded encrypted fixtures await execution.
+starter emoji picker. The latest hosted builds stopped at an ambiguous user-ID
+comparison before Rust tests; a reviewed one-site repair, new regressions and
+expanded encrypted fixtures await execution.
 Native keyboard, IME and accessibility behavior remain unverified; the starter
 picker does not cover the full Unicode emoji catalog or skin-tone variants.
+
+A native click-to-preview image viewer is now implemented for bounded PNG and
+baseline JPEG attachments in rooms and threads. It keeps preview data in memory
+and leaves encrypted-room previews off by default. Native builds, real attachment
+and accessibility acceptance remain pending; animation, WebP, audio and video
+previews are not supported. See [image preview limits](docs/IMAGE_PREVIEWS.md).
 
 ![Morpheus native desktop preview with fictional accounts](docs/screenshots/desktop.png)
 

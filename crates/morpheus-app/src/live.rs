@@ -1951,6 +1951,7 @@ fn message_item(info: &MessageInfo) -> MessageItem {
         edit_markdown,
         reply_to: info.reply_preview.as_deref().unwrap_or("").into(),
         attachment: info.attachment_name.as_deref().unwrap_or("").into(),
+        attachment_is_image: info.attachment_is_image,
         reaction: info.reaction_summary.as_str().into(),
         accent: accent(&info.sender),
     }
@@ -2076,6 +2077,7 @@ mod member_tests {
             rich_markdown: Some("Visible **bold** text".into()),
             rich_accessible: Some("Visible bold text".into()),
             attachment_name: None,
+            attachment_is_image: false,
             reply_preview: None,
             reaction_summary: String::new(),
             timestamp_ms: 0,
