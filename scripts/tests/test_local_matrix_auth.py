@@ -6,7 +6,9 @@ import http.server
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import ssl
 import stat
 import subprocess
 import sys
@@ -46,7 +48,7 @@ class FakeOpener:
 
 class BrowserTests(unittest.TestCase):
     def setUp(self):
-        self.issuer = "http://127.0.0.1:12001/"
+        self.issuer = "https://127.0.0.1:12001/"
         self.redirect = "http://127.0.0.1:12002/callback"
         self.authorization = self.issuer + "authorize?" + urllib.parse.urlencode({
             "redirect_uri": self.redirect, "state": "fixture-state", "response_type": "code",
@@ -102,12 +104,23 @@ class BrowserTests(unittest.TestCase):
             auth.browser(request, opener=FakeOpener([]))
 
     def test_only_explicit_unambiguous_loopback_urls(self):
-        for value in ("https://127.0.0.1:1234/", "http://localhost:1234/", "http://127.0.0.1/",
+        for value in ("https://localhost:1234/", "http://localhost:1234/", "http://127.0.0.1/",
                       "http://127.0.0.1:0/", "http://127.0.0.1:65536/", "http://127.0.0.1:1234@elsewhere/",
                       "http://user@127.0.0.1:1234/", "http://127.0.0.1:1234\\evil/",
                       "http://127.0.0.1:1234/\n", "file:///tmp/file"):
             with self.subTest(value=value), self.assertRaises(auth.FixtureError):
                 auth.loopback_url(value)
+        self.assertEqual(auth.loopback_url("https://127.0.0.1:1234/").scheme, "https")
+
+    def test_issuer_requires_https_but_native_callback_remains_http(self):
+        cases = [dict(self.request, authorization_url=self.authorization.replace("https:", "http:"),
+                      issuer_url=self.issuer.replace("https:", "http:")),
+                 dict(self.request, redirect_url=self.redirect.replace("http:", "https:"))]
+        for request in cases:
+            opener = FakeOpener([])
+            with self.subTest(request=request), self.assertRaises(auth.FixtureError):
+                auth.browser(request, opener=opener)
+            self.assertEqual(opener.requests, [])
 
     def test_form_requires_exact_csrf_login_contract(self):
         pages = [self.login.replace('method="POST"', 'method="GET"'),
@@ -127,7 +140,9 @@ class BrowserTests(unittest.TestCase):
         self.assertTrue(any(isinstance(handler, auth.urllib.request.HTTPCookieProcessor) for handler in opener.handlers))
         self.assertFalse(any(hasattr(handler, "proxies") and handler.proxies for handler in opener.handlers))
 
-    def test_real_http_cookie_jar_login_consent_and_intercepted_callback(self):
+    @unittest.skipUnless(sys.platform == "linux" and os.environ.get("GITHUB_ACTIONS") == "true",
+                         "real HTTPS cookie flow runs only on the disposable Linux runner")
+    def test_real_https_cookie_jar_login_consent_and_intercepted_callback(self):
         observations = []
         login, consent = self.login, self.consent
 
@@ -179,18 +194,44 @@ class BrowserTests(unittest.TestCase):
             def log_message(self, format, *args):
                 pass
 
-        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            issuer = f"http://127.0.0.1:{server.server_port}/"
-            redirect = issuer + "callback"
+        with tempfile.TemporaryDirectory() as directory:
+            tls = Path(directory)
+            # This isolated helper test trusts only its own leaf certificate;
+            # unlike the actual acceptance fixture it never changes system trust.
+            subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                            "-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1",
+                            "-keyout", str(tls / "key.pem"), "-out", str(tls / "cert.pem")],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=30, check=True, umask=0o077)
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(tls / "cert.pem", tls / "key.pem")
+            server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(thread.join, 3)
+            self.addCleanup(server.shutdown)
+            issuer = f"https://127.0.0.1:{server.server_port}/"
+            redirect = "http://127.0.0.1:12002/callback"
             request = dict(self.request, issuer_url=issuer, redirect_url=redirect,
                            authorization_url=issuer + "authorize?" + urllib.parse.urlencode({
                                "state": "fixture-state", "redirect_uri": redirect,
                            }))
             # Exercise the real urllib opener, redirects and cookie handling.
-            result = auth.browser(request)
+            # The server returns the exact permitted HTTP native callback, but
+            # the driver must intercept it rather than opening that endpoint.
+            original_reply = Handler.reply
+            def reply(handler, **kwargs):
+                if kwargs.get("location", "").startswith("/callback?"):
+                    kwargs["location"] = redirect + "?" + kwargs["location"].split("?", 1)[1]
+                original_reply(handler, **kwargs)
+            opener = auth.urllib.request.build_opener(
+                auth.urllib.request.ProxyHandler({}), auth.NoRedirect(),
+                auth.urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=str(tls / "cert.pem"))),
+                auth.urllib.request.HTTPCookieProcessor(auth.http.cookiejar.CookieJar()))
+            with mock.patch.object(Handler, "reply", reply):
+                result = auth.browser(request, opener=opener)
             self.assertEqual(result, {"callback_url": redirect + "?code=fixture-code&state=fixture-state"})
             self.assertIn(("login-valid", True), observations)
             self.assertIn(("consent-valid", True), observations)
@@ -198,10 +239,6 @@ class BrowserTests(unittest.TestCase):
             self.assertEqual([item for item in observations if item[0] in ("GET", "POST")],
                              [("GET", "/authorize"), ("GET", "/login"), ("POST", "/login"),
                               ("GET", "/consent"), ("POST", "/consent")])
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=3)
 
 
 
@@ -209,7 +246,8 @@ class FixtureTests(unittest.TestCase):
     def test_configuration_is_private_loopback_only_and_uses_generated_keys(self):
         with tempfile.TemporaryDirectory() as directory:
             root = auth.private_directory(Path(directory) / "fixture")
-            account = auth.fixture_configuration(root, "a" * 32, {"postgres": 12000, "mas": 12001, "synapse": 12002})
+            account = auth.fixture_configuration(root, "a" * 32, {"postgres": 12000, "mas": 12001, "synapse": 12002,
+                                                                  "mas_internal": 12003})
             self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o700)
             for path in root.iterdir():
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700 if path.is_dir() else 0o600)
@@ -223,11 +261,19 @@ class FixtureTests(unittest.TestCase):
             self.assertNotIn("uri", mas["database"])
             self.assertEqual(mas["experimental"]["access_token_ttl"], 60)
             self.assertEqual(mas["http"]["listeners"][0]["binds"], [{"host": "127.0.0.1", "port": 12001}])
+            self.assertEqual(mas["http"]["issuer"], "https://127.0.0.1:12001/")
+            self.assertEqual(mas["http"]["public_base"], account["issuer_url"])
+            self.assertEqual(mas["http"]["listeners"][0]["tls"], {
+                "certificate_file": "/fixture/tls/server.crt", "key_file": "/fixture/tls/server.key"})
+            self.assertEqual(mas["http"]["listeners"][1], {
+                "name": "synapse-internal", "binds": [{"host": "127.0.0.1", "port": 12003}],
+                "resources": [{"name": "discovery"}, {"name": "oauth"}]})
             synapse = json.loads((root / "synapse-overlay.json").read_text())
             self.assertEqual(synapse["listeners"][0]["bind_addresses"], ["127.0.0.1"])
             self.assertFalse(synapse["password_config"]["enabled"])
             self.assertFalse(synapse["enable_registration"])
             self.assertTrue(synapse["matrix_authentication_service"]["enabled"])
+            self.assertEqual(synapse["matrix_authentication_service"]["endpoint"], "http://127.0.0.1:12003/")
 
     def test_checkout_root_and_symlink_output_are_rejected(self):
         with self.assertRaises(ValueError):
@@ -266,7 +312,7 @@ class FixtureTests(unittest.TestCase):
             results = [subprocess.CompletedProcess([], 0, (cid + "\n").encode()),
                        subprocess.CompletedProcess([], 0, json.dumps({auth.OWNER_LABEL: "different-owner"}).encode())]
             with mock.patch.object(auth.Docker, "run", side_effect=results) as run:
-                with self.assertRaisesRegex(auth.FixtureError, "unowned"):
+                with self.assertRaisesRegex(auth.FixtureError, "cleanup failed"):
                     auth.down(root)
             self.assertEqual(run.call_count, 2)
             self.assertEqual(run.call_args_list[0].args[-1], "label=" + auth.OWNER_LABEL + "=" + owner)
@@ -336,6 +382,177 @@ class FixtureTests(unittest.TestCase):
         run.assert_called_once_with("synapse.app.homeserver", run_name="__main__")
 
 
+class CertificateTests(unittest.TestCase):
+    def test_missing_or_non_executable_tool_fails_before_fixture_creation(self):
+        for present, executable in ((False, True), (True, False)):
+            with self.subTest(present=present, executable=executable), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / "fixture"
+                with mock.patch.object(auth.sys, "platform", "linux"), \
+                        mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted"}, clear=True), \
+                        mock.patch.object(auth.Path, "is_file", return_value=present), \
+                        mock.patch.object(auth.os, "access", return_value=executable), \
+                        mock.patch.object(auth, "private_command") as run:
+                    with self.assertRaises(auth.FixtureError):
+                        auth.up(root)
+                    run.assert_not_called()
+                self.assertFalse(root.exists())
+
+    def test_non_hosted_and_ambient_trust_overrides_fail_before_commands(self):
+        for env in ({}, {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "self-hosted"},
+                    *({"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted", name: "private-path"}
+                      for name in ("SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"))):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(auth.sys, "platform", "linux"), mock.patch.object(auth, "private_command") as run:
+                with self.assertRaises(auth.FixtureError):
+                    auth.install_certificate(Path("/unused"), {"owner": "a" * 32})
+                run.assert_not_called()
+
+    def test_install_records_exact_public_ca_before_privileged_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = auth.private_directory(Path(directory) / "fixture")
+            trusted_root = Path(directory) / "system-trust"
+            trusted_root.mkdir()
+            state = {"schema": 1, "owner": "a" * 32, "containers": []}
+            commands = []
+
+            def run(_, args):
+                commands.append(args)
+                if args[0] == "/usr/bin/openssl":
+                    for name in ("ca.key", "ca.crt", "server.key", "server.csr", "server.crt"):
+                        auth.write_private(root / "tls" / name, "disposable-" + name)
+                if "/usr/bin/install" in args:
+                    recorded = json.loads((root / auth.STATE_FILE).read_text())
+                    self.assertEqual(recorded["certificate_sha256"], auth.certificate_digest(root / "tls" / "ca.crt"))
+                    self.assertEqual(args[-2:], [str(root / "tls" / "ca.crt"), str(trusted_root / ("morpheus-oauth-" + "a" * 32 + ".crt"))])
+                    raise KeyboardInterrupt("private-interruption")
+
+            with mock.patch.object(auth, "CA_DIRECTORY", trusted_root), \
+                    mock.patch.object(auth, "certificate_preflight"), \
+                    mock.patch.object(auth, "private_command", side_effect=run):
+                with self.assertRaises(KeyboardInterrupt):
+                    auth.install_certificate(root, state)
+            self.assertEqual(len(commands), 4)
+            self.assertEqual((root / auth.STATE_FILE).stat().st_mode & 0o777, 0o600)
+            self.assertTrue(all(path.stat().st_mode & 0o777 == 0o600 for path in (root / "tls").iterdir()))
+
+    def test_cleanup_requires_digest_and_retries_trust_refresh_after_partial_remove(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = auth.private_directory(Path(directory) / "fixture")
+            trusted_root = Path(directory) / "system-trust"
+            trusted_root.mkdir()
+            with mock.patch.object(auth, "CA_DIRECTORY", trusted_root):
+                trusted = auth.trusted_certificate("a" * 32)
+                trusted.write_text("owned-public-certificate")
+                state = {"schema": 1, "owner": "a" * 32, "containers": [],
+                         "certificate_sha256": auth.certificate_digest(trusted)}
+                auth.save_state(root, state)
+
+                def run(_, args):
+                    if "/usr/bin/rm" in args:
+                        trusted.unlink()
+                    else:
+                        raise auth.FixtureError("refresh failed")
+
+                with mock.patch.object(auth, "private_command", side_effect=run):
+                    with self.assertRaises(auth.FixtureError):
+                        auth.remove_certificate(root, state)
+                self.assertIn("certificate_sha256", json.loads((root / auth.STATE_FILE).read_text()))
+                self.assertFalse(trusted.exists())
+                with mock.patch.object(auth, "private_command") as run:
+                    auth.remove_certificate(root, state)
+                run.assert_called_once_with(root, ["/usr/bin/sudo", "--non-interactive", "/usr/bin/timeout",
+                                                  "--signal=TERM", "--kill-after=2s", "20s", auth.CA_UPDATE])
+                self.assertNotIn("certificate_sha256", json.loads((root / auth.STATE_FILE).read_text()))
+
+    def test_cleanup_refuses_changed_or_symlinked_system_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = auth.private_directory(Path(directory) / "fixture")
+            with mock.patch.object(auth, "CA_DIRECTORY", Path(directory)):
+                trusted = auth.trusted_certificate("a" * 32)
+                state = {"owner": "a" * 32, "certificate_sha256": "0" * 64}
+                trusted.write_text("unrelated-public-certificate")
+                for symlink in (False, True):
+                    if symlink:
+                        trusted.unlink()
+                        trusted.symlink_to(root / "absent")
+                    with self.subTest(symlink=symlink), mock.patch.object(auth, "private_command") as run:
+                        with self.assertRaises((auth.FixtureError, OSError)):
+                            auth.remove_certificate(root, state)
+                        run.assert_not_called()
+
+    def test_docker_interrupt_still_attempts_ca_cleanup_and_keeps_evidence(self):
+        for error in (KeyboardInterrupt(), SystemExit(1), auth.FixtureError("private-docker-error")):
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as directory:
+                root = auth.private_directory(Path(directory) / "fixture")
+                state = {"schema": 1, "owner": "a" * 32, "containers": []}
+                auth.save_state(root, state)
+                with mock.patch.object(auth.Docker, "run", side_effect=error), \
+                        mock.patch.object(auth, "remove_certificate") as cleanup:
+                    with self.assertRaises(type(error)):
+                        auth.down(root)
+                    cleanup.assert_called_once_with(root, state)
+                self.assertTrue((root / auth.STATE_FILE).is_file())
+
+    def test_failed_ca_cleanup_keeps_retry_record_after_containers_are_removed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = auth.private_directory(Path(directory) / "fixture")
+            state = {"schema": 1, "owner": "a" * 32, "containers": [], "certificate_sha256": "b" * 64}
+            auth.save_state(root, state)
+            with mock.patch.object(auth.Docker, "run", return_value=subprocess.CompletedProcess([], 0, b"")), \
+                    mock.patch.object(auth, "remove_certificate", side_effect=auth.FixtureError("private-error")):
+                with self.assertRaises(auth.FixtureError):
+                    auth.down(root)
+            self.assertEqual(json.loads((root / auth.STATE_FILE).read_text()), state)
+
+    def test_docker_cleanup_budget_reserves_time_for_certificate_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = auth.private_directory(Path(directory) / "fixture")
+            state = {"schema": 1, "owner": "a" * 32, "containers": []}
+            auth.save_state(root, state)
+            # No Docker command is started after its cleanup budget expires;
+            # the certificate cleanup is still attempted and evidence retained.
+            with mock.patch.object(auth.time, "monotonic", side_effect=[100, 146]), \
+                    mock.patch.object(auth.Docker, "run") as docker, \
+                    mock.patch.object(auth, "remove_certificate") as cleanup:
+                with self.assertRaises(auth.FixtureError):
+                    auth.down(root)
+                docker.assert_not_called()
+                cleanup.assert_called_once_with(root, state)
+            self.assertTrue(root.exists())
+
+    def test_privileged_watchdog_is_inside_sudo_with_group_signals(self):
+        with mock.patch.object(auth, "private_command") as run:
+            auth.privileged_command(Path("/private/fixture"), [auth.CA_UPDATE])
+        run.assert_called_once_with(Path("/private/fixture"), [
+            "/usr/bin/sudo", "--non-interactive", "/usr/bin/timeout", "--signal=TERM",
+            "--kill-after=2s", "20s", auth.CA_UPDATE])
+        self.assertNotIn("--foreground", run.call_args.args[1])
+
+    def test_interruption_waits_for_retained_command_before_returning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process = mock.Mock()
+            process.wait.side_effect = [KeyboardInterrupt("private-value"), 0]
+            with mock.patch.object(auth.subprocess, "Popen", return_value=process) as spawn, \
+                    mock.patch.object(auth.time, "monotonic", side_effect=[100, 100, 105]):
+                with self.assertRaises(KeyboardInterrupt):
+                    auth.private_command(Path(directory), ["/usr/bin/sudo", "private-test-arguments"])
+            self.assertTrue(spawn.call_args.kwargs["start_new_session"])
+            self.assertEqual(process.wait.call_args_list, [mock.call(timeout=30), mock.call(timeout=25)])
+            process.kill.assert_not_called()
+
+    def test_python_timeout_never_uses_unbounded_reap_or_formats_arguments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            process = mock.Mock()
+            process.wait.side_effect = [subprocess.TimeoutExpired(["private-argument"], 30), 0]
+            with mock.patch.object(auth.subprocess, "Popen", return_value=process), \
+                    mock.patch.object(auth.time, "monotonic", side_effect=[100, 100]):
+                with self.assertRaises(auth.FixtureError) as error:
+                    auth.private_command(Path(directory), ["private-argument"])
+            process.kill.assert_called_once_with()
+            self.assertEqual(process.wait.call_args_list, [mock.call(timeout=30), mock.call(timeout=3)])
+            self.assertNotIn("private-argument", str(error.exception))
+
+
 class CliDiagnosticsTests(unittest.TestCase):
     def invoke(self, arguments, *, stdin=b""):
         stdout, stderr = io.StringIO(), io.StringIO()
@@ -399,7 +616,9 @@ class CliDiagnosticsTests(unittest.TestCase):
                 # No sockets, Docker or services: fail at the first vendor
                 # configuration operation, then exercise up's actual cleanup.
                 with mock.patch.object(auth.sys, "platform", "linux"), \
+                        mock.patch.object(auth, "certificate_preflight"), \
                         mock.patch.object(auth, "PortReservations") as ports, \
+                        mock.patch.object(auth, "install_certificate"), \
                         mock.patch.object(auth, "fixture_configuration", return_value={}), \
                         mock.patch.object(auth, "one_shot", side_effect=RuntimeError("private-vendor-output")), \
                         mock.patch.object(auth, "down", side_effect=cleanup):
@@ -420,8 +639,8 @@ class CliDiagnosticsTests(unittest.TestCase):
 
     def test_real_browser_state_machine_reports_login_consent_and_callback_failures(self):
         redirect = "http://127.0.0.1:12002/callback"
-        request = {"issuer_url": "http://127.0.0.1:12001/", "redirect_url": redirect,
-                   "authorization_url": "http://127.0.0.1:12001/authorize?" + urllib.parse.urlencode({
+        request = {"issuer_url": "https://127.0.0.1:12001/", "redirect_url": redirect,
+                   "authorization_url": "https://127.0.0.1:12001/authorize?" + urllib.parse.urlencode({
                        "redirect_uri": redirect, "state": "fixture-state",
                    }), "username": "fixture-user", "password": "private-password"}
         login = '<form method="POST"><input name="csrf" value="fixture-csrf">' \

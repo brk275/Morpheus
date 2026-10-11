@@ -111,6 +111,24 @@ class WaylandFixtureTests(unittest.TestCase):
             self.assertNotIn(private, MODULE.json.dumps(facts))
         self.assertEqual(MODULE.capture_test_facts("", None)["command"], "timed_out")
 
+    def test_reopen_pixel_failures_are_fixed_facts_without_source_or_command_data(self):
+        facts = MODULE.capture_test_facts(
+            "selected display did not deliver fresh expected pixels\n"
+            "fixture pixel animation failed: private source, socket and command\n"
+            "cannot change acceptance output: private argument\n",
+            101, "first_frame_2",
+        )
+        self.assertTrue(facts["fresh_pixels_timeout"])
+        self.assertTrue(facts["pixel_animation_failed"])
+        self.assertTrue(facts["output_command_failed"])
+        self.assertEqual(facts["last_stage"], "first_frame_2")
+        self.assertFalse(facts["required_test_passed"])
+        for private in ("private", "socket", "argument", "source,"):
+            self.assertNotIn(private, MODULE.json.dumps(facts))
+        clean = MODULE.capture_test_facts("", 0)
+        for key in ("fresh_pixels_timeout", "pixel_animation_failed", "output_command_failed"):
+            self.assertFalse(clean[key])
+
     def test_capture_evidence_requires_actual_named_test_and_one_pass(self):
         target = f"test {MODULE.TARGET_TEST} ... ok\n"
         summary = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n"

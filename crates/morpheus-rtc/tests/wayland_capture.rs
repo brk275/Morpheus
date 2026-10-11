@@ -8,7 +8,9 @@ use std::{
     ffi::{CStr, c_void},
     os::unix::fs::MetadataExt,
     path::Path,
-    process::Command,
+    process::{Child, Command, Stdio},
+    sync::mpsc,
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -146,21 +148,130 @@ fn center_chroma(frame: &I420Buffer) -> (u8, u8) {
     )
 }
 
-fn output(arguments: &[&str]) {
-    let result = Command::new("swaymsg")
-        .args(arguments)
-        .output()
-        .expect("swaymsg unavailable");
-    assert!(result.status.success(), "cannot change acceptance output");
-    let value: serde_json::Value =
-        serde_json::from_slice(&result.stdout).expect("invalid sway reply");
-    assert!(
-        value
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|item| item["success"] == true)
+struct OutputCommand(Child);
+
+impl Drop for OutputCommand {
+    fn drop(&mut self) {
+        // No other code reaps this child. Child retains its exit status after
+        // try_wait, so kill cannot target a reused PID after observed exit.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn change_output(arguments: &[&str]) -> Result<(), &'static str> {
+    // Sway 1.9's quiet mode still returns a failure status for an unsuccessful
+    // IPC command. Do not collect arbitrary output or inherit a terminal.
+    let mut command = OutputCommand(
+        Command::new("/usr/bin/swaymsg")
+            .arg("--quiet")
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| "fixture output command could not start")?,
     );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(status) = command
+            .0
+            .try_wait()
+            .map_err(|_| "fixture output command wait failed")?
+        {
+            return if status.success() {
+                Ok(())
+            } else {
+                Err("fixture output command failed")
+            };
+        }
+        if Instant::now() >= deadline {
+            return Err("fixture output command deadline");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn output(arguments: &[&str]) {
+    change_output(arguments).expect("cannot change acceptance output");
+}
+
+struct SourceAnimation {
+    stop: mpsc::Sender<()>,
+    worker: Option<JoinHandle<Result<(), &'static str>>>,
+}
+
+impl SourceAnimation {
+    fn start(colors: [&'static str; 2]) -> Self {
+        let (stop, receiver) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let mut index = 0;
+            loop {
+                // xdpw 0.7.1 uses copy_with_damage on a shared screencopy
+                // manager. Keep supplying owned damage during negotiation;
+                // a single transition can be consumed by a closing session.
+                change_output(&["output", "HEADLESS-2", "bg", colors[index], "solid_color"])?;
+                match receiver.recv_timeout(Duration::from_millis(250)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                if Instant::now() >= deadline {
+                    return Err("fixture pixel animation deadline");
+                }
+                index ^= 1;
+            }
+        });
+        Self {
+            stop,
+            worker: Some(worker),
+        }
+    }
+
+    fn stop(&mut self) -> Result<(), &'static str> {
+        let _ = self.stop.send(());
+        self.worker.take().map_or(Ok(()), |worker| {
+            worker
+                .join()
+                .map_err(|_| "fixture pixel animation panicked")?
+        })
+    }
+}
+
+impl Drop for SourceAnimation {
+    fn drop(&mut self) {
+        // Also stop and join when the capture assertion unwinds. Each owned
+        // swaymsg command has a deadline and is killed/reaped on error.
+        let _ = self.stop();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ExpectedColor {
+    Green,
+    Yellow,
+}
+
+fn wait_for_selected_pixels(capture: &ScreenCapture, color: ExpectedColor) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let frame = capture
+            .next_frame_sized(320, 180)
+            .expect("first PipeWire frame");
+        let (u, v) = center_chroma(&frame.buffer);
+        let matches = match color {
+            ExpectedColor::Green => u < 110 && v < 110,
+            ExpectedColor::Yellow => u < 85 && (115..155).contains(&v),
+        };
+        if matches {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "selected display did not deliver fresh expected pixels"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[test]
@@ -206,19 +317,29 @@ fn wayland_selected_display_streams_changes_and_stops() {
         } else {
             "first_frame_2"
         });
-        let frame = capture
-            .next_frame_sized(320, 180)
-            .expect("first PipeWire frame");
+        if iteration == 0 {
+            let frame = capture
+                .next_frame_sized(320, 180)
+                .expect("first PipeWire frame");
+            let (u, v) = center_chroma(&frame.buffer);
+            assert!(
+                v as i16 - u as i16 > 40,
+                "selected red HEADLESS-2 was not captured"
+            );
+        } else {
+            let mut animation = SourceAnimation::start(["#20f020", "#10d010"]);
+            wait_for_selected_pixels(&capture, ExpectedColor::Green);
+            // A failed animator must not be accepted merely because an older
+            // frame happened to match. Check the joined worker before success.
+            animation.stop().expect("fixture pixel animation failed");
+        }
         stage(if iteration == 0 {
             "checking_pixels_1"
         } else {
             "checking_pixels_2"
         });
-        let (u, v) = center_chroma(&frame.buffer);
-        assert!(
-            v as i16 - u as i16 > 40,
-            "selected red HEADLESS-2 was not captured"
-        );
+        // The stop budget measures the native session, after the fixture
+        // animation has stopped and joined.
         let started = Instant::now();
         stage(if iteration == 0 {
             "stopping_display_1"
@@ -235,9 +356,11 @@ fn wayland_selected_display_streams_changes_and_stops() {
     stage("reopening_display");
     let capture = ScreenCapture::open_key("portal:monitor").expect("portal reopen");
     stage("reopen_frame");
-    capture.next_frame_sized(320, 180).expect("initial frame");
+    let mut animation = SourceAnimation::start(["#f0f020", "#d0d010"]);
+    wait_for_selected_pixels(&capture, ExpectedColor::Yellow);
+    animation.stop().expect("fixture pixel animation failed");
     stage("changing_source");
-    output(&["output", "HEADLESS-2", "bg", "#20f020", "solid_color"]);
+    output(&["output", "HEADLESS-2", "bg", "#f020f0", "solid_color"]);
     let deadline = Instant::now() + Duration::from_secs(8);
     stage("awaiting_changed_frame");
     loop {
@@ -245,7 +368,7 @@ fn wayland_selected_display_streams_changes_and_stops() {
             .next_frame_sized(320, 180)
             .expect("continuous PipeWire frame");
         let (u, v) = center_chroma(&frame.buffer);
-        if u < 110 && v < 110 {
+        if u > 160 && v > 160 {
             break;
         }
         assert!(
@@ -264,7 +387,7 @@ fn wayland_selected_display_streams_changes_and_stops() {
             Ok(frame) => {
                 let (u, v) = center_chroma(&frame.buffer);
                 assert!(
-                    u < 110 && v < 110,
+                    u > 160 && v > 160,
                     "capture silently changed to another display"
                 );
             }
@@ -302,6 +425,6 @@ fn wayland_selected_display_streams_changes_and_stops() {
     );
     stage("complete");
     println!(
-        "Wayland portal acceptance: selected display, continuous pixels, repeated start/stop, source departure, denial and cancellation passed; native-window/GNOME/KDE remain separate gates."
+        "Wayland portal acceptance: first static frame, distinct moving pixels on reopen, repeated start/stop, source departure, denial and cancellation passed; untouched-static reopen/native-window/GNOME/KDE remain separate gates."
     );
 }

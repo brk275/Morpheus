@@ -5,7 +5,7 @@
 Stderr contains fixed-enum progress/failure markers, never service diagnostics.
 ``down``
 removes this fixture's labelled containers, then its private data. ``browser``
-drives the pinned MAS login/consent forms over HTTP, using JSON on stdin/stdout.
+drives the pinned MAS login/consent forms over HTTPS, using JSON on stdin/stdout.
 It tests the browser protocol, not an actual browser window or desktop launch.
 """
 
@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 from enum import Enum
+import hashlib
 import http.client
 import http.cookiejar
 from html.parser import HTMLParser
@@ -24,6 +25,7 @@ import re
 import secrets
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -43,12 +45,15 @@ OWNER_LABEL = "io.github.brk275.morpheus.oauth-fixture"
 STATE_FILE = "oauth-owner.json"
 FIXTURE_FILE = "oauth-accounts.json"
 MAX_BODY = 1024 * 1024
+CA_DIRECTORY = Path("/usr/local/share/ca-certificates")
+CA_UPDATE = "/usr/sbin/update-ca-certificates"
 
 
 class Stage(str, Enum):
     ROOT = "fixture_root"
     PORTS = "ports"
     CONFIGURATION = "configuration"
+    CERTIFICATE = "certificate"
     MAS_CONFIG = "mas_config"
     SYNAPSE_CONFIG = "synapse_config"
     MERGE_CONFIG = "merge_config"
@@ -129,13 +134,133 @@ class Docker:
         return result
 
 
+def private_command(root: Path, args: list[str]):
+    """Bounded certificate tooling; output never leaves the private fixture."""
+    log = root / ("certificate-" + secrets.token_hex(8) + ".log")
+    try:
+        with private_output(log) as output:
+            process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=output,
+                                       stderr=subprocess.STDOUT, start_new_session=True, umask=0o077)
+            deadline = time.monotonic() + 30
+            interrupted = None
+            while True:
+                try:
+                    status = process.wait(timeout=max(0, deadline - time.monotonic()))
+                    break
+                except (KeyboardInterrupt, SystemExit) as error:
+                    # Do not let up/down start a competing trust operation
+                    # while this retained sudo handle still owns its command.
+                    # The separate session avoids inherited terminal signals.
+                    interrupted = interrupted or error
+                except subprocess.TimeoutExpired:
+                    # Privileged commands have their own 20s+2s watchdog;
+                    # killing only sudo here is never their containment policy.
+                    process.kill()
+                    process.wait(timeout=3)
+                    raise FixtureError("OAuth fixture certificate command timed out") from None
+            if interrupted is not None:
+                raise interrupted
+    except (OSError, subprocess.SubprocessError):
+        raise FixtureError("OAuth fixture certificate command could not complete") from None
+    if status:
+        raise FixtureError("OAuth fixture certificate command failed")
+
+
+def privileged_command(root: Path, args: list[str]):
+    # GNU timeout runs with the same privilege as the trusted system command,
+    # so its process-group TERM/KILL also reaches update-ca-certificates hooks.
+    # No --foreground: that option would disable descendant group signalling.
+    private_command(root, ["/usr/bin/sudo", "--non-interactive", "/usr/bin/timeout",
+                           "--signal=TERM", "--kill-after=2s", "20s", *args])
+
+
+def certificate_digest(path: Path) -> str:
+    # Never follow a replaced symlink while deciding which system trust entry
+    # this fixture owns. The contents are public certificates, not private keys.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd, "rb") as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise FixtureError("OAuth fixture certificate is not a regular file")
+        content = source.read(MAX_BODY + 1)
+    if not content or len(content) > MAX_BODY:
+        raise FixtureError("OAuth fixture certificate has an invalid size")
+    return hashlib.sha256(content).hexdigest()
+
+
+def trusted_certificate(owner: str) -> Path:
+    if not isinstance(owner, str) or not re.fullmatch(r"[0-9a-f]{32}", owner):
+        raise FixtureError("OAuth fixture certificate owner is invalid")
+    return CA_DIRECTORY / ("morpheus-oauth-" + owner + ".crt")
+
+
+def certificate_preflight():
+    # Refuse before creating ownership/key material if these ordinary runner
+    # tools are absent. No package installation or paid runner upgrade is needed.
+    if (sys.platform != "linux" or os.environ.get("GITHUB_ACTIONS") != "true"
+            or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"):
+        raise FixtureError("OAuth fixture trust requires a disposable hosted Linux runner")
+    if any(name in os.environ for name in ("SSL_CERT_FILE", "SSL_CERT_DIR", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")):
+        raise FixtureError("OAuth fixture requires ordinary system certificate trust")
+    for name in ("/usr/bin/openssl", CA_UPDATE, "/usr/bin/sudo", "/usr/bin/timeout", "/usr/bin/install", "/usr/bin/rm"):
+        if not Path(name).is_file() or not os.access(name, os.X_OK):
+            raise FixtureError("OAuth fixture certificate tooling is unavailable")
+
+
+def install_certificate(root: Path, state: dict):
+    # System trust changes belong only to this disposable hosted fixture. The
+    # actual SDK and urllib clients retain their ordinary certificate validation.
+    certificate_preflight()
+    tls = private_directory(root / "tls")
+    run = lambda args: private_command(root, args)
+    run(["/usr/bin/openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+         "-subj", "/CN=Morpheus disposable OAuth QA CA", "-keyout", str(tls / "ca.key"),
+         "-out", str(tls / "ca.crt"), "-addext", "basicConstraints=critical,CA:TRUE",
+         "-addext", "keyUsage=critical,keyCertSign,cRLSign"])
+    run(["/usr/bin/openssl", "req", "-new", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=127.0.0.1",
+         "-keyout", str(tls / "server.key"), "-out", str(tls / "server.csr")])
+    write_private(tls / "server.ext", "subjectAltName=IP:127.0.0.1\nbasicConstraints=critical,CA:FALSE\n"
+                  "extendedKeyUsage=serverAuth\nkeyUsage=critical,digitalSignature,keyEncipherment\n", create=True)
+    run(["/usr/bin/openssl", "x509", "-req", "-in", str(tls / "server.csr"), "-CA", str(tls / "ca.crt"),
+         "-CAkey", str(tls / "ca.key"), "-CAcreateserial", "-days", "1", "-out", str(tls / "server.crt"),
+         "-extfile", str(tls / "server.ext")])
+    for path in tls.iterdir():
+        path.chmod(0o600)
+    trusted = trusted_certificate(state["owner"])
+    if trusted.exists() or trusted.is_symlink():
+        raise FixtureError("OAuth fixture refused an existing system trust entry")
+    # Persist the exact certificate identity BEFORE sudo can copy it. A separate
+    # down process can therefore clean up interrupted install/refresh commands.
+    state["certificate_sha256"] = certificate_digest(tls / "ca.crt")
+    save_state(root, state)
+    privileged_command(root, ["/usr/bin/install", "-m", "644", str(tls / "ca.crt"), str(trusted)])
+    privileged_command(root, [CA_UPDATE])
+
+
+def remove_certificate(root: Path, state: dict):
+    expected = state.get("certificate_sha256")
+    if expected is None:
+        return
+    if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise FixtureError("OAuth fixture certificate ownership is invalid")
+    trusted = trusted_certificate(state["owner"])
+    if trusted.exists() or trusted.is_symlink():
+        if certificate_digest(trusted) != expected:
+            raise FixtureError("OAuth fixture refused an unowned system trust entry")
+        privileged_command(root, ["/usr/bin/rm", "--", str(trusted)])
+    # Run even after a prior partial cleanup removed the source file: generated
+    # trust links/bundle may still contain the CA until refresh succeeds.
+    privileged_command(root, [CA_UPDATE])
+    del state["certificate_sha256"]
+    save_state(root, state)
+
+
 class PortReservations:
     """Hold all chosen loopback ports until their individual services start."""
 
     def __init__(self):
         self.sockets: dict[str, socket.socket] = {}
         try:
-            for name in ("postgres", "synapse", "mas"):
+            for name in ("postgres", "synapse", "mas", "mas_internal"):
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.sockets[name] = sock
                 sock.bind(("127.0.0.1", 0))
@@ -158,7 +283,8 @@ class PortReservations:
 
 def fixture_configuration(root: Path, nonce: str, ports: dict[str, int]) -> dict:
     """Write secrets and explicit loopback overlays for generated vendor config."""
-    mas_url = f"http://127.0.0.1:{ports['mas']}/"
+    mas_url = f"https://127.0.0.1:{ports['mas']}/"
+    mas_internal_url = f"http://127.0.0.1:{ports['mas_internal']}/"
     synapse_url = f"http://127.0.0.1:{ports['synapse']}"
     server_name = f"localhost:{ports['synapse']}"
     shared_secret = secrets.token_hex(32)
@@ -174,8 +300,13 @@ def fixture_configuration(root: Path, nonce: str, ports: dict[str, int]) -> dict
         "http": {
             "public_base": mas_url, "issuer": mas_url, "trusted_proxies": [],
             "listeners": [{"name": "fixture", "binds": [{"host": "127.0.0.1", "port": ports["mas"]}],
+                           "tls": {"certificate_file": "/fixture/tls/server.crt", "key_file": "/fixture/tls/server.key"},
                            "resources": [{"name": name} for name in
-                                         ("discovery", "human", "oauth", "compat", "assets", "health")]}],
+                                         ("discovery", "human", "oauth", "compat", "assets", "health")]},
+                          # Synapse derives both its metadata and introspection
+                          # URLs from this private endpoint, not the public issuer.
+                          {"name": "synapse-internal", "binds": [{"host": "127.0.0.1", "port": ports["mas_internal"]}],
+                           "resources": [{"name": "discovery"}, {"name": "oauth"}]}],
         },
         "database": {"host": "127.0.0.1", "port": ports["postgres"], "username": "mas",
                      "database": "mas", "password_file": "/fixture/postgres.secret",
@@ -194,7 +325,7 @@ def fixture_configuration(root: Path, nonce: str, ports: dict[str, int]) -> dict
                        "resources": [{"names": ["client"], "compress": False}]}],
         "database": {"name": "sqlite3", "args": {"database": "/fixture/synapse/homeserver.db"}},
         "media_store_path": "/fixture/synapse/media", "trusted_key_servers": [],
-        "matrix_authentication_service": {"enabled": True, "endpoint": mas_url,
+        "matrix_authentication_service": {"enabled": True, "endpoint": mas_internal_url,
                                           "secret_path": "/fixture/mas-synapse.secret"},
         # No outbound federation or URL-preview traffic belongs to this fixture.
         "federation_domain_whitelist": [], "url_preview_enabled": False,
@@ -311,6 +442,7 @@ def up(root: Path) -> Path:
     set_stage(Stage.ROOT)
     if sys.platform != "linux":
         raise FixtureError("OAuth fixture services require Linux Docker host networking")
+    certificate_preflight()
     root = external_path(root)
     if root.exists() and any(root.iterdir()):
         raise FixtureError("OAuth fixture requires a fresh empty private directory")
@@ -322,6 +454,8 @@ def up(root: Path) -> Path:
     reservations = PortReservations()
     try:
         ports = reservations.ports()
+        set_stage(Stage.CERTIFICATE)
+        install_certificate(root, state)
         set_stage(Stage.CONFIGURATION)
         account = fixture_configuration(root, state["owner"], ports)
         set_stage(Stage.MAS_CONFIG)
@@ -371,6 +505,7 @@ def up(root: Path) -> Path:
         mas = create_container(docker, state, "mas", MAS_IMAGE,
                                ["--config", "/fixture/mas.yaml", "server"], network="host")
         reservations.release("mas")
+        reservations.release("mas_internal")
         docker.run("start", mas)
         set_stage(Stage.MAS_READY)
         wait_ready(account["issuer_url"] + ".well-known/openid-configuration",
@@ -413,18 +548,41 @@ def down(root: Path, *, remove_data: bool = True):
     except (OSError, ValueError, KeyError, TypeError):
         raise FixtureError("OAuth fixture ownership record is missing or invalid") from None
     docker = Docker(root)
-    # Reconcile the exact nonce label to recover interrupted docker create calls.
-    found = docker.run("ps", "--all", "--quiet", "--no-trunc", "--filter", "label=" + OWNER_LABEL + "=" + owner)
-    ids = found.stdout.decode().split()
-    for cid in reversed(ids):
-        if not re.fullmatch(r"[0-9a-f]{64}", cid):
-            raise FixtureError("OAuth fixture cleanup received an invalid container identity")
-        result = docker.run("inspect", "--format", "{{json .Config.Labels}}", cid)
-        if json.loads(result.stdout).get(OWNER_LABEL) != owner:
-            raise FixtureError("OAuth fixture cleanup refused an unowned container")
-        # --volumes also removes anonymous volumes declared by the pinned image;
-        # bind-mounted data is removed below, and no unrelated volume is touched.
-        docker.run("rm", "--force", "--volumes", cid)
+    cleanup_error = None
+    # Leave at least 60s for the two bounded CA-removal commands before the
+    # parent's 120s cleanup deadline, even when Docker is unresponsive.
+    docker_deadline = time.monotonic() + 45
+
+    def cleanup_run(*args):
+        remaining = docker_deadline - time.monotonic()
+        if remaining <= 0:
+            raise FixtureError("OAuth fixture container cleanup deadline expired")
+        return docker.run(*args, timeout=min(10, remaining))
+    # Attempt CA removal even when Docker fails; retain all ownership evidence
+    # if either cleanup fails so another down invocation can retry safely.
+    try:
+        found = cleanup_run("ps", "--all", "--quiet", "--no-trunc", "--filter", "label=" + OWNER_LABEL + "=" + owner)
+        ids = found.stdout.decode().split()
+        for cid in reversed(ids):
+            try:
+                if not re.fullmatch(r"[0-9a-f]{64}", cid):
+                    raise FixtureError("OAuth fixture cleanup received an invalid container identity")
+                result = cleanup_run("inspect", "--format", "{{json .Config.Labels}}", cid)
+                if json.loads(result.stdout).get(OWNER_LABEL) != owner:
+                    raise FixtureError("OAuth fixture cleanup refused an unowned container")
+                cleanup_run("rm", "--force", "--volumes", cid)
+            except BaseException as error:
+                cleanup_error = cleanup_error or error
+    except BaseException as error:
+        cleanup_error = cleanup_error or error
+    try:
+        remove_certificate(root, state)
+    except BaseException as error:
+        cleanup_error = cleanup_error or error
+    if isinstance(cleanup_error, (KeyboardInterrupt, SystemExit)):
+        raise cleanup_error
+    if cleanup_error is not None:
+        raise FixtureError("OAuth fixture owned-resource cleanup failed")
     if remove_data:
         shutil.rmtree(root)
 
@@ -433,14 +591,14 @@ def loopback_url(value: str) -> urllib.parse.SplitResult:
     try:
         parsed = urllib.parse.urlsplit(value)
         valid = (isinstance(value, str) and not any(ord(c) < 33 for c in value)
-                 and "\\" not in value and parsed.scheme == "http"
+                 and "\\" not in value and parsed.scheme in ("http", "https")
                  and parsed.hostname == "127.0.0.1" and parsed.port is not None
                  and parsed.port > 0 and parsed.username is None and parsed.password is None)
         if valid:
             return parsed
     except (ValueError, TypeError, AttributeError):
         pass
-    raise FixtureError("OAuth form driver requires explicit HTTP loopback URLs")
+    raise FixtureError("OAuth form driver requires explicit HTTP(S) loopback URLs")
 
 
 def origin(value: str) -> tuple[str, str, int]:
@@ -497,7 +655,8 @@ def browser(request: dict, *, opener=None) -> dict:
     redirect = request["redirect_url"]
     issuer = request["issuer_url"]
     auth_parts, redirect_parts = loopback_url(authorization), loopback_url(redirect)
-    if auth_parts.fragment or redirect_parts.query or redirect_parts.fragment or origin(authorization) != origin(issuer):
+    if (auth_parts.scheme != "https" or redirect_parts.scheme != "http" or auth_parts.fragment
+            or redirect_parts.query or redirect_parts.fragment or origin(authorization) != origin(issuer)):
         raise FixtureError("OAuth form driver received an invalid authorization target")
     query = urllib.parse.parse_qs(auth_parts.query, strict_parsing=True)
     if query.get("redirect_uri") != [redirect] or len(query.get("state", [])) != 1 or not query["state"][0]:

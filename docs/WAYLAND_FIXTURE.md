@@ -103,6 +103,8 @@ with unmodified distribution backends, GNOME, KDE, native-window sharing,
 physical displays, hardware buffers, or packaged permission behavior. Those
 remain separate release gates. Morpheus itself continues to use the user's
 system portal; this CI backend is never shipped or used as an app fallback.
+Repeated capture currently supplies changing fixture pixels; reopening an
+untouched static source remains a separate open gate, as explained below.
 
 On failure, the app reports the portal phase using fixed, local messages. The
 helper emits only allowlisted boolean facts and fixed service-state values
@@ -186,3 +188,45 @@ This corrects an omitted public API step. The retained `db25e42` evidence cannot
 prove it was the sole cause of the deadline, and the corrected candidate still
 requires hosted compilation and actual frame acceptance. The pinned fixture
 backend, its SHM adaptation, and all other platform capture paths are unchanged.
+
+## Damage-driven reopen fixture
+
+Candidate `3f1a3df`, run `38115477988`, passed the first selected red frame and
+its stop budget, then timed out at `first_frame_2`. The second consumer had
+accepted its format, allocated buffers and reached streaming, but had no process
+callback. All five services stayed running and all 33 library bindings passed.
+Producer readiness/enqueue facts aggregate all sessions, so they do not establish
+that the second producer delivered a frame.
+
+The pinned xdpw backend calls
+[`copy_with_damage`](https://github.com/emersion/xdg-desktop-portal-wlr/blob/74428f2a8fa7f252e2a46fdf5b697536c66c8a1c/src/screencast/wlr_screencast.c#L178)
+through its persistent screencopy manager. This protocol request waits for
+changed output pixels. The hosted job installed Sway `1.9-1build2` and wlroots
+`0.17.1-2.1build1`. Its
+[Ubuntu source archive](https://archive.ubuntu.com/ubuntu/pool/universe/w/wlroots/wlroots_0.17.1-2.1build1.dsc)
+identifies the reviewed `types/wlr_screencopy_v1.c`, whose SHA-256 is
+`1b862fab88ec313ba9e60edc6e2188046051e13d3e4335a66bbeb350b20bfe6d`.
+That implementation keeps damage per manager client/output, clears it after
+delivery, and waits if a later `copy_with_damage` has no new damage. Ubuntu's
+single downstream patch changes layer-shell, not screencopy. Reopening the
+same unchanged red output therefore need not immediately produce another frame.
+This is a source-backed explanation consistent with the retained facts, not a
+claim that deleted per-session raw logs proved the precise timeout cause.
+
+The fixture retains the first static red frame assertion. On the second open it
+alternates two green brightnesses; on the third it alternates two yellow
+brightnesses. Each newly opened capture must produce its distinct expected
+chroma. A prior red/green frame, or the unselected blue display, cannot satisfy
+those assertions. Repeated changes during negotiation avoid one change being
+consumed by the preceding producer as it shuts down. Each animator is bounded
+to 20 seconds, each quiet `swaymsg` child to two seconds, and the owning worker
+is stopped and joined before accepting success or measuring native stop time.
+Child errors remain fixed categories; pixels and IPC payloads are not recorded.
+Panic cleanup also stops/joins the worker and kills/reaps its owned command.
+
+After the third capture, animation stops and a separate magenta change must
+arrive before the existing source-loss, no-silent-switch, denial and cancellation
+checks. Production capture code and the pinned backend adaptation are unchanged.
+This is stronger evidence of fresh moving pixels across independent sessions;
+it does **not** resolve or validate an untouched static source on reopen.
+That backend/product behavior and actual hosted success remain open checks.

@@ -97,3 +97,14 @@ layout or native capture; the hosted preflight and exact native test supply
 that platform evidence. Changes to dedicated fixture files select only
 Windows. Shared workflow/scope or native changes retain the full supported
 platform matrix under `AGENTS.md`.
+
+## Hosted result, 2026-10-11
+
+[Run 38115477988](https://github.com/brk275/Morpheus/actions/runs/38115477988),
+Windows job `114399448857`, tested
+`3f1a3df4a1ed4ad125504d5c7d8daf45ae8b7dcb` and reported
+`{"passed": true, "stage": "complete"}`. The final job passed, including the
+owned-process preflight and the exact capture test described above. Its final
+log passed credential scanning with zero findings, and the cache post-step
+completed. No installer or screenshot was uploaded. The physical-device,
+application UI, RTC delivery and installed-package limits above still apply.

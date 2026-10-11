@@ -3,6 +3,69 @@
 Morpheus is pre-alpha software with no approved installer release. This log records checks actually completed;
 the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
+## Current hosted acceptance, 2026-10-11
+
+[Run 38115477988](https://github.com/brk275/Morpheus/actions/runs/38115477988)
+tested `3f1a3df4a1ed4ad125504d5c7d8daf45ae8b7dcb` on the four standard public
+runners. Windows and both Mac architectures passed their complete jobs: each passed
+16 configuration, 37 Matrix, eight RTC protocol, 74 desktop, and 36 native
+RTC/device tests, plus the vendor security suites. The Windows owned-window
+and display capture fixture reported `passed: true`, `stage: complete`.
+This is actual synthetic capture evidence on the hosted Windows VM; it does
+not establish physical desktop, permissions, packaged-app, or Narrator behavior.
+
+Linux built the native app, passed Xvfb startup, 89 desktop and 47 native
+RTC/device tests, the same configuration/Matrix/protocol suites, and all vendor
+security checks. Its Wayland fixture confirmed all 33 bindings use system
+PipeWire and received the first selected-display frame. The second capture
+reached its first-frame deadline with consumer format, buffer allocation and
+streaming established, but no process callback. The five desktop services
+remained running. Producer markers aggregate both captures and cannot prove
+that the second capture produced a frame. The full Wayland gate failed.
+
+The independent live Linux harness passed message/sync isolation, encrypted
+room and thread draft persistence, tracked-send acknowledgement, room actions,
+formatted messages, media, discovery, moderation, search with both native
+sliding and classic sync, and encrypted recovery. Moderation reported all four
+required checks true: an existing unverified identity, unchanged identity trust,
+and successful reinvite/rejoin after kick and after unban. This validates the
+ordinary-invitation policy without automatically verifying the device.
+
+The real MAS login/refresh process passed cancellation, login, callback replay
+rejection, token rotation, vault persistence and plaintext-profile checks.
+The separate restored process passed identity restore, expired-token rejection,
+automatic refresh and updated vault persistence, then failed at logout. The
+retained diagnostic does not distinguish the individual logout assertions.
+RTC bootstrap, encrypted RTC and Element Call acceptance were not reached.
+OAuth and Matrix service teardown and checked container/network absence passed.
+
+All four native job logs passed credential scans with zero findings, and their
+cache post-steps completed. Evidence is retained privately; no installers were
+built or uploaded. This run does not satisfy the Linux live gate or beta release
+checks.
+
+### Focused Linux fixture follow-up
+
+The [Wayland fixture](WAYLAND_FIXTURE.md#damage-driven-reopen-fixture) retains
+its initial static frame check and supplies distinct moving source pixels on
+each reopen. This matches the pinned backend's damage-driven protocol and
+rejects stale frames. Untouched-static reopening remains unverified. The
+[OAuth fixture](OAUTH_ACCEPTANCE.md) now serves its issuer over verified HTTPS:
+the pinned OAuth library rejects HTTP token revocation before sending a request.
+Its temporary CA has recorded ownership, bounded privileged commands and retryable
+cleanup. Separate remote, account and vault logout facts remain mandatory.
+Application source, dependency locks, production TLS policy and workflows are
+unchanged by these corrections; actual fixture acceptance awaits Linux CI.
+
+Independent reviews covered the pixel assertions, worker cleanup, native TLS
+configuration, certificate ownership and cleanup deadlines. Across the focused
+OAuth, Wayland and CI-selection checks, 105 portable tests passed and four
+hosted/Linux-only checks were skipped locally. Rust formatting, Actionlint and
+whitespace checks passed. The actual changed-path selection contains only the
+standard Ubuntu runner; the completed Mac and Windows jobs are not rerun for
+these Linux fixture changes. No local native build, native test, service or
+certificate installation was performed.
+
 ## Beta gate implementation batch, 2026-10-10
 
 Candidate `e411b0e` added delegated OAuth/OIDC and cancellation/refresh cleanup,

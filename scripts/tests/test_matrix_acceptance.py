@@ -371,6 +371,18 @@ class LiveEvidenceTests(unittest.TestCase):
         self.assertEqual(oauth_diagnostics("MORPHEUS_OAUTH_STAGE password_value\n"
                                            "MORPHEUS_OAUTH_FAILURE https://example.org/private"), {})
 
+    def test_oauth_logout_diagnostics_and_evidence_are_exact_and_complete(self):
+        self.assertEqual(oauth_diagnostics("MORPHEUS_OAUTH_STAGE logout_remote\n"
+                                          "MORPHEUS_OAUTH_FAILURE logout_remote\n"
+                                          "MORPHEUS_OAUTH_FAILURE logout_remote private-token\n"),
+                         {"stage": "logout_remote", "failure": "logout_remote"})
+        required = OAUTH_PHASES["restore_refresh"]
+        complete = "\n".join(f"MORPHEUS_OAUTH_CHECK {name}=true" for name in required)
+        self.assertEqual(oauth_evidence(complete, required), dict.fromkeys(required, True))
+        for name in ("remote_logout", "account_removed", "vault_removed", "logout"):
+            with self.subTest(name=name), self.assertRaises(RuntimeError):
+                oauth_evidence(complete.replace(f"MORPHEUS_OAUTH_CHECK {name}=true", ""), required)
+
     def test_moderation_diagnostics_accept_only_fixed_facts_and_preserve_false(self):
         output = "\n".join((
             "MORPHEUS_MODERATION_STAGE invite_initial",

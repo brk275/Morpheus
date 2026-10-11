@@ -211,6 +211,9 @@ def capture_test_facts(output: str, status: int | None, stage: str = "unknown") 
         "consumer_dequeue_pending": "frames without a dequeued consumer buffer",
         "consumer_buffer_seen": "frames after consumer buffer dequeue",
         "wrong_selected_source": "selected red HEADLESS-2 was not captured",
+        "fresh_pixels_timeout": "selected display did not deliver fresh expected pixels",
+        "pixel_animation_failed": "fixture pixel animation failed",
+        "output_command_failed": "cannot change acceptance output",
         "stop_timeout": "session shutdown exceeded stop budget",
         "reopen": "portal reopen",
         "continuous_frame": "continuous PipeWire frame",
@@ -470,7 +473,7 @@ def session(root: Path) -> int:
             if status != 0 or not capture_test_passed(test_output) or not bindings_passed(origins):
                 print("Wayland capture test facts: " + json.dumps(capture_test_facts(test_output, status, capture_stage(stage_path)), sort_keys=True), file=sys.stderr)
                 raise RuntimeError("Wayland portal acceptance did not execute and pass its required test")
-            print("Actual Wayland display selection/stream/cancel tests passed; native window and GNOME/KDE remain unverified.")
+            print("Actual Wayland first static frame, moving-pixel reopen, stream and cancellation tests passed; untouched-static reopen, native window and GNOME/KDE remain unverified.")
             return 0
         except Exception:
             print("Wayland fixture diagnostic facts: " + json.dumps(diagnostic_facts(root, stage, services), sort_keys=True), file=sys.stderr)

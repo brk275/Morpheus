@@ -57,20 +57,24 @@ OAUTH_PHASES = {
         "no_plaintext_credentials",
     ),
     "restore_refresh": (
-        "restored", "expired_token_rejected", "automatic_refresh", "vaulted", "logout",
+        "restored", "expired_token_rejected", "automatic_refresh", "vaulted", "remote_logout",
+        "account_removed", "vault_removed", "logout",
     ),
 }
 OAUTH_CHECK_NAMES = frozenset(name for names in OAUTH_PHASES.values() for name in names)
 OAUTH_EVIDENCE = re.compile(r"^MORPHEUS_OAUTH_CHECK ([a-z_]+)=(true|false)$", re.MULTILINE)
 OAUTH_STAGES = frozenset((
-    "fixture_root", "ports", "configuration", "mas_config", "synapse_config", "merge_config",
+    "fixture_root", "ports", "certificate", "configuration", "mas_config", "synapse_config", "merge_config",
     "postgres_start", "postgres_ready", "synapse_start", "mas_start", "mas_ready", "synapse_ready",
     "registration", "cleanup", "browser_authorize", "browser_login", "browser_consent", "browser_callback",
     "fixture_load", "profile_open", "cancel_begin", "cancel_verify", "login_begin", "browser_forms",
     "login_finish", "login_identity", "callback_replay", "manual_refresh", "vault_persist", "profile_scan",
     "restore", "restore_identity", "expiry_wait", "expired_token_probe", "automatic_refresh", "logout",
+    "logout_remote", "logout_account", "logout_vault",
 ))
-OAUTH_FAILURES = frozenset(("fixture_operation", "browser_protocol", "rust_acceptance", "deadline"))
+OAUTH_FAILURES = frozenset(("fixture_operation", "browser_protocol", "rust_acceptance", "deadline",
+                           "logout_timeout", "logout_operation", "logout_remote", "logout_account",
+                           "logout_vault_lookup", "logout_vault_retained"))
 OAUTH_STAGE = re.compile(r"^MORPHEUS_OAUTH_STAGE ([a-z_]+)$", re.MULTILINE)
 OAUTH_FAILURE = re.compile(r"^MORPHEUS_OAUTH_FAILURE ([a-z_]+)$", re.MULTILINE)
 
@@ -325,7 +329,7 @@ class Acceptance:
                 cleanup = helper + ["down", "--root", str(services)]
                 if failed:
                     cleanup.append("--keep-data")
-                self.run("oauth-services-down", cleanup, seconds=60)
+                self.run("oauth-services-down", cleanup, seconds=120)
             except (RuntimeError, OSError):
                 # Keep the failed test as the primary diagnostic, but do not
                 # claim a passing run when its owned service cleanup failed.

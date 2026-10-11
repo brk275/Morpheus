@@ -47,6 +47,9 @@ enum Stage {
     ExpiredTokenProbe,
     AutomaticRefresh,
     Logout,
+    LogoutRemote,
+    LogoutAccount,
+    LogoutVault,
 }
 
 fn stage(value: Stage) {
@@ -73,6 +76,9 @@ fn stage(value: Stage) {
         Stage::ExpiredTokenProbe => "expired_token_probe",
         Stage::AutomaticRefresh => "automatic_refresh",
         Stage::Logout => "logout",
+        Stage::LogoutRemote => "logout_remote",
+        Stage::LogoutAccount => "logout_account",
+        Stage::LogoutVault => "logout_vault",
     };
     println!("\nMORPHEUS_OAUTH_STAGE {name}");
 }
@@ -111,9 +117,9 @@ fn private_path(path: &Path, directory: bool) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn loopback_endpoint(value: &str) -> Result<Url> {
+fn loopback_endpoint(value: &str, scheme: &str) -> Result<Url> {
     let url = Url::parse(value).map_err(|_| "invalid fixture endpoint")?;
-    if url.scheme() != "http"
+    if url.scheme() != scheme
         || url.host_str() != Some("127.0.0.1")
         || url.port().is_none()
         || !url.username().is_empty()
@@ -336,7 +342,7 @@ async fn login_and_refresh(
     .map_err(|_| "OAuth start failed")?;
     let authorization =
         Url::parse(&attempt.browser_url).map_err(|_| "invalid authorization URL")?;
-    let issuer = loopback_endpoint(&fixture.issuer_url)?;
+    let issuer = loopback_endpoint(&fixture.issuer_url, "https")?;
     if authorization.origin() != issuer.origin()
         || !authorization
             .query_pairs()
@@ -482,14 +488,23 @@ async fn restore_and_refresh(
         .await
         .map_err(|_| "OAuth logout timed out")?
         .map_err(|_| "OAuth logout failed")?;
-    if !result.remote_logout_succeeded || !manager.accounts().await.is_empty() {
+    stage(Stage::LogoutRemote);
+    if !result.remote_logout_succeeded {
+        return Err("OAuth remote logout failed");
+    }
+    println!("\nMORPHEUS_OAUTH_CHECK remote_logout=true");
+    stage(Stage::LogoutAccount);
+    if !manager.accounts().await.is_empty() {
         return Err("OAuth logout did not remove the account");
     }
+    println!("\nMORPHEUS_OAUTH_CHECK account_removed=true");
+    stage(Stage::LogoutVault);
     let entry = keyring::Entry::new("Morpheus Matrix", &account.id)
         .map_err(|_| "vault entry lookup failed")?;
     if !matches!(entry.get_password(), Err(keyring::Error::NoEntry)) {
         return Err("OAuth logout retained the vault credential");
     }
+    println!("\nMORPHEUS_OAUTH_CHECK vault_removed=true");
     println!("\nMORPHEUS_OAUTH_CHECK logout=true");
     Ok(())
 }
@@ -507,8 +522,10 @@ fn delegated_oauth_success_refresh_and_vaulted_restart() {
             Zeroizing::new(fs::read(fixture_path).map_err(|_| "cannot read OAuth fixture")?);
         let fixture: Fixture =
             serde_json::from_slice(&fixture_bytes).map_err(|_| "invalid OAuth fixture")?;
-        loopback_endpoint(&fixture.homeserver_url)?;
-        loopback_endpoint(&fixture.issuer_url)?;
+        loopback_endpoint(&fixture.homeserver_url, "http")?;
+        // RFC 7009 requires HTTPS even for loopback token revocation. Use the
+        // runner's installed disposable CA through the ordinary SDK TLS client.
+        loopback_endpoint(&fixture.issuer_url, "https")?;
         if fixture.access_token_ttl_seconds != 60 {
             return Err("OAuth fixture must use the supported 60-second TTL");
         }
@@ -539,8 +556,17 @@ fn delegated_oauth_success_refresh_and_vaulted_restart() {
             outcome
         })
     })();
-    if result.is_err() {
-        println!("\nMORPHEUS_OAUTH_FAILURE rust_acceptance");
+    if let Err(error) = result {
+        let failure = match error {
+            "OAuth logout timed out" => "logout_timeout",
+            "OAuth logout failed" => "logout_operation",
+            "OAuth remote logout failed" => "logout_remote",
+            "OAuth logout did not remove the account" => "logout_account",
+            "vault entry lookup failed" => "logout_vault_lookup",
+            "OAuth logout retained the vault credential" => "logout_vault_retained",
+            _ => "rust_acceptance",
+        };
+        println!("\nMORPHEUS_OAUTH_FAILURE {failure}");
     }
     // Only our static stage identifiers can reach a panic/public test output.
     assert!(
