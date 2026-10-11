@@ -5,7 +5,30 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
 ## Current hosted acceptance, 2026-10-11
 
-### Policy correction and precise remaining failures
+### Native preview and microphone cancellation results
+
+[Run 38138168629](https://github.com/brk275/Morpheus/actions/runs/38138168629)
+tested `95caa416de0a4bd01c4084aa82e96270d40f64be`. Scope passed 390 helper
+checks with one skip. Apple Silicon, Intel Mac and Windows each passed native
+check/build and 334 unit/vendor/SDK tests, plus ten fixture-selector checks
+without live inputs. All seven new microphone cancellation and controller
+regressions passed on those platforms; Windows capture also passed.
+
+Linux passed the native preview capture and 360 unit/vendor/SDK tests, plus
+12 fixture-selector checks without live inputs. These include 124 desktop tests
+and 74 native RTC tests, including the new audio guards. Wayland capture passed on this run:
+the exact named test and one-pass summary were present, the fixture reached
+`complete`, and both output streams drained without truncation. This pass
+does not establish the cause or resolution of the previous first-frame timeout.
+The live harness still failed the four invitation cases at
+`observer_roster` / `slot_unavailable`, before incoming admission, and fresh-device
+late join at `initial_bob_roster` with `MissingMegolmSession`. The stock Element
+case passed all 11 facts. The live harness completed 39 checks successfully
+and failed five, with none left unrun; 17 live Rust tests passed. All cleanup,
+cache and checkout post-steps completed. Completed logs scanned with zero findings.
+
+
+### Previous policy correction and precise remaining failures
 
 [Run 38134894308](https://github.com/brk275/Morpheus/actions/runs/38134894308)
 tested `ebccda37af584ba2e629ad5e7825f2e2a2a7d8a0`. Scope passed 384 helper
@@ -59,20 +82,32 @@ scanned with zero findings and are retained privately with metadata and hashes.
 No installers were uploaded. These failures keep the candidate below beta
 readiness.
 
-### Pending screenshot and microphone cancellation candidate
+### Native screenshot capture, 2026-10-11
 
-The next candidate adds a debug-only native Slint preview capture before
-account, configuration and network initialization. It will render three actual
-UI states under Xvfb and losslessly encode their RGB snapshots as PNG, with
-source/binary/image provenance. Only the PNGs and provenance may be uploaded;
+The Linux job in [run 38138168629](https://github.com/brk275/Morpheus/actions/runs/38138168629)
+captured the actual Slint desktop, open account switcher and sign-in view from
+`95caa416de0a4bd01c4084aa82e96270d40f64be`. All three 1560×1040 images use
+fictional, in-memory preview data. The PNGs preserve the renderer's RGB pixels;
+visual review checked the names and account IDs in all three views.
+Artifact `11701413137` has SHA-256
+`ea9320ac648a60d03d1c5a783d8445b61f794ddf0ed5d51ea6239146b973cc2d`.
+Its four-file archive, source revision, run identity, PNG chunks and decoded
+pixel hashes matched the provenance. The original archive and verification
+receipt are retained privately. The README now uses the fresh desktop capture.
+
+### Screenshot and microphone cancellation candidate preparation
+
+That candidate added a debug-only native Slint preview capture before
+account, configuration and network initialization. It renders three actual
+UI states under Xvfb and losslessly encodes their RGB snapshots as PNG, with
+source/binary/image provenance. Only the PNGs and provenance are uploaded;
 raw snapshots and logs remain private. The converter and scope checks passed
-24 Python tests and source review, but native capture has not run and no new
-README screenshot is claimed yet.
+24 Python tests and source review. Native capture subsequently passed as
+recorded above.
 
-The same candidate tightens microphone authorization during delayed device
-opening, account changes and cancellation. Focused fake-device and controller
-regressions have been written and reviewed; their native execution remains
-pending. These changes are not verified by the `ebccda3` results above.
+The same candidate tightened microphone authorization during delayed device
+opening, account changes and cancellation. The focused fake-device and
+controller regressions passed in the hosted results recorded above.
 
 ### Previous incoming admission policy regression and correction
 

@@ -26,7 +26,9 @@ progress. Do not rely on this client for important conversations or
 encryption-key recovery yet. The first beta requires the cross-platform
 checks in [the feature matrix](docs/FEATURE_MATRIX.md).
 
-![Morpheus desktop preview](docs/screenshots/desktop-preview.png)
+![Morpheus native desktop preview with fictional accounts](docs/screenshots/desktop.png)
+
+Actual application capture using fictional preview accounts.
 
 ## Direction
 
