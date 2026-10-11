@@ -74,6 +74,17 @@ class Stage(str, Enum):
 class Failure(str, Enum):
     FIXTURE_OPERATION = "fixture_operation"
     BROWSER_PROTOCOL = "browser_protocol"
+    CALLBACK_FRAGMENT = "browser_callback_fragment"
+    CALLBACK_QUERY = "browser_callback_query"
+    CALLBACK_STATE = "browser_callback_state"
+    CALLBACK_CODE = "browser_callback_code"
+    OAUTH_ACCESS_DENIED = "browser_oauth_access_denied"
+    OAUTH_LOGIN_REQUIRED = "browser_oauth_login_required"
+    OAUTH_CONSENT_REQUIRED = "browser_oauth_consent_required"
+    OAUTH_INTERACTION_REQUIRED = "browser_oauth_interaction_required"
+    OAUTH_INVALID_REQUEST = "browser_oauth_invalid_request"
+    OAUTH_SERVER_ERROR = "browser_oauth_server_error"
+    OAUTH_OTHER = "browser_oauth_other"
 
 
 _stage = Stage.ROOT
@@ -92,6 +103,14 @@ def set_stage(stage: Stage):
 
 class FixtureError(RuntimeError):
     """Internal descriptions never leave the CLI's fixed-enum failure boundary."""
+
+
+class BrowserCallbackError(FixtureError):
+    def __init__(self, failure: Failure):
+        if not isinstance(failure, Failure):
+            raise TypeError("callback failure must be a fixed enum")
+        self.failure = failure
+        super().__init__("OAuth form driver received an invalid callback")
 
 
 class PrivateArgumentParser(argparse.ArgumentParser):
@@ -691,12 +710,39 @@ def browser(request: dict, *, opener=None) -> dict:
                 parts = loopback_url(target)
                 if origin(target) == origin(redirect) and parts.path == redirect_parts.path:
                     set_stage(Stage.CALLBACK)
-                    callback = urllib.parse.parse_qs(parts.query, strict_parsing=True)
-                    if (parts.fragment or callback.get("state") != query["state"]
-                            or len(callback.get("code", [])) != 1 or not callback["code"][0]
-                            or "error" in callback):
-                        raise FixtureError("OAuth form driver received an invalid callback")
-                    return {"callback_url": target}
+                    if parts.fragment:
+                        raise BrowserCallbackError(Failure.CALLBACK_FRAGMENT)
+                    if len(target) > 16_384:
+                        raise BrowserCallbackError(Failure.CALLBACK_QUERY)
+                    try:
+                        callback = urllib.parse.parse_qs(parts.query, strict_parsing=True,
+                                                         keep_blank_values=True, max_num_fields=32)
+                    except ValueError:
+                        raise BrowserCallbackError(Failure.CALLBACK_QUERY) from None
+                    if callback.get("state") != query["state"]:
+                        raise BrowserCallbackError(Failure.CALLBACK_STATE)
+                    if "error" in callback:
+                        # Never copy a provider error or description into output.
+                        # Unknown, blank and repeated errors share one fixed code.
+                        errors = callback["error"]
+                        known = {
+                            "access_denied": Failure.OAUTH_ACCESS_DENIED,
+                            "login_required": Failure.OAUTH_LOGIN_REQUIRED,
+                            "consent_required": Failure.OAUTH_CONSENT_REQUIRED,
+                            "interaction_required": Failure.OAUTH_INTERACTION_REQUIRED,
+                            "invalid_request": Failure.OAUTH_INVALID_REQUEST,
+                            "server_error": Failure.OAUTH_SERVER_ERROR,
+                        }
+                        failure = known.get(errors[0], Failure.OAUTH_OTHER) if len(errors) == 1 else Failure.OAUTH_OTHER
+                        raise BrowserCallbackError(failure)
+                    if len(callback.get("code", [])) != 1 or not callback["code"][0]:
+                        raise BrowserCallbackError(Failure.CALLBACK_CODE)
+                    # MAS v1.26.0 deliberately appends an empty fragment to
+                    # query-mode redirects (authorization/callback.rs:135-154).
+                    # A browser's HTTP callback request never sends that '#'.
+                    # Normalize only the already-validated empty fragment;
+                    # nonempty fragments above remain an error.
+                    return {"callback_url": target.removesuffix("#")}
                 if origin(target) != origin(issuer):
                     raise FixtureError("OAuth form driver refused an off-origin redirect")
                 if response.status in (301, 302, 303):
@@ -753,10 +799,11 @@ def run_cli() -> int:
     _failure = Failure.FIXTURE_OPERATION
     try:
         main()
-    except (Exception, KeyboardInterrupt):
+    except (Exception, KeyboardInterrupt) as error:
         # JSON, HTTP and OS exception text may contain credentials or callback
         # URLs. Only literal enum values reach the public job log.
-        print("MORPHEUS_OAUTH_FAILURE " + _failure.value, file=sys.stderr, flush=True)
+        failure = error.failure if isinstance(error, BrowserCallbackError) else _failure
+        print("MORPHEUS_OAUTH_FAILURE " + failure.value, file=sys.stderr, flush=True)
         return 1
     return 0
 

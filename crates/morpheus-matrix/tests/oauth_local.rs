@@ -23,6 +23,34 @@ type Result<T> = std::result::Result<T, &'static str>;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const VAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
+const BROWSER_FAILURES: &[&str] = &[
+    "browser_protocol",
+    "browser_callback_fragment",
+    "browser_callback_query",
+    "browser_callback_state",
+    "browser_callback_code",
+    "browser_oauth_access_denied",
+    "browser_oauth_login_required",
+    "browser_oauth_consent_required",
+    "browser_oauth_interaction_required",
+    "browser_oauth_invalid_request",
+    "browser_oauth_server_error",
+    "browser_oauth_other",
+    "browser_helper_exit",
+    "browser_helper_output_size",
+    "browser_helper_output_schema",
+    "browser_callback_url",
+    "browser_callback_match",
+];
+
+fn browser_failure_marker(line: &str) -> Option<&'static str> {
+    let value = line.strip_prefix("MORPHEUS_OAUTH_FAILURE ")?;
+    BROWSER_FAILURES
+        .iter()
+        .copied()
+        .find(|known| *known == value)
+}
+
 #[derive(Clone, Copy)]
 enum Stage {
     FixtureLoad,
@@ -174,17 +202,28 @@ fn browser_callback(
         .map_err(|_| "browser form driver failed")?;
     // The helper's stderr may also contain private diagnostics. Forward only
     // exact fixed markers, through our enum; never print a raw helper line.
+    let mut helper_failure = None;
     for line in String::from_utf8_lossy(&output.stderr).lines() {
         match line {
             "MORPHEUS_OAUTH_STAGE browser_authorize" => stage(Stage::BrowserAuthorize),
             "MORPHEUS_OAUTH_STAGE browser_login" => stage(Stage::BrowserLogin),
             "MORPHEUS_OAUTH_STAGE browser_consent" => stage(Stage::BrowserConsent),
             "MORPHEUS_OAUTH_STAGE browser_callback" => stage(Stage::BrowserCallback),
-            _ => {}
+            _ => {
+                if let Some(failure) = browser_failure_marker(line) {
+                    helper_failure = Some(failure);
+                }
+            }
         }
     }
-    if !output.status.success() || output.stdout.len() > 16_384 {
-        return Err("browser form protocol failed");
+    if let Some(failure) = helper_failure {
+        return Err(failure);
+    }
+    if !output.status.success() {
+        return Err("browser_helper_exit");
+    }
+    if output.stdout.len() > 16_384 {
+        return Err("browser_helper_output_size");
     }
     #[derive(Deserialize)]
     struct Callback {
@@ -192,7 +231,7 @@ fn browser_callback(
     }
     serde_json::from_slice::<Callback>(&output.stdout)
         .map(|result| result.callback_url)
-        .map_err(|_| "browser form driver returned an invalid response")
+        .map_err(|_| "browser_helper_output_schema")
 }
 
 async fn whoami(client: &Client, account: &AccountInfo) -> Result<()> {
@@ -356,8 +395,8 @@ async fn login_and_refresh(
         &attempt.browser_url,
         &attempt.redirect_url,
     )?);
-    if !attempt.accepts_callback(&Url::parse(&callback).map_err(|_| "invalid returned callback")?) {
-        return Err("browser callback did not match the pending attempt");
+    if !attempt.accepts_callback(&Url::parse(&callback).map_err(|_| "browser_callback_url")?) {
+        return Err("browser_callback_match");
     }
     stage(Stage::LoginFinish);
     let account = timeout(
@@ -558,6 +597,7 @@ fn delegated_oauth_success_refresh_and_vaulted_restart() {
     })();
     if let Err(error) = result {
         let failure = match error {
+            value if BROWSER_FAILURES.contains(&value) => value,
             "OAuth logout timed out" => "logout_timeout",
             "OAuth logout failed" => "logout_operation",
             "OAuth remote logout failed" => "logout_remote",
@@ -573,4 +613,19 @@ fn delegated_oauth_success_refresh_and_vaulted_restart() {
         result.is_ok(),
         "Delegated OAuth acceptance failed: {result:?}"
     );
+}
+
+#[test]
+fn browser_failure_diagnostics_only_forward_exact_fixed_codes() {
+    assert_eq!(
+        browser_failure_marker("MORPHEUS_OAUTH_FAILURE browser_callback_state"),
+        Some("browser_callback_state")
+    );
+    for line in [
+        "MORPHEUS_OAUTH_FAILURE browser_callback_state private-value",
+        "MORPHEUS_OAUTH_FAILURE unknown_provider_error",
+        "MORPHEUS_OAUTH_FAILURE https://example.org/callback?code=private",
+    ] {
+        assert!(browser_failure_marker(line).is_none());
+    }
 }

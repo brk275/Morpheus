@@ -49,6 +49,17 @@ without fetching it. The Rust test passes that URL to Morpheus's normal account
 manager API. It reserves a loopback callback port but does not exercise the app's
 HTTP callback listener.
 
+MAS 1.26.0 appends an empty `#` fragment to query-mode redirects. After checking
+the exact callback origin/path, state, single nonempty code and absence of an
+OAuth error, the helper removes only that empty suffix to model a browser's
+HTTP request. Nonempty fragments remain rejected; production callback validation
+is unchanged. This fixes a source-confirmed fixture mismatch consistent with
+`e22d685` failing at `browser_callback` after HTTPS startup. The retained log
+cannot prove it was the only cause, and hosted acceptance remains required.
+Fixed failure categories now distinguish fragment/query/state/code, allowlisted
+OAuth errors, helper exit/schema and the Rust callback match. Unknown provider
+errors share one category; descriptions and callback values are never printed.
+
 This provides protocol evidence for Morpheus's delegated account lifecycle. It
 does **not** verify opening an OS browser, the real browser window, app focus,
 callback listener delivery, accessibility, or an external OIDC provider. Those

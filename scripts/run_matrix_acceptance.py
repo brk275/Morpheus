@@ -74,7 +74,13 @@ OAUTH_STAGES = frozenset((
 ))
 OAUTH_FAILURES = frozenset(("fixture_operation", "browser_protocol", "rust_acceptance", "deadline",
                            "logout_timeout", "logout_operation", "logout_remote", "logout_account",
-                           "logout_vault_lookup", "logout_vault_retained"))
+                           "logout_vault_lookup", "logout_vault_retained",
+                           "browser_callback_fragment", "browser_callback_query", "browser_callback_state",
+                           "browser_callback_code", "browser_oauth_access_denied", "browser_oauth_login_required",
+                           "browser_oauth_consent_required", "browser_oauth_interaction_required",
+                           "browser_oauth_invalid_request", "browser_oauth_server_error", "browser_oauth_other",
+                           "browser_helper_exit", "browser_helper_output_size", "browser_helper_output_schema",
+                           "browser_callback_url", "browser_callback_match"))
 OAUTH_STAGE = re.compile(r"^MORPHEUS_OAUTH_STAGE ([a-z_]+)$", re.MULTILINE)
 OAUTH_FAILURE = re.compile(r"^MORPHEUS_OAUTH_FAILURE ([a-z_]+)$", re.MULTILINE)
 

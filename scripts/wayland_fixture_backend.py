@@ -1,7 +1,7 @@
 """Pinned, CI-only xdpw build for a SHM-only software Wayland display.
 
-The three-line adaptation below is not shipped with Morpheus or installed in
-the host. See docs/WAYLAND_FIXTURE.md for its provenance and evidence limits.
+The SHM adaptation and bounded producer diagnostics are not shipped with
+Morpheus or installed in the host. See docs/WAYLAND_FIXTURE.md for its provenance and evidence limits.
 """
 
 from __future__ import annotations
@@ -25,6 +25,60 @@ ORIGINAL_CHECK = (
     "\t\t\t cast->screencopy_frame_info[DMABUF].format == DRM_FORMAT_INVALID)) {"
 )
 SHM_CHECK = "\tif (cast->screencopy_frame_info[WL_SHM].format == DRM_FORMAT_INVALID) {"
+
+PRODUCER_SOURCE_SHA256 = "e5dd5063d50494efaf82295807b43b20a8c5e68a389e89dbcfca63a724d60d4f"
+PRODUCER_BEGIN = (
+    'void xdpw_pwr_enqueue_buffer(struct xdpw_screencast_instance *cast) {\n'
+    '\tlogprint(TRACE, "pipewire: enqueueing buffer");'
+)
+PRODUCER_DIAGNOSTIC_BEGIN = PRODUCER_BEGIN + (
+    '\n\t/* Morpheus CI only: fixed literals, at most 16 attempts per process. */'
+    '\n\tstatic unsigned diagnostic_samples = 0;'
+    '\n\tconst bool diagnose = diagnostic_samples < 16;'
+    '\n\tif (diagnose) {'
+    '\n\t\tdiagnostic_samples++;'
+    '\n\t\tlogprint(TRACE, "%s", cast->current_frame.pw_buffer ?'
+    '\n\t\t\t"morpheus-fixture-producer: buffer-present" :'
+    '\n\t\t\t"morpheus-fixture-producer: buffer-absent");'
+    '\n\t}'
+)
+PRODUCER_QUEUE = '\tpw_stream_queue_buffer(cast->stream, pw_buf);'
+PRODUCER_DIAGNOSTIC_QUEUE = (
+    '\tconst bool diagnostic_driving = diagnose && pw_stream_is_driving(cast->stream);'
+    '\n\tif (diagnose) {'
+    '\n\t\tlogprint(TRACE, "%s", buffer_corrupt ?'
+    '\n\t\t\t"morpheus-fixture-producer: frame-corrupt" :'
+    '\n\t\t\t"morpheus-fixture-producer: frame-valid");'
+    '\n\t\tlogprint(TRACE, "%s", diagnostic_driving ?'
+    '\n\t\t\t"morpheus-fixture-producer: queue-while-driving" :'
+    '\n\t\t\t"morpheus-fixture-producer: queue-while-not-driving");'
+    '\n\t}'
+    '\n\tconst int queue_result = pw_stream_queue_buffer(cast->stream, pw_buf);'
+    '\n\tif (diagnose) {'
+    '\n\t\tlogprint(TRACE, "%s", queue_result < 0 ?'
+    '\n\t\t\t"morpheus-fixture-producer: queue-rejected" :'
+    '\n\t\t\t"morpheus-fixture-producer: queue-accepted");'
+    '\n\t\tlogprint(TRACE, "morpheus-fixture-producer: queued frame=%s driving=%s result=%s",'
+    '\n\t\t\tbuffer_corrupt ? "corrupt" : "valid", diagnostic_driving ? "yes" : "no",'
+    '\n\t\t\tqueue_result < 0 ? "rejected" : "accepted");'
+    '\n\t\tif (diagnostic_samples == 16) {'
+    '\n\t\t\tlogprint(TRACE, "morpheus-fixture-producer: sample-limit");'
+    '\n\t\t}'
+    '\n\t}'
+)
+
+
+def add_producer_diagnostics(source: Path) -> None:
+    """Observe the existing queue call once, without changing queue semantics."""
+    contents = source.read_bytes()
+    if hashlib.sha256(contents).hexdigest() != PRODUCER_SOURCE_SHA256:
+        raise RuntimeError("Wayland fixture producer source checksum mismatch")
+    text = contents.decode("utf-8")
+    if text.count(PRODUCER_BEGIN) != 1 or text.count(PRODUCER_QUEUE) != 1:
+        raise RuntimeError("Wayland fixture producer diagnostic anchors did not match exactly")
+    text = text.replace(PRODUCER_BEGIN, PRODUCER_DIAGNOSTIC_BEGIN, 1)
+    text = text.replace(PRODUCER_QUEUE, PRODUCER_DIAGNOSTIC_QUEUE, 1)
+    source.write_text(text, encoding="utf-8")
 
 
 def extract_verified_archive(data: bytes, destination: Path) -> None:
@@ -78,6 +132,7 @@ def prepare_backend(root: Path, run_command) -> Path:
     source = root / "backend-source"
     extract_verified_archive(data, source)
     adapt_shm_check(source / "src" / "screencast" / "screencast.c")
+    add_producer_diagnostics(source / "src" / "screencast" / "pipewire_screencast.c")
     build = root / "backend-build"
     run_command("backend-configure", [
         "meson", "setup", str(build), str(source), "--buildtype=release",

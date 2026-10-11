@@ -2,6 +2,7 @@ import os
 import contextlib
 import io
 from pathlib import Path
+import re
 import sys
 import tempfile
 import unittest
@@ -370,6 +371,22 @@ class LiveEvidenceTests(unittest.TestCase):
         self.assertEqual(oauth_diagnostics(output), {"stage": "login_finish", "failure": "rust_acceptance"})
         self.assertEqual(oauth_diagnostics("MORPHEUS_OAUTH_STAGE password_value\n"
                                            "MORPHEUS_OAUTH_FAILURE https://example.org/private"), {})
+
+    def test_browser_diagnostics_are_preserved_through_all_three_allowlists(self):
+        import local_matrix_auth
+        from run_matrix_acceptance import OAUTH_FAILURES
+        source = (Path(__file__).resolve().parents[2] / "crates/morpheus-matrix/tests/oauth_local.rs").read_text()
+        rust_list = source.split("const BROWSER_FAILURES: &[&str] = &[", 1)[1].split("];", 1)[0]
+        rust_codes = set(re.findall(r'"([a-z_]+)"', rust_list))
+        helper_codes = {failure.value for failure in local_matrix_auth.Failure
+                        if failure.value.startswith("browser_")}
+        self.assertLessEqual(helper_codes, rust_codes)
+        self.assertLessEqual(rust_codes, OAUTH_FAILURES)
+        for code in rust_codes:
+            self.assertEqual(oauth_diagnostics("MORPHEUS_OAUTH_STAGE browser_callback\n"
+                                              f"MORPHEUS_OAUTH_FAILURE {code}\n"
+                                              f"MORPHEUS_OAUTH_FAILURE {code} private-code\n"),
+                             {"stage": "browser_callback", "failure": code})
 
     def test_oauth_logout_diagnostics_and_evidence_are_exact_and_complete(self):
         self.assertEqual(oauth_diagnostics("MORPHEUS_OAUTH_STAGE logout_remote\n"

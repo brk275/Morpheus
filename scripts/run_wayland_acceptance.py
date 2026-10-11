@@ -16,12 +16,14 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 # Import by sibling path as well when this script is loaded by unit tests.
@@ -82,6 +84,180 @@ CAPTURE_STAGES = frozenset({
     "stopping_lost_source", "restoring_source", "denying_selection", "cancelling_selection",
     "complete",
 })
+
+# Topic names, function names and message shapes below are verified against
+# upstream PipeWire 1.0.5 stream.c, impl-node.c and spa/plugins/support/logger.c.
+# These traces are fixture-only, bounded, private, and never copied to stdout.
+PIPEWIRE_TRACE_LIMIT = 8 * 1024 * 1024
+PRODUCER_MARKERS = (
+    "buffer-present", "buffer-absent", "frame-valid", "frame-corrupt",
+    "queue-while-driving", "queue-while-not-driving", "queue-accepted", "queue-rejected",
+    "sample-limit",
+)
+
+
+def trace_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("PIPEWIRE_LOG", None)  # Do not use a caller's output destination.
+    env.update(PIPEWIRE_DEBUG="1,pw.stream:4,pw.node:4", PIPEWIRE_LOG_LINE="true",
+               PIPEWIRE_LOG_COLOR="false", PIPEWIRE_LOG_SYSTEMD="false")
+    return env
+
+
+class CappedPrivateLog:
+    """Drain a child's pipe while storing only the first bounded private bytes.
+
+    Discard excess output instead of blocking the child or placing a file-size
+    limit on Cargo's build outputs. The caller owns/reaps the process group
+    before closing this sink. No raw text or arbitrary exception is reported.
+    """
+    def __init__(self, path: Path, limit: int = PIPEWIRE_TRACE_LIMIT):
+        self.limit = limit
+        self.written = 0
+        self.truncated = False
+        self.failed = False
+        self.source = None
+        self.thread = None
+        self.stop = threading.Event()
+        self.output = path.open("xb", buffering=0)
+        path.chmod(0o600)
+
+    def attach(self, source) -> None:
+        self.source = source
+        os.set_blocking(source.fileno(), False)
+        self.thread = threading.Thread(target=self._drain, daemon=True,
+                                       name="wayland-private-log")
+        self.thread.start()
+
+    def _drain(self) -> None:
+        try:
+            fd = self.source.fileno()
+            while not self.stop.is_set():
+                if not select.select([fd], [], [], 0.1)[0]:
+                    continue
+                try:
+                    data = os.read(fd, 65536)
+                except BlockingIOError:
+                    continue
+                if not data:
+                    return
+                remaining = max(0, self.limit - self.written)
+                self.truncated |= len(data) > remaining
+                if remaining and not self.failed:
+                    try:
+                        stored = memoryview(data)[:remaining]
+                        offset = 0
+                        while offset < len(stored):
+                            count = self.output.write(stored[offset:])
+                            if type(count) is not int or not 0 < count <= len(stored) - offset:
+                                self.failed = True
+                                break
+                            offset += count
+                            self.written += count
+                    except OSError:
+                        self.failed = True
+        except (OSError, ValueError):
+            self.failed = True
+
+    def finish(self) -> None:
+        # Use only after the child has exited, so EOF should follow promptly.
+        if self.thread is not None:
+            self.thread.join(timeout=2)
+            if self.thread.is_alive():
+                self.failed = True
+
+    def facts(self) -> dict:
+        return {"truncated": self.truncated, "capture_failed": self.failed}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.stop.set()
+        if self.thread is not None:
+            self.thread.join(timeout=2)
+        if self.thread is None or not self.thread.is_alive():
+            if self.source is not None:
+                self.source.close()
+            self.output.close()
+        else:
+            # The bounded reader must not outlive cleanup silently.
+            raise RuntimeError("Wayland private trace did not stop")
+
+
+def pipewire_trace_facts(contents: bytes) -> dict:
+    """Match only pinned function/message forms; never emit captures/addresses.
+
+    These are aggregate observations, not session correlation or proof of
+    absence. Truncation, source-version or logger differences can hide records.
+    """
+    contents = contents[:PIPEWIRE_TRACE_LIMIT]
+    pointer = rb"(?:0x[0-9a-fA-F]{1,16}|\(nil\))"
+    def observed(topic: bytes, filename: bytes, function: bytes, message: bytes) -> bool:
+        # Accept the default and support logger layouts, with source locations
+        # required. Restrict the whole line so arbitrary error prose does not
+        # accidentally become an observation.
+        pattern = (rb"^\[(?:T|\*T\*|D|I)\](?:\[[0-9]{1,5}\.[0-9]{6}\])? "
+                   + re.escape(topic) + rb" +(?:\| )?\[ *" + re.escape(filename)
+                   + rb": *[0-9]{1,5} " + re.escape(function) + rb"\(\)\] "
+                   + message + rb"$")
+        return re.search(pattern, contents, re.MULTILINE) is not None
+    # Upstream builds define FASTPATH: process-input/output, callback and
+    # node-ready fastpath trace calls are compiled out. Never report their
+    # absence as runtime evidence. These debug/info sites remain compiled in.
+    return {
+        "legacy_driver_trigger_branch": observed(b"pw.stream", b"stream.c", b"pw_stream_queue_buffer",
+                                                 rb"deprecated: use pw_stream_trigger_process\(\) to drive the stream\."),
+        "input_start": observed(b"pw.stream", b"stream.c", b"impl_send_command",
+                                pointer + rb": start 0"),
+        "output_start": observed(b"pw.stream", b"stream.c", b"impl_send_command",
+                                 pointer + rb": start 1"),
+        "clock_io_nonnull": observed(b"pw.stream", b"stream.c", b"impl_set_io",
+                                     pointer + rb": set io id 3 \([^\n\)]{1,64}\) 0x[0-9a-fA-F]{1,16} [1-9][0-9]{0,9}"),
+        "position_io_nonnull": observed(b"pw.stream", b"stream.c", b"impl_set_io",
+                                        pointer + rb": set io id 7 \([^\n\)]{1,64}\) 0x[0-9a-fA-F]{1,16} [1-9][0-9]{0,9}"),
+        "node_became_driver": observed(b"pw.node", b"impl-node.c", b"pw_impl_node_set_driver",
+                                        pointer + rb": driver " + pointer + rb" driving:1"),
+        "ready_nonactive_node": observed(b"pw.node", b"impl-node.c", b"node_ready",
+                                         pointer + rb": ready non-active node [^\n]{1,128} in state -?[0-9]{1,10}"),
+        "scheduled_nonactive_node": observed(b"pw.node", b"impl-node.c", b"process_node",
+                                             pointer + rb": scheduling non-active node [^\n]{1,128}"),
+        "graph_not_finished": observed(b"pw.node", b"impl-node.c", b"node_ready",
+                                       rb"\([^\n]{1,128}\) graph not finished: state:" + pointer
+                                       + rb" quantum:[0-9]{1,20} pending [0-9]{1,10}/[0-9]{1,10}"),
+    }
+
+
+def private_trace_facts(root: Path, sinks: dict[str, CappedPrivateLog]) -> dict:
+    facts = {}
+    for name in ("portal-wlr", "capture-test"):
+        sink = sinks.get(name)
+        facts[name] = sink.facts() if sink else {"unavailable": True}
+        try:
+            with (root / f"{name}.log").open("rb") as source:
+                contents = source.read(PIPEWIRE_TRACE_LIMIT)
+        except OSError:
+            contents = b""
+            facts[name]["unavailable"] = True
+        facts[name]["pipewire"] = pipewire_trace_facts(contents)
+        if name == "portal-wlr":
+            facts[name]["producer"] = {
+                marker.replace("-", "_"): re.search(
+                    rb"^.{0,512}\bmorpheus-fixture-producer: " + marker.encode("ascii") + rb"$",
+                    contents, re.MULTILINE,
+                ) is not None for marker in PRODUCER_MARKERS
+            }
+            # Correlated queue observations are bounded and contain only
+            # these six fixed words; no IDs, dimensions or addresses escape.
+            records = re.findall(
+                rb"^.{0,512}\bmorpheus-fixture-producer: queued frame=(valid|corrupt) "
+                rb"driving=(yes|no) result=(accepted|rejected)$", contents, re.MULTILINE,
+            )
+            facts[name]["producer"]["queue_samples"] = [
+                {"frame": frame.decode("ascii"), "driving": driving == b"yes",
+                 "result": result.decode("ascii")} for frame, driving, result in records[:16]
+            ]
+    return facts
 
 
 def binding_facts(path: Path) -> dict:
@@ -379,13 +555,23 @@ def session(root: Path) -> int:
     runtime = Path(os.environ["XDG_RUNTIME_DIR"])
     processes: list[subprocess.Popen] = []
     services: dict[str, subprocess.Popen] = {}
+    trace_sinks: dict[str, CappedPrivateLog] = {}
     stage = "backend_build"
+    trace_reported = False
     with contextlib.ExitStack() as files:
-        def start(name: str, command: list[str], *, service: bool = True):
-            log = files.enter_context((root / f"{name}.log").open("wb"))
-            os.chmod(root / f"{name}.log", 0o600)
-            process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-            processes.append(process)
+        def start(name: str, command: list[str], *, service: bool = True, trace: bool = False):
+            if trace:
+                sink = files.enter_context(CappedPrivateLog(root / f"{name}.log"))
+                process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                           start_new_session=True, env=trace_environment())
+                processes.append(process)
+                trace_sinks[name] = sink
+                sink.attach(process.stdout)
+            else:
+                log = files.enter_context((root / f"{name}.log").open("wb"))
+                os.chmod(root / f"{name}.log", 0o600)
+                process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+                processes.append(process)
             if service:
                 services[name] = process
             return process
@@ -418,7 +604,7 @@ def session(root: Path) -> int:
             stage = "portal"
             # Trace remains in the mode-0700 fixture and is deleted at exit.
             # It distinguishes SHM-only backend startup from chooser failure.
-            backend_process = start("portal-wlr", [str(backend), "--loglevel", "TRACE", "--config", str(root / "config" / "wlr.ini")])
+            backend_process = start("portal-wlr", [str(backend), "--loglevel", "TRACE", "--config", str(root / "config" / "wlr.ini")], trace=True)
 
             def backend_owned():
                 probe = subprocess.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.DBus", "--object-path", "/org/freedesktop/DBus", "--method", "org.freedesktop.DBus.GetConnectionUnixProcessID", "org.freedesktop.impl.portal.desktop.wlr"], capture_output=True, timeout=3)
@@ -459,24 +645,33 @@ def session(root: Path) -> int:
             binding_path = root / "binding-facts"
             binding_path.write_text("{}", encoding="ascii")
             binding_path.chmod(0o600)
-            test_log = files.enter_context((root / "capture-test.log").open("wb"))
-            os.chmod(root / "capture-test.log", 0o600)
-            test = subprocess.Popen(command + ["--", "--ignored", "--exact", TARGET_TEST, "--test-threads=1"], cwd=REPO, stdout=test_log, stderr=subprocess.STDOUT, start_new_session=True)
+            test_sink = files.enter_context(CappedPrivateLog(root / "capture-test.log"))
+            test = subprocess.Popen(command + ["--", "--ignored", "--exact", TARGET_TEST, "--test-threads=1"], cwd=REPO,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
+                                    env=trace_environment())
             processes.append(test)
+            trace_sinks["capture-test"] = test_sink
+            test_sink.attach(test.stdout)
             try:
                 status = wait_owned_process(test, timeout=180)
             except subprocess.TimeoutExpired:
                 status = None
+            if status is not None:
+                test_sink.finish()
             test_output = (root / "capture-test.log").read_text(errors="replace")
+            print("Wayland private delivery trace facts: " + json.dumps(private_trace_facts(root, trace_sinks), sort_keys=True))
+            trace_reported = True
             origins = binding_facts(binding_path)
             print("Wayland PipeWire binding facts: " + json.dumps(origins, sort_keys=True))
-            if status != 0 or not capture_test_passed(test_output) or not bindings_passed(origins):
+            if status != 0 or test_sink.failed or test_sink.truncated or not capture_test_passed(test_output) or not bindings_passed(origins):
                 print("Wayland capture test facts: " + json.dumps(capture_test_facts(test_output, status, capture_stage(stage_path)), sort_keys=True), file=sys.stderr)
                 raise RuntimeError("Wayland portal acceptance did not execute and pass its required test")
             print("Actual Wayland first static frame, moving-pixel reopen, stream and cancellation tests passed; untouched-static reopen, native window and GNOME/KDE remain unverified.")
             return 0
         except Exception:
             print("Wayland fixture diagnostic facts: " + json.dumps(diagnostic_facts(root, stage, services), sort_keys=True), file=sys.stderr)
+            if not trace_reported:
+                print("Wayland private delivery trace facts: " + json.dumps(private_trace_facts(root, trace_sinks), sort_keys=True), file=sys.stderr)
             raise
         finally:
             stop_owned_groups(processes)

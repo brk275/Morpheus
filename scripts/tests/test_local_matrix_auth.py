@@ -91,6 +91,33 @@ class BrowserTests(unittest.TestCase):
             with self.subTest(location=location), self.assertRaises(auth.FixtureError):
                 auth.browser(self.request, opener=FakeOpener([response(303, location=location)]))
 
+    def test_mas_empty_fragment_becomes_the_actual_http_callback_target(self):
+        # MAS v1.26.0 query-mode redirects end with '#'. Python urljoin may
+        # preserve it; browsers strip fragments before sending HTTP requests.
+        # Model the actual HTTPS issuer -> HTTP native-listener transition.
+        opener = FakeOpener([response(303, location=self.callback + "#")])
+        self.assertEqual(auth.browser(self.request, opener=opener), {"callback_url": self.callback})
+        self.assertEqual(len(opener.requests), 1)
+        self.assertTrue(opener.requests[0].full_url.startswith("https://"))
+        self.assertTrue(self.callback.startswith("http://"))
+        for suffix in ("#private-fragment", "##"):
+            with self.subTest(suffix=suffix), self.assertRaises(auth.BrowserCallbackError) as raised:
+                auth.browser(self.request, opener=FakeOpener([response(303, location=self.callback + suffix)]))
+            self.assertEqual(raised.exception.failure, auth.Failure.CALLBACK_FRAGMENT)
+
+    def test_callback_query_checks_preserve_blank_duplicate_and_field_bounds(self):
+        for query, expected in (
+            ("state=fixture-state&state=&code=fixture", auth.Failure.CALLBACK_STATE),
+            ("state=fixture-state&code=fixture&code=", auth.Failure.CALLBACK_CODE),
+            ("state=fixture-state&code=", auth.Failure.CALLBACK_CODE),
+            ("state=fixture-state&code=fixture&missing_equals", auth.Failure.CALLBACK_QUERY),
+            ("state=fixture-state&code=fixture&" + "&".join("a=value" for _ in range(32)),
+             auth.Failure.CALLBACK_QUERY),
+        ):
+            with self.subTest(expected=expected), self.assertRaises(auth.BrowserCallbackError) as raised:
+                auth.browser(self.request, opener=FakeOpener([response(303, location=self.redirect + "?" + query)]))
+            self.assertEqual(raised.exception.failure, expected)
+
     def test_rejects_cross_origin_authorization_before_request(self):
         request = dict(self.request, issuer_url="http://127.0.0.1:12003/")
         opener = FakeOpener([])
@@ -654,7 +681,38 @@ class CliDiagnosticsTests(unittest.TestCase):
         for stage, replies in cases:
             with self.subTest(stage=stage), mock.patch.object(auth, "http_opener", return_value=FakeOpener(replies)):
                 result = self.invoke(["browser"], stdin=json.dumps(request).encode())
-            self.assert_failure(result, stage, "browser_protocol")
+            self.assert_failure(result, stage, "browser_callback_state" if stage == "browser_callback" else "browser_protocol")
+
+    def test_callback_provider_errors_only_emit_fixed_categories(self):
+        redirect = "http://127.0.0.1:12002/callback"
+        request = {"issuer_url": "https://127.0.0.1:12001/", "redirect_url": redirect,
+                   "authorization_url": "https://127.0.0.1:12001/authorize?" + urllib.parse.urlencode({
+                       "redirect_uri": redirect, "state": "fixture-state",
+                   }), "username": "fixture-user", "password": "private-password"}
+        for provider_error, expected in (
+            ("access_denied", "browser_oauth_access_denied"),
+            ("login_required", "browser_oauth_login_required"),
+            ("consent_required", "browser_oauth_consent_required"),
+            ("interaction_required", "browser_oauth_interaction_required"),
+            ("invalid_request", "browser_oauth_invalid_request"),
+            ("server_error", "browser_oauth_server_error"),
+            ("private-provider-secret", "browser_oauth_other"),
+            ("", "browser_oauth_other"),
+        ):
+            location = redirect + "?" + urllib.parse.urlencode({
+                "state": "fixture-state", "error": provider_error,
+                "error_description": "private-password https://elsewhere/?code=private-code",
+            }) + "#"
+            with self.subTest(expected=expected), mock.patch.object(
+                    auth, "http_opener", return_value=FakeOpener([response(303, location=location)])):
+                result = self.invoke(["browser"], stdin=json.dumps(request).encode())
+            self.assert_failure(result, "browser_callback", expected)
+            for private in ("private-provider-secret", "private-password", "private-code", "error_description"):
+                self.assertNotIn(private, result[1] + result[2])
+
+    def test_callback_failure_rejects_non_enum_codes(self):
+        with self.assertRaises(TypeError):
+            auth.BrowserCallbackError("private-error")
 
     def test_stage_rejects_non_enum_values(self):
         with self.assertRaises(TypeError):

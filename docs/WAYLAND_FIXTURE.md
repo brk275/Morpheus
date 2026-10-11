@@ -230,3 +230,67 @@ checks. Production capture code and the pinned backend adaptation are unchanged.
 This is stronger evidence of fresh moving pixels across independent sessions;
 it does **not** resolve or validate an untouched static source on reopen.
 That backend/product behavior and actual hosted success remain open checks.
+
+## First-frame delivery diagnostics
+
+Candidate `e22d685`, run `38117794649`, failed again at `first_frame_1`.
+Format, buffers and streaming were observed on the consumer, but its process
+callback did not run. All 33 PipeWire bindings resolved to the system library,
+all five services were running, and producer submission/readiness/enqueue-attempt
+markers were present. This is a first-frame failure; second/third-open pixel
+animation does not explain or resolve it. The static first-frame assertion
+remains unchanged.
+
+The next diagnostic candidate instruments the pinned backend's original
+`src/screencast/pipewire_screencast.c`, whose full SHA-256 must match before two
+exact source replacements:
+
+```text
+e5dd5063d50494efaf82295807b43b20a8c5e68a389e89dbcfca63a724d60d4f
+```
+
+For at most the first 16 enqueue attempts per backend process, fixed literals
+record buffer presence, valid/corrupt frame status, the read-only
+`pw_stream_is_driving` result, and accepted/rejected `pw_stream_queue_buffer`
+result. Correlated queue samples retain only those fixed categories. The
+original queue call still executes exactly once. No frame, chooser, scheduling,
+return-value or source-selection behavior is changed; this instrumentation is
+part of the temporary fixture backend only.
+
+The distinction matters because
+[xdpw's enqueue marker](https://github.com/emersion/xdg-desktop-portal-wlr/blob/74428f2a8fa7f252e2a46fdf5b697536c66c8a1c/src/screencast/pipewire_screencast.c#L429-L525)
+precedes its missing-buffer check and ignored queue result. In
+[PipeWire 1.0.5](https://github.com/PipeWire/pipewire/blob/1.0.5/src/pipewire/stream.c#L2452-L2474),
+queueing invokes the legacy graph trigger only if the output stream is already
+driving and has not switched to explicit trigger mode. An accepted queue while
+not driving can therefore be distinguished from a rejected queue or a queue
+that entered that trigger branch. Neither acceptance nor the driving getter
+alone proves that the consumer processed the frame. Source inspection also
+found explicit follower-before-driver startup ordering, so a startup race has
+not been established and no speculative production correction is applied.
+
+The backend and capture test also receive fixture-only `pw.stream`/`pw.node`
+debug logging. Source-verified function/message patterns yield boolean facts
+for Start, non-null Clock/Position IO setup, driver selection, the legacy
+trigger branch, and non-active/incomplete graph reports. PipeWire's
+[build flags](https://github.com/PipeWire/pipewire/blob/1.0.5/meson.build#L99-L102)
+define `FASTPATH`; its
+[logging header](https://github.com/PipeWire/pipewire/blob/1.0.5/src/pipewire/log.h#L138-L142)
+compiles process-input/output and callback fastpath tracing out. Those absent
+records are deliberately not presented as observations. The `pw.node` facts
+cover code paths executed in the captured backend/client processes; the
+PipeWire daemon is not part of this targeted trace capture. Absent client
+records say nothing about equivalent work performed in the daemon. These
+diagnostics do not prove exact graph delivery or consumer dispatch.
+
+Each of the two traced child outputs is drained into a private mode-0600 file
+with an 8 MiB storage cap. Excess bytes are discarded while the pipe continues
+to drain; partial writes are completed and errors/truncation are explicit.
+No file-size limit is imposed on Cargo artifacts. Systemd logging and inherited
+PipeWire log destinations are disabled for these two children. Normal owned
+process cleanup precedes closing the bounded reader threads. Files remain
+under the mode-0700 temporary fixture and are deleted on exit, never uploaded.
+Only fixed boolean/category samples leave the fixture. Missing, truncated,
+changed-format or unrecognized log records cannot establish that an event did
+not occur. All selected-source, static-frame, moving-frame, source-loss,
+shutdown, denial and cancellation gates remain required.

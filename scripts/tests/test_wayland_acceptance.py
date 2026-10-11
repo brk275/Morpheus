@@ -451,5 +451,153 @@ class WaylandProcessTreeTests(unittest.TestCase):
         return state not in ("Z", "X")
 
 
+
+class DeliveryTraceTests(unittest.TestCase):
+    def test_trace_environment_is_private_and_targeted(self):
+        with mock.patch.dict(os.environ, {'PIPEWIRE_LOG': '/private/user-log', 'OTHER': 'unchanged'}, clear=True):
+            env = MODULE.trace_environment()
+        self.assertNotIn('PIPEWIRE_LOG', env)
+        self.assertEqual(env['PIPEWIRE_DEBUG'], '1,pw.stream:4,pw.node:4')
+        self.assertEqual(env['PIPEWIRE_LOG_SYSTEMD'], 'false')
+        self.assertEqual(env['PIPEWIRE_LOG_COLOR'], 'false')
+        self.assertEqual(env['PIPEWIRE_LOG_LINE'], 'true')
+        self.assertEqual(env['OTHER'], 'unchanged')
+
+    def test_source_verified_trace_shapes_emit_booleans_only(self):
+        lines = [
+            '[D][12345.000001] pw.stream    | [        stream.c: 2468 pw_stream_queue_buffer()] deprecated: use pw_stream_trigger_process() to drive the stream.',
+            '[D][12345.000001] pw.stream    | [        stream.c:  717 impl_send_command()] 0xabcdef: start 0',
+            '[D] pw.stream [stream.c:717 impl_send_command()] 0x123456: start 1',
+            '[D] pw.stream [stream.c:517 impl_set_io()] 0xabcdef: set io id 3 (Spa:Enum:IO:Clock) 0xabcdef 160',
+            '[D] pw.stream [stream.c:517 impl_set_io()] 0xabcdef: set io id 7 (Spa:Enum:IO:Position) 0xabcdef 512',
+            '[D] pw.node [impl-node.c:890 pw_impl_node_set_driver()] 0xabcdef: driver 0x123456 driving:1',
+            '[I] pw.node [impl-node.c:1779 node_ready()] 0xabcdef: ready non-active node PRIVATE_SOURCE in state 3',
+            '[D] pw.node [impl-node.c:1246 process_node()] 0xabcdef: scheduling non-active node PRIVATE_SOURCE',
+            '[D] pw.node [impl-node.c:1791 node_ready()] (PRIVATE_SOURCE-42) graph not finished: state:0xabcdef quantum:1024 pending 1/1',
+        ]
+        facts = MODULE.pipewire_trace_facts('\n'.join(lines).encode())
+        self.assertTrue(all(facts.values()), facts)
+        self.assertTrue(all(type(value) is bool for value in facts.values()))
+        rendered = MODULE.json.dumps(facts)
+        for private in ('PRIVATE_SOURCE', 'abcdef', '123456', '12345', '1024'):
+            self.assertNotIn(private, rendered)
+        # Function/topic/location are part of the allowlist. Free text and
+        # old fastpath markers cannot masquerade as compiled observations.
+        for line in lines:
+            self.assertFalse(any(MODULE.pipewire_trace_facts(line.replace('pw.', 'other.').encode()).values()))
+            self.assertFalse(any(MODULE.pipewire_trace_facts(('private error says ' + line).encode()).values()))
+        fastpath = b'[T] pw.stream [stream.c:1047 impl_node_process_input()] 0x1: process in status:2 id:1 ticks:0 delay:0'
+        self.assertFalse(any(MODULE.pipewire_trace_facts(fastpath).values()))
+
+    def test_producer_queue_samples_are_correlated_bounded_and_redacted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            prefix = b'[TRACE] private-prefix morpheus-fixture-producer: '
+            data = (prefix + b'buffer-present\n'
+                    + prefix + b'queued frame=valid driving=no result=accepted\n'
+                    + prefix + b'queued frame=corrupt driving=yes result=rejected\n'
+                    + prefix + b'queued frame=PRIVATE driving=yes result=accepted\n')
+            (root / 'portal-wlr.log').write_bytes(data + (prefix + b'queued frame=valid driving=yes result=accepted\n') * 50)
+            facts = MODULE.private_trace_facts(root, {})
+            producer = facts['portal-wlr']['producer']
+            self.assertTrue(producer['buffer_present'])
+            self.assertEqual(len(producer['queue_samples']), 16)
+            self.assertEqual(producer['queue_samples'][:2], [
+                {'frame': 'valid', 'driving': False, 'result': 'accepted'},
+                {'frame': 'corrupt', 'driving': True, 'result': 'rejected'},
+            ])
+            rendered = MODULE.json.dumps(facts)
+            for private in ('PRIVATE', 'private-prefix', directory):
+                self.assertNotIn(private, rendered)
+            self.assertTrue(facts['capture-test']['unavailable'])
+
+    def test_capped_log_drains_excess_without_process_or_unbounded_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'private.log'
+            read_fd, write_fd = os.pipe()
+            try:
+                with MODULE.CappedPrivateLog(path, limit=32) as sink:
+                    sink.attach(os.fdopen(read_fd, 'rb', buffering=0))
+                    os.write(write_fd, b'x' * 2048)
+                    os.close(write_fd)
+                    write_fd = None
+                    sink.finish()
+                    self.assertFalse(sink.failed)
+                    self.assertTrue(sink.truncated)
+                    self.assertEqual(path.read_bytes(), b'x' * 32)
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                self.assertFalse(sink.thread.is_alive())
+            finally:
+                if write_fd is not None:
+                    os.close(write_fd)
+
+    def test_capped_log_stops_when_writer_remains_open_and_reports_write_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            read_fd, write_fd = os.pipe()
+            try:
+                with MODULE.CappedPrivateLog(Path(directory) / 'private.log', limit=32) as sink:
+                    sink.attach(os.fdopen(read_fd, 'rb', buffering=0))
+                    real_output = sink.output
+                    sink.output = mock.Mock()
+                    sink.output.write.side_effect = OSError('PRIVATE DISK ERROR')
+                    os.write(write_fd, b'x' * 64)
+                    deadline = time.monotonic() + 2
+                    while not sink.failed and time.monotonic() < deadline:
+                        time.sleep(0.005)
+                    self.assertTrue(sink.failed)
+                    self.assertNotIn('PRIVATE', MODULE.json.dumps(sink.facts()))
+                    sink.output = real_output
+                self.assertFalse(sink.thread.is_alive())
+            finally:
+                os.close(write_fd)
+
+    def test_capped_log_completes_partial_writes_without_duplication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'private.log'
+            read_fd, write_fd = os.pipe()
+            try:
+                with MODULE.CappedPrivateLog(path, limit=32) as sink:
+                    real_output = sink.output
+                    writer = mock.Mock()
+                    writer.write.side_effect = lambda data: real_output.write(data[:3])
+                    sink.output = writer
+                    sink.attach(os.fdopen(read_fd, 'rb', buffering=0))
+                    os.write(write_fd, b'0123456789abcdefghij')
+                    os.close(write_fd)
+                    write_fd = None
+                    sink.finish()
+                    self.assertFalse(sink.failed)
+                    self.assertFalse(sink.truncated)
+                    self.assertEqual(path.read_bytes(), b'0123456789abcdefghij')
+                    self.assertEqual(sink.written, 20)
+                    self.assertGreater(writer.write.call_count, 1)
+                    sink.output = real_output
+            finally:
+                if write_fd is not None:
+                    os.close(write_fd)
+
+    def test_capped_log_rejects_nonprogressing_write_without_spinning(self):
+        for result in (0, None):
+            with self.subTest(result=result), tempfile.TemporaryDirectory() as directory:
+                read_fd, write_fd = os.pipe()
+                try:
+                    with MODULE.CappedPrivateLog(Path(directory) / 'private.log', limit=32) as sink:
+                        real_output = sink.output
+                        writer = mock.Mock()
+                        writer.write.return_value = result
+                        sink.output = writer
+                        sink.attach(os.fdopen(read_fd, 'rb', buffering=0))
+                        os.write(write_fd, b'bounded output')
+                        os.close(write_fd)
+                        write_fd = None
+                        sink.finish()
+                        self.assertTrue(sink.failed)
+                        self.assertEqual(writer.write.call_count, 1)
+                        sink.output = real_output
+                finally:
+                    if write_fd is not None:
+                        os.close(write_fd)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -55,7 +55,7 @@ the pinned OAuth library rejects HTTP token revocation before sending a request.
 Its temporary CA has recorded ownership, bounded privileged commands and retryable
 cleanup. Separate remote, account and vault logout facts remain mandatory.
 Application source, dependency locks, production TLS policy and workflows are
-unchanged by these corrections; actual fixture acceptance awaits Linux CI.
+unchanged by these corrections. The follow-up run below still fails acceptance.
 
 Independent reviews covered the pixel assertions, worker cleanup, native TLS
 configuration, certificate ownership and cleanup deadlines. Across the focused
@@ -65,6 +65,70 @@ whitespace checks passed. The actual changed-path selection contains only the
 standard Ubuntu runner; the completed Mac and Windows jobs are not rerun for
 these Linux fixture changes. No local native build, native test, service or
 certificate installation was performed.
+
+[Run 38117794649](https://github.com/brk275/Morpheus/actions/runs/38117794649)
+tested the Linux-only fixture revision
+`e22d685ceb774fae6030c1311802a6ec592e286b`. The scope job passed 274 helper tests,
+including the real hosted HTTPS cookie flow; one separately invoked process
+containment test was skipped in that helper suite. Linux passed 16 configuration,
+37 Matrix, eight RTC protocol, 89 desktop and 47 native RTC/device tests, the
+vendor suites, native build and Xvfb startup.
+
+The Wayland gate failed at its **first** static selected-display frame. All 33
+PipeWire binding origins were correct, the consumer reached format acceptance,
+buffer allocation and streaming, and the five desktop services remained alive.
+The producer recorded a screencopy-ready/enqueue attempt, but the consumer never
+received a process callback. This run did not reach the new animated reopen
+checks. Moving the source is not accepted as proof of static-source capture.
+
+The preceding live chat, draft, moderation, both search/sync paths and recovery
+checks passed again. HTTPS MAS startup and OAuth cancellation passed, but the
+first login process failed at `browser_callback` before finishing login. The
+current diagnostic does not distinguish the callback failure's cause. Restored
+OAuth logout, native RTC and the stock Element peer were not reached. Both
+service cleanup checks and the cache post-step completed; the cache was already
+up to date. The completed scope and Linux logs scanned with zero findings and
+are retained privately. No packages were built or uploaded.
+
+### Account-selection and ringing validation work
+
+Local candidate `ae8d2c7` adds revocable account-selection tokens to queued
+desktop notifications: an A-to-B-to-A switch cannot revive old work. Password
+and browser sign-in, account switching, logout and sync shutdown cover the same
+transition boundary. Source review found no unresolved issue; three token
+regressions and the existing account/queue integration check cover the change.
+The RTC boundary also contains 11 bounded notification-parser regressions for
+the pinned deployed protocol. It does not yet send or display incoming rings;
+see the [implementation boundary](../crates/morpheus-rtc/README.md#ringing-implementation-boundary).
+
+Formatting, whitespace checks and 17 CI-selection helper tests passed locally.
+The exact staged source scan found only the hash-verified public upstream test
+JWT; the committed-history scan found zero credentials. Native tests for this
+shared-source candidate remain pending on all four standard public runners.
+
+### Callback correction and capture diagnostics
+
+The next fixture candidate corrects a source-confirmed mismatch with MAS 1.26.0:
+the provider deliberately appends an empty fragment to its query-mode redirect,
+but a browser omits that fragment from the HTTP callback. The Python driver now
+removes only the already-validated empty suffix. Origin, path, state, code,
+nonempty-fragment and production callback checks remain intact. The earlier
+failure is consistent with this defect; the retained facts cannot establish its
+sole cause. Fixed diagnostic categories preserve provider/callback distinctions
+without printing URLs, state, authorization codes or provider descriptions.
+
+Independent source reviews passed. The focused OAuth helper suites ran 83 tests:
+82 passed and the real hosted HTTPS check was skipped locally. The native
+callback regression and actual login/restore/logout phases still require hosted
+execution. Wayland adds bounded, private producer queue and PipeWire diagnostics
+to locate the missing delivery; this is not a capture fix or a passing gate.
+The initial static-source frame assertion remains mandatory.
+
+The focused Wayland helper suites ran 40 tests: 37 passed and three Linux-only
+process checks were skipped locally. They cover the pinned-source patch guards,
+fixed diagnostic output, bounded log draining, partial writes and cleanup.
+Python syntax, Rust formatting, Actionlint and whitespace checks passed. No
+local native compilation, native test, service or certificate installation ran.
 
 ## Beta gate implementation batch, 2026-10-10
 
