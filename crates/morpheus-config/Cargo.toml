@@ -8,6 +8,7 @@ description = "Versioned local configuration for Morpheus"
 
 [dependencies]
 directories = "6.0.0"
+ruma-identifiers-validation = "=0.12.1"
 serde = { version = "1.0.229", features = ["derive"] }
 tempfile = "3"
 thiserror = "2.0.21"

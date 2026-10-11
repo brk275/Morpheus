@@ -6139,6 +6139,7 @@ name = "morpheus-config"
 version = "0.1.0"
 dependencies = [
  "directories",
+ "ruma-identifiers-validation",
  "serde",
  "tempfile",
  "thiserror 2.0.21",

@@ -869,11 +869,22 @@ def main():
         acceptance.require_containment()
         acceptance.script("local_matrix_env", "up")
         fixture = fixture_from_output(str(root / "accounts.json"), root)
-        def chat():
-            for name in CHAT_TESTS:
-                acceptance.test(name, fixture)
-            acceptance.test("search_local", fixture, extra={"MORPHEUS_MATRIX_SEARCH_CLASSIC": "1"})
-        acceptance.group(CHAT_CHECKS, chat)
+        # Each selector owns its local profile, fresh devices and unique test
+        # data. They share seeded accounts/rooms, not the preceding result.
+        # Moderation is the one exception: it asserts an existing identity is
+        # unverified on a fresh device. formatted_local explicitly establishes
+        # that identity; automatic login bootstrap is only best-effort.
+        formatted_passed = False
+        for name in CHAT_TESTS:
+            if name == "moderation_local" and not formatted_passed:
+                acceptance.not_run[name] = "dependency_failed"
+                print(json.dumps({"check": name, "status": "not_run", "reason": "dependency_failed"}), flush=True)
+                continue
+            succeeded = acceptance.group((name,), lambda name=name: acceptance.test(name, fixture))
+            if name == "formatted_local":
+                formatted_passed = succeeded
+        acceptance.group(("search_local-classic",), lambda: acceptance.test(
+            "search_local", fixture, extra={"MORPHEUS_MATRIX_SEARCH_CLASSIC": "1"}))
         def recovery_case():
             recovery = fixture_from_output(acceptance.script("local_matrix_env", "recovery-fixture"), root)
             acceptance.test("recovery_local", recovery, extra={"MORPHEUS_MATRIX_TEST_RECOVERY": "1"})

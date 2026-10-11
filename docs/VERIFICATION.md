@@ -5,6 +5,73 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
 ## Current hosted acceptance, 2026-10-11
 
+### Native suites pass; live projection and actor setup remain blocked: `4fd8071`
+
+[Run 38160617966](https://github.com/brk275/Morpheus/actions/runs/38160617966)
+tested `4fd8071e1cbd895311205a09fe40ca93f1e538ce`. Scope passed 484 Python
+checks with one skip and scanned all 48 reachable commits with zero findings.
+All four native check/build jobs reached their Rust suites: Apple Silicon,
+Intel Mac and Windows each passed 746 unit/vendor/SDK checks; Linux passed 772.
+The 65 added guards passed everywhere: 45 composer, six emoji picker, one
+inherited-reply trust and 13 image-preview guards. These results supersede the
+unexecuted/native-build-pending status recorded for earlier candidates below.
+
+Separate integration targets without live fixture input contributed nine early
+returns and one pure diagnostic test on each Mac/Windows job, and ten early
+returns plus two diagnostic tests on Linux. Those are not live acceptance.
+All platforms passed 280 RTC core tests, including 17 peer-renewal guards, and
+17 key-rotation tests. One opt-in application live test remained ignored in the
+ordinary unit invocation.
+
+The Linux live harness reported 12 Rust passes across accounts/switching,
+encrypted drafts, room actions, recovery, HTTPS OAuth login/refresh/restore/logout,
+unsupported transport, and the three native RTC cases. Current and Sticky2025
+fresh-device cases decrypted newly renewed membership; historical-key recovery
+is not claimed. Stock Element Call `v0.28.0-rc.1` passed all eleven facts in the
+pre-synced Sticky2025 fixture, without proving fresh-device or Current-format
+Element interoperability.
+
+Five live checks failed:
+
+- The expanded encrypted formatting test reached Bob's message but failed its
+  rich-projection assertion at `formatted_local.rs:433`. Source inspection found
+  that strict sanitization removes a selected room mention's private attribute
+  while retaining its span; the projection rejected that bare span. A reviewed
+  repair treats only attribute-free spans as transparent, retaining all child,
+  URL, depth and size guards. Its two new regressions and the unchanged live
+  assertion await hosted retest.
+- All four Current/Sticky2025 DM/room invitation cases passed encrypted
+  membership proof, then stopped at `actor_setup` with `unavailable`. No incoming
+  discovery/Answer assertion passed. The next source repair aligns call-room
+  configuration validation with the pinned SDK's modern room IDs; runtime
+  resolution of this setup failure remains unproven.
+
+The harness did not run media, discovery, moderation or either search mode after
+the formatting failure. In particular, the expanded image-preview API fixture
+has no live pass on this revision. Earlier, narrower successes remain historical
+evidence; they do not cover these changed fixtures.
+
+The updated harness continues independent chat checks after a contained test
+failure. Moderation still requires the formatting fixture's explicit identity
+setup; infrastructure failures, deadlines and final failure enforcement remain
+unchanged. This orchestration change also awaits hosted retest.
+
+The Windows owned synthetic window/display capture passed. Linux's exact Wayland
+test passed with all 33 bindings resolving to system PipeWire and complete,
+untruncated test logs. Its bounded ordered trace reached the event limit; this
+pass does not establish that the intermittent startup issue is resolved or that
+installed AppImage capture works. Four actual native preview PNGs were captured
+in artifact `11710027728` and checked for fictional identities; the README image
+files remain unchanged. Static preview capture does not verify live interactions,
+keyboard/IME, screen readers or physical devices.
+
+Every job and cache/checkout post-step completed; Apple Silicon, Intel and Windows
+succeeded, while Linux's job failed for the live checks above.
+All five complete job logs scanned with zero findings. All native caches restored
+and reported “Cache up-to-date.” No installer was uploaded. The sections below
+retain results and pending work as recorded for each older candidate; no beta or
+release checkbox is closed by this run.
+
 ### Composer compiler failures and palette follow-up: `03cb9d5`
 
 [Run 38158419315](https://github.com/brk275/Morpheus/actions/runs/38158419315)

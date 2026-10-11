@@ -1,6 +1,6 @@
 # Native image previews
 
-This source slice adds an explicit image viewer to the room timeline and thread replies. It does not establish hosted or installed acceptance; those checks are pending.
+An explicit image viewer is implemented in the room timeline and thread replies. Native builds and its 13 focused guards passed on all four platforms at `4fd8071`; real viewer and installed acceptance remain pending.
 
 ## Behavior and privacy
 
@@ -25,6 +25,6 @@ Animated PNG/GIF, progressive or multi-scan JPEG, WebP, SVG, 16-bit PNG, audio a
 
 ## Verification boundary
 
-Source regressions cover actual PNG and baseline JPEG pixels, metadata stripping, animation/size/dimension rejection, ciphertext tampering and EOF hash verification, streamed body limits, privacy combinations, permanent cancellation, worker permit ownership, queued-pixel clearing and stale view/account selection rejection. They require the normal hosted Rust test suite; no local native build, test, Slint generation or application run was used to validate this slice.
+Thirteen focused regressions passed in hosted Rust suites on Apple Silicon, Intel Mac, Windows and Linux at `4fd8071`. They cover actual PNG and baseline JPEG pixels, metadata stripping, animation/size/dimension rejection, ciphertext tampering and EOF hash verification, streamed body limits, privacy combinations, permanent cancellation, worker permit ownership, queued-pixel clearing and stale view/account selection rejection. No local native build or test was used.
 
-Before claiming this feature usable, run all four supported native platforms, then real encrypted and unencrypted attachment checks including opt-in/off reload, rapid account/room switching during load, viewer keyboard/accessibility behavior and failed/oversized images. No runtime or installed-package pass is asserted here.
+The expanded `media_local` encrypted/plain-image API fixture did not run in that candidate because an earlier formatting check failed. No real image-download/preview API pass follows from the unit results. Real encrypted and unencrypted attachment checks, opt-in/off reload, rapid account/room switching during load, viewer keyboard/accessibility behavior, failed/oversized images and installed-package acceptance remain required.

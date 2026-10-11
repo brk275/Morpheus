@@ -1,6 +1,9 @@
 //! Versioned, non-secret configuration for the Morpheus desktop client.
 
 use directories::ProjectDirs;
+// Use the same opaque room-ID grammar as Ruma/Matrix SDK. Since room v12,
+// room IDs need not include a server-name suffix.
+use ruma_identifiers_validation::room_id::validate as validate_room_id;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -98,14 +101,14 @@ impl Config {
         self.media.validate_audio_devices()?;
         for overrides in self.account_overrides.values() {
             for room_id in &overrides.local_voice_rooms {
-                if !room_id.starts_with('!') || !room_id.contains(':') {
+                if validate_room_id(room_id).is_err() {
                     return Err(ConfigError::Invalid(
                         "account_overrides.local_voice_rooms must contain Matrix room IDs".into(),
                     ));
                 }
             }
             for room_id in &overrides.legacy_element_call_rooms {
-                if !room_id.starts_with('!') || !room_id.contains(':') {
+                if validate_room_id(room_id).is_err() {
                     return Err(ConfigError::Invalid(
                         "account_overrides.legacy_element_call_rooms must contain Matrix room IDs"
                             .into(),
@@ -113,7 +116,7 @@ impl Config {
                 }
             }
             for room_id in &overrides.element_call_matrix_2_0_rooms {
-                if !room_id.starts_with('!') || !room_id.contains(':') {
+                if validate_room_id(room_id).is_err() {
                     return Err(ConfigError::Invalid(
                         "account_overrides.element_call_matrix_2_0_rooms must contain Matrix room IDs".into(),
                     ));
@@ -144,7 +147,7 @@ impl Config {
         room_id: &str,
         enabled: bool,
     ) -> Result<bool, ConfigError> {
-        if account_id.is_empty() || !room_id.starts_with('!') || !room_id.contains(':') {
+        if account_id.is_empty() || validate_room_id(room_id).is_err() {
             return Err(ConfigError::Invalid(
                 "local voice spaces require an account and Matrix room ID".into(),
             ));
@@ -226,7 +229,7 @@ impl Config {
         room_id: &str,
         mode: RoomCallMode,
     ) -> Result<bool, ConfigError> {
-        if account_id.is_empty() || !room_id.starts_with('!') || !room_id.contains(':') {
+        if account_id.is_empty() || validate_room_id(room_id).is_err() {
             return Err(ConfigError::Invalid(
                 "call mode requires an account and Matrix room ID".into(),
             ));
@@ -1438,5 +1441,93 @@ mod tests {
                 .set_room_call_mode("", room, RoomCallMode::ElementCallMatrix2)
                 .is_err()
         );
+    }
+    #[test]
+    fn legacy_and_serverless_room_preferences_roundtrip_without_cross_account_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let mut config = store.load_or_create().unwrap();
+        for room in [
+            "!fixture:example.org",
+            "!Nhcu5BS-UMnFX7hBVfVSoXiD7OgH6iRT-xyIuqDnpYQ",
+        ] {
+            assert!(config.set_local_voice_room("primary", room, true).unwrap());
+            for mode in [
+                RoomCallMode::ElementCallMatrix2,
+                RoomCallMode::ElementCallLegacy,
+                RoomCallMode::Standard,
+            ] {
+                config.set_room_call_mode("primary", room, mode).unwrap();
+                store.save(&config).unwrap();
+                config = store.load().unwrap();
+                assert!(config.is_local_voice_room("primary", room));
+                assert!(!config.is_local_voice_room("other", room));
+                assert_eq!(config.room_call_mode("primary", room), mode);
+                assert_eq!(config.room_call_mode("other", room), RoomCallMode::Standard);
+                let overrides = &config.account_overrides["primary"];
+                assert_eq!(
+                    overrides
+                        .legacy_element_call_rooms
+                        .iter()
+                        .any(|id| id == room),
+                    mode == RoomCallMode::ElementCallLegacy
+                );
+                assert_eq!(
+                    overrides
+                        .element_call_matrix_2_0_rooms
+                        .iter()
+                        .any(|id| id == room),
+                    mode == RoomCallMode::ElementCallMatrix2
+                );
+            }
+            assert!(config.set_local_voice_room("primary", room, false).unwrap());
+            store.save(&config).unwrap();
+        }
+        assert!(store.load().unwrap().account_overrides.is_empty());
+    }
+
+    #[test]
+    fn invalid_room_ids_cannot_mutate_preferences_or_replace_valid_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let valid = store.load_or_create().unwrap();
+        let original = fs::read(store.path()).unwrap();
+        for room in [
+            "",
+            "room:example.org",
+            "#alias:example.org",
+            "@user:example.org",
+            "!bad\0:example.org",
+        ] {
+            let mut config = valid.clone();
+            assert!(config.set_local_voice_room("primary", room, true).is_err());
+            for mode in [
+                RoomCallMode::Standard,
+                RoomCallMode::ElementCallLegacy,
+                RoomCallMode::ElementCallMatrix2,
+            ] {
+                assert!(config.set_room_call_mode("primary", room, mode).is_err());
+                assert_eq!(config, valid);
+            }
+            // Also cover hand-edited TOML: each stored room list is validated,
+            // independently of the setter and before atomic replacement.
+            for list in 0..3 {
+                let mut invalid = valid.clone();
+                let overrides = invalid
+                    .account_overrides
+                    .entry("primary".into())
+                    .or_default();
+                match list {
+                    0 => &mut overrides.local_voice_rooms,
+                    1 => &mut overrides.legacy_element_call_rooms,
+                    _ => &mut overrides.element_call_matrix_2_0_rooms,
+                }
+                .push(room.into());
+                assert!(invalid.validate().is_err());
+                assert!(store.save(&invalid).is_err());
+                assert_eq!(fs::read(store.path()).unwrap(), original);
+                assert_eq!(store.load().unwrap(), valid);
+            }
+        }
     }
 }

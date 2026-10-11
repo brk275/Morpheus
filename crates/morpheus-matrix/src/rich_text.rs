@@ -145,6 +145,14 @@ fn render_inline(node: &NodeRef, output: &mut String, depth: usize) -> Option<()
             match tag {
                 "strong" | "b" => wrap(node, output, depth, "**"),
                 "em" | "i" => wrap(node, output, depth, "*"),
+                "span" => {
+                    // Sanitized room-mention markers are ordinary spans. An
+                    // attribute-free span has no presentation of its own;
+                    // preserve its contents without interpreting mention intent.
+                    // Spoilers, colors and other attributes still fall back.
+                    no_attributes(node)?;
+                    render_inline_children(node, output, depth)
+                }
                 "code" => {
                     no_attributes(node)?;
                     let mut code = String::new();
@@ -306,6 +314,64 @@ mod tests {
             matrix_html_to_markdown("<a href=\"https://x.test\" onclick=\"x\">go</a>").is_none()
         );
         assert!(matrix_html_to_markdown("<a href=\"https://user:pass@x.test\">go</a>").is_none());
+    }
+
+    #[test]
+    fn transparent_spans_keep_styles_but_semantic_attributes_still_fall_back() {
+        let markdown = matrix_html_to_markdown(
+            "<p><span>Literal **text** <span><strong>bold</strong></span> @room</span></p>",
+        )
+        .expect("Attribute-free spans are transparent containers");
+        assert!(markdown.contains("**bold**"));
+        assert_eq!(
+            markdown_to_accessible_text(&markdown),
+            "Literal **text** bold @room"
+        );
+        for attribute in [
+            "data-mx-spoiler=\"reason\"",
+            "data-mx-color=\"#00ff00\"",
+            "class=\"custom\"",
+            "onclick=\"action()\"",
+            "data-morpheus-room=\"1\"",
+        ] {
+            let html = format!("<span {attribute}>content</span>");
+            assert!(matrix_html_to_markdown(&html).is_none());
+        }
+        let nested = format!("{}text{}", "<span>".repeat(34), "</span>".repeat(34));
+        assert!(matrix_html_to_markdown(&nested).is_none());
+    }
+
+    #[test]
+    fn selected_room_mention_keeps_bold_in_the_sanitized_compose_projection() {
+        use crate::{ComposeText, MentionTarget, TextFormat, formatting::compose_room};
+        use matrix_sdk::ruma::{UserId, events::room::message::MessageType};
+
+        let source = "Hello **main-projection** <script>alert(1)</script> @casey:example.org @room";
+        let mut text = ComposeText::new(source, TextFormat::Markdown);
+        for target in [
+            MentionTarget::User("@casey:example.org".to_owned()),
+            MentionTarget::Room,
+        ] {
+            let start = text.body.find(target.text()).unwrap();
+            let end = start + target.text().len();
+            text = text.insert_mention(start..end, target).unwrap().0;
+        }
+        let own = UserId::parse("@writer:example.org").unwrap();
+        let content = compose_room(&text, &own).unwrap();
+        let MessageType::Text(message) = content.msgtype else {
+            panic!("Expected a text message");
+        };
+        let html = message.formatted.unwrap().body;
+        assert!(html.contains("<span>@room</span>"));
+        assert!(!html.contains("data-morpheus-room"));
+        assert!(!html.contains("<script>"));
+        let markdown = matrix_html_to_markdown(&html)
+            .expect("Selected room mentions must not discard supported formatting");
+        assert!(markdown.replace("\\-", "-").contains("**main-projection**"));
+        assert_eq!(
+            markdown_to_accessible_text(&markdown),
+            "Hello main-projection <script>alert(1)</script> @casey:example.org @room"
+        );
     }
 
     #[test]

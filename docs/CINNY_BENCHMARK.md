@@ -8,9 +8,10 @@ is the pinned comparison point; its [release history](https://github.com/cinnyap
 documents earlier voice/video rooms, DM and room video starts, code-block
 formatting, media, and device-management changes.
 
-The `56688d0`, `7357111` and `03cb9d5` builds stopped before Rust tests. The latest
-composer and image-preview additions still need native and live acceptance;
-no current CI result or completed beta gate is implied below.
+At `4fd8071`, all four native builds and the 65 added composer, picker, trust
+and image-preview guards passed. Live rich-text projection and incoming actor
+setup failed; the expanded image API check did not run. No beta gate is complete;
+see [the current verification results](VERIFICATION.md).
 
 ## Navigation and discovery
 
@@ -30,9 +31,10 @@ no current CI result or completed beta gate is implied below.
       A safe subset of rich text renders in the offline timeline and thread
       preview, and decrypted events passed that rich-text projection. Member
       suggestions and a searchable 44-entry starter emoji picker are implemented;
-      their new guards and native keyboard/IME/accessibility behavior remain
-      unverified. Live encrypted rendering in the UI, stickers and the complete
-      behavior set remain open.
+      their guards passed on all four native targets at `4fd8071`. Its expanded
+      encrypted test exposed a room-mention rich-projection failure; the reviewed
+      span repair awaits retest. Native keyboard/IME/accessibility, live rendered
+      UI, full emoji breadth, stickers and the complete behavior set remain open.
 - [ ] Upload, download, preview, and safely open images, video, audio, and
       files in encrypted and unencrypted rooms. The Matrix core passed an
       encrypted binary-file upload/download roundtrip with metadata, account
@@ -40,8 +42,9 @@ no current CI result or completed beta gate is implied below.
       a timeline card, progress, cancel, and same-transaction retry are wired;
       live UI acceptance remains open. A memory-only click-to-preview viewer
       for bounded PNG/baseline JPEG is implemented, with encrypted previews off
-      by default. Its guards and expanded encrypted/plain-image API fixture
-      await completed hosted verification. Animation, WebP, audio/video previews
+      by default. Its 13 guards passed on all four targets; the expanded
+      encrypted/plain-image API fixture was skipped after the formatting failure.
+      Real viewer acceptance remains open. Animation, WebP, audio/video previews
       and full type coverage remain open; see [image preview limits](IMAGE_PREVIEWS.md).
 - [ ] Search rooms, users, and message history; show results in their room and
       timeline context.
@@ -78,9 +81,10 @@ no current CI result or completed beta gate is implied below.
       isolated macOS app check; an encrypted macOS GUI call also joined with
       two participants. Voice-space navigation and designation, Call and notify,
       and incoming Answer/local Dismiss are wired. Incoming guards passed at
-      `c7ad50c`, but its expanded live actor cases stopped at fixture setup before
-      sending an invitation. Actual Answer UI, audible ringing, protocol Decline
-      and voice-space drop-in acceptance remain open.
+      `c7ad50c` and the current native suite. At `4fd8071`, all four live actor
+      cases still stopped at setup with `unavailable`; the modern room-ID
+      configuration repair awaits hosted retest. Actual Answer UI, audible ringing,
+      protocol Decline and voice-space drop-in acceptance remain open.
 - [ ] Encrypted voice and video, reconnect, device selection, and screen share
       interoperate with Element Call on compatible homeservers. Local encrypted
       transport has carried synthetic camera/audio and real macOS display and

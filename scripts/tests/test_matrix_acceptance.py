@@ -159,8 +159,82 @@ class FinalizationTests(unittest.TestCase):
                 self.assert_both_cleanups(runner)
                 self.assertEqual(collector.failures, [{"check": failed, "reason": "test_failed"}])
                 if failed == "live_local":
-                    self.assertNotIn("drafts_local", [item.args[0] for item in runner.test.call_args_list])
+                    self.assertIn("drafts_local", [item.args[0] for item in runner.test.call_args_list])
                     self.assertIn("recovery_local", [item.args[0] for item in runner.test.call_args_list])
+
+    def test_chat_assertion_failures_collect_independent_cases_and_keep_exact_prerequisite(self):
+        for failed in acceptance_module.CHAT_CHECKS:
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()):
+                collector = Acceptance(Path(folder), "scanner")
+                # Other groups are successful in this isolated orchestration
+                # test, so finish_checks must reject the known chat failure.
+                collector.results = [{"check": label} for label in acceptance_module.PLANNED_CHECKS
+                                     if label not in acceptance_module.CHAT_CHECKS]
+                visited = []
+                with self.mocked_main() as (runner, _):
+                    runner.not_run = collector.not_run
+                    runner.group.side_effect = collector.group
+                    runner.finish_checks.side_effect = collector.finish_checks
+                    def test(name, _fixture, **kwargs):
+                        label = name + ("-classic" if kwargs.get("extra", {}).get("MORPHEUS_MATRIX_SEARCH_CLASSIC") else "")
+                        if label not in acceptance_module.CHAT_CHECKS:
+                            return
+                        visited.append(label)
+                        if label == failed:
+                            raise acceptance_module.CheckFailure(label, "test_failed")
+                        collector.results.append({"check": label})
+                    runner.test.side_effect = test
+                    with self.assertRaisesRegex(RuntimeError, "failed or unexecuted"):
+                        acceptance_module.main()
+                expected = [name for name in acceptance_module.CHAT_CHECKS
+                            if not (failed == "formatted_local" and name == "moderation_local")]
+                self.assertEqual(visited, expected)
+                self.assertEqual(collector.failures, [{"check": failed, "reason": "test_failed"}])
+                self.assertEqual(collector.not_run, {"moderation_local": "dependency_failed"}
+                                 if failed == "formatted_local" else {})
+                runner.oauth_cases.assert_called_once()
+                runner.outgoing_ring_cases.assert_called_once()
+                runner.element_case.assert_called_once()
+                self.assert_both_cleanups(runner)
+
+    def test_chat_infrastructure_failure_remains_fatal_before_later_cases(self):
+        for message in ("credential scanner failed", "containment failed", "owned process cleanup failed"):
+            original = RuntimeError(message)
+            with self.subTest(failure=message), tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()):
+                collector = Acceptance(Path(folder), "scanner")
+                with self.mocked_main() as (runner, _):
+                    runner.group.side_effect = collector.group
+                    def test(name, _fixture, **_kwargs):
+                        if name == "formatted_local":
+                            raise original
+                    runner.test.side_effect = test
+                    with self.assertRaises(RuntimeError) as caught:
+                        acceptance_module.main()
+                self.assertIs(caught.exception, original)
+                self.assertEqual([item.args[0] for item in runner.test.call_args_list],
+                                 list(acceptance_module.CHAT_TESTS[:4]))
+                runner.oauth_cases.assert_not_called()
+                runner.outgoing_ring_cases.assert_not_called()
+                self.assert_both_cleanups(runner)
+                self.assertEqual(collector.failures, [])
+
+    def test_chat_budget_exhaustion_does_not_start_more_commands_or_extend_deadline(self):
+        with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()):
+            collector = Acceptance(Path(folder), "scanner")
+            deadline = collector.deadline
+            with self.mocked_main() as (runner, _), patch.object(collector, "available", return_value=0):
+                runner.not_run = collector.not_run
+                runner.group.side_effect = collector.group
+                runner.finish_checks.side_effect = collector.finish_checks
+                with self.assertRaisesRegex(RuntimeError, "failed or unexecuted"):
+                    acceptance_module.main()
+            runner.test.assert_not_called()
+            self.assertEqual(collector.deadline, deadline)
+            self.assertEqual(set(collector.not_run), set(acceptance_module.PLANNED_CHECKS))
+            self.assertEqual(collector.not_run["moderation_local"], "dependency_failed")
+            self.assertTrue(all(reason == "budget_spent" for label, reason in collector.not_run.items()
+                                if label != "moderation_local"))
+            self.assert_both_cleanups(runner)
 
     def test_each_cleanup_failure_is_fatal_after_both_attempts_and_never_formats_payload(self):
         class UnprintableFailure(RuntimeError):

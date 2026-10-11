@@ -903,24 +903,35 @@ impl QuietEvidence {
 
 #[test]
 fn fresh_fixture_config_supports_persisted_call_mode_before_worker_start() {
-    let profile = tempfile::tempdir().unwrap();
-    let store = morpheus_config::ConfigStore::at(profile.path().join("incoming-config.toml"));
-    assert!(!store.path().exists());
-    let preferences = fixture_preferences(store.clone()).unwrap();
-    preferences
-        .set_room_call_mode(
-            "fixture-account",
-            "!fixture:example.org",
-            RoomCallMode::ElementCallMatrix2,
-        )
-        .unwrap();
-    assert_eq!(
-        store
-            .load()
-            .unwrap()
-            .room_call_mode("fixture-account", "!fixture:example.org"),
-        RoomCallMode::ElementCallMatrix2
-    );
+    // Synapse's pinned default room version is v12. Exercise its serverless
+    // room IDs as well as historical IDs through the real fixture setup path.
+    for room in [
+        "!fixture:example.org",
+        "!Nhcu5BS-UMnFX7hBVfVSoXiD7OgH6iRT-xyIuqDnpYQ",
+    ] {
+        let room = RoomId::parse(room).unwrap();
+        for mode in [RoomCallMode::ElementCallMatrix2, RoomCallMode::Standard] {
+            let profile = tempfile::tempdir().unwrap();
+            let store =
+                morpheus_config::ConfigStore::at(profile.path().join("incoming-config.toml"));
+            assert!(!store.path().exists());
+            let preferences = fixture_preferences(store.clone()).unwrap();
+            preferences
+                .set_room_call_mode("fixture-account", room.as_str(), mode)
+                .unwrap();
+            assert_eq!(
+                preferences.room_call_mode("fixture-account", room.as_str()),
+                mode
+            );
+            assert_eq!(
+                store
+                    .load()
+                    .unwrap()
+                    .room_call_mode("fixture-account", room.as_str()),
+                mode
+            );
+        }
+    }
 }
 
 #[test]

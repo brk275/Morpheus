@@ -28,17 +28,19 @@ progress. Do not rely on this client for important conversations or
 encryption-key recovery yet. The first beta requires the cross-platform
 checks in [the feature matrix](docs/FEATURE_MATRIX.md).
 
-The composer candidate adds explicit mention selection, typed Plain/Markdown
-drafts, mention-aware replies, threads and edits, and a searchable 44-entry
-starter emoji picker. These additions await native and live acceptance.
-Native keyboard, IME and accessibility behavior remain unverified; the starter
-picker does not cover the full Unicode emoji catalog or skin-tone variants.
+The composer includes explicit mention selection, typed Plain/Markdown drafts,
+mention-aware replies, threads and edits, and a searchable 44-entry starter
+emoji picker. Native builds and their focused guards passed on all four
+platforms at `4fd8071`; a live room-mention rich-text projection failed and its
+repair awaits retesting. Keyboard, IME and accessibility acceptance remain open;
+the picker does not cover the full Unicode catalog or skin-tone variants.
 
 A native click-to-preview image viewer is now implemented for bounded PNG and
 baseline JPEG attachments in rooms and threads. It keeps preview data in memory
-and leaves encrypted-room previews off by default. Native builds, real attachment
-and accessibility acceptance remain pending; animation, WebP, audio and video
-previews are not supported. See [image preview limits](docs/IMAGE_PREVIEWS.md).
+and leaves encrypted-room previews off by default. Native builds and 13 focused
+guards passed on all four platforms; the expanded real-attachment check did not
+run, and viewer/accessibility acceptance remains pending. Animation, WebP, audio
+and video previews are not supported. See [image preview limits](docs/IMAGE_PREVIEWS.md).
 
 ![Morpheus native desktop preview with fictional accounts](docs/screenshots/desktop.png)
 
