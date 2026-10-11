@@ -8,6 +8,7 @@ members = [
     "vendor/lru",
     "vendor/livekit-api",
     "vendor/matrix-rtc-livekit",
+    "vendor/matrix-rtc-core",
     "vendor/cargo-packager-updater",
     "vendor/matrix-sdk-base",
 ]
@@ -42,6 +43,8 @@ nokhwa-bindings-macos = { path = "vendor/nokhwa-bindings-macos" }
 [patch."https://github.com/element-hq/matrix-rust-rtc"]
 # Validate every local/remote focus before exchanging Matrix OpenID credentials.
 matrix-rtc-livekit = { path = "vendor/matrix-rtc-livekit" }
+# Renew encrypted call membership for a newly observed peer using normal room sends.
+matrix-rtc-core = { path = "vendor/matrix-rtc-core" }
 
 [patch."https://github.com/matrix-org/matrix-rust-sdk"]
 # Preserve decrypted keyless sticky receipts without altering the keyed map.

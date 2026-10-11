@@ -230,6 +230,7 @@ jobs:
           cargo test --locked -p lru --lib test_pop_panicking_key_drop_keeps_list_consistent
           cargo test --locked -p livekit-api --lib --features signal-client-tokio,rustls-tls-native-roots
           cargo test --locked -p matrix-rtc-livekit --lib
+          cargo test --locked -p matrix-rtc-core --lib --test key_rotation
           cargo test --locked -p cargo-packager-updater --lib
       - name: Test pinned SDK sticky receipt and redaction regressions
         id: sdk-receipt-tests

@@ -41,6 +41,16 @@ when publication inputs change.
       active and the error is visible. Test settings and TOML round trips.
 - [ ] Fully quit Morpheus and verify it sends no notifications.
 
+## Repository and product presentation
+
+- [ ] Review the README, setup instructions, feature status, contribution and
+      support paths for clarity and consistency with the verified beta.
+- [ ] Capture a fresh, heavily customized view of the actual native app for the
+      README. Use fictional people and example-domain account IDs, excluding
+      the owner's personal names and GitHub handle from app users. Review every
+      visible pane and image metadata before publication. Keep the capture's
+      source revision and provenance; do not generate or retouch the app image.
+
 ## Platform gate
 
 | Platform | Build and install | Calls and screen capture | Accessibility | Update and uninstall |

@@ -137,7 +137,7 @@ class FinalizationTests(unittest.TestCase):
         self.assert_both_cleanups(runner)
 
     def test_known_chat_or_late_join_failure_does_not_starve_independent_element_check(self):
-        for failed in ("live_local", "local_rtc-late-join"):
+        for failed in ("live_local", "local_rtc-late-join", "local_rtc-sticky-2025-late-join"):
             with self.subTest(failed=failed), tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()):
                 collector = Acceptance(Path(folder), "scanner")
                 with self.mocked_main() as (runner, _):
@@ -145,7 +145,9 @@ class FinalizationTests(unittest.TestCase):
                     runner.finish_checks.side_effect = collector.finish_checks
                     runner.rtc_cases.side_effect = lambda: Acceptance.rtc_cases(runner)
                     def test(name, _fixture, **kwargs):
-                        label = name + ("-late-join" if kwargs.get("extra", {}).get("MORPHEUS_RTC_LATE_JOIN") else "")
+                        extra = kwargs.get("extra", {})
+                        label = name + ("-sticky-2025" if extra.get("MORPHEUS_RTC_TEST_MODE") == "sticky-2025" else "")
+                        label += "-late-join" if extra.get("MORPHEUS_RTC_LATE_JOIN") else ""
                         if label == failed:
                             raise acceptance_module.CheckFailure(label, "test_failed")
                     runner.test.side_effect = test
@@ -624,21 +626,47 @@ class LiveEvidenceTests(unittest.TestCase):
     def test_rtc_cases_use_separate_fixtures_and_labels(self):
         with tempfile.TemporaryDirectory() as folder:
             runner = Acceptance(Path(folder), "unused-scanner")
-            fixtures = [Path(folder) / name for name in ("normal.json", "late.json")]
+            fixtures = [Path(folder) / name for name in ("normal.json", "late.json", "sticky-late.json")]
             for fixture in fixtures:
                 fixture.write_text("{}")
                 fixture.chmod(0o600)
             with patch.object(runner, "script", side_effect=[str(path) for path in fixtures]) as script, patch.object(runner, "run") as run:
                 runner.rtc_cases()
-            self.assertEqual(script.call_count, 2)
-            first, second = run.call_args_list
+            self.assertEqual(script.call_count, 3)
+            first, second, third = run.call_args_list
             self.assertEqual(first.args[0], "local_rtc")
             self.assertEqual(second.args[0], "local_rtc-late-join")
+            self.assertEqual(third.args[0], "local_rtc-sticky-2025-late-join")
             self.assertNotIn("MORPHEUS_RTC_LATE_JOIN", first.kwargs["extra"])
             self.assertEqual(second.kwargs["extra"]["MORPHEUS_RTC_LATE_JOIN"], "1")
+            self.assertEqual(third.kwargs["extra"]["MORPHEUS_RTC_LATE_JOIN"], "1")
+            self.assertEqual([call.kwargs["extra"]["MORPHEUS_RTC_TEST_MODE"] for call in run.call_args_list],
+                             ["current", "current", "sticky-2025"])
             self.assertNotEqual(first.kwargs["extra"]["MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS"],
                                 second.kwargs["extra"]["MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS"])
             self.assertEqual(first.args[1], second.args[1], "reuse the same compiled test binary")
+            self.assertEqual(first.args[1], third.args[1], "reuse the same compiled test binary")
+            self.assertEqual(len({call.kwargs["extra"]["MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS"]
+                                  for call in run.call_args_list}), 3)
+
+    def test_late_join_success_requires_new_decrypted_membership_in_each_dialect(self):
+        summary = "test result: ok. 1 passed; 0 failed; 0 ignored;\n"
+        markers = ["MORPHEUS_RTC_LATE_JOIN historical_member=false",
+                   "MORPHEUS_RTC_LATE_JOIN renewed_member=true"]
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            for label in ("local_rtc-late-join", "local_rtc-sticky-2025-late-join"):
+                def validate(lines):
+                    return runner.validated_record(label, summary + "\n".join(lines), test=True,
+                                                   ring_case=None, oauth_checks=None, element_checks=None)
+                self.assertEqual(validate(markers)["late_join_checks"],
+                                 {"historical_member_absent": True, "new_membership_decrypted": True})
+                for lines in ([], markers[:1], markers[1:], markers[::-1],
+                              [markers[0], markers[1].replace("true", "false")],
+                              [markers[0].replace("false", "true"), markers[1]],
+                              markers + markers, markers + ["MORPHEUS_RTC_LATE_JOIN renewed_member=unknown"]):
+                    with self.subTest(label=label, lines=lines), self.assertRaisesRegex(RuntimeError, "renewal evidence"):
+                        validate(lines)
 
     @unittest.skipIf(os.name == "nt", "Linux hosted harness")
     def test_failure_only_publishes_strict_late_join_boolean(self):
@@ -1234,14 +1262,14 @@ class ScopedContinuationTests(unittest.TestCase):
     def test_rtc_failure_continues_with_new_fixture_for_late_join(self):
         with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()):
             runner = Acceptance(Path(folder), "scanner")
-            fixtures = [Path(folder) / name for name in ("first.json", "second.json")]
+            fixtures = [Path(folder) / name for name in ("first.json", "second.json", "third.json")]
             for path in fixtures:
                 path.write_text("{}")
                 path.chmod(0o600)
             with (patch.object(runner, "script", side_effect=list(map(str, fixtures))) as script,
-                  patch.object(runner, "test", side_effect=[acceptance_module.CheckFailure("local_rtc", "test_failed"), None]) as test):
+                  patch.object(runner, "test", side_effect=[acceptance_module.CheckFailure("local_rtc", "test_failed"), None, None]) as test):
                 runner.rtc_cases()
-            self.assertEqual(script.call_count, 2)
+            self.assertEqual(script.call_count, 3)
             self.assertEqual([call.args[1] for call in test.call_args_list], [path.resolve() for path in fixtures])
             self.assertEqual(runner.failures, [{"check": "local_rtc", "reason": "test_failed"}])
 

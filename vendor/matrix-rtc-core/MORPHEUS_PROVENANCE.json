@@ -1,0 +1,25 @@
+{
+  "upstream_repository": "https://github.com/element-hq/matrix-rust-rtc",
+  "revision": "53880ef1ef66b62df555ce71ccd1d6c85b813596",
+  "package": "matrix-rtc-core",
+  "version": "0.5.0-rc.2",
+  "upstream_inventory_sha256": "37e938b8b0540ebfea68545ecd33ef3d58b5db322cb6e357a6adf8dc321d1e4f",
+  "workspace_files": {
+    "Cargo.toml": "65d9cb6174aceab08b531f49736750e65870918cf6a6d9a1363d23b8d2dfd4a3",
+    "LICENSE": "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0",
+    "LICENSE-COMMERCIAL": "8f4b65d16f5ae2810f08a57430d2672e82bd06ddd1762f68dafdeb9f1f151896"
+  },
+  "changed_source_files": [
+    "src/own_membership.rs",
+    "src/session.rs"
+  ],
+  "new_lock_identities": [],
+  "lock_change": {
+    "replaced_source": "git+https://github.com/element-hq/matrix-rust-rtc?tag=v0.5.0-rc.2#53880ef1ef66b62df555ce71ccd1d6c85b813596",
+    "existing_versions_changed": 0,
+    "new_registry_or_git_identities": 0,
+    "existing_dev_dependency_added_to_core": [
+      "futures"
+    ]
+  }
+}

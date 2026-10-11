@@ -8,6 +8,8 @@ provenance and regression tests when updating a dependency.
 | --- | --- | --- |
 | lru 0.16.4 | Backport panic-safe cache removal | [Patch notes](lru/MORPHEUS_PATCH.md) |
 | matrix-rtc-livekit | Secure authorization and media endpoints | [Patch notes](matrix-rtc-livekit/README.md) |
+| matrix-rtc-core 0.5.0-rc.2 | Bounded encrypted membership renewal for newly joined devices | [Patch notes](matrix-rtc-core/MORPHEUS_PATCH.md) |
+| matrix-sdk-base 0.19.1 | Preserve bounded encrypted keyless sticky receipts and their revocation | [Patch notes](matrix-sdk-base/MORPHEUS_PATCH.md) |
 | livekit-api 0.5.3 | Secure signaling, fallback endpoints, and authenticated redirects | [Patch notes](livekit-api/README.md) |
 | webrtc-sys 0.3.35 | Isolate pinned Linux WebRTC PipeWire stubs from the system PipeWire API | [Patch notes](webrtc-sys/MORPHEUS_PATCH.md) |
 | cargo-packager-updater 0.2.3 | HTTPS and bounded signed-update staging; installation disabled pending recovery checks | [Patch notes](cargo-packager-updater/README.md) |

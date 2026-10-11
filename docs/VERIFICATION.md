@@ -5,6 +5,29 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
 ## Current hosted acceptance, 2026-10-11
 
+### Fresh-device call membership renewal candidate
+
+The pinned RTC core is now vendored at the same `0.5.0-rc.2` revision, with a
+bounded renewal request when an existing participant observes a newly joined,
+encrypted and device-attributed peer. The existing heartbeat sends fresh
+ordinary membership through the unchanged SDK encryption path. It retains the
+logical membership, content and fixed lifetime, serializes with leave, limits
+optional attempts to one per ten seconds, and preserves the room's recipient
+and trust policies. No historical keys are exported. Delayed-leave maintenance
+must succeed first, except for the already-selected shorter lifetime on a
+permanently unsupported server. The per-join replay ledger disables optional
+renewal at capacity instead of evicting old identities.
+
+Seventeen source-reviewed core regressions and upstream key-rotation tests are
+selected in CI. The live harness now covers both Current and Sticky2025 fresh
+devices without changing the 45-second roster deadline. Each must observe a
+new encrypted event for the same logical membership after the original event
+preceded the second device's creation. Its historical-event marker means only
+that the original event was absent from the sampled current live map.
+Runtime recovery and native regressions for this candidate await hosted checks.
+Dependency resolution found one patched core instance, no existing version
+changes and no new registry/git package identities.
+
 ### Stable call-slot lookup correction
 
 The passive observer now reads `m.rtc.slot`, matching the pinned SDK writer.
@@ -16,9 +39,25 @@ alias. Both reads share the existing ten-second snapshot deadline.
 
 Five injected-response regressions cover request identity against the pinned
 writer, stable-state precedence, exact missing-state fallback and failure paths.
-Source/API review and formatting checks passed; native execution and all four
-live invitation/admission cases are pending hosted verification of this change.
-The separate fresh-device `MissingMegolmSession` failure remains unresolved.
+[Run 38140942397](https://github.com/brk275/Morpheus/actions/runs/38140942397)
+tested `831cb13ddf19a1e43c2e7660eacc40fd0063c808`. All five passed on all four
+native targets. Apple Silicon, Intel Mac and Windows each passed native
+check/build, 339 unit/vendor/SDK tests and ten fixture selectors without live
+inputs. Windows owned-window/display capture passed. Scope passed 390 helper
+checks with one skip.
+
+Linux passed 365 unit/vendor/SDK tests, 12 fixture selectors and 21 live Rust
+tests. The live harness passed 43 checks and failed one. All four
+Current/Sticky2025 DM/room invitation cases passed the actual passive observer,
+encrypted receipt, incoming admission and revocation assertions. Both OAuth
+phases, ordinary encrypted RTC and the stock Element RC pre-synced interop case
+passed. The exact Wayland test passed with all 33 bindings from system PipeWire;
+the earlier intermittent first-frame timeout still has no established cause.
+The sole live failure remained fresh-device `initial_bob_roster`, with the
+bounded diagnostic reporting `MissingMegolmSession` for Alice's current event
+on Bob. The renewal candidate above addresses this separate failure.
+All jobs, cache and checkout post-steps completed. Their private final logs
+scanned with zero findings. No installer was uploaded.
 
 ### Native preview and microphone cancellation results
 

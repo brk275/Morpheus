@@ -135,7 +135,7 @@ RING_CASES = tuple((mode, target) for mode in ("current", "sticky-2025") for tar
 CHAT_CHECKS = (*CHAT_TESTS, "search_local-classic")
 OAUTH_LABELS = tuple("oauth-local-" + phase.replace("_", "-") for phase in OAUTH_PHASES)
 RING_LABELS = tuple(f"outgoing-ring-{mode}-{target}" for mode, target in RING_CASES)
-RTC_LABELS = ("local_rtc", "local_rtc-late-join")
+RTC_LABELS = ("local_rtc", "local_rtc-late-join", "local_rtc-sticky-2025-late-join")
 ELEMENT_LABEL = "element-call-rc-sticky2025-presynced"
 # Setup/build/browser-install stages never prove that a peer check entered.
 ELEMENT_TEST_STAGES = frozenset((
@@ -537,6 +537,12 @@ class Acceptance:
             record["ring_mode"], record["ring_target"] = ring_case
         elif test:
             record["passed"] = passed_tests(output)
+        if label in ("local_rtc-late-join", "local_rtc-sticky-2025-late-join"):
+            markers = [line for line in output.splitlines() if line.startswith("MORPHEUS_RTC_LATE_JOIN ")]
+            if markers != ["MORPHEUS_RTC_LATE_JOIN historical_member=false",
+                           "MORPHEUS_RTC_LATE_JOIN renewed_member=true"]:
+                raise RuntimeError("Fresh-device encrypted membership renewal evidence is incomplete")
+            record["late_join_checks"] = {"historical_member_absent": True, "new_membership_decrypted": True}
         if label == "live_local":
             diagnostics = live_diagnostics(output)
             if not diagnostics["test_entered"] or diagnostics.get("stage") != "complete":
@@ -570,21 +576,24 @@ class Acceptance:
             args += ["--features", "native-devices"]
         args += ["--test", name, "--", "--nocapture", "--test-threads=1"]
         label = name + ("-classic" if env.get("MORPHEUS_MATRIX_SEARCH_CLASSIC") else "")
+        if env.get("MORPHEUS_RTC_TEST_MODE") == "sticky-2025":
+            label += "-sticky-2025"
         if env.get("MORPHEUS_RTC_LATE_JOIN") == "1":
             label += "-late-join"
         self.run(label, args, extra=env, test=True, pid_namespace=True)
 
     def rtc_cases(self):
-        # The second run gets different users/room: existing devices and keys
-        # would hide a regression in encrypted sticky membership for late join.
-        for late_join in (False, True):
+        # Every run gets different users/room: existing devices and keys would
+        # hide a regression in either encrypted sticky membership dialect.
+        for mode, late_join in (("current", False), ("current", True), ("sticky-2025", True)):
             def case():
                 fixture = fixture_from_output(self.script("local_matrix_rtc", "rtc-fixture"), self.root)
-                extra = {"MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": str(fixture)}
+                extra = {"MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": str(fixture), "MORPHEUS_RTC_TEST_MODE": mode}
                 if late_join:
                     extra["MORPHEUS_RTC_LATE_JOIN"] = "1"
                 self.test("local_rtc", fixture, rtc=True, extra=extra)
-            self.group(("local_rtc-late-join" if late_join else "local_rtc",), case)
+            label = "local_rtc" + ("-sticky-2025" if mode == "sticky-2025" else "")
+            self.group((label + ("-late-join" if late_join else ""),), case)
 
     def outgoing_ring_cases(self):
         # Each mode/target uses new users and an encrypted room. Existing

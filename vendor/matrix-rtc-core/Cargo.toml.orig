@@ -1,0 +1,56 @@
+# Copyright 2026 Element Creations Ltd.
+#
+# SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-Element-Commercial
+# Please see LICENSE in the repository root for full details.
+
+[package]
+name = "matrix-rtc-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+# Sync primitives and `select!` (the upkeep) on every target. Spawning and
+# timers go through `src/executor.rs`, which takes tokio's `time` off wasm32
+# only (below).
+tokio = { workspace = true, features = ["macros"] }
+log.workspace = true
+async-trait.workspace = true
+rand = "0.8"
+rand_core = "0.6"
+base64 = "0.21"
+
+# `rand` reaches getrandom 0.2, which has no wasm entropy source unless its
+# `js` feature is on and refuses to compile for wasm32-unknown-unknown without
+# it. Lives here — where the `rand` dependency is — so every crate over the
+# core checks for wasm32 without repeating it.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+# `std::time::SystemTime::now()` PANICS on wasm32-unknown-unknown (std has no
+# clock there); web-time is the drop-in that reads `Date.now()` instead.
+web-time = "1"
+
+# The executor (`src/executor.rs`): tokio's spawn and timer driver off wasm32;
+# `spawn_local` plus setTimeout-backed sleeps on it. `tokio::time` must not
+# reach the wasm build at all — it panics at runtime on wasm32-unknown-unknown.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["time"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"
+gloo-timers = { version = "0.3", features = ["futures"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "channel"] }
+
+[features]
+# Exposes `testing::MockCommandSender`, the recording command sender the core's
+# own tests use, to the crates built on it.
+testing = []
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "test-util", "time", "sync"] }
+futures = "0.3"
+

@@ -73,3 +73,18 @@ added identities and upstream file hashes are recorded in the
 This incremental query does not replace the existing maintenance notices or
 source review of the SDK patch. The receipt cache's trust, redaction, bounds,
 and lifecycle tests still require execution on the hosted candidate.
+
+## Pinned RTC membership renewal, 2026-10-11
+
+The local `matrix-rtc-core` patch retains version `0.5.0-rc.2` and revision
+`53880ef1ef66b62df555ce71ccd1d6c85b813596`. Resolution replaces the single Git
+core package with the local source and adds its existing `futures` test
+dependency to that package's lock entry. There are no new registry/Git package
+identities or existing version upgrades. The original source inventory,
+workspace values and licenses are recorded in its
+[provenance manifest](../vendor/matrix-rtc-core/MORPHEUS_PROVENANCE.json).
+
+The [patch note](../vendor/matrix-rtc-core/MORPHEUS_PATCH.md) records the two
+changed source files, bounded maintenance hint, unchanged encryption/trust
+policies and required core/live tests. This source patch requires hosted
+verification; an unchanged dependency version does not establish its safety.

@@ -125,38 +125,47 @@ async fn prepare_bob(
     (saved, client)
 }
 
-fn has_encrypted_membership(room: &matrix_sdk::Room, membership_id: &str) -> bool {
-    room.sticky_events().live().iter().any(|entry| {
-        entry.encryption_info().is_some()
-            && entry
-                .raw()
-                .get_field::<serde_json::Value>("content")
-                .ok()
-                .flatten()
-                .and_then(|content| {
-                    content
-                        .get("member")?
-                        .get("id")?
-                        .as_str()
-                        .map(str::to_owned)
-                })
-                .is_some_and(|id| id == membership_id)
-    })
+fn encrypted_membership_event(
+    room: &matrix_sdk::Room,
+    account: &AccountInfo,
+    membership_id: &str,
+) -> Option<matrix_sdk::ruma::OwnedEventId> {
+    let live = room.sticky_events().live();
+    let mut matches = live.iter().filter(|entry| {
+        entry.key.sticky_key == membership_id
+            && matches!(
+                entry.key.event_type.to_string().as_str(),
+                "m.rtc.member" | "org.matrix.msc4143.rtc.member"
+            )
+            && entry.encryption_info().is_some_and(|encryption| {
+                encryption.sender.as_str() == account.user_id
+                    && entry.key.sender == encryption.sender
+                    && encryption.sender_device.as_deref().map(|id| id.as_str())
+                        == Some(account.device_id.as_str())
+            })
+    });
+    let first = matches.next()?.event_id.clone();
+    matches.next().is_none().then_some(first)
 }
 
-async fn wait_for_encrypted_membership(client: &Client, room_id: &str, membership_id: &str) {
+async fn wait_for_encrypted_membership(
+    client: &Client,
+    room_id: &str,
+    account: &AccountInfo,
+    membership_id: &str,
+) -> matrix_sdk::ruma::OwnedEventId {
     let room_id = matrix_sdk::ruma::RoomId::parse(room_id).expect("Invalid fixture room ID");
     let room = client.get_room(&room_id).expect("Alice room is missing");
     timeout(Duration::from_secs(30), async {
         loop {
-            if has_encrypted_membership(&room, membership_id) {
-                return;
+            if let Some(event_id) = encrypted_membership_event(&room, account, membership_id) {
+                return event_id;
             }
             sleep(Duration::from_millis(100)).await;
         }
     })
     .await
-    .expect("Alice encrypted membership did not arrive before Bob's device creation");
+    .expect("Alice encrypted membership did not arrive before Bob's device creation")
 }
 
 async fn bootstrap_test_identity(client: &Client, account: &TestAccount) {
@@ -660,6 +669,11 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
         Err(std::env::VarError::NotPresent) => false,
         _ => panic!("MORPHEUS_RTC_LATE_JOIN must be absent or 1"),
     };
+    let options = match std::env::var("MORPHEUS_RTC_TEST_MODE").as_deref() {
+        Ok("current") | Err(std::env::VarError::NotPresent) => CallOptions::default(),
+        Ok("sticky-2025") => CallOptions::element_call_matrix_2_0(),
+        _ => panic!("MORPHEUS_RTC_TEST_MODE must be absent, current or sticky-2025"),
+    };
     let fixture: Fixture = serde_json::from_slice(
         &fs::read(PathBuf::from(path)).expect("Cannot read protected local Matrix fixture"),
     )
@@ -728,7 +742,7 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
     .expect("Unencrypted room state did not load");
     assert!(matches!(
         unencrypted_call
-            .join(unencrypted_room_id, CallOptions::default())
+            .join(unencrypted_room_id, options.clone())
             .await,
         Err(RtcError::UnencryptedRoomUnsupported)
     ));
@@ -761,25 +775,38 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
         .unwrap_or(60);
     let alice_call = timeout(
         Duration::from_secs(join_timeout),
-        alice_rtc.join(room_id, CallOptions::default()),
+        alice_rtc.join(room_id, options.clone()),
     )
     .await
     .expect("Alice RTC join timed out")
     .expect("Alice RTC join failed");
+    let mut original_membership_event = None;
     let (bob_account, bob_client) = match early_bob {
         Some(bob) => bob,
         None => {
             // A prior call leave/rejoin reuses Bob's old Megolm keys and does
             // not cover this case. His receiving device must not exist until
             // Alice's encrypted sticky membership has actually been sent.
-            wait_for_encrypted_membership(&alice_client, room_id, &alice_call.membership_id).await;
+            original_membership_event = Some(
+                wait_for_encrypted_membership(
+                    &alice_client,
+                    room_id,
+                    &alice_account,
+                    &alice_call.membership_id,
+                )
+                .await,
+            );
             assert!(bob_manager.accounts().await.is_empty());
             let prepared = prepare_bob(&bob_manager, bob, room_id, unencrypted_room_id).await;
             let id = matrix_sdk::ruma::RoomId::parse(room_id).expect("Invalid fixture room ID");
             let room = prepared.1.get_room(&id).expect("Bob room is missing");
-            eprintln!(
-                "\nMORPHEUS_RTC_LATE_JOIN historical_member={}",
-                has_encrypted_membership(&room, &alice_call.membership_id),
+            let historical_member =
+                encrypted_membership_event(&room, &alice_account, &alice_call.membership_id)
+                    .is_some_and(|event_id| original_membership_event.as_ref() == Some(&event_id));
+            eprintln!("\nMORPHEUS_RTC_LATE_JOIN historical_member={historical_member}");
+            assert!(
+                !historical_member,
+                "Fresh device already has the old call membership"
             );
             prepared
         }
@@ -802,7 +829,7 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
     .expect("Bob did not receive the shared voice-space marker");
     let bob_call = timeout(
         Duration::from_secs(join_timeout),
-        bob_rtc.join(room_id, CallOptions::default()),
+        bob_rtc.join(room_id, options.clone()),
     )
     .await
     .expect("Bob RTC join timed out")
@@ -831,6 +858,21 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
         }),
     )
     .await;
+    if let Some(original) = original_membership_event {
+        let room = bob_client
+            .get_room(&matrix_sdk::ruma::RoomId::parse(room_id).unwrap())
+            .expect("Bob room disappeared");
+        // Observe the production scheduler's new, decrypted live membership.
+        // No explicit refresh, historical key import, or diagnostic GET can
+        // satisfy this check. The logical join must remain unchanged.
+        let renewed = encrypted_membership_event(&room, &alice_account, &alice_call.membership_id)
+            .is_some_and(|event_id| event_id != original);
+        eprintln!("\nMORPHEUS_RTC_LATE_JOIN renewed_member={renewed}");
+        assert!(
+            renewed,
+            "Late join did not receive a new encrypted membership event"
+        );
+    }
     timeout(Duration::from_secs(30), async {
         loop {
             if bob_rtc
@@ -1018,7 +1060,7 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
     eprintln!("Alice activated media-key index {rotated_key_index} after Bob left.");
     let rejoined = timeout(
         Duration::from_secs(join_timeout),
-        bob_rtc.join(room_id, CallOptions::default()),
+        bob_rtc.join(room_id, options.clone()),
     )
     .await
     .expect("Bob rejoin timed out")
