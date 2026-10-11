@@ -30,9 +30,7 @@ checks in [the feature matrix](docs/FEATURE_MATRIX.md).
 
 The composer candidate adds explicit mention selection, typed Plain/Markdown
 drafts, mention-aware replies, threads and edits, and a searchable 44-entry
-starter emoji picker. The latest hosted builds stopped at an ambiguous user-ID
-comparison before Rust tests; a reviewed one-site repair, new regressions and
-expanded encrypted fixtures await execution.
+starter emoji picker. These additions await native and live acceptance.
 Native keyboard, IME and accessibility behavior remain unverified; the starter
 picker does not cover the full Unicode emoji catalog or skin-tone variants.
 

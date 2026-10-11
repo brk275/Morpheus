@@ -8,6 +8,10 @@ is the pinned comparison point; its [release history](https://github.com/cinnyap
 documents earlier voice/video rooms, DM and room video starts, code-block
 formatting, media, and device-management changes.
 
+The `56688d0`, `7357111` and `03cb9d5` builds stopped before Rust tests. The latest
+composer and image-preview additions still need native and live acceptance;
+no current CI result or completed beta gate is implied below.
+
 ## Navigation and discovery
 
 - [ ] Home, direct messages, Spaces, nested Space navigation, and rooms shared
@@ -24,15 +28,21 @@ formatting, media, and device-management changes.
       Encrypted replies, edits, reactions, and threads passed local core checks;
       the native Markdown toggle and send path passed a macOS click-through.
       A safe subset of rich text renders in the offline timeline and thread
-      preview. Live decrypted rich rendering, mention suggestions, emoji and
-      sticker pickers, and the complete behavior set remain open.
+      preview, and decrypted events passed that rich-text projection. Member
+      suggestions and a searchable 44-entry starter emoji picker are implemented;
+      their new guards and native keyboard/IME/accessibility behavior remain
+      unverified. Live encrypted rendering in the UI, stickers and the complete
+      behavior set remain open.
 - [ ] Upload, download, preview, and safely open images, video, audio, and
       files in encrypted and unencrypted rooms. The Matrix core passed an
       encrypted binary-file upload/download roundtrip with metadata, account
       isolation, and a local plaintext-store scan. Native attach/save dialogs,
       a timeline card, progress, cancel, and same-transaction retry are wired;
-      live UI acceptance, media previews, type coverage, and unencrypted-room
-      checks remain open.
+      live UI acceptance remains open. A memory-only click-to-preview viewer
+      for bounded PNG/baseline JPEG is implemented, with encrypted previews off
+      by default. Its guards and expanded encrypted/plain-image API fixture
+      await completed hosted verification. Animation, WebP, audio/video previews
+      and full type coverage remain open; see [image preview limits](IMAGE_PREVIEWS.md).
 - [ ] Search rooms, users, and message history; show results in their room and
       timeline context.
 - [ ] Preserve per-room drafts, including across restart; failed sends keep the
@@ -42,7 +52,9 @@ formatting, media, and device-management changes.
       cached restore, guarded disk loads and revision checks. Thread sends
       retain text until the exact queued transaction is acknowledged; a
       per-thread guard prevents duplicate submissions during that session.
-      These changes still need hosted and live UI acceptance. Pending sends
+      Controller regressions passed all four native targets at `3f1a3df`;
+      Linux live checks passed encrypted persistence/isolation and tracked-send
+      acknowledgement. Live thread UI acceptance remains open. Pending sends
       completed after app exit can leave stale drafts; queue reconciliation
       after restart and retry/cancel controls remain open.
 - [ ] Render long and mixed-height timelines with virtualization and keyboard
@@ -64,27 +76,33 @@ formatting, media, and device-management changes.
       shared voice-space room-state marker and Morpheus roster snapshot passed
       a local two-device test. A native two-person call-stage roster passed an
       isolated macOS app check; an encrypted macOS GUI call also joined with
-      two participants. Voice-space navigation and designation are wired, but
-      drop-in acceptance and DM/room ringing remain open.
+      two participants. Voice-space navigation and designation, Call and notify,
+      and incoming Answer/local Dismiss are wired. Incoming guards passed at
+      `c7ad50c`, but its expanded live actor cases stopped at fixture setup before
+      sending an invitation. Actual Answer UI, audible ringing, protocol Decline
+      and voice-space drop-in acceptance remain open.
 - [ ] Encrypted voice and video, reconnect, device selection, and screen share
       interoperate with Element Call on compatible homeservers. Local encrypted
       transport has carried synthetic camera/audio and real macOS display and
       window pixels. An opt-in legacy room-state call exchanged encrypted
-      microphone and video with an Element Call v0.26.1 browser peer. Its
-      current `matrix_2_0` mode still fails the local interop fixture. The
-      remote tile and native Camera/Share source controls compile. In one
-      encrypted macOS GUI call, the display-share UI reached Active and Bob's
-      observer decoded one encrypted `ScreenShare` I420 frame. Sustained
-      sharing, camera publication, and Morpheus's received tile are
-      unverified. On the tested FaceTime camera, a format-selection change
-      still produced no GUI frame: capture stayed Starting for about 20
+      microphone and video with an Element Call v0.26.1 browser peer. A
+      stock v0.28.0-rc.1 peer passed the pre-synced `Sticky2025` fixture
+      at `c7ad50c`; Current-format and fresh-device Element acceptance remain
+      open. The remote tile and native Camera/Share controls compiled on earlier
+      candidates. A fresh encrypted macOS GUI display share delivered ten
+      nonblank encrypted `ScreenShare` I420 frames to its receiving peer.
+      Remote removal after Stop, camera publication and Morpheus's received
+      tile remain unverified. On the tested FaceTime camera, a format-selection
+      change still produced no GUI frame: capture stayed Starting for about 20
       seconds, then moved through Stopping and Failed to Off. Native camera
       capture remains blocked on that macOS device. An unencrypted-room probe
       found no remote camera track despite a publishing peer. Current-format
       calls therefore reject cleartext rooms. Forced signalling socket closure
-      recovered in a native test; a full network outage, SFU restart, capture
-      stop/start, device selection, and cross-platform call acceptance remain
-      open.
+      recovered in a native test. Persisted next-call microphone/speaker
+      selectors passed native compilation and regressions on all four targets
+      at `3f1a3df`; real routing, permissions and unplug behavior remain open.
+      A full network outage, SFU restart, GUI capture stop/start and
+      cross-platform call acceptance also remain open.
 - [ ] Settings, themes, accessibility, and platform packaging work on macOS,
       Windows, and Linux.
 

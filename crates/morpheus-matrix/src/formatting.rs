@@ -286,16 +286,16 @@ mod tests {
             assert!(!html.contains("<em>"));
             assert!(!html.contains("<strong>"));
             let parsed = ruma::html::Html::parse(html);
-            fn text(node: &ruma::html::NodeRef) -> String {
+            fn collect_text(node: &ruma::html::NodeRef) -> String {
                 if let Some(value) = node.as_text() {
                     return value.borrow().to_string();
                 }
-                node.children().map(|child| text(&child)).collect()
+                node.children().map(|child| collect_text(&child)).collect()
             }
             assert_eq!(
                 parsed
                     .children()
-                    .map(|node| text(&node))
+                    .map(|node| collect_text(&node))
                     .collect::<String>()
                     .trim(),
                 id

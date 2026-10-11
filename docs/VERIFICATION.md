@@ -5,6 +5,33 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
 ## Current hosted acceptance, 2026-10-11
 
+### Composer compiler failures and palette follow-up: `03cb9d5`
+
+[Run 38158419315](https://github.com/brk275/Morpheus/actions/runs/38158419315)
+tested `03cb9d59247ae6f2326463b5a0f36fa3e8e33098`. Scope passed 484 Python
+checks with one skip and scanned all 47 reachable commits with zero findings.
+All four native targets passed the previous user-ID comparison site, then stopped
+at the same two source issues: a formatting test's local `text` value shadows its
+recursive helper (`E0434`/`E0618`), and the composer reads a private generated Slint
+`side-panel-tab` getter (`E0624`). No Rust test-result summary, completed native
+build, preview capture or live acceptance was produced. Every job and cache/checkout
+post-step completed; all four completed native logs scanned with zero findings.
+Cache restoration and upload attempts were observed, but explicit cache-service
+save confirmation was absent. No installer was uploaded.
+
+The reviewed repair renames the test helper and exposes the existing Slint
+property as an output, preserving internal UI control without adding a Rust
+setter. A source-only check of 317 root properties found no additional private
+AppWindow accessor call. Hosted compilation and the outstanding composer,
+picker, image-preview and live-fixture checks remain pending.
+
+The same follow-up corrects built-in dark/light and shipped Aurora color pairs,
+including the call button's high-contrast, unavailable and destructive states.
+Independent source calculations put the 32 reviewed foreground/background pairs
+at 4.538:1 or higher. Custom theme overrides and avatar colors are unchanged;
+these calculations are not native rendering, screen-reader or full accessibility
+acceptance. No new feature or test source is added by this follow-up.
+
 ### ID comparison build failure and image-preview candidate: `7357111`
 
 [Run 38156725671](https://github.com/brk275/Morpheus/actions/runs/38156725671)

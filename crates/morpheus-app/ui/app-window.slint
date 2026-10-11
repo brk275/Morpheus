@@ -822,7 +822,7 @@ export component AppWindow inherits Window {
     in-out property <bool> room-action-busy: false;
     in-out property <int> room-action-operation: 0;
     in-out property <bool> stress-timeline-active: false;
-    property <int> side-panel-tab: 0;
+    out property <int> side-panel-tab: 0;
     in-out property <int> page: 0; // 0 chat, 1 settings, 2 call stage
     changed page => {
         root.close-image-preview();
@@ -916,10 +916,10 @@ export component AppWindow inherits Window {
     property <color> elevated: custom-theme-active ? custom-elevated : light-palette ? #ffffff : theme-mode == 2 ? #181818 : #272d3b;
     property <color> hover: custom-theme-active ? custom-hover : light-palette ? #e3e8f2 : theme-mode == 2 ? #333333 : #32394b;
     property <color> ink: custom-theme-active ? custom-ink : light-palette ? #182132 : #ffffff;
-    property <color> muted: custom-theme-active ? custom-muted : light-palette ? #637083 : theme-mode == 2 ? #ffffff : #a7afc1;
+    property <color> muted: custom-theme-active ? custom-muted : light-palette ? #596579 : theme-mode == 2 ? #ffffff : #a7afc1;
     property <color> divider: custom-theme-active ? custom-divider : light-palette ? #dfe4ee : theme-mode == 2 ? #ffffff : #303747;
-    property <color> accent: custom-theme-active ? custom-accent : theme-mode == 2 ? #ffff00 : #a88cff;
-    property <color> accent-ink: custom-theme-active ? custom-accent-ink : theme-mode == 2 ? #000000 : #ffffff;
+    property <color> accent: custom-theme-active ? custom-accent : light-palette ? #6545b5 : theme-mode == 2 ? #ffff00 : #ad91ff;
+    property <color> accent-ink: custom-theme-active ? custom-accent-ink : light-palette ? #ffffff : theme-mode == 2 ? #000000 : #10131b;
     default-font-family: root.ui-font-family;
     background: canvas;
 
@@ -2147,7 +2147,7 @@ export component AppWindow inherits Window {
                                         background: index == 1 ? #e6eaf2 : #11151f;
                                         Rectangle {
                                             x: 8px; y: 8px; width: 30px; height: 26px; border-radius: 4px;
-                                            background: index == 2 ? #ffff00 : #a88cff;
+                                            background: index == 1 ? #6545b5 : index == 2 ? #ffff00 : #ad91ff;
                                         }
                                     }
                                     Text { text: choice; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; overflow: elide; }
@@ -2906,7 +2906,7 @@ export component AppWindow inherits Window {
                             }
                             ActionRect {
                                 width: 110px; height: 43px; border-radius: 9px; background: root.live-session && !root.native-call-enabled ? root.hover : root.call-connected ? #d65163 : root.accent;
-                                focus-color: root.ink;
+                                focus-color: root.live-session && !root.native-call-enabled ? root.muted : root.call-connected ? #10131b : root.accent-ink;
                                 label: root.live-session ? (root.native-leave-unconfirmed ? "Review incomplete call cleanup" : (root.call-connected ? "Leave native call" : "Join native call")) : (root.call-connected ? "End call preview" : "Start call preview");
                                 enabled: !root.live-session || root.native-call-enabled;
                                 activated => {
@@ -2918,7 +2918,7 @@ export component AppWindow inherits Window {
                                         }
                                     } else { root.call-connected = !root.call-connected; }
                                 }
-                                Text { text: root.live-session ? (root.native-call-enabled ? (root.native-leave-unconfirmed ? "Review leave" : (root.call-connected ? "Leave call" : (root.room-call-mode == 2 ? "Join legacy call" : "Join call"))) : "Unavailable") : (root.call-connected ? "End preview" : "Start preview"); color: #ffffff; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                                Text { text: root.live-session ? (root.native-call-enabled ? (root.native-leave-unconfirmed ? "Review leave" : (root.call-connected ? "Leave call" : (root.room-call-mode == 2 ? "Join legacy call" : "Join call"))) : "Unavailable") : (root.call-connected ? "End preview" : "Start preview"); color: root.live-session && !root.native-call-enabled ? root.muted : root.call-connected ? #10131b : root.accent-ink; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                             }
                             IconAction { width: 40px; height: 43px; icon: "R"; label: "Return to chat"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.page = 0; } }
                         }
