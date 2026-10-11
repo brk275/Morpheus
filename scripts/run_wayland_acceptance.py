@@ -89,6 +89,10 @@ CAPTURE_STAGES = frozenset({
 # upstream PipeWire 1.0.5 stream.c, impl-node.c and spa/plugins/support/logger.c.
 # These traces are fixture-only, bounded, private, and never copied to stdout.
 PIPEWIRE_TRACE_LIMIT = 8 * 1024 * 1024
+ORDER_EVENT_LIMIT = 96
+ORDER_PARSE_LIMIT = 4096
+TRACE_ROLES = {"portal-wlr": "producer", "capture-test": "consumer", "pipewire": "daemon"}
+NODE_ROLES = {b"morpheus-fixture-producer": "producer", b"morpheus-fixture-consumer": "consumer"}
 PRODUCER_MARKERS = (
     "buffer-present", "buffer-absent", "frame-valid", "frame-corrupt",
     "queue-while-driving", "queue-while-not-driving", "queue-accepted", "queue-rejected",
@@ -96,12 +100,169 @@ PRODUCER_MARKERS = (
 )
 
 
-def trace_environment() -> dict[str, str]:
+def trace_environment(process: str) -> dict[str, str]:
+    role = TRACE_ROLES[process]
     env = os.environ.copy()
     env.pop("PIPEWIRE_LOG", None)  # Do not use a caller's output destination.
-    env.update(PIPEWIRE_DEBUG="1,pw.stream:4,pw.node:4", PIPEWIRE_LOG_LINE="true",
+    # Child-local diagnostic labels let the daemon's node/link logs identify
+    # roles without publishing randomized names or depending on app metadata.
+    env.pop("PIPEWIRE_PROPS", None)
+    if role != "daemon":
+        env["PIPEWIRE_PROPS"] = f"node.name=morpheus-fixture-{role}"
+    env.update(PIPEWIRE_DEBUG="1,pw.stream:4,pw.node:4,pw.link:4", PIPEWIRE_LOG_LINE="true",
                PIPEWIRE_LOG_COLOR="false", PIPEWIRE_LOG_SYSTEMD="false")
     return env
+
+
+def folded_raw_clock() -> int | None:
+    try:
+        value = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+    except (AttributeError, OSError):
+        return None
+    seconds, nanoseconds = divmod(value, 1_000_000_000)
+    return ((seconds & 0x1FFFFFFF) % 100000) * 1_000_000 + nanoseconds // 1000
+
+
+def ordered_trace_facts(logs: dict[str, bytes], boundaries: list[tuple[int | None, str]]) -> dict:
+    """Order only source-verified raw-clock records; all captures stay private.
+
+    Equal microseconds form unordered groups. A wrap/discontinuity invalidates
+    ordering; unsupported/default logger records are never assigned a time.
+    Role labels can recur after reopening, so identities stay internal and a
+    reused role is explicitly ambiguous rather than one fictitious node.
+    """
+    records = []
+    clock_processes = set()
+    identities = {}
+    destroyed = set()
+    ambiguous_roles = False
+    unsupported = False
+    parse_limited = False
+    pointer = rb"(?:0x[0-9a-fA-F]{1,16}|\(nil\))"
+    label = rb"(morpheus-fixture-(?:producer|consumer))"
+    node = rb"\(" + label + rb"-([0-9]{1,10})\)"
+    header = re.compile(
+        rb"^\[(?:D|I)\]\[([0-9]{5})\.([0-9]{6})\] (pw\.(?:stream|node|link)) +\| "
+        rb"\[ *([a-z-]{1,20}\.c): *[0-9]{1,5} ([a-z_]{1,64})\(\)\] ([^\r\n]{1,1024})$")
+    queue = re.compile(
+        rb"^[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} \[TRACE\] - "
+        rb"morpheus-fixture-order: raw=([0-9]{5})\.([0-9]{6}) "
+        rb"event=(queue-begin|queue-rejected|queue-corrupt-accepted|queue-valid-accepted)$")
+
+    def remember(process, role, identity, event):
+        nonlocal ambiguous_roles
+        key = process, role
+        known = identities.setdefault(key, set())
+        if (known and identity not in known) or (process, role, identity) in destroyed:
+            ambiguous_roles = True
+        known.add(identity)
+        if event == "node_destroyed":
+            destroyed.add((process, role, identity))
+
+    def add(stamp, process, role, event):
+        nonlocal parse_limited
+        if len(records) == ORDER_PARSE_LIMIT:
+            parse_limited = True
+            return
+        records.append((stamp, {"process": TRACE_ROLES.get(process, "harness"), "role": role, "event": event}))
+
+    for process in TRACE_ROLES:
+        links = set()
+        for line in logs.get(process, b"")[:PIPEWIRE_TRACE_LIMIT].splitlines():
+            if len(line) > 2048:
+                continue
+            marker = queue.fullmatch(line) if process == "portal-wlr" else None
+            if marker:
+                stamp = int(marker[1]) * 1_000_000 + int(marker[2])
+                clock_processes.add(process)
+                add(stamp, process, "producer", marker[3].decode("ascii").replace("-", "_"))
+                continue
+            if b"morpheus-fixture-order: clock-unavailable" in line:
+                unsupported = True
+            match = header.fullmatch(line)
+            if not match:
+                if re.match(rb"^\[(?:D|I)\](?:\[[^\]]{0,32}\])? pw\.(?:stream|node|link) ", line):
+                    unsupported = True
+                continue
+            stamp = int(match[1]) * 1_000_000 + int(match[2])
+            clock_processes.add(process)
+            topic, source, function, message = match.group(3, 4, 5, 6)
+            role, event = None, None
+            if (topic, source) == (b"pw.stream", b"stream.c") and process != "pipewire":
+                role = TRACE_ROLES[process]
+                if function == b"impl_send_command":
+                    command = re.fullmatch(pointer + rb": (start [01]|pause)", message)
+                    if command:
+                        event = {b"start 0": "input_start", b"start 1": "output_start",
+                                 b"pause": "stream_pause"}[command[1]]
+                elif function == b"pw_stream_queue_buffer" and message == b"deprecated: use pw_stream_trigger_process() to drive the stream.":
+                    event = "legacy_trigger"
+            elif (topic, source) == (b"pw.node", b"impl-node.c"):
+                observed = None
+                if function == b"node_update_state":
+                    observed = re.fullmatch(node + rb" (creating|suspended|idle|running) -> (suspended|idle|running)", message)
+                    if observed:
+                        event = "node_" + observed[4].decode("ascii")
+                elif function == b"pw_impl_node_destroy":
+                    observed = re.fullmatch(node + rb" destroy", message)
+                    if observed:
+                        event = "node_destroyed"
+                elif function == b"node_ready":
+                    observed = re.fullmatch(node + rb" graph not finished: state:" + pointer + rb" quantum:[0-9]{1,20} pending [0-9]{1,10}/[0-9]{1,10}", message)
+                    if observed:
+                        event = "graph_incomplete"
+                    else:
+                        inactive = re.fullmatch(pointer + rb": ready non-active node " + label + rb" in state -?[0-9]{1,10}", message)
+                        if inactive:
+                            role, event = NODE_ROLES[inactive[1]], "ready_nonactive"
+                elif function == b"pw_impl_node_set_driver":
+                    observed = re.fullmatch(node + rb" -> change driver \([^\r\n()]{1,128} -> " + label + rb"-[0-9]{1,10}\)", message)
+                    if observed:
+                        event = "driver_selected_" + NODE_ROLES[observed[3]]
+                if observed:
+                    role = NODE_ROLES[observed[1]]
+                    remember(process, role, observed[2], event)
+            elif (topic, source) == (b"pw.link", b"impl-link.c") and process == "pipewire":
+                if function == b"pw_context_create_link":
+                    created = re.fullmatch(rb"\(([0-9.]{1,40} -> [0-9.]{1,40})\) \(morpheus-fixture-producer\) -> \(morpheus-fixture-consumer\)", message)
+                    if created:
+                        links.add(created[1])
+                        role, event = "connection", "link_created"
+                elif function == b"pw_impl_link_activate":
+                    active = re.fullmatch(rb"\(([0-9.]{1,40} -> [0-9.]{1,40})\) activated", message)
+                    if active and active[1] in links:
+                        role, event = "connection", "link_activated"
+                elif function == b"pw_impl_link_destroy":
+                    removed = re.fullmatch(rb"\(([0-9.]{1,40} -> [0-9.]{1,40})\) destroy", message)
+                    if removed and removed[1] in links:
+                        links.remove(removed[1])
+                        role, event = "connection", "link_destroyed"
+            if role and event:
+                add(stamp, process, role, event)
+
+    for stamp, event in boundaries[:2]:
+        if stamp is None:
+            unsupported = True
+        elif event in {"test_finished", "test_timeout", "cleanup_begin"}:
+            add(stamp, "harness", "fixture", event)
+    clock = "common" if len(clock_processes) == 3 else "partial" if clock_processes else "unavailable"
+    if records and max(item[0] for item in records) - min(item[0] for item in records) > 900_000_000:
+        # Refuse modulo wrap, unrelated clock epochs and stale mixed logs. The
+        # whole fixture is bounded to 840s plus cleanup; never guess an epoch.
+        clock = "discontinuity"
+    if unsupported:
+        clock = "unsupported"
+    groups = []
+    clipped = parse_limited or len(records) > ORDER_EVENT_LIMIT
+    if clock in {"common", "partial"}:
+        for stamp, event in sorted(records, key=lambda item: item[0])[:ORDER_EVENT_LIMIT]:
+            if not groups or groups[-1][0] != stamp:
+                groups.append((stamp, []))
+            groups[-1][1].append(event)
+    return {"clock": clock, "multiple_role_instances": ambiguous_roles,
+            "events_truncated": clipped,
+            "equal_time_groups": any(len(events) > 1 for _, events in groups),
+            "groups": [events for _, events in groups]}
 
 
 class CappedPrivateLog:
@@ -116,6 +277,7 @@ class CappedPrivateLog:
         self.written = 0
         self.truncated = False
         self.failed = False
+        self.drained = False
         self.source = None
         self.thread = None
         self.stop = threading.Event()
@@ -125,9 +287,10 @@ class CappedPrivateLog:
     def attach(self, source) -> None:
         self.source = source
         os.set_blocking(source.fileno(), False)
-        self.thread = threading.Thread(target=self._drain, daemon=True,
-                                       name="wayland-private-log")
-        self.thread.start()
+        thread = threading.Thread(target=self._drain, daemon=True,
+                                  name="wayland-private-log")
+        thread.start()
+        self.thread = thread
 
     def _drain(self) -> None:
         try:
@@ -140,6 +303,7 @@ class CappedPrivateLog:
                 except BlockingIOError:
                     continue
                 if not data:
+                    self.drained = True
                     return
                 remaining = max(0, self.limit - self.written)
                 self.truncated |= len(data) > remaining
@@ -167,7 +331,8 @@ class CappedPrivateLog:
                 self.failed = True
 
     def facts(self) -> dict:
-        return {"truncated": self.truncated, "capture_failed": self.failed}
+        return {"truncated": self.truncated, "capture_failed": self.failed,
+                "drained_to_eof": self.drained}
 
     def __enter__(self):
         return self
@@ -228,9 +393,11 @@ def pipewire_trace_facts(contents: bytes) -> dict:
     }
 
 
-def private_trace_facts(root: Path, sinks: dict[str, CappedPrivateLog]) -> dict:
+def private_trace_facts(root: Path, sinks: dict[str, CappedPrivateLog],
+                        boundaries: list[tuple[int | None, str]] | None = None) -> dict:
     facts = {}
-    for name in ("portal-wlr", "capture-test"):
+    logs = {}
+    for name in TRACE_ROLES:
         sink = sinks.get(name)
         facts[name] = sink.facts() if sink else {"unavailable": True}
         try:
@@ -239,6 +406,7 @@ def private_trace_facts(root: Path, sinks: dict[str, CappedPrivateLog]) -> dict:
         except OSError:
             contents = b""
             facts[name]["unavailable"] = True
+        logs[name] = contents
         facts[name]["pipewire"] = pipewire_trace_facts(contents)
         if name == "portal-wlr":
             facts[name]["producer"] = {
@@ -257,6 +425,12 @@ def private_trace_facts(root: Path, sinks: dict[str, CappedPrivateLog]) -> dict:
                 {"frame": frame.decode("ascii"), "driving": driving == b"yes",
                  "result": result.decode("ascii")} for frame, driving, result in records[:16]
             ]
+    facts["ordered"] = ordered_trace_facts(logs, boundaries or [])
+    facts["ordered"]["trace_incomplete"] = any(
+        not facts[name].get("drained_to_eof", False) or facts[name].get("truncated", False)
+        or facts[name].get("capture_failed", False) or facts[name].get("unavailable", False)
+        for name in TRACE_ROLES
+    )
     return facts
 
 
@@ -459,6 +633,7 @@ def private_environment(root: Path) -> dict[str, str]:
     env.update({
         "XDG_RUNTIME_DIR": str(runtime), "PIPEWIRE_RUNTIME_DIR": str(runtime),
         "XDG_CONFIG_HOME": str(root / "config"), "XDG_CURRENT_DESKTOP": "sway",
+        "XDG_STATE_HOME": str(root / "state"), "XDG_DATA_HOME": str(root / "data"),
         "XDG_SESSION_TYPE": "wayland", "WLR_BACKENDS": "headless",
         "WLR_RENDERER": "pixman", "WLR_HEADLESS_OUTPUTS": "2",
         "WLR_LIBINPUT_NO_DEVICES": "1", "MORPHEUS_WAYLAND_ACCEPTANCE": "1",
@@ -557,13 +732,13 @@ def session(root: Path) -> int:
     services: dict[str, subprocess.Popen] = {}
     trace_sinks: dict[str, CappedPrivateLog] = {}
     stage = "backend_build"
-    trace_reported = False
+    trace_boundaries = []
     with contextlib.ExitStack() as files:
         def start(name: str, command: list[str], *, service: bool = True, trace: bool = False):
             if trace:
                 sink = files.enter_context(CappedPrivateLog(root / f"{name}.log"))
                 process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                           start_new_session=True, env=trace_environment())
+                                           start_new_session=True, env=trace_environment(name))
                 processes.append(process)
                 trace_sinks[name] = sink
                 sink.attach(process.stdout)
@@ -598,7 +773,7 @@ def session(root: Path) -> int:
             os.environ.update(WAYLAND_DISPLAY=display, SWAYSOCK=str(sway_socket))
             subprocess.run(["dbus-update-activation-environment", "WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "PIPEWIRE_RUNTIME_DIR"], check=True, timeout=10)
             stage = "media_services"
-            start("pipewire", ["pipewire"])
+            start("pipewire", ["pipewire"], trace=True)
             wait_for(lambda: (runtime / "pipewire-0").is_socket(), list(services.values()), "PipeWire socket")
             start("wireplumber", ["wireplumber"])
             stage = "portal"
@@ -648,7 +823,7 @@ def session(root: Path) -> int:
             test_sink = files.enter_context(CappedPrivateLog(root / "capture-test.log"))
             test = subprocess.Popen(command + ["--", "--ignored", "--exact", TARGET_TEST, "--test-threads=1"], cwd=REPO,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
-                                    env=trace_environment())
+                                    env=trace_environment("capture-test"))
             processes.append(test)
             trace_sinks["capture-test"] = test_sink
             test_sink.attach(test.stdout)
@@ -656,11 +831,10 @@ def session(root: Path) -> int:
                 status = wait_owned_process(test, timeout=180)
             except subprocess.TimeoutExpired:
                 status = None
+            trace_boundaries.append((folded_raw_clock(), "test_timeout" if status is None else "test_finished"))
             if status is not None:
                 test_sink.finish()
             test_output = (root / "capture-test.log").read_text(errors="replace")
-            print("Wayland private delivery trace facts: " + json.dumps(private_trace_facts(root, trace_sinks), sort_keys=True))
-            trace_reported = True
             origins = binding_facts(binding_path)
             print("Wayland PipeWire binding facts: " + json.dumps(origins, sort_keys=True))
             if status != 0 or test_sink.failed or test_sink.truncated or not capture_test_passed(test_output) or not bindings_passed(origins):
@@ -670,11 +844,20 @@ def session(root: Path) -> int:
             return 0
         except Exception:
             print("Wayland fixture diagnostic facts: " + json.dumps(diagnostic_facts(root, stage, services), sort_keys=True), file=sys.stderr)
-            if not trace_reported:
-                print("Wayland private delivery trace facts: " + json.dumps(private_trace_facts(root, trace_sinks), sort_keys=True), file=sys.stderr)
             raise
         finally:
-            stop_owned_groups(processes)
+            trace_boundaries.append((folded_raw_clock(), "cleanup_begin"))
+            try:
+                stop_owned_groups(processes)
+            finally:
+                # All children normally exit before this join. EOF confirms
+                # the bounded reader consumed pending pipe bytes; a remaining
+                # writer marks the evidence incomplete instead of assuming a
+                # scheduler delay or buffered file flush has finished.
+                for sink in trace_sinks.values():
+                    sink.finish()
+                print("Wayland private delivery trace facts: " + json.dumps(
+                    private_trace_facts(root, trace_sinks, trace_boundaries), sort_keys=True))
 
 
 def run_session(command: list[str], env: dict[str, str], timeout: float = 840) -> int:

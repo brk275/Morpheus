@@ -39,6 +39,17 @@ CHAT_TESTS = (
     "media_local", "discovery_local", "moderation_local", "search_local",
 )
 RESULT = re.compile(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;")
+LIVE_STAGES = frozenset((
+    "fixture", "login_alice", "sync_alice", "send_alice", "login_carol", "sync_carol",
+    "switch_alice", "cached_alice", "switch_carol", "stop_primary", "restore_carol",
+    "sync_restored", "restore_alice", "cached_restored", "login_bob", "sync_bob",
+    "encrypted_send", "encrypted_edit", "encrypted_reply", "encrypted_reaction",
+    "encrypted_thread_send", "encrypted_thread_receive", "action_isolation", "return_alice",
+    "stop_peer", "restore_peer", "encrypted_restart", "logout_bob", "logout_alice",
+    "logout_carol", "stop_restored", "classic_login", "classic_sync", "classic_logout",
+    "classic_stop", "profile_cleanup", "complete",
+))
+LIVE_STAGE = re.compile(r"^MORPHEUS_LIVE_STAGE ([a-z_]+)$", re.MULTILINE)
 LATE_JOIN_EVIDENCE = re.compile(r"^MORPHEUS_RTC_LATE_JOIN historical_member=(true|false)$", re.MULTILINE)
 MODERATION_STAGES = frozenset(("invite_initial", "invite_after_kick", "invite_after_unban"))
 MODERATION_FAILURES = frozenset((
@@ -83,6 +94,65 @@ OAUTH_FAILURES = frozenset(("fixture_operation", "browser_protocol", "rust_accep
                            "browser_callback_url", "browser_callback_match"))
 OAUTH_STAGE = re.compile(r"^MORPHEUS_OAUTH_STAGE ([a-z_]+)$", re.MULTILINE)
 OAUTH_FAILURE = re.compile(r"^MORPHEUS_OAUTH_FAILURE ([a-z_]+)$", re.MULTILINE)
+RING_TEST = "outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction"
+RING_CHECKS = frozenset((
+    "sticky_sync", "own_crypto", "peer_trust", "joined_without_media", "encrypted_membership",
+    "invitation_receipt", "fetched_decrypted_notification", "targeted_reference", "redaction_receipt",
+    "redaction_observed", "cleanup",
+))
+RING_CHECK = re.compile(r"^MORPHEUS_RING_CHECK ([a-z_]+)=(true|false)$", re.MULTILINE)
+RING_RESULT = re.compile(r"^MORPHEUS_RING_RESULT passed=(true|false)$", re.MULTILINE)
+RING_STAGES = frozenset((
+    "fixture", "login", "sticky_sync", "own_crypto", "peer_trust", "targets", "join", "membership",
+    "send", "fetch", "validate", "redact", "redaction", "cleanup",
+))
+RING_STAGE = re.compile(r"^MORPHEUS_RING_STAGE ([a-z_]+)$", re.MULTILINE)
+RING_FAILURE = re.compile(r"^MORPHEUS_RING_FAILURE ([a-z_]+)$", re.MULTILINE)
+
+
+def live_diagnostics(output: str) -> dict:
+    """Distinguish an entered test from compile/startup stalls without raw logs."""
+    stages = [stage for stage in LIVE_STAGE.findall(output) if stage in LIVE_STAGES]
+    result = {"test_entered": "fixture" in stages}
+    if stages:
+        result["stage"] = stages[-1]
+    return result
+
+
+def ring_evidence(output: str) -> dict[str, bool]:
+    """Allow only fixed checks; a later true cannot erase an earlier false."""
+    checks = {}
+    for name, value in RING_CHECK.findall(output):
+        if name in RING_CHECKS:
+            checks[name] = checks.get(name, True) and value == "true"
+    return checks
+
+
+def ring_diagnostics(output: str) -> dict:
+    """Only source-defined stages, booleans and failure categories are public."""
+    diagnostics = {"checks": ring_evidence(output)}
+    stages = [stage for stage in RING_STAGE.findall(output) if stage in RING_STAGES]
+    failures = [stage for stage in RING_FAILURE.findall(output) if stage in RING_STAGES]
+    if stages:
+        diagnostics["stage"] = stages[-1]
+    if failures:
+        diagnostics["failure"] = failures[-1]
+    results = RING_RESULT.findall(output)
+    if results:
+        diagnostics["passed"] = all(value == "true" for value in results)
+    return diagnostics
+
+
+def ring_passed_tests(output: str) -> int:
+    """The opt-in app test, complete fixed facts and its final result must agree."""
+    named = re.findall(rf"^test {re.escape(RING_TEST)} \.\.\. ok$", output, re.MULTILINE)
+    checks = ring_evidence(output)
+    if (passed_tests(output) != 1 or len(RESULT.findall(output)) != 1 or len(named) != 1
+            or any(checks.get(name) is not True for name in RING_CHECKS)
+            or "failure" in ring_diagnostics(output)
+            or RING_RESULT.findall(output) != ["true"]):
+        raise RuntimeError("Outgoing ring acceptance evidence is incomplete")
+    return 1
 
 
 def moderation_diagnostics(output: str) -> dict:
@@ -182,7 +252,10 @@ class Acceptance:
         self.sequence = 0
 
     def run(self, label: str, args: list[str], *, extra=None, test=False, oauth_checks=(), element_checks=False,
-            stdin=None, seconds=900, pid_namespace=False) -> str:
+            ring_case=None, stdin=None, seconds=900, pid_namespace=False) -> str:
+        if ring_case is not None and ring_case not in (
+                ("current", "dm"), ("current", "room"), ("sticky-2025", "dm"), ("sticky-2025", "room")):
+            raise RuntimeError("Invalid outgoing ring acceptance case")
         self.sequence += 1
         log = self.logs / f"{self.sequence:02d}-{label}.log"
         started = time.monotonic()
@@ -234,6 +307,10 @@ class Acceptance:
             failed = re.findall(r"^test ([A-Za-z0-9_:]+) \.\.\. FAILED$", output, re.MULTILINE)
             locations = re.findall(r"panicked at (crates/[A-Za-z0-9_./-]+\.rs:\d+:\d+)", output)
             evidence = {"check": label, "failed_tests": failed, "panic_locations": locations}
+            if label == "live_local":
+                evidence["live_diagnostics"] = live_diagnostics(output)
+                if timed_out:
+                    evidence["live_diagnostics"]["failure"] = "deadline"
             if fixture_diagnostics := matrix_fixture_diagnostics(output):
                 if timed_out:
                     fixture_diagnostics["failure"] = "deadline"
@@ -257,13 +334,31 @@ class Acceptance:
                 evidence["element_diagnostics"] = element_diagnostics(output)
                 if timed_out:
                     evidence["element_diagnostics"]["failure"] = "deadline"
+            if ring_case is not None:
+                evidence["ring_diagnostics"] = ring_diagnostics(output)
+                if timed_out:
+                    evidence["ring_diagnostics"]["failure"] = "deadline"
             print(json.dumps(evidence), flush=True)
             if timed_out:
                 raise RuntimeError(f"{label} exceeded its {seconds}-second deadline")
             raise RuntimeError(f"{label} failed with exit status {process.returncode}")
         record = {"check": label, "seconds": round(time.monotonic() - started, 2)}
-        if test:
+        if ring_case is not None:
+            try:
+                record["passed"] = ring_passed_tests(output)
+            except RuntimeError:
+                print(json.dumps({"check": label, "ring_diagnostics": ring_diagnostics(output)}), flush=True)
+                raise
+            record["ring_checks"] = ring_evidence(output)
+            record["ring_mode"], record["ring_target"] = ring_case
+        elif test:
             record["passed"] = passed_tests(output)
+        if label == "live_local":
+            diagnostics = live_diagnostics(output)
+            if not diagnostics["test_entered"] or diagnostics.get("stage") != "complete":
+                print(json.dumps({"check": label, "live_diagnostics": diagnostics}), flush=True)
+                raise RuntimeError("Live Matrix acceptance completion evidence is incomplete")
+            record["live_diagnostics"] = diagnostics
         if label == "moderation_local":
             # A green moderation result must exercise an existing, unverified
             # account identity on this fresh device without changing trust.
@@ -307,6 +402,22 @@ class Acceptance:
             if late_join:
                 extra["MORPHEUS_RTC_LATE_JOIN"] = "1"
             self.test("local_rtc", fixture, rtc=True, extra=extra)
+
+    def outgoing_ring_cases(self):
+        # Each mode/target uses new users and an encrypted room. Existing
+        # devices, memberships or notification events cannot satisfy its gate.
+        for mode in ("current", "sticky-2025"):
+            for target in ("dm", "room"):
+                fixture = fixture_from_output(self.script("local_matrix_rtc", "rtc-fixture"), self.root)
+                self.run(
+                    f"outgoing-ring-{mode}-{target}",
+                    ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
+                     "--bin", "morpheus-app", RING_TEST, "--", "--ignored", "--exact", "--show-output",
+                     "--test-threads=1"],
+                    extra={"MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": str(fixture),
+                           "MORPHEUS_RING_TEST_MODE": mode, "MORPHEUS_RING_TEST_TARGET": target},
+                    ring_case=(mode, target), seconds=300,
+                )
 
     def oauth_cases(self):
         """Separate processes prove that refresh tokens survive vaulted restart."""
@@ -428,6 +539,10 @@ class Acceptance:
                                  "browser-to-native audio, roster and departure. This does not verify stable "
                                  "v0.26.1 Matrix 2.0, Morpheus's Current default, fresh-device late join, "
                                  "native-to-browser audio, or full call release acceptance.\n")
+                if any("ring_checks" in item for item in self.results):
+                    output.write("\nOutgoing invitation rows verify the actual app sender, fetched and decrypted "
+                                 "encrypted events by receipt, and server redaction for the listed modes and targets. "
+                                 "They do not verify incoming ringing, notification presentation, or Element receipt.\n")
                 output.write("\nNo fixture credentials or installers were uploaded. Physical-device, UI, "
                              "OS-browser handoff, broader Element Call interoperability, and installed-package gates remain separate.\n")
 
@@ -479,6 +594,7 @@ def main():
         gate = fixture_from_output(acceptance.script("local_matrix_env", "rtc-gate-fixture"), root)
         acceptance.test("unsupported_transport_local", gate, rtc=True,
                         extra={"MORPHEUS_MATRIX_RTC_GATE_TEST_ACCOUNTS": str(gate)})
+        acceptance.outgoing_ring_cases()
         acceptance.rtc_cases()
         acceptance.element_case()
     except BaseException:

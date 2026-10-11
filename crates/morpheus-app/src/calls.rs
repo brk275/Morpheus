@@ -32,7 +32,9 @@ use std::{
     time::Duration,
 };
 
-use morpheus_matrix::{AccountManager, MatrixCoreError, SyncBackend, SyncStatus};
+use morpheus_matrix::{
+    AccountInfo, AccountManager, AccountSelection, MatrixCoreError, SyncBackend, SyncStatus,
+};
 pub use morpheus_rtc::CallInfo;
 use morpheus_rtc::{
     AudioControls, AudioDeviceSelection, AudioState, CallOptions, LocalRtcSupport, MediaError,
@@ -48,8 +50,10 @@ use crate::{
         CaptureCommand, CaptureKind, CaptureSource, CaptureStop, LocalVideoSession,
         LocalVideoStatus,
     },
+    outgoing_ring::{InvitationOutcome, OutgoingRing},
     updater::{CallLease as UpdateCallLease, UpdateActivity, UpdateError},
     video_render::{RosterUpdate, VideoUpdate, run_remote_video},
+    voice_spaces::VoiceSpaces,
 };
 
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -77,6 +81,20 @@ pub enum CallJoinMode {
     Standard,
     ElementCallMatrix2,
     ElementCallRoomState,
+}
+
+/// Joining a voice space or an existing call is quiet. Notifications require
+/// the separate explicit action captured before any asynchronous work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallStartIntent {
+    Quiet,
+    Notify,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InvitationUpdate {
+    pub token: u64,
+    pub text: &'static str,
 }
 
 impl CallJoinMode {
@@ -306,6 +324,7 @@ struct Shared {
     // A worker panic retains the lease until explicit completed cleanup.
     update_call_lease: std::sync::Mutex<Option<UpdateCallLease>>,
     status: watch::Sender<CallStatus>,
+    invitation: watch::Sender<InvitationUpdate>,
     video: watch::Sender<VideoUpdate>,
     roster: watch::Sender<RosterUpdate>,
     audio: watch::Sender<AudioUpdate>,
@@ -402,6 +421,19 @@ impl Shared {
     fn clear_media(&self, token: u64) {
         self.clear_video(token);
         self.clear_audio(token);
+        if self.active_video_token.load(Ordering::SeqCst) == 0 {
+            self.invitation.send_replace(InvitationUpdate::default());
+        }
+    }
+
+    fn send_invitation(&self, token: u64, selection: &AccountSelection, text: &'static str) {
+        if token != 0
+            && self.active_video_token.load(Ordering::SeqCst) == token
+            && selection.is_current()
+        {
+            self.invitation
+                .send_replace(InvitationUpdate { token, text });
+        }
     }
 
     fn clear_video(&self, token: u64) {
@@ -447,6 +479,7 @@ impl CallController {
                 update_activity,
                 update_call_lease: std::sync::Mutex::new(None),
                 status,
+                invitation: watch::channel(InvitationUpdate::default()).0,
                 video,
                 roster,
                 audio,
@@ -461,6 +494,14 @@ impl CallController {
 
     pub fn subscribe_status(&self) -> watch::Receiver<CallStatus> {
         self.shared.status.subscribe()
+    }
+
+    pub fn subscribe_invitation(&self) -> watch::Receiver<InvitationUpdate> {
+        self.shared.invitation.subscribe()
+    }
+
+    pub fn invitation(&self) -> InvitationUpdate {
+        *self.shared.invitation.borrow()
     }
 
     pub fn subscribe_video(&self) -> watch::Receiver<VideoUpdate> {
@@ -720,11 +761,16 @@ impl CallController {
     /// playback of subscribed remote microphones.
     pub async fn start_audio(
         &self,
-        expected_account_id: &str,
+        selection: AccountSelection,
         room_id: &str,
         mode: CallJoinMode,
         audio_devices: AudioDeviceSelection,
+        intent: CallStartIntent,
+        voice_spaces: Arc<VoiceSpaces>,
     ) -> Result<CallInfo, CallControllerError> {
+        if !selection.is_current() {
+            return Err(CallControllerError::AccountChanged);
+        }
         let account =
             self.manager
                 .active_account()
@@ -732,7 +778,7 @@ impl CallController {
                 .ok_or(CallControllerError::Unavailable(
                     AudioCallCapability::SignInRequired,
                 ))?;
-        if account.id != expected_account_id {
+        if account.id != selection.account_id() || !selection.is_current() {
             return Err(CallControllerError::AccountChanged);
         }
         let token = self.shared.next_token.fetch_add(1, Ordering::Relaxed);
@@ -743,6 +789,9 @@ impl CallController {
         let (ready_tx, ready_rx) = oneshot::channel();
         {
             let mut slot = self.shared.slot.lock().await;
+            if !selection.is_current() {
+                return Err(CallControllerError::AccountChanged);
+            }
             if !matches!(*slot, CallSlot::Idle) {
                 return Err(CallControllerError::AlreadyBusy);
             }
@@ -775,6 +824,9 @@ impl CallController {
                 token,
                 ..LocalVideoStatus::default()
             });
+            self.shared
+                .invitation
+                .send_replace(InvitationUpdate { token, text: "" });
             self.shared.status.send_replace(CallStatus::Starting {
                 account_id: account.id.clone(),
                 room_id: room_id.to_owned(),
@@ -783,7 +835,8 @@ impl CallController {
         let worker = CallWorker {
             manager: Arc::clone(&self.manager),
             shared: Arc::clone(&self.shared),
-            account_id: account.id,
+            account_id: account.id.clone(),
+            account,
             room_id: room_id.to_owned(),
             options: mode.options(),
             audio_devices,
@@ -793,6 +846,9 @@ impl CallController {
             ready: Some(ready_tx),
             video_commands: Some(video_rx),
             capture_stop,
+            selection,
+            intent,
+            voice_spaces,
         };
         tokio::spawn(worker.run());
         ready_rx
@@ -1012,6 +1068,7 @@ struct CallWorker {
     manager: Arc<AccountManager>,
     shared: Arc<Shared>,
     account_id: String,
+    account: AccountInfo,
     room_id: String,
     options: CallOptions,
     audio_devices: AudioDeviceSelection,
@@ -1021,6 +1078,9 @@ struct CallWorker {
     ready: Option<oneshot::Sender<Result<CallInfo, CallControllerError>>>,
     video_commands: Option<mpsc::Receiver<CaptureCommand>>,
     capture_stop: Arc<CaptureStop>,
+    selection: AccountSelection,
+    intent: CallStartIntent,
+    voice_spaces: Arc<VoiceSpaces>,
 }
 
 impl CallWorker {
@@ -1045,9 +1105,11 @@ impl CallWorker {
         if !matches!(
             self.cancel.try_recv(),
             Err(oneshot::error::TryRecvError::Empty)
-        ) || ensure_account(&self.manager, &self.account_id)
-            .await
-            .is_err()
+        ) || !self.selection.is_current()
+            || ensure_account(&self.manager, &self.account_id)
+                .await
+                .is_err()
+            || !self.selection.is_current()
         {
             self.shared.clear_media(self.token);
             let leave = leave_with_timeout(&mut rtc, &self.room_id).await;
@@ -1070,7 +1132,10 @@ impl CallWorker {
             let mut slot = self.shared.slot.lock().await;
             match &mut *slot {
                 CallSlot::Running(running)
-                    if running.token == self.token && running.cancel.is_some() =>
+                    if running.token == self.token
+                        && running.cancel.is_some()
+                        && self.selection.is_current()
+                        && !self.capture_stop.requested() =>
                 {
                     running.audio_controls = Some(controls.clone());
                     self.shared.status.send_replace(CallStatus::Joined {
@@ -1088,7 +1153,7 @@ impl CallWorker {
                 }
             }
         }
-        if self.send_ready(Ok(info)) {
+        if self.send_ready(Ok(info.clone())) {
             let leave = leave_with_timeout(&mut rtc, &self.room_id).await;
             self.finish(leave.map_err(|error| error.to_string()), None)
                 .await;
@@ -1101,6 +1166,7 @@ impl CallWorker {
             == Some(self.account_id.as_str());
         let sync_state = sync.borrow().clone();
         if !account_still_active
+            || !self.selection.is_current()
             || !matches!(
                 sync_state,
                 SyncStatus::Running {
@@ -1109,7 +1175,7 @@ impl CallWorker {
             )
         {
             self.shared.clear_media(self.token);
-            let reason = if account_still_active {
+            let reason = if account_still_active && self.selection.is_current() {
                 CallControllerError::Unavailable(AudioCallCapability::StickySyncRequired(
                     sync_state,
                 ))
@@ -1136,18 +1202,28 @@ impl CallWorker {
         let account_capture_guard = {
             let mut active = active.clone();
             let account_id = self.account_id.clone();
+            let selection = self.selection.clone();
             let stop = Arc::clone(&self.capture_stop);
             tokio::spawn(async move {
                 loop {
-                    if active.borrow().as_ref().map(|account| account.id.as_str())
-                        != Some(account_id.as_str())
+                    if !selection.is_current()
+                        || active.borrow().as_ref().map(|account| account.id.as_str())
+                            != Some(account_id.as_str())
                     {
                         stop.request();
                         break;
                     }
-                    if active.changed().await.is_err() {
-                        stop.request();
-                        break;
+                    tokio::select! {
+                        _ = selection.revoked() => {
+                            stop.request();
+                            break;
+                        }
+                        changed = active.changed() => {
+                            if changed.is_err() {
+                                stop.request();
+                                break;
+                            }
+                        }
                     }
                 }
             })
@@ -1173,7 +1249,34 @@ impl CallWorker {
                 }
             })
         };
+        let mut invitation_receipt = None;
         let media_result = {
+            let voice_spaces = Arc::clone(&self.voice_spaces);
+            let voice_account = self.account_id.clone();
+            let voice_room = self.room_id.clone();
+            let local_voice_space = move || {
+                voice_spaces
+                    .local_rooms(&voice_account)
+                    .contains(&voice_room)
+            };
+            let invitation = OutgoingRing::new(
+                &self.account,
+                self.selection.clone(),
+                &info,
+                self.options.interop_mode,
+                self.token,
+                &self.shared.active_video_token,
+                &self.capture_stop,
+                &local_voice_space,
+            )
+            .send(&rtc);
+            tokio::pin!(invitation);
+            let mut invitation_pending = self.intent == CallStartIntent::Notify;
+            let mut invitation_deadline = None;
+            if invitation_pending {
+                self.shared
+                    .send_invitation(self.token, &self.selection, "Preparing invitation…");
+            }
             let audio = rtc.run_audio_controlled_with_devices(
                 &self.room_id,
                 &controls,
@@ -1195,8 +1298,9 @@ impl CallWorker {
             loop {
                 tokio::select! {
                     _ = &mut self.cancel => break Ok(()),
+                    _ = self.selection.revoked() => break Err(CallControllerError::AccountChanged),
                     changed = active.changed() => {
-                        if changed.is_err()
+                        if changed.is_err() || !self.selection.is_current()
                             || active.borrow().as_ref().map(|account| account.id.as_str()) != Some(self.account_id.as_str()) {
                             break Err(CallControllerError::AccountChanged);
                         }
@@ -1206,6 +1310,19 @@ impl CallWorker {
                         if changed.is_err() || !matches!(state, SyncStatus::Running { backend: SyncBackend::SlidingSticky }) {
                             break Err(CallControllerError::Unavailable(AudioCallCapability::StickySyncRequired(state)));
                         }
+                    }
+                    outcome = &mut invitation, if invitation_pending => {
+                        invitation_pending = false;
+                        self.shared.send_invitation(self.token, &self.selection, outcome.status_text());
+                        if let InvitationOutcome::Sent(receipt) = outcome {
+                            invitation_deadline = Some(tokio::time::Instant::from_std(receipt.expires_at()));
+                            invitation_receipt = Some(receipt);
+                        }
+                    }
+                    _ = tokio::time::sleep_until(invitation_deadline.unwrap_or_else(tokio::time::Instant::now)), if invitation_deadline.is_some() => {
+                        invitation_deadline = None;
+                        self.shared.send_invitation(self.token, &self.selection,
+                            "Invitation sent; its 30-second window has ended.");
                     }
                     result = &mut audio, if audio_running => match result {
                         Ok(()) => break Ok(()),
@@ -1233,6 +1350,7 @@ impl CallWorker {
                             break Ok(());
                         }
                         if self.shared.active_video_token.load(Ordering::SeqCst) != self.token
+                            || !self.selection.is_current()
                             || active.borrow().as_ref().map(|account| account.id.as_str())
                                 != Some(self.account_id.as_str())
                         {
@@ -1248,6 +1366,12 @@ impl CallWorker {
         sync_capture_guard.abort();
         let outgoing_result = outgoing.shutdown().await;
         self.shared.clear_media(self.token);
+        // Local media and invitation UI stop before the bounded network
+        // cleanup. Unknown HTTP completion has no receipt and is not retried;
+        // the invitation's original short expiry remains the fallback.
+        if let Some(receipt) = invitation_receipt {
+            let _ = receipt.redact(&rtc).await;
+        }
         let leave_result = leave_with_timeout(&mut rtc, &self.room_id).await;
         let cleanup = match (leave_result, outgoing_result) {
             (Ok(()), Ok(())) => Ok(()),
@@ -1260,6 +1384,9 @@ impl CallWorker {
     }
 
     async fn setup(&mut self) -> Result<(RtcService, CallInfo), CallControllerError> {
+        if !self.selection.is_current() {
+            return Err(CallControllerError::AccountChanged);
+        }
         let controller = CallController {
             manager: Arc::clone(&self.manager),
             shared: Arc::clone(&self.shared),
@@ -1274,12 +1401,18 @@ impl CallWorker {
             unavailable => return Err(CallControllerError::Unavailable(unavailable)),
         }
         ensure_account(&self.manager, &self.account_id).await?;
+        if !self.selection.is_current() {
+            return Err(CallControllerError::AccountChanged);
+        }
         let client = tokio::select! {
             biased;
             _ = &mut self.cancel => return Err(CallControllerError::Cancelled),
             result = self.manager.active_client() => result?,
         };
         ensure_account(&self.manager, &self.account_id).await?;
+        if !self.selection.is_current() {
+            return Err(CallControllerError::AccountChanged);
+        }
         let mut rtc = RtcService::new(client);
         if !matches!(
             self.cancel.try_recv(),
@@ -1324,7 +1457,14 @@ impl CallWorker {
                 .map_err(|error| CallControllerError::Cleanup(error.to_string()))?;
             return Err(CallControllerError::Cancelled);
         }
-        if let Err(error) = ensure_account(&self.manager, &self.account_id).await {
+        let account_check = ensure_account(&self.manager, &self.account_id).await;
+        let account_check = account_check.and_then(|()| {
+            self.selection
+                .is_current()
+                .then_some(())
+                .ok_or(CallControllerError::AccountChanged)
+        });
+        if let Err(error) = account_check {
             leave_with_timeout(&mut rtc, &room_id)
                 .await
                 .map_err(|cleanup| {
@@ -1668,6 +1808,7 @@ mod tests {
             update_activity: UpdateActivity::default(),
             update_call_lease: std::sync::Mutex::new(None),
             status,
+            invitation: watch::channel(InvitationUpdate::default()).0,
             video,
             roster,
             audio,
@@ -1677,8 +1818,17 @@ mod tests {
             active_audio_token: AtomicU64::new(5),
             next_token: AtomicU64::new(6),
         };
-        shared.clear_video(5);
+        shared.invitation.send_replace(InvitationUpdate {
+            token: 5,
+            text: "Invitation sent",
+        });
+        shared.clear_media(5);
         assert_eq!(shared.active_video_token.load(Ordering::SeqCst), 0);
+        assert_eq!(*shared.invitation.borrow(), InvitationUpdate::default());
+        shared.invitation.send_replace(InvitationUpdate {
+            token: 5,
+            text: "Late invitation",
+        });
         shared.video.send_replace(VideoUpdate::Clear { token: 5 });
         shared.local_video.send_replace(LocalVideoStatus {
             token: 5,
@@ -1692,12 +1842,18 @@ mod tests {
             token: 5,
             members: Vec::new(),
         });
-        shared.clear_video(5);
+        shared.clear_media(5);
+        assert_eq!(*shared.invitation.borrow(), InvitationUpdate::default());
         assert_eq!(shared.video.borrow().token(), 0);
         assert_eq!(shared.roster.borrow().token, 0);
         assert_eq!(shared.local_video.borrow().token, 0);
 
         shared.active_video_token.store(6, Ordering::SeqCst);
+        let current_invitation = InvitationUpdate {
+            token: 6,
+            text: "Current invitation",
+        };
+        shared.invitation.send_replace(current_invitation);
         shared.video.send_replace(VideoUpdate::Clear { token: 6 });
         shared.local_video.send_replace(LocalVideoStatus {
             token: 6,
@@ -1707,7 +1863,8 @@ mod tests {
             },
             ..LocalVideoStatus::default()
         });
-        shared.clear_video(5);
+        shared.clear_media(5);
+        assert_eq!(*shared.invitation.borrow(), current_invitation);
         assert_eq!(shared.video.borrow().token(), 6);
         assert_eq!(shared.local_video.borrow().token, 6);
         assert_eq!(shared.local_video.borrow().screen.source, "New display");
@@ -1731,6 +1888,7 @@ mod tests {
             update_activity: UpdateActivity::default(),
             update_call_lease: std::sync::Mutex::new(None),
             status,
+            invitation: watch::channel(InvitationUpdate::default()).0,
             video,
             roster,
             audio,

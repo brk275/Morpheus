@@ -1,0 +1,759 @@
+//! Hosted, opt-in sender-event acceptance. Bob fetches by the actual helper
+//! receipt; this does not establish unsolicited notification delivery or rings.
+//! Each invocation requires a fresh private loopback RTC fixture and two fresh
+//! AccountManager stores. No media publication or capture device is opened.
+
+use std::{collections::HashMap, fs, future::Future, panic::AssertUnwindSafe, path::PathBuf};
+
+use futures_util::FutureExt;
+use matrix_sdk::{
+    Client,
+    deserialized_responses::TimelineEvent,
+    ruma::{
+        EventId,
+        api::client::{room::get_room_event, uiaa},
+    },
+};
+use morpheus_matrix::{AccountManager, SyncBackend, SyncStatus};
+use morpheus_rtc::{
+    CallOptions, RtcStreamKind,
+    ringing::{
+        CallParticipation, ResolvedJoinedCall, RingContext, RingNotification, RoomMentionPermission,
+    },
+};
+use serde::Deserialize;
+
+use super::*;
+
+const WORK_LIMIT: Duration = Duration::from_secs(210);
+const PHASE_LIMIT: Duration = Duration::from_secs(45);
+
+#[derive(Clone, Copy)]
+enum Stage {
+    Fixture,
+    Login,
+    StickySync,
+    OwnCrypto,
+    PeerTrust,
+    Targets,
+    Join,
+    Membership,
+    Send,
+    Fetch,
+    Validate,
+    Redact,
+    Redaction,
+    Cleanup,
+}
+
+impl Stage {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Fixture => "fixture",
+            Self::Login => "login",
+            Self::StickySync => "sticky_sync",
+            Self::OwnCrypto => "own_crypto",
+            Self::PeerTrust => "peer_trust",
+            Self::Targets => "targets",
+            Self::Join => "join",
+            Self::Membership => "membership",
+            Self::Send => "send",
+            Self::Fetch => "fetch",
+            Self::Validate => "validate",
+            Self::Redact => "redact",
+            Self::Redaction => "redaction",
+            Self::Cleanup => "cleanup",
+        }
+    }
+}
+
+fn phase(current: &mut Stage, next: Stage) {
+    *current = next;
+    eprintln!("MORPHEUS_RING_STAGE {}", next.name());
+}
+
+fn fact(name: &'static str) {
+    eprintln!("MORPHEUS_RING_CHECK {name}=true");
+}
+
+fn require(condition: bool) -> Result<(), ()> {
+    if condition { Ok(()) } else { Err(()) }
+}
+
+#[derive(Deserialize)]
+struct Fixture {
+    accounts: Vec<FixtureAccount>,
+    rooms: HashMap<String, String>,
+}
+
+#[derive(Deserialize)]
+struct FixtureAccount {
+    label: String,
+    username: String,
+    user_id: String,
+    homeserver_url: String,
+    password: String,
+}
+
+struct Case {
+    fixture: Fixture,
+    profile: tempfile::TempDir,
+    mode: InteropMode,
+    dm: bool,
+    room_id: OwnedRoomId,
+}
+
+impl Case {
+    fn read() -> Result<Self, ()> {
+        let path = PathBuf::from(std::env::var_os("MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS").ok_or(())?);
+        let metadata = fs::symlink_metadata(&path).map_err(|_| ())?;
+        require(
+            metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() < 1_048_576,
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            require(metadata.permissions().mode() & 0o077 == 0)?;
+        }
+        let path = path.canonicalize().map_err(|_| ())?;
+        let repository = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .map_err(|_| ())?;
+        require(!path.starts_with(repository))?;
+        let fixture: Fixture =
+            serde_json::from_slice(&fs::read(&path).map_err(|_| ())?).map_err(|_| ())?;
+        require(fixture.accounts.len() == 2)?;
+        for (label, prefix) in [("a_primary", "rtcalice"), ("a_second_device", "rtcbob")] {
+            let account = fixture
+                .accounts
+                .iter()
+                .find(|account| account.label == label)
+                .ok_or(())?;
+            require(account.username.starts_with(prefix) && account.password.len() >= 16)?;
+            UserId::parse(&account.user_id).map_err(|_| ())?;
+            let url = url::Url::parse(&account.homeserver_url).map_err(|_| ())?;
+            require(
+                matches!(url.scheme(), "http" | "https")
+                    && url.username().is_empty()
+                    && url.password().is_none(),
+            )?;
+            require(matches!(
+                url.host_str(),
+                Some("127.0.0.1" | "localhost" | "[::1]")
+            ))?;
+        }
+        let room_id =
+            RoomId::parse(fixture.rooms.get("encrypted_room").ok_or(())?).map_err(|_| ())?;
+        let mode = match std::env::var("MORPHEUS_RING_TEST_MODE").as_deref() {
+            Ok("current") => InteropMode::Current,
+            Ok("sticky-2025") => InteropMode::Sticky2025,
+            _ => return Err(()),
+        };
+        let dm = match std::env::var("MORPHEUS_RING_TEST_TARGET").as_deref() {
+            Ok("dm") => true,
+            Ok("room") => false,
+            _ => return Err(()),
+        };
+        let profile = tempfile::Builder::new()
+            .prefix("outgoing-invitation-")
+            .tempdir_in(path.parent().ok_or(())?)
+            .map_err(|_| ())?;
+        Ok(Self {
+            fixture,
+            profile,
+            mode,
+            dm,
+            room_id,
+        })
+    }
+
+    fn account(&self, label: &str) -> Result<&FixtureAccount, ()> {
+        self.fixture
+            .accounts
+            .iter()
+            .find(|account| account.label == label)
+            .ok_or(())
+    }
+}
+
+struct Session {
+    alice: AccountManager,
+    bob: AccountManager,
+    rtc: Option<RtcService>,
+    receipt: Option<InvitationReceipt>,
+    stage: Stage,
+}
+
+impl Session {
+    fn open(case: &Case) -> Result<Self, ()> {
+        Ok(Self {
+            alice: AccountManager::open(case.profile.path().join("alice")).map_err(|_| ())?,
+            bob: AccountManager::open(case.profile.path().join("bob")).map_err(|_| ())?,
+            rtc: None,
+            receipt: None,
+            stage: Stage::Fixture,
+        })
+    }
+
+    async fn run(&mut self, case: &Case) -> Result<(), ()> {
+        phase(&mut self.stage, Stage::Login);
+        let alice_fixture = case.account("a_primary")?;
+        let bob_fixture = case.account("a_second_device")?;
+        let alice = self
+            .alice
+            .add_password_account(
+                &alice_fixture.homeserver_url,
+                &alice_fixture.username,
+                &alice_fixture.password,
+            )
+            .await
+            .map_err(|_| ())?;
+        let bob = self
+            .bob
+            .add_password_account(
+                &bob_fixture.homeserver_url,
+                &bob_fixture.username,
+                &bob_fixture.password,
+            )
+            .await
+            .map_err(|_| ())?;
+        require(
+            alice.user_id == alice_fixture.user_id
+                && bob.user_id == bob_fixture.user_id
+                && alice.user_id != bob.user_id,
+        )?;
+        let alice_client = self.alice.active_client().await.map_err(|_| ())?;
+        let bob_client = self.bob.active_client().await.map_err(|_| ())?;
+
+        phase(&mut self.stage, Stage::StickySync);
+        wait_ready(&self.alice, &alice_client, &case.room_id).await?;
+        wait_ready(&self.bob, &bob_client, &case.room_id).await?;
+        fact("sticky_sync");
+        phase(&mut self.stage, Stage::OwnCrypto);
+        bootstrap(&alice_client, alice_fixture).await?;
+        bootstrap(&bob_client, bob_fixture).await?;
+        fact("own_crypto");
+        phase(&mut self.stage, Stage::PeerTrust);
+        // Fixture-only manual trust: compare the expected locally bootstrapped
+        // master public key before signing the server-fetched peer identity.
+        trust_fixture_peer(&bob_client, &alice_client).await?;
+        trust_fixture_peer(&alice_client, &bob_client).await?;
+        fact("peer_trust");
+
+        let alice_room = alice_client.get_room(&case.room_id).ok_or(())?;
+        let bob_room = bob_client.get_room(&case.room_id).ok_or(())?;
+        phase(&mut self.stage, Stage::Targets);
+        alice_room.set_is_direct(case.dm).await.map_err(|_| ())?;
+        time::timeout(PHASE_LIMIT, async {
+            loop {
+                let is_dm = alice_room.is_direct().await.map_err(|_| ())?;
+                let targets = alice_room.direct_targets();
+                if is_dm == case.dm
+                    && if case.dm {
+                        targets.len() == 1
+                            && targets.iter().any(|target| target.as_str() == bob.user_id)
+                    } else {
+                        targets.is_empty()
+                    }
+                {
+                    return Ok::<_, ()>(());
+                }
+                time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| ())??;
+
+        phase(&mut self.stage, Stage::Join);
+        self.rtc = Some(RtcService::new(alice_client.clone()));
+        let rtc = self.rtc.as_mut().ok_or(())?;
+        rtc.open_slot(case.room_id.as_str(), "m.call#room", true)
+            .await
+            .map_err(|_| ())?;
+        let options = match case.mode {
+            InteropMode::Current => CallOptions::default(),
+            InteropMode::Sticky2025 => CallOptions::element_call_matrix_2_0(),
+            InteropMode::RoomState => return Err(()),
+        };
+        let info = time::timeout(PHASE_LIMIT, rtc.join(case.room_id.as_str(), options))
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
+        require(
+            rtc.participants(case.room_id.as_str())
+                .map_err(|_| ())?
+                .iter()
+                .all(|member| {
+                    member.streams.iter().all(|stream| {
+                        !matches!(
+                            stream.kind,
+                            RtcStreamKind::Microphone
+                                | RtcStreamKind::Camera
+                                | RtcStreamKind::ScreenShare
+                                | RtcStreamKind::ScreenShareAudio
+                        )
+                    })
+                }),
+        )?;
+        fact("joined_without_media");
+        let dialect = NotificationDialect::new(
+            case.mode,
+            &alice.user_id,
+            &alice.device_id,
+            &info.room_id,
+            &info.slot_id,
+        )
+        .ok_or(())?;
+
+        phase(&mut self.stage, Stage::Membership);
+        time::timeout(PHASE_LIMIT, async {
+            loop {
+                if own_membership(&alice_room, &alice, &info, &dialect, case.mode)
+                    .map_err(|_| ())?
+                    .is_some()
+                    && own_membership(&bob_room, &alice, &info, &dialect, case.mode)
+                        .map_err(|_| ())?
+                        .is_some()
+                {
+                    return Ok::<_, ()>(());
+                }
+                time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| ())??;
+        fact("encrypted_membership");
+
+        phase(&mut self.stage, Stage::Send);
+        let selection = self.alice.account_selection(&alice.id).ok_or(())?;
+        let active_token = AtomicU64::new(1);
+        let stop = CaptureStop::default();
+        let local_voice_space = || false;
+        let outcome = OutgoingRing::new(
+            &alice,
+            selection,
+            &info,
+            case.mode,
+            1,
+            &active_token,
+            &stop,
+            &local_voice_space,
+        )
+        .send(rtc)
+        .await;
+        let InvitationOutcome::Sent(receipt) = outcome else {
+            return Err(());
+        };
+        self.receipt = Some(receipt);
+        let receipt = self.receipt.as_ref().ok_or(())?;
+        fact("invitation_receipt");
+
+        phase(&mut self.stage, Stage::Fetch);
+        let notification = fetch_decrypted(&bob_room, &receipt.event_id, &alice).await?;
+        fact("fetched_decrypted_notification");
+        phase(&mut self.stage, Stage::Validate);
+        let envelope: Value =
+            serde_json::from_str(notification.raw().json().get()).map_err(|_| ())?;
+        let parsed = RingNotification::parse(&envelope, case.room_id.as_str()).map_err(|_| ())?;
+        require(
+            parsed.event_id() == receipt.event_id.as_str() && parsed.sender() == alice.user_id,
+        )?;
+        let content = envelope.get("content").ok_or(())?;
+        require(content.pointer("/m.mentions/room").and_then(Value::as_bool) == Some(!case.dm))?;
+        let targets = content
+            .pointer("/m.mentions/user_ids")
+            .and_then(Value::as_array)
+            .ok_or(())?;
+        require(if case.dm {
+            targets.len() == 1 && targets[0].as_str() == Some(bob.user_id.as_str())
+        } else {
+            targets.is_empty()
+        })?;
+        require(content.get("application").is_some() == (case.mode == InteropMode::Current))?;
+        require(
+            content.get("sticky_key").is_none() && content.get("msc4354_sticky_key").is_none(),
+        )?;
+        let reference_id = EventId::parse(parsed.membership_event_id()).map_err(|_| ())?;
+        let reference = fetch_decrypted(&bob_room, &reference_id, &alice).await?;
+        let reference_content = membership_content(&reference)?;
+        require(matches_own_membership(
+            MembershipEvidence {
+                sender: &alice.user_id,
+                device: Some(&alice.device_id),
+                verified: true,
+                sticky_key: &info.membership_id,
+                content: &reference_content,
+            },
+            &alice,
+            &info,
+            dialect.membership_slot(),
+            case.mode,
+        ))?;
+        // The reference can be an earlier refresh of the same logical join.
+        // Independently resolve Bob's currently live, authenticated membership.
+        let current_id = own_membership(&bob_room, &alice, &info, &dialect, case.mode)
+            .map_err(|_| ())?
+            .ok_or(())?;
+        let current = fetch_decrypted(&bob_room, &current_id, &alice).await?;
+        let current_content = membership_content(&current)?;
+        require(matches_own_membership(
+            MembershipEvidence {
+                sender: &alice.user_id,
+                device: Some(&alice.device_id),
+                verified: true,
+                sticky_key: &info.membership_id,
+                content: &current_content,
+            },
+            &alice,
+            &info,
+            dialect.membership_slot(),
+            case.mode,
+        ))?;
+        let powers = bob_room.power_levels().await.map_err(|_| ())?;
+        let permitted = powers
+            .user_can_trigger_room_notification(&UserId::parse(&alice.user_id).map_err(|_| ())?);
+        require(case.dm || permitted)?;
+        let context = RingContext {
+            recipient_user_id: &bob.user_id,
+            room_mention_permission: if permitted {
+                RoomMentionPermission::Allowed
+            } else {
+                RoomMentionPermission::Denied
+            },
+            call: ResolvedJoinedCall {
+                referenced_event_id: reference_id.as_str(),
+                referenced: participation(&reference_content, &alice, &case.room_id)?,
+                current: participation(&current_content, &alice, &case.room_id)?,
+            },
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ())?
+            .as_millis();
+        let window = parsed
+            .validate_for(&context, u64::try_from(now).map_err(|_| ())?)
+            .map_err(|_| ())?;
+        require(window.remaining_ms > 0 && window.remaining_ms <= 30000)?;
+        fact("targeted_reference");
+
+        phase(&mut self.stage, Stage::Redact);
+        require(receipt.redact(rtc).await == RetractionOutcome::Accepted)?;
+        fact("redaction_receipt");
+        phase(&mut self.stage, Stage::Redaction);
+        time::timeout(Duration::from_secs(20), async {
+            loop {
+                let response = bob_client
+                    .send(get_room_event::v3::Request::new(
+                        case.room_id.clone(),
+                        receipt.event_id.clone(),
+                    ))
+                    .with_request_config(
+                        RequestConfig::new()
+                            .retry_limit(0)
+                            .timeout(Duration::from_secs(5)),
+                    )
+                    .await
+                    .map_err(|_| ())?;
+                let event: Value =
+                    serde_json::from_str(response.event.json().get()).map_err(|_| ())?;
+                if let Some(redaction) = event.pointer("/unsigned/redacted_because") {
+                    require(
+                        event.get("event_id").and_then(Value::as_str)
+                            == Some(receipt.event_id.as_str()),
+                    )?;
+                    require(
+                        event
+                            .get("content")
+                            .and_then(Value::as_object)
+                            .is_some_and(|content| content.is_empty()),
+                    )?;
+                    require(
+                        redaction.get("sender").and_then(Value::as_str)
+                            == Some(alice.user_id.as_str()),
+                    )?;
+                    let redacts = redaction
+                        .get("redacts")
+                        .or_else(|| redaction.pointer("/content/redacts"));
+                    require(redacts.and_then(Value::as_str) == Some(receipt.event_id.as_str()))?;
+                    return Ok::<_, ()>(());
+                }
+                time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| ())??;
+        fact("redaction_observed");
+        Ok(())
+    }
+
+    /// All cleanup is outside the main deadline and every attempt runs even
+    /// after a preceding failure. Client/RTC owners remain here on cancellation.
+    async fn cleanup(&mut self, room_id: &OwnedRoomId) -> bool {
+        let mut clean = true;
+        if let Some(rtc) = self.rtc.as_mut() {
+            if let Some(receipt) = self.receipt.take() {
+                clean &= cleanup_attempt(Duration::from_secs(3), async {
+                    receipt.redact(rtc).await == RetractionOutcome::Accepted
+                })
+                .await;
+            }
+            if rtc.call(room_id.as_str()).is_some() {
+                clean &= cleanup_attempt(Duration::from_secs(12), async {
+                    rtc.leave(room_id.as_str()).await.is_ok()
+                })
+                .await;
+            }
+        }
+        for manager in [&self.alice, &self.bob] {
+            clean &= cleanup_attempt(Duration::from_secs(10), async {
+                let mut logged_out = true;
+                for account in manager.accounts().await {
+                    logged_out &= manager
+                        .logout_account(&account.id)
+                        .await
+                        .is_ok_and(|result| result.remote_logout_succeeded);
+                }
+                logged_out
+            })
+            .await;
+        }
+        for manager in [&self.alice, &self.bob] {
+            clean &= cleanup_attempt(Duration::from_secs(5), async {
+                manager.stop().await;
+                true
+            })
+            .await;
+        }
+        self.rtc = None;
+        clean
+    }
+}
+
+async fn cleanup_attempt<F: Future<Output = bool>>(limit: Duration, work: F) -> bool {
+    matches!(
+        AssertUnwindSafe(time::timeout(limit, work))
+            .catch_unwind()
+            .await,
+        Ok(Ok(true))
+    )
+}
+
+async fn wait_ready(
+    manager: &AccountManager,
+    client: &Client,
+    room_id: &OwnedRoomId,
+) -> Result<(), ()> {
+    let mut sync = manager.subscribe_sync_status();
+    time::timeout(PHASE_LIMIT, async {
+        loop {
+            if matches!(
+                &*sync.borrow(),
+                SyncStatus::Running {
+                    backend: SyncBackend::SlidingSticky
+                }
+            ) && client
+                .get_room(room_id)
+                .is_some_and(|room| room.state() == RoomState::Joined)
+            {
+                return Ok(());
+            }
+            tokio::select! {
+                changed = sync.changed() => { changed.map_err(|_| ())?; }
+                _ = time::sleep(Duration::from_millis(100)) => {}
+            }
+        }
+    })
+    .await
+    .map_err(|_| ())?
+}
+
+async fn bootstrap(client: &Client, account: &FixtureAccount) -> Result<(), ()> {
+    let encryption = client.encryption();
+    encryption.wait_for_e2ee_initialization_tasks().await;
+    let own = client.user_id().ok_or(())?;
+    let identity = encryption
+        .request_user_identity(own)
+        .await
+        .map_err(|_| ())?;
+    let device = encryption.get_own_device().await.map_err(|_| ())?;
+    if identity.is_some_and(|identity| identity.is_verified())
+        && device.is_some_and(|device| device.is_verified_with_cross_signing())
+    {
+        return Ok(());
+    }
+    if let Err(error) = encryption.bootstrap_cross_signing(None).await {
+        let challenge = error.as_uiaa_response().ok_or(())?;
+        let mut password = uiaa::Password::new(
+            uiaa::UserIdentifier::Matrix(uiaa::MatrixUserIdentifier::new(account.username.clone())),
+            account.password.clone(),
+        );
+        password.session = challenge.session.clone();
+        encryption
+            .bootstrap_cross_signing(Some(uiaa::AuthData::Password(password)))
+            .await
+            .map_err(|_| ())?;
+    }
+    let identity = encryption
+        .request_user_identity(own)
+        .await
+        .map_err(|_| ())?
+        .ok_or(())?;
+    require(identity.is_verified())?;
+    let device = encryption
+        .get_own_device()
+        .await
+        .map_err(|_| ())?
+        .ok_or(())?;
+    if !device.is_verified_with_cross_signing() {
+        device.verify().await.map_err(|_| ())?;
+        encryption
+            .request_user_identity(own)
+            .await
+            .map_err(|_| ())?;
+    }
+    require(
+        encryption
+            .get_own_device()
+            .await
+            .map_err(|_| ())?
+            .is_some_and(|device| device.is_verified_with_cross_signing()),
+    )
+}
+
+async fn trust_fixture_peer(observer: &Client, subject: &Client) -> Result<(), ()> {
+    let user = subject.user_id().ok_or(())?;
+    let own = subject
+        .encryption()
+        .request_user_identity(user)
+        .await
+        .map_err(|_| ())?
+        .ok_or(())?;
+    require(own.is_verified())?;
+    let expected = own.master_key().get_first_key().ok_or(())?.to_base64();
+    let peer = observer
+        .encryption()
+        .request_user_identity(user)
+        .await
+        .map_err(|_| ())?
+        .ok_or(())?;
+    require(
+        peer.user_id() == user
+            && peer.master_key().get_first_key().ok_or(())?.to_base64() == expected,
+    )?;
+    peer.verify().await.map_err(|_| ())?;
+    require(
+        observer
+            .encryption()
+            .request_user_identity(user)
+            .await
+            .map_err(|_| ())?
+            .is_some_and(|identity| identity.is_verified()),
+    )
+}
+
+async fn fetch_decrypted(
+    room: &Room,
+    event_id: &OwnedEventId,
+    sender: &AccountInfo,
+) -> Result<TimelineEvent, ()> {
+    time::timeout(Duration::from_secs(20), async {
+        loop {
+            let event = room
+                .event(
+                    event_id,
+                    Some(
+                        RequestConfig::new()
+                            .retry_limit(0)
+                            .timeout(Duration::from_secs(5)),
+                    ),
+                )
+                .await
+                .map_err(|_| ())?;
+            if event.encryption_info().is_some_and(|info| {
+                info.verification_state == VerificationState::Verified
+                    && info.sender.as_str() == sender.user_id
+                    && info
+                        .sender_device
+                        .as_deref()
+                        .is_some_and(|device| device.as_str() == sender.device_id)
+            }) {
+                require(event.raw().json().get().len() <= MAX_MEMBERSHIP_BYTES)?;
+                let raw_sender: Option<String> = event.raw().get_field("sender").map_err(|_| ())?;
+                let raw_id: Option<String> = event.raw().get_field("event_id").map_err(|_| ())?;
+                require(
+                    raw_sender.as_deref() == Some(sender.user_id.as_str())
+                        && raw_id.as_deref() == Some(event_id.as_str()),
+                )?;
+                return Ok(event);
+            }
+            time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| ())?
+}
+
+fn participation<'a>(
+    content: &'a Value,
+    sender: &'a AccountInfo,
+    room: &'a OwnedRoomId,
+) -> Result<CallParticipation<'a>, ()> {
+    Ok(CallParticipation {
+        room_id: room.as_str(),
+        sender: &sender.user_id,
+        logical_membership_id: content
+            .pointer("/member/id")
+            .and_then(Value::as_str)
+            .ok_or(())?,
+        slot_id: content.get("slot_id").and_then(Value::as_str).ok_or(())?,
+        application: content
+            .pointer("/application/type")
+            .and_then(Value::as_str)
+            .ok_or(())?,
+        device_id: Some(&sender.device_id),
+    })
+}
+
+fn membership_content(event: &TimelineEvent) -> Result<Value, ()> {
+    let event_type: Option<String> = event.raw().get_field("type").map_err(|_| ())?;
+    require(matches!(
+        event_type.as_deref(),
+        Some("m.rtc.member" | "org.matrix.msc4143.rtc.member")
+    ))?;
+    event.raw().get_field("content").map_err(|_| ())?.ok_or(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "Requires a fresh private loopback MatrixRTC fixture and credential vault"]
+async fn actual_outgoing_invitation_encrypted_receipt_and_redaction() {
+    eprintln!("MORPHEUS_RING_STAGE fixture");
+    let opened = Case::read().and_then(|case| Session::open(&case).map(|session| (case, session)));
+    let Ok((case, mut session)) = opened else {
+        eprintln!("MORPHEUS_RING_FAILURE fixture");
+        eprintln!("MORPHEUS_RING_RESULT passed=false");
+        panic!("Outgoing invitation fixture rejected");
+    };
+    let result = AssertUnwindSafe(time::timeout(WORK_LIMIT, session.run(&case)))
+        .catch_unwind()
+        .await;
+    let passed = matches!(result, Ok(Ok(Ok(()))));
+    if !passed {
+        eprintln!("MORPHEUS_RING_FAILURE {}", session.stage.name());
+    }
+    phase(&mut session.stage, Stage::Cleanup);
+    let clean = session.cleanup(&case.room_id).await;
+    drop(session);
+    let removed = case.profile.close().is_ok();
+    let clean = clean && removed;
+    eprintln!("MORPHEUS_RING_CHECK cleanup={clean}");
+    if !clean {
+        eprintln!("MORPHEUS_RING_FAILURE cleanup");
+    }
+    let passed = passed && clean;
+    eprintln!("MORPHEUS_RING_RESULT passed={passed}");
+    assert!(
+        passed,
+        "Outgoing invitation acceptance failed; see fixed phase facts"
+    );
+}

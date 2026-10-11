@@ -4,6 +4,7 @@ use std::sync::{
     Arc, RwLock,
     atomic::{AtomicBool, Ordering},
 };
+use tokio::sync::Notify;
 
 /// A token for one selection of a local account. Returning to the same account
 /// creates a different token; previously queued work never becomes current
@@ -16,6 +17,7 @@ use std::sync::{
 pub struct AccountSelection {
     account_id: String,
     current: Arc<AtomicBool>,
+    revocation: Arc<Notify>,
 }
 
 impl AccountSelection {
@@ -25,6 +27,24 @@ impl AccountSelection {
 
     pub fn is_current(&self) -> bool {
         self.current.load(Ordering::Acquire)
+    }
+
+    /// Wait until this selection is permanently revoked. Every clone is woken
+    /// immediately on revocation, before account switching waits for sync to
+    /// stop. Waiting after revocation also completes immediately. Cancelling
+    /// this future does not consume another waiter's notification.
+    pub async fn revoked(&self) {
+        loop {
+            let notified = self.revocation.notified();
+            tokio::pin!(notified);
+            // Register before checking the flag: notify_waiters does not keep
+            // a permit for a future waiter, so checking first could lose a wake.
+            notified.as_mut().enable();
+            if !self.is_current() {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -45,10 +65,12 @@ impl Selections {
         let mut selected = self.0.write().unwrap_or_else(|error| error.into_inner());
         if let Some(previous) = selected.take() {
             previous.current.store(false, Ordering::Release);
+            previous.revocation.notify_waiters();
         }
         *selected = account_id.map(|account_id| AccountSelection {
             account_id: account_id.to_owned(),
             current: Arc::new(AtomicBool::new(true)),
+            revocation: Arc::new(Notify::new()),
         });
     }
 }
@@ -62,6 +84,101 @@ impl Drop for Selections {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn revocation_before_wait_completes_without_a_saved_permit() {
+        runtime().block_on(async {
+            let selections = Selections::default();
+            selections.replace(Some("alice"));
+            let selection = selections.for_account("alice").unwrap();
+            selections.replace(None);
+            for _ in 0..2 {
+                tokio::time::timeout(Duration::from_secs(1), selection.revoked())
+                    .await
+                    .expect("already revoked selection did not complete");
+            }
+        });
+    }
+
+    #[test]
+    fn replacement_wakes_every_registered_clone() {
+        runtime().block_on(async {
+            let selections = Selections::default();
+            selections.replace(Some("alice"));
+            let copies: Vec<_> = (0..8)
+                .map(|_| selections.for_account("alice").unwrap())
+                .collect();
+            let mut waiters: Vec<_> = copies
+                .iter()
+                .map(|selection| Box::pin(selection.revoked()))
+                .collect();
+            for waiter in &mut waiters {
+                assert!(futures_util::poll!(waiter.as_mut()).is_pending());
+            }
+            selections.replace(Some("bob"));
+            for waiter in waiters {
+                tokio::time::timeout(Duration::from_secs(1), waiter)
+                    .await
+                    .expect("a registered clone missed revocation");
+            }
+        });
+    }
+
+    #[test]
+    fn dropped_waiter_cannot_consume_another_waiters_revocation() {
+        runtime().block_on(async {
+            let selections = Selections::default();
+            selections.replace(Some("alice"));
+            let selection = selections.for_account("alice").unwrap();
+            let mut cancelled = Box::pin(selection.revoked());
+            assert!(futures_util::poll!(cancelled.as_mut()).is_pending());
+            drop(cancelled);
+            let mut retained = Box::pin(selection.revoked());
+            assert!(futures_util::poll!(retained.as_mut()).is_pending());
+            selections.replace(None);
+            tokio::time::timeout(Duration::from_secs(1), retained)
+                .await
+                .expect("a cancelled waiter consumed revocation");
+        });
+    }
+
+    #[test]
+    fn returning_to_the_same_account_keeps_new_waiters_pending_until_owner_drop() {
+        runtime().block_on(async {
+            let selections = Selections::default();
+            selections.replace(Some("alice"));
+            let original = selections.for_account("alice").unwrap();
+            let mut original_wait = Box::pin(original.revoked());
+            assert!(futures_util::poll!(original_wait.as_mut()).is_pending());
+            selections.replace(Some("bob"));
+            let intermediate = selections.for_account("bob").unwrap();
+            let mut intermediate_wait = Box::pin(intermediate.revoked());
+            assert!(futures_util::poll!(intermediate_wait.as_mut()).is_pending());
+            selections.replace(Some("alice"));
+            let current = selections.for_account("alice").unwrap();
+            let mut current_wait = Box::pin(current.revoked());
+            assert!(futures_util::poll!(current_wait.as_mut()).is_pending());
+            tokio::time::timeout(Duration::from_secs(1), original_wait)
+                .await
+                .expect("original selection was revived");
+            tokio::time::timeout(Duration::from_secs(1), intermediate_wait)
+                .await
+                .expect("intermediate selection remained active");
+            assert!(futures_util::poll!(current_wait.as_mut()).is_pending());
+            drop(selections);
+            tokio::time::timeout(Duration::from_secs(1), current_wait)
+                .await
+                .expect("owner drop did not wake the current selection");
+        });
+    }
 
     #[test]
     fn coalesced_account_switch_never_revives_queued_work() {

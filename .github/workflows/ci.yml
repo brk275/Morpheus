@@ -185,7 +185,9 @@ jobs:
           cargo test --locked -p cargo-packager-updater --lib
       - name: Test real Matrix accounts, recovery, moderation, and encrypted RTC
         if: runner.os == 'Linux'
-        timeout-minutes: 35
+        # Four fresh invitation cases each have a bounded 300-second command.
+        # Preserve room for the existing checks and their service cleanup.
+        timeout-minutes: 55
         shell: bash
         run: |
           set -euo pipefail

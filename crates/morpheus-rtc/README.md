@@ -51,21 +51,43 @@ panics. The service also calls the helper as a fallback.
 
 ## Ringing implementation boundary
 
-DM and ordinary-room ringing are not yet connected to the app. The native
-`ringing` module provides bounded parsing of the pinned, deployed
+The app has a separate **Call and notify** action for Standard and Element Call
+Matrix 2.0. Existing Join and voice-space entry remain quiet; Legacy cannot
+send invitations through this action. This outgoing path still needs hosted
+compilation, live encrypted-peer and UI acceptance before it is considered
+usable. Incoming ringing is not connected to the app. The native `ringing`
+module provides bounded parsing of the pinned, deployed
 `m.rtc.notification` format (flat, nested, and consistent duplicated fields).
 It checks explicit recipients/room-mention permission, caps lifetime at two
 minutes, and correlates a referenced membership with the same live logical
 participation across event refreshes. The caller must independently establish
 decryption authenticity, joined room, open slot and current participation;
-parsing alone never authorizes a ring. These new regressions await hosted tests.
+parsing alone never authorizes a ring.
 
-The remaining controller must use the account-selection cancellation token,
+An outgoing attempt belongs to the captured account selection and call
+generation, checks the live local/shared voice designation and current roster,
+and requires a verified encrypted membership from this user, device and logical
+join. It references that membership's actual event ID. Direct-chat targets must
+match both current joined members and direct-chat metadata; ordinary rooms
+require room-mention permission. The narrow `NotificationDialect` adapter uses
+the pinned RTC library's wire format without a dependency upgrade or vendor
+patch. A room becoming occupied suppresses the invitation; Matrix cannot make
+the final roster check and send atomic.
+
+The worker attempts one transaction, keeps a successful server receipt, and
+reports ambiguous completion without offering a retry. Server acceptance does
+not establish that any recipient rang. Notification lifetime is 30 seconds; sticky
+retention is 60 seconds, following the pinned library's
+`notification_sticky_duration_ms` rule. No acknowledgement extension is
+implemented. Leaving clears local invitation status and stops media before
+a bounded best-effort retraction using the original account's receipt. An
+accepted request with no returned receipt cannot be retracted by this path;
+the original expiry remains the fallback. Invitation failure leaves the call
+usable.
+
+The remaining incoming controller must use the account-selection cancellation token,
 deduplicate events, stop on expiry/departure/other-device acceptance or decline,
-keep voice spaces quiet, and request no capture device before Accept. Outgoing
-notifications must reference an observed membership event and retain the actual
-send receipt; server acceptance does not prove a peer rang. No RTC vendor patch
-is required for that send path. The pinned SDK drops keyless events from its
+keep voice spaces quiet, and request no capture device before Accept. The pinned SDK drops keyless events from its
 sticky map while the pinned notification builder omits a sticky key. Ordinary
 timeline reception therefore cannot establish restart/reconnect delivery from
 the sticky extension. Delayed decryption, this compatibility gap, sound, UI and

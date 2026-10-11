@@ -432,6 +432,7 @@ export component AppWindow inherits Window {
     in-out property <int> room-call-mode: 0;
     in-out property <bool> native-call-request-pending: false;
     in-out property <string> native-call-status;
+    in-out property <string> native-invitation-status;
     in-out property <bool> native-call-joined: false;
     in-out property <bool> native-audio-failed: false;
     in-out property <string> native-audio-error;
@@ -577,6 +578,7 @@ export component AppWindow inherits Window {
     callback preview-demo();
     callback toggle-stress-timeline();
     callback start-native-call();
+    callback notify-native-call();
     callback end-native-call();
     callback open-native-call-slot();
     callback open-discovery();
@@ -2332,6 +2334,21 @@ export component AppWindow inherits Window {
                                         ? "Older Element Call room-state calls; room permission may be required."
                                         : "Standard MatrixRTC. Saved for this account and room; no automatic compatibility fallback.";
                             color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                        }
+                        if !root.call-connected && !root.native-call-request-pending && root.active-room-id != "" && root.room-call-mode != 2 && !root.active-voice-local && !root.active-voice-shared : HorizontalLayout {
+                            alignment: start;
+                            Button {
+                                text: "Call and notify";
+                                accessible-label: "Call and notify people in " + root.active-room-name;
+                                enabled: !root.call-connected && !root.native-call-request-pending && root.active-room-id != "" && root.room-call-mode != 2 && !root.active-voice-local && !root.active-voice-shared;
+                                clicked => { root.notify-native-call(); }
+                            }
+                        }
+                        if root.native-invitation-status != "" : Text {
+                            text: root.native-invitation-status;
+                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                            accessible-label: "Call invitation status: " + root.native-invitation-status;
+                            accessible-live-region: polite;
                         }
                     }
                     if root.live-session : Rectangle {

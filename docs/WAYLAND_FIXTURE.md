@@ -242,8 +242,8 @@ animation does not explain or resolve it. The static first-frame assertion
 remains unchanged.
 
 The next diagnostic candidate instruments the pinned backend's original
-`src/screencast/pipewire_screencast.c`, whose full SHA-256 must match before two
-exact source replacements:
+`src/screencast/pipewire_screencast.c`, whose full SHA-256 must match before
+exact, anchor-checked diagnostic source replacements:
 
 ```text
 e5dd5063d50494efaf82295807b43b20a8c5e68a389e89dbcfca63a724d60d4f
@@ -277,20 +277,72 @@ trigger branch, and non-active/incomplete graph reports. PipeWire's
 define `FASTPATH`; its
 [logging header](https://github.com/PipeWire/pipewire/blob/1.0.5/src/pipewire/log.h#L138-L142)
 compiles process-input/output and callback fastpath tracing out. Those absent
-records are deliberately not presented as observations. The `pw.node` facts
-cover code paths executed in the captured backend/client processes; the
-PipeWire daemon is not part of this targeted trace capture. Absent client
-records say nothing about equivalent work performed in the daemon. These
-diagnostics do not prove exact graph delivery or consumer dispatch.
+records are deliberately not presented as observations. The initial trace
+captured backend/client processes only; the ordered diagnostic extension below
+also captures the daemon. These diagnostics do not prove exact graph delivery
+or consumer dispatch.
 
-Each of the two traced child outputs is drained into a private mode-0600 file
+Each of the three traced child outputs is drained into a private mode-0600 file
 with an 8 MiB storage cap. Excess bytes are discarded while the pipe continues
 to drain; partial writes are completed and errors/truncation are explicit.
 No file-size limit is imposed on Cargo artifacts. Systemd logging and inherited
-PipeWire log destinations are disabled for these two children. Normal owned
-process cleanup precedes closing the bounded reader threads. Files remain
+PipeWire log destinations are disabled for these children. Normal owned
+process cleanup precedes joining the bounded readers to EOF and reporting the
+trace; a missing EOF explicitly marks it incomplete. Files remain
 under the mode-0700 temporary fixture and are deleted on exit, never uploaded.
 Only fixed boolean/category samples leave the fixture. Missing, truncated,
 changed-format or unrecognized log records cannot establish that an event did
 not occur. All selected-source, static-frame, moving-frame, source-loss,
 shutdown, denial and cancellation gates remain required.
+
+## Ordered graph diagnostics
+
+Candidate `d155e25`, run `38119789400`, recorded one valid producer queue that
+was accepted while driving, followed by a corrupt queue during the failed
+attempt. The consumer had Start and Clock/Position IO but no process callback.
+Aggregate `graph_not_finished` and `ready_nonactive_node` flags do not identify
+the cause: PipeWire's latter branch explicitly handles nodes removed during
+shutdown, and the former continues scheduling. No producer scheduling change,
+new damage, retry, or production correction is justified by those facts alone.
+
+The next diagnostic input includes the daemon's private `pw.node`/`pw.link`
+logs and a bounded ordered report. Each backend queue retains the original
+single queue operation and adds timestamps immediately before and after it,
+using `CLOCK_MONOTONIC_RAW`. This mirrors PipeWire 1.0.5's
+[support logger](https://github.com/PipeWire/pipewire/blob/1.0.5/spa/plugins/support/logger.c#L94-L99):
+microsecond precision with folded seconds. Its
+[initialization](https://github.com/PipeWire/pipewire/blob/1.0.5/src/pipewire/pipewire.c#L606)
+enables that logger's timestamps. The PID namespace does not create a separate
+time namespace. xdpw's ordinary wall-clock prefix is ignored; it is never
+correlated as a monotonic timestamp.
+
+For each traced client only, the harness sets `PIPEWIRE_PROPS` to a synthetic
+producer or consumer `node.name`. PipeWire's
+[stream property override](https://github.com/PipeWire/pipewire/blob/1.0.5/src/pipewire/stream.c#L2052)
+applies this diagnostic input; no target, format, driver, or permission property
+is supplied. The daemon gets no override and the parent environment is untouched.
+The isolated fixture has no custom WirePlumber rules, and its data/state roots
+are now private too. The reviewed WirePlumber 0.4.17 stock monitor rules match
+ALSA, BlueZ, V4L2 and libcamera prefixes, not these synthetic labels. General
+policy still runs normally; this is a documented fixture property change,
+not evidence about an unmodified desktop configuration.
+
+The parser recognizes exact source/function/message forms and classifies names,
+node IDs and link identities internally. Only fixed process roles and event
+categories leave the fixture, in at most 96 events. Equal-microsecond events
+form an **unordered group**; list order within that group has no causal meaning.
+Repeated role identities, including a destroyed/recreated identity, flag
+cross-session ambiguity. Link identity must be observed before its activation
+and is forgotten at destruction. No private name, ID, pointer, raw line or
+timestamp is published. Missing sources, event/storage limits, unsupported
+logger records and incomplete pipe drains are explicit. A clock wrap or a span
+longer than the fixture budget invalidates the order rather than guessing an
+epoch. Partial source coverage is labeled partial.
+
+Harness `test_finished`/`test_timeout` and `cleanup_begin` observations share
+the same clock. The first is observed **after** the child exits; Rust panic
+unwinding and `PortalCapture::drop` can already have run. Events before that
+boundary can therefore still be teardown. The report orders logging
+observations, not completion of asynchronous work, and cannot prove absence
+of a callback that upstream compiled out. All static first-frame, selected
+pixels, source-loss, shutdown, denial and cancellation assertions remain intact.

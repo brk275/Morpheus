@@ -43,6 +43,20 @@ PRODUCER_DIAGNOSTIC_BEGIN = PRODUCER_BEGIN + (
     '\n\t}'
 )
 PRODUCER_QUEUE = '\tpw_stream_queue_buffer(cast->stream, pw_buf);'
+PRODUCER_INCLUDE = '#include <assert.h>'
+PRODUCER_CLOCK_HELPER = '''static void morpheus_fixture_order(const char *event) {
+	struct timespec now;
+	if (clock_gettime(CLOCK_MONOTONIC_RAW, &now) != 0) {
+		logprint(TRACE, "morpheus-fixture-order: clock-unavailable");
+		return;
+	}
+	/* Match PipeWire 1.0.5 support/logger.c, including its folded seconds. */
+	logprint(TRACE, "morpheus-fixture-order: raw=%05lu.%06lu event=%s",
+		((unsigned long)now.tv_sec & 0x1FFFFFFF) % 100000,
+		(unsigned long)now.tv_nsec / 1000, event);
+}
+
+'''
 PRODUCER_DIAGNOSTIC_QUEUE = (
     '\tconst bool diagnostic_driving = diagnose && pw_stream_is_driving(cast->stream);'
     '\n\tif (diagnose) {'
@@ -53,8 +67,11 @@ PRODUCER_DIAGNOSTIC_QUEUE = (
     '\n\t\t\t"morpheus-fixture-producer: queue-while-driving" :'
     '\n\t\t\t"morpheus-fixture-producer: queue-while-not-driving");'
     '\n\t}'
+    '\n\tif (diagnose) { morpheus_fixture_order("queue-begin"); }'
     '\n\tconst int queue_result = pw_stream_queue_buffer(cast->stream, pw_buf);'
     '\n\tif (diagnose) {'
+    '\n\t\tmorpheus_fixture_order(queue_result < 0 ? "queue-rejected" :'
+    '\n\t\t\tbuffer_corrupt ? "queue-corrupt-accepted" : "queue-valid-accepted");'
     '\n\t\tlogprint(TRACE, "%s", queue_result < 0 ?'
     '\n\t\t\t"morpheus-fixture-producer: queue-rejected" :'
     '\n\t\t\t"morpheus-fixture-producer: queue-accepted");'
@@ -74,9 +91,10 @@ def add_producer_diagnostics(source: Path) -> None:
     if hashlib.sha256(contents).hexdigest() != PRODUCER_SOURCE_SHA256:
         raise RuntimeError("Wayland fixture producer source checksum mismatch")
     text = contents.decode("utf-8")
-    if text.count(PRODUCER_BEGIN) != 1 or text.count(PRODUCER_QUEUE) != 1:
+    if any(text.count(anchor) != 1 for anchor in (PRODUCER_BEGIN, PRODUCER_QUEUE, PRODUCER_INCLUDE)):
         raise RuntimeError("Wayland fixture producer diagnostic anchors did not match exactly")
-    text = text.replace(PRODUCER_BEGIN, PRODUCER_DIAGNOSTIC_BEGIN, 1)
+    text = text.replace(PRODUCER_INCLUDE, PRODUCER_INCLUDE + '\n#include <time.h>', 1)
+    text = text.replace(PRODUCER_BEGIN, PRODUCER_CLOCK_HELPER + PRODUCER_DIAGNOSTIC_BEGIN, 1)
     text = text.replace(PRODUCER_QUEUE, PRODUCER_DIAGNOSTIC_QUEUE, 1)
     source.write_text(text, encoding="utf-8")
 

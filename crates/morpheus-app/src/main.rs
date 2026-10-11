@@ -11,6 +11,8 @@ mod live;
 #[cfg(feature = "native-calls")]
 mod local_video;
 mod notifications;
+#[cfg(feature = "native-calls")]
+mod outgoing_ring;
 mod security;
 mod shortcuts;
 mod sso;
@@ -45,7 +47,9 @@ use url::Url;
 
 use crate::attachments::{UploadCommand, UploadController, mime_type_for};
 #[cfg(feature = "native-calls")]
-use crate::calls::{AudioUpdate, CallController, CallControllerError, CallJoinMode, CallStatus};
+use crate::calls::{
+    AudioUpdate, CallController, CallControllerError, CallJoinMode, CallStartIntent, CallStatus,
+};
 use crate::live::{LiveUi, MessageTarget, RoomAction, show_error};
 #[cfg(feature = "native-calls")]
 use crate::local_video::{CaptureKind, CapturePhase, CaptureSource, LocalVideoStatus};
@@ -1557,6 +1561,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let calls = calls.clone();
         let weak = ui.as_weak();
+        runtime.spawn(async move {
+            let mut invitation = calls.subscribe_invitation();
+            loop {
+                let update = *invitation.borrow_and_update();
+                let calls_for_ui = calls.clone();
+                let closed = weak
+                    .upgrade_in_event_loop(move |ui| {
+                        // A queued completion cannot overwrite a later join or
+                        // restore invitation text after Leave cleared its token.
+                        if calls_for_ui.invitation() != update {
+                            return;
+                        }
+                        let text = if update.token == calls_for_ui.video_token() {
+                            update.text
+                        } else {
+                            ""
+                        };
+                        ui.set_native_invitation_status(text.into());
+                    })
+                    .is_err();
+                if closed || invitation.changed().await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    #[cfg(feature = "native-calls")]
+    {
+        let calls = calls.clone();
+        let weak = ui.as_weak();
         let applied_token = applied_audio_token.clone();
         runtime.spawn(async move {
             let mut audio = calls.subscribe_audio();
@@ -2098,7 +2132,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let calls = calls.clone();
         let call_live = live.clone();
         let handle = runtime.handle().clone();
-        ui.on_start_native_call(move || {
+        let start_call = move |intent: CallStartIntent| {
             let Some(window) = weak.upgrade() else {
                 return;
             };
@@ -2113,10 +2147,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if account_id.is_empty() || room_id.is_empty() {
                 return;
             }
+            let Some(selection) = call_live.manager.account_selection(&account_id) else {
+                return;
+            };
             // Read the account-scoped checked preferences, not a potentially
             // queued UI snapshot. The worker owns this immutable choice.
             let mode =
                 CallJoinMode::from(call_live.voice_spaces.room_call_mode(&account_id, &room_id));
+            if intent == CallStartIntent::Notify
+                && (mode == CallJoinMode::ElementCallRoomState
+                    || window.get_active_voice_local()
+                    || window.get_active_voice_shared())
+            {
+                return;
+            }
             let audio_selection = audio_devices::selection(&window);
             window.set_native_call_request_pending(true);
             let calls = calls.clone();
@@ -2124,12 +2168,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let weak = weak.clone();
             handle.spawn(async move {
                 let _transition = call_live.account_transition.lock().await;
+                let local_voice = call_live
+                    .voice_spaces
+                    .local_rooms(&account_id)
+                    .contains(&room_id);
+                // A live preference edit made while this request waited must
+                // not turn voice-space entry into an invitation.
+                let intent = if local_voice {
+                    CallStartIntent::Quiet
+                } else {
+                    intent
+                };
                 let result = calls
-                    .start_audio(&account_id, &room_id, mode, audio_selection)
+                    .start_audio(
+                        selection.clone(),
+                        &room_id,
+                        mode,
+                        audio_selection,
+                        intent,
+                        call_live.voice_spaces.clone(),
+                    )
                     .await;
                 let _ = weak.upgrade_in_event_loop(move |ui| {
                     ui.set_native_call_request_pending(false);
-                    if ui.get_active_account_local_id().as_str() == account_id
+                    if selection.is_current()
+                        && ui.get_active_account_local_id().as_str() == account_id
                         && ui.get_active_room_id().as_str() == room_id
                         && let Err(error) = result
                     {
@@ -2137,7 +2200,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 });
             });
-        });
+        };
+        let join_quietly = start_call.clone();
+        ui.on_start_native_call(move || join_quietly(CallStartIntent::Quiet));
+        ui.on_notify_native_call(move || start_call(CallStartIntent::Notify));
     }
     #[cfg(feature = "native-calls")]
     {

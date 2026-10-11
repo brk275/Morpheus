@@ -85,7 +85,7 @@ class WaylandBackendTests(unittest.TestCase):
             self.assertEqual(source.read_text(), content)
 
     def test_producer_diagnostics_preserve_one_queue_call_and_only_fixed_values(self):
-        content = (MODULE.PRODUCER_BEGIN + '\n\tbefore();\n' + MODULE.PRODUCER_QUEUE
+        content = (MODULE.PRODUCER_INCLUDE + '\n' + MODULE.PRODUCER_BEGIN + '\n\tbefore();\n' + MODULE.PRODUCER_QUEUE
                    + '\n\tafter();\n}\n')
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / 'pipewire_screencast.c'
@@ -99,17 +99,24 @@ class WaylandBackendTests(unittest.TestCase):
             self.assertIn('const int queue_result = pw_stream_queue_buffer', result)
             self.assertIn('buffer_corrupt ? "corrupt" : "valid"', result)
             self.assertIn('queue_result < 0 ? "rejected" : "accepted"', result)
+            self.assertIn('clock_gettime(CLOCK_MONOTONIC_RAW, &now)', result)
+            self.assertIn('now.tv_sec & 0x1FFFFFFF) % 100000', result)
+            self.assertLess(result.index('morpheus_fixture_order("queue-begin")'), result.index('const int queue_result'))
+            self.assertGreater(result.index('morpheus_fixture_order(queue_result'), result.index('const int queue_result'))
             self.assertNotIn('%d', result)
             self.assertNotIn('%p', result)
-            self.assertEqual(result.replace(MODULE.PRODUCER_DIAGNOSTIC_BEGIN, MODULE.PRODUCER_BEGIN)
+            self.assertEqual(result.replace(MODULE.PRODUCER_INCLUDE + '\n#include <time.h>', MODULE.PRODUCER_INCLUDE)
+                             .replace(MODULE.PRODUCER_CLOCK_HELPER, '')
+                             .replace(MODULE.PRODUCER_DIAGNOSTIC_BEGIN, MODULE.PRODUCER_BEGIN)
                              .replace(MODULE.PRODUCER_DIAGNOSTIC_QUEUE, MODULE.PRODUCER_QUEUE), content)
             with self.assertRaisesRegex(RuntimeError, 'checksum mismatch'):
                 MODULE.add_producer_diagnostics(source)
 
     def test_producer_diagnostics_reject_wrong_hash_missing_and_duplicate_anchors(self):
-        valid = MODULE.PRODUCER_BEGIN + '\n' + MODULE.PRODUCER_QUEUE
+        valid = MODULE.PRODUCER_INCLUDE + '\n' + MODULE.PRODUCER_BEGIN + '\n' + MODULE.PRODUCER_QUEUE
         for content in ('untrusted source', valid.replace(MODULE.PRODUCER_QUEUE, ''),
-                        valid + MODULE.PRODUCER_QUEUE, valid + MODULE.PRODUCER_BEGIN):
+                        valid + MODULE.PRODUCER_QUEUE, valid + MODULE.PRODUCER_BEGIN,
+                        valid.replace(MODULE.PRODUCER_INCLUDE, ''), valid + MODULE.PRODUCER_INCLUDE):
             with self.subTest(content=content), tempfile.TemporaryDirectory() as directory:
                 source = Path(directory) / 'pipewire_screencast.c'
                 source.write_text(content)

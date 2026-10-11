@@ -27,6 +27,8 @@ mod media;
 #[cfg(feature = "native-rtc")]
 mod native;
 #[cfg(feature = "native-rtc")]
+mod outgoing_notification;
+#[cfg(feature = "native-rtc")]
 pub mod ringing;
 #[cfg(any(feature = "device-camera", feature = "device-screen"))]
 mod video_device;
@@ -49,6 +51,8 @@ pub use native::{
     CallInfo, CallOptions, InteropMode, ParticipantInfo, ParticipantStreamInfo, RtcService,
     RtcStreamKind, install_crypto_provider,
 };
+#[cfg(feature = "native-rtc")]
+pub use outgoing_notification::NotificationDialect;
 #[cfg(feature = "device-camera")]
 pub use video_device::CameraCapture;
 #[cfg(feature = "device-screen")]

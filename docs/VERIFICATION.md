@@ -5,6 +5,56 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
 ## Current hosted acceptance, 2026-10-11
 
+### Latest completed run
+
+[Run 38119789400](https://github.com/brk275/Morpheus/actions/runs/38119789400)
+tested `d155e2591545611bf2f465baa491b35394cb538d` on all four standard public
+runners. Windows and both Mac architectures passed their complete jobs, native
+builds, 16 configuration, 40 Matrix, eight RTC protocol, 74 desktop and 47 native
+RTC/device tests, plus the four vendor suites (1/32/10/5). The hosted Windows
+owned-window/display capture check completed. Linux passed its native build,
+Xvfb startup, the same configuration/Matrix/protocol checks, 89 desktop and
+58 native RTC/device tests, and all vendor suites.
+
+Linux still failed acceptance. Its Wayland step's API conclusion is **success
+because of `continue-on-error`**; the actual capture test failed at the first
+static selected-display frame. All 33 PipeWire binding origins were correct.
+Producer traces now show successful buffer queueing while driving, the legacy
+driver-trigger branch, a ready but nonactive node and an unfinished graph.
+The consumer reached streaming and received Start/Clock/Position setup, but no
+process callback. The graph warnings were not ordered against shutdown, so they
+may describe teardown. These fixed diagnostics narrow the investigation; they do not
+establish a root cause or a passing capture gate. Final workflow enforcement
+correctly rejected the failed capture result.
+
+The separate Matrix harness started disposable services, then `live_local`
+exceeded its 900-second command deadline. The retained public facts do not
+distinguish compilation/startup from a particular SDK await. Later chat tests,
+recovery, OAuth, native RTC and Element Call were not reached. Owned service
+cleanup and the container/network absence checks passed. Completed scope and
+native logs scanned with zero findings and are retained privately with hashes;
+all post/cache steps completed. No installer was uploaded.
+
+The next test-only diagnostic change emits 37 fixed phase identifiers and
+requires an entered/completed live test before recording success. Failure output
+contains only the last recognized phase and a deadline category after private
+log scanning. Account-selection source review found no concrete deadlock. These
+diagnostics do not claim to fix the stalled test. The live workflow allowance
+increases from 35 to 55 minutes to accommodate four new bounded invitation cases;
+the standard runner selection and 90-minute native job limit are unchanged.
+
+The next Wayland diagnostic also captures the daemon and orders source-verified
+raw-clock records from all three processes. Each raw stream is private and
+capped at 8 MiB; public output contains at most 96 fixed event records, with
+ties, clock discontinuities, repeated node roles and incomplete drains explicit.
+Fixture-only node labels identify producer and consumer; raw identities and
+timestamps are withheld. Upstream scheduling changes were reviewed, but no
+scheduling backport or production capture change is included. The initial static
+frame remains mandatory. Independent source review passed; 48 portable Wayland
+helper tests passed and three Linux-only process checks were skipped locally.
+
+### Earlier completed candidate
+
 [Run 38115477988](https://github.com/brk275/Morpheus/actions/runs/38115477988)
 tested `3f1a3df4a1ed4ad125504d5c7d8daf45ae8b7dcb` on the four standard public
 runners. Windows and both Mac architectures passed their complete jobs: each passed
@@ -92,7 +142,7 @@ are retained privately. No packages were built or uploaded.
 
 ### Account-selection and ringing validation work
 
-Local candidate `ae8d2c7` adds revocable account-selection tokens to queued
+Candidate `ae8d2c7`, included in `d155e25`, adds revocable account-selection tokens to queued
 desktop notifications: an A-to-B-to-A switch cannot revive old work. Password
 and browser sign-in, account switching, logout and sync shutdown cover the same
 transition boundary. Source review found no unresolved issue; three token
@@ -103,8 +153,9 @@ see the [implementation boundary](../crates/morpheus-rtc/README.md#ringing-imple
 
 Formatting, whitespace checks and 17 CI-selection helper tests passed locally.
 The exact staged source scan found only the hash-verified public upstream test
-JWT; the committed-history scan found zero credentials. Native tests for this
-shared-source candidate remain pending on all four standard public runners.
+JWT; the committed-history scan found zero credentials. These native unit checks
+passed on all four standard public runners in `d155e25`; the Linux integration
+failures described above remain open.
 
 ### Callback correction and capture diagnostics
 
@@ -119,8 +170,8 @@ without printing URLs, state, authorization codes or provider descriptions.
 
 Independent source reviews passed. The focused OAuth helper suites ran 83 tests:
 82 passed and the real hosted HTTPS check was skipped locally. The native
-callback regression and actual login/restore/logout phases still require hosted
-execution. Wayland adds bounded, private producer queue and PipeWire diagnostics
+callback regression passed with the Matrix suite in `d155e25`; actual
+login/restore/logout phases were not reached. Wayland adds bounded, private producer queue and PipeWire diagnostics
 to locate the missing delivery; this is not a capture fix or a passing gate.
 The initial static-source frame assertion remains mandatory.
 
@@ -129,6 +180,43 @@ process checks were skipped locally. They cover the pinned-source patch guards,
 fixed diagnostic output, bounded log draining, partial writes and cleanup.
 Python syntax, Rust formatting, Actionlint and whitespace checks passed. No
 local native compilation, native test, service or certificate installation ran.
+
+### Outgoing invitation candidate
+
+The next shared-source candidate adds an explicit **Call and notify** action
+for Standard and Element Call Matrix 2.0. Join and voice-space entry remain
+quiet. The worker uses the captured account-selection token and call generation,
+requires its verified encrypted membership, checks current recipients and
+room-mention permission, and suppresses notifications for occupied calls or
+voice spaces. The pinned RTC dialect adapter controls the wire format. One
+transaction has a 30-second invitation window; an ambiguous response offers no
+retry. A known receipt permits bounded best-effort retraction after media stops.
+Source review covered stale-account updates and the original expiry deadline.
+Native compilation and runtime acceptance for this candidate remain pending.
+
+Review also found that revocation precedes the active-account watch update while
+sync shutdown is pending. The candidate adds a direct revocation wakeup for the
+call's media loop, independent capture guard and invitation sender. Revocation
+before subscribing and multiple pending listeners have focused regressions;
+native execution is pending. This closes a cancellation observation gap in the
+candidate and is not an explanation for the separate `live_local` timeout.
+
+The hosted Linux harness adds four fresh encrypted cases: Current and Sticky2025,
+each with direct-chat and room targets. Each invokes the actual app helper,
+then Bob fetches and decrypts the event by the returned receipt, independently
+checks its authenticated membership reference, targets and lifetime, and observes
+server-side redaction. Fixture-only peer trust compares the actual bootstrapped
+master keys before signing. The test opens no capture devices or media tracks.
+Its main operation is bounded at 210 seconds, followed by bounded cleanup; the
+outer command allows 300 seconds. The harness requires the exact named test,
+all 11 fixed facts and a single final success marker. Its 54 portable helper
+tests passed locally. No live outcome has been recorded yet.
+
+This test establishes sender-event and explicit-fetch behavior only. Incoming
+notification reception, sound, Accept/Decline, presentation in another client,
+and real UI use remain separate gates. See the
+[ringing boundary](../crates/morpheus-rtc/README.md#ringing-implementation-boundary)
+for the pinned SDK's keyless sticky-event limitation.
 
 ## Beta gate implementation batch, 2026-10-10
 

@@ -11,6 +11,14 @@ use serde::Deserialize;
 use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
+// Only source-defined identifiers enter the hosted runner's public diagnostics.
+// Start a fresh line because libtest can leave its test-name prefix unfinished.
+macro_rules! phase {
+    ($name:ident) => {
+        eprintln!("\nMORPHEUS_LIVE_STAGE {}", stringify!($name));
+    };
+}
+
 #[derive(Deserialize)]
 struct Fixture {
     accounts: Vec<TestAccount>,
@@ -208,6 +216,7 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
         );
         return;
     };
+    phase!(fixture);
     let credentials_path = PathBuf::from(credentials_path);
     let fixture: Fixture = serde_json::from_slice(
         &fs::read(&credentials_path).expect("Cannot read local Matrix credentials"),
@@ -238,6 +247,7 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
 
         let manager =
             AccountManager::open(primary_store.clone()).expect("Cannot open local account store");
+        phase!(login_alice);
         let alice = manager
             .add_password_account(
                 &alice_fixture.homeserver_url,
@@ -247,6 +257,7 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
             .await
             .expect("Alice Matrix login failed");
         assert_eq!(alice.user_id, alice_fixture.user_id);
+        phase!(sync_alice);
         wait_for_room(&manager, a_room).await;
         wait_for_sync_backend(&manager, SyncBackend::SlidingSticky).await;
         let alice_rooms = wait_for_room(&manager, encrypted_room).await;
@@ -256,6 +267,7 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
                 .any(|room| room.room_id == encrypted_room)
         );
         assert!(!alice_rooms.iter().any(|room| room.room_id == b_room));
+        phase!(send_alice);
         let a_body = format!("Morpheus account-switch acceptance {}", Uuid::new_v4());
         manager
             .send_text_for(&alice.id, a_room, a_body.clone())
@@ -263,6 +275,7 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
             .expect("Alice room send failed");
         wait_for_remote_echo(&manager, a_room, &a_body).await;
 
+        phase!(login_carol);
         let carol = manager
             .add_password_account(
                 &carol_fixture.homeserver_url,
@@ -273,6 +286,7 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
             .expect("Carol Matrix login failed");
         assert_eq!(carol.user_id, carol_fixture.user_id);
         assert_ne!(alice.homeserver, carol.homeserver);
+        phase!(sync_carol);
         let carol_rooms = wait_for_room(&manager, b_room).await;
         assert!(!carol_rooms.iter().any(|room| room.room_id == a_room));
         assert!(matches!(
@@ -282,21 +296,26 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
             Err(MatrixCoreError::SelectedAccountChanged)
         ));
 
+        phase!(switch_alice);
         manager
             .switch_to(&alice.id)
             .await
             .expect("Cannot switch to Alice");
         let alice_rooms = wait_for_room(&manager, a_room).await;
         assert!(!alice_rooms.iter().any(|room| room.room_id == b_room));
+        phase!(cached_alice);
         assert_cached_feed_contains(&manager, a_room, &a_body).await;
         wait_for_message(&manager, a_room, &a_body).await;
+        phase!(switch_carol);
         manager
             .switch_to(&carol.id)
             .await
             .expect("Cannot switch to Carol");
+        phase!(stop_primary);
         manager.stop().await;
         drop(manager);
 
+        phase!(restore_carol);
         let restored =
             AccountManager::open(primary_store.clone()).expect("Cannot reopen local account store");
         let active = restored
@@ -306,16 +325,20 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
             .expect("Saved active account missing");
         assert_eq!(active.id, carol.id);
         assert_eq!(active.user_id, carol_fixture.user_id);
+        phase!(sync_restored);
         let carol_rooms = wait_for_room(&restored, b_room).await;
         assert!(!carol_rooms.iter().any(|room| room.room_id == a_room));
 
+        phase!(restore_alice);
         restored
             .switch_to(&alice.id)
             .await
             .expect("Cannot restore Alice");
+        phase!(cached_restored);
         assert_cached_feed_contains(&restored, a_room, &a_body).await;
         wait_for_message(&restored, a_room, &a_body).await;
         wait_for_room(&restored, encrypted_room).await;
+        phase!(login_bob);
         let peer =
             AccountManager::open(peer_store.clone()).expect("Cannot open peer account store");
         let bob = peer
@@ -327,8 +350,10 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
             .await
             .expect("Bob Matrix login failed");
         assert_eq!(bob.user_id, bob_fixture.user_id);
+        phase!(sync_bob);
         wait_for_room(&peer, encrypted_room).await;
 
+        phase!(encrypted_send);
         let body = format!("Morpheus encrypted acceptance {}", Uuid::new_v4());
         restored
             .send_text_for(&alice.id, encrypted_room, body.clone())
@@ -336,6 +361,7 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
             .expect("Encrypted send failed");
         wait_for_message(&peer, encrypted_room, &body).await;
 
+        phase!(encrypted_edit);
         let root_event_id = wait_for_event_id(&restored, encrypted_room, &body).await;
         let edited_body = format!("Morpheus encrypted edit {}", Uuid::new_v4());
         restored
@@ -349,6 +375,7 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
             .expect("Encrypted edit failed");
         wait_for_message(&peer, encrypted_room, &edited_body).await;
 
+        phase!(encrypted_reply);
         let reply_body = format!("Morpheus encrypted reply {}", Uuid::new_v4());
         restored
             .send_reply_for(
@@ -362,6 +389,7 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
         wait_for_message(&peer, encrypted_room, &reply_body).await;
         wait_for_reply_context(&peer, encrypted_room, &reply_body).await;
 
+        phase!(encrypted_reaction);
         assert!(
             restored
                 .toggle_reaction_for(&alice.id, encrypted_room, &root_event_id, "❤️")
@@ -370,6 +398,7 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
         );
         wait_for_reaction(&peer, encrypted_room, &root_event_id, "❤️").await;
 
+        phase!(encrypted_thread_send);
         let thread_body = format!("Morpheus encrypted thread {}", Uuid::new_v4());
         let queued_thread = restored
             .send_thread_formatted_tracked_for(
@@ -387,6 +416,7 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
                 .expect("Thread server acknowledgement timed out"),
             morpheus_matrix::QueuedSendOutcome::Sent,
         );
+        phase!(encrypted_thread_receive);
         let thread_feed = tokio::time::timeout(
             Duration::from_secs(30),
             peer.thread_message_feed_for(&bob.id, encrypted_room, &root_event_id),
@@ -425,6 +455,7 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
             "Thread reply leaked into the main room timeline"
         );
 
+        phase!(action_isolation);
         restored
             .switch_to(&carol.id)
             .await
@@ -459,13 +490,16 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
                 .await,
             Err(MatrixCoreError::SelectedAccountChanged)
         ));
+        phase!(return_alice);
         restored
             .switch_to(&alice.id)
             .await
             .expect("Cannot switch back to Alice");
 
+        phase!(stop_peer);
         peer.stop().await;
         drop(peer);
+        phase!(restore_peer);
         let peer_restored =
             AccountManager::open(peer_store.clone()).expect("Cannot reopen peer account store");
         let peer_active = peer_restored
@@ -474,27 +508,33 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
             .expect("Cannot restore peer Matrix session")
             .expect("Saved peer account missing");
         assert_eq!(peer_active.id, bob.id);
+        phase!(encrypted_restart);
         wait_for_room(&peer_restored, encrypted_room).await;
         wait_for_message(&peer_restored, encrypted_room, &edited_body).await;
 
+        phase!(logout_bob);
         peer_restored
             .logout_account(&bob.id)
             .await
             .expect("Cannot remove peer test session");
+        phase!(logout_alice);
         restored
             .logout_account(&alice.id)
             .await
             .expect("Cannot remove Alice test session");
+        phase!(logout_carol);
         restored
             .logout_account(&carol.id)
             .await
             .expect("Cannot remove Carol test session");
+        phase!(stop_restored);
         peer_restored.stop().await;
         restored.stop().await;
 
         // Both current Synapse fixtures advertise sliding sync. Force the
         // classic adapter on a fresh Carol session to verify the fallback's
         // room list and account isolation without relying on server age.
+        phase!(classic_login);
         let classic =
             AccountManager::open_with_sync_policy(root.join("classic"), SyncPolicy::ClassicOnly)
                 .expect("Cannot open classic-sync test store");
@@ -506,16 +546,21 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
             )
             .await
             .expect("Carol classic-sync login failed");
+        phase!(classic_sync);
         wait_for_sync_backend(&classic, SyncBackend::Classic).await;
         let classic_rooms = wait_for_room(&classic, b_room).await;
         assert!(!classic_rooms.iter().any(|room| room.room_id == a_room));
+        phase!(classic_logout);
         classic
             .logout_account(&classic_carol.id)
             .await
             .expect("Cannot remove classic-sync test session");
+        phase!(classic_stop);
         classic.stop().await;
     });
+    phase!(profile_cleanup);
     fs::remove_dir_all(&root).expect("Cannot remove local test account stores");
+    phase!(complete);
     eprintln!(
         "Live local Matrix acceptance passed: account isolation, restore, both sync adapters, encrypted edit/reply/reaction/thread, and message after restart."
     );

@@ -349,6 +349,8 @@ class WaylandFixtureTests(unittest.TestCase):
             for name in ("DISPLAY", "WAYLAND_DISPLAY", "SWAYSOCK", "DBUS_SESSION_BUS_ADDRESS"):
                 self.assertNotIn(name, env)
             self.assertEqual(env["WLR_HEADLESS_OUTPUTS"], "2")
+            self.assertEqual(env["XDG_STATE_HOME"], str(Path(directory) / 'state'))
+            self.assertEqual(env["XDG_DATA_HOME"], str(Path(directory) / 'data'))
             self.assertEqual(Path(env["XDG_RUNTIME_DIR"]).stat().st_mode & 0o777, 0o700)
 
 
@@ -452,12 +454,153 @@ class WaylandProcessTreeTests(unittest.TestCase):
 
 
 
+class OrderedDeliveryTraceTests(unittest.TestCase):
+    @staticmethod
+    def line(stamp, topic, source, function, body):
+        return f'[D][{stamp}] {topic} | [{source}:1 {function}()] {body}\n'.encode()
+
+    def test_common_clock_orders_fixed_roles_without_exposing_captures(self):
+        logs = {
+            'pipewire': self.line('12345.000001', 'pw.node', 'impl-node.c', 'node_update_state',
+                                  '(morpheus-fixture-producer-42) suspended -> running')
+                        + self.line('12345.000003', 'pw.node', 'impl-node.c', 'node_update_state',
+                                    '(morpheus-fixture-consumer-43) suspended -> running'),
+            'capture-test': self.line('12345.000002', 'pw.stream', 'stream.c', 'impl_send_command', '0xabcdef: start 0'),
+            'portal-wlr': self.line('12345.000004', 'pw.stream', 'stream.c', 'pw_stream_queue_buffer',
+                                    'deprecated: use pw_stream_trigger_process() to drive the stream.')
+                          + b'2026/10/11 23:12:01 [TRACE] - morpheus-fixture-order: raw=12345.000005 event=queue-valid-accepted\n',
+        }
+        facts = MODULE.ordered_trace_facts(logs, [(12_345_000_006, 'cleanup_begin')])
+        self.assertEqual(facts['clock'], 'common')
+        self.assertFalse(facts['equal_time_groups'])
+        self.assertEqual([group[0]['event'] for group in facts['groups']],
+                         ['node_running', 'input_start', 'node_running', 'legacy_trigger', 'queue_valid_accepted', 'cleanup_begin'])
+        self.assertEqual(facts['groups'][0][0], {'process': 'daemon', 'role': 'producer', 'event': 'node_running'})
+        rendered = MODULE.json.dumps(facts)
+        for private in ('12345', 'abcdef', 'morpheus-fixture', '23:12:01', '42', '43'):
+            self.assertNotIn(private, rendered)
+
+    def test_equal_microseconds_are_grouped_without_claiming_causal_order(self):
+        logs = {name: self.line('00001.000001', 'pw.stream', 'stream.c', 'impl_send_command', '0x123: start 0')
+                for name in ('portal-wlr', 'capture-test')}
+        facts = MODULE.ordered_trace_facts(logs, [])
+        self.assertEqual(facts['clock'], 'partial')
+        self.assertTrue(facts['equal_time_groups'])
+        self.assertEqual(len(facts['groups']), 1)
+        self.assertEqual({event['process'] for event in facts['groups'][0]}, {'producer', 'consumer'})
+
+    def test_wrap_or_split_epoch_refuses_order_instead_of_guessing(self):
+        for first, second in [('99999.999999', '00000.000001'), ('00001.000000', '02000.000000')]:
+            with self.subTest(first=first):
+                data = self.line(first, 'pw.stream', 'stream.c', 'impl_send_command', '0x123: start 0')
+                data += self.line(second, 'pw.stream', 'stream.c', 'impl_send_command', '0x123: pause')
+                facts = MODULE.ordered_trace_facts({'capture-test': data}, [])
+                self.assertEqual(facts['clock'], 'discontinuity')
+                self.assertEqual(facts['groups'], [])
+
+    def test_default_logger_or_failed_clock_refuses_mixed_order(self):
+        valid = self.line('00001.000001', 'pw.stream', 'stream.c', 'impl_send_command', '0x123: start 0')
+        for invalid in [b'[D] pw.stream [stream.c:1 impl_send_command()] 0x123: pause\n',
+                        b'2026/10/11 23:12:01 [TRACE] - morpheus-fixture-order: clock-unavailable\n']:
+            with self.subTest(invalid=invalid):
+                facts = MODULE.ordered_trace_facts({'capture-test': valid, 'portal-wlr': invalid}, [])
+                self.assertEqual(facts['clock'], 'unsupported')
+                self.assertEqual(facts['groups'], [])
+        self.assertEqual(MODULE.ordered_trace_facts({'capture-test': valid}, [(None, 'cleanup_begin')])['clock'], 'unsupported')
+
+    def test_named_source_and_function_are_required_for_role_and_event(self):
+        good = self.line('00001.000001', 'pw.node', 'impl-node.c', 'node_update_state',
+                         '(morpheus-fixture-consumer-99) idle -> running')
+        for bad in [good.replace(b'pw.node', b'pw.link'), good.replace(b'impl-node.c', b'stream.c'),
+                    good.replace(b'node_update_state', b'other_function'),
+                    good.replace(b'morpheus-fixture-consumer', b'PRIVATE_DESKTOP'),
+                    b'private error says ' + good, good.rstrip() + b' PRIVATE_SUFFIX\n']:
+            with self.subTest(bad=bad):
+                facts = MODULE.ordered_trace_facts({'pipewire': bad}, [])
+                self.assertEqual(facts['groups'], [])
+                self.assertNotIn('PRIVATE', MODULE.json.dumps(facts))
+
+    def test_multiple_ids_and_recreated_same_id_mark_role_ambiguity(self):
+        first = self.line('00001.000001', 'pw.node', 'impl-node.c', 'node_update_state',
+                          '(morpheus-fixture-producer-42) idle -> running')
+        other = self.line('00001.000003', 'pw.node', 'impl-node.c', 'node_update_state',
+                          '(morpheus-fixture-producer-43) idle -> running')
+        destroy = self.line('00001.000002', 'pw.node', 'impl-node.c', 'pw_impl_node_destroy',
+                            '(morpheus-fixture-producer-42) destroy')
+        for data in (first + other, first + destroy + first.replace(b'000001', b'000003')):
+            self.assertTrue(MODULE.ordered_trace_facts({'pipewire': data}, [])['multiple_role_instances'])
+
+    def test_link_identity_must_be_observed_before_activation(self):
+        active = self.line('00001.000002', 'pw.link', 'impl-link.c', 'pw_impl_link_activate', '(42.0.0 -> 43.0.0) activated')
+        created = self.line('00001.000001', 'pw.link', 'impl-link.c', 'pw_context_create_link',
+                            '(42.0.0 -> 43.0.0) (morpheus-fixture-producer) -> (morpheus-fixture-consumer)')
+        self.assertEqual(MODULE.ordered_trace_facts({'pipewire': active}, [])['groups'], [])
+        facts = MODULE.ordered_trace_facts({'pipewire': created + active}, [])
+        self.assertEqual([group[0]['event'] for group in facts['groups']], ['link_created', 'link_activated'])
+        # An old earlier activation must not be classified retrospectively.
+        facts = MODULE.ordered_trace_facts({'pipewire': active + created}, [])
+        self.assertEqual([group[0]['event'] for group in facts['groups']], ['link_created'])
+        removed = self.line('00001.000003', 'pw.link', 'impl-link.c', 'pw_impl_link_destroy', '(42.0.0 -> 43.0.0) destroy')
+        facts = MODULE.ordered_trace_facts({'pipewire': created + removed + active.replace(b'000002', b'000004')}, [])
+        self.assertEqual([group[0]['event'] for group in facts['groups']], ['link_created', 'link_destroyed'])
+
+    def test_graph_reports_are_fixed_categories_and_teardown_boundary_is_ordered(self):
+        data = self.line('00001.000001', 'pw.node', 'impl-node.c', 'node_ready',
+                         '(morpheus-fixture-producer-42) graph not finished: state:0x123 quantum:1024 pending 1/1')
+        data += self.line('00001.000003', 'pw.node', 'impl-node.c', 'node_ready',
+                          '0x123: ready non-active node morpheus-fixture-producer in state 3')
+        facts = MODULE.ordered_trace_facts({'portal-wlr': data}, [(1_000_002, 'cleanup_begin')])
+        self.assertEqual([group[0]['event'] for group in facts['groups']], ['graph_incomplete', 'cleanup_begin', 'ready_nonactive'])
+        for value in ('42', '0x123', '1024', '1/1'):
+            self.assertNotIn(value, MODULE.json.dumps(facts))
+
+    def test_event_count_is_capped_and_missing_drain_stays_incomplete(self):
+        data = b''.join(self.line(f'00001.{index:06}', 'pw.stream', 'stream.c', 'impl_send_command', '0x123: start 0')
+                        for index in range(150))
+        facts = MODULE.ordered_trace_facts({'capture-test': data}, [])
+        self.assertEqual(sum(map(len, facts['groups'])), MODULE.ORDER_EVENT_LIMIT)
+        self.assertTrue(facts['events_truncated'])
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'capture-test.log').write_bytes(data)
+            self.assertTrue(MODULE.private_trace_facts(root, {})['ordered']['trace_incomplete'])
+
+    def test_role_overrides_are_child_local_and_daemon_has_no_stream_override(self):
+        with mock.patch.dict(os.environ, {'PIPEWIRE_PROPS': 'PRIVATE_TARGET', 'PIPEWIRE_LOG': 'PRIVATE_FILE'}, clear=True):
+            producer = MODULE.trace_environment('portal-wlr')
+            consumer = MODULE.trace_environment('capture-test')
+            daemon = MODULE.trace_environment('pipewire')
+            self.assertEqual(os.environ['PIPEWIRE_PROPS'], 'PRIVATE_TARGET')
+        self.assertEqual(producer['PIPEWIRE_PROPS'], 'node.name=morpheus-fixture-producer')
+        self.assertEqual(consumer['PIPEWIRE_PROPS'], 'node.name=morpheus-fixture-consumer')
+        self.assertNotIn('PIPEWIRE_PROPS', daemon)
+        self.assertTrue(all('PIPEWIRE_LOG' not in env for env in (producer, consumer, daemon)))
+        with self.assertRaises(KeyError):
+            MODULE.trace_environment('unknown')
+
+    def test_thread_start_failure_leaves_stream_owned_for_context_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            read_fd, write_fd = os.pipe()
+            source = os.fdopen(read_fd, 'rb', buffering=0)
+            try:
+                with MODULE.CappedPrivateLog(Path(directory) / 'trace') as sink:
+                    with mock.patch.object(MODULE.threading.Thread, 'start', side_effect=RuntimeError('PRIVATE')):
+                        with self.assertRaises(RuntimeError):
+                            sink.attach(source)
+                    sink.finish()
+                self.assertTrue(source.closed)
+                self.assertTrue(sink.output.closed)
+            finally:
+                os.close(write_fd)
+
+
 class DeliveryTraceTests(unittest.TestCase):
     def test_trace_environment_is_private_and_targeted(self):
         with mock.patch.dict(os.environ, {'PIPEWIRE_LOG': '/private/user-log', 'OTHER': 'unchanged'}, clear=True):
-            env = MODULE.trace_environment()
+            env = MODULE.trace_environment("portal-wlr")
         self.assertNotIn('PIPEWIRE_LOG', env)
-        self.assertEqual(env['PIPEWIRE_DEBUG'], '1,pw.stream:4,pw.node:4')
+        self.assertEqual(env['PIPEWIRE_DEBUG'], '1,pw.stream:4,pw.node:4,pw.link:4')
+        self.assertEqual(env['PIPEWIRE_PROPS'], 'node.name=morpheus-fixture-producer')
         self.assertEqual(env['PIPEWIRE_LOG_SYSTEMD'], 'false')
         self.assertEqual(env['PIPEWIRE_LOG_COLOR'], 'false')
         self.assertEqual(env['PIPEWIRE_LOG_LINE'], 'true')
@@ -523,6 +666,7 @@ class DeliveryTraceTests(unittest.TestCase):
                     write_fd = None
                     sink.finish()
                     self.assertFalse(sink.failed)
+                    self.assertTrue(sink.drained)
                     self.assertTrue(sink.truncated)
                     self.assertEqual(path.read_bytes(), b'x' * 32)
                     self.assertEqual(path.stat().st_mode & 0o777, 0o600)
