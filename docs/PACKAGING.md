@@ -53,8 +53,8 @@ override is deliberately not used for release packages.
 | --- | --- |
 | macOS Apple Silicon and Intel | Verify and mount the DMG read-only without interaction; copy the app into a temporary Applications directory; check native Mach-O architecture, bundle identifier/version, microphone/camera/screen purpose strings, exact license and theme contents; launch the installed executable for 12 seconds, stop it, remove the app, detach the DMG. |
 | Windows x64 | Silently install NSIS into a temporary path containing spaces; check x64 PE32+ GUI subsystem, license/theme and Add/Remove Programs registration/version; require the installed process to survive 12 seconds and create a Win32 window with its visible flag set; close/stop the process, run the real silent uninstaller and verify application directory and registration removal. |
-| Linux x64 DEB | Resolve/install the DEB in a fresh Ubuntu 24.04 container with no compiler or library development packages; verify declared ABI floors and `libxi6`, direct shared libraries and dynamic loading of `libXi.so.6` **before** adding Xvfb; check ELF architecture/symbol floors, desktop entry/icon and license/theme; launch as an unprivileged user under X11/Xvfb for 12 seconds and require a Morpheus window; stop the process and purge the package. |
-| Linux x64 AppImage | In a separate fresh Ubuntu 24.04 container with a minimal X11 desktop runtime, inspect the extracted metadata/resources/ELF, then launch the **AppImage itself** as an unprivileged user using its extract-and-run runtime (no FUSE mount); require a Morpheus X11 window and 12-second survival; stop the process and remove the portable file. No DEB is installed in this container. |
+| Linux x64 DEB | Resolve/install the DEB in a fresh Ubuntu 24.04 container with no compiler or library development packages; verify declared ABI floors and `libxi6`, direct shared libraries and dynamic loading of `libXi.so.6` **before** adding Xvfb; check ELF architecture/symbol floors, desktop entry/icon and license/theme; launch as an unprivileged user under X11/Xvfb for 12 seconds and require a visible window owned by that launch; stop the process and purge the package. |
+| Linux x64 AppImage | In a separate fresh Ubuntu 24.04 container with a minimal X11 desktop runtime, inspect the extracted metadata/resources/ELF, then launch the **AppImage itself** as an unprivileged user using its extract-and-run runtime (no FUSE mount); require a visible window owned by that launch and 12-second survival. Only then install accessibility test tools and relaunch the same package for the bounded keyboard/AT-SPI checks below. Remove the portable file. No DEB is installed in this container. |
 
 The Linux runtime image is resolved once per job and used by immutable image ID
 for both containers. Logs record that image ID and each installer's filename,
@@ -63,11 +63,58 @@ installers are rejected to avoid testing a stale package accidentally. ELF
 requirements above `GLIBC_2.39` or `GLIBCXX_3.4.30` fail the smoke until the
 declared compatibility baseline is deliberately reviewed.
 
+Linux window ownership requires `_NET_WM_PID` to identify a live process in the
+launcher's still-owned process group and session, carrying its fresh nonce.
+This accepts the AppImage runtime's child process and rejects an unrelated
+window with the same title. Raw application logs are never printed on startup
+failure; the keyboard driver's entire output is private except for validated
+fixed phases and boolean results. No accessibility trees or screenshots are
+published.
+
+#### Installed Linux keyboard and accessibility API check
+
+`scripts/linux_package_ui.py` runs only as the disposable container's unprivileged
+user, under private DBus and Xvfb. It has a 180-second acceptance deadline and
+bounded process-group cleanup inside a 240-second launcher deadline. The normal
+package smoke installs `python3-pyatspi`, `python3-gi`, `at-spi2-core`,
+`libglib2.0-bin` (for `gdbus`) and `xdotool`
+**after** the minimal-runtime launch succeeds, so those tools cannot conceal a
+missing dependency in that earlier check. No second native build is needed.
+
+The driver uses fresh release XDG configuration/data/cache directories and no
+account. It checks the sign-in field names and password accessibility role,
+enters the synthetic preview through its accessible action, then:
+
+- Anchors focus through AT-SPI and sends actual X11 XTEST key events for
+  Return, Space, Tab, Shift+Tab and Escape. It checks focus state, account-menu
+  dismissal, keyboard reachability of Manage accounts, modal Tab wrapping and
+  focus returning to the account trigger after Escape.
+- Opens Settings and increases font scale from 110% to 120% with a key; verifies
+  the displayed value and saved TOML. An invalid external TOML edit must show an
+  accessible settings error while the displayed scale stays at the last valid
+  120%. Restoring the valid file must clear the error.
+- Sends a normal `WM_DELETE_WINDOW` request, requires zero exit status and no
+  remaining process carrying this launch's nonce, then reaps the anchored
+  process group. Forced cleanup on failure never counts as normal exit.
+
+This is focused API/keyboard coverage, **not Orca acceptance**, whole-app keyboard
+reachability, contrast validation, notification delivery after quit, or real
+account switching. Preview entry currently has an accessible action but no
+explicit keyboard FocusScope; the driver does not claim keyboard-only entry.
+The check does not cover the DEB's UI, Wayland, VoiceOver or Narrator. No native
+media device or permission prompt is exercised.
+
+After applicable native CI is healthy, run only the affected ordinary package
+check with `platform=linux`, `linux_formats=appimage`, `appimage_updates=false`.
+The helper and its Python tests do not trigger an automatic native matrix;
+installed acceptance requires that explicit Linux package run. Debian `both`
+remains blocked until its working public maintainer contact is configured.
+
 These checks are implemented automation, not evidence that a particular
 candidate passed. A successful run establishes only the checks listed above
 for its exact source and package hashes. macOS startup is process liveness;
 the Windows visible-window flag and virtual X11 window do not establish visual
-quality or accessibility. Signing/notarization, installer UI, full desktop
+quality or complete accessibility. Signing/notarization, installer UI, full desktop
 integration, real account/credential-vault behavior, native media permissions,
 Wayland, hardware, updates and rollback remain release acceptance gates.
 The helper rejects a missing Debian `Maintainer` field. The packaging wrapper

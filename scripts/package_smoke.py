@@ -14,6 +14,7 @@ import os
 import platform
 import plistlib
 import re
+import secrets
 import shlex
 import shutil
 import signal
@@ -32,6 +33,7 @@ DEB_PACKAGE = "morpheus"
 IDENTIFIER = "io.github.brk275.morpheus"
 GLIBC_MAX = (2, 39)
 GLIBCXX_MAX = (3, 4, 30)
+NONCE_ENV = "MORPHEUS_PACKAGE_SMOKE_NONCE"
 
 
 def require(condition, message):
@@ -228,6 +230,57 @@ def stop_process(process):
     require(process.returncode is not None, "Smoke app did not stop")
 
 
+def linux_process_identity(pid, proc_root=Path("/proc")):
+    # comm may itself contain parentheses/spaces. Fields after its final ')' are
+    # state, ppid, pgrp, session, ... starttime (field 22).
+    fields = (proc_root / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()
+    return fields[0], int(fields[2]), int(fields[3]), int(fields[19])
+
+
+def owned_linux_pid(pid, group, nonce, proc_root=Path("/proc")):
+    """Accept the launcher or AppImage descendants, never an unrelated title."""
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        before = linux_process_identity(pid, proc_root)
+        with (proc_root / str(pid) / "environ").open("rb") as source:
+            environment = source.read(1024 * 1024 + 1)
+        after = linux_process_identity(pid, proc_root)
+        return (before[1:] == after[1:] and before[0] != "Z" and after[0] != "Z"
+                and before[1:3] == (group, group)
+                and len(environment) <= 1024 * 1024
+                and (NONCE_ENV + "=" + nonce).encode() in environment.split(b"\0"))
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def x11_output(argv):
+    # X11 titles/properties and tool stderr are private diagnostic data.
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=3)
+    require(result.returncode == 0 and len(result.stdout) <= 262144,
+            "Could not inspect the package smoke X11 window")
+    return result.stdout
+
+
+def owned_x11_windows(group, nonce):
+    tree = x11_output(["xwininfo", "-root", "-tree"])
+    windows = set(re.findall(r"^\s+(0x[0-9a-fA-F]+)\s", tree, re.MULTILINE))
+    require(len(windows) <= 128, "Unexpected number of smoke X11 windows")
+    found = []
+    for window in sorted(windows):
+        metadata = x11_output(["xprop", "-id", window, "_NET_WM_PID"])
+        match = re.fullmatch(r"_NET_WM_PID\(CARDINAL\) = ([1-9][0-9]*)\s*", metadata)
+        if not match:
+            continue
+        pid = int(match[1])
+        if owned_linux_pid(pid, group, nonce):
+            attributes = x11_output(["xwininfo", "-id", window, "-stats"])
+            if re.search(r"^\s*Map State: IsViewable\s*$", attributes, re.MULTILINE) \
+                    and owned_linux_pid(pid, group, nonce):
+                found.append((window, pid))
+    return found
+
+
 def launch_smoke(executable, window_check=None, seconds=12):
     if os.name != "nt":
         require_nonreaping_wait()
@@ -237,6 +290,8 @@ def launch_smoke(executable, window_check=None, seconds=12):
     env.pop("MORPHEUS_QA_PROFILE_DIR", None)
     if sys.platform.startswith("linux"):
         env.update(SLINT_BACKEND="winit-software", WINIT_UNIX_BACKEND="x11", APPIMAGE_EXTRACT_AND_RUN="1")
+    nonce = secrets.token_hex(16)
+    env[NONCE_ENV] = nonce
     with tempfile.TemporaryFile() as log:
         process = subprocess.Popen([str(executable)], env=env, stdout=log, stderr=subprocess.STDOUT,
                                    start_new_session=os.name != "nt")
@@ -249,13 +304,13 @@ def launch_smoke(executable, window_check=None, seconds=12):
                 if window_check == "win32":
                     saw_window = saw_window or bool(visible_windows(process.pid))
                 elif window_check == "x11" and not saw_window:
-                    tree = output(["xwininfo", "-root", "-tree"])
-                    saw_window = saw_window or bool(re.search(r'"Morpheus"', tree))
+                    saw_window = bool(owned_x11_windows(process.pid, nonce))
                 time.sleep(0.25)
             require(window_check is None or saw_window, "Installed app did not create the expected native window")
         except Exception:
-            log.seek(0)
-            print(log.read().decode("utf-8", errors="replace")[-6000:], file=sys.stderr)
+            # Never publish app logs: even startup errors can contain private
+            # paths, URLs or account details. Only this literal fact is public.
+            print('{"check":"installed_startup","status":"failed","app_log_public":false}', flush=True)
             raise
         finally:
             stop_process(process)
@@ -351,9 +406,62 @@ def apt_install(*packages):
     run(["apt-get", "install", "-y", "--no-install-recommends", *packages], env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"})
 
 
-def linux_display_launch(executable):
-    run(["runuser", "-u", "packageqa", "--", "dbus-run-session", "--", "xvfb-run", "-a", "-s", "-screen 0 1280x800x24",
-         "python3", str(Path(__file__)), "--launch-x11", str(executable)])
+def linux_display_launch(executable, keyboard=False):
+    script = Path(__file__).with_name("linux_package_ui.py") if keyboard else Path(__file__)
+    arguments = [str(executable)] if keyboard else ["--launch-x11", str(executable)]
+    # The driver has a 180-second alarm plus bounded cleanup; leave headroom
+    # before this outer deadline. The owning Docker container is removed even
+    # if this launcher is terminated before its children exit.
+    command = ["runuser", "-u", "packageqa", "--", "dbus-run-session", "--", "xvfb-run", "-a", "-s", "-screen 0 1280x800x24",
+               "python3", str(script), *arguments]
+    if not keyboard:
+        subprocess.run(command, check=True, timeout=180)
+        return
+    # Native accessibility/X11 libraries can print diagnostics outside Python's
+    # exception handler. Keep the whole driver's stream private as well.
+    with tempfile.TemporaryFile() as log:
+        result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=240)
+        log.seek(0)
+        report = keyboard_report(log.read(65537))
+    print(json.dumps(report, sort_keys=True), flush=True)
+    require(result.returncode == 0 and report["status"] == "passed", "Installed keyboard acceptance failed")
+
+
+def keyboard_report(raw):
+    expected = {"check", "status", "phase", "sign_in_semantics", "account_menu_keyboard",
+                "appearance_config", "normal_window_close", "app_log_public", "screen_reader_acceptance"}
+    phases = {"setup", "sign_in_semantics", "account_menu_keyboard", "appearance_config",
+              "normal_window_close", "complete"}
+    require(len(raw) <= 65536, "Installed keyboard diagnostics exceeded bound")
+    matches = []
+    for line in raw.splitlines():
+        try:
+            value = json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
+        if not isinstance(value, dict) or value.get("check") != "installed_linux_keyboard_atspi":
+            continue
+        require(value.keys() == expected and value["status"] in {"passed", "failed"}
+                and value["phase"] in phases
+                and all(type(value[key]) is bool for key in expected - {"check", "status", "phase"})
+                and not value["app_log_public"] and not value["screen_reader_acceptance"],
+                "Invalid installed keyboard diagnostic shape")
+        require(value["status"] != "passed" or (value["phase"] == "complete"
+                and all(value[key] for key in ("sign_in_semantics", "account_menu_keyboard",
+                                             "appearance_config", "normal_window_close"))),
+                "Incomplete installed keyboard evidence")
+        matches.append(value)
+    require(len(matches) == 1, "Missing or ambiguous installed keyboard evidence")
+    return matches[0]
+
+
+def linux_appimage_launch(executable):
+    linux_display_launch(executable)
+    # Accessibility/XTest tooling can add runtime libraries. Prove a launch
+    # against the minimal runtime before installing any of that tooling.
+    record("appimage_clean_runtime_before_accessibility_tools")
+    apt_install("python3-pyatspi", "python3-gi", "at-spi2-core", "libglib2.0-bin", "xdotool")
+    linux_display_launch(executable, keyboard=True)
 
 
 def linux_container_smoke(dist, kind):
@@ -411,7 +519,7 @@ def linux_container_smoke(dist, kind):
             # path, not the root-owned read-only fallback.
             shutil.chown(work, user="packageqa", group="packageqa")
             shutil.chown(installed, user="packageqa", group="packageqa")
-            linux_display_launch(installed)
+            linux_appimage_launch(installed)
             sidecar = work / ("." + installed.name + ".morpheus-update")
             require(sidecar.is_dir() and (sidecar.stat().st_mode & 0o777) == 0o700,
                     "AppImage did not establish its private update recovery directory")
