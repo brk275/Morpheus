@@ -383,6 +383,17 @@ checks passed. Native builds, native tests, source generation, archive
 transformations and Matrix/RTC services were reserved for the free hosted
 runners. The shared audio/client changes require all four native targets.
 
+[Run 38114660116](https://github.com/brk275/Morpheus/actions/runs/38114660116)
+tested `2c652f13d332c8bb7999d9bd15edad994c55f41f`. All four targets passed
+16 configuration, 37 Matrix and eight protocol tests and the default desktop
+check, then failed the native build with Rust E0282 in the device-opening
+closure. Native device, capture and live integration checks did not run after
+that failure. All four completed native-job logs passed credential scanning;
+their cache post steps finished before another candidate was pushed.
+The correction explicitly gives the closure a `MediaError` result type.
+Independent source review and formatting checks passed; hosted compilation is
+still required. No installer was built or uploaded.
+
 ## Public source publication, 2026-10-10
 
 - Published `brk275/Morpheus` as public pre-alpha source at

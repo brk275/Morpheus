@@ -780,7 +780,7 @@ impl RtcService {
             .name("morpheus-audio-open".into())
             .spawn(move || {
                 let _opening = DeviceOpenGuard;
-                let result = (|| {
+                let result = (|| -> Result<_, MediaError> {
                     // A timed-out or cancelled receiver revokes this request
                     // even if the call's membership itself is still active.
                     let active = || opening_lease.is_active() && !device_tx.is_closed();
