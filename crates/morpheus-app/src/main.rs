@@ -3,6 +3,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod attachments;
+mod audio_devices;
 #[cfg(feature = "native-calls")]
 mod calls;
 mod drafts;
@@ -873,6 +874,7 @@ fn apply_notification_settings(ui: &AppWindow, config: &Config) {
 
 fn apply_config(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
     shortcuts::apply_config(ui, config);
+    audio_devices::apply_config(ui, config);
     let mode = match config.appearance.theme {
         ThemeMode::Dark => 0,
         ThemeMode::Light => 1,
@@ -936,6 +938,7 @@ fn save_config_change(
             // privacy changes from a successfully saved config.
             apply_notification_settings(ui, &config);
             shortcuts::apply_config(ui, &config);
+            audio_devices::apply_config(ui, &config);
             match store.load_theme(&config) {
                 Ok(theme) => apply_loaded_config(
                     ui,
@@ -1581,7 +1584,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 ui.set_native_microphone_muted(true);
                                 ui.set_native_deafened(false);
                             }
-                            AudioUpdate::Failed { .. } => {
+                            AudioUpdate::Failed { reason, .. } => {
+                                ui.set_native_audio_error(reason.message().into());
                                 ui.set_native_audio_ready(false);
                                 ui.set_native_audio_failed(true);
                                 ui.set_native_microphone_muted(true);
@@ -1736,6 +1740,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     shortcuts::register(&ui, store.clone());
+    audio_devices::register(&ui, store.clone(), runtime.handle());
     let notifications = DesktopNotifications::start(
         manager.clone(),
         initial_config,
@@ -1766,6 +1771,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         current_notifications.apply_config(&config);
                         apply_notification_settings(&ui, &config);
                         shortcuts::apply_config(&ui, &config);
+                        audio_devices::apply_config(&ui, &config);
                         current_live.voice_spaces.apply_config(&config);
                         match current_store.load_theme(&config) {
                             Ok(theme) => apply_loaded_config(
@@ -2111,13 +2117,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // queued UI snapshot. The worker owns this immutable choice.
             let mode =
                 CallJoinMode::from(call_live.voice_spaces.room_call_mode(&account_id, &room_id));
+            let audio_selection = audio_devices::selection(&window);
             window.set_native_call_request_pending(true);
             let calls = calls.clone();
             let call_live = call_live.clone();
             let weak = weak.clone();
             handle.spawn(async move {
                 let _transition = call_live.account_transition.lock().await;
-                let result = calls.start_audio(&account_id, &room_id, mode).await;
+                let result = calls
+                    .start_audio(&account_id, &room_id, mode, audio_selection)
+                    .await;
                 let _ = weak.upgrade_in_event_loop(move |ui| {
                     ui.set_native_call_request_pending(false);
                     if ui.get_active_account_local_id().as_str() == account_id

@@ -1,4 +1,9 @@
-import { AboutSlint, Button, ListView, Palette, ScrollView } from "std-widgets.slint";
+import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView } from "std-widgets.slint";
+
+export struct AudioDeviceItem {
+    id: string,
+    name: string,
+}
 
 export struct AccountItem {
     name: string,
@@ -355,6 +360,18 @@ export component AppWindow inherits Window {
     in-out property <string> session-error;
     in-out property <string> transfer-notice;
     in-out property <string> config-path;
+    in-out property <bool> audio-devices-enabled: false;
+    in-out property <bool> audio-devices-busy: false;
+    in-out property <bool> audio-catalog-loaded: false;
+    in-out property <[AudioDeviceItem]> audio-microphones;
+    in-out property <[AudioDeviceItem]> audio-speakers;
+    in-out property <string> audio-microphone-id;
+    in-out property <string> audio-speaker-id;
+    in-out property <[string]> audio-microphone-choices;
+    in-out property <[string]> audio-speaker-choices;
+    in-out property <int> audio-microphone-index: 0;
+    in-out property <int> audio-speaker-index: 0;
+    in-out property <string> audio-device-notice: "Refresh to find microphones and speakers. No audio is recorded during discovery.";
     in-out property <string> update-status: "Signed updates are unavailable for this build.";
     in-out property <string> update-version;
     in-out property <bool> update-can-check: false;
@@ -417,6 +434,7 @@ export component AppWindow inherits Window {
     in-out property <string> native-call-status;
     in-out property <bool> native-call-joined: false;
     in-out property <bool> native-audio-failed: false;
+    in-out property <string> native-audio-error;
     in-out property <bool> native-leave-unconfirmed: false;
     in-out property <bool> native-video-visible: false;
     in-out property <image> native-video-frame;
@@ -527,6 +545,9 @@ export component AppWindow inherits Window {
     callback discard-update();
     callback dispatch-shortcut(string, bool, bool, bool, bool) -> bool;
     callback save-shortcuts();
+    callback refresh-audio-devices();
+    callback select-audio-microphone(string);
+    callback select-audio-speaker(string);
     callback reset-shortcuts();
     callback open-quick-switcher();
     callback close-quick-switcher();
@@ -2153,6 +2174,27 @@ export component AppWindow inherits Window {
                             }
                         }
                         Rectangle { height: 1px; background: root.divider; }
+                        Text { text: "Call audio devices"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
+                        Text { text: "Saved for your next call. Your current call keeps its selection until you leave. An unavailable selected device shows an error. System default follows your operating system's audio routing."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                        Text { text: "Microphone"; color: root.ink; font-size: 13px * root.text-scale; }
+                        ComboBox {
+                            model: root.audio-microphone-choices;
+                            current-index <=> root.audio-microphone-index;
+                            enabled: root.audio-devices-enabled && !root.audio-devices-busy;
+                            accessible-label: "Microphone for the next call";
+                            selected(value) => { root.select-audio-microphone(value); }
+                        }
+                        Text { text: "Speaker"; color: root.ink; font-size: 13px * root.text-scale; }
+                        ComboBox {
+                            model: root.audio-speaker-choices;
+                            current-index <=> root.audio-speaker-index;
+                            enabled: root.audio-devices-enabled && !root.audio-devices-busy;
+                            accessible-label: "Speaker for the next call";
+                            selected(value) => { root.select-audio-speaker(value); }
+                        }
+                        Button { text: root.audio-devices-busy ? "Finding devices…" : "Refresh audio devices"; enabled: root.audio-devices-enabled && !root.audio-devices-busy; clicked => { root.refresh-audio-devices(); } }
+                        Text { text: root.audio-device-notice; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-label: "Audio device status: " + root.audio-device-notice; accessible-live-region: polite; }
+                        Rectangle { height: 1px; background: root.divider; }
                         Text { text: "Keyboard shortcuts"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text {
                             text: "Mod is Command on macOS and Ctrl elsewhere. Meta is Command on macOS and Windows/Super elsewhere. Combine Mod, Ctrl, Meta, Alt, or Shift with A–Z, 0–9, arrows, Home, End, PageUp, PageDown, or F1–F12. Include a modifier other than Shift. Blank disables an action. Shift+digits, Alt+letters/digits, and editing or window shortcuts are reserved.";
@@ -2230,6 +2272,11 @@ export component AppWindow inherits Window {
                             : (root.call-connected ? "Call preview active · no network connection" : "Call preview · no network connection");
                         accessible-live-region: polite;
                         color: root.muted; font-size: 12px * root.text-scale;
+                    }
+                    if root.live-session && root.native-audio-failed : Text {
+                        text: root.native-audio-error;
+                        color: #e58e9b; font-size: 12px * root.text-scale;
+                        wrap: word-wrap; accessible-live-region: polite;
                     }
                     if root.live-session && root.native-camera-active : Text {
                         text: "Camera · " + root.native-camera-source;

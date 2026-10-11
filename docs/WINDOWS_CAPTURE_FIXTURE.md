@@ -46,6 +46,18 @@ all paths. Cleanup attempts every retained child even after another failure;
 it never signals a numeric PID. Temporary inheritable standard-I/O handles
 are duplicates, so the helper's originals stay noninheritable.
 
+Termination completion is proved with a bounded wait on each retained
+process handle. Windows documents that `TerminateProcess` is asynchronous
+and can return `ERROR_ACCESS_DENIED` for a process that has terminated;
+a failed termination request is accepted only if the subsequent wait observes
+the handle signaled. Timeout or wait failure still fails cleanup. The source
+previously retried that observation with a zero-time wait, which could reject
+pending completion after Job termination. The first hosted attempt at
+`db25e42` stopped before capture with cleanup status 5; that result is
+consistent with this defect, but its old diagnostics cannot establish whether
+an earlier startup failure was also present. See Microsoft's
+[TerminateProcess completion semantics](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-terminateprocess).
+
 A mandatory hosted preflight starts a disposable child plus a detached
 grandchild, observes both in the Job, then terminates the Job and requires
 zero active processes. This checks descendant cleanup on the actual runner;
@@ -71,8 +83,10 @@ privacy relies on that disposable runner account's inherited filesystem ACL;
 Python's POSIX-style `chmod` is not represented as a Windows ACL guarantee.
 No real accounts, credentials, or Matrix services are used.
 
-Public evidence contains only a pass boolean, fixed phase/failure enums, and
-an optional unsigned 32-bit process/Win32 status. Native error bodies and
+Public evidence contains only a pass boolean, fixed phase/failure/operation
+enums, and optional unsigned 32-bit process/Win32 statuses. If cleanup also
+fails, bounded prior-failure facts preserve the earlier operation without
+formatting exception messages. Native error bodies and
 libtest panic payloads stay private. Passing requires exit code zero, the
 exact named test's success line, a one-passed/zero-failed/zero-ignored summary,
 the terminal fixture phase, and successful owned-process cleanup.

@@ -208,6 +208,60 @@ class WindowsCaptureTests(unittest.TestCase):
         self.assertIsNone(job.job)
         self.assertEqual(job.handles, [])
 
+    def test_failed_terminate_waits_for_delayed_completion_on_retained_handle(self):
+        kernel = Kernel()
+        kernel.WaitForSingleObject = Mock(side_effect=[258, 0])
+        kernel.TerminateProcess = Mock(return_value=False)
+        job = job_with(kernel)
+        with patch.object(ctypes, "get_last_error", return_value=5, create=True):
+            job.terminate_handle(20)
+        self.assertEqual(kernel.WaitForSingleObject.call_args_list,
+                         [unittest.mock.call(20, 0), unittest.mock.call(20, 10000)])
+        kernel.TerminateProcess.assert_called_once_with(20, 1)
+
+    def test_failed_terminate_timeout_or_wait_failure_never_passes(self):
+        for wait_result in (258, 0xFFFFFFFF, 128):
+            kernel = Kernel()
+            kernel.WaitForSingleObject = Mock(side_effect=[258, wait_result])
+            kernel.TerminateProcess = Mock(return_value=False)
+            job = job_with(kernel)
+            with (patch.object(ctypes, "get_last_error", side_effect=[5, 6], create=True),
+                  self.subTest(wait_result=wait_result), self.assertRaises(capture.Failure) as raised):
+                job.terminate_handle(20)
+            facts = capture.failure_chain(raised.exception)
+            self.assertEqual(facts[0], {"failure": "cleanup", "status": 5, "operation": "process_terminate"})
+            self.assertEqual(facts[1]["operation"], "process_completion")
+            self.assertEqual(facts[1].get("status"), 6 if wait_result == 0xFFFFFFFF else None)
+            self.assertEqual(kernel.WaitForSingleObject.call_args.args, (20, 10000))
+
+    def test_assignment_failure_is_retained_when_child_cleanup_also_fails(self):
+        kernel = Kernel(assign=False)
+        job = job_with(kernel)
+        job.terminate_handle = Mock(side_effect=capture.Failure("cleanup", 5, "process_terminate"))
+        with (patch.object(ctypes, "get_last_error", return_value=5, create=True),
+              self.assertRaises(capture.Failure) as raised):
+            job.assign_and_resume(20, 21)
+        self.assertEqual(capture.failure_chain(raised.exception), [
+            {"failure": "cleanup", "status": 5, "operation": "process_terminate"},
+            {"failure": "job_assignment", "status": 5, "operation": "job_assign"},
+        ])
+        self.assertNotIn("resume", [call[0] for call in kernel.calls])
+
+    def test_job_cleanup_preserves_each_distinct_operation_and_closes_all_handles(self):
+        kernel = Kernel()
+        kernel.TerminateJobObject = Mock(return_value=False)
+        job = job_with(kernel)
+        job.handles = [20, 30]
+        job.terminate_handle = Mock(side_effect=[capture.Failure("cleanup", 5, "process_terminate"),
+                                                capture.Failure("cleanup", 6, "process_completion")])
+        with (patch.object(ctypes, "get_last_error", return_value=5, create=True),
+              self.assertRaises(capture.Failure) as raised):
+            job.close()
+        self.assertEqual([item["operation"] for item in capture.failure_chain(raised.exception)],
+                         ["job_terminate", "process_terminate", "process_completion"])
+        self.assertEqual([call.args[0] for call in job.terminate_handle.call_args_list], [20, 30])
+        self.assertEqual([call for call in kernel.calls if call[0] == "close"], [("close", 20), ("close", 30), ("close", 10)])
+
     def test_timeout_is_fixed_and_owner_always_closes(self):
         kernel = Kernel()
         job = job_with(kernel)
@@ -236,6 +290,27 @@ class WindowsCaptureTests(unittest.TestCase):
             self.assertEqual(capture.main(), 1)
         self.assertNotIn("PRIVATE", output.getvalue())
         self.assertEqual(json.loads(output.getvalue().split(": ", 1)[1])["failure"], "internal")
+
+    def test_public_cleanup_facts_retain_primary_failure_without_private_text(self):
+        def fail(root, environment):
+            try:
+                raise capture.Failure("job_assignment", 5, "job_assign")
+            finally:
+                raise capture.Failure("cleanup", 5, "process_terminate")
+        output = io.StringIO()
+        with patch.object(capture, "guard"), patch.object(capture, "execute", side_effect=fail), contextlib.redirect_stdout(output):
+            self.assertEqual(capture.main(), 1)
+        facts = json.loads(output.getvalue().split(": ", 1)[1])
+        self.assertEqual(facts["operation"], "process_terminate")
+        self.assertEqual(facts["prior_failures"], [{"failure": "job_assignment", "status": 5, "operation": "job_assign"}])
+        private = capture.Failure("private-value", "private-status", "private-operation")
+        self.assertEqual(capture.failure_chain(private), [{"failure": "internal"}])
+        with self.assertRaises(RuntimeError) as raised:
+            try:
+                raise private
+            finally:
+                raise RuntimeError("private-exception-body")
+        self.assertEqual(capture.failure_chain(raised.exception), [{"failure": "internal"}])
 
     def test_cleanup_failure_revokes_prior_success(self):
         with tempfile.TemporaryDirectory() as directory:

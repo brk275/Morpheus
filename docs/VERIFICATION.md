@@ -317,6 +317,48 @@ JavaScript syntax, package configuration and whitespace checks passed.
 Independent source reviews cleared both changes. No local native build, native
 test, source generation, archive transformation or Matrix/RTC service ran.
 
+### Hosted follow-up results, 2026-10-11
+
+[Run 38112448483](https://github.com/brk275/Morpheus/actions/runs/38112448483)
+tested `db25e42e38897acd746780722d1bac58a57a65b7` on all four standard public
+runners. Security/scope and both Mac jobs passed. All four platforms passed
+14 configuration, 37 Matrix and eight protocol tests, their native app build,
+and the four vendor security suites. Each Mac and Windows passed 69 desktop
+and 33 native RTC/device tests; Linux passed 84 desktop and 42 native RTC/device
+tests and Xvfb startup. These include the new draft-cache regressions and the
+Linux serialized SPA-format offer check. All four completed native logs passed
+credential scans with zero findings. No installer was built or uploaded.
+
+Windows failed the capture fixture before its native test started: cleanup
+reported status 5. The step's `continue-on-error` presentation did not establish
+success; the final outcome gate failed. Source review found that a failed
+`TerminateProcess` can precede asynchronous completion. The correction waits
+on the retained process handle, accepts only confirmed completion, and preserves
+earlier failures alongside cleanup failures. Nineteen mocked lifecycle checks
+pass; the Windows fixture still requires successful hosted execution.
+
+Linux again failed its first-frame Wayland check. All 33 PipeWire bindings
+resolved to the system library; this time the portal backend remained alive,
+negotiated a format and added buffers. The capture still timed out without a
+frame. SHM was offered, DMA-BUF was not, and all five fixture services remained
+running. These facts narrow the failure but do not establish screen capture.
+
+The live Linux vault and two-homeserver startup checks passed. The live account,
+encrypted draft restart/isolation, room action, formatted message, media and
+discovery tests each passed. Moderation failed at its post-kick invitation
+check; later search, recovery, thread, OAuth and RTC/Element checks were not
+reached. Both fixture shutdowns passed, and the native dependency cache finished
+saving before further hosted work. The overall candidate remains unverified.
+
+The next shared native batch adds persisted microphone and speaker selection
+for the next call. Exact device IDs are resolved again at open time; unavailable
+selections fail without choosing another endpoint. Current calls keep their
+selection, discovery runs off the UI thread, and cancelled device opens cannot
+start capture after their request expires. Independent source review and
+formatting checks cleared; ten new focused regressions await hosted execution.
+Physical routing, permissions, unplug behavior and picker accessibility remain
+required.
+
 ## Public source publication, 2026-10-10
 
 - Published `brk275/Morpheus` as public pre-alpha source at

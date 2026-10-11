@@ -38,6 +38,129 @@ impl Drop for DeviceOpenGuard {
     }
 }
 
+/// An immutable routing choice for one join. IDs are CPAL host-qualified IDs,
+/// never display names or enumeration offsets. None alone requests the default.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AudioDeviceSelection {
+    pub microphone: Option<String>,
+    pub speaker: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioDevice {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AudioDeviceCatalog {
+    pub microphones: Vec<AudioDevice>,
+    pub speakers: Vec<AudioDevice>,
+}
+
+/// Enumerate the platform's default backend without opening an audio stream.
+/// Platform enumeration can block; callers must keep it off the UI thread.
+pub fn audio_devices() -> Result<AudioDeviceCatalog, MediaError> {
+    let host = cpal::default_host();
+    let collect = |input: bool| -> Result<Vec<AudioDevice>, MediaError> {
+        let devices = host
+            .devices()
+            .map_err(|_| MediaError::Device("could not enumerate audio devices".into()))?;
+        let mut entries = Vec::new();
+        for device in devices.take(512) {
+            if !(if input {
+                device.supports_input()
+            } else {
+                device.supports_output()
+            }) {
+                continue;
+            }
+            let (Ok(id), Ok(description)) = (device.id(), device.description()) else {
+                continue;
+            };
+            entries.push(AudioDevice {
+                id: id.to_string(),
+                name: description.name().to_owned(),
+            });
+        }
+        // Duplicate IDs cannot identify one endpoint. Do not offer either.
+        let mut counts = HashMap::new();
+        for entry in &entries {
+            *counts.entry(entry.id.clone()).or_insert(0) += 1;
+        }
+        entries.retain(|entry| counts[&entry.id] == 1);
+        entries.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+        Ok(entries)
+    };
+    Ok(AudioDeviceCatalog {
+        microphones: collect(true)?,
+        speakers: collect(false)?,
+    })
+}
+
+fn unique_device_index<'a>(ids: impl Iterator<Item = &'a str>, selected: &str) -> Option<usize> {
+    let mut matches = ids
+        .enumerate()
+        .filter_map(|(index, id)| (id == selected).then_some(index));
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
+fn resolve_device(selected: Option<&str>, input: bool) -> Result<cpal::Device, MediaError> {
+    let host = cpal::default_host();
+    let unavailable = || {
+        if input {
+            MediaError::MicrophoneUnavailable
+        } else {
+            MediaError::SpeakerUnavailable
+        }
+    };
+    let Some(selected) = selected else {
+        return (if input {
+            host.default_input_device()
+        } else {
+            host.default_output_device()
+        })
+        .ok_or_else(unavailable);
+    };
+    // Re-enumerate at open time. An old picker row, unplugged endpoint, foreign
+    // host, or duplicated ID must never fall back to a microphone with the same
+    // name or to the default microphone.
+    let devices = host
+        .devices()
+        .map_err(|_| unavailable())?
+        .filter(|device| {
+            if input {
+                device.supports_input()
+            } else {
+                device.supports_output()
+            }
+        })
+        .filter_map(|device| device.id().ok().map(|id| (id.to_string(), device)))
+        .collect::<Vec<_>>();
+    let index = unique_device_index(devices.iter().map(|(id, _)| id.as_str()), selected)
+        .ok_or_else(unavailable)?;
+    Ok(devices
+        .into_iter()
+        .nth(index)
+        .expect("resolved enumeration index")
+        .1)
+}
+
+fn while_open_active<T>(
+    active: &impl Fn() -> bool,
+    action: impl FnOnce() -> Result<T, MediaError>,
+) -> Result<T, MediaError> {
+    if !active() {
+        return Err(MediaError::CallEnded);
+    }
+    let result = action()?;
+    if !active() {
+        return Err(MediaError::CallEnded);
+    }
+    Ok(result)
+}
+
 /// Native microphone PCM capture. Frames are 10 ms at 48 kHz, with one or two
 /// channels matching the selected input device. Keep this value alive while
 /// pumping `next_frame()` into a microphone `Publication`.
@@ -49,8 +172,7 @@ pub struct MicrophoneCapture {
 }
 
 impl MicrophoneCapture {
-    /// List input device names for a device picker. This proof currently opens
-    /// the default device; names do not serve as stable device identifiers.
+    /// Legacy display-only enumeration. Use `audio_devices` for selectable IDs.
     pub fn devices() -> Result<Vec<String>, MediaError> {
         cpal::default_host()
             .input_devices()
@@ -65,10 +187,17 @@ impl MicrophoneCapture {
     }
 
     pub fn open_default() -> Result<Self, MediaError> {
-        let device = cpal::default_host()
-            .default_input_device()
-            .ok_or_else(|| MediaError::Device("no default microphone".into()))?;
-        let config = select_48k_config(&device, true)?;
+        let stream = Self::prepare_selected(None, &|| true)?;
+        stream.start(&|| true)?;
+        Ok(stream)
+    }
+
+    fn prepare_selected(
+        selected: Option<&str>,
+        active: &impl Fn() -> bool,
+    ) -> Result<Self, MediaError> {
+        let device = while_open_active(active, || resolve_device(selected, true))?;
+        let config = while_open_active(active, || select_48k_config(&device, true))?;
         let channels = u32::from(config.channels());
         let sample_format = config.sample_format();
         let chunk_len = CHUNK_SAMPLES_PER_CHANNEL * channels as usize;
@@ -124,14 +253,19 @@ impl MicrophoneCapture {
                 None,
             )
             .map_err(|error| MediaError::Device(error.to_string()))?;
-        stream
-            .play()
-            .map_err(|error| MediaError::Device(error.to_string()))?;
         Ok(Self {
             _stream: stream,
             rx,
             channels,
             stream_error,
+        })
+    }
+
+    fn start(&self, active: &impl Fn() -> bool) -> Result<(), MediaError> {
+        while_open_active(active, || {
+            self._stream
+                .play()
+                .map_err(|_| MediaError::Device("could not start microphone".into()))
         })
     }
 
@@ -242,8 +376,7 @@ impl AudioMixer {
 }
 
 impl AudioOutput {
-    /// List output device names for a device picker. This proof currently
-    /// opens the default device.
+    /// Legacy display-only enumeration. Use `audio_devices` for selectable IDs.
     pub fn devices() -> Result<Vec<String>, MediaError> {
         cpal::default_host()
             .output_devices()
@@ -258,10 +391,17 @@ impl AudioOutput {
     }
 
     pub fn open_default() -> Result<Self, MediaError> {
-        let device = cpal::default_host()
-            .default_output_device()
-            .ok_or_else(|| MediaError::Device("no default speaker".into()))?;
-        let config = select_48k_config(&device, false)?;
+        let stream = Self::prepare_selected(None, &|| true)?;
+        stream.start(&|| true)?;
+        Ok(stream)
+    }
+
+    fn prepare_selected(
+        selected: Option<&str>,
+        active: &impl Fn() -> bool,
+    ) -> Result<Self, MediaError> {
+        let device = while_open_active(active, || resolve_device(selected, false))?;
+        let config = while_open_active(active, || select_48k_config(&device, false))?;
         let channels = u32::from(config.channels());
         let sample_format = config.sample_format();
         let mixer = Arc::new(Mutex::new(AudioMixer::new(channels)));
@@ -313,9 +453,6 @@ impl AudioOutput {
                 None,
             )
             .map_err(|error| MediaError::Device(error.to_string()))?;
-        stream
-            .play()
-            .map_err(|error| MediaError::Device(error.to_string()))?;
         Ok(Self {
             _stream: stream,
             mixer,
@@ -326,6 +463,14 @@ impl AudioOutput {
     /// Compatibility path for callers with a single remote stream.
     pub fn push_frame(&self, frame: &AudioFrame) -> Result<(), MediaError> {
         self.push_frame_for("_single_stream", frame)
+    }
+
+    fn start(&self, active: &impl Fn() -> bool) -> Result<(), MediaError> {
+        while_open_active(active, || {
+            self._stream
+                .play()
+                .map_err(|_| MediaError::Device("could not start speaker".into()))
+        })
     }
 
     pub fn push_frame_for(&self, member_id: &str, frame: &AudioFrame) -> Result<(), MediaError> {
@@ -594,6 +739,18 @@ impl RtcService {
         room_id: &str,
         controls: &AudioControls,
     ) -> Result<(), MediaError> {
+        self.run_audio_controlled_with_devices(room_id, controls, AudioDeviceSelection::default())
+            .await
+    }
+
+    /// Use the immutable selection captured when this join was requested.
+    /// Later configuration changes never reroute an active call.
+    pub async fn run_audio_controlled_with_devices(
+        &self,
+        room_id: &str,
+        controls: &AudioControls,
+        selection: AudioDeviceSelection,
+    ) -> Result<(), MediaError> {
         let call = self.call(room_id).ok_or(MediaError::NotJoined)?;
         let lease = self.call_lease(room_id).ok_or(MediaError::NotJoined)?;
         if !controls.is_for(lease) {
@@ -624,17 +781,20 @@ impl RtcService {
             .spawn(move || {
                 let _opening = DeviceOpenGuard;
                 let result = (|| {
-                    if !opening_lease.is_active() {
-                        return Err(MediaError::CallEnded);
-                    }
-                    let microphone = MicrophoneCapture::open_default()?;
-                    if !opening_lease.is_active() {
-                        return Err(MediaError::CallEnded);
-                    }
-                    let speaker = AudioOutput::open_default()?;
-                    if !opening_lease.is_active() {
-                        return Err(MediaError::CallEnded);
-                    }
+                    // A timed-out or cancelled receiver revokes this request
+                    // even if the call's membership itself is still active.
+                    let active = || opening_lease.is_active() && !device_tx.is_closed();
+                    let microphone = MicrophoneCapture::prepare_selected(
+                        selection.microphone.as_deref(),
+                        &active,
+                    )?;
+                    let speaker =
+                        AudioOutput::prepare_selected(selection.speaker.as_deref(), &active)?;
+                    // Neither stream runs while another device is still being
+                    // opened. In particular a stuck speaker open cannot keep
+                    // an already-started microphone alive after cancellation.
+                    speaker.start(&active)?;
+                    microphone.start(&active)?;
                     Ok((microphone, speaker))
                 })();
                 let _ = device_tx.send(result);
@@ -955,6 +1115,69 @@ fn remix_channels(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_ids_are_exact_unique_and_independent_of_catalog_order() {
+        let ids = ["wasapi:first", "wasapi:second"];
+        assert_eq!(
+            unique_device_index(ids.into_iter(), "wasapi:second"),
+            Some(1)
+        );
+        assert_eq!(
+            unique_device_index(ids.into_iter().rev(), "wasapi:second"),
+            Some(0)
+        );
+        assert_eq!(
+            unique_device_index(ids.into_iter(), "coreaudio:second"),
+            None
+        );
+        assert_eq!(unique_device_index(ids.into_iter(), "Headset"), None);
+        assert_eq!(
+            unique_device_index(
+                ["wasapi:second", "wasapi:second"].into_iter(),
+                "wasapi:second"
+            ),
+            None
+        );
+        assert_eq!(
+            unique_device_index(std::iter::empty(), "wasapi:second"),
+            None
+        );
+    }
+
+    #[test]
+    fn cancelled_or_timed_out_open_never_runs_the_next_start_step() {
+        use std::cell::Cell;
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let started = Cell::new(false);
+        drop(rx); // Timeout and dropped call future both close this receiver.
+        let result = while_open_active(&|| !tx.is_closed(), || {
+            started.set(true);
+            Ok(())
+        });
+        assert!(matches!(result, Err(MediaError::CallEnded)));
+        assert!(!started.get());
+    }
+
+    #[test]
+    fn cancellation_during_an_os_step_drops_result_before_next_step() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        struct Opened(Rc<Cell<bool>>);
+        impl Drop for Opened {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let active = Cell::new(true);
+        let dropped = Rc::new(Cell::new(false));
+        let result = while_open_active(&|| active.get(), || {
+            active.set(false);
+            Ok(Opened(dropped.clone()))
+        });
+        assert!(matches!(result, Err(MediaError::CallEnded)));
+        assert!(dropped.get());
+    }
 
     fn frame(samples: &[i16], channels: u32) -> AudioFrame {
         AudioFrame {

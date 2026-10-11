@@ -30,7 +30,10 @@ mod native;
 mod video_device;
 
 #[cfg(feature = "device-audio")]
-pub use audio_device::{AudioControls, AudioOutput, AudioState, MicrophoneCapture};
+pub use audio_device::{
+    AudioControls, AudioDevice, AudioDeviceCatalog, AudioDeviceSelection, AudioOutput, AudioState,
+    MicrophoneCapture, audio_devices,
+};
 #[cfg(feature = "native-rtc")]
 pub use matrix_rtc_call_sdk::CallEvent as RtcCallEvent;
 #[cfg(feature = "native-rtc")]

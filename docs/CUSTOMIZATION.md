@@ -47,6 +47,44 @@ causes a reload.
 The schema is versioned. Morpheus rejects an unknown schema version instead of
 silently discarding settings.
 
+## Call audio devices
+
+In builds with native calls, **Settings → Call audio devices → Refresh audio
+devices** lists microphones and speakers from the platform's current CPAL
+backend. Refresh opens no recording or playback stream. Selectors save
+immediately to the existing `media.microphone_device` and
+`media.speaker_device` fields. **System default** removes the corresponding
+field. These are global machine preferences, shared by all signed-in accounts.
+
+Each saved value is a complete host-qualified CPAL device ID, not its display
+name or position in the list. The picker shows a bounded friendly name and a short stable ID fingerprint
+so two identically named devices remain distinguishable. Selecting a row
+writes the complete ID to TOML; IDs and availability differ across operating
+systems. Malformed IDs
+reject the configuration edit and retain the last valid preferences.
+
+Choices apply to the **next join**. Changing Settings or TOML does not reroute
+an active call; leave and rejoin to apply them. At startup of each call,
+Morpheus resolves the exact selected ID again. A missing or ambiguous ID
+produces an explicit audio error without falling back to a different device.
+An unavailable saved choice remains visible until you explicitly change it.
+The call can remain joined with local audio unavailable; choose another device
+and rejoin to retry.
+
+Device discovery runs off the UI thread and times out after 20 seconds. A
+driver query still blocked in the operating system prevents another query
+until it returns; late results cannot replace a newer list. Discovery uses the
+platform default backend (CoreAudio, WASAPI, or the configured Linux ALSA
+backend), not every optional CPAL backend. Audio still requires the existing
+48 kHz mono/stereo PCM support. Operating-system default and virtual endpoints
+can themselves reroute audio. Automatic device hotplug recovery, live
+reconfiguration, camera selection, and extra noise-processing controls are
+outside this change. Native compilation, selector interaction, permissions,
+duplicate-name hardware, unplug/rejoin, and actual routing acceptance on all
+supported desktops remain pending for this batch.
+
+## Call membership mode
+
 The call stage remembers one **Call mode** separately for each account and
 room: **Standard** (the default), **Element Call Matrix 2.0**, or **Legacy**.
 The same choices are available in TOML:

@@ -20,13 +20,47 @@ STAGES = {"before_test", "window_ready", "window_frames", "display_frames", "cha
           "reopen", "retitle_rejection", "closed_rejection", "complete"}
 FAILURES = {"guard", "job_setup", "job_assignment", "process_start", "process_wait",
             "deadline", "cleanup", "containment", "build", "discovery", "capture", "internal"}
+OPERATIONS = {"job_create", "job_configure", "handle_duplicate", "process_create",
+              "job_assign", "thread_resume", "process_observe", "process_terminate",
+              "process_completion", "process_wait", "process_exit_code", "job_query",
+              "job_terminate", "job_drain"}
 
 
 class Failure(Exception):
-    def __init__(self, code, status=None):
+    def __init__(self, code, status=None, operation=None):
         self.code = code if code in FAILURES else "internal"
         self.status = status if type(status) is int and 0 <= status <= 0xFFFFFFFF else None
+        self.operation = operation if operation in OPERATIONS else None
+        self.previous = []
         super().__init__(self.code)
+
+    def retain(self, error):
+        # Store only fixed facts, never another exception's arbitrary payload.
+        for item in failure_chain(error):
+            if item not in self.previous and len(self.previous) < 5:
+                self.previous.append(item)
+
+
+def failure_chain(error):
+    """Preserve primary/cleanup distinctions without exposing exception text."""
+    result, seen = [], set()
+    while error is not None and id(error) not in seen and len(seen) < 6 and len(result) < 6:
+        seen.add(id(error))
+        item = {"failure": "internal"}
+        if isinstance(error, Failure):
+            item["failure"] = error.code
+            if error.status is not None:
+                item["status"] = error.status
+            if error.operation is not None:
+                item["operation"] = error.operation
+        if item not in result:
+            result.append(item)
+        if isinstance(error, Failure):
+            for previous in error.previous:
+                if previous not in result and len(result) < 6:
+                    result.append(previous)
+        error = error.__cause__ if error.__cause__ is not None else error.__context__
+    return result
 
 
 def guard(environment=None, platform=None):
@@ -128,11 +162,11 @@ class WindowsJob:
         self.handles = []
         self.job = kernel.CreateJobObjectW(None, None)  # Noninheritable, unnamed.
         if not self.job:
-            raise Failure("job_setup", ctypes.get_last_error())
+            raise Failure("job_setup", ctypes.get_last_error(), "job_create")
         limits = Extended(); limits.limits.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         if not kernel.SetInformationJobObject(self.job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
             code = ctypes.get_last_error(); kernel.CloseHandle(self.job); self.job = None
-            raise Failure("job_setup", code)
+            raise Failure("job_setup", code, "job_configure")
 
     def spawn(self, command, environment, log):
         import msvcrt
@@ -151,13 +185,13 @@ class WindowsJob:
                     duplicate = w.HANDLE()
                     if not self.kernel.DuplicateHandle(current, msvcrt.get_osfhandle(stream.fileno()),
                             current, ctypes.byref(duplicate), 0, True, 2):  # DUPLICATE_SAME_ACCESS
-                        raise Failure("process_start", ctypes.get_last_error())
+                        raise Failure("process_start", ctypes.get_last_error(), "handle_duplicate")
                     duplicates.append(duplicate.value)
                 startup.stdin, startup.stdout, startup.stderr = duplicates[0], duplicates[1], duplicates[1]
                 created = self.kernel.CreateProcessW(executable, command_line, None, None, True,
                     0x4 | 0x400 | 0x08000000, env_block, str(REPO), ctypes.byref(startup), ctypes.byref(process))
                 if not created:
-                    raise Failure("process_start", ctypes.get_last_error())
+                    raise Failure("process_start", ctypes.get_last_error(), "process_create")
                 # Retain ownership before assignment/cleanup can fail. close()
                 # also terminates unassigned suspended children by handle.
                 self.handles.append(process.process)
@@ -176,23 +210,33 @@ class WindowsJob:
         if result == 0:
             return
         if result != 258:
-            raise Failure("cleanup", ctypes.get_last_error())
+            raise Failure("cleanup", ctypes.get_last_error(), "process_observe")
         if not self.kernel.TerminateProcess(handle, 1):
             code = ctypes.get_last_error()
-            # It may have exited between the observation and termination.
-            if self.kernel.WaitForSingleObject(handle, 0) != 0:
-                raise Failure("cleanup", code)
-        if self.kernel.WaitForSingleObject(handle, 10000) != 0:
-            raise Failure("cleanup")
+            # Job termination is asynchronous. The kernel can reject another
+            # terminate with ERROR_ACCESS_DENIED while completion is pending.
+            # Only a signaled retained handle proves that cleanup completed.
+            result = self.kernel.WaitForSingleObject(handle, 10000)
+            if result == 0:
+                return
+            error = Failure("cleanup", code, "process_terminate")
+            error.retain(Failure("cleanup", ctypes.get_last_error() if result == 0xFFFFFFFF else None,
+                                 "process_completion"))
+            raise error
+        result = self.kernel.WaitForSingleObject(handle, 10000)
+        if result != 0:
+            raise Failure("cleanup", ctypes.get_last_error() if result == 0xFFFFFFFF else None,
+                          "process_completion")
 
     def assign_and_resume(self, process, thread):
         try:
             if not self.kernel.AssignProcessToJobObject(self.job, process):
-                raise Failure("job_assignment", ctypes.get_last_error())
+                raise Failure("job_assignment", ctypes.get_last_error(), "job_assign")
             # CREATE_SUSPENDED establishes exactly one suspend count.
             result = self.kernel.ResumeThread(thread)
             if result != 1:
-                raise Failure("process_start", ctypes.get_last_error() if result == 0xFFFFFFFF else None)
+                raise Failure("process_start", ctypes.get_last_error() if result == 0xFFFFFFFF else None,
+                              "thread_resume")
         except BaseException:
             self.terminate_handle(process)
             raise
@@ -201,18 +245,18 @@ class WindowsJob:
         from ctypes import wintypes as w
         result = self.kernel.WaitForSingleObject(handle, int(seconds * 1000))
         if result == 258:
-            raise Failure("deadline")
+            raise Failure("deadline", operation="process_wait")
         if result != 0:
-            raise Failure("process_wait", ctypes.get_last_error())
+            raise Failure("process_wait", ctypes.get_last_error(), "process_wait")
         code = w.DWORD()
         if not self.kernel.GetExitCodeProcess(handle, ctypes.byref(code)):
-            raise Failure("process_wait", ctypes.get_last_error())
+            raise Failure("process_wait", ctypes.get_last_error(), "process_exit_code")
         return code.value
 
     def active(self):
         value = self.Accounting()
         if not self.kernel.QueryInformationJobObject(self.job, 1, ctypes.byref(value), ctypes.sizeof(value), None):
-            raise Failure("cleanup", ctypes.get_last_error())
+            raise Failure("cleanup", ctypes.get_last_error(), "job_query")
         return value.active
 
     def close(self):
@@ -221,11 +265,11 @@ class WindowsJob:
         failure = None
         try:
             if not self.kernel.TerminateJobObject(self.job, 1):
-                raise Failure("cleanup", ctypes.get_last_error())
+                raise Failure("cleanup", ctypes.get_last_error(), "job_terminate")
             deadline = time.monotonic() + 10
             while self.active():
                 if time.monotonic() >= deadline:
-                    raise Failure("cleanup")
+                    raise Failure("cleanup", operation="job_drain")
                 time.sleep(.05)
         except Failure as error:
             failure = error
@@ -236,7 +280,10 @@ class WindowsJob:
                 try:
                     self.terminate_handle(handle)
                 except Failure as error:
-                    failure = error
+                    if failure is None:
+                        failure = error
+                    else:
+                        failure.retain(error)
                 finally:
                     self.kernel.CloseHandle(handle)
             self.handles.clear()
@@ -307,14 +354,12 @@ def main():
                 facts["passed"] = True
             finally:
                 facts["stage"] = stage_fact(root / "stage")
-    except Failure as error:
+    except BaseException as error:
         facts["passed"] = False
-        facts["failure"] = error.code
-        if error.status is not None:
-            facts["status"] = error.status
-    except BaseException:
-        facts["passed"] = False
-        facts["failure"] = "internal"
+        details = failure_chain(error)
+        facts.update(details[0])
+        if len(details) > 1:
+            facts["prior_failures"] = details[1:]
     print("Windows synthetic capture facts: " + json.dumps(facts, sort_keys=True))
     return 0 if facts["passed"] and "failure" not in facts else 1
 

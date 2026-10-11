@@ -95,6 +95,7 @@ impl Config {
             ));
         }
         validate_shortcuts(&self.shortcuts)?;
+        self.media.validate_audio_devices()?;
         for overrides in self.account_overrides.values() {
             for room_id in &overrides.local_voice_rooms {
                 if !room_id.starts_with('!') || !room_id.contains(':') {
@@ -404,12 +405,43 @@ impl Default for Notifications {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Media {
+    /// CPAL host-qualified device ID; None follows the system default.
     pub microphone_device: Option<String>,
+    /// CPAL host-qualified device ID; None follows the system default.
     pub speaker_device: Option<String>,
     pub camera_device: Option<String>,
     pub noise_suppression: bool,
     pub autoplay_animated_media: bool,
     pub previews_in_encrypted_rooms: bool,
+}
+
+impl Media {
+    fn validate_audio_devices(&self) -> Result<(), ConfigError> {
+        for (field, id) in [
+            ("microphone_device", &self.microphone_device),
+            ("speaker_device", &self.speaker_device),
+        ] {
+            let Some(id) = id else { continue };
+            // The opaque suffix may contain colons and Unicode. Accept other
+            // platforms' host names so moving a config never silently chooses
+            // a different device; availability is checked at call startup.
+            let valid = id.len() <= 4096
+                && !id.chars().any(char::is_control)
+                && id.split_once(':').is_some_and(|(host, device)| {
+                    !host.is_empty()
+                        && host
+                            .bytes()
+                            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+                        && !device.trim().is_empty()
+                });
+            if !valid {
+                return Err(ConfigError::Invalid(format!(
+                    "media.{field} must be a host-qualified device ID of at most 4096 bytes; remove the field to use the system default"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for Media {
@@ -938,6 +970,56 @@ impl ThemeColors {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_ids_roundtrip_without_device_names_or_schema_changes() {
+        let mut config: Config = toml::from_str("schema_version = 1").unwrap();
+        assert_eq!(config.media.microphone_device, None);
+        assert_eq!(config.media.speaker_device, None);
+        config.media.microphone_device = Some("coreaudio:USB:Microphone-東京".into());
+        config.media.speaker_device = Some("wasapi:{0.0.0.00000000}.{example}".into());
+        config.validate().unwrap(); // Other operating systems' IDs are valid config.
+        let encoded = toml::to_string(&config).unwrap();
+        assert_eq!(toml::from_str::<Config>(&encoded).unwrap(), config);
+    }
+
+    #[test]
+    fn malformed_audio_ids_never_replace_last_valid_preferences() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let mut config = store.load_or_create().unwrap();
+        config.media.microphone_device = Some("alsa:hw:CARD=USB,DEV=0".into());
+        store.save(&config).unwrap();
+        let saved = fs::read(store.path()).unwrap();
+        for bad in [
+            "".into(),
+            "USB Microphone".into(),
+            ":device".into(),
+            "alsa:".into(),
+            "alsa:  ".into(),
+            "alsa:device\n".into(),
+            "alsa:\0".into(),
+            format!("alsa:{}", "x".repeat(4096)),
+        ] {
+            for microphone in [true, false] {
+                let mut invalid = config.clone();
+                if microphone {
+                    invalid.media.microphone_device = Some(bad.clone());
+                } else {
+                    invalid.media.speaker_device = Some(bad.clone());
+                }
+                assert!(store.save(&invalid).is_err());
+                assert_eq!(fs::read(store.path()).unwrap(), saved);
+                assert_eq!(store.load().unwrap().media, config.media);
+            }
+        }
+        fs::write(store.path(), "[media]\nmicrophone_device = 'not an ID'\n").unwrap();
+        assert!(store.load().is_err());
+        assert_eq!(
+            config.media.microphone_device.as_deref(),
+            Some("alsa:hw:CARD=USB,DEV=0")
+        );
+    }
 
     #[test]
     fn shortcut_parser_normalizes_keys_and_resolves_platform_modifiers() {

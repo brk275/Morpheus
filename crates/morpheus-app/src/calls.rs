@@ -35,8 +35,8 @@ use std::{
 use morpheus_matrix::{AccountManager, MatrixCoreError, SyncBackend, SyncStatus};
 pub use morpheus_rtc::CallInfo;
 use morpheus_rtc::{
-    AudioControls, AudioState, CallOptions, LocalRtcSupport, MediaError, RtcError, RtcService,
-    TransportSupport, local_device_support, local_support,
+    AudioControls, AudioDeviceSelection, AudioState, CallOptions, LocalRtcSupport, MediaError,
+    RtcError, RtcService, TransportSupport, local_device_support, local_support,
 };
 use tokio::{
     sync::{Mutex, mpsc, oneshot, watch},
@@ -234,6 +234,7 @@ pub enum AudioUpdate {
     /// so remote participants and video remain visible.
     Failed {
         token: u64,
+        reason: AudioFailure,
     },
     Applied {
         token: u64,
@@ -241,12 +242,43 @@ pub enum AudioUpdate {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioFailure {
+    MicrophoneUnavailable,
+    SpeakerUnavailable,
+    Other,
+}
+
+impl AudioFailure {
+    fn from_error(error: &MediaError) -> Self {
+        match error {
+            MediaError::MicrophoneUnavailable => Self::MicrophoneUnavailable,
+            MediaError::SpeakerUnavailable => Self::SpeakerUnavailable,
+            _ => Self::Other,
+        }
+    }
+
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::MicrophoneUnavailable => {
+                "Microphone unavailable or ambiguous. Choose a microphone in Settings, then leave and rejoin."
+            }
+            Self::SpeakerUnavailable => {
+                "Speaker unavailable or ambiguous. Choose a speaker in Settings, then leave and rejoin."
+            }
+            Self::Other => {
+                "Local audio could not start or stopped. Check device permissions and Settings, then leave and rejoin."
+            }
+        }
+    }
+}
+
 impl AudioUpdate {
     pub fn token(self) -> u64 {
         match self {
-            Self::Unavailable { token } | Self::Failed { token } | Self::Applied { token, .. } => {
-                token
-            }
+            Self::Unavailable { token }
+            | Self::Failed { token, .. }
+            | Self::Applied { token, .. } => token,
         }
     }
 }
@@ -356,13 +388,14 @@ impl Shared {
         }
     }
 
-    fn fail_audio(&self, token: u64) {
+    fn fail_audio(&self, token: u64, reason: AudioFailure) {
         if self
             .active_audio_token
             .compare_exchange(token, 0, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            self.audio.send_replace(AudioUpdate::Failed { token: 0 });
+            self.audio
+                .send_replace(AudioUpdate::Failed { token: 0, reason });
         }
     }
 
@@ -690,6 +723,7 @@ impl CallController {
         expected_account_id: &str,
         room_id: &str,
         mode: CallJoinMode,
+        audio_devices: AudioDeviceSelection,
     ) -> Result<CallInfo, CallControllerError> {
         let account =
             self.manager
@@ -752,6 +786,7 @@ impl CallController {
             account_id: account.id,
             room_id: room_id.to_owned(),
             options: mode.options(),
+            audio_devices,
             token,
             cancel: cancel_rx,
             done: done_tx,
@@ -979,6 +1014,7 @@ struct CallWorker {
     account_id: String,
     room_id: String,
     options: CallOptions,
+    audio_devices: AudioDeviceSelection,
     token: u64,
     cancel: oneshot::Receiver<()>,
     done: watch::Sender<Option<Result<(), String>>>,
@@ -1138,7 +1174,11 @@ impl CallWorker {
             })
         };
         let media_result = {
-            let audio = rtc.run_audio_controlled(&self.room_id, &controls);
+            let audio = rtc.run_audio_controlled_with_devices(
+                &self.room_id,
+                &controls,
+                self.audio_devices.clone(),
+            );
             let mut applied_audio = controls.subscribe_applied_state();
             let video = run_remote_video(
                 &rtc,
@@ -1170,11 +1210,11 @@ impl CallWorker {
                     result = &mut audio, if audio_running => match result {
                         Ok(()) => break Ok(()),
                         Err(MediaError::CallEnded) => break Err(CallControllerError::Media(MediaError::CallEnded)),
-                        Err(_) => {
+                        Err(error) => {
                             // A missing or stuck local audio device must not
                             // tear down the receive-only call stage.
                             audio_running = false;
-                            self.shared.fail_audio(self.token);
+                            self.shared.fail_audio(self.token, AudioFailure::from_error(&error));
                         }
                     },
                     changed = applied_audio.changed() => {
@@ -1730,13 +1770,19 @@ mod tests {
         // A local audio failure keeps the remote call stage alive and cannot
         // disable audio controls belonging to a later join.
         shared.active_audio_token.store(5, Ordering::SeqCst);
-        shared.fail_audio(5);
-        assert_eq!(*shared.audio.borrow(), AudioUpdate::Failed { token: 0 });
+        shared.fail_audio(5, AudioFailure::MicrophoneUnavailable);
+        assert_eq!(
+            *shared.audio.borrow(),
+            AudioUpdate::Failed {
+                token: 0,
+                reason: AudioFailure::MicrophoneUnavailable
+            }
+        );
         assert_eq!(shared.active_video_token.load(Ordering::SeqCst), 5);
 
         shared.active_audio_token.store(6, Ordering::SeqCst);
         shared.send_applied_audio(6, state);
-        shared.fail_audio(5);
+        shared.fail_audio(5, AudioFailure::MicrophoneUnavailable);
         shared.clear_audio(5);
         shared.send_applied_audio(
             5,
