@@ -23,5 +23,10 @@ platform behavior is relevant.
 | Accessibility | Keyboard and VoiceOver/Narrator/Orca checks | Main macOS offline-preview keyboard path, menu autofocus, forward modal Tab loops, and Escape focus return checked; physical Shift+Tab, screen-reader, and other-platform checks pending |
 | Distribution | Signed, installable, updateable packages | Public source remains pre-alpha. Platform-selected unsigned package validation is wired, with installer uploads disabled. Historical private QA built all four platform variants across earlier revisions; those artifacts are withdrawn before public development. Historical publication revision `bc1614b` passed all four native targets (run `38092977119`); that evidence does not verify later native changes or packaging. See the verification log for current candidate results. Settings now exposes explicit signed-update Check/Download/Discard/Restart controls with call/recovery exclusion and orderly worker shutdown; controls remain disabled without a compiled feed/key and a supported AppImage installation. Its controller and security regressions passed on all four native targets at `95f61da`. Installed-package QA, signing, notarization, an updater feed, and update/uninstall acceptance remain open |
 
+Experimental encrypted invitation-history bundles are disabled for both sending
+and receiving; ordinary invitations and own-account recovery remain supported.
+See the [invitation history policy](INVITATION_HISTORY_POLICY.md) and the
+[verification log](VERIFICATION.md) for the pending fresh-device reinvite gate.
+
 Computer-audio sharing, mobile clients, executable plugins, and a Morpheus
 hosted call service are later work.

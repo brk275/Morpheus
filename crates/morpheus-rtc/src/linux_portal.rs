@@ -18,14 +18,14 @@ use pipewire::{
     main_loop::MainLoopRc,
     properties,
     spa::{
-        buffer::ChunkFlags,
+        buffer::{ChunkFlags, DataType},
         param::{
             ParamType,
             format::{FormatProperties, MediaSubtype, MediaType},
             video::{VideoFormat, VideoInfoRaw},
         },
         pod::{self, Pod, serialize::PodSerializer},
-        utils::{Direction, Fraction, Rectangle, SpaTypes},
+        utils::{Choice, ChoiceEnum, ChoiceFlags, Direction, Fraction, Rectangle, SpaTypes},
     },
     stream::{StreamFlags, StreamListener, StreamRc, StreamState},
 };
@@ -440,6 +440,36 @@ fn selected_stream(
 struct FrameState {
     latest: Option<xcap::image::RgbaImage>,
     failed: bool,
+    progress: CaptureProgress,
+}
+
+#[derive(Default)]
+struct CaptureProgress {
+    format_accepted: bool,
+    buffer_added: bool,
+    streaming: bool,
+    process_called: bool,
+    buffer_dequeued: bool,
+}
+
+impl CaptureProgress {
+    fn timeout_message(&self) -> &'static str {
+        // Fixed local categories only: never expose portal node IDs, source
+        // names, negotiated dimensions or backend error bodies.
+        if !self.format_accepted {
+            "screen-sharing stream stopped producing frames before consumer format acceptance"
+        } else if !self.buffer_added {
+            "screen-sharing stream stopped producing frames before consumer buffer allocation"
+        } else if !self.streaming {
+            "screen-sharing stream stopped producing frames before consumer streaming"
+        } else if !self.process_called {
+            "screen-sharing stream stopped producing frames before consumer processing"
+        } else if !self.buffer_dequeued {
+            "screen-sharing stream stopped producing frames without a dequeued consumer buffer"
+        } else {
+            "screen-sharing stream stopped producing frames after consumer buffer dequeue"
+        }
+    }
 }
 struct StreamData {
     format: VideoInfoRaw,
@@ -460,6 +490,66 @@ fn capture_format_choices() -> pod::Property {
         VideoFormat::RGBA,
         VideoFormat::RGBx,
         VideoFormat::RGB
+    )
+}
+
+fn capture_buffer_params(
+    format: VideoFormat,
+    width: u32,
+    height: u32,
+) -> Result<Vec<u8>, MediaError> {
+    if !matches!(
+        format,
+        VideoFormat::RGB
+            | VideoFormat::RGBA
+            | VideoFormat::RGBx
+            | VideoFormat::BGRA
+            | VideoFormat::BGRx
+    ) || width == 0
+        || height == 0
+        || width > 7680
+        || height > 4320
+    {
+        return Err(MediaError::InvalidFormat);
+    }
+    // Finish the consumer side of format negotiation explicitly. A producer's
+    // add_buffer callback does not establish allocation on this input stream.
+    // Packed RGB needs one plane of CPU-mappable memory, never DMA-BUF. Leave
+    // size/stride to the producer: SHM rows may be padded, and unpack_frame
+    // checks the received chunk extents before reading any pixels.
+    let int_choice =
+        |choice| pod::Value::Choice(pod::ChoiceValue::Int(Choice(ChoiceFlags::empty(), choice)));
+    let object = pod::Object {
+        type_: SpaTypes::ObjectParamBuffers.as_raw(),
+        id: ParamType::Buffers.as_raw(),
+        properties: vec![
+            pod::Property::new(
+                pipewire::spa::sys::SPA_PARAM_BUFFERS_buffers,
+                int_choice(ChoiceEnum::Range {
+                    default: 8,
+                    min: 2,
+                    max: 16,
+                }),
+            ),
+            pod::Property::new(
+                pipewire::spa::sys::SPA_PARAM_BUFFERS_blocks,
+                pod::Value::Int(1),
+            ),
+            pod::Property::new(
+                pipewire::spa::sys::SPA_PARAM_BUFFERS_dataType,
+                int_choice(ChoiceEnum::Flags {
+                    default: ((1 << DataType::MemPtr.as_raw()) | (1 << DataType::MemFd.as_raw()))
+                        as i32,
+                    flags: Vec::new(),
+                }),
+            ),
+        ],
+    };
+    Ok(
+        PodSerializer::serialize(Cursor::new(Vec::new()), &pod::Value::Object(object))
+            .map_err(portal_error)?
+            .0
+            .into_inner(),
     )
 }
 
@@ -496,29 +586,51 @@ impl PortalCapture {
         let state = Rc::new(RefCell::new(FrameState::default()));
         let format_state = Rc::clone(&state);
         let status_state = Rc::clone(&state);
+        let buffer_state = Rc::clone(&state);
         let frame_state = Rc::clone(&state);
         let listener = stream
             .add_local_listener_with_user_data(StreamData {
                 format: VideoInfoRaw::default(),
             })
             .state_changed(move |_, _, old, new| {
+                let mut state = status_state.borrow_mut();
+                state.progress.streaming |= new == StreamState::Streaming;
                 if matches!(new, StreamState::Error(_) | StreamState::Unconnected)
                     || (old == StreamState::Streaming && new == StreamState::Paused)
                 {
-                    status_state.borrow_mut().failed = true;
+                    state.failed = true;
                 }
             })
-            .param_changed(move |_, data, id, param| {
-                if id == ParamType::Format.as_raw() {
-                    if param.is_none_or(|param| data.format.parse(param).is_err()) {
-                        format_state.borrow_mut().failed = true;
-                    }
+            .param_changed(move |stream, data, id, param| {
+                if id != ParamType::Format.as_raw() {
+                    return;
                 }
+                let result = (|| {
+                    let param = param.ok_or(MediaError::InvalidFormat)?;
+                    data.format
+                        .parse(param)
+                        .map_err(|_| MediaError::InvalidFormat)?;
+                    let size = data.format.size();
+                    let serialized =
+                        capture_buffer_params(data.format.format(), size.width, size.height)?;
+                    let param = Pod::from_bytes(&serialized).ok_or(MediaError::InvalidFormat)?;
+                    // PipeWire copies these serialized values during the call.
+                    // Do not hold FrameState's RefCell across native callbacks.
+                    stream.update_params(&mut [param]).map_err(portal_error)
+                })();
+                let mut state = format_state.borrow_mut();
+                state.progress.format_accepted = result.is_ok();
+                state.failed |= result.is_err();
+            })
+            .add_buffer(move |_, _, _| {
+                buffer_state.borrow_mut().progress.buffer_added = true;
             })
             .process(move |stream, data| {
+                frame_state.borrow_mut().progress.process_called = true;
                 let Some(mut buffer) = stream.dequeue_buffer() else {
                     return;
                 };
+                frame_state.borrow_mut().progress.buffer_dequeued = true;
                 let datas = buffer.datas_mut();
                 let Some(data_buffer) = datas.first_mut() else {
                     frame_state.borrow_mut().failed = true;
@@ -636,7 +748,7 @@ impl PortalCapture {
                 return Ok(image.clone());
             }
             if Instant::now() >= deadline {
-                return Err(error("screen-sharing stream stopped producing frames"));
+                return Err(error(self.state.borrow().progress.timeout_message()));
             }
         }
     }
@@ -721,6 +833,106 @@ fn unpack_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serialized_consumer_buffers_require_one_mappable_plane_and_allow_padded_rows() {
+        use pipewire::spa::{pod::deserialize::PodDeserializer, sys};
+        let bytes = capture_buffer_params(VideoFormat::BGRx, 1920, 1080).unwrap();
+        let (_, value) = PodDeserializer::deserialize_any_from(&bytes).unwrap();
+        let pod::Value::Object(object) = value else {
+            panic!("buffer object missing");
+        };
+        assert_eq!(object.type_, SpaTypes::ObjectParamBuffers.as_raw());
+        assert_eq!(object.id, ParamType::Buffers.as_raw());
+        let property = |key| {
+            &object
+                .properties
+                .iter()
+                .find(|p| p.key == key)
+                .unwrap()
+                .value
+        };
+        assert_eq!(property(sys::SPA_PARAM_BUFFERS_blocks), &pod::Value::Int(1));
+        assert_eq!(
+            property(sys::SPA_PARAM_BUFFERS_buffers),
+            &pod::Value::Choice(pod::ChoiceValue::Int(Choice(
+                ChoiceFlags::empty(),
+                ChoiceEnum::Range {
+                    default: 8,
+                    min: 2,
+                    max: 16
+                }
+            )))
+        );
+        let pod::Value::Choice(pod::ChoiceValue::Int(Choice(
+            _,
+            ChoiceEnum::Flags { default, flags },
+        ))) = property(sys::SPA_PARAM_BUFFERS_dataType)
+        else {
+            panic!("memory-type flags missing");
+        };
+        assert_eq!(
+            *default,
+            ((1 << DataType::MemPtr.as_raw()) | (1 << DataType::MemFd.as_raw())) as i32
+        );
+        assert_eq!(*default & (1 << DataType::DmaBuf.as_raw()), 0);
+        assert!(flags.is_empty());
+        assert!(!object.properties.iter().any(|p| matches!(
+            p.key,
+            sys::SPA_PARAM_BUFFERS_size | sys::SPA_PARAM_BUFFERS_stride
+        )));
+        // The offer must permit padding; received rows remain bounds-checked
+        // by the independent offset/padded-row decoder regression below.
+        for (format, width, height) in [
+            (VideoFormat::NV12, 1920, 1080),
+            (VideoFormat::BGRx, 0, 1080),
+            (VideoFormat::BGRx, 1920, 0),
+            (VideoFormat::BGRx, 7681, 1080),
+            (VideoFormat::BGRx, 1920, 4321),
+        ] {
+            assert!(capture_buffer_params(format, width, height).is_err());
+        }
+    }
+
+    #[test]
+    fn timeout_identifies_last_consumer_boundary_without_backend_payloads() {
+        let mut progress = CaptureProgress::default();
+        assert!(
+            progress
+                .timeout_message()
+                .ends_with("before consumer format acceptance")
+        );
+        progress.format_accepted = true;
+        assert!(
+            progress
+                .timeout_message()
+                .ends_with("before consumer buffer allocation")
+        );
+        progress.buffer_added = true;
+        assert!(
+            progress
+                .timeout_message()
+                .ends_with("before consumer streaming")
+        );
+        progress.streaming = true;
+        assert!(
+            progress
+                .timeout_message()
+                .ends_with("before consumer processing")
+        );
+        progress.process_called = true;
+        assert!(
+            progress
+                .timeout_message()
+                .ends_with("without a dequeued consumer buffer")
+        );
+        progress.buffer_dequeued = true;
+        assert!(
+            progress
+                .timeout_message()
+                .ends_with("after consumer buffer dequeue")
+        );
+    }
 
     #[test]
     fn serialized_format_choices_accept_bgrx_only_shm_source() {

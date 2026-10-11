@@ -40,6 +40,17 @@ CHAT_TESTS = (
 )
 RESULT = re.compile(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;")
 LATE_JOIN_EVIDENCE = re.compile(r"^MORPHEUS_RTC_LATE_JOIN historical_member=(true|false)$", re.MULTILINE)
+MODERATION_STAGES = frozenset(("invite_initial", "invite_after_kick", "invite_after_unban"))
+MODERATION_FAILURES = frozenset((
+    "selected_account_changed", "room_not_found", "invalid_user_id",
+    "history_sender_unverified", "history_cross_signing_missing", "sdk", "other",
+))
+MODERATION_CHECKS = frozenset((
+    "reinvite_identity_unverified", "reinvite_trust_unchanged", "reinvite_after_kick", "reinvite_after_unban",
+))
+MODERATION_STAGE = re.compile(r"^MORPHEUS_MODERATION_STAGE ([a-z_]+)$", re.MULTILINE)
+MODERATION_FAILURE = re.compile(r"^MORPHEUS_MODERATION_FAILURE ([a-z_]+)$", re.MULTILINE)
+MODERATION_EVIDENCE = re.compile(r"^MORPHEUS_MODERATION_CHECK ([a-z_]+)=(true|false)$", re.MULTILINE)
 OAUTH_PHASES = {
     "login_refresh": (
         "cancelled", "login", "callback_replay_rejected", "refresh", "vaulted",
@@ -62,6 +73,29 @@ OAUTH_STAGES = frozenset((
 OAUTH_FAILURES = frozenset(("fixture_operation", "browser_protocol", "rust_acceptance", "deadline"))
 OAUTH_STAGE = re.compile(r"^MORPHEUS_OAUTH_STAGE ([a-z_]+)$", re.MULTILINE)
 OAUTH_FAILURE = re.compile(r"^MORPHEUS_OAUTH_FAILURE ([a-z_]+)$", re.MULTILINE)
+
+
+def moderation_diagnostics(output: str) -> dict:
+    result = {}
+    stages = [value for value in MODERATION_STAGE.findall(output) if value in MODERATION_STAGES]
+    failures = [value for value in MODERATION_FAILURE.findall(output) if value in MODERATION_FAILURES]
+    if stages:
+        result["stage"] = stages[-1]
+    if failures:
+        result["failure"] = failures[-1]
+    for name, value in MODERATION_EVIDENCE.findall(output):
+        if name in MODERATION_CHECKS:
+            checks = result.setdefault("checks", {})
+            checks[name] = checks.get(name, True) and value == "true"
+    return result
+
+
+def moderation_evidence(output: str) -> dict[str, bool]:
+    evidence = moderation_diagnostics(output)
+    checks = evidence.get("checks", {})
+    if "failure" in evidence or any(checks.get(name) is not True for name in MODERATION_CHECKS):
+        raise RuntimeError("Moderation acceptance evidence is incomplete")
+    return checks
 
 
 def oauth_diagnostics(output: str) -> dict[str, str]:
@@ -206,6 +240,8 @@ class Acceptance:
                 if timed_out:
                     diagnostics["failure"] = "deadline"
                 evidence["oauth_diagnostics"] = diagnostics
+            if label == "moderation_local":
+                evidence["moderation_diagnostics"] = moderation_diagnostics(output)
             if element_checks:
                 evidence["element_checks"] = element_evidence(output)
                 evidence["element_diagnostics"] = element_diagnostics(output)
@@ -218,6 +254,14 @@ class Acceptance:
         record = {"check": label, "seconds": round(time.monotonic() - started, 2)}
         if test:
             record["passed"] = passed_tests(output)
+        if label == "moderation_local":
+            # A green moderation result must exercise an existing, unverified
+            # account identity on this fresh device without changing trust.
+            try:
+                record["moderation_checks"] = moderation_evidence(output)
+            except RuntimeError:
+                print(json.dumps({"check": label, "moderation_diagnostics": moderation_diagnostics(output)}), flush=True)
+                raise
         if oauth_checks:
             record["oauth_checks"] = oauth_evidence(output, oauth_checks)
         if element_checks:

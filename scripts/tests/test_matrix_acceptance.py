@@ -371,6 +371,63 @@ class LiveEvidenceTests(unittest.TestCase):
         self.assertEqual(oauth_diagnostics("MORPHEUS_OAUTH_STAGE password_value\n"
                                            "MORPHEUS_OAUTH_FAILURE https://example.org/private"), {})
 
+    def test_moderation_diagnostics_accept_only_fixed_facts_and_preserve_false(self):
+        output = "\n".join((
+            "MORPHEUS_MODERATION_STAGE invite_initial",
+            "MORPHEUS_MODERATION_STAGE invite_after_kick",
+            "MORPHEUS_MODERATION_STAGE private_account",
+            "MORPHEUS_MODERATION_FAILURE history_sender_unverified",
+            "MORPHEUS_MODERATION_FAILURE private_server_response",
+            "MORPHEUS_MODERATION_FAILURE sdk trailing-private-data",
+            "MORPHEUS_MODERATION_CHECK reinvite_identity_unverified=false",
+            "MORPHEUS_MODERATION_CHECK reinvite_identity_unverified=true",
+            "MORPHEUS_MODERATION_CHECK private_account=true",
+            "MORPHEUS_MODERATION_CHECK reinvite_after_kick=true trailing-private-data",
+        ))
+        self.assertEqual(acceptance_module.moderation_diagnostics(output), {
+            "stage": "invite_after_kick", "failure": "history_sender_unverified",
+            "checks": {"reinvite_identity_unverified": False},
+        })
+
+    def test_moderation_success_requires_actual_unverified_reinvites_and_unchanged_trust(self):
+        output = "\n".join(f"MORPHEUS_MODERATION_CHECK {name}=true"
+                           for name in acceptance_module.MODERATION_CHECKS)
+        self.assertEqual(acceptance_module.moderation_evidence(output),
+                         dict.fromkeys(acceptance_module.MODERATION_CHECKS, True))
+        for invalid in ("", output.replace("reinvite_identity_unverified=true", "reinvite_identity_unverified=false"),
+                        output + "\nMORPHEUS_MODERATION_FAILURE sdk",
+                        "MORPHEUS_MODERATION_CHECK reinvite_trust_unchanged=false\n" + output):
+            with self.subTest(output=invalid), self.assertRaisesRegex(RuntimeError, "Moderation acceptance evidence"):
+                acceptance_module.moderation_evidence(invalid)
+
+    @unittest.skipIf(os.name == "nt", "Linux hosted harness")
+    def test_moderation_failure_emits_category_but_never_private_error(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            visible = io.StringIO()
+            output = "\n".join((
+                "MORPHEUS_MODERATION_STAGE invite_after_kick",
+                "MORPHEUS_MODERATION_FAILURE history_sender_unverified",
+                "MORPHEUS_MODERATION_FAILURE private_payload",
+                "private-error-body",
+            ))
+            with (patch("run_matrix_acceptance.subprocess.run", return_value=subprocess.CompletedProcess([], 0)),
+                  contextlib.redirect_stdout(visible), self.assertRaises(RuntimeError)):
+                runner.run("moderation_local", [sys.executable, "-c", f"print({output!r}); raise SystemExit(1)"])
+            self.assertIn('"moderation_diagnostics": {"stage": "invite_after_kick", "failure": "history_sender_unverified"}',
+                          visible.getvalue())
+            self.assertNotIn("private", visible.getvalue())
+            self.assertEqual(runner.results, [])
+
+    @unittest.skipIf(os.name == "nt", "Linux hosted harness")
+    def test_green_process_without_moderation_checks_cannot_pass_acceptance(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            with (patch("run_matrix_acceptance.subprocess.run", return_value=subprocess.CompletedProcess([], 0)),
+                  contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, "Moderation acceptance evidence")):
+                runner.run("moderation_local", [sys.executable, "-c", "print('private-error-body')"])
+            self.assertEqual(runner.results, [])
+
     def test_oauth_cases_restore_the_same_vaulted_profile_in_a_separate_process(self):
         with tempfile.TemporaryDirectory() as folder:
             runner = Acceptance(Path(folder), "unused-scanner")

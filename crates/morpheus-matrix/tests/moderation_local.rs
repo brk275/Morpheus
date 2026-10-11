@@ -41,6 +41,78 @@ impl Fixture {
     }
 }
 
+fn invitation_failure(error: &MatrixCoreError) -> &'static str {
+    match error {
+        MatrixCoreError::SelectedAccountChanged => "selected_account_changed",
+        MatrixCoreError::RoomNotFound(_) => "room_not_found",
+        MatrixCoreError::InvalidUserId(_) => "invalid_user_id",
+        // MatrixCoreError currently retains SDK errors as text. Match only
+        // complete, pinned SDK messages; never publish the arbitrary payload.
+        MatrixCoreError::Sdk(message)
+            if message
+                == "encryption failed due to an error collecting the recipient devices: Encryption failed because your device is not verified" =>
+        {
+            "history_sender_unverified"
+        }
+        MatrixCoreError::Sdk(message)
+            if message
+                == "encryption failed due to an error collecting the recipient devices: Encryption failed because cross-signing is not set up on your account" =>
+        {
+            "history_cross_signing_missing"
+        }
+        MatrixCoreError::Sdk(_) => "sdk",
+        _ => "other",
+    }
+}
+
+async fn invite(
+    manager: &AccountManager,
+    account_id: &str,
+    room_id: &str,
+    user_id: &str,
+    stage: &'static str,
+) {
+    eprintln!("MORPHEUS_MODERATION_STAGE {stage}");
+    if let Err(error) = manager.invite_user_for(account_id, room_id, user_id).await {
+        eprintln!("MORPHEUS_MODERATION_FAILURE {}", invitation_failure(&error));
+        panic!("Moderation invitation failed; fixed category emitted");
+    }
+}
+
+async fn own_identity_verified(client: &Client) -> Option<bool> {
+    client
+        .encryption()
+        .get_user_identity(client.user_id().expect("Test account is not signed in"))
+        .await
+        .expect("Cannot inspect test account identity")
+        .map(|identity| identity.is_verified())
+}
+
+#[test]
+fn invitation_diagnostics_discard_arbitrary_sdk_payloads() {
+    assert_eq!(
+        invitation_failure(&MatrixCoreError::Sdk(
+            "encryption failed due to an error collecting the recipient devices: Encryption failed because your device is not verified".into()
+        )),
+        "history_sender_unverified"
+    );
+    assert_eq!(
+        invitation_failure(&MatrixCoreError::Sdk(
+            "encryption failed due to an error collecting the recipient devices: Encryption failed because cross-signing is not set up on your account".into()
+        )),
+        "history_cross_signing_missing"
+    );
+    for payload in [
+        "private server response with credentials",
+        "encryption failed due to an error collecting the recipient devices: Encryption failed because your device is not verified; private response",
+    ] {
+        assert_eq!(
+            invitation_failure(&MatrixCoreError::Sdk(payload.into())),
+            "sdk"
+        );
+    }
+}
+
 async fn wait_for_room(manager: &AccountManager, room_id: &str, expected: RoomMembership) {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
@@ -258,10 +330,14 @@ async fn room_settings_redaction_and_moderation_are_enforced() {
             .await,
         Err(MatrixCoreError::SelectedAccountChanged)
     ));
-    creator
-        .invite_user_for(&alice_account.id, &room_id, &bob.user_id)
-        .await
-        .expect("Cannot invite Bob");
+    invite(
+        &creator,
+        &alice_account.id,
+        &room_id,
+        &bob.user_id,
+        "invite_initial",
+    )
+    .await;
     wait_for_room(&peer, &room_id, RoomMembership::Invited).await;
     wait_for_member_list_state(
         &creator,
@@ -409,15 +485,34 @@ async fn room_settings_redaction_and_moderation_are_enforced() {
         .await
         .expect("Creator cannot kick Bob");
     wait_for_member_state(&alice_client, &room_id, &bob.user_id, "leave").await;
-    creator
-        .invite_user_for(&alice_account.id, &room_id, &bob.user_id)
-        .await
-        .expect("Cannot invite Bob after kick");
+    // The hosted fixture reuses an account identity from the preceding live
+    // tests with a fresh local device. Do not verify/reset that identity to
+    // make an ordinary invitation pass, or enable an unsafe sharing strategy.
+    let trust_before_invite = own_identity_verified(&alice_client).await;
+    eprintln!(
+        "MORPHEUS_MODERATION_CHECK reinvite_identity_unverified={}",
+        trust_before_invite == Some(false)
+    );
+    invite(
+        &creator,
+        &alice_account.id,
+        &room_id,
+        &bob.user_id,
+        "invite_after_kick",
+    )
+    .await;
+    let trust_unchanged = own_identity_verified(&alice_client).await == trust_before_invite;
+    eprintln!("MORPHEUS_MODERATION_CHECK reinvite_trust_unchanged={trust_unchanged}");
+    assert!(
+        trust_unchanged,
+        "Inviting changed the account identity trust"
+    );
     wait_for_room(&peer, &room_id, RoomMembership::Invited).await;
     peer.accept_invite(&room_id)
         .await
         .expect("Bob cannot rejoin after kick");
     wait_for_member_state(&alice_client, &room_id, &bob.user_id, "join").await;
+    eprintln!("MORPHEUS_MODERATION_CHECK reinvite_after_kick=true");
 
     assert!(matches!(
         creator
@@ -456,15 +551,20 @@ async fn room_settings_redaction_and_moderation_are_enforced() {
         .await
         .expect("Creator cannot unban Bob");
     wait_for_member_state(&alice_client, &room_id, &bob.user_id, "leave").await;
-    creator
-        .invite_user_for(&alice_account.id, &room_id, &bob.user_id)
-        .await
-        .expect("Cannot invite Bob after unban");
+    invite(
+        &creator,
+        &alice_account.id,
+        &room_id,
+        &bob.user_id,
+        "invite_after_unban",
+    )
+    .await;
     wait_for_room(&peer, &room_id, RoomMembership::Invited).await;
     peer.accept_invite(&room_id)
         .await
         .expect("Bob cannot rejoin after unban");
     wait_for_member_state(&alice_client, &room_id, &bob.user_id, "join").await;
+    eprintln!("MORPHEUS_MODERATION_CHECK reinvite_after_unban=true");
     eprintln!("Room kick, reinvite, ban, blocked join, unban, and rejoin passed.");
 
     peer.leave_room(&room_id)

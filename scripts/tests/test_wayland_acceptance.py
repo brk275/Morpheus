@@ -204,6 +204,36 @@ class WaylandFixtureTests(unittest.TestCase):
         self.assertTrue(facts["portal-wlr.create_session_received"])
         self.assertTrue(facts["portal-wlr.dmabuf_buffer_announced"])
 
+    def test_consumer_timeout_progress_and_producer_processing_are_fixed_facts(self):
+        progress = {
+            "consumer_format_pending": "before consumer format acceptance",
+            "consumer_buffers_pending": "before consumer buffer allocation",
+            "consumer_streaming_pending": "before consumer streaming",
+            "consumer_processing_pending": "before consumer processing",
+            "consumer_dequeue_pending": "without a dequeued consumer buffer",
+            "consumer_buffer_seen": "after consumer buffer dequeue",
+        }
+        for expected, suffix in progress.items():
+            facts = MODULE.capture_test_facts(
+                f"screen-sharing stream stopped producing frames {suffix} PRIVATE-PIXELS", 101)
+            self.assertTrue(facts["frame_delivery_timeout"])
+            self.assertEqual([key for key in progress if facts[key]], [expected])
+            self.assertNotIn("PRIVATE", MODULE.json.dumps(facts))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "portal-wlr.log").write_bytes(
+                b'pipewire: stream state changed to "streaming" PRIVATE-NODE\n'
+                b"pipewire: out of buffers PRIVATE-ID\n"
+                b"pipewire: enqueueing buffer PRIVATE-ADDRESS\n"
+                b"wlroots: ready event handler PRIVATE-TIMESTAMP\n"
+                b"wlroots: frame copied PRIVATE-SOURCE\n"
+            )
+            facts = MODULE.diagnostic_facts(root, "capture_test", {})
+            for key in ("pipewire_streaming", "pipewire_out_of_buffers", "pipewire_enqueue_attempted",
+                        "screencopy_ready", "screencopy_submitted"):
+                self.assertTrue(facts[f"portal-wlr.{key}"])
+            self.assertNotIn("PRIVATE", MODULE.json.dumps(facts))
+
     def test_cleanup_rejects_a_reaped_leader_without_signalling_its_pid(self):
         process = mock.Mock(pid=1234, returncode=0)
         with mock.patch.object(MODULE.os, "killpg") as kill:

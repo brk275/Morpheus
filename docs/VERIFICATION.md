@@ -359,6 +359,30 @@ formatting checks cleared; ten new focused regressions await hosted execution.
 Physical routing, permissions, unplug behavior and picker accessibility remain
 required.
 
+The Linux follow-up completes the PipeWire consumer's required buffer-parameter
+update after receiving a format. Its serialized offer permits only one packed
+RGB plane in mapped memory and preserves producer-supplied row padding. Fixed
+consumer-progress diagnostics distinguish allocation, streaming and delivery
+timeouts. Independent source review cleared the API and buffer lifetime handling;
+actual capture remains pending.
+
+The [invitation policy](INVITATION_HISTORY_POLICY.md) now explicitly disables
+the SDK's experimental incoming and outgoing invite-history bundles. Ordinary
+invites retain server authorization and existing encryption trust checks.
+Inspection found that automatic history sharing can reject an unverified sender
+before sending the invite; the old panic location alone cannot confirm that
+this caused the hosted failure. The next moderation gate requires actual
+rejoins after kick and unban from an unverified identity with unchanged trust,
+and reports only fixed failure categories. Root source review and 37 focused
+Python harness checks passed. Hosted native and live execution remain required.
+
+Before pushing this combined candidate, 256 portable Python checks passed and
+five platform checks were skipped on macOS. Rust formatting, Actionlint,
+Python compilation, JavaScript syntax, package configuration and whitespace
+checks passed. Native builds, native tests, source generation, archive
+transformations and Matrix/RTC services were reserved for the free hosted
+runners. The shared audio/client changes require all four native targets.
+
 ## Public source publication, 2026-10-10
 
 - Published `brk275/Morpheus` as public pre-alpha source at

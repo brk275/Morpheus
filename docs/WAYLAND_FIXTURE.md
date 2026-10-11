@@ -149,3 +149,40 @@ loss. The metadata regression covers valid pixel decoding, no access to corrupt
 nonempty or empty chunks, and a subsequent valid frame. This correctness fix and the
 fixture cleanup change are not evidence of the cause of an earlier native
 capture failure; the actual hosted stream check still has to pass.
+
+## Consumer buffer negotiation correction
+
+Candidate `db25e42`, run `38112448483`, confirmed all 33 system-library
+bindings and reached `first_frame_1`. The portal backend stayed running,
+negotiated a format and added buffers, but Morpheus reached its ten-second
+first-frame deadline. These backend facts describe the producer; they do not
+establish consumer allocation, streaming, or delivery. No source-selection
+or permission check failed in the retained facts.
+
+Inspection found that the consumer parsed `SPA_PARAM_Format` without completing
+the required `pw_stream_update_params` step. PipeWire's
+[stream contract](https://github.com/PipeWire/pipewire/blob/1.0.5/src/pipewire/stream.h#L75-L102)
+requires this step after the format callback; its
+[video consumer example](https://github.com/PipeWire/pipewire/blob/1.0.5/src/examples/video-play.c#L335-L365)
+supplies buffer requirements there. Morpheus now validates the negotiated packed
+RGB format and dimensions, then advertises 2–16 single-plane buffers using
+CPU-addressable `MemPtr`/`MemFd` memory. DMA-BUF is not accepted by this decoder.
+Size and stride remain producer-specified to preserve padded SHM rows; received
+offsets, strides and extents are still checked before pixel access. PipeWire
+copies the serialized parameters during the update call.
+
+A regression deserializes the actual buffer offer and checks count, plane count,
+memory flags, rejection of unsupported formats/dimensions, and absence of fixed
+stride/size constraints. Fixed timeout categories now distinguish consumer
+format acceptance, allocation, streaming, processing, dequeue without data,
+and a dequeued buffer without a usable frame. The helper also extracts literal
+producer streaming, buffer shortage/enqueue-attempt, and screencopy
+submission/readiness facts without publishing the matched log text.
+These facts improve any later failure diagnosis; they do not
+replace the existing selected-source pixel, change, stop, denial and cancellation
+assertions.
+
+This corrects an omitted public API step. The retained `db25e42` evidence cannot
+prove it was the sole cause of the deadline, and the corrected candidate still
+requires hosted compilation and actual frame acceptance. The pinned fixture
+backend, its SHM adaptation, and all other platform capture paths are unchanged.

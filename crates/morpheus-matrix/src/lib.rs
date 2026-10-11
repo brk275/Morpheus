@@ -2499,6 +2499,12 @@ async fn build_client(homeserver: &str, store_path: &Path, passphrase: &str) -> 
             backup_download_strategy: BackupDownloadStrategy::AfterDecryptionFailure,
             ..Default::default()
         })
+        // MSC4268 invite-history bundles are an experimental SDK default.
+        // Morpheus has no explicit history-sharing consent/verification flow
+        // yet, so invitations must not upload or distribute historic keys.
+        // This also disables accepting those bundles; ordinary key backup,
+        // recovery and encrypted messaging retain their existing policies.
+        .with_enable_share_history_on_invite(false)
         .handle_refresh_tokens()
         .build()
         .await
