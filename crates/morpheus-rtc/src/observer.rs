@@ -6,18 +6,19 @@
 //! revalidate snapshots on a timer as well as on membership changes. A roster
 //! alone does not prove trust, consent, invitation delivery, or a callable SFU.
 
-use std::{collections::BTreeSet, fmt, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, fmt, future::Future, sync::Arc, time::Duration};
 
 use matrix_rtc_call_sdk::SdkMatrixBackend;
 use matrix_rtc_core::{
     BaseRtcClient, BaseRtcRoomHandle, EventOrigin, JoinedMembership, RawSlotEvent,
-    RawSlotEventContent, RoomEncryption, RoomOptions, SlotState, wire_event_type,
+    RawSlotEventContent, RoomEncryption, RoomOptions, SLOT_EVENT_TYPE, SlotState, wire_event_type,
 };
 use matrix_sdk::{
-    Client, Room, RoomState,
+    Client, HttpError, Room, RoomState,
     config::RequestConfig,
     ruma::{
-        EventId, OwnedRoomId, RoomId, UserId, api::client::state::get_state_event_for_key,
+        EventId, OwnedRoomId, RoomId, UserId,
+        api::{client::state::get_state_event_for_key, error::ErrorKind},
         events::StateEventType,
     },
 };
@@ -187,26 +188,21 @@ impl PassiveCallObserver {
     async fn snapshot_inner(&mut self) -> Result<ObservedCall, ObserverError> {
         require_joined(&self.room)?;
         require_encrypted(&self.room).await?;
-        // Pinned call-sdk::open_slot sends this exact core slot unchanged as
-        // the state key. Sticky2025 changes the membership/token slot only;
-        // neither that writer nor core state ingestion uppercases this key.
-        let request = get_state_event_for_key::v3::Request::new(
-            self.room_id.clone(),
-            StateEventType::from(wire_event_type("m.rtc.slot")),
-            SLOT.to_owned(),
-        );
-        let response = self
-            .room
-            .client()
-            .send(request)
-            .with_request_config(
-                RequestConfig::new()
-                    .retry_limit(0)
-                    .timeout(SNAPSHOT_TIMEOUT),
-            )
-            .await
-            .map_err(|_| ObserverError::SlotUnavailable)?;
-        validate_slot(self.room_id.as_str(), response.event_or_content.get())?;
+        let client = self.room.client();
+        validate_current_slot(&self.room_id, |request| {
+            let client = client.clone();
+            async move {
+                client
+                    .send(request)
+                    .with_request_config(
+                        RequestConfig::new()
+                            .retry_limit(0)
+                            .timeout(SNAPSHOT_TIMEOUT),
+                    )
+                    .await
+            }
+        })
+        .await?;
         require_joined(&self.room)?;
         // No await after taking either snapshot: a feed refresh racing the two
         // snapshots is rejected by exact current event identity below.
@@ -308,6 +304,41 @@ fn wire_slot(mode: InteropMode) -> Result<&'static str, ObserverError> {
         InteropMode::Sticky2025 => Ok("m.call#ROOM"),
         InteropMode::RoomState => Err(ObserverError::UnsupportedDialect),
     }
+}
+
+// Match pinned core::feeder::SlotEvents::current: a stable state event is
+// authoritative, even when it is closed or malformed. The pinned SDK slot
+// writer sends SLOT_EVENT_TYPE directly; Ruma 0.35 has no slot alias mapping.
+// Only an exact missing-state response permits the unstable spelling. Both
+// requests stay inside snapshot's existing overall ten-second deadline.
+async fn validate_current_slot<F, Fut>(room_id: &RoomId, mut fetch: F) -> Result<(), ObserverError>
+where
+    F: FnMut(get_state_event_for_key::v3::Request) -> Fut,
+    Fut: Future<Output = Result<get_state_event_for_key::v3::Response, HttpError>>,
+{
+    let request = |event_type| {
+        get_state_event_for_key::v3::Request::new(
+            room_id.to_owned(),
+            StateEventType::from(event_type),
+            SLOT.to_owned(),
+        )
+    };
+    let response = match fetch(request(SLOT_EVENT_TYPE)).await {
+        Ok(response) => response,
+        Err(error) if missing_slot_state(&error) => {
+            fetch(request(wire_event_type(SLOT_EVENT_TYPE)))
+                .await
+                .map_err(|_| ObserverError::SlotUnavailable)?
+        }
+        Err(_) => return Err(ObserverError::SlotUnavailable),
+    };
+    validate_slot(room_id.as_str(), response.event_or_content.get())
+}
+
+fn missing_slot_state(error: &HttpError) -> bool {
+    error.as_client_api_error().is_some_and(|error| {
+        error.status_code.as_u16() == 404 && error.error_kind() == Some(&ErrorKind::NotFound)
+    })
 }
 
 fn validate_slot(room_id: &str, raw: &str) -> Result<(), ObserverError> {
@@ -424,6 +455,166 @@ mod tests {
     fn content() -> Value {
         json!({"slot_id":"m.call#room", "application":{"type":"m.call"},
             "member":{"id":"logical", "membership":"join"}, "sticky_key":"logical"})
+    }
+
+    fn slot_response(value: Value) -> get_state_event_for_key::v3::Response {
+        get_state_event_for_key::v3::Response::new(serde_json::value::to_raw_value(&value).unwrap())
+    }
+
+    fn open_slot_response() -> get_state_event_for_key::v3::Response {
+        // Use the pinned writer's constructor, not a separate hand-written
+        // payload that might drift from the slot actually sent by Morpheus.
+        let content = RawSlotEventContent::for_open(
+            "m.call".into(),
+            Some(matrix_rtc_core::SlotEncryption {
+                encryption_type: "m.per_member".into(),
+                extra: Default::default(),
+            }),
+        );
+        slot_response(serde_json::to_value(content).unwrap())
+    }
+
+    fn api_error(status: u16, kind: ErrorKind) -> HttpError {
+        use matrix_sdk::ruma::api::{
+            client::uiaa::UiaaResponse,
+            error::{ErrorBody, FromHttpResponseError, StandardErrorBody},
+        };
+        let error = ErrorBody::Standard(StandardErrorBody::new(kind, "fixture".into()))
+            .into_error(status.try_into().unwrap());
+        HttpError::from(FromHttpResponseError::Server(UiaaResponse::MatrixError(
+            error,
+        )))
+    }
+
+    fn record_request(seen: &mut Vec<String>, request: get_state_event_for_key::v3::Request) {
+        assert_eq!(request.room_id.as_str(), "!room:example.org");
+        assert_eq!(request.state_key, SLOT);
+        assert_eq!(request.format.to_string(), "content");
+        seen.push(request.event_type.to_string());
+    }
+
+    #[tokio::test]
+    async fn stable_slot_request_matches_the_pinned_writer_without_ruma_aliasing() {
+        let room_id = RoomId::parse("!room:example.org").unwrap();
+        let mut seen = Vec::new();
+        assert_eq!(
+            validate_current_slot(&room_id, |request| {
+                record_request(&mut seen, request);
+                std::future::ready(Ok(open_slot_response()))
+            })
+            .await,
+            Ok(())
+        );
+        assert_eq!(seen, [SLOT_EVENT_TYPE]);
+        assert_eq!(
+            StateEventType::from(SLOT_EVENT_TYPE).to_string(),
+            "m.rtc.slot"
+        );
+        assert_ne!(SLOT_EVENT_TYPE, wire_event_type(SLOT_EVENT_TYPE));
+    }
+
+    #[tokio::test]
+    async fn closed_or_malformed_stable_slot_never_reads_an_unstable_open_slot() {
+        let room_id = RoomId::parse("!room:example.org").unwrap();
+        for value in [
+            json!({"status":"closed"}),
+            json!({}),
+            json!({"status":"open", "application":{"type":"m.call"}}),
+            json!({"status":"open", "application":{"type":"other"}, "encryption":{"type":"m.per_member"}}),
+            json!({"status":"open", "application":{"type":"m.call"}, "encryption":{"type":"unknown"}}),
+            Value::Null,
+            json!({"extra":"x".repeat(MAX_EVENT_BYTES)}),
+        ] {
+            let mut seen = Vec::new();
+            assert_eq!(
+                validate_current_slot(&room_id, |request| {
+                    record_request(&mut seen, request);
+                    std::future::ready(Ok(if seen.len() == 1 {
+                        slot_response(value.clone())
+                    } else {
+                        open_slot_response()
+                    }))
+                })
+                .await,
+                Err(ObserverError::SlotUnavailable)
+            );
+            assert_eq!(seen, [SLOT_EVENT_TYPE]);
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_missing_stable_state_reads_and_validates_the_unstable_slot() {
+        let room_id = RoomId::parse("!room:example.org").unwrap();
+        let mut seen = Vec::new();
+        assert_eq!(
+            validate_current_slot(&room_id, |request| {
+                record_request(&mut seen, request);
+                std::future::ready(if seen.len() == 1 {
+                    Err(api_error(404, ErrorKind::NotFound))
+                } else {
+                    Ok(open_slot_response())
+                })
+            })
+            .await,
+            Ok(())
+        );
+        assert_eq!(seen, [SLOT_EVENT_TYPE, wire_event_type(SLOT_EVENT_TYPE)]);
+    }
+
+    #[tokio::test]
+    async fn unavailable_auth_or_non_missing_errors_never_try_an_alias() {
+        use matrix_sdk::ruma::api::error::IntoHttpError;
+        let room_id = RoomId::parse("!room:example.org").unwrap();
+        for error in [
+            api_error(403, ErrorKind::Forbidden),
+            api_error(404, ErrorKind::Forbidden),
+            api_error(404, ErrorKind::Unrecognized),
+            api_error(500, ErrorKind::NotFound),
+            HttpError::IntoHttp(IntoHttpError::NoUnstablePath),
+            HttpError::Cached(Arc::new(api_error(404, ErrorKind::NotFound))),
+        ] {
+            let mut error = Some(error);
+            let mut seen = Vec::new();
+            assert_eq!(
+                validate_current_slot(&room_id, |request| {
+                    record_request(&mut seen, request);
+                    std::future::ready(match error.take() {
+                        Some(error) => Err(error),
+                        None => Ok(open_slot_response()),
+                    })
+                })
+                .await,
+                Err(ObserverError::SlotUnavailable)
+            );
+            assert_eq!(seen, [SLOT_EVENT_TYPE]);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_or_closed_unstable_state_cannot_rearm_a_missing_slot() {
+        let room_id = RoomId::parse("!room:example.org").unwrap();
+        for fallback in [
+            Err(api_error(404, ErrorKind::NotFound)),
+            Err(api_error(403, ErrorKind::Forbidden)),
+            Ok(slot_response(json!({"status":"closed"}))),
+            Ok(slot_response(json!({}))),
+        ] {
+            let mut fallback = Some(fallback);
+            let mut seen = Vec::new();
+            assert_eq!(
+                validate_current_slot(&room_id, |request| {
+                    record_request(&mut seen, request);
+                    std::future::ready(if seen.len() == 1 {
+                        Err(api_error(404, ErrorKind::NotFound))
+                    } else {
+                        fallback.take().expect("at most one fallback request")
+                    })
+                })
+                .await,
+                Err(ObserverError::SlotUnavailable)
+            );
+            assert_eq!(seen, [SLOT_EVENT_TYPE, wire_event_type(SLOT_EVENT_TYPE)]);
+        }
     }
 
     #[test]

@@ -5,6 +5,21 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
 ## Current hosted acceptance, 2026-10-11
 
+### Stable call-slot lookup correction
+
+The passive observer now reads `m.rtc.slot`, matching the pinned SDK writer.
+Only a direct HTTP 404 with `M_NOT_FOUND` permits trying the unstable
+`org.matrix.msc4143.rtc.slot` alias. A present stable event remains authoritative,
+including when it is closed, malformed or fails the encryption/application
+checks. Authentication, transport and other server errors do not select an
+alias. Both reads share the existing ten-second snapshot deadline.
+
+Five injected-response regressions cover request identity against the pinned
+writer, stable-state precedence, exact missing-state fallback and failure paths.
+Source/API review and formatting checks passed; native execution and all four
+live invitation/admission cases are pending hosted verification of this change.
+The separate fresh-device `MissingMegolmSession` failure remains unresolved.
+
 ### Native preview and microphone cancellation results
 
 [Run 38138168629](https://github.com/brk275/Morpheus/actions/runs/38138168629)
@@ -60,8 +75,8 @@ sticky sync, own crypto, peer trust and join-without-media setup, then cleaned
 up. Invitation receipt and incoming admission assertions were not reached.
 Source inspection found a concrete event-type mismatch: the pinned writer sends
 `m.rtc.slot`, while the observer requests `org.matrix.msc4143.rtc.slot`; locked
-Ruma preserves those distinct strings. The observer correction remains pending
-and is excluded from the screenshot candidate.
+Ruma preserves those distinct strings. The screenshot candidate excluded the observer correction; the subsequent
+correction is described above and still requires hosted verification.
 Fresh-device late join failed at `initial_bob_roster`: Alice's membership was
 absent from Bob's roster. The bounded diagnostic selected Alice's current
 membership and reported `MissingMegolmSession` on Bob; it did not turn the
