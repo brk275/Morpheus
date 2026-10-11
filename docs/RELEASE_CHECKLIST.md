@@ -78,7 +78,7 @@ when publication inputs change.
       installation launches without manually installing extra libraries.
 - [ ] Put a project maintainer identity and working project contact address in
       the Debian package's `Maintainer` field; a personal name or email is not
-      required.
+      required. Debian packaging is deferred by the owner until this is provided.
 - [ ] Establish and verify a Linux package build path for distributions older
       than Ubuntu 24.04 before claiming support for them.
 - [ ] Test upgrades from installed older builds, failed or interrupted updates,

@@ -5,7 +5,70 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
 ## Current hosted acceptance, 2026-10-11
 
-### SDK receipt verification and test setup correction
+### Corrected SDK tests and next diagnostic candidate
+
+[Run 38127191100](https://github.com/brk275/Morpheus/actions/runs/38127191100)
+tested `139460d946d3fa7367397f9883ce5ebd7da19dd6`. Windows, Apple Silicon and
+Intel Mac completed successfully: each passed its native check/build and 293
+tests, including all 46 SDK sticky tests (12 new keyless-receipt regressions and
+four upstream sliding-sync sticky tests). Windows synthetic owned-window/display
+capture passed. All three logs scanned with zero findings, every post-step
+completed, and their caches were current.
+
+Linux passed its native app build and Xvfb startup, 16 configuration, 44 Matrix,
+eight RTC protocol, 97 desktop, 60 native RTC/device, 46 SDK sticky tests and the
+four vendor suites (1/32/10/5). Twelve additional fixture-selector checks ran
+without live inputs and are not live acceptance evidence. The desktop suite
+also reported one explicitly ignored test. Scope passed 334 helper tests with
+one explicit skip, including the hosted HTTPS cookie login/consent flow.
+
+The live suite passed chat/account/sync isolation, encrypted drafts, room
+actions, formatted messages, media, discovery, moderation, both search/sync
+paths, encrypted recovery, and both real HTTPS OAuth phases including vault
+removal and remote logout. All four Current/Sticky2025 DM/room invitation cases
+passed all 13 required facts: unsolicited encrypted receipt through sync before
+the GET cross-check, actual SDK verification and targeting, then both server
+redaction and sync-cache removal before expiry. These checks establish receipt
+plumbing; they do not establish incoming UI, audible ringing or Accept behavior.
+
+The ordinary encrypted RTC case passed. Fresh-device late join failed while
+Bob waited for Alice's initial roster entry (`initial_bob_roster`, expected
+present, observed absent; historical membership was not decrypted). The later
+Element check still ran and passed all 11 facts against the official
+`v0.28.0-rc.1` image, digest
+`sha256:6d83fe15c425e1139edafdffe2b2073256608dcafdc554da5bf840de496891fe`.
+This is the pre-synced Sticky2025 baseline, not Current-format or fresh-device
+Element acceptance. The failed native late-join check remains open.
+
+Wayland still failed the first static selected-display frame. All 33 origins
+used system PipeWire, all five desktop services remained running, and the
+complete trace recorded a valid producer queue before the consumer's local
+Running transition, followed by no processing callback. The nonactive warning
+was teardown-only; no unfinished-graph marker appeared. The cause remains
+unproved. All explicit fixture/container/network cleanup checks and CI posts
+completed; Linux saved its cache. Every job log scanned clean. No installers
+were uploaded. These two Linux failures keep the candidate below beta readiness.
+
+The next implementation adds a passive MatrixRTC observer, with fresh encrypted
+slot reads and bounded cross-checks against actual SDK membership metadata. It
+does not join a call or grant device trust. Existing outgoing membership checks
+are shared with the planned receiver. The four live invitation fixtures now
+also require the observer to see only the caller and to observe departure before
+natural membership expiry. These new native checks have not executed yet;
+incoming UI, audible ringing and Accept behavior are not implemented by this
+change.
+
+A separate, manual Linux-only [startup comparison](WAYLAND_FIXTURE.md#explicit-systemcontrolpatched-startup-diagnostic)
+implements system/control/patched PipeWire experiments. The ordinary capture
+gate continues to require all 33 system bindings and its first static frame.
+Private-client results cannot replace that evidence. The experiment has not
+run; its review and mocked helper checks are preparation, not native validation.
+
+The owner has deferred Debian packaging until a working public project email
+is provided. Manual Linux package QA defaults to AppImage; Debian acceptance
+remains open.
+
+### Previous SDK test setup failure
 
 [Run 38124824005](https://github.com/brk275/Morpheus/actions/runs/38124824005)
 tested `af50e11fbd74c09a7a974ca9b7dc9196f41bfcf6`. Linux built the desktop app,
@@ -43,7 +106,7 @@ production code intact. One `--lib sticky` invocation retains both previous
 filter sets and also includes the undecryptable-sticky and in-memory queue
 tests. An SDK regression failure now permits independently built live app
 checks to run and remains a failure at the final CI gate. Vendored security
-failures still stop the job. Native verification of this correction is pending.
+failures still stop the job. The corrected run is recorded above.
 Its focused local checks passed: 17 CI-selection tests, Actionlint, formatting
 and whitespace checks. No native build, native test or fixture service ran locally.
 
@@ -97,16 +160,15 @@ checked container/network absence gates passed. All job logs scanned with zero
 findings and are retained privately with hashes. Every post/cache step
 completed; the caches were already current. No installer was uploaded.
 
-### Receipt patch and live harness changes awaiting acceptance
+### Receipt patch and live harness changes
 
 Candidate `af50e11` adds a narrow patch to pinned `matrix-sdk-base` 0.19.1 that
 retains keyless sticky receipts with the SDK's actual encryption metadata. It
 keeps existing keyed semantics, original expiry and room generations; redaction, late keys,
 replay, byte/count limits and broadcast lag have dedicated regressions. The
 four live invitation cases now require unsolicited receipt **before** any GET,
-then observed sync-cache redaction before expiry. The SDK test setup failure
-above prevented the new native tests and these stronger live checks from
-executing. See the
+then observed sync-cache redaction before expiry. The first SDK test setup
+failure prevented those checks; the corrected run above passed them. See the
 [patch contract](../vendor/matrix-sdk-base/MORPHEUS_PATCH.md).
 
 The live harness now collects independent checks after a contained, scanned

@@ -17,6 +17,7 @@ native-rtc = [
     "dep:matrix-rtc-transport",
     "dep:matrix-sdk",
     "dep:rustls",
+    "dep:tokio",
 ]
 # Native OS device backends are independent so packaging can enable the
 # backends that have been verified for a target platform.

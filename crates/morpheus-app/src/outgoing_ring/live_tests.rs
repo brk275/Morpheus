@@ -18,7 +18,7 @@ use matrix_sdk::{
 };
 use morpheus_matrix::{AccountManager, SyncBackend, SyncStatus};
 use morpheus_rtc::{
-    CallOptions, RtcStreamKind,
+    CallOptions, PassiveCallObserver, RtcStreamKind,
     ringing::{
         CallParticipation, ResolvedJoinedCall, RingContext, RingNotification, RoomMentionPermission,
     },
@@ -187,6 +187,7 @@ struct Session {
     alice: AccountManager,
     bob: AccountManager,
     rtc: Option<RtcService>,
+    observer: Option<PassiveCallObserver>,
     receipt: Option<InvitationReceipt>,
     stage: Stage,
 }
@@ -197,6 +198,7 @@ impl Session {
             alice: AccountManager::open(case.profile.path().join("alice")).map_err(|_| ())?,
             bob: AccountManager::open(case.profile.path().join("bob")).map_err(|_| ())?,
             rtc: None,
+            observer: None,
             receipt: None,
             stage: Stage::Fixture,
         })
@@ -329,6 +331,22 @@ impl Session {
         })
         .await
         .map_err(|_| ())??;
+        // Bob observes the actual call without joining it. Keep its feed in
+        // Session so cancellation still detaches it during bounded cleanup.
+        self.observer = Some(
+            PassiveCallObserver::open(bob_client.clone(), case.room_id.as_str(), case.mode)
+                .await
+                .map_err(|_| ())?,
+        );
+        wait_for_passive_caller(
+            self.observer.as_mut().ok_or(())?,
+            &bob_room,
+            &alice,
+            &info,
+            &dialect,
+            case.mode,
+        )
+        .await?;
         fact("encrypted_membership");
 
         // Subscribe before the snapshot and before sending. This receiver
@@ -614,6 +632,49 @@ impl Session {
         .await
         .map_err(|_| ())??;
         fact("unsolicited_redaction_observed");
+
+        // This is a separate membership-removal assertion, after all existing
+        // invitation checks. A naturally expired membership cannot satisfy it.
+        phase(&mut self.stage, Stage::Membership);
+        let before_leave = own_membership(&bob_room, &alice, &info, &dialect, case.mode)
+            .map_err(|_| ())?
+            .ok_or(())?;
+        let expires_at = bob_room
+            .sticky_events()
+            .live()
+            .into_iter()
+            .find(|event| event.event_id == before_leave)
+            .ok_or(())?
+            .expires_at;
+        require(MilliSecondsSinceUnixEpoch::now() < expires_at)?;
+        time::timeout(Duration::from_secs(12), rtc.leave(case.room_id.as_str()))
+            .await
+            .map_err(|_| ())?
+            .map_err(|_| ())?;
+        let observer = self.observer.as_mut().ok_or(())?;
+        time::timeout(Duration::from_secs(20), async {
+            loop {
+                require(MilliSecondsSinceUnixEpoch::now() < expires_at)?;
+                if let Ok(snapshot) = observer.snapshot().await {
+                    require(
+                        snapshot.room_id == info.room_id
+                            && snapshot.slot_id == info.slot_id
+                            && snapshot.mode == case.mode,
+                    )?;
+                    if snapshot.participants.is_empty()
+                        && own_membership(&bob_room, &alice, &info, &dialect, case.mode)
+                            .map_err(|_| ())?
+                            .is_none()
+                    {
+                        require(MilliSecondsSinceUnixEpoch::now() < expires_at)?;
+                        return Ok::<_, ()>(());
+                    }
+                }
+                time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .map_err(|_| ())??;
         Ok(())
     }
 
@@ -621,6 +682,8 @@ impl Session {
     /// after a preceding failure. Client/RTC owners remain here on cancellation.
     async fn cleanup(&mut self, room_id: &OwnedRoomId) -> bool {
         let mut clean = true;
+        // No passive feed remains attached while its account logs out/stops.
+        self.observer = None;
         if let Some(rtc) = self.rtc.as_mut() {
             if let Some(receipt) = self.receipt.take() {
                 clean &= cleanup_attempt(Duration::from_secs(3), async {
@@ -658,6 +721,51 @@ impl Session {
         self.rtc = None;
         clean
     }
+}
+
+async fn wait_for_passive_caller(
+    observer: &mut PassiveCallObserver,
+    room: &Room,
+    caller: &AccountInfo,
+    info: &CallInfo,
+    dialect: &NotificationDialect,
+    mode: InteropMode,
+) -> Result<(), ()> {
+    time::timeout(Duration::from_secs(20), async {
+        loop {
+            // Feed seeding and SDK map updates are independent. Retry only
+            // within this existing work budget, never accept an unproven row.
+            if let Ok(snapshot) = observer.snapshot().await {
+                require(
+                    snapshot.room_id == info.room_id
+                        && snapshot.slot_id == info.slot_id
+                        && snapshot.mode == mode
+                        && snapshot.participants.len() <= 1,
+                )?;
+                if let Some(participant) = snapshot.participants.first() {
+                    // Exactly the caller means the receiver has no logical
+                    // membership of its own as a side effect of observing.
+                    require(
+                        participant.user_id == caller.user_id
+                            && participant.device_id == caller.device_id
+                            && participant.membership_id == info.membership_id,
+                    )?;
+                    // No await between reading the observer and the existing
+                    // independently Verified SDK membership proof. A refresh
+                    // race waits for the two current event IDs to agree.
+                    if own_membership(room, caller, info, dialect, mode)
+                        .map_err(|_| ())?
+                        .is_some_and(|event| event.as_str() == participant.membership_event_id)
+                    {
+                        return Ok::<_, ()>(());
+                    }
+                }
+            }
+            time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .map_err(|_| ())?
 }
 
 async fn cleanup_attempt<F: Future<Output = bool>>(limit: Duration, work: F) -> bool {

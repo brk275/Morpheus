@@ -5,6 +5,8 @@
 mod attachments;
 mod audio_devices;
 #[cfg(feature = "native-calls")]
+mod call_membership;
+#[cfg(feature = "native-calls")]
 mod calls;
 mod drafts;
 mod live;

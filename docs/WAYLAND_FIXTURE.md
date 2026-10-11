@@ -368,3 +368,58 @@ as its completion barrier. Real-time callbacks would require a different thread
 ownership model and do not fix this core ordering. The source review did not
 identify a supported application workaround. The system PipeWire library and
 the mandatory first static-frame assertion remain unchanged; this gate is open.
+
+## Explicit system/control/patched startup diagnostic
+
+The manual [`wayland-startup-probe.yml`](../.github/workflows/wayland-startup-probe.yml)
+workflow is an opt-in experiment on the standard free Ubuntu 24.04 runner. It
+is restricted to the public repository's `main` branch; the helper also requires
+the explicit probe flag, GitHub-hosted Linux x64, Ubuntu 24.04 and matching
+installed package/source identities. **This implementation has not been
+executed; free hosted verification is pending.** Ordinary CI keeps its separate,
+mandatory system-library gate.
+
+The diagnostic collects three conditions, each in a fresh owned PID namespace
+and disposable Wayland fixture:
+
+- **System (S):** the ordinary installed library and unchanged requirement that
+  all 33 Rust PipeWire bindings resolve to the trusted system library.
+- **Control (A):** a private rebuild of Ubuntu source `1.0.5-1ubuntu3.3`, including
+  every pinned distro patch.
+- **Patched (B):** the same private build plus only upstream commit
+  [`800a25a01f99156d7d954f4d7fe1b0a6cf8ae7e3`](https://github.com/PipeWire/pipewire/commit/800a25a01f99156d7d954f4d7fe1b0a6cf8ae7e3).
+
+[`pipewire_startup_probe.py`](../scripts/pipewire_startup_probe.py) checks bounded
+archive hashes, paths and types, the complete distro patch series, and exact
+before/after source hashes for the upstream change. Sources are fetched over
+official Ubuntu HTTPS and matched to fixed hashes; this does not claim an
+independent OpenPGP verification of the `.dsc` signature. It builds only the client
+shared library. A and B use one configuration/build recipe; all 32 other object
+hashes must remain identical and `impl-node.c.o` must change. This control is
+not claimed to be a byte-identical reproduction of Ubuntu's packaged binary.
+
+A and B run the same recorded Rust test ELF and shared capture assertions,
+including the first static frame. Only its diagnostic entry uses the verified
+absolute system loader's `--library-path` argument. Before initialization, all
+33 bindings must resolve to the expected private file, matching its SHA-256,
+GNU Build-ID and mapped-file identity. This separate verifier cannot satisfy or
+relax S's system-origin assertion. PipeWire, WirePlumber and portal services
+remain on system libraries. No diagnostic library is installed, no system
+library is replaced, and no loader override is exported to child processes.
+
+Preparation and each capture have bounded deadlines and private output caps.
+The caller retains process ownership and namespace cleanup; incomplete drains,
+truncated logs, invalid provenance, setup errors or failed cleanup cannot count
+as a collected comparison. Raw logs and artifacts stay in private temporary
+directories and are removed, never uploaded. Public output contains fixed
+diagnostic categories, booleans and validated artifact digests/Build-IDs,
+without pixels or raw process metadata. The digests identify the test ELF,
+loader, two private libraries, configuration and build recipe after cleanup.
+
+S failure remains a workflow failure even when B passes. A failure with B
+success would support the relevance of the upstream state-completion change;
+it would not directly show which eventfd read consumed a wake-up or establish
+that this is the sole cause. A pass in both private builds is also inconclusive
+about that race. Rebuilding and changing scheduling can affect timing. No
+result from this diagnostic alone closes production Wayland acceptance or
+authorizes bundling a replacement runtime.

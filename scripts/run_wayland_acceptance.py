@@ -36,6 +36,7 @@ from element_process_namespace import (
 
 REPO = Path(__file__).resolve().parents[1]
 TARGET_TEST = "wayland_selected_display_streams_changes_and_stops"
+PROBE_TEST = "wayland_private_client_startup_diagnostic"
 # Only these literal facts may leave the private fixture. Never copy matched
 # text: service messages also contain session paths, output names and app IDs.
 DIAGNOSTIC_MARKERS = {
@@ -503,9 +504,10 @@ def diagnostic_facts(root: Path, stage: str, services: dict[str, subprocess.Pope
     return facts
 
 
-def capture_test_passed(output: str) -> bool:
+def capture_test_passed(output: str, *, private_client: bool = False) -> bool:
     """An existing but no-longer-ignored test must not produce false evidence."""
-    target_passed = re.search(rf"^test {re.escape(TARGET_TEST)} \.\.\. ok$", output, re.MULTILINE)
+    target = PROBE_TEST if private_client else TARGET_TEST
+    target_passed = re.search(rf"^test {re.escape(target)} \.\.\. ok$", output, re.MULTILINE)
     summary_passed = re.search(
         r"^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;",
         output, re.MULTILINE,
@@ -513,11 +515,20 @@ def capture_test_passed(output: str) -> bool:
     return target_passed is not None and summary_passed is not None
 
 
-def capture_test_facts(output: str, status: int | None, stage: str = "unknown") -> dict:
+def capture_test_completed(output: str, *, private_client: bool = False) -> bool:
+    if capture_test_passed(output, private_client=private_client):
+        return True
+    target = PROBE_TEST if private_client else TARGET_TEST
+    return (re.search(rf"^test {re.escape(target)} \.\.\. FAILED$", output, re.MULTILINE) is not None
+            and re.search(r"^test result: FAILED\. 0 passed; 1 failed; 0 ignored; 0 measured; [0-9]+ filtered out;",
+                          output, re.MULTILINE) is not None)
+
+
+def capture_test_facts(output: str, status: int | None, stage: str = "unknown", *, private_client: bool = False) -> dict:
     """Do not publish libtest panic payloads, even when the test fails."""
     facts = {
         "command": "timed_out" if status is None else "succeeded" if status == 0 else "failed",
-        "required_test_passed": capture_test_passed(output),
+        "required_test_passed": capture_test_passed(output, private_client=private_client),
         "zero_tests_passed": "test result: ok. 0 passed;" in output,
         "last_stage": stage if stage in CAPTURE_STAGES else "unknown",
     }
@@ -725,14 +736,21 @@ def assert_session_namespace() -> None:
         raise RuntimeError("Wayland process containment failed")
 
 
-def session(root: Path) -> int:
+def session(root: Path, *, private_client=None, record_probe: bool = False) -> int:
     assert_session_namespace()
+    # Only the separate, explicit hosted diagnostic calls this optional path.
+    # Normal CLI entry points always use the unconditional system-library gate.
+    if private_client is not None and not record_probe:
+        raise RuntimeError("private client requires the separate diagnostic runner")
     runtime = Path(os.environ["XDG_RUNTIME_DIR"])
     processes: list[subprocess.Popen] = []
     services: dict[str, subprocess.Popen] = {}
     trace_sinks: dict[str, CappedPrivateLog] = {}
     stage = "backend_build"
     trace_boundaries = []
+    outcome = {"schema": 1, "capture_attempted": False, "capture_completed": False,
+               "bindings_verified": False, "capture_passed": False,
+               "cleanup_passed": False, "services_system": False, "trace_complete": False}
     with contextlib.ExitStack() as files:
         def start(name: str, command: list[str], *, service: bool = True, trace: bool = False):
             if trace:
@@ -795,6 +813,11 @@ def session(root: Path) -> int:
                 probe = subprocess.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.portal.Desktop", "--object-path", "/org/freedesktop/portal/desktop", "--method", "org.freedesktop.DBus.Properties.Get", "org.freedesktop.portal.ScreenCast", "AvailableSourceTypes"], capture_output=True, timeout=3)
                 return probe.returncode == 0
             wait_for(portal_ready, list(services.values()), "ScreenCast portal", seconds=30)
+            if record_probe:
+                from run_pipewire_startup_probe import service_library_facts
+                outcome["services_system"] = service_library_facts(services)
+                if not outcome["services_system"]:
+                    raise RuntimeError("diagnostic service library provenance failed")
             stage = "outputs"
             outputs = subprocess.run(["swaymsg", "-t", "get_outputs", "-r"], capture_output=True, check=True, timeout=5)
             active = {item["name"] for item in json.loads(outputs.stdout) if item["active"]}
@@ -804,14 +827,23 @@ def session(root: Path) -> int:
             # otherwise make a zero-test run look like acceptance evidence.
             stage = "test_discovery"
             command = ["cargo", "test", "--locked", "-p", "morpheus-rtc", "--features", "native-devices", "--test", "wayland_capture"]
-            listing_log = files.enter_context((root / "test-list.log").open("wb"))
-            listing = subprocess.Popen(command + ["--", "--list"], cwd=REPO, stdout=listing_log, stderr=subprocess.STDOUT, start_new_session=True)
+            target = TARGET_TEST
+            if private_client is not None:
+                command = private_client.command()
+                target = PROBE_TEST
+            listing_sink = files.enter_context(CappedPrivateLog(root / "test-list.log"))
+            separator = [] if private_client is not None else ["--"]
+            listing = subprocess.Popen(command + separator + ["--list"], cwd=REPO, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
             processes.append(listing)
+            trace_sinks["test-list"] = listing_sink
+            listing_sink.attach(listing.stdout)
             listing_status = wait_owned_process(listing, timeout=300)
+            listing_sink.finish()
             listing_output = (root / "test-list.log").read_text(errors="replace")
-            if listing_status or f"{TARGET_TEST}: test" not in listing_output:
+            if listing_status or listing_sink.failed or listing_sink.truncated or not listing_sink.drained or f"{target}: test" not in listing_output:
                 # Compiler diagnostics contain no fixture pixels or secrets.
-                print(listing_output[-24000:], file=sys.stderr)
+                if not record_probe:
+                    print(listing_output[-24000:], file=sys.stderr)
                 raise RuntimeError("Wayland acceptance test did not compile or was not discovered")
             stage = "capture_test"
             stage_path = root / "capture-stage"
@@ -821,10 +853,16 @@ def session(root: Path) -> int:
             binding_path.write_text("{}", encoding="ascii")
             binding_path.chmod(0o600)
             test_sink = files.enter_context(CappedPrivateLog(root / "capture-test.log"))
-            test = subprocess.Popen(command + ["--", "--ignored", "--exact", TARGET_TEST, "--test-threads=1"], cwd=REPO,
+            capture_env = trace_environment("capture-test")
+            if private_client is not None:
+                # Loader arguments affect this ELF only; spawned helpers and
+                # all desktop services keep the ordinary system resolution.
+                capture_env["MORPHEUS_PIPEWIRE_PROBE_ARTIFACT"] = str(private_client.artifact_path)
+            test = subprocess.Popen(command + separator + ["--ignored", "--exact", target, "--test-threads=1"], cwd=REPO,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
-                                    env=trace_environment("capture-test"))
+                                    env=capture_env)
             processes.append(test)
+            outcome["capture_attempted"] = True
             trace_sinks["capture-test"] = test_sink
             test_sink.attach(test.stdout)
             try:
@@ -836,11 +874,24 @@ def session(root: Path) -> int:
                 test_sink.finish()
             test_output = (root / "capture-test.log").read_text(errors="replace")
             origins = binding_facts(binding_path)
+            origins_passed = bindings_passed(origins)
+            if private_client is not None:
+                from run_pipewire_startup_probe import private_binding_facts
+                origins = private_binding_facts(binding_path, private_client.variant)
+                origins_passed = origins.get("status") == "valid"
             print("Wayland PipeWire binding facts: " + json.dumps(origins, sort_keys=True))
-            if status != 0 or test_sink.failed or test_sink.truncated or not capture_test_passed(test_output) or not bindings_passed(origins):
-                print("Wayland capture test facts: " + json.dumps(capture_test_facts(test_output, status, capture_stage(stage_path)), sort_keys=True), file=sys.stderr)
+            outcome["bindings_verified"] = origins_passed
+            outcome["capture_completed"] = (status is not None and not test_sink.failed
+                and not test_sink.truncated and test_sink.drained
+                and capture_test_completed(test_output, private_client=private_client is not None))
+            if status != 0 or test_sink.failed or test_sink.truncated or not capture_test_passed(test_output, private_client=private_client is not None) or not origins_passed:
+                print("Wayland capture test facts: " + json.dumps(capture_test_facts(test_output, status, capture_stage(stage_path), private_client=private_client is not None), sort_keys=True), file=sys.stderr)
                 raise RuntimeError("Wayland portal acceptance did not execute and pass its required test")
-            print("Actual Wayland first static frame, moving-pixel reopen, stream and cancellation tests passed; untouched-static reopen, native window and GNOME/KDE remain unverified.")
+            outcome["capture_passed"] = True
+            if private_client is None:
+                print("Actual Wayland first static frame, moving-pixel reopen, stream and cancellation tests passed; untouched-static reopen, native window and GNOME/KDE remain unverified.")
+            else:
+                print("Private-client diagnostic scenario passed; this is not the system-library acceptance gate.")
             return 0
         except Exception:
             print("Wayland fixture diagnostic facts: " + json.dumps(diagnostic_facts(root, stage, services), sort_keys=True), file=sys.stderr)
@@ -848,7 +899,13 @@ def session(root: Path) -> int:
         finally:
             trace_boundaries.append((folded_raw_clock(), "cleanup_begin"))
             try:
-                stop_owned_groups(processes)
+                try:
+                    if record_probe:
+                        from run_pipewire_startup_probe import service_library_facts
+                        outcome["services_system"] = outcome["services_system"] and service_library_facts(services)
+                finally:
+                    stop_owned_groups(processes)
+                    outcome["cleanup_passed"] = True
             finally:
                 # All children normally exit before this join. EOF confirms
                 # the bounded reader consumed pending pipe bytes; a remaining
@@ -856,8 +913,13 @@ def session(root: Path) -> int:
                 # scheduler delay or buffered file flush has finished.
                 for sink in trace_sinks.values():
                     sink.finish()
-                print("Wayland private delivery trace facts: " + json.dumps(
-                    private_trace_facts(root, trace_sinks, trace_boundaries), sort_keys=True))
+                traces = private_trace_facts(root, trace_sinks, trace_boundaries)
+                print("Wayland private delivery trace facts: " + json.dumps(traces, sort_keys=True))
+                if record_probe:
+                    outcome["trace_complete"] = not traces["ordered"]["trace_incomplete"]
+                    result_path = root / "probe-outcome.json"
+                    result_path.write_text(json.dumps(outcome, sort_keys=True), encoding="ascii")
+                    result_path.chmod(0o600)
 
 
 def run_session(command: list[str], env: dict[str, str], timeout: float = 840) -> int:

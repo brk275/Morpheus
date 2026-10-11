@@ -104,6 +104,24 @@ stock Element receipt remain explicit acceptance work. A receipt alone grants
 no permission to start capture or join a call.
 The newer `m.rtc.invite` proposal requires a separate protocol migration.
 
+### Passive signalling observation
+
+`PassiveCallObserver` owns a cancellable room feed without joining, publishing
+membership, connecting media or opening capture devices. Its open/snapshot
+operations have deadlines and its snapshots enforce participant/event limits.
+Fresh snapshots validate the encrypted room-wide slot and cross-check current roster
+entries against decrypted SDK sticky events, including device, logical join,
+event identity and the explicitly selected Current/Sticky2025 dialect. Dropping
+the observer detaches its feed. Its result is not a device-trust claim: the
+caller must independently require SDK verification and retain its revocable
+account selection.
+
+The four hosted invitation cases now also require Bob's passive observer to
+see only Alice's authenticated current membership, then observe its removal
+after Alice leaves and before natural expiry. These checks reuse the existing
+fixtures and time budget; **live validation is pending**. This adapter does not
+implement an incoming-call banner, Accept/Dismiss actions or audible ringing.
+
 ## Native devices
 
 The optional device features connect native OS media to those frame streams:

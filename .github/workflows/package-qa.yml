@@ -10,10 +10,10 @@ on:
         default: linux
         options: [linux, windows, macos, all]
       linux_formats:
-        description: Linux package formats (both required for release acceptance)
+        description: Linux package formats (Debian deferred until a project email is configured)
         type: choice
         required: true
-        default: both
+        default: appimage
         options: [both, appimage, deb]
       appimage_updates:
         description: Run installed signed AppImage update QA instead of ordinary Linux packaging

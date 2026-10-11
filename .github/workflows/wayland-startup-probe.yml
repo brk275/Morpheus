@@ -1,0 +1,57 @@
+name: Wayland startup diagnostic
+
+on:
+  # An explicitly requested Linux-only experiment; ordinary CI still runs
+  # the mandatory system-library capture gate independently.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wayland-startup-probe-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  # Preserve the normal CI cache's job-name component.
+  compile:
+    name: Linux private-client startup comparison
+    if: github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: native-${{ github.sha }}-ubuntu-24.04
+      cancel-in-progress: false
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Linux native and fixture dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev libclang-dev libdbus-1-dev libdrm-dev libegl-dev \
+            libfontconfig1-dev libgbm-dev libglib2.0-dev libinih-dev libpipewire-0.3-dev libssl-dev libsystemd-dev systemd-dev libudev-dev \
+            libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libxi6 libxrandr-dev meson ninja-build pkg-config wayland-protocols \
+            dbus-x11 libglib2.0-bin sway swaybg pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-wlr
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action
+        with:
+          toolchain: 1.99.0
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
+      - name: Compare system, exact control rebuild and upstream fix
+        env:
+          MORPHEUS_WAYLAND_STARTUP_PROBE: "1"
+        run: python3 scripts/run_pipewire_startup_probe.py
+      # No binary, library, screenshot, raw trace or installer upload step.

@@ -109,6 +109,9 @@ check with `platform=linux`, `linux_formats=appimage`, `appimage_updates=false`.
 The helper and its Python tests do not trigger an automatic native matrix;
 installed acceptance requires that explicit Linux package run. Debian `both`
 remains blocked until its working public maintainer contact is configured.
+The owner explicitly deferred Debian packaging on 2026-10-11. Manual QA now
+defaults to AppImage; do not invent an address or retry DEB builds while that
+contact is missing. Debian's release checks remain open.
 
 These checks are implemented automation, not evidence that a particular
 candidate passed. A successful run establishes only the checks listed above

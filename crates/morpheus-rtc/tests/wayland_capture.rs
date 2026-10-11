@@ -3,6 +3,9 @@
 //! chooser. Pixel data never leaves this process and is never written to disk.
 #![cfg(all(target_os = "linux", feature = "device-screen"))]
 
+#[path = "support/pipewire_probe.rs"]
+mod pipewire_probe;
+
 use morpheus_rtc::{I420Buffer, ScreenCapture};
 use std::{
     ffi::{CStr, c_void},
@@ -71,7 +74,7 @@ fn binding_origin(address: *const c_void) -> BindingOrigin {
     }
 }
 
-fn verify_pipewire_bindings() {
+fn pipewire_addresses() -> [*const c_void; 33] {
     use pipewire::sys as pw;
     macro_rules! addresses {
         ($($name:ident),+ $(,)?) => { [$(pw::$name as *const () as *const c_void),+] };
@@ -113,6 +116,11 @@ fn verify_pipewire_bindings() {
         pw_thread_loop_unlock,
         pw_thread_loop_wait,
     ];
+    addresses
+}
+
+fn verify_pipewire_bindings() {
+    let addresses = pipewire_addresses();
     let mut counts = [0_u32; 4];
     for address in addresses {
         counts[binding_origin(address) as usize] += 1;
@@ -284,6 +292,25 @@ fn wayland_selected_display_streams_changes_and_stops() {
     assert!(std::env::var_os("DISPLAY").is_none(), "must not use X11");
     stage("pipewire_binding_origin");
     verify_pipewire_bindings();
+    capture_scenario();
+}
+
+#[test]
+#[ignore = "requires the explicitly selected hosted private-client diagnostic"]
+fn wayland_private_client_startup_diagnostic() {
+    assert_eq!(
+        std::env::var("MORPHEUS_WAYLAND_ACCEPTANCE").as_deref(),
+        Ok("1")
+    );
+    assert!(std::env::var_os("DISPLAY").is_none(), "must not use X11");
+    stage("pipewire_binding_origin");
+    pipewire_probe::verify(&pipewire_addresses()).expect("private client provenance rejected");
+    capture_scenario();
+}
+
+// Both entries exercise identical capture assertions. Only the ordinary
+// system-library entry can supply the required Wayland acceptance result.
+fn capture_scenario() {
     stage("pipewire_initializer");
     // Invoke the same public initializer used by PortalCapture only after the
     // origin check. Its internal Once keeps normal capture initialization safe.
@@ -424,7 +451,4 @@ fn wayland_selected_display_streams_changes_and_stops() {
         "selection cancellation exceeded worker stop budget"
     );
     stage("complete");
-    println!(
-        "Wayland portal acceptance: first static frame, distinct moving pixels on reopen, repeated start/stop, source departure, denial and cancellation passed; untouched-static reopen/native-window/GNOME/KDE remain separate gates."
-    );
 }

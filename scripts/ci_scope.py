@@ -38,6 +38,7 @@ LINUX_ACCEPTANCE_INPUTS = {
     "scripts/prepare_appimage_update.py",
     "crates/morpheus-rtc/src/linux_portal.rs",
     "crates/morpheus-rtc/tests/wayland_capture.rs",
+    "crates/morpheus-rtc/tests/support/pipewire_probe.rs",
     "vendor/webrtc-sys/pipewire_isolation.rs",
     "vendor/webrtc-sys/pipewire-symbols.txt",
     "crates/morpheus-app/src/updater/linux_transaction.rs",
@@ -70,9 +71,9 @@ def classify(paths, force_all=False):
         elif path.startswith(("scripts/", "tests/")):
             # Scope job checks Python and JavaScript without external accounts.
             continue
-        elif path == ".github/workflows/package-qa.yml":
+        elif path in {".github/workflows/package-qa.yml", ".github/workflows/wayland-startup-probe.yml"}:
             # This workflow is manual-only. CI compiles do not exercise its
-            # package/install steps; explicitly dispatch the affected package
+            # package/install/diagnostic steps; explicitly dispatch the affected
             # platforms after review instead of rebuilding every desktop here.
             continue
         elif path in {".github/CODEOWNERS", ".github/dependabot.yml"} or path.startswith(".github/ISSUE_TEMPLATE/"):
