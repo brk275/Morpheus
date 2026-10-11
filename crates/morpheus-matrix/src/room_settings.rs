@@ -17,9 +17,9 @@ use matrix_sdk::{
     config::RequestConfig,
     ruma::{
         OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, RoomVersionId, UInt,
-        api::client::{
+        api::{
+            client::state::{get_state_event_for_key, send_state_event},
             error::ErrorKind,
-            state::{get_state_event_for_key, send_state_event},
         },
         events::{
             EmptyStateKey, StateEventContent, StateEventType,

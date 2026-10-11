@@ -870,6 +870,7 @@ export component AppWindow inherits Window {
     out property <int> side-panel-tab: 0;
     in-out property <int> page: 0; // 0 chat, 1 settings, 2 call stage
     changed page => {
+        root.cancel-room-settings();
         root.close-image-preview();
         if root.page != 1 {
             root.security-recovery-input = "";
@@ -945,7 +946,6 @@ export component AppWindow inherits Window {
     property <string> login-password;
 
     // A picker snapshot never survives a change of account or Space.
-    changed page => { root.cancel-room-settings(); }
     changed image-previews-encrypted-enabled => {
         if !root.image-previews-encrypted-enabled { root.cancel-room-settings(); }
     }

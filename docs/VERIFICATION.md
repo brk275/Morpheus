@@ -5,6 +5,32 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
 ## Current hosted acceptance, 2026-10-11
 
+### Room-settings candidate stopped at compilation: `8a1ca01`
+
+[Run 38170624743](https://github.com/brk275/Morpheus/actions/runs/38170624743)
+tested `8a1ca01f2f60776db238e5a98a105a1bf8581c0f`. Scope ran 490 helper
+tests (489 passed, one skipped), selected all four native platforms and scanned
+52 reachable commits with zero findings.
+
+The candidate has two integration errors: `room_settings.rs` imports Ruma's
+`ErrorKind` through the wrong module, and `AppWindow` declares two `changed page`
+callbacks. All four native jobs fail for these errors. The model test command
+exits before producing any Rust test-result summary; its continue-on-error
+workflow step does not establish a passing suite.
+The desktop check also fails. Native build, preview capture, device checks and
+live Matrix/RTC fixtures do not execute, so this run provides no room-settings
+or departure-observation acceptance and produces no new preview images.
+
+Every job and cache/checkout post-step finished. All four native caches restored
+and reported “Cache up-to-date”. All five complete logs scanned with zero
+findings. No installer was uploaded and no package acceptance was dispatched.
+
+The next source repair uses the pinned Ruma API's `api::error::ErrorKind` path
+and moves room-settings cancellation into the existing page-change handler,
+preserving its other cleanup. Direct formatting, component-scoped callback
+inspection and independent pinned-API source review passed. Native compilation
+and the new runtime checks still require hosted verification.
+
 ### Real native preview and expanded live fixtures: `c02a1b7`
 
 [Run 38167245637](https://github.com/brk275/Morpheus/actions/runs/38167245637)
@@ -74,7 +100,7 @@ finished. All five complete logs scanned with zero findings. All four native
 caches restored and reported “Cache up-to-date”; no new cache save is inferred.
 No installer was uploaded or package acceptance dispatched.
 
-### Next source candidate: room settings and bounded departure observation
+### Unverified source in `8a1ca01`: room settings and departure observation
 
 The reviewed room-settings core adds permission-checked name/topic, avatar and
 supported join-rule writes. Each operation retains the exact account selection,
