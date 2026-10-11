@@ -30,6 +30,52 @@ CHAT_TESTS = (
 )
 RESULT = re.compile(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;")
 LATE_JOIN_EVIDENCE = re.compile(r"^MORPHEUS_RTC_LATE_JOIN historical_member=(true|false)$", re.MULTILINE)
+OAUTH_PHASES = {
+    "login_refresh": (
+        "cancelled", "login", "callback_replay_rejected", "refresh", "vaulted",
+        "no_plaintext_credentials",
+    ),
+    "restore_refresh": (
+        "restored", "expired_token_rejected", "automatic_refresh", "vaulted", "logout",
+    ),
+}
+OAUTH_CHECK_NAMES = frozenset(name for names in OAUTH_PHASES.values() for name in names)
+OAUTH_EVIDENCE = re.compile(r"^MORPHEUS_OAUTH_CHECK ([a-z_]+)=(true|false)$", re.MULTILINE)
+OAUTH_STAGES = frozenset((
+    "fixture_root", "ports", "configuration", "mas_config", "synapse_config", "merge_config",
+    "postgres_start", "postgres_ready", "synapse_start", "mas_start", "mas_ready", "synapse_ready",
+    "registration", "cleanup", "browser_authorize", "browser_login", "browser_consent", "browser_callback",
+    "fixture_load", "profile_open", "cancel_begin", "cancel_verify", "login_begin", "browser_forms",
+    "login_finish", "login_identity", "callback_replay", "manual_refresh", "vault_persist", "profile_scan",
+    "restore", "restore_identity", "expiry_wait", "expired_token_probe", "automatic_refresh", "logout",
+))
+OAUTH_FAILURES = frozenset(("fixture_operation", "browser_protocol", "rust_acceptance", "deadline"))
+OAUTH_STAGE = re.compile(r"^MORPHEUS_OAUTH_STAGE ([a-z_]+)$", re.MULTILINE)
+OAUTH_FAILURE = re.compile(r"^MORPHEUS_OAUTH_FAILURE ([a-z_]+)$", re.MULTILINE)
+
+
+def oauth_diagnostics(output: str) -> dict[str, str]:
+    """Report the last recognized attempted stage and fixed failure category."""
+    result = {}
+    stages = [stage for stage in OAUTH_STAGE.findall(output) if stage in OAUTH_STAGES]
+    failures = [failure for failure in OAUTH_FAILURE.findall(output) if failure in OAUTH_FAILURES]
+    if stages:
+        result["stage"] = stages[-1]
+    if failures:
+        result["failure"] = failures[-1]
+    return result
+
+
+def oauth_evidence(output: str, required=()) -> dict[str, bool]:
+    """Only exact allowlisted booleans can leave private OAuth test logs."""
+    evidence = {}
+    for name, value in OAUTH_EVIDENCE.findall(output):
+        if name in OAUTH_CHECK_NAMES:
+            # A false result cannot be hidden by a later successful marker.
+            evidence[name] = evidence.get(name, True) and value == "true"
+    if any(evidence.get(name) is not True for name in required):
+        raise RuntimeError("Delegated OAuth acceptance evidence is incomplete")
+    return evidence
 
 
 def passed_tests(output: str) -> int:
@@ -46,7 +92,17 @@ def passed_tests(output: str) -> int:
 
 
 def fixture_from_output(output: str, root: Path) -> Path:
-    path = external_path(Path(output.strip()))
+    # The OAuth helper keeps its sole fixture path on stdout and emits only
+    # fixed progress codes on stderr. This runner deliberately captures both.
+    lines = []
+    for line in output.strip().splitlines():
+        match = OAUTH_STAGE.fullmatch(line)
+        if match and match[1] in OAUTH_STAGES:
+            continue
+        lines.append(line)
+    if len(lines) != 1:
+        raise RuntimeError("Fixture command did not return a single private fixture path")
+    path = external_path(Path(lines[0]))
     if not path.is_relative_to(root.resolve()) or not path.is_file():
         raise RuntimeError("Fixture command did not return a private fixture path")
     if path.stat().st_mode & 0o077:
@@ -69,7 +125,7 @@ class Acceptance:
         self.results = []
         self.sequence = 0
 
-    def run(self, label: str, args: list[str], *, extra=None, test=False,
+    def run(self, label: str, args: list[str], *, extra=None, test=False, oauth_checks=(),
             stdin=None, seconds=900) -> str:
         self.sequence += 1
         log = self.logs / f"{self.sequence:02d}-{label}.log"
@@ -77,6 +133,7 @@ class Acceptance:
         print(f"Starting {label}", flush=True)
         # Create the private log before the child can write anything to it.
         fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        timed_out = False
         with os.fdopen(fd, "wb") as output:
             process = subprocess.Popen(
                 args, cwd=REPO, env=self.env | (extra or {}),
@@ -90,7 +147,7 @@ class Acceptance:
                 # owned group so a timed-out test cannot outlive its services.
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
-                raise RuntimeError(f"{label} exceeded its {seconds}-second deadline") from None
+                timed_out = True
         output = log.read_text(errors="replace")
         # Scan bytes through stdin: avoid reading the adjacent credential files
         # and avoid source allowlists/inline exclusions applying to fresh logs.
@@ -100,7 +157,7 @@ class Acceptance:
         )
         if scan.returncode:
             raise RuntimeError(f"{label} log failed credential scanning; raw log withheld")
-        if process.returncode:
+        if process.returncode or timed_out:
             # Scanner coverage is not a guarantee: arbitrary server errors can
             # reflect secrets without a recognizable prefix. Never publish raw
             # child logs, including on failure. Only source locations and Rust
@@ -114,11 +171,21 @@ class Acceptance:
             late_join = LATE_JOIN_EVIDENCE.findall(output)
             if late_join:
                 evidence["late_join_historical_member"] = [value == "true" for value in late_join]
+            if oauth_checks:
+                evidence["oauth_checks"] = oauth_evidence(output)
+            if diagnostics := oauth_diagnostics(output):
+                if timed_out:
+                    diagnostics["failure"] = "deadline"
+                evidence["oauth_diagnostics"] = diagnostics
             print(json.dumps(evidence), flush=True)
+            if timed_out:
+                raise RuntimeError(f"{label} exceeded its {seconds}-second deadline")
             raise RuntimeError(f"{label} failed with exit status {process.returncode}")
         record = {"check": label, "seconds": round(time.monotonic() - started, 2)}
         if test:
             record["passed"] = passed_tests(output)
+        if oauth_checks:
+            record["oauth_checks"] = oauth_evidence(output, oauth_checks)
         print(json.dumps(record | {"status": "passed"}), flush=True)
         self.results.append(record)
         write_private(self.root / "results.json", json.dumps(self.results, indent=2) + "\n")
@@ -149,6 +216,41 @@ class Acceptance:
                 extra["MORPHEUS_RTC_LATE_JOIN"] = "1"
             self.test("local_rtc", fixture, rtc=True, extra=extra)
 
+    def oauth_cases(self):
+        """Separate processes prove that refresh tokens survive vaulted restart."""
+        services = self.root / "oauth-services"
+        profile = private_directory(self.root / "oauth-profile")
+        helper = [sys.executable, "scripts/local_matrix_auth.py"]
+        failed = False
+        try:
+            output = self.run("oauth-services-up", helper + ["up", "--root", str(services)], seconds=300)
+            fixture = fixture_from_output(output, services)
+            for phase, required in OAUTH_PHASES.items():
+                self.run(
+                    "oauth-local-" + phase.replace("_", "-"),
+                    ["cargo", "test", "--locked", "-p", "morpheus-matrix", "--test", "oauth_local",
+                     "--", "--nocapture", "--test-threads=1"],
+                    extra={"MORPHEUS_MATRIX_OAUTH_FIXTURE": str(fixture),
+                           "MORPHEUS_MATRIX_OAUTH_PROFILE": str(profile),
+                           "MORPHEUS_MATRIX_OAUTH_PHASE": phase},
+                    test=True, oauth_checks=required, seconds=600,
+                )
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            try:
+                cleanup = helper + ["down", "--root", str(services)]
+                if failed:
+                    cleanup.append("--keep-data")
+                self.run("oauth-services-down", cleanup, seconds=60)
+            except (RuntimeError, OSError):
+                # Keep the failed test as the primary diagnostic, but do not
+                # claim a passing run when its owned service cleanup failed.
+                if not failed:
+                    raise
+                print("OAuth fixture cleanup incomplete; private state retained", file=sys.stderr)
+
     def start_keyring(self):
         # This D-Bus session and empty-password keyring exist only on a fresh
         # ephemeral runner. No desktop user's existing vault is unlocked.
@@ -167,13 +269,14 @@ class Acceptance:
         if summary:
             with open(summary, "a", encoding="utf-8") as output:
                 output.write("### Disposable Matrix integration\n\n")
-                output.write("Real Synapse, OS Secret Service and LiveKit; synthetic call media.\n\n")
+                output.write("Real Synapse, Matrix Authentication Service, OS Secret Service and LiveKit; "
+                             "synthetic call media and OAuth browser-form protocol automation.\n\n")
                 output.write("| Check | Passed tests | Seconds |\n| --- | ---: | ---: |\n")
                 for item in self.results:
                     if "passed" in item:
                         output.write(f"| {item['check']} | {item['passed']} | {item['seconds']} |\n")
                 output.write("\nNo fixture credentials or installers were uploaded. Physical-device, UI, "
-                             "Element Call, and installed-package gates remain separate.\n")
+                             "OS-browser handoff, Element Call, and installed-package gates remain separate.\n")
 
 
 def main():
@@ -210,6 +313,7 @@ def main():
         acceptance.test("search_local", fixture, extra={"MORPHEUS_MATRIX_SEARCH_CLASSIC": "1"})
         recovery = fixture_from_output(acceptance.script("local_matrix_env", "recovery-fixture"), root)
         acceptance.test("recovery_local", recovery, extra={"MORPHEUS_MATRIX_TEST_RECOVERY": "1"})
+        acceptance.oauth_cases()
         gate = fixture_from_output(acceptance.script("local_matrix_env", "rtc-gate-fixture"), root)
         acceptance.test("unsupported_transport_local", gate, rtc=True,
                         extra={"MORPHEUS_MATRIX_RTC_GATE_TEST_ACCOUNTS": str(gate)})

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Run the actual Wayland ScreenCast/PipeWire fixture in a private desktop.
 
-Requires Sway, swaybg, PipeWire, WirePlumber, xdg-desktop-portal and the Ubuntu
-24.04 wlr 0.7.1 backend. No user desktop, screen recording, account or display
-permission is used. No pixels or raw service logs are uploaded.
+Requires Sway, swaybg, PipeWire, WirePlumber, xdg-desktop-portal and the xdpw
+build dependencies documented in docs/WAYLAND_FIXTURE.md. Builds a pinned,
+CI-only xdpw 0.7.1 with a SHM compatibility adaptation in the private fixture;
+no system backend is replaced. No user desktop, account or display permission
+is used. No pixels or raw service logs are uploaded.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import contextlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import shutil
 import signal
@@ -21,8 +24,112 @@ import sys
 import tempfile
 import time
 
+# Import by sibling path as well when this script is loaded by unit tests.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from wayland_fixture_backend import prepare_backend
+
 REPO = Path(__file__).resolve().parents[1]
 TARGET_TEST = "wayland_selected_display_streams_changes_and_stops"
+# Only these literal facts may leave the private fixture. Never copy matched
+# text: service messages also contain session paths, output names and app IDs.
+DIAGNOSTIC_MARKERS = {
+    "portal-wlr": {
+        "create_session_received": b"dbus: create session method invoked",
+        "select_sources_received": b"dbus: select sources method invoked",
+        "start_received": b"dbus: start method invoked",
+        "no_valid_screencopy_format": b"wlroots: unable to receive a valid format from wlr_screencopy",
+        "shm_buffer_announced": b"wlroots: buffer event handler",
+        "dmabuf_buffer_announced": b"wlroots: linux_dmabuf event handler",
+        "screencopy_failed": b"wlroots: failed event handler",
+        "chooser_cancelled": b"wlroots: output chooser canceled",
+        "no_output_selected": b"wlroots: no output found",
+        "pipewire_iteration_failed": b"pipewire_loop_iterate failed:",
+    },
+    "portal": {
+        "backend_call_failed": b"A backend call failed:",
+        "session_export_failed": b"Failed to export session:",
+        "result_processing_failed": b"Failed to process results:",
+        "screencast_proxy_failed": b"Failed to create screen cast proxy:",
+    },
+}
+DIAGNOSTIC_STAGES = frozenset({
+    "backend_build", "compositor", "media_services", "portal", "outputs", "test_discovery", "capture_test",
+})
+DIAGNOSTIC_LOG_LIMIT = 4 * 1024 * 1024
+
+
+def diagnostic_facts(root: Path, stage: str, services: dict[str, subprocess.Popen]) -> dict:
+    """Return only fixed enums/booleans; unknown log text is never emitted."""
+    facts = {"stage": stage if stage in DIAGNOSTIC_STAGES else "unknown"}
+    for name in ("sway", "pipewire", "wireplumber", "portal-wlr", "portal"):
+        process = services.get(name)
+        if process is None:
+            facts[f"{name}.process"] = "not_started"
+        else:
+            try:
+                code = peek_returncode(process)
+                facts[f"{name}.process"] = "running" if code is None else "exited"
+            except (OSError, RuntimeError):
+                facts[f"{name}.process"] = "unavailable"
+        if name not in DIAGNOSTIC_MARKERS:
+            continue
+        try:
+            with (root / f"{name}.log").open("rb") as log:
+                contents = log.read(DIAGNOSTIC_LOG_LIMIT)
+                truncated = bool(log.read(1))
+                if truncated:
+                    log.seek(-DIAGNOSTIC_LOG_LIMIT, os.SEEK_END)
+                    contents += log.read(DIAGNOSTIC_LOG_LIMIT)
+            facts[f"{name}.log_unavailable"] = False
+            facts[f"{name}.log_truncated"] = truncated
+        except OSError:
+            contents = b""
+            facts[f"{name}.log_unavailable"] = True
+        for fact, marker in DIAGNOSTIC_MARKERS[name].items():
+            facts[f"{name}.{fact}"] = marker in contents
+    return facts
+
+
+def capture_test_passed(output: str) -> bool:
+    """An existing but no-longer-ignored test must not produce false evidence."""
+    target_passed = re.search(rf"^test {re.escape(TARGET_TEST)} \.\.\. ok$", output, re.MULTILINE)
+    summary_passed = re.search(
+        r"^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;",
+        output, re.MULTILINE,
+    )
+    return target_passed is not None and summary_passed is not None
+
+
+def capture_test_facts(output: str, status: int | None) -> dict:
+    """Do not publish libtest panic payloads, even when the test fails."""
+    facts = {
+        "command": "timed_out" if status is None else "succeeded" if status == 0 else "failed",
+        "required_test_passed": capture_test_passed(output),
+        "zero_tests_passed": "test result: ok. 0 passed;" in output,
+    }
+    for phase, marker in {
+        "create_session": "creating the screen-sharing session:",
+        "select_sources": "selecting the screen-sharing source:",
+        "start_stream": "starting the screen-sharing stream:",
+        "portal_request_failed": "system screen-sharing portal could not complete the request",
+        "initial_selection": "portal display selection",
+        "first_frame": "first PipeWire frame",
+        "wrong_selected_source": "selected red HEADLESS-2 was not captured",
+        "stop_timeout": "session shutdown exceeded stop budget",
+        "reopen": "portal reopen",
+        "continuous_frame": "continuous PipeWire frame",
+        "changed_frame_timeout": "stream did not deliver changed selected-source pixels",
+        "unexpected_source_switch": "capture silently changed to another display",
+        "source_loss_timeout": "lost source did not terminate capture",
+        "denial_failed": "denied portal must not capture",
+        "cancel_failed": "cancelled selection must not capture",
+        "cancel_timeout": "selection cancellation exceeded worker stop budget",
+    }.items():
+        facts[phase] = marker in output
+    location = re.search(r"panicked at crates/morpheus-rtc/tests/wayland_capture\.rs:([0-9]{1,5}):[0-9]{1,5}", output)
+    if location:
+        facts["fixture_panic_line"] = int(location[1])
+    return facts
 
 
 def chooser(mode_path: Path) -> int:
@@ -180,59 +287,107 @@ def force_registered_groups(root: Path) -> None:
 def session(root: Path) -> int:
     runtime = Path(os.environ["XDG_RUNTIME_DIR"])
     processes: list[subprocess.Popen] = []
+    services: dict[str, subprocess.Popen] = {}
+    stage = "backend_build"
     with contextlib.ExitStack() as files:
-        def start(name: str, command: list[str]):
+        def start(name: str, command: list[str], *, service: bool = True):
             log = files.enter_context((root / f"{name}.log").open("wb"))
+            os.chmod(root / f"{name}.log", 0o600)
             process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             processes.append(process)
+            if service:
+                services[name] = process
             register_groups(root, processes)
             return process
+
+        def build_command(name: str, command: list[str]):
+            process = start(name, command, service=False)
+            try:
+                status = wait_owned_process(process, timeout=180)
+            except subprocess.TimeoutExpired:
+                status = -1
+            if status:
+                # No desktop has started yet. These are compiler diagnostics,
+                # never service logs or source-selection payloads.
+                print((root / f"{name}.log").read_text(errors="replace")[-24000:], file=sys.stderr)
+                raise RuntimeError("pinned Wayland fixture backend did not build")
+
         try:
+            backend = prepare_backend(root, build_command)
+            print("Wayland fixture: pinned xdpw 0.7.1 with CI-only SHM adaptation; no system installation.")
+            stage = "compositor"
             start("sway", ["sway", "--config", str(root / "config" / "sway.conf")])
-            display = wait_for(lambda: next((p.name for p in runtime.glob("wayland-*") if p.is_socket()), None), processes, "Wayland socket")
-            sway_socket = wait_for(lambda: next(runtime.glob("sway-ipc.*.sock"), None), processes, "Sway control socket")
+            display = wait_for(lambda: next((p.name for p in runtime.glob("wayland-*") if p.is_socket()), None), list(services.values()), "Wayland socket")
+            sway_socket = wait_for(lambda: next(runtime.glob("sway-ipc.*.sock"), None), list(services.values()), "Sway control socket")
             os.environ.update(WAYLAND_DISPLAY=display, SWAYSOCK=str(sway_socket))
             subprocess.run(["dbus-update-activation-environment", "WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "PIPEWIRE_RUNTIME_DIR"], check=True, timeout=10)
+            stage = "media_services"
             start("pipewire", ["pipewire"])
-            wait_for(lambda: (runtime / "pipewire-0").is_socket(), processes, "PipeWire socket")
+            wait_for(lambda: (runtime / "pipewire-0").is_socket(), list(services.values()), "PipeWire socket")
             start("wireplumber", ["wireplumber"])
-            start("portal-wlr", ["/usr/libexec/xdg-desktop-portal-wlr", "--config", str(root / "config" / "wlr.ini")])
+            stage = "portal"
+            # Trace remains in the mode-0700 fixture and is deleted at exit.
+            # It distinguishes SHM-only backend startup from chooser failure.
+            backend_process = start("portal-wlr", [str(backend), "--loglevel", "TRACE", "--config", str(root / "config" / "wlr.ini")])
+
+            def backend_owned():
+                probe = subprocess.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.DBus", "--object-path", "/org/freedesktop/DBus", "--method", "org.freedesktop.DBus.GetConnectionUnixProcessID", "org.freedesktop.impl.portal.desktop.wlr"], capture_output=True, timeout=3)
+                match = re.fullmatch(rb"\(uint32 ([0-9]+),\)\s*", probe.stdout)
+                return probe.returncode == 0 and match is not None and int(match[1]) == backend_process.pid
+
+            # Establish this process's ownership before the frontend can
+            # auto-activate the unadapted installed backend through D-Bus.
+            wait_for(backend_owned, list(services.values()), "private portal backend")
             start("portal", ["/usr/libexec/xdg-desktop-portal", "--replace"])
 
             def portal_ready():
                 probe = subprocess.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.portal.Desktop", "--object-path", "/org/freedesktop/portal/desktop", "--method", "org.freedesktop.DBus.Properties.Get", "org.freedesktop.portal.ScreenCast", "AvailableSourceTypes"], capture_output=True, timeout=3)
                 return probe.returncode == 0
-            wait_for(portal_ready, processes, "ScreenCast portal", seconds=30)
+            wait_for(portal_ready, list(services.values()), "ScreenCast portal", seconds=30)
+            stage = "outputs"
             outputs = subprocess.run(["swaymsg", "-t", "get_outputs", "-r"], capture_output=True, check=True, timeout=5)
             active = {item["name"] for item in json.loads(outputs.stdout) if item["active"]}
             if active != {"HEADLESS-1", "HEADLESS-2"}:
                 raise RuntimeError("fixture requires exactly two active headless outputs")
             # Listing first catches accidental cfg/feature changes that would
             # otherwise make a zero-test run look like acceptance evidence.
+            stage = "test_discovery"
             command = ["cargo", "test", "--locked", "-p", "morpheus-rtc", "--features", "native-devices", "--test", "wayland_capture"]
             listing_log = files.enter_context((root / "test-list.log").open("wb"))
             listing = subprocess.Popen(command + ["--", "--list"], cwd=REPO, stdout=listing_log, stderr=subprocess.STDOUT, start_new_session=True)
             processes.append(listing)
             register_groups(root, processes)
-            listing_status = wait_owned_process(listing, timeout=900)
+            listing_status = wait_owned_process(listing, timeout=300)
             listing_output = (root / "test-list.log").read_text(errors="replace")
             if listing_status or f"{TARGET_TEST}: test" not in listing_output:
                 # Compiler diagnostics contain no fixture pixels or secrets.
                 print(listing_output[-24000:], file=sys.stderr)
                 raise RuntimeError("Wayland acceptance test did not compile or was not discovered")
-            test = subprocess.Popen(command + ["--", "--ignored", "--nocapture", "--test-threads=1"], cwd=REPO, start_new_session=True)
+            stage = "capture_test"
+            test_log = files.enter_context((root / "capture-test.log").open("wb"))
+            os.chmod(root / "capture-test.log", 0o600)
+            test = subprocess.Popen(command + ["--", "--ignored", "--exact", TARGET_TEST, "--test-threads=1"], cwd=REPO, stdout=test_log, stderr=subprocess.STDOUT, start_new_session=True)
             processes.append(test)
             register_groups(root, processes)
-            if wait_owned_process(test, timeout=180):
-                raise RuntimeError("Wayland portal acceptance failed")
+            try:
+                status = wait_owned_process(test, timeout=180)
+            except subprocess.TimeoutExpired:
+                status = None
+            test_output = (root / "capture-test.log").read_text(errors="replace")
+            if status != 0 or not capture_test_passed(test_output):
+                print("Wayland capture test facts: " + json.dumps(capture_test_facts(test_output, status), sort_keys=True), file=sys.stderr)
+                raise RuntimeError("Wayland portal acceptance did not execute and pass its required test")
             print("Actual Wayland display selection/stream/cancel tests passed; native window and GNOME/KDE remain unverified.")
             return 0
+        except Exception:
+            print("Wayland fixture diagnostic facts: " + json.dumps(diagnostic_facts(root, stage, services), sort_keys=True), file=sys.stderr)
+            raise
         finally:
             stop_owned_groups(processes)
             (root / "cleanup.done").touch(mode=0o600)
 
 
-def run_session(command: list[str], env: dict[str, str], root: Path, timeout: float = 1200) -> int:
+def run_session(command: list[str], env: dict[str, str], root: Path, timeout: float = 840) -> int:
     process = subprocess.Popen(command, cwd=REPO, env=env, start_new_session=True)
     try:
         return process.wait(timeout=timeout)
@@ -268,12 +423,9 @@ def main() -> int:
         return session(args.inside_session)
     if sys.platform != "linux":
         raise RuntimeError("the Wayland acceptance fixture requires Linux")
-    for command in ("sway", "swaymsg", "swaybg", "pipewire", "wireplumber", "dbus-run-session", "dbus-update-activation-environment", "gdbus", "cargo"):
+    for command in ("sway", "swaymsg", "swaybg", "pipewire", "wireplumber", "dbus-run-session", "dbus-update-activation-environment", "gdbus", "cargo", "meson", "ninja", "pkg-config", "cc"):
         if not shutil.which(command):
             raise RuntimeError(f"missing Wayland acceptance dependency: {command}")
-    version = subprocess.run(["dpkg-query", "-W", "-f=${Version}", "xdg-desktop-portal-wlr"], capture_output=True, text=True, check=True).stdout
-    if not version.startswith("0.7.1-"):
-        raise RuntimeError("this chooser fixture is qualified for Ubuntu 24.04 xdg-desktop-portal-wlr 0.7.1")
     with tempfile.TemporaryDirectory(prefix="morpheus-wayland-") as directory:
         root = Path(directory)
         root.chmod(0o700)

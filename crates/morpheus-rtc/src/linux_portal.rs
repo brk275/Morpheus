@@ -52,6 +52,55 @@ fn error(message: &str) -> MediaError {
 fn portal_error(_: impl std::fmt::Debug) -> MediaError {
     error("system screen-sharing portal is unavailable or returned an invalid response")
 }
+
+#[derive(Clone, Copy)]
+enum RequestPhase {
+    CreateSession,
+    SelectSources,
+    Start,
+}
+
+impl RequestPhase {
+    fn method(self) -> &'static str {
+        match self {
+            Self::CreateSession => "CreateSession",
+            Self::SelectSources => "SelectSources",
+            Self::Start => "Start",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::CreateSession => "creating the screen-sharing session",
+            Self::SelectSources => "selecting the screen-sharing source",
+            Self::Start => "starting the screen-sharing stream",
+        }
+    }
+
+    fn with_error(self, failure: MediaError) -> MediaError {
+        // Request errors below are static, locally generated messages. Never
+        // include D-Bus error bodies, session paths, source names or node IDs.
+        let reason = match failure {
+            MediaError::Device(message) => message,
+            _ => "system screen-sharing request failed".into(),
+        };
+        error(&format!("{}: {reason}", self.label()))
+    }
+}
+
+fn response_values(code: u32, values: Dict) -> Result<Dict, MediaError> {
+    match code {
+        0 => Ok(values),
+        1 => Err(error("screen sharing cancelled in the system dialog")),
+        2 => Err(error(
+            "system screen-sharing portal could not complete the request",
+        )),
+        _ => Err(error(
+            "system screen-sharing portal returned an unsupported response",
+        )),
+    }
+}
+
 fn runtime() -> Result<Runtime, MediaError> {
     Builder::new_current_thread()
         .enable_all()
@@ -144,13 +193,14 @@ fn path(connection: &Connection, kind: &str, token: &str) -> Result<OwnedObjectP
 /// Close uses the predicted request even when cancellation races the reply.
 async fn request(
     proxy: &Proxy<'_>,
-    method: &str,
+    phase: RequestPhase,
     session: &OwnedObjectPath,
     mut options: HashMap<&str, Value<'_>>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Dict, MediaError> {
     let request_token = token();
-    let request_path = path(proxy.connection(), "request", &request_token)?;
+    let request_path = path(proxy.connection(), "request", &request_token)
+        .map_err(|failure| phase.with_error(failure))?;
     let request = wait(
         async {
             Proxy::new(
@@ -165,7 +215,8 @@ async fn request(
         cancelled,
         RPC_TIMEOUT,
     )
-    .await?;
+    .await
+    .map_err(|failure| phase.with_error(failure))?;
     options.insert("handle_token", Value::from(request_token));
     let result = wait(
         async {
@@ -173,11 +224,12 @@ async fn request(
                 .receive_signal("Response")
                 .await
                 .map_err(portal_error)?;
-            let returned: OwnedObjectPath = match method {
-                "CreateSession" => proxy.call(method, &options).await,
-                "SelectSources" => proxy.call(method, &(session, options)).await,
-                "Start" => proxy.call(method, &(session, "", options)).await,
-                _ => return Err(portal_error("unknown method")),
+            let returned: OwnedObjectPath = match phase {
+                RequestPhase::CreateSession => proxy.call(phase.method(), &options).await,
+                RequestPhase::SelectSources => {
+                    proxy.call(phase.method(), &(session, options)).await
+                }
+                RequestPhase::Start => proxy.call(phase.method(), &(session, "", options)).await,
             }
             .map_err(portal_error)?;
             if returned != request_path {
@@ -189,13 +241,7 @@ async fn request(
                 .ok_or_else(|| portal_error("response ended"))?;
             let (code, values): (u32, Dict) =
                 response.body().deserialize().map_err(portal_error)?;
-            match code {
-                0 => Ok(values),
-                1 => Err(error("screen sharing cancelled in the system dialog")),
-                _ => Err(error(
-                    "system screen-sharing permission was denied or failed",
-                )),
-            }
+            response_values(code, values)
         },
         cancelled,
         SELECT_TIMEOUT,
@@ -204,7 +250,7 @@ async fn request(
     if result.is_err() {
         let _ = tokio::time::timeout(CLOSE_TIMEOUT, request.call::<_, _, ()>("Close", &())).await;
     }
-    result
+    result.map_err(|failure| phase.with_error(failure))
 }
 
 struct PortalSession {
@@ -274,8 +320,14 @@ impl PortalSession {
             }
             let mut options = HashMap::new();
             options.insert("session_handle_token", Value::from(session_token));
-            let mut created =
-                request(&proxy, "CreateSession", &owner.session, options, cancelled).await?;
+            let mut created = request(
+                &proxy,
+                RequestPhase::CreateSession,
+                &owner.session,
+                options,
+                cancelled,
+            )
+            .await?;
             let returned = created
                 .remove("session_handle")
                 .ok_or_else(|| portal_error("no session"))?;
@@ -288,9 +340,22 @@ impl PortalSession {
             options.insert("types", Value::from(kind));
             options.insert("multiple", Value::from(false));
             options.insert("persist_mode", Value::from(0u32));
-            request(&proxy, "SelectSources", &owner.session, options, cancelled).await?;
-            let mut started =
-                request(&proxy, "Start", &owner.session, HashMap::new(), cancelled).await?;
+            request(
+                &proxy,
+                RequestPhase::SelectSources,
+                &owner.session,
+                options,
+                cancelled,
+            )
+            .await?;
+            let mut started = request(
+                &proxy,
+                RequestPhase::Start,
+                &owner.session,
+                HashMap::new(),
+                cancelled,
+            )
+            .await?;
             let streams = started
                 .remove("streams")
                 .ok_or_else(|| portal_error("no streams"))?;
@@ -631,6 +696,40 @@ fn unpack_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portal_failures_identify_phase_without_response_payloads() {
+        for phase in [
+            RequestPhase::CreateSession,
+            RequestPhase::SelectSources,
+            RequestPhase::Start,
+        ] {
+            let failure = response_values(
+                2,
+                HashMap::from([("private-source".into(), OwnedValue::from(987654u32))]),
+            )
+            .unwrap_err();
+            let message = phase.with_error(failure).to_string();
+            assert!(message.contains(phase.label()));
+            assert!(message.contains("could not complete the request"));
+            assert!(!message.contains("private-source"));
+            assert!(!message.contains("987654"));
+            assert!(!message.contains("denied"));
+        }
+        assert!(response_values(0, HashMap::new()).is_ok());
+        assert!(
+            response_values(1, HashMap::new())
+                .unwrap_err()
+                .to_string()
+                .contains("cancelled")
+        );
+        assert!(
+            response_values(u32::MAX, HashMap::new())
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported response")
+        );
+    }
 
     #[test]
     fn rejects_ambiguous_or_wrong_portal_source() {

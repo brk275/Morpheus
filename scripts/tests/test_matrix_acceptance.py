@@ -9,7 +9,7 @@ from unittest.mock import patch
 import subprocess
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from run_matrix_acceptance import Acceptance, fixture_from_output, passed_tests
+from run_matrix_acceptance import Acceptance, OAUTH_PHASES, fixture_from_output, oauth_diagnostics, oauth_evidence, passed_tests
 
 
 class LiveEvidenceTests(unittest.TestCase):
@@ -22,6 +22,74 @@ class LiveEvidenceTests(unittest.TestCase):
 
     def test_counts_real_results(self):
         self.assertEqual(passed_tests("test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured;"), 2)
+
+    def test_oauth_evidence_requires_each_stage_and_never_overwrites_failure(self):
+        required = OAUTH_PHASES["login_refresh"]
+        complete = "\n".join(f"MORPHEUS_OAUTH_CHECK {name}=true" for name in required)
+        self.assertEqual(oauth_evidence(complete, required), dict.fromkeys(required, True))
+        for output in ("", complete.replace("login=true", "login=opaque-credential"),
+                       "MORPHEUS_OAUTH_CHECK login=false\n" + complete,
+                       complete + "\nMORPHEUS_OAUTH_CHECK login=false"):
+            with self.subTest(output=output), self.assertRaises(RuntimeError):
+                oauth_evidence(output, required)
+        self.assertEqual(oauth_evidence("MORPHEUS_OAUTH_CHECK access_token=true\n"
+                                       "MORPHEUS_OAUTH_CHECK login=opaque-credential\n"
+                                       "MORPHEUS_OAUTH_CHECK login=true trailing-data"), {})
+
+    def test_oauth_diagnostics_allow_only_fixed_stage_and_failure_codes(self):
+        output = "\n".join((
+            "MORPHEUS_OAUTH_STAGE login_begin", "MORPHEUS_OAUTH_STAGE login_finish",
+            "MORPHEUS_OAUTH_STAGE opaque_credential", "MORPHEUS_OAUTH_STAGE login_finish?code=opaque",
+            "MORPHEUS_OAUTH_FAILURE rust_acceptance", "MORPHEUS_OAUTH_FAILURE opaque_credential",
+            "MORPHEUS_OAUTH_FAILURE fixture_operation trailing-secret",
+        ))
+        self.assertEqual(oauth_diagnostics(output), {"stage": "login_finish", "failure": "rust_acceptance"})
+        self.assertEqual(oauth_diagnostics("MORPHEUS_OAUTH_STAGE password_value\n"
+                                           "MORPHEUS_OAUTH_FAILURE https://example.org/private"), {})
+
+    def test_oauth_cases_restore_the_same_vaulted_profile_in_a_separate_process(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            services = Path(folder) / "oauth-services"
+            services.mkdir(mode=0o700)
+            fixture = services / "oauth-accounts.json"
+            fixture.write_text("{}")
+            fixture.chmod(0o600)
+            with patch.object(runner, "run", side_effect=[str(fixture), "", "", ""]) as run:
+                runner.oauth_cases()
+            up, login, restore, down = run.call_args_list
+            self.assertEqual(up.args[0], "oauth-services-up")
+            self.assertEqual(down.args[0], "oauth-services-down")
+            self.assertNotIn("--keep-data", down.args[1])
+            self.assertEqual(login.args[0], "oauth-local-login-refresh")
+            self.assertEqual(restore.args[0], "oauth-local-restore-refresh")
+            self.assertEqual(login.args[1], restore.args[1], "reuse the same compiled test binary")
+            for invocation, phase in ((login, "login_refresh"), (restore, "restore_refresh")):
+                self.assertEqual(invocation.kwargs["extra"]["MORPHEUS_MATRIX_OAUTH_PHASE"], phase)
+                self.assertEqual(invocation.kwargs["extra"]["MORPHEUS_MATRIX_OAUTH_FIXTURE"], str(fixture.resolve()))
+                self.assertEqual(invocation.kwargs["oauth_checks"], OAUTH_PHASES[phase])
+            self.assertEqual(login.kwargs["extra"]["MORPHEUS_MATRIX_OAUTH_PROFILE"],
+                             restore.kwargs["extra"]["MORPHEUS_MATRIX_OAUTH_PROFILE"])
+            self.assertEqual((Path(folder) / "oauth-profile").stat().st_mode & 0o777, 0o700)
+
+    def test_oauth_cases_always_attempt_owned_cleanup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            with patch.object(runner, "run", side_effect=[RuntimeError("fixture failed"), ""]) as run:
+                with self.assertRaisesRegex(RuntimeError, "fixture failed"):
+                    runner.oauth_cases()
+            self.assertEqual([call.args[0] for call in run.call_args_list],
+                             ["oauth-services-up", "oauth-services-down"])
+            self.assertIn("--keep-data", run.call_args_list[-1].args[1])
+
+    @unittest.skipIf(os.name == "nt", "Linux hosted harness")
+    def test_missing_oauth_markers_cannot_create_a_pass_record(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            with patch("run_matrix_acceptance.subprocess.run", return_value=subprocess.CompletedProcess([], 0)), contextlib.redirect_stdout(io.StringIO()), self.assertRaises(RuntimeError):
+                runner.run("oauth-incomplete", [sys.executable, "-c", "print('test result: ok. 1 passed; 0 failed; 0 ignored;')"],
+                           test=True, oauth_checks=OAUTH_PHASES["login_refresh"])
+            self.assertEqual(runner.results, [])
 
     def test_rtc_cases_use_separate_fixtures_and_labels(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -54,6 +122,42 @@ class LiveEvidenceTests(unittest.TestCase):
             self.assertNotIn("opaque-fixture-credential", visible.getvalue())
 
     @unittest.skipIf(os.name == "nt", "Linux hosted harness")
+    def test_failure_only_publishes_allowlisted_oauth_booleans(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            visible = io.StringIO()
+            code = "print('MORPHEUS_OAUTH_CHECK login=false'); print('MORPHEUS_OAUTH_CHECK login=opaque-fixture-credential'); print('MORPHEUS_OAUTH_CHECK opaque_credential=true'); raise SystemExit(1)"
+            with patch("run_matrix_acceptance.subprocess.run", return_value=subprocess.CompletedProcess([], 0)), contextlib.redirect_stdout(visible), self.assertRaises(RuntimeError):
+                runner.run("oauth-failure", [sys.executable, "-c", code], oauth_checks=OAUTH_PHASES["login_refresh"])
+            self.assertIn('"oauth_checks": {"login": false}', visible.getvalue())
+            self.assertNotIn("opaque", visible.getvalue())
+
+    @unittest.skipIf(os.name == "nt", "Linux hosted harness")
+    def test_helper_failure_publishes_only_fixed_diagnostics_without_rust_test_names(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            visible = io.StringIO()
+            code = "print('MORPHEUS_OAUTH_STAGE postgres_ready'); print('MORPHEUS_OAUTH_FAILURE fixture_operation'); print('MORPHEUS_OAUTH_STAGE opaque_credential'); print('private-password-and-url'); raise SystemExit(1)"
+            with patch("run_matrix_acceptance.subprocess.run", return_value=subprocess.CompletedProcess([], 0)), contextlib.redirect_stdout(visible), self.assertRaises(RuntimeError):
+                runner.run("oauth-services-up", [sys.executable, "-c", code])
+            self.assertIn('"oauth_diagnostics": {"stage": "postgres_ready", "failure": "fixture_operation"}', visible.getvalue())
+            self.assertNotIn("opaque", visible.getvalue())
+            self.assertNotIn("private-password", visible.getvalue())
+
+    @unittest.skipIf(os.name == "nt", "Linux hosted harness")
+    def test_oauth_deadline_preserves_last_fixed_stage_after_scanning_log(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            visible = io.StringIO()
+            code = "import time; print('MORPHEUS_OAUTH_STAGE mas_ready', flush=True); print('private-diagnostic', flush=True); time.sleep(10)"
+            with patch("run_matrix_acceptance.subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as scan, contextlib.redirect_stdout(visible), self.assertRaisesRegex(RuntimeError, "deadline"):
+                runner.run("oauth-services-up", [sys.executable, "-c", code], seconds=0.2)
+            scan.assert_called_once()
+            self.assertIn('"oauth_diagnostics": {"stage": "mas_ready", "failure": "deadline"}', visible.getvalue())
+            self.assertNotIn("private-diagnostic", visible.getvalue())
+            self.assertEqual(runner.results, [])
+
+    @unittest.skipIf(os.name == "nt", "Linux hosted harness")
     def test_child_output_is_not_published_even_if_scanner_misses_it(self):
         with tempfile.TemporaryDirectory() as folder:
             runner = Acceptance(Path(folder), "unused-scanner")
@@ -73,6 +177,11 @@ class LiveEvidenceTests(unittest.TestCase):
             fixture.write_text("{}")
             fixture.chmod(0o600)
             self.assertEqual(fixture_from_output(str(fixture) + "\n", root), fixture.resolve())
+            self.assertEqual(fixture_from_output("MORPHEUS_OAUTH_STAGE registration\n" + str(fixture) + "\n", root), fixture.resolve())
+            with self.assertRaises(RuntimeError):
+                fixture_from_output("MORPHEUS_OAUTH_STAGE opaque_credential\n" + str(fixture), root)
+            with self.assertRaises(RuntimeError):
+                fixture_from_output(str(fixture) + "\n" + str(fixture), root)
             fixture.chmod(0o644)
             with self.assertRaises(RuntimeError):
                 fixture_from_output(str(fixture), root)

@@ -17,6 +17,78 @@ SPEC.loader.exec_module(MODULE)
 
 
 class WaylandFixtureTests(unittest.TestCase):
+    def test_failed_capture_diagnostics_do_not_echo_panic_payload(self):
+        output = (
+            "thread 'private test name' panicked at crates/morpheus-rtc/tests/wayland_capture.rs:63:77:\n"
+            "portal display selection: starting the screen-sharing stream: "
+            "system screen-sharing portal could not complete the request\n"
+            "private source /desktop/session identity=not-public\n"
+        )
+        facts = MODULE.capture_test_facts(output, 101)
+        self.assertEqual(facts["fixture_panic_line"], 63)
+        self.assertEqual(facts["command"], "failed")
+        self.assertTrue(facts["start_stream"])
+        self.assertTrue(facts["initial_selection"])
+        for private in ("private", "not-public", "/desktop", "identity", "77"):
+            self.assertNotIn(private, MODULE.json.dumps(facts))
+        self.assertEqual(MODULE.capture_test_facts("", None)["command"], "timed_out")
+
+    def test_capture_evidence_requires_actual_named_test_and_one_pass(self):
+        target = f"test {MODULE.TARGET_TEST} ... ok\n"
+        summary = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.00s\n"
+        self.assertTrue(MODULE.capture_test_passed(target + summary))
+        self.assertFalse(MODULE.capture_test_passed(
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s\n"
+        ))
+        self.assertFalse(MODULE.capture_test_passed(target))
+        self.assertFalse(MODULE.capture_test_passed(summary))
+        self.assertFalse(MODULE.capture_test_passed(target + summary.replace("1 passed", "0 passed")))
+        self.assertFalse(MODULE.capture_test_passed(target.replace("ok", "FAILED") + summary))
+
+    def test_diagnostics_only_emit_literal_facts_not_service_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "portal-wlr.log").write_bytes(
+                b"private desktop app-id=/private/session token=do-not-copy\n"
+                b"dbus: start method invoked\nwlroots: buffer event handler\n"
+                b"wlroots: unable to receive a valid format from wlr_screencopy\n"
+            )
+            (root / "portal.log").write_bytes(b"A backend call failed: private app-id and output\n")
+            services = {"portal-wlr": mock.Mock(pid=987654), "portal": mock.Mock(pid=987655)}
+            with mock.patch.object(MODULE, "peek_returncode", side_effect=[None, 1]):
+                facts = MODULE.diagnostic_facts(root, "capture_test", services)
+            rendered = MODULE.json.dumps(facts)
+            for private in ("private", "app-id", "do-not-copy", "987654", "987655", directory):
+                self.assertNotIn(private, rendered)
+            self.assertTrue(facts["portal-wlr.start_received"])
+            self.assertTrue(facts["portal-wlr.shm_buffer_announced"])
+            self.assertTrue(facts["portal-wlr.no_valid_screencopy_format"])
+            self.assertFalse(facts["portal-wlr.dmabuf_buffer_announced"])
+            self.assertTrue(facts["portal.backend_call_failed"])
+            self.assertEqual(facts["portal-wlr.process"], "running")
+            self.assertEqual(facts["portal.process"], "exited")
+
+    def test_diagnostics_handle_missing_logs_and_unknown_stage_without_echoing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            facts = MODULE.diagnostic_facts(Path(directory), "private-stage-name", {})
+        self.assertEqual(facts["stage"], "unknown")
+        self.assertTrue(facts["portal.log_unavailable"])
+        self.assertEqual(facts["portal.process"], "not_started")
+        self.assertNotIn("private-stage-name", str(facts))
+
+    def test_diagnostics_bound_reads_and_mark_truncation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "portal-wlr.log").write_bytes(
+                b"dbus: create session method invoked\n" + b"x" * 512
+                + b"\nwlroots: linux_dmabuf event handler\n"
+            )
+            with mock.patch.object(MODULE, "DIAGNOSTIC_LOG_LIMIT", 128):
+                facts = MODULE.diagnostic_facts(root, "capture_test", {})
+        self.assertTrue(facts["portal-wlr.log_truncated"])
+        self.assertTrue(facts["portal-wlr.create_session_received"])
+        self.assertTrue(facts["portal-wlr.dmabuf_buffer_announced"])
+
     def test_cleanup_rejects_a_reaped_leader_without_signalling_its_pid(self):
         process = mock.Mock(pid=1234, returncode=0)
         with mock.patch.object(MODULE.os, "killpg") as kill:

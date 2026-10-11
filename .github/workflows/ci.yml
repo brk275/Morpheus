@@ -102,11 +102,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libasound2-dev libclang-dev libdbus-1-dev libegl-dev \
-            libfontconfig1-dev libgbm-dev libglib2.0-dev libpipewire-0.3-dev libssl-dev libudev-dev \
+            libasound2-dev libclang-dev libdbus-1-dev libdrm-dev libegl-dev \
+            libfontconfig1-dev libgbm-dev libglib2.0-dev libinih-dev libpipewire-0.3-dev libssl-dev libsystemd-dev libudev-dev \
             libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev \
-            libxkbcommon-dev libxkbcommon-x11-dev libxi6 libxrandr-dev pkg-config xvfb \
+            libxkbcommon-dev libxkbcommon-x11-dev libxi6 libxrandr-dev meson ninja-build pkg-config wayland-protocols xvfb \
             dbus-x11 gnome-keyring libsecret-tools libglib2.0-bin \
             sway swaybg pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-wlr
       - name: Install pinned Rust toolchain
@@ -147,8 +147,12 @@ jobs:
       - name: Test native device and call guards
         run: cargo test --locked -p morpheus-rtc --features native-devices --lib
       - name: Test real Wayland portal streaming, source loss, and cancellation
+        id: wayland-tests
         if: runner.os == 'Linux'
-        timeout-minutes: 10
+        # Collect independent Matrix/OAuth/RTC evidence even if this desktop
+        # fixture fails. The final outcome gate still rejects the candidate.
+        continue-on-error: true
+        timeout-minutes: 15
         run: python3 scripts/run_wayland_acceptance.py
       - name: Test vendored security fixes
         shell: bash
@@ -172,9 +176,9 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
           dbus-run-session -- python3 scripts/run_matrix_acceptance.py \
             --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks"
-      - name: Enforce protocol model test result
-        if: ${{ !cancelled() && steps.model-tests.outcome == 'failure' }}
+      - name: Enforce collected acceptance results
+        if: ${{ !cancelled() && (steps.model-tests.outcome == 'failure' || steps.wayland-tests.outcome == 'failure') }}
         shell: bash
         run: |
-          echo "Protocol model tests failed; this candidate is not verified."
+          echo "Protocol model or Wayland acceptance tests failed; this candidate is not verified."
           exit 1

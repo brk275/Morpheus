@@ -13,7 +13,7 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(classify(["packaging/linux.toml"])["native_matrix"]["os"], ["ubuntu-24.04"])
 
     def test_linux_acceptance_helpers_are_actually_exercised(self):
-        for path in ["scripts/run_matrix_acceptance.py", "scripts/local_matrix_rtc.py", "scripts/local_matrix_env.py", "scripts/run_wayland_acceptance.py", "crates/morpheus-rtc/src/linux_portal.rs", "crates/morpheus-app/src/updater/linux_transaction.rs"]:
+        for path in ["scripts/run_matrix_acceptance.py", "scripts/local_matrix_rtc.py", "scripts/local_matrix_env.py", "scripts/run_wayland_acceptance.py", "scripts/wayland_fixture_backend.py", "crates/morpheus-rtc/src/linux_portal.rs", "crates/morpheus-app/src/updater/linux_transaction.rs"]:
             with self.subTest(path=path):
                 self.assertEqual(classify([path])["native_matrix"]["os"], ["ubuntu-24.04"])
         self.assertFalse(classify(["scripts/tests/test_matrix_acceptance.py"])["native"])
@@ -21,6 +21,12 @@ class ScopeTests(unittest.TestCase):
     def test_macos_capture_change_selects_both_macs(self):
         actual = classify(["vendor/nokhwa-bindings-macos/src/lib.rs"])["native_matrix"]["os"]
         self.assertEqual(actual, list(MACOS))
+
+    def test_delegated_oauth_acceptance_only_selects_linux(self):
+        for path in ("scripts/local_matrix_auth.py", "crates/morpheus-matrix/tests/oauth_local.rs"):
+            with self.subTest(path=path):
+                self.assertEqual(classify([path])["native_matrix"]["os"], ["ubuntu-24.04"])
+        self.assertFalse(classify(["scripts/tests/test_local_matrix_auth.py"])["native"])
 
     def test_shared_native_or_lock_change_selects_all(self):
         for path in ["Cargo.lock", "Packager.toml", "crates/morpheus-rtc/src/video_device.rs", "vendor/nokhwa/src/lib.rs"]:

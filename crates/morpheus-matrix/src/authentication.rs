@@ -129,6 +129,8 @@ impl PendingStore {
 
     fn commit(&mut self) {
         self.keep = true;
+        // The registry is already saved while this lock is held. Cleanup must
+        // re-read it after acquiring the lock, even if this unlink fails.
         self.marker.take();
         let _ = fs::remove_file(self.account_dir.join(PENDING_STORE_MARKER));
     }
@@ -136,11 +138,59 @@ impl PendingStore {
 
 impl Drop for PendingStore {
     fn drop(&mut self) {
-        self.marker.take();
         if !self.keep {
-            let _ = fs::remove_dir_all(&self.account_dir);
+            if let Some(marker) = self.marker.take() {
+                let _ = remove_pending_store(&self.account_dir, marker);
+            }
         }
     }
+}
+
+/// The marker is a retry record as well as an inter-process lock. Never
+/// recursively remove its parent: Windows can delete the marker first and
+/// then fail on a still-open SQLite file, making the leftover undiscoverable.
+fn remove_pending_store(account_dir: &Path, marker: fs::File) -> std::io::Result<()> {
+    remove_pending_store_with(account_dir, marker, |store| fs::remove_dir_all(store))
+}
+
+fn remove_pending_store_with(
+    account_dir: &Path,
+    marker: fs::File,
+    remove_payload: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let reject = || std::io::Error::other("unfinished browser store contains unrecognized entries");
+    let account_metadata = fs::symlink_metadata(account_dir)?;
+    if !account_metadata.is_dir() || account_metadata.file_type().is_symlink() {
+        return Err(reject());
+    }
+    // Only the two entries created by PendingStore belong to this cleanup.
+    // Leave any unknown sibling or symlink untouched, including the payload.
+    for entry in fs::read_dir(account_dir)? {
+        let entry = entry?;
+        if entry.file_name() != "store" && entry.file_name() != PENDING_STORE_MARKER {
+            return Err(reject());
+        }
+    }
+    let marker_path = account_dir.join(PENDING_STORE_MARKER);
+    if !fs::symlink_metadata(&marker_path)?.is_file() {
+        return Err(reject());
+    }
+    let store = account_dir.join("store");
+    match fs::symlink_metadata(&store) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            // Keep marker's lock/handle alive until every payload file is gone.
+            // A deletion failure returns with the marker still on disk; Drop
+            // releases only its handle so a later cleanup can retry safely.
+            remove_payload(&store)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => return Err(reject()),
+        Err(error) => return Err(error),
+    }
+    drop(marker);
+    fs::remove_file(marker_path)?;
+    // Nonrecursive removal cannot erase an unrelated file added meanwhile.
+    fs::remove_dir(account_dir)
 }
 
 /// SQLite's worker may release its last Windows file handle after the Client
@@ -173,12 +223,33 @@ pub(super) fn cleanup_pending_stores(data_dir: &Path, registry: &Registry) -> Re
         if file.read(&mut version).ok() != Some(19) || &version != b"morpheus-pending-v1" {
             continue;
         }
-        drop(file);
-        if fs::remove_dir_all(entry.path()).is_err() {
+        // The caller's registry snapshot can predate another process's login.
+        // That writer holds this marker lock through saving accounts.json, so
+        // reading again while we own the lock closes commit's unlock/unlink
+        // window. An unreadable or invalid registry is never deletion consent.
+        match registered_account_on_disk(data_dir, id) {
+            Ok(false) => {}
+            Ok(true) => continue,
+            Err(_) => {
+                warn!("could not validate account registry; unfinished store cleanup deferred");
+                continue;
+            }
+        }
+        if remove_pending_store(&entry.path(), file).is_err() {
             warn!("could not remove unfinished browser sign-in store; retrying next launch");
         }
     }
     Ok(())
+}
+
+fn registered_account_on_disk(data_dir: &Path, id: &str) -> Result<bool> {
+    let registry: Registry = match fs::read(data_dir.join("accounts.json")) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Registry::default(),
+        Err(error) => return Err(error.into()),
+    };
+    registry.validate()?;
+    Ok(registry.accounts.iter().any(|account| account.id == id))
 }
 
 pub(super) fn http_client() -> Result<reqwest::Client> {
@@ -767,6 +838,180 @@ mod tests {
         cleanup_pending_stores(&directory.0, &Registry::default()).unwrap();
         assert!(!path.exists());
         assert!(!path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn pending_store_cleanup_rechecks_disk_registry_after_observing_stale_snapshot() {
+        let directory = PrivateTestDir::new();
+        let manager = AccountManager::open(&directory.0).unwrap();
+        let stale_registry = Registry::default();
+        let mut pending = PendingStore::new(&manager).unwrap();
+        let account_dir = pending.account_dir.clone();
+        let registry = Registry {
+            accounts: vec![AccountInfo {
+                id: pending.id.clone(),
+                user_id: "@fixture:example.org".into(),
+                device_id: "TESTDEVICE".into(),
+                homeserver: "https://example.org".into(),
+            }],
+            ..Registry::default()
+        };
+        // Match finish_sso's ordering: publish the registry under the marker
+        // lock, then release it. Retain the marker to simulate unlink failure
+        // or a cleanup that opened it just before commit could remove it.
+        save_registry(&directory.0, &registry).unwrap();
+        pending.keep = true;
+        drop(pending);
+        cleanup_pending_stores(&directory.0, &stale_registry).unwrap();
+        assert!(account_dir.join("store").is_dir());
+        assert!(account_dir.join(PENDING_STORE_MARKER).is_file());
+    }
+
+    #[test]
+    fn pending_store_cleanup_defers_when_current_registry_cannot_be_validated() {
+        let directory = PrivateTestDir::new();
+        let manager = AccountManager::open(&directory.0).unwrap();
+        let mut pending = PendingStore::new(&manager).unwrap();
+        let account_dir = pending.account_dir.clone();
+        pending.keep = true;
+        drop(pending);
+        let registry_path = directory.0.join("accounts.json");
+
+        fs::write(&registry_path, b"invalid registry JSON").unwrap();
+        cleanup_pending_stores(&directory.0, &Registry::default()).unwrap();
+        assert!(account_dir.join("store").is_dir());
+        assert!(account_dir.join(PENDING_STORE_MARKER).is_file());
+
+        let mut unsupported = Registry::default();
+        unsupported.version = REGISTRY_VERSION.wrapping_add(1);
+        fs::write(&registry_path, serde_json::to_vec(&unsupported).unwrap()).unwrap();
+        cleanup_pending_stores(&directory.0, &Registry::default()).unwrap();
+        assert!(account_dir.join("store").is_dir());
+        assert!(account_dir.join(PENDING_STORE_MARKER).is_file());
+
+        fs::remove_file(&registry_path).unwrap();
+        fs::create_dir(&registry_path).unwrap();
+        cleanup_pending_stores(&directory.0, &Registry::default()).unwrap();
+        assert!(account_dir.join("store").is_dir());
+        assert!(account_dir.join(PENDING_STORE_MARKER).is_file());
+
+        fs::remove_dir(&registry_path).unwrap();
+        cleanup_pending_stores(&directory.0, &Registry::default()).unwrap();
+        assert!(!account_dir.exists());
+    }
+
+    #[test]
+    fn pending_store_cleanup_keeps_locked_marker_when_payload_removal_fails() {
+        let directory = PrivateTestDir::new();
+        let manager = AccountManager::open(&directory.0).unwrap();
+        let mut pending = PendingStore::new(&manager).unwrap();
+        let account_dir = pending.account_dir.clone();
+        let payload = pending.path.join("database-fixture");
+        fs::write(&payload, b"unfinished store fixture").unwrap();
+        let marker = pending.marker.take().unwrap();
+        pending.keep = true;
+        drop(pending);
+        let result = remove_pending_store_with(&account_dir, marker, |store| {
+            assert_eq!(store, account_dir.join("store"));
+            let contender = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(account_dir.join(PENDING_STORE_MARKER))
+                .unwrap();
+            assert!(
+                matches!(contender.try_lock(), Err(fs::TryLockError::WouldBlock)),
+                "the marker must stay locked throughout payload deletion"
+            );
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected locked database file",
+            ))
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(account_dir.join(PENDING_STORE_MARKER)).unwrap(),
+            b"morpheus-pending-v1"
+        );
+        assert_eq!(fs::read(&payload).unwrap(), b"unfinished store fixture");
+        cleanup_pending_stores(&directory.0, &Registry::default()).unwrap();
+        assert!(
+            !account_dir.exists(),
+            "a later cleanup must still discover the store"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pending_store_windows_open_file_preserves_marker_until_retry_succeeds() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let directory = PrivateTestDir::new();
+        let manager = AccountManager::open(&directory.0).unwrap();
+        let pending = PendingStore::new(&manager).unwrap();
+        let account_dir = pending.account_dir.clone();
+        let payload = pending.path.join("locked-sqlite-fixture");
+        fs::write(&payload, b"unfinished store fixture").unwrap();
+        // Windows denies deletion while this handle omits FILE_SHARE_DELETE.
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&payload)
+            .unwrap();
+        drop(pending);
+        assert!(payload.exists());
+        assert!(account_dir.join(PENDING_STORE_MARKER).is_file());
+        cleanup_pending_stores(&directory.0, &Registry::default()).unwrap();
+        assert!(account_dir.join(PENDING_STORE_MARKER).is_file());
+        drop(locked);
+        cleanup_pending_stores(&directory.0, &Registry::default()).unwrap();
+        assert!(!account_dir.exists());
+    }
+
+    #[test]
+    fn pending_store_cleanup_preserves_unknown_sibling_files() {
+        let directory = PrivateTestDir::new();
+        let manager = AccountManager::open(&directory.0).unwrap();
+        let pending = PendingStore::new(&manager).unwrap();
+        let account_dir = pending.account_dir.clone();
+        let unknown = account_dir.join("owner-note");
+        fs::write(&unknown, b"keep this unrelated file").unwrap();
+        drop(pending);
+        cleanup_pending_stores(&directory.0, &Registry::default()).unwrap();
+        assert_eq!(fs::read(&unknown).unwrap(), b"keep this unrelated file");
+        assert!(account_dir.join("store").is_dir());
+        assert!(account_dir.join(PENDING_STORE_MARKER).is_file());
+        fs::remove_file(unknown).unwrap();
+        cleanup_pending_stores(&directory.0, &Registry::default()).unwrap();
+        assert!(!account_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_store_cleanup_preserves_symlink_payload_and_target() {
+        use std::os::unix::fs::symlink;
+
+        let directory = PrivateTestDir::new();
+        let manager = AccountManager::open(&directory.0).unwrap();
+        let pending = PendingStore::new(&manager).unwrap();
+        let account_dir = pending.account_dir.clone();
+        let outside = directory.0.join("unrelated-directory");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("sentinel"), b"never follow the symlink").unwrap();
+        fs::remove_dir(&pending.path).unwrap();
+        symlink(&outside, &pending.path).unwrap();
+        drop(pending);
+        cleanup_pending_stores(&directory.0, &Registry::default()).unwrap();
+        assert!(
+            fs::symlink_metadata(account_dir.join("store"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(account_dir.join(PENDING_STORE_MARKER).is_file());
+        assert_eq!(
+            fs::read(outside.join("sentinel")).unwrap(),
+            b"never follow the symlink"
+        );
     }
 
     #[test]

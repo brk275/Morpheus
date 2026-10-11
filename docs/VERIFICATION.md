@@ -49,7 +49,49 @@ locally; three Linux process tests were skipped on macOS. Rust formatting,
 locked offline dependency metadata, Actionlint, package configuration and
 whitespace checks passed. Full-history scanning found no unresolved credentials;
 the working-tree scan matched only the documented public upstream test JWT,
-whose hash matches the reviewed fixture. Native compile/test results are still pending.
+whose hash matches the reviewed fixture.
+
+[Run 38102279481](https://github.com/brk275/Morpheus/actions/runs/38102279481)
+tested follow-up `ec8e7f55ca20816d6ade41b60cac1ec95c3ffec5` on all four free
+standard public runners. Security/scope and both Mac jobs passed. Each Mac ran
+32 Matrix, 50 desktop, and 31 native RTC/device tests, plus configuration,
+protocol, and vendor security suites. Opt-in integration wrappers without
+fixture credentials are not counted as live acceptance.
+
+Windows built the native desktop and passed its 50 desktop and 31 native
+RTC/device tests, but one of 32 Matrix tests failed: cancellation left an
+unfinished browser-login store behind. Its final outcome gate rejected the
+candidate despite the model step's `continue-on-error` presentation. The fix
+keeps the cleanup marker locked and present until the database payload can be
+removed, with regressions for a real Windows delete-denied handle, interrupted
+deletion, unknown files, and symlinks. This fix awaits hosted verification.
+
+Linux passed 32 Matrix, 65 desktop, and 35 native RTC/device tests, its native
+build, and Xvfb startup. The first real Wayland portal open failed before frames
+arrived. Later vendor and live Matrix/RTC steps were skipped. Source review found
+that the stock wlr backend requires a DMA-BUF format that the fixture's Sway
+software renderer does not supply. The [revised fixture](WAYLAND_FIXTURE.md)
+builds a pinned backend with a small, isolated SHM compatibility adaptation;
+it still requires actual selected-source frames and cancellation checks to pass.
+Neither the failed run nor this unverified adaptation establishes stock desktop
+compatibility. CI now collects the
+independent Matrix/OAuth/RTC results after a portal failure, but still fails its
+final gate when either the model tests or Wayland acceptance fail.
+
+A new [delegated OAuth fixture](OAUTH_ACCEPTANCE.md) uses real MAS, Synapse,
+PostgreSQL, and an OS vault. It checks login, cancellation, token rotation,
+restart, automatic refresh after expiry, and logout in separate processes.
+Its bounded HTTP form driver tests the browser protocol; actual OS-browser
+handoff and callback-listener acceptance remain separate. This fixture has not
+yet passed a hosted live run.
+
+Before the next hosted run, the correction batch passed 97 Python helper tests
+locally; three Linux process tests were skipped on macOS. Rust formatting,
+Actionlint, and whitespace checks passed. Independent reviews covered pending
+store deletion/registry sequencing, OAuth fixture isolation and diagnostics, and
+the pinned Wayland backend adaptation. The Wayland harness now rejects a
+zero-test success and requires its exact named capture test to pass. No native
+build or service was started locally for this batch.
 
 Live Linux protocol tests and installed-package checks remain pending. Prior
 candidate results below do not verify these changed inputs. OIDC provider/browser
