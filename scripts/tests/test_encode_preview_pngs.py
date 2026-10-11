@@ -55,7 +55,7 @@ class PreviewEncodingTests(unittest.TestCase):
         binary.write_bytes(b"fixture binary bytes only")
         return raw, binary
 
-    def test_complete_output_is_exact_five_files_with_path_free_hash_provenance(self):
+    def test_complete_output_is_exact_allowlist_with_path_free_hash_provenance(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder).resolve()
             raw, binary = self.fixture(root)

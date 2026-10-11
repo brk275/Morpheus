@@ -57,6 +57,11 @@ pub enum ObserverError {
     Closed,
     #[error("the call membership cannot be confirmed in the selected dialect")]
     InvalidMembership,
+    /// The core still names an event absent from the SDK live cache. No
+    /// snapshot is authorized; callers may await convergence within their
+    /// existing deadline. Conflicting or invalid entries remain fatal.
+    #[error("the call roster has not converged with the current sticky cache")]
+    RosterNotCurrent,
     #[error("the call observation exceeds the supported participant limit")]
     TooManyParticipants,
 }
@@ -214,59 +219,79 @@ impl PassiveCallObserver {
         if live.len() > MAX_LIVE_EVENTS {
             return Err(ObserverError::TooManyParticipants);
         }
-        let mut seen = BTreeSet::new();
-        let mut participants = Vec::with_capacity(roster.len());
-        for member in roster.iter() {
-            let participant = participant(member, self.room_id.as_str())?;
-            if !seen.insert((
-                participant.user_id.clone(),
-                participant.membership_id.clone(),
-            )) {
-                return Err(ObserverError::InvalidMembership);
-            }
-            let mut matches = 0;
-            for entry in &live {
-                if entry.event_id.as_str() != participant.membership_event_id {
-                    continue;
+        let participants =
+            validate_roster_references(&roster, self.room_id.as_str(), |participant| {
+                let mut matches = 0;
+                for entry in &live {
+                    if entry.event_id.as_str() != participant.membership_event_id {
+                        continue;
+                    }
+                    if !matches!(
+                        entry.key.event_type.to_string().as_str(),
+                        "m.rtc.member" | "org.matrix.msc4143.rtc.member"
+                    ) || entry.raw().json().get().len() > MAX_EVENT_BYTES
+                    {
+                        return Err(ObserverError::InvalidMembership);
+                    }
+                    let metadata = entry
+                        .encryption_info()
+                        .ok_or(ObserverError::InvalidMembership)?;
+                    if metadata.sender.as_str() != participant.user_id
+                        || entry.key.sender != metadata.sender
+                        || metadata.sender_device.as_deref().map(|id| id.as_str())
+                            != Some(participant.device_id.as_str())
+                        || entry.key.sticky_key != participant.membership_id
+                    {
+                        return Err(ObserverError::InvalidMembership);
+                    }
+                    let content = entry
+                        .raw()
+                        .get_field::<Value>("content")
+                        .ok()
+                        .flatten()
+                        .ok_or(ObserverError::InvalidMembership)?;
+                    validate_content(&content, &participant, self.mode)?;
+                    matches += 1;
                 }
-                if !matches!(
-                    entry.key.event_type.to_string().as_str(),
-                    "m.rtc.member" | "org.matrix.msc4143.rtc.member"
-                ) || entry.raw().json().get().len() > MAX_EVENT_BYTES
-                {
-                    return Err(ObserverError::InvalidMembership);
-                }
-                let metadata = entry
-                    .encryption_info()
-                    .ok_or(ObserverError::InvalidMembership)?;
-                if metadata.sender.as_str() != participant.user_id
-                    || entry.key.sender != metadata.sender
-                    || metadata.sender_device.as_deref().map(|id| id.as_str())
-                        != Some(participant.device_id.as_str())
-                    || entry.key.sticky_key != participant.membership_id
-                {
-                    return Err(ObserverError::InvalidMembership);
-                }
-                let content = entry
-                    .raw()
-                    .get_field::<Value>("content")
-                    .ok()
-                    .flatten()
-                    .ok_or(ObserverError::InvalidMembership)?;
-                validate_content(&content, &participant, self.mode)?;
-                matches += 1;
-            }
-            if matches != 1 {
-                return Err(ObserverError::InvalidMembership);
-            }
-            participants.push(participant);
-        }
+                Ok(matches)
+            })?;
         Ok(ObservedCall {
             room_id: self.room_id.to_string(),
             slot_id: SLOT.to_owned(),
             mode: self.mode,
             participants,
         })
+    }
+}
+
+// Finish checking every row even after a missing reference, so a later invalid
+// or duplicate row cannot hide behind a retryable propagation condition.
+fn validate_roster_references(
+    roster: &[JoinedMembership],
+    room_id: &str,
+    mut live_matches: impl FnMut(&ObservedParticipant) -> Result<usize, ObserverError>,
+) -> Result<Vec<ObservedParticipant>, ObserverError> {
+    let mut seen = BTreeSet::new();
+    let mut participants = Vec::with_capacity(roster.len());
+    let mut missing = false;
+    for member in roster {
+        let participant = participant(member, room_id)?;
+        if !seen.insert((
+            participant.user_id.clone(),
+            participant.membership_id.clone(),
+        )) {
+            return Err(ObserverError::InvalidMembership);
+        }
+        match live_matches(&participant)? {
+            0 => missing = true,
+            1 => participants.push(participant),
+            _ => return Err(ObserverError::InvalidMembership),
+        }
+    }
+    if missing {
+        Err(ObserverError::RosterNotCurrent)
+    } else {
+        Ok(participants)
     }
 }
 
@@ -683,9 +708,8 @@ mod tests {
         assert!(validate_content(&value, &member(), InteropMode::Current).is_err());
     }
 
-    #[test]
-    fn roster_requires_actual_encrypted_device_and_current_refresh_identity() {
-        let mut joined = JoinedMembership {
+    fn joined_member() -> JoinedMembership {
+        JoinedMembership {
             room_id: "!room:example.org".into(),
             slot_id: SLOT.into(),
             sender: "@observer:example.org".into(),
@@ -698,7 +722,77 @@ mod tests {
             application: "m.call".into(),
             transports: vec![],
             can_subscribe: vec![],
-        };
+        }
+    }
+
+    #[test]
+    fn absent_current_reference_is_pending_but_duplicates_and_invalid_entries_are_fatal() {
+        let first = joined_member();
+        assert_eq!(
+            validate_roster_references(&[first.clone()], "!room:example.org", |_| Ok(0)),
+            Err(ObserverError::RosterNotCurrent)
+        );
+        assert_eq!(
+            validate_roster_references(&[first.clone()], "!room:example.org", |_| Ok(2)),
+            Err(ObserverError::InvalidMembership)
+        );
+        assert_eq!(
+            validate_roster_references(&[first.clone()], "!room:example.org", |_| Err(
+                ObserverError::InvalidMembership
+            )),
+            Err(ObserverError::InvalidMembership)
+        );
+        let exact = validate_roster_references(&[first], "!room:example.org", |_| Ok(1)).unwrap();
+        assert_eq!(exact.len(), 1);
+        assert_eq!(exact[0].membership_event_id, "$first");
+    }
+
+    #[test]
+    fn missing_reference_never_masks_a_later_invalid_or_duplicate_participation() {
+        let first = joined_member();
+        assert_eq!(
+            validate_roster_references(
+                &[first.clone(), first.clone()],
+                "!room:example.org",
+                |_| Ok(0)
+            ),
+            Err(ObserverError::InvalidMembership)
+        );
+        let mut second = first.clone();
+        second.member_id = "second".into();
+        second.sticky_key = "second".into();
+        for origin in [
+            EventOrigin::Unknown,
+            EventOrigin::Cleartext,
+            EventOrigin::claimed("DEVICE"),
+            EventOrigin::encrypted(None),
+        ] {
+            second.origin = origin;
+            assert_eq!(
+                validate_roster_references(
+                    &[first.clone(), second.clone()],
+                    "!room:example.org",
+                    |_| Ok(0)
+                ),
+                Err(ObserverError::InvalidMembership)
+            );
+        }
+        second.origin = EventOrigin::encrypted(Some("DEVICE".into()));
+        assert_eq!(
+            validate_roster_references(&[first, second], "!room:example.org", |row| {
+                if row.membership_id == "logical" {
+                    Ok(0)
+                } else {
+                    Err(ObserverError::InvalidMembership)
+                }
+            }),
+            Err(ObserverError::InvalidMembership)
+        );
+    }
+
+    #[test]
+    fn roster_requires_actual_encrypted_device_and_current_refresh_identity() {
+        let mut joined = joined_member();
         let first = participant(&joined, "!room:example.org").unwrap();
         joined.membership_event_id = Some("$refresh".into());
         let refresh = participant(&joined, "!room:example.org").unwrap();

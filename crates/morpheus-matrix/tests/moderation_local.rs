@@ -2,6 +2,9 @@
 //! Fixture credentials are read from a protected file and never printed.
 #![recursion_limit = "512"]
 
+#[path = "moderation_local/room_settings.rs"]
+mod room_settings;
+
 use std::{fs, path::PathBuf, time::Duration};
 
 use matrix_sdk::{
@@ -566,6 +569,21 @@ async fn room_settings_redaction_and_moderation_are_enforced() {
     wait_for_member_state(&alice_client, &room_id, &bob.user_id, "join").await;
     eprintln!("MORPHEUS_MODERATION_CHECK reinvite_after_unban=true");
     eprintln!("Room kick, reinvite, ban, blocked join, unban, and rejoin passed.");
+
+    wait_for_room(&peer, &room_id, RoomMembership::Joined).await;
+    timeout(
+        Duration::from_secs(180),
+        room_settings::exercise(
+            &creator,
+            &peer,
+            &alice_account.id,
+            &bob_account.id,
+            &alice_client,
+            &room_id,
+        ),
+    )
+    .await
+    .expect("Live room settings acceptance timed out");
 
     peer.leave_room(&room_id)
         .await

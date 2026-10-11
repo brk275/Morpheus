@@ -21,6 +21,7 @@ mod notifications;
 mod outgoing_ring;
 #[cfg(debug_assertions)]
 mod preview_capture;
+mod room_settings;
 mod security;
 mod shortcuts;
 mod sso;
@@ -1527,6 +1528,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let uploads = Arc::new(UploadController::default());
     let image_previews =
         image_previews::ImagePreviews::register(&ui, live.clone(), store.clone(), runtime.handle());
+    let room_settings =
+        room_settings::RoomSettingsUi::register(&ui, live.clone(), runtime.handle());
     ui.set_native_call_enabled(cfg!(feature = "native-calls"));
     ui.set_native_call_status("Select a room to check call availability".into());
     let update_activity = updater::UpdateActivity::default();
@@ -2258,6 +2261,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let switch_calls = calls.clone();
     ui.on_switch_account(move |index| {
         if let Some(ui) = weak.upgrade() {
+            ui.invoke_cancel_room_settings();
             ui.invoke_close_image_preview();
         }
         if switch_live.is_live.load(Ordering::Acquire) {
@@ -2323,6 +2327,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let room_handle = runtime.handle().clone();
     ui.on_open_room(move |room_id| {
         if let Some(ui) = weak.upgrade() {
+            ui.invoke_cancel_room_settings();
             ui.invoke_close_image_preview();
         }
         if room_live.is_live.load(Ordering::Acquire) {
@@ -2333,6 +2338,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if account_id.is_empty() {
                 return;
             }
+            window.invoke_cancel_room_settings();
             let navigation_epoch = room_live.invalidate_navigation();
             reset_room_search(&window);
             let live = room_live.clone();
@@ -2394,6 +2400,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             }
         }
+        window.invoke_cancel_room_settings();
         let navigation_epoch = voice_live.invalidate_navigation();
         reset_room_search(&window);
         let live = voice_live.clone();
@@ -2798,11 +2805,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     let admin_live = live.clone();
     let admin_handle = runtime.handle().clone();
+    let admin_settings = room_settings.clone();
     ui.on_submit_room_admin(move |kind, value, _reason| {
         let Some(window) = weak.upgrade() else {
             return;
         };
-        if !admin_live.is_live.load(Ordering::Acquire) || window.get_room_admin_busy() {
+        if matches!(kind, 0 | 1) {
+            admin_settings.save_text(&window, kind, value.to_string());
+            return;
+        }
+        if kind != 2
+            || !window.get_room_admin_open()
+            || window.get_room_admin_mode() != 2
+            || !admin_live.is_live.load(Ordering::Acquire)
+            || window.get_room_admin_busy()
+        {
             return;
         }
         let account_id = window.get_active_account_local_id().to_string();
@@ -2812,18 +2829,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             || window.get_room_admin_account_id().as_str() != account_id
             || window.get_room_admin_room_id().as_str() != room_id
         {
-            window.set_room_admin_error("Room or account changed. Reopen room details.".into());
+            window
+                .set_room_admin_error("Room or account changed. Reopen message redaction.".into());
             return;
         }
-        if kind == 0 && value.trim().is_empty() {
-            window.set_room_admin_error("Enter a room name".into());
-            return;
-        }
-        if kind == 2 && value.is_empty() {
+        if value.is_empty() || window.get_room_admin_event_id() != value {
             window.set_room_admin_error("Choose a message to redact".into());
-            return;
-        }
-        if !(0..=2).contains(&kind) {
             return;
         }
         let value = value.to_string();
@@ -2839,61 +2850,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !live.navigation_is_current(navigation_epoch) {
                 return;
             }
-            let manager = live.manager.clone();
-            let result = match kind {
-                0 => {
-                    manager
-                        .rename_room_for(&account_id, &room_id, value.trim())
-                        .await
-                }
-                1 => {
-                    manager
-                        .set_room_topic_for(&account_id, &room_id, &value)
-                        .await
-                }
-                2 => {
-                    manager
-                        .redact_message_for(&account_id, &room_id, &value, None)
-                        .await
-                }
-                _ => return,
-            };
-            if result.is_ok() && kind != 2 && live.navigation_is_current(navigation_epoch) {
-                let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
-                loop {
-                    if !live.navigation_is_current(navigation_epoch) {
-                        break;
-                    }
-                    let settled = manager.rooms_snapshot().await.ok().is_some_and(|rooms| {
-                        rooms
-                            .iter()
-                            .find(|room| room.room_id == room_id)
-                            .is_some_and(|room| {
-                                if kind == 0 {
-                                    room.name == value.trim()
-                                } else {
-                                    room.topic.as_deref().unwrap_or("") == value
-                                }
-                            })
-                    });
-                    if settled || tokio::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(400)).await;
-                }
-            }
+            let result = live
+                .manager
+                .redact_message_for(&account_id, &room_id, &value, None)
+                .await;
             let refresh = result.is_ok() && live.navigation_is_current(navigation_epoch);
             let error = result.err().map(|error| {
-                let verb = match kind {
-                    0 => "rename room",
-                    1 => "save room topic",
-                    _ => "redact message",
-                };
-                directory_plain_text(&format!("Could not {verb}: {error}"), 240)
+                directory_plain_text(&format!("Could not redact message: {error}"), 240)
             });
+            let completion_live = live.clone();
             let _ = weak.upgrade_in_event_loop(move |window| {
-                if window.get_active_account_local_id().as_str() != account_id
+                if !window.get_room_admin_open()
+                    || window.get_room_admin_mode() != 2
+                    || !completion_live.navigation_is_current(navigation_epoch)
+                    || window.get_active_account_local_id().as_str() != account_id
                     || window.get_active_room_id().as_str() != room_id
+                    || window.get_room_admin_account_id().as_str() != account_id
+                    || window.get_room_admin_room_id().as_str() != room_id
+                    || window.get_room_admin_event_id().as_str() != value
                     || window.get_room_admin_operation() != operation
                 {
                     return;
@@ -2902,23 +2876,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(error) = error {
                     window.set_room_admin_error(error.into());
                 } else {
-                    window.set_room_admin_notice(match kind {
-                        0 => "Room name saved".into(),
-                        1 => "Room topic saved".into(),
-                        _ => "Message redacted".into(),
-                    });
-                    if kind == 0 {
-                        window.set_active_room_name(value.into());
-                    } else if kind == 1 {
-                        window.set_active_room_topic_raw(value.clone().into());
-                        window.set_active_room_topic(if value.is_empty() {
-                            "No room topic".into()
-                        } else {
-                            value.into()
-                        });
-                    } else {
-                        window.set_room_admin_event_id("".into());
-                    }
+                    window.set_room_admin_notice("Message redacted".into());
+                    window.set_room_admin_event_id("".into());
                 }
             });
             if refresh {
@@ -3363,6 +3322,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if account_id.is_empty() {
             return;
         }
+        window.invoke_cancel_room_settings();
         let navigation_epoch = space_live.invalidate_navigation();
         let live = space_live.clone();
         let ui = weak.clone();
@@ -3968,6 +3928,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if security::block_account_change(&ui, &preview_live.security_gate) {
                 return;
             }
+            ui.invoke_cancel_room_settings();
             preview_live.invalidate_navigation();
             preview_live.is_live.store(false, Ordering::Release);
             let live = preview_live.clone();
@@ -3995,6 +3956,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             window.set_login_loading(false);
             return;
+        }
+        if let Some(window) = weak.upgrade() {
+            window.invoke_cancel_room_settings();
         }
         login_live.invalidate_navigation();
         let live = login_live.clone();
@@ -4057,6 +4021,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             window.set_login_loading(false);
             return;
+        }
+        if let Some(window) = weak.upgrade() {
+            window.invoke_cancel_room_settings();
         }
         sso_live.invalidate_navigation();
         let live = sso_live.clone();
@@ -4141,6 +4108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let logout_calls = calls.clone();
     ui.on_log_out(move || {
         if let Some(ui) = weak.upgrade() {
+            ui.invoke_cancel_room_settings();
             ui.invoke_close_image_preview();
         }
         if !logout_live.is_live.load(Ordering::Acquire) {
@@ -4483,6 +4451,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let ui_result = ui.run();
+    room_settings.shutdown(&ui);
     image_previews.shutdown(&ui);
     #[cfg(feature = "native-calls")]
     incoming_calls.shutdown();

@@ -625,6 +625,24 @@ class LiveEvidenceTests(unittest.TestCase):
             with self.subTest(output=invalid), self.assertRaisesRegex(RuntimeError, "Moderation acceptance evidence"):
                 acceptance_module.moderation_evidence(invalid)
 
+    def test_every_room_settings_fact_is_required_and_failed_facts_cannot_be_repaired_by_later_true(self):
+        complete = "\n".join(f"MORPHEUS_MODERATION_CHECK {name}=true"
+                             for name in acceptance_module.MODERATION_CHECKS)
+        settings = {
+            "settings_permission_denial", "settings_avatar_roundtrip", "settings_encrypted_preview_opt_in",
+            "settings_avatar_remove", "settings_stale_write_rejected", "settings_access_rules_roundtrip",
+            "settings_directory_unchanged", "settings_cancelled_form_rejected",
+            "settings_text_roundtrip",
+        }
+        self.assertTrue(settings <= acceptance_module.MODERATION_CHECKS)
+        for name in settings:
+            line = f"MORPHEUS_MODERATION_CHECK {name}=true"
+            for invalid in (complete.replace(line, ""),
+                            complete.replace(line, line.replace("=true", "=false")),
+                            f"MORPHEUS_MODERATION_CHECK {name}=false\n" + complete):
+                with self.subTest(name=name), self.assertRaises(RuntimeError):
+                    acceptance_module.moderation_evidence(invalid)
+
     @unittest.skipIf(os.name == "nt", "Linux hosted harness")
     def test_moderation_failure_emits_category_but_never_private_error(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -1097,10 +1115,29 @@ class IncomingActorTests(unittest.TestCase):
                          acceptance_module.INCOMING_STAGES)
         errors = set(re.findall(r'\berror\("([a-z_]+)"\)', source))
         error_source = source.split("fn controller_error(", 1)[1].split("async fn bounded", 1)[0]
-        errors.update(re.findall(r'=> "([a-z_]+)"', error_source))
+        errors.update(re.findall(r'=>\s*(?:\{\s*)?"([a-z_]+)"', error_source))
         self.assertEqual(errors, acceptance_module.INCOMING_ERRORS)
         for marker in ('CHECK {name}=true', 'STAGE {}', 'FAILURE {}', 'ERROR {category}'):
             self.assertIn('\\nMORPHEUS_INCOMING_' + marker, source)
+
+    def test_departure_and_invitation_categories_are_fixed_failures_not_success_facts(self):
+        categories = {value for value in acceptance_module.INCOMING_ERRORS
+                      if value.startswith(("observer_", "invitation_"))}
+        self.assertEqual(len(categories), 29)
+        self.assertIn("observer_roster_not_current", categories)
+        self.assertIn("observer_invalid_membership", categories)
+        self.assertIn("invitation_suppressed_occupied", categories)
+        for category in categories:
+            marker = f"MORPHEUS_INCOMING_ERROR {category}\n"
+            with self.subTest(category=category):
+                self.assertEqual(acceptance_module.incoming_diagnostics(marker),
+                                 {"checks": {}, "error": category})
+                with self.assertRaises(RuntimeError):
+                    acceptance_module.ring_passed_tests(self.output() + marker, ("current", "dm"))
+                malformed = marker.rstrip() + " private-payload\n"
+                evidence = acceptance_module.incoming_diagnostics(malformed)
+                self.assertEqual(evidence, {"checks": {}, "malformed": True})
+                self.assertNotIn("private-payload", json.dumps(evidence))
 
     def test_actor_schema_does_not_replace_the_thirteen_sender_checks(self):
         self.assertEqual(len(acceptance_module.RING_CHECKS), 13)

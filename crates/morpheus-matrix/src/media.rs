@@ -400,7 +400,9 @@ impl AccountManager {
     }
 }
 
-async fn fetch_bounded_media(
+/// Crate-internal only: callers must bind a server-resolved source to an active
+/// account/room capability; never expose arbitrary MXC input to UI actions.
+pub(crate) async fn fetch_bounded_media(
     client: &Client,
     source: &MediaSource,
     maximum: usize,

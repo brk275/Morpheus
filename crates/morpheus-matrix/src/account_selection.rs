@@ -25,6 +25,12 @@ impl AccountSelection {
         &self.account_id
     }
 
+    /// Internal capability identity; matching account IDs alone do not bind
+    /// work to the same manager and account-selection epoch.
+    pub(crate) fn same_epoch(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.current, &other.current)
+    }
+
     pub fn is_current(&self) -> bool {
         self.current.load(Ordering::Acquire)
     }
@@ -209,6 +215,23 @@ mod tests {
         let after_restart = selections.for_account("alice").unwrap();
         drop(selections);
         assert!(!after_restart.is_current());
+    }
+
+    #[test]
+    fn capability_identity_rejects_another_manager_or_selection_with_the_same_account_id() {
+        let first = Selections::default();
+        let second = Selections::default();
+        first.replace(Some("casey-local"));
+        second.replace(Some("casey-local"));
+        let original = first.for_account("casey-local").unwrap();
+        let foreign = second.for_account("casey-local").unwrap();
+        assert!(original.is_current() && foreign.is_current());
+        assert!(original.same_epoch(&original.clone()));
+        assert!(!original.same_epoch(&foreign));
+        first.replace(Some("jules-local"));
+        first.replace(Some("casey-local"));
+        assert!(!original.same_epoch(&first.for_account("casey-local").unwrap()));
+        assert!(!original.is_current());
     }
 
     #[test]

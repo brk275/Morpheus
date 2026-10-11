@@ -502,6 +502,27 @@ export component AppWindow inherits Window {
     in-out property <string> room-admin-error;
     in-out property <string> room-admin-notice;
     in-out property <int> room-admin-operation: 0;
+    in-out property <string> room-settings-form-id;
+    in-out property <bool> room-settings-loaded: false;
+    in-out property <bool> room-settings-dirty: false;
+    in-out property <bool> room-settings-refresh-required: false;
+    in-out property <bool> room-settings-name-allowed: false;
+    in-out property <bool> room-settings-topic-allowed: false;
+    in-out property <bool> room-settings-avatar-allowed: false;
+    in-out property <bool> room-settings-join-allowed: false;
+    in-out property <bool> room-settings-avatar-present: false;
+    in-out property <bool> room-settings-preview-available: false;
+    in-out property <image> room-settings-image;
+    in-out property <bool> room-settings-image-visible: false;
+    in-out property <bool> room-settings-staged: false;
+    in-out property <[string]> room-settings-join-options;
+    in-out property <int> room-settings-join-index: -1;
+    in-out property <bool> room-settings-restricted: false;
+    in-out property <string> room-settings-allow-rooms;
+    in-out property <string> room-settings-access-description;
+    in-out property <int> room-settings-confirmation: 0;
+    private property <bool> room-settings-editable: root.room-settings-loaded && !root.room-admin-busy && !root.room-settings-refresh-required && root.room-settings-confirmation == 0;
+
     in-out property <bool> active-voice-local: false;
     in-out property <bool> active-voice-shared: false;
     in-out property <bool> voice-designation-busy: false;
@@ -683,6 +704,17 @@ export component AppWindow inherits Window {
     callback refresh-room-members();
     callback submit-member-action(int, string, string);
     callback submit-room-admin(int, string, string);
+    callback open-room-settings();
+    callback cancel-room-settings();
+    // 0 refresh, 1 choose, 2 preview, 3 save avatar, 4 discard, 5 remove,
+    // 6 confirm, 7 cancel confirmation, 8 save join rule, 9 select join rule.
+    callback room-settings-action(int);
+    callback room-settings-edit(int);
+    public function dismiss-room-settings() {
+        root.cancel-room-settings();
+        account-trigger.focus();
+    }
+
     callback submit-room-action(int, string);
     callback respond-invite(string, bool);
     callback send-message(string);
@@ -913,12 +945,25 @@ export component AppWindow inherits Window {
     property <string> login-password;
 
     // A picker snapshot never survives a change of account or Space.
-    changed active-account-local-id => { root.close-image-preview(); root.quick-switcher-open = false; root.incoming-call-notice = ""; root.mention-context-changed(); }
+    changed page => { root.cancel-room-settings(); }
+    changed image-previews-encrypted-enabled => {
+        if !root.image-previews-encrypted-enabled { root.cancel-room-settings(); }
+    }
+    changed room-admin-open => {
+        if !root.room-admin-open { root.cancel-room-settings(); }
+    }
+    changed room-admin-mode => {
+        if root.room-admin-mode != 0 { root.cancel-room-settings(); }
+    }
+    changed active-account-local-id => {
+        root.cancel-room-settings(); root.close-image-preview(); root.quick-switcher-open = false; root.incoming-call-notice = ""; root.mention-context-changed(); }
     changed active-account-index => { root.quick-switcher-open = false; root.mention-context-changed(); }
-    changed active-room-id => { root.close-image-preview(); root.mention-context-changed(); }
+    changed active-room-id => {
+        root.cancel-room-settings(); root.close-image-preview(); root.mention-context-changed(); }
     changed thread-root-id => { root.close-image-preview(); root.mention-context-changed(); }
     changed active-space-id => { root.quick-switcher-open = false; }
-    changed show-sign-in => { if root.show-sign-in { root.close-image-preview(); } if !root.show-sign-in { shortcut-scope.focus(); } }
+    changed show-sign-in => {
+        if root.show-sign-in { root.cancel-room-settings(); } if root.show-sign-in { root.close-image-preview(); } if !root.show-sign-in { shortcut-scope.focus(); } }
 
     property <bool> light-palette: root.theme-mode == 1 || (root.theme-mode == 3 && Palette.color-scheme == ColorScheme.light);
     property <float> text-scale: root.font-scale-percent / 100.0;
@@ -1443,17 +1488,10 @@ export component AppWindow inherits Window {
                         if root.page == 0 : VerticalLayout {
                             width: 34px; alignment: center;
                             IconAction {
-                            icon: "⚙"; label: "Edit room name and topic"; ink: root.muted; surface: root.canvas; hover-surface: root.hover;
+                            icon: "⚙"; label: "Edit room settings"; ink: root.muted; surface: root.canvas; hover-surface: root.hover;
                             enabled: root.live-session && root.active-room-id != "";
                             activated => {
-                                root.room-admin-mode = 0;
-                                root.room-admin-name-input = root.active-room-name;
-                                root.room-admin-topic-input = root.active-room-topic-raw;
-                                root.room-admin-account-id = root.active-account-local-id;
-                                root.room-admin-room-id = root.active-room-id;
-                                root.room-admin-error = "";
-                                root.room-admin-notice = "";
-                                root.room-admin-open = true;
+                                root.open-room-settings();
                             }
                         }
                         }
@@ -3745,7 +3783,260 @@ export component AppWindow inherits Window {
         }
     }
 
-    if root.room-admin-open : FocusScope {
+    if root.room-admin-open && root.room-admin-mode == 0 : FocusScope {
+        focus-on-tab-navigation: false;
+        init => { settings-close.focus(); }
+        capture-key-pressed(event) => {
+            if event.text == Key.Escape {
+                if root.room-settings-confirmation != 0 {
+                    root.room-settings-action(7);
+                    settings-close.focus();
+                } else {
+                    root.dismiss-room-settings();
+                }
+                accept
+            } else if root.room-settings-confirmation != 0 { reject }
+            else if (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) && settings-refresh.has-focus {
+                settings-close.focus(); accept
+            } else if event.text == Key.Tab && !event.modifiers.shift && settings-close.has-focus {
+                if !root.room-admin-busy { settings-refresh.focus(); }
+                accept
+            } else if root.room-admin-busy && (event.text == Key.Tab || event.text == Key.Backtab) {
+                settings-close.focus(); accept
+            } else { reject }
+        }
+        Rectangle {
+            background: #000000aa;
+            TouchArea { width: parent.width; height: parent.height; }
+            Rectangle {
+                width: min(620px, parent.width - 40px);
+                height: min(820px, parent.height - 40px);
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                background: root.canvas; border-color: root.divider; border-width: 1px; border-radius: 14px;
+                accessible-role: region;
+                accessible-label: "Room settings";
+                VerticalLayout {
+                    padding: 20px; spacing: 12px;
+                    HorizontalLayout {
+                        spacing: 12px;
+                        Text { text: "Room settings"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; vertical-alignment: center; horizontal-stretch: 1; }
+                        settings-refresh := ActionRect {
+                            width: 118px * root.text-scale;
+                            height: 42px * root.text-scale; border-radius: 8px; border-width: 1px; border-color: root.divider;
+                            background: self.enabled && self.has-hover ? root.hover : root.elevated; focus-color: root.ink;
+                            label: "Refresh room settings from the homeserver";
+                            enabled: !root.room-admin-busy && root.room-settings-confirmation == 0;
+                            activated => { root.room-settings-action(0); }
+
+                            Text { x: 12px; width: parent.width - 24px; text: root.room-settings-dirty ? "Refresh…" : "Refresh"; color: parent.enabled ? root.ink : root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+                    Text { text: "Changes apply to this room for all members. Permissions are checked again when saving."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                    ScrollView {
+                        vertical-stretch: 1;
+                        VerticalLayout {
+                            padding-right: 12px; spacing: 10px;
+                            Text { text: "Room name"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 650; }
+                            Rectangle {
+                                min-height: 42px * root.text-scale; background: root.elevated; border-radius: 8px;
+                                TextInput {
+                                    x: 12px; width: parent.width - 24px; height: parent.height;
+                                    text <=> root.room-admin-name-input; single-line: true;
+                                    enabled: root.room-settings-editable && root.room-settings-name-allowed;
+                                    color: root.ink; font-size: 13px * root.text-scale; accessible-label: "Room name; at most 1024 bytes";
+                                    edited => { root.room-settings-edit(1); }
+                                }
+                            }
+                            ActionRect {
+                                height: 42px * root.text-scale; border-radius: 8px; border-width: 1px; border-color: root.divider;
+                                background: self.enabled ? root.accent : root.panel; focus-color: root.ink;
+                                label: "Save room name";
+                                enabled: root.room-settings-editable && root.room-settings-name-allowed && root.room-admin-name-input != "";
+                                activated => { root.submit-room-admin(0, root.room-admin-name-input, ""); }
+
+                                Text { x: 12px; width: parent.width - 24px; text: "Save name"; color: parent.enabled ? root.accent-ink : root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                            Text { text: "Topic"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 650; }
+                            Rectangle {
+                                min-height: 70px * root.text-scale; background: root.elevated; border-radius: 8px;
+                                TextInput {
+                                    x: 12px; y: 8px; width: parent.width - 24px; height: parent.height - 16px;
+                                    text <=> root.room-admin-topic-input; single-line: false; wrap: word-wrap;
+                                    enabled: root.room-settings-editable && root.room-settings-topic-allowed;
+                                    color: root.ink; font-size: 13px * root.text-scale; accessible-label: "Room topic; blank clears it; at most 16 KiB";
+                                    edited => { root.room-settings-edit(2); }
+                                }
+                            }
+                            ActionRect {
+                                height: 42px * root.text-scale; border-radius: 8px; border-width: 1px; border-color: root.divider;
+                                background: self.enabled ? root.accent : root.panel; focus-color: root.ink;
+                                label: "Save room topic";
+                                enabled: root.room-settings-editable && root.room-settings-topic-allowed;
+                                activated => { root.submit-room-admin(1, root.room-admin-topic-input, ""); }
+
+                                Text { x: 12px; width: parent.width - 24px; text: "Save topic"; color: parent.enabled ? root.accent-ink : root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                            Rectangle { height: 1px; background: root.divider; }
+                            Text { text: "Room avatar"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 700; }
+                            Text { text: "Static PNG or baseline JPEG, up to 8 MiB and 4 megapixels. New avatars are resized to at most 512 px and stripped of metadata. Room avatars are shared metadata, even in encrypted rooms."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                            Rectangle {
+                                height: 112px; background: root.elevated; border-radius: 10px;
+                                if root.room-settings-image-visible : Image {
+                                    x: (parent.width - 96px) / 2; y: 8px; width: 96px; height: 96px;
+                                    source: root.room-settings-image; image-fit: contain;
+                                    accessible-role: image;
+                                    accessible-label: root.room-settings-staged ? "Staged room avatar; not uploaded" : "Current room avatar preview";
+                                }
+                                if !root.room-settings-image-visible : Text {
+                                    text: root.room-settings-avatar-present ? "Avatar hidden · preview is optional" : "No avatar";
+                                    color: root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; wrap: word-wrap;
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                ActionRect {
+                                    height: 42px * root.text-scale; border-radius: 8px; border-width: 1px; border-color: root.divider;
+                                    background: self.enabled && self.has-hover ? root.hover : root.elevated; focus-color: root.ink;
+                                    label: "Download and preview current room avatar";
+                                    enabled: root.room-settings-editable && root.room-settings-preview-available && !root.room-settings-staged;
+                                    activated => { root.room-settings-action(2); }
+
+                                    Text { x: 12px; width: parent.width - 24px; text: "Preview current"; color: parent.enabled ? root.ink : root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                                }
+                                ActionRect {
+                                    height: 42px * root.text-scale; border-radius: 8px; border-width: 1px; border-color: root.divider;
+                                    background: self.enabled && self.has-hover ? root.hover : root.elevated; focus-color: root.ink;
+                                    label: "Choose a new room avatar image";
+                                    enabled: root.room-settings-editable && root.room-settings-avatar-allowed && !root.room-settings-staged;
+                                    activated => { root.room-settings-action(1); }
+
+                                    Text { x: 12px; width: parent.width - 24px; text: "Choose image…"; color: parent.enabled ? root.ink : root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                ActionRect {
+                                    height: 42px * root.text-scale; border-radius: 8px; border-width: 1px; border-color: root.divider;
+                                    background: self.enabled ? root.accent : root.panel; focus-color: root.ink;
+                                    label: "Upload and save staged room avatar";
+                                    enabled: root.room-settings-editable && root.room-settings-avatar-allowed && root.room-settings-staged;
+                                    activated => { root.room-settings-action(3); }
+
+                                    Text { x: 12px; width: parent.width - 24px; text: "Save avatar"; color: parent.enabled ? root.accent-ink : root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                                }
+                                ActionRect {
+                                    height: 42px * root.text-scale; border-radius: 8px; border-width: 1px; border-color: root.divider;
+                                    background: self.enabled && self.has-hover ? root.hover : root.elevated; focus-color: root.ink;
+                                    label: "Discard room avatar image from this form";
+                                    enabled: !root.room-admin-busy && root.room-settings-confirmation == 0 && root.room-settings-image-visible;
+                                    activated => { root.room-settings-action(4); }
+
+                                    Text { x: 12px; width: parent.width - 24px; text: "Discard preview"; color: parent.enabled ? root.ink : root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                                }
+
+                            }
+                            ActionRect {
+                                height: 42px * root.text-scale; border-radius: 8px; border-width: 1px; border-color: root.divider;
+                                background: self.enabled && self.has-hover ? root.hover : root.elevated; focus-color: root.ink;
+                                label: "Confirm removal of current room avatar";
+                                enabled: root.room-settings-editable && root.room-settings-avatar-allowed && root.room-settings-avatar-present;
+                                activated => { root.room-settings-action(5); }
+
+                                Text { x: 12px; width: parent.width - 24px; text: "Remove…"; color: parent.enabled ? root.ink : root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                            Text { text: root.room-settings-staged ? "Staged locally. Inspect orientation and colours before saving." : "Encrypted-room previews follow your Appearance privacy setting. No avatar is downloaded automatically."; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+                            Rectangle { height: 1px; background: root.divider; }
+                            Text { text: "Who can join"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 700; }
+                            Text { text: root.room-settings-access-description; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                            ComboBox {
+                                model: root.room-settings-join-options; current-index <=> root.room-settings-join-index;
+                                enabled: root.room-settings-editable && root.room-settings-join-allowed;
+                                accessible-label: "Room join rule; only choices supported by this room version";
+                                selected(value) => { root.room-settings-action(9); }
+                            }
+                            if root.room-settings-restricted : Text { text: "Allowed rooms · one Matrix room ID per line (up to 32)"; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                            if root.room-settings-restricted : Rectangle {
+                                min-height: 96px * root.text-scale; background: root.elevated; border-radius: 8px;
+                                TextInput {
+                                    x: 12px; y: 8px; width: parent.width - 24px; height: parent.height - 16px;
+                                    text <=> root.room-settings-allow-rooms; single-line: false; wrap: word-wrap;
+                                    enabled: root.room-settings-editable && root.room-settings-join-allowed;
+                                    color: root.ink; font-size: 12px * root.text-scale;
+                                    accessible-label: "Allowed Matrix room IDs; one per line; empty permits no automatic restricted joins";
+                                    edited => { root.room-settings-edit(4); }
+                                }
+                            }
+                            ActionRect {
+                                height: 42px * root.text-scale; border-radius: 8px; border-width: 1px; border-color: root.divider;
+                                background: self.enabled ? root.accent : root.panel; focus-color: root.ink;
+                                label: "Save room join rule";
+                                enabled: root.room-settings-editable && root.room-settings-join-allowed && root.room-settings-join-index >= 0;
+                                activated => { root.room-settings-action(8); }
+
+                                Text { x: 12px; width: parent.width - 24px; text: "Save join rule"; color: parent.enabled ? root.accent-ink : root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                            Text { text: "Public access requires confirmation. Directory listing is a separate setting and is not changed here. Unknown rules remain read-only."; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+                        }
+                    }
+                    if root.room-admin-busy : Text { text: "Working… You can close this form to cancel pending work."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+                    if root.room-admin-error != "" : Text { text: root.room-admin-error; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+                    if root.room-admin-notice != "" : Text { text: root.room-admin-notice; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+                    settings-close := ActionRect {
+                        height: 42px * root.text-scale; border-radius: 8px; border-width: 1px; border-color: root.divider;
+                        background: self.enabled && self.has-hover ? root.hover : root.elevated; focus-color: root.ink;
+                        label: "Close room settings and discard unsaved edits and images";
+                        enabled: root.room-settings-confirmation == 0;
+                        activated => { root.dismiss-room-settings(); }
+
+                        Text { x: 12px; width: parent.width - 24px; text: "Close"; color: parent.enabled ? root.ink : root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+                if root.room-settings-confirmation != 0 : FocusScope {
+                    init => { settings-confirm-cancel.focus(); }
+                    Rectangle {
+                        background: #000000bb;
+                        TouchArea { width: parent.width; height: parent.height; }
+                        Rectangle {
+                            x: 20px; y: (parent.height - self.height) / 2; width: parent.width - 40px;
+                            height: confirmation-layout.preferred-height;
+                            background: root.elevated; border-radius: 12px; border-color: root.divider; border-width: 1px;
+                            accessible-role: region;
+                            accessible-label: root.room-settings-confirmation == 1 ? "Confirm public room access" : root.room-settings-confirmation == 2 ? "Confirm room avatar removal" : "Confirm discard and refresh";
+                            confirmation-layout := VerticalLayout {
+                                padding: 20px; spacing: 16px;
+                                Text { text: root.room-settings-confirmation == 1 ? "Allow anyone to join?" : root.room-settings-confirmation == 2 ? "Remove this room's avatar?" : "Discard edits and refresh?"; color: root.ink; font-size: 18px * root.text-scale; font-weight: 700; wrap: word-wrap; }
+                                Text { text: root.room-settings-confirmation == 1 ? "Anyone will be able to join this room. This does not list the room in a public directory." : root.room-settings-confirmation == 2 ? "This removes the shared avatar for everyone in the room. It does not delete previously uploaded media from the homeserver." : "Unsaved name, topic, access and image edits will be discarded. Current settings will be fetched from the homeserver."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                                HorizontalLayout {
+                                    spacing: 10px;
+                                    settings-confirm-cancel := ActionRect {
+                                        height: 42px * root.text-scale; border-radius: 8px; background: root.panel; label: "Cancel room settings confirmation";
+                                        trap-tab: true; cancel-on-escape: true; focus-color: root.accent;
+                                        next-focus => { settings-confirm-save.focus(); } previous-focus => { settings-confirm-save.focus(); }
+                                        cancelled => { root.room-settings-action(7); settings-close.focus(); }
+                                        activated => { root.room-settings-action(7); settings-close.focus(); }
+                                        Text { text: "Cancel"; color: root.ink; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                                    }
+                                    settings-confirm-save := ActionRect {
+                                        height: 42px * root.text-scale; border-radius: 8px; background: root.accent;
+                                        label: root.room-settings-confirmation == 1 ? "Confirm public access" : root.room-settings-confirmation == 2 ? "Confirm avatar removal" : "Confirm discard edits and refresh";
+                                        trap-tab: true; cancel-on-escape: true; focus-color: root.ink;
+                                        next-focus => { settings-confirm-cancel.focus(); } previous-focus => { settings-confirm-cancel.focus(); }
+                                        cancelled => { root.room-settings-action(7); settings-close.focus(); }
+                                        activated => { root.room-settings-action(6); settings-close.focus(); }
+                                        Text { text: "Confirm"; color: root.accent-ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+
+    if root.room-admin-open && root.room-admin-mode == 2 : FocusScope {
         init => { admin-close.focus(); }
         key-pressed(event) => {
             if event.text == Key.Escape && !root.room-admin-busy {
@@ -3791,62 +4082,6 @@ export component AppWindow inherits Window {
                         font-size: 12px * root.text-scale;
                         wrap: word-wrap;
                         height: 43px;
-                    }
-                    if root.room-admin-mode == 0 : Text {
-                        text: "Room name";
-                        color: root.ink;
-                        font-size: 12px * root.text-scale;
-                    }
-                    if root.room-admin-mode == 0 : Rectangle {
-                        height: 42px;
-                        background: root.elevated;
-                        border-radius: 8px;
-                        TextInput {
-                            x: 10px; width: parent.width - 20px; height: parent.height;
-                            text <=> root.room-admin-name-input;
-                            enabled: !root.room-admin-busy;
-                            color: root.ink;
-                            font-size: 13px * root.text-scale;
-                            accessible-label: "Matrix room name";
-                        }
-                    }
-                    if root.room-admin-mode == 0 : Button {
-                        width: 128px; height: 35px; text: "Save name";
-                        enabled: !root.room-admin-busy && root.room-admin-name-input != "";
-                        clicked => {
-                            if root.room-admin-account-id == root.active-account-local-id
-                                && root.room-admin-room-id == root.active-room-id {
-                                root.submit-room-admin(0, root.room-admin-name-input, "");
-                            }
-                        }
-                    }
-                    if root.room-admin-mode == 0 : Text {
-                        text: "Room topic";
-                        color: root.ink;
-                        font-size: 12px * root.text-scale;
-                    }
-                    if root.room-admin-mode == 0 : Rectangle {
-                        height: 42px;
-                        background: root.elevated;
-                        border-radius: 8px;
-                        TextInput {
-                            x: 10px; width: parent.width - 20px; height: parent.height;
-                            text <=> root.room-admin-topic-input;
-                            enabled: !root.room-admin-busy;
-                            color: root.ink;
-                            font-size: 13px * root.text-scale;
-                            accessible-label: "Matrix room topic; blank clears it";
-                        }
-                    }
-                    if root.room-admin-mode == 0 : Button {
-                        width: 128px; height: 35px; text: "Save topic";
-                        enabled: !root.room-admin-busy;
-                        clicked => {
-                            if root.room-admin-account-id == root.active-account-local-id
-                                && root.room-admin-room-id == root.active-room-id {
-                                root.submit-room-admin(1, root.room-admin-topic-input, "");
-                            }
-                        }
                     }
                     if root.room-admin-error != "" : Text {
                         text: root.room-admin-error;

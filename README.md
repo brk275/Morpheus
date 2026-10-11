@@ -22,25 +22,33 @@ receive and departure in the legacy room-state mode. A stock Element Call v0.28.
 (`Sticky2025`) protocol fixture. Fresh-device native peers passed Current and
 Sticky2025 membership renewal in Linux CI. Fresh-device Element interoperability,
 live remote-frame rendering, packaged-app permissions, and three-platform
-runtime behavior remain unverified. Rich formatting, broader media previews, full
-call controls, recovery screens, and platform acceptance tests remain in
-progress. Do not rely on this client for important conversations or
+runtime behavior remain unverified. Native rich-text, mention and image-preview
+paths are implemented; their interactive UI acceptance, broader media support,
+full call controls and platform release checks remain in progress. Do not rely on this client for important conversations or
 encryption-key recovery yet. The first beta requires the cross-platform
 checks in [the feature matrix](docs/FEATURE_MATRIX.md).
 
 The composer includes explicit mention selection, typed Plain/Markdown drafts,
 mention-aware replies, threads and edits, and a searchable 44-entry starter
 emoji picker. Native builds and their focused guards passed on all four
-platforms at `4fd8071`; a live room-mention rich-text projection failed and its
-repair awaits retesting. Keyboard, IME and accessibility acceptance remain open;
+platforms at `c02a1b7`. The expanded encrypted formatting and typed-draft
+fixtures passed in Linux at `c02a1b7`, including the room-mention projection repair.
+Keyboard, IME and accessibility acceptance remain open;
 the picker does not cover the full Unicode catalog or skin-tone variants.
 
 A native click-to-preview image viewer is now implemented for bounded PNG and
 baseline JPEG attachments in rooms and threads. It keeps preview data in memory
 and leaves encrypted-room previews off by default. Native builds and 13 focused
-guards passed on all four platforms; the expanded real-attachment check did not
-run, and viewer/accessibility acceptance remains pending. Animation, WebP, audio
+guards passed on all four platforms. The expanded encrypted/plain-image API
+fixture passed in Linux at `c02a1b7`; viewer/accessibility acceptance remains pending. Animation, WebP, audio
 and video previews are not supported. See [image preview limits](docs/IMAGE_PREVIEWS.md).
+
+A [room-settings extension](docs/ROOM_SETTINGS.md) adds guarded name/topic,
+avatar and join-rule controls.
+Its source has been reviewed; compilation, live settings fixtures and native
+interaction acceptance are pending. Incoming Answer/Dismiss are wired, but three
+of four current hosted controller cases still fail departure observation; audible
+ringing and protocol Decline remain incomplete.
 
 ![Morpheus native desktop preview with fictional accounts](docs/screenshots/desktop.png)
 

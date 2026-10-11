@@ -20,11 +20,12 @@ use super::{AppWindow, Config, apply_config, apply_state, fixtures};
 
 const WIDTH: u32 = 1440;
 const HEIGHT: u32 = 900;
-const FILES: [&str; 4] = [
+const FILES: [&str; 5] = [
     "desktop-preview.ppm",
     "account-switcher.ppm",
     "sign-in.ppm",
     "incoming-call.ppm",
+    "room-settings.ppm",
 ];
 
 pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
@@ -97,6 +98,37 @@ pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
                             account: "@casey:example.org".into(),
                         }],
                     )));
+                }
+                3 => {
+                    // Presentation-only settings fixture: no controller, file
+                    // chooser, account session, upload or state write exists.
+                    window.set_incoming_call_offers(slint::ModelRc::new(slint::VecModel::from(
+                        Vec::<super::IncomingCallItem>::new(),
+                    )));
+                    window.set_room_admin_mode(0);
+                    window.set_room_admin_name_input("The Workshop".into());
+                    window.set_room_admin_topic_input(
+                        "A place to make things, share progress, and help each other.".into(),
+                    );
+                    window.set_room_settings_loaded(true);
+                    window.set_room_settings_name_allowed(true);
+                    window.set_room_settings_topic_allowed(true);
+                    window.set_room_settings_avatar_allowed(true);
+                    window.set_room_settings_join_allowed(true);
+                    window.set_room_settings_join_options(slint::ModelRc::new(
+                        slint::VecModel::from(vec![
+                            "Invite only".into(),
+                            "Public".into(),
+                            "Knock".into(),
+                            "Restricted".into(),
+                            "Knock or restricted".into(),
+                        ]),
+                    ));
+                    window.set_room_settings_join_index(0);
+                    window.set_room_settings_access_description(
+                        "Only invited people can join.".into(),
+                    );
+                    window.set_room_admin_open(true);
                 }
                 _ => {
                     *captured.borrow_mut() = Some(Ok(()));

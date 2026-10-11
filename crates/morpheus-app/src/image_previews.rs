@@ -2,6 +2,7 @@
 //! at a time and no decoded cache is retained. A cancelled codec call already
 //! entered on its dedicated worker cannot be recalled, but its permit remains
 //! held until exit and its result cannot publish to a revoked selection/view.
+pub(crate) mod avatar;
 mod decode;
 
 use crate::{AppWindow, live::LiveUi};
@@ -134,6 +135,9 @@ pub fn apply_config(ui: &AppWindow, config: &Config) {
         // Runs synchronously on the UI thread for each Settings save and each
         // observed valid file reload. Disabling/re-enabling never revives work.
         ui.invoke_close_image_preview();
+        if !enabled {
+            ui.invoke_cancel_room_settings();
+        }
         ui.set_image_previews_encrypted_enabled(enabled);
     }
 }

@@ -158,6 +158,7 @@ impl ObserverDiagnostic {
             ObserverError::TimedOut => "timed_out",
             ObserverError::Closed => "closed",
             ObserverError::InvalidMembership => "invalid_membership",
+            ObserverError::RosterNotCurrent => "roster_not_current",
             ObserverError::TooManyParticipants => "too_many_participants",
         });
     }

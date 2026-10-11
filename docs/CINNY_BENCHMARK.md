@@ -8,9 +8,10 @@ is the pinned comparison point; its [release history](https://github.com/cinnyap
 documents earlier voice/video rooms, DM and room video starts, code-block
 formatting, media, and device-management changes.
 
-At `4fd8071`, all four native builds and the 65 added composer, picker, trust
-and image-preview guards passed. Live rich-text projection and incoming actor
-setup failed; the expanded image API check did not run. No beta gate is complete;
+The current `c02a1b7` Linux run passed expanded encrypted formatting, typed
+drafts, image-preview APIs, search and the exact Wayland fixture. Current/room
+incoming controller acceptance passed; the other three cases failed departure
+observation. No beta gate is complete;
 see [the current verification results](VERIFICATION.md).
 
 ## Navigation and discovery
@@ -31,9 +32,9 @@ see [the current verification results](VERIFICATION.md).
       A safe subset of rich text renders in the offline timeline and thread
       preview, and decrypted events passed that rich-text projection. Member
       suggestions and a searchable 44-entry starter emoji picker are implemented;
-      their guards passed on all four native targets at `4fd8071`. Its expanded
-      encrypted test exposed a room-mention rich-projection failure; the reviewed
-      span repair awaits retest. Native keyboard/IME/accessibility, live rendered
+      their guards passed on all four native targets at `c02a1b7`. The room-mention
+      projection repair and expanded encrypted room/reply/thread/edit fixture
+      passed in Linux at `c02a1b7`. Native keyboard/IME/accessibility, live rendered
       UI, full emoji breadth, stickers and the complete behavior set remain open.
 - [ ] Upload, download, preview, and safely open images, video, audio, and
       files in encrypted and unencrypted rooms. The Matrix core passed an
@@ -43,7 +44,7 @@ see [the current verification results](VERIFICATION.md).
       live UI acceptance remains open. A memory-only click-to-preview viewer
       for bounded PNG/baseline JPEG is implemented, with encrypted previews off
       by default. Its 13 guards passed on all four targets; the expanded
-      encrypted/plain-image API fixture was skipped after the formatting failure.
+      encrypted/plain-image API fixture passed in Linux at `c02a1b7`.
       Real viewer acceptance remains open. Animation, WebP, audio/video previews
       and full type coverage remain open; see [image preview limits](IMAGE_PREVIEWS.md).
 - [ ] Search rooms, users, and message history; show results in their room and
@@ -68,7 +69,9 @@ see [the current verification results](VERIFICATION.md).
 - [ ] Verify devices and recover encrypted history with key backup after a
       fresh install. Show actionable errors for missing keys.
 - [ ] Manage room name, topic, avatar, join rules, invites, roles, power levels,
-      bans, kicks, and redactions subject to Matrix permissions.
+      bans, kicks, and redactions subject to Matrix permissions. The next reviewed
+      room-settings source adds guarded name/topic/avatar/join-rule controls and
+      staged image preparation. Core and native UI acceptance remain pending.
 - [ ] Configure notifications, muted rooms, highlights, and local privacy
       behavior; a fully quit app sends no notifications.
 
@@ -81,9 +84,11 @@ see [the current verification results](VERIFICATION.md).
       isolated macOS app check; an encrypted macOS GUI call also joined with
       two participants. Voice-space navigation and designation, Call and notify,
       and incoming Answer/local Dismiss are wired. Incoming guards passed at
-      `c7ad50c` and the current native suite. At `4fd8071`, all four live actor
-      cases still stopped at setup with `unavailable`; the modern room-ID
-      configuration repair awaits hosted retest. Actual Answer UI, audible ringing,
+      `c7ad50c` and subsequent native suites. At `c02a1b7`, all four live actor cases
+      progressed through discovery and accepted join identity; Current/room passed,
+      while Current/DM and both Sticky2025 cases failed departure observation.
+      The bounded missing-reference observation change is source-only and is not
+      a confirmed repair of those generic errors. Actual Answer UI, audible ringing,
       protocol Decline and voice-space drop-in acceptance remain open.
 - [ ] Encrypted voice and video, reconnect, device selection, and screen share
       interoperate with Element Call on compatible homeservers. Local encrypted

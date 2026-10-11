@@ -5,6 +5,111 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
 ## Current hosted acceptance, 2026-10-11
 
+### Real native preview and expanded live fixtures: `c02a1b7`
+
+[Run 38167245637](https://github.com/brk275/Morpheus/actions/runs/38167245637)
+tested `c02a1b78fc1ce6a7b28b66c4b22768e6f30594c2`. Scope ran 488 helper
+tests (487 passed, one skipped), selected all four native platforms and scanned
+50 reachable commits with zero findings. All four platforms completed native
+check/build and their unit/vendor/SDK suites: 776 passes on Linux and 750 on
+each of Apple Silicon, Intel Mac and Windows, with no native test failures and
+one ignored opt-in application test per platform.
+
+The no-input integration targets separately contributed ten early returns and
+two pure diagnostic tests on Linux, and nine early returns plus one diagnostic
+on each Mac and Windows job. Those are not live fixture acceptance. Linux's 65 composer,
+starter-picker, inherited-reply trust and image-preview guards passed, along
+with the four rich-span/modern-room-ID regressions and modified actor-setup guard.
+The supported native suites include 280 RTC core tests and 17 key-rotation tests.
+
+The Linux live harness reported 20 Rust passes. Real formatting now passed
+room/reply/thread/edit mention payloads, decrypted rich-text projection and the
+independently verified hidden-reply sender case. Typed room/thread drafts passed
+restart/isolation checks. The expanded media fixture passed encrypted opt-out,
+opt-in preview byte equality, non-image and foreign-selection rejection, and
+cleartext-room image fetches; it does not exercise the Slint decoder or viewer.
+Discovery, moderation and both search modes ran and passed after formatting.
+The new independent-check orchestration was used, but this run did not exercise
+continuation after a formatting failure because formatting succeeded.
+
+Accounts/switching, room actions, recovery and both real HTTPS OAuth phases
+passed, including refresh persistence, restart, remote logout and vault removal.
+Normal RTC and both Current/Sticky2025 fresh-device cases passed; the latter
+decrypted a renewed membership without claiming historical-key recovery.
+Stock Element Call `v0.28.0-rc.1` passed all eleven pre-synced Sticky2025 facts;
+fresh-device and Current-format Element interoperability remain open.
+
+All four invitation cases passed the thirteen sender/receipt facts. The modern
+room-ID repair allowed the actual incoming actor to discover, withdraw, resolve
+an exact one-shot key and join the admitted call in every case. Current/room
+passed all ten actor checks. Current/DM, Sticky2025/DM and Sticky2025/room failed
+`accepted_leave` with the generic `rtc` category; their other nine actor facts,
+including cleanup, passed. `accepted_leave_observed` and the subsequent
+Current/DM account-ABA assertion are not established by this run. The outer
+fixture assertion is `outgoing_ring/live_tests.rs:1234:5`; the discarded observer
+subtype prevents attributing these failures to a specific source condition.
+Quiet evidence samples cache/media state, and Joined after SDK receipt removal
+does not prove the actor processed that withdrawal. No remaining check was
+skipped; all fixture service/container/network cleanup gates passed.
+
+Windows's owned synthetic window/display fixture passed. Linux Wayland capture
+separately passed the exact named test and one-pass summary, with all 33 system
+PipeWire bindings and both stdout/stderr drains complete and untruncated. Its
+ordered diagnostic event list reached its cap. This one pass does not resolve
+the intermittent first-frame failures on previous unchanged capture inputs or
+establish installed AppImage/physical-device behavior.
+
+Four real 1440×900 native preview PNGs were captured as artifact `11712208811`.
+The archive SHA-256 is
+`c98b6e17ebc865d62a17f0ad67869d36ec3e61fc4c5127fc7398db428d42b915`.
+Archive verification checked its revision/provenance, exact file allowlist and
+PNG/RGB hashes; the actual rendered images were reviewed for fictional identities. README and
+three screenshots were published in documentation-only commit `109e451` with
+`[skip ci]`; that publication did not cancel this native run. These images are
+static preview evidence, not live UI, keyboard, screen-reader or call acceptance.
+
+Linux failed solely for the three live invitation cases; Apple Silicon, Intel
+Mac and Windows completed successfully. Every job and cache/checkout post-step
+finished. All five complete logs scanned with zero findings. All four native
+caches restored and reported “Cache up-to-date”; no new cache save is inferred.
+No installer was uploaded or package acceptance dispatched.
+
+### Next source candidate: room settings and bounded departure observation
+
+The reviewed room-settings core adds permission-checked name/topic, avatar and
+supported join-rule writes. Each operation retains the exact account selection,
+room and cancellable form; writes are not retried. A successful save advances
+only its field's baseline, preserving other unsaved baselines until explicit
+Refresh. The added live fixture runs after existing moderation assertions and
+checks concurrent topic change versus a name save, stale-baseline rejection,
+refresh, state readback, avatar privacy and permission/account rejection within
+one 180-second bound. Its nine new facts and all new Rust tests are unexecuted.
+
+The native editor adds bounded in-memory PNG/baseline-JPEG preparation, staged
+preview and explicit upload/removal/public-access confirmation. One owned file
+worker retains its permit until the OS chooser/read exits; closing the form or
+revoking its account prevents later publication or mutation steps. Encrypted-room
+avatar downloads require the existing preview opt-in. Cancellation cannot recall
+already-dispatched server writes, and baseline checks do not provide atomic CAS.
+The fifth hosted `room-settings` snapshot is a presentation-only fixture before
+account/controller initialization; it has not been captured or reviewed yet.
+Native compile, actual form/chooser/keyboard/accessibility and live settings
+acceptance remain pending. Existing README images are not replaced automatically.
+
+A separate reviewed observer/fixture change identifies only the absence of a
+matching current SDK membership event as `RosterNotCurrent`. The production
+observer still returns an error and grants no snapshot. Departure observation
+may retry only that category under the original 20-second window and membership
+expiry; malformed, duplicate, conflicting or unauthenticated entries remain fatal.
+Before the next fresh offer, the fixture also waits for the initiating client's
+actual exact own-only roster. It never refreshes membership or retries a send.
+Fixed observer/invitation subtypes preserve the next failure's cause. These
+changes are source-reviewed, not executed; the prior Current/DM occupied-call
+explanation remains a hypothesis and no generic `rtc` failure is declared fixed.
+
+The prior candidate records below retain their historical outcomes. None of
+these results closes a beta or release checkbox.
+
 ### Native suites pass; live projection and actor setup remain blocked: `4fd8071`
 
 [Run 38160617966](https://github.com/brk275/Morpheus/actions/runs/38160617966)

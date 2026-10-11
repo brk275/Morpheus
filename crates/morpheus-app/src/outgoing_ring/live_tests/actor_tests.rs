@@ -120,6 +120,62 @@ fn call_error(value: CallControllerError) {
         CallControllerError::Update(_) => "update",
     });
 }
+// Fixed enum categories preserve the failing boundary without SDK text or IDs.
+fn observer_error(value: ObserverError) {
+    error(match value {
+        ObserverError::UnsupportedDialect => "observer_unsupported_dialect",
+        ObserverError::InvalidRoom => "observer_invalid_room",
+        ObserverError::NotJoined => "observer_not_joined",
+        ObserverError::UnsupportedServer => "observer_unsupported_server",
+        ObserverError::NotEncrypted => "observer_not_encrypted",
+        ObserverError::SlotUnavailable => "observer_slot_unavailable",
+        ObserverError::Unavailable => "observer_unavailable",
+        ObserverError::TimedOut => "observer_timed_out",
+        ObserverError::Closed => "observer_closed",
+        ObserverError::InvalidMembership => "observer_invalid_membership",
+        ObserverError::RosterNotCurrent => "observer_roster_not_current",
+        ObserverError::TooManyParticipants => "observer_too_many_participants",
+    });
+}
+fn invitation_error(value: InvitationOutcome) {
+    let category = match value {
+        InvitationOutcome::Sent(_) => return,
+        InvitationOutcome::Suppressed(Suppression::Legacy) => "invitation_suppressed_legacy",
+        InvitationOutcome::Suppressed(Suppression::VoiceSpace) => {
+            "invitation_suppressed_voice_space"
+        }
+        InvitationOutcome::Suppressed(Suppression::Occupied) => "invitation_suppressed_occupied",
+        InvitationOutcome::Suppressed(Suppression::Cancelled) => "invitation_suppressed_cancelled",
+        InvitationOutcome::Failed(InvitationFailure::AccountMismatch) => {
+            "invitation_account_mismatch"
+        }
+        InvitationOutcome::Failed(InvitationFailure::CallUnavailable) => {
+            "invitation_call_unavailable"
+        }
+        InvitationOutcome::Failed(InvitationFailure::NotEncrypted) => "invitation_not_encrypted",
+        InvitationOutcome::Failed(InvitationFailure::UnsupportedServer) => {
+            "invitation_unsupported_server"
+        }
+        InvitationOutcome::Failed(InvitationFailure::VoiceSpaceCheck) => {
+            "invitation_voice_space_check"
+        }
+        InvitationOutcome::Failed(InvitationFailure::TargetCheck) => "invitation_target_check",
+        InvitationOutcome::Failed(InvitationFailure::RoomMentionForbidden) => {
+            "invitation_room_mention_forbidden"
+        }
+        InvitationOutcome::Failed(InvitationFailure::NoTargets) => "invitation_no_targets",
+        InvitationOutcome::Failed(InvitationFailure::TooManyTargets) => {
+            "invitation_too_many_targets"
+        }
+        InvitationOutcome::Failed(InvitationFailure::MembershipUnconfirmed) => {
+            "invitation_membership_unconfirmed"
+        }
+        InvitationOutcome::Failed(InvitationFailure::TimedOut) => "invitation_timed_out",
+        InvitationOutcome::Failed(InvitationFailure::Clock) => "invitation_clock",
+        InvitationOutcome::Unconfirmed => "invitation_unconfirmed",
+    };
+    error(category);
+}
 async fn bounded<T>(future: impl Future<Output = Result<T, ()>>) -> Result<T, ()> {
     time::timeout(OBSERVE_LIMIT, future)
         .await
@@ -284,9 +340,12 @@ impl ActorAcceptance {
         )
         .send(rtc)
         .await;
-        let InvitationOutcome::Sent(receipt) = result else {
-            error("unavailable");
-            return Err(());
+        let receipt = match result {
+            InvitationOutcome::Sent(receipt) => receipt,
+            other => {
+                invitation_error(other);
+                return Err(());
+            }
         };
         self.receipt = Some(receipt);
         let row = wait_offer(&self.worker.handle(), &self.account, caller, case).await?;
@@ -441,6 +500,7 @@ impl ActorAcceptance {
             info,
             case.mode,
             expiry,
+            rtc,
         )
         .await?;
         check(
@@ -801,6 +861,73 @@ fn current_expiry(
         .map(|event| event.expires_at)
         .ok_or(())
 }
+// No observation attempt resets this window. A clock rollback cannot extend
+// the monotonic deadline, and a forward jump beyond original expiry denies it.
+struct DepartureWindow {
+    deadline: Instant,
+    expiry: MilliSecondsSinceUnixEpoch,
+}
+impl DepartureWindow {
+    fn new(
+        now: Instant,
+        wall: MilliSecondsSinceUnixEpoch,
+        expiry: MilliSecondsSinceUnixEpoch,
+    ) -> Result<Self, ()> {
+        let remaining = u64::from(expiry.get()).saturating_sub(u64::from(wall.get()));
+        if remaining == 0 {
+            error("expired");
+            return Err(());
+        }
+        Ok(Self {
+            deadline: now + OBSERVE_LIMIT.min(Duration::from_millis(remaining)),
+            expiry,
+        })
+    }
+    fn valid(&self, now: Instant, wall: MilliSecondsSinceUnixEpoch) -> bool {
+        now < self.deadline && wall < self.expiry
+    }
+}
+
+fn departure_observation(
+    result: Result<morpheus_rtc::ObservedCall, ObserverError>,
+) -> Result<Option<morpheus_rtc::ObservedCall>, ObserverError> {
+    match result {
+        // Only absence of the core's referenced event is retryable. A present
+        // but malformed, duplicate, mixed or unauthenticated event is fatal.
+        Err(ObserverError::RosterNotCurrent) => Ok(None),
+        other => other.map(Some),
+    }
+}
+
+fn caller_roster_departed(
+    roster: &[ParticipantInfo],
+    caller: (&str, &str, &str),
+    departed: (&str, &str, &str),
+) -> Result<bool, ()> {
+    let mut own_count = 0;
+    let mut peer_count = 0;
+    for member in roster {
+        let exact = |identity: (&str, &str, &str)| {
+            member.user_id == identity.0
+                && member.device_id.as_deref() == Some(identity.1)
+                && member.member_id == identity.2
+        };
+        if exact(caller) && member.is_local {
+            own_count += 1;
+        } else if exact(departed) && !member.is_local {
+            peer_count += 1;
+        } else {
+            error("wrong_call");
+            return Err(());
+        }
+        if own_count > 1 || peer_count > 1 {
+            error("wrong_call");
+            return Err(());
+        }
+    }
+    Ok(own_count == 1 && peer_count == 0)
+}
+
 async fn wait_left(
     observer: &mut PassiveCallObserver,
     room: &Room,
@@ -810,6 +937,7 @@ async fn wait_left(
     caller_info: &CallInfo,
     mode: InteropMode,
     expiry: MilliSecondsSinceUnixEpoch,
+    rtc: &RtcService,
 ) -> Result<(), ()> {
     let dialect = NotificationDialect::new(
         mode,
@@ -819,30 +947,60 @@ async fn wait_left(
         &joined.slot_id,
     )
     .ok_or(())?;
-    bounded(async {
+    let window = DepartureWindow::new(Instant::now(), MilliSecondsSinceUnixEpoch::now(), expiry)?;
+    let mut diagnostic = ObserverDiagnostic::new();
+    time::timeout_at(window.deadline.into(), async {
         loop {
-            check(MilliSecondsSinceUnixEpoch::now() < expiry)?;
-            let snapshot = observer.snapshot().await.map_err(|_| error("rtc"))?;
-            check(
-                snapshot.room_id == joined.room_id
-                    && snapshot.slot_id == joined.slot_id
-                    && snapshot.mode == mode,
+            check(window.valid(Instant::now(), MilliSecondsSinceUnixEpoch::now()))?;
+            let observed = observer.snapshot().await;
+            if let Err(value) = &observed {
+                diagnostic.error(*value);
+            }
+            let snapshot = departure_observation(observed).map_err(observer_error)?;
+            // Slot network I/O may have consumed the remaining original TTL.
+            check(window.valid(Instant::now(), MilliSecondsSinceUnixEpoch::now()))?;
+            // Alice's live call roster and Bob's passive feed are independently
+            // scheduled. Require the initiating client to observe exact leave
+            // before a new OutgoingRing attempt; never retry the send itself.
+            let roster = rtc
+                .participants(&joined.room_id)
+                .map_err(|_| error("rtc"))?;
+            let caller_ready = caller_roster_departed(
+                &roster,
+                (
+                    &caller.user_id,
+                    &caller.device_id,
+                    &caller_info.membership_id,
+                ),
+                (&own.user_id, &own.device_id, &joined.membership_id),
             )?;
-            if snapshot.participants.len() == 1
-                && snapshot.participants[0].user_id == caller.user_id
-                && snapshot.participants[0].device_id == caller.device_id
-                && snapshot.participants[0].membership_id == caller_info.membership_id
-                && own_membership(room, own, joined, &dialect, mode)
-                    .map_err(|_| error("admission_trust"))?
-                    .is_none()
-            {
-                return Ok(());
+            if let Some(snapshot) = snapshot {
+                check(
+                    snapshot.room_id == joined.room_id
+                        && snapshot.slot_id == joined.slot_id
+                        && snapshot.mode == mode,
+                )?;
+                if caller_ready
+                    && snapshot.participants.len() == 1
+                    && snapshot.participants[0].user_id == caller.user_id
+                    && snapshot.participants[0].device_id == caller.device_id
+                    && snapshot.participants[0].membership_id == caller_info.membership_id
+                    && own_membership(room, own, joined, &dialect, mode)
+                        .map_err(|_| error("admission_trust"))?
+                        .is_none()
+                {
+                    diagnostic.complete();
+                    return Ok(());
+                }
+                diagnostic.record("membership_still_present");
             }
             time::sleep(Duration::from_millis(100)).await;
         }
     })
     .await
+    .map_err(|_| error("timed_out"))?
 }
+
 fn drain<T: Clone>(
     updates: &mut tokio::sync::broadcast::Receiver<T>,
     generation: u64,
@@ -942,4 +1100,90 @@ fn fixture_config_initialization_preserves_invalid_existing_input() {
     std::fs::write(store.path(), original).unwrap();
     assert!(fixture_preferences(store.clone()).is_err());
     assert_eq!(std::fs::read_to_string(store.path()).unwrap(), original);
+}
+
+#[test]
+fn departure_observation_retries_only_absent_references_never_invalid_or_closed_state() {
+    assert_eq!(
+        departure_observation(Err(ObserverError::RosterNotCurrent)),
+        Ok(None)
+    );
+    for error in [
+        ObserverError::UnsupportedDialect,
+        ObserverError::InvalidRoom,
+        ObserverError::NotJoined,
+        ObserverError::UnsupportedServer,
+        ObserverError::NotEncrypted,
+        ObserverError::SlotUnavailable,
+        ObserverError::Unavailable,
+        ObserverError::TimedOut,
+        ObserverError::Closed,
+        ObserverError::InvalidMembership,
+        ObserverError::TooManyParticipants,
+    ] {
+        assert_eq!(departure_observation(Err(error)), Err(error));
+    }
+    let exact = morpheus_rtc::ObservedCall {
+        room_id: "!room:example.org".into(),
+        slot_id: "m.call#room".into(),
+        mode: InteropMode::Current,
+        participants: vec![],
+    };
+    assert_eq!(departure_observation(Ok(exact.clone())), Ok(Some(exact)));
+}
+
+#[test]
+fn departure_window_never_extends_for_reads_or_wall_clock_changes() {
+    let now = Instant::now();
+    let wall = MilliSecondsSinceUnixEpoch(1_000_u32.into());
+    let expiry = MilliSecondsSinceUnixEpoch(6_000_u32.into());
+    let window = DepartureWindow::new(now, wall, expiry).unwrap();
+    assert_eq!(window.deadline, now + Duration::from_secs(5));
+    for elapsed in 0..5 {
+        assert!(window.valid(now + Duration::from_secs(elapsed), wall));
+    }
+    assert!(!window.valid(now + Duration::from_secs(5), wall));
+    assert!(!window.valid(now, expiry));
+    let rollback = MilliSecondsSinceUnixEpoch(500_u32.into());
+    assert!(!window.valid(now + Duration::from_secs(6), rollback));
+    let long =
+        DepartureWindow::new(now, wall, MilliSecondsSinceUnixEpoch(61_000_u32.into())).unwrap();
+    assert_eq!(long.deadline, now + OBSERVE_LIMIT);
+    assert!(DepartureWindow::new(now, wall, wall).is_err());
+}
+
+#[test]
+fn next_offer_waits_for_the_callers_exact_own_only_roster() {
+    let row = |local: bool, user: &str, device: &str, generation: &str| ParticipantInfo {
+        member_id: generation.into(),
+        user_id: user.into(),
+        device_id: Some(device.into()),
+        is_local: local,
+        reachable: true,
+        streams: vec![],
+        hand_raised_at_ms: None,
+        joined_at_ms: None,
+    };
+    let caller = ("@caller:example.org", "CALLER", "call-generation");
+    let peer = ("@peer:example.org", "PEER", "peer-generation");
+    let own = row(true, caller.0, caller.1, caller.2);
+    let departed = row(false, peer.0, peer.1, peer.2);
+    assert_eq!(caller_roster_departed(&[], caller, peer), Ok(false));
+    assert_eq!(
+        caller_roster_departed(&[own.clone(), departed], caller, peer),
+        Ok(false)
+    );
+    assert_eq!(
+        caller_roster_departed(&[own.clone()], caller, peer),
+        Ok(true)
+    );
+    assert!(caller_roster_departed(&[own.clone(), own.clone()], caller, peer).is_err());
+    for conflict in [
+        row(false, caller.0, caller.1, caller.2),
+        row(true, caller.0, "REPLACED", caller.2),
+        row(true, caller.0, caller.1, "new-generation"),
+        row(false, peer.0, peer.1, "other-generation"),
+    ] {
+        assert!(caller_roster_departed(&[own.clone(), conflict], caller, peer).is_err());
+    }
 }

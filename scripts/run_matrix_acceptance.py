@@ -61,13 +61,17 @@ LATE_JOIN_DECRYPT = re.compile(
 RTC_STAGES = frozenset(("initial_alice_roster", "initial_bob_roster", "departed_bob_roster", "rejoined_bob_roster"))
 RTC_STAGE = re.compile(r"^MORPHEUS_RTC_STAGE ([a-z_]+)$", re.MULTILINE)
 RTC_ROSTER = re.compile(r"^MORPHEUS_RTC_ROSTER expected_present=(true|false) observed_present=(true|false)$", re.MULTILINE)
-MODERATION_STAGES = frozenset(("invite_initial", "invite_after_kick", "invite_after_unban"))
+MODERATION_STAGES = frozenset(("invite_initial", "room_settings", "invite_after_kick", "invite_after_unban"))
 MODERATION_FAILURES = frozenset((
     "selected_account_changed", "room_not_found", "invalid_user_id",
     "history_sender_unverified", "history_cross_signing_missing", "sdk", "other",
 ))
 MODERATION_CHECKS = frozenset((
     "reinvite_identity_unverified", "reinvite_trust_unchanged", "reinvite_after_kick", "reinvite_after_unban",
+    "settings_permission_denial", "settings_avatar_roundtrip", "settings_encrypted_preview_opt_in",
+    "settings_avatar_remove", "settings_stale_write_rejected", "settings_access_rules_roundtrip",
+    "settings_directory_unchanged", "settings_cancelled_form_rejected",
+    "settings_text_roundtrip",
 ))
 MODERATION_STAGE = re.compile(r"^MORPHEUS_MODERATION_STAGE ([a-z_]+)$", re.MULTILINE)
 MODERATION_FAILURE = re.compile(r"^MORPHEUS_MODERATION_FAILURE ([a-z_]+)$", re.MULTILINE)
@@ -122,7 +126,7 @@ RING_FAILURE = re.compile(r"^MORPHEUS_RING_FAILURE ([a-z_]+)$", re.MULTILINE)
 RING_OBSERVER_RESULTS = frozenset((
     "unsupported_dialect", "invalid_room", "not_joined", "unsupported_server", "not_encrypted",
     "slot_unavailable", "unavailable", "timed_out", "closed", "invalid_membership",
-    "too_many_participants", "not_sampled", "empty_roster", "unexpected_roster",
+    "too_many_participants", "roster_not_current", "not_sampled", "empty_roster", "unexpected_roster",
     "current_event_mismatch", "membership_still_present", "membership_expired", "leave_unavailable",
 ))
 RING_OBSERVER = re.compile(r"^MORPHEUS_RING_OBSERVER result=([a-z_]+)$", re.MULTILINE)
@@ -153,6 +157,36 @@ INCOMING_ERRORS = frozenset((
     "wrong_call", "cancelled", "account_changed", "incoming_offer_unavailable", "room_not_loaded",
     "encryption_state", "room_state", "matrix", "rtc", "media", "worker_stopped", "timed_out",
     "cleanup", "update", "assertion",
+    "invitation_account_mismatch",
+    "invitation_call_unavailable",
+    "invitation_clock",
+    "invitation_membership_unconfirmed",
+    "invitation_no_targets",
+    "invitation_not_encrypted",
+    "invitation_room_mention_forbidden",
+    "invitation_suppressed_cancelled",
+    "invitation_suppressed_legacy",
+    "invitation_suppressed_occupied",
+    "invitation_suppressed_voice_space",
+    "invitation_target_check",
+    "invitation_timed_out",
+    "invitation_too_many_targets",
+    "invitation_unconfirmed",
+    "invitation_unsupported_server",
+    "invitation_voice_space_check",
+    "observer_closed",
+    "observer_invalid_membership",
+    "observer_invalid_room",
+    "observer_not_encrypted",
+    "observer_not_joined",
+    "observer_roster_not_current",
+    "observer_slot_unavailable",
+    "observer_timed_out",
+    "observer_too_many_participants",
+    "observer_unavailable",
+    "observer_unsupported_dialect",
+    "observer_unsupported_server",
+
 ))
 INCOMING_CHECK = re.compile(r"^MORPHEUS_INCOMING_CHECK ([a-z_]+)=(true|false)$", re.MULTILINE)
 INCOMING_STAGE = re.compile(r"^MORPHEUS_INCOMING_STAGE ([a-z_]+)$", re.MULTILINE)

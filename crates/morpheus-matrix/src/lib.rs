@@ -27,6 +27,14 @@ mod compose;
 pub use compose::{ComposeError, ComposeText, MentionSpan, MentionTarget, RestoredCompose};
 mod account_selection;
 mod admin;
+mod room_settings;
+pub use room_settings::{
+    AvatarPng, CurrentJoinRule, EditableJoinRule, JoinRuleKind, MAX_RESTRICTED_ALLOW_ROOMS,
+    MAX_ROOM_AVATAR_PIXELS, MAX_ROOM_AVATAR_PREVIEW_BYTES, MAX_ROOM_AVATAR_SIDE,
+    MAX_ROOM_AVATAR_UPLOAD_BYTES, ReadOnlyJoinRule, RoomAvatarPreview, RoomAvatarSummary,
+    RoomSettingsCancellation, RoomSettingsError, RoomSettingsPermissions, RoomSettingsSession,
+    RoomSettingsSnapshot,
+};
 mod rich_text;
 pub use account_selection::AccountSelection;
 pub use admin::RoomMemberInfo;
