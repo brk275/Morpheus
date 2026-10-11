@@ -98,7 +98,9 @@ reject invalidation, lag, changed generations and expired receipts.
 The hosted invitation cases now require Bob to discover the authenticated
 notification through sync before receiving Alice's event ID, then verify GET,
 the referenced participation, and sync-cache removal on redaction before expiry.
-These new receipt checks still need hosted execution. The cache is not persisted;
+[Run 38127191100](https://github.com/brk275/Morpheus/actions/runs/38127191100)
+passed those receipt checks for all four Current/Sticky2025 DM/room cases at
+`139460d`. The cache is not persisted;
 fresh-sync/offline replay, delayed-key integration, sound, incoming call UI and
 stock Element receipt remain explicit acceptance work. A receipt alone grants
 no permission to start capture or join a call.
@@ -119,8 +121,22 @@ account selection.
 The four hosted invitation cases now also require Bob's passive observer to
 see only Alice's authenticated current membership, then observe its removal
 after Alice leaves and before natural expiry. These checks reuse the existing
-fixtures and time budget; **live validation is pending**. This adapter does not
-implement an incoming-call banner, Accept/Dismiss actions or audible ringing.
+fixtures and time budget. On [run 38129843715](https://github.com/brk275/Morpheus/actions/runs/38129843715)
+all four cases failed before notification receipt in the combined membership/
+observer stage, despite passing the five observer unit tests. The next candidate
+separates open/roster/leave stages and reports fixed failure categories; live
+acceptance remains open. This adapter does not implement an incoming-call
+banner, Accept/Dismiss actions or audible ringing.
+
+The app's incoming admission boundary additionally checks current local device
+trust against the original encryption/signing keys, strict push/ignore policy,
+the referenced membership and this passive roster. It keeps one bounded replay
+ledger across account switches, captures the semantic deadline before network
+work, and permanently withdraws an offer on failed or cancelled revalidation. The four live
+invitation cases exercise this boundary before and after receipt redaction;
+hosted validation of the new admission path is pending. UI change subscriptions,
+Accept with cancellation through joining, sound and offline replay are still
+separate work. Admission itself neither joins a call nor enables capture.
 
 ## Native devices
 

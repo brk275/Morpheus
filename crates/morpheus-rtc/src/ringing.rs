@@ -321,6 +321,27 @@ impl RingNotification {
         {
             return Err(E::NotTargeted);
         }
+        self.window_at(now_ms)
+    }
+
+    /// Compute only the notification's untrusted time window at receipt time.
+    ///
+    /// This grants no permission to ring, present an offer or join: it does
+    /// not check the recipient, sender trust, membership, room policy or call
+    /// state. Those checks still belong in [`Self::validate_for`] and the host.
+    ///
+    /// Capture this before the first network await and immediately translate
+    /// `remaining_ms` to a monotonic deadline. Keep that first deadline as an
+    /// upper bound: tolerated future timestamps can make a later evaluation
+    /// produce a later expiry, and a wall-clock adjustment can change the
+    /// remaining time. Revalidation may shorten the bound, never replace it
+    /// with a longer one. The host must also cap it by the retained receipt's
+    /// own expiry and prevent replay from establishing a new deadline.
+    pub fn window_at(&self, now_ms: u64) -> Result<RingWindow, RingIneligible> {
+        use RingIneligible as E;
+        if now_ms > MAX_SAFE_INTEGER {
+            return Err(E::InvalidContext);
+        }
         let start = if self.sender_ts_ms.abs_diff(self.origin_server_ts_ms) > MAX_CLOCK_SKEW_MS {
             self.origin_server_ts_ms
         } else {
@@ -715,6 +736,66 @@ mod tests {
         assert_eq!(
             parse(&event()).unwrap().validate_for(&context(), u64::MAX),
             Err(RingIneligible::InvalidContext)
+        );
+    }
+
+    #[test]
+    fn first_receipt_window_precedes_network_and_is_not_replaced_by_a_later_window() {
+        let mut value = event();
+        value["content"]["sender_ts"] = json!(110000);
+        let ring = parse(&value).unwrap();
+        let first = ring.window_at(100000).unwrap();
+        assert_eq!(
+            first,
+            RingWindow {
+                expires_at_ms: 130000,
+                remaining_ms: 30000,
+            }
+        );
+        // Twelve seconds of admission work later, the sender timestamp is no
+        // longer in the future. Recomputing alone would move the deadline ten
+        // seconds later; the host must retain its first monotonic upper bound.
+        let after_network = ring.validate_for(&context(), 112000).unwrap();
+        assert_eq!(after_network, ring.window_at(112000).unwrap());
+        assert_eq!(after_network.expires_at_ms, 140000);
+        assert_eq!(after_network.remaining_ms, 28000);
+        let first_deadline_ms = first.remaining_ms;
+        let proposed_later_deadline_ms = 12000 + after_network.remaining_ms;
+        assert_eq!(first_deadline_ms.min(proposed_later_deadline_ms), 30000);
+    }
+
+    #[test]
+    fn standalone_window_does_not_authorize_an_untargeted_call() {
+        let mut value = event();
+        value["content"]["m.mentions"] = json!({"user_ids": ["@someone:example.org"]});
+        let ring = parse(&value).unwrap();
+        assert!(ring.window_at(100000).is_ok());
+        assert_eq!(
+            ring.validate_for(&context(), 100000),
+            Err(RingIneligible::NotTargeted)
+        );
+    }
+
+    #[test]
+    fn standalone_window_rejects_expired_future_and_out_of_range_clock_values() {
+        let ring = parse(&event()).unwrap();
+        for now in [130000, MAX_SAFE_INTEGER] {
+            assert_eq!(ring.window_at(now), Err(RingIneligible::Expired));
+        }
+        assert_eq!(ring.window_at(0), Err(RingIneligible::FutureTimestamp));
+        for now in [MAX_SAFE_INTEGER + 1, u64::MAX] {
+            assert_eq!(ring.window_at(now), Err(RingIneligible::InvalidContext));
+        }
+        let mut value = event();
+        value["origin_server_ts"] = json!(MAX_SAFE_INTEGER);
+        value["content"]["sender_ts"] = json!(MAX_SAFE_INTEGER);
+        let boundary = parse(&value).unwrap().window_at(MAX_SAFE_INTEGER).unwrap();
+        assert_eq!(boundary.remaining_ms, 30000);
+        assert_eq!(boundary.expires_at_ms, MAX_SAFE_INTEGER + 30000);
+        value["content"]["lifetime"] = json!(0);
+        assert_eq!(
+            parse(&value).unwrap().window_at(MAX_SAFE_INTEGER),
+            Err(RingIneligible::Expired)
         );
     }
 

@@ -1,6 +1,7 @@
 import os
 import contextlib
 import io
+import json
 from pathlib import Path
 import re
 import sys
@@ -738,6 +739,12 @@ class OutgoingRingTests(unittest.TestCase):
         self.assertEqual(facts, acceptance_module.RING_CHECKS)
         self.assertEqual(set(re.findall(r'Self::\w+ => "([a-z_]+)"', source)),
                          acceptance_module.RING_STAGES)
+        observer_results = set(re.findall(r'ObserverError::\w+ => "([a-z_]+)"', source))
+        observer_results.update(re.findall(r'diagnostic.record\("([a-z_]+)"\)', source))
+        observer_results.add("not_sampled")
+        self.assertEqual(observer_results, acceptance_module.RING_OBSERVER_RESULTS)
+        self.assertIn('Self(Some("not_sampled"))', source)
+        self.assertIn('\\nMORPHEUS_RING_OBSERVER result={result}', source)
 
     def output(self):
         facts = "\n".join(f"MORPHEUS_RING_CHECK {name}=true" for name in sorted(acceptance_module.RING_CHECKS))
@@ -756,6 +763,7 @@ class OutgoingRingTests(unittest.TestCase):
                    complete.replace("MORPHEUS_RING_RESULT passed=true", ""),
                    complete + "MORPHEUS_RING_RESULT passed=false\n",
                    complete + "MORPHEUS_RING_FAILURE cleanup\n",
+                   complete + "MORPHEUS_RING_OBSERVER result=empty_roster\n",
                    complete + "MORPHEUS_RING_RESULT passed=true\n",
                    "Skipped live checks\n" + complete,
                    complete + "test result: ok. 0 passed; 0 failed; 0 ignored;\n"]
@@ -791,6 +799,36 @@ class OutgoingRingTests(unittest.TestCase):
         ))
         self.assertEqual(acceptance_module.ring_diagnostics(output), {
             "checks": {"cleanup": False}, "stage": "redact", "failure": "redaction", "passed": False,
+        })
+
+    def test_observer_diagnostics_preserve_only_fixed_categories(self):
+        for category in acceptance_module.RING_OBSERVER_RESULTS:
+            with self.subTest(category=category):
+                output = f"MORPHEUS_RING_OBSERVER result={category}\n"
+                self.assertEqual(acceptance_module.ring_diagnostics(output), {
+                    "checks": {}, "observer_result": category,
+                })
+        for stage in ("observer_open", "observer_roster", "observer_leave"):
+            with self.subTest(stage=stage):
+                output = f"MORPHEUS_RING_STAGE {stage}\nMORPHEUS_RING_FAILURE {stage}\n"
+                self.assertEqual(acceptance_module.ring_diagnostics(output), {
+                    "checks": {}, "stage": stage, "failure": stage,
+                })
+
+    def test_observer_diagnostics_reject_suffixes_unknown_payloads_and_prefixed_lines(self):
+        valid = "MORPHEUS_RING_OBSERVER result=current_event_mismatch"
+        malformed = (
+            valid + " private-event", "private-prefix " + valid,
+            "MORPHEUS_RING_OBSERVER result=private_server_error",
+            "MORPHEUS_RING_OBSERVER result=InvalidMembership",
+            "MORPHEUS_RING_OBSERVER event_id=empty_roster",
+            "MORPHEUS_RING_OBSERVER result=empty_roster\\nprivate-payload",
+        )
+        for line in malformed:
+            with self.subTest(line=line):
+                self.assertEqual(acceptance_module.ring_diagnostics(line + "\n"), {"checks": {}})
+        self.assertEqual(acceptance_module.ring_diagnostics(valid + "\n" + "\n".join(malformed)), {
+            "checks": {}, "observer_result": "current_event_mismatch",
         })
 
     def test_four_cases_use_fresh_fixtures_and_the_same_exact_ignored_app_test(self):
@@ -904,6 +942,93 @@ class OutgoingRingTests(unittest.TestCase):
 
 
 class ScopedContinuationTests(unittest.TestCase):
+    def test_failed_observer_publishes_fixed_stage_and_result_only_after_scan(self):
+        output = ("running 1 test\nMORPHEUS_RING_STAGE observer_roster\n"
+                  "MORPHEUS_RING_OBSERVER result=slot_unavailable\n"
+                  "MORPHEUS_RING_FAILURE observer_roster\n"
+                  "MORPHEUS_RING_OBSERVER result=private-server-data\n"
+                  "MORPHEUS_RING_CHECK cleanup=true\nprivate-account-event-key\n")
+        for scanner_code in (0, 1):
+            with self.subTest(scanner_code=scanner_code), tempfile.TemporaryDirectory() as folder:
+                runner = Acceptance(Path(folder), "scanner")
+                with self.contained_child(runner, output, scanner_code=scanner_code) as (
+                    visible, _, _, _, _, scanner,
+                ), self.assertRaises(RuntimeError):
+                    runner.run("outgoing-ring-current-dm", ["test"],
+                               ring_case=("current", "dm"), pid_namespace=True)
+                scanner.assert_called_once()
+                self.assertNotIn("private-server-data", visible.getvalue())
+                self.assertNotIn("private-account-event-key", visible.getvalue())
+                if scanner_code == 0:
+                    evidence = json.loads(next(
+                        line for line in visible.getvalue().splitlines() if line.startswith("{")
+                    ))
+                    self.assertEqual(evidence["ring_diagnostics"], {
+                        "checks": {"cleanup": True}, "stage": "observer_roster",
+                        "failure": "observer_roster", "observer_result": "slot_unavailable",
+                    })
+                else:
+                    self.assertNotIn("observer_result", visible.getvalue())
+
+    def test_late_join_decryption_accepts_only_fixed_categories_and_sampled_booleans(self):
+        for category in acceptance_module.LATE_JOIN_DECRYPT_RESULTS:
+            with self.subTest(category=category):
+                output = ("MORPHEUS_RTC_LATE_JOIN_DECRYPT alice_current=true "
+                          f"bob_current=false result={category}\n")
+                self.assertEqual(acceptance_module.rtc_diagnostics(output), {
+                    "late_join_decryption": {
+                        "alice_current": True, "bob_current": False, "result": category,
+                    },
+                })
+        self.assertEqual(acceptance_module.rtc_diagnostics(
+            "MORPHEUS_RTC_LATE_JOIN_DECRYPT alice_current=false bob_current=false result=unavailable\n"
+        ), {"late_join_decryption": {
+            "alice_current": False, "bob_current": False, "result": "unavailable",
+        }})
+
+    def test_late_join_decryption_rejects_unknown_or_embellished_markers(self):
+        valid = ("MORPHEUS_RTC_LATE_JOIN_DECRYPT alice_current=true "
+                 "bob_current=false result=MissingMegolmSession")
+        for invalid in (
+            valid + " private-event-id", "private-prefix " + valid,
+            valid.replace("MissingMegolmSession", "PrivateError"),
+            valid.replace("alice_current=true", "alice_current=private"),
+            valid.replace("bob_current=false", "bob_current=0"),
+            valid.replace("result=", "event_id="),
+        ):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(acceptance_module.rtc_diagnostics(invalid + "\n"), {})
+        self.assertEqual(acceptance_module.rtc_diagnostics(valid + "\n" + invalid + "\n"), {
+            "late_join_decryption": {
+                "alice_current": True, "bob_current": False, "result": "MissingMegolmSession",
+            },
+        })
+
+    def test_failed_late_join_publishes_decryption_only_after_clean_scan(self):
+        output = ("running 1 test\nMORPHEUS_RTC_STAGE initial_bob_roster\n"
+                  "MORPHEUS_RTC_ROSTER expected_present=true observed_present=false\n"
+                  "MORPHEUS_RTC_LATE_JOIN_DECRYPT alice_current=true bob_current=false "
+                  "result=UnknownMegolmMessageIndex\nprivate-event-key-error\n")
+        for scanner_code in (0, 1):
+            with self.subTest(scanner_code=scanner_code), tempfile.TemporaryDirectory() as folder:
+                runner = Acceptance(Path(folder), "scanner")
+                with self.contained_child(runner, output, scanner_code=scanner_code) as (
+                    visible, _, _, _, _, scanner,
+                ), self.assertRaises(RuntimeError):
+                    runner.run("local_rtc-late-join", ["test"], test=True, pid_namespace=True)
+                scanner.assert_called_once()
+                self.assertNotIn("private-event-key-error", visible.getvalue())
+                if scanner_code == 0:
+                    evidence = json.loads(next(
+                        line for line in visible.getvalue().splitlines() if line.startswith("{")
+                    ))
+                    self.assertEqual(evidence["rtc_diagnostics"]["late_join_decryption"], {
+                        "alice_current": True, "bob_current": False,
+                        "result": "UnknownMegolmMessageIndex",
+                    })
+                else:
+                    self.assertNotIn("late_join_decryption", visible.getvalue())
+
     def test_rtc_diagnostics_reject_ids_unknown_stages_suffixes_and_unobserved_defaults(self):
         self.assertEqual(acceptance_module.rtc_diagnostics("private server response"), {})
         output = ("MORPHEUS_RTC_STAGE initial_bob_roster\n"

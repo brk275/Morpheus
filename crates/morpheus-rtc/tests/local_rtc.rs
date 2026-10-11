@@ -9,7 +9,12 @@ use std::{collections::HashMap, fs, path::PathBuf, time::Duration};
 use futures_util::StreamExt;
 use livekit::SimulateScenario;
 use matrix_rtc_call_sdk::CallEvent;
-use matrix_sdk::{Client, ruma::api::client::uiaa};
+use matrix_sdk::{
+    Client,
+    config::RequestConfig,
+    deserialized_responses::{TimelineEventKind, UnableToDecryptReason, VerificationState},
+    ruma::api::client::uiaa,
+};
 use morpheus_matrix::{AccountInfo, AccountManager, SyncBackend, SyncStatus};
 #[cfg(feature = "device-screen")]
 use morpheus_rtc::ScreenCapture;
@@ -247,12 +252,93 @@ async fn bootstrap_test_identity(client: &Client, account: &TestAccount) {
     );
 }
 
+struct LateJoinDiagnostic<'a> {
+    alice: &'a Client,
+    alice_account: &'a AccountInfo,
+    bob: &'a Client,
+    membership_id: &'a str,
+}
+
+impl LateJoinDiagnostic<'_> {
+    async fn emit(&self, room_id: &str) {
+        let mut alice_current = false;
+        let mut bob_current = false;
+        let result = timeout(Duration::from_secs(5), async {
+            let room_id = matrix_sdk::ruma::RoomId::parse(room_id).ok()?;
+            let alice_room = self.alice.get_room(&room_id)?;
+            let bob_room = self.bob.get_room(&room_id)?;
+            // Select the current encrypted event, not the join's original ID
+            // or a guessed event received by Bob. Trust here is Alice's own
+            // verified local metadata; the fetch below diagnoses decryption
+            // and does not claim that Bob has verified Alice's identity.
+            let live = alice_room.sticky_events().live();
+            let mut matching = live.iter().filter(|entry| {
+                entry.key.sticky_key == self.membership_id
+                    && matches!(
+                        entry.key.event_type.to_string().as_str(),
+                        "m.rtc.member" | "org.matrix.msc4143.rtc.member"
+                    )
+                    && entry.encryption_info().is_some_and(|info| {
+                        info.verification_state == VerificationState::Verified
+                            && info.sender.as_str() == self.alice_account.user_id
+                            && entry.key.sender == info.sender
+                            && info.sender_device.as_deref().map(|id| id.as_str())
+                                == Some(self.alice_account.device_id.as_str())
+                    })
+            });
+            let event_id = matching.next()?.event_id.clone();
+            if matching.next().is_some() {
+                return None;
+            }
+            alice_current = true;
+            // This is sampled before the diagnostic GET. A successful fetch
+            // is not evidence that Bob's sticky sync map delivered the entry.
+            bob_current = bob_room
+                .sticky_events()
+                .live()
+                .iter()
+                .any(|entry| entry.event_id == event_id);
+            let event = bob_room
+                .event(
+                    &event_id,
+                    Some(
+                        RequestConfig::new()
+                            .retry_limit(0)
+                            .timeout(Duration::from_secs(5)),
+                    ),
+                )
+                .await
+                .ok()?;
+            if event.kind.parse_event_id().as_ref() != Some(&event_id) {
+                return None;
+            }
+            Some(match &event.kind {
+                TimelineEventKind::Decrypted(_) => "decrypted",
+                TimelineEventKind::UnableToDecrypt { utd_info, .. } => match &utd_info.reason {
+                    UnableToDecryptReason::MissingMegolmSession { .. } => "MissingMegolmSession",
+                    UnableToDecryptReason::UnknownMegolmMessageIndex => "UnknownMegolmMessageIndex",
+                    _ => "otherUTD",
+                },
+                TimelineEventKind::PlainText { .. } => "unavailable",
+            })
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or("unavailable");
+        eprintln!(
+            "\nMORPHEUS_RTC_LATE_JOIN_DECRYPT alice_current={alice_current} bob_current={bob_current} result={result}"
+        );
+    }
+}
+
 async fn wait_for_peer(
     rtc: &RtcService,
     room_id: &str,
     peer_user_id: &str,
     present: bool,
     phase: RosterPhase,
+    late_join_diagnostic: Option<LateJoinDiagnostic<'_>>,
 ) {
     // Start a new line even when libtest has left its test-name prefix open.
     // Never put room, user, device, membership or transport values in markers.
@@ -278,6 +364,12 @@ async fn wait_for_peer(
             eprintln!(
                 "\nMORPHEUS_RTC_ROSTER expected_present={present} observed_present={observed}"
             );
+        }
+        // The roster has already failed its unchanged 45-second deadline.
+        // Diagnose only this late-join failure, without retries, key imports,
+        // trust changes or membership refreshes that could change acceptance.
+        if let Some(diagnostic) = late_join_diagnostic {
+            diagnostic.emit(room_id).await;
         }
     }
     result.expect("Peer did not reach the expected roster presence");
@@ -692,7 +784,7 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
             prepared
         }
     };
-    let mut bob_rtc = RtcService::new(bob_client);
+    let mut bob_rtc = RtcService::new(bob_client.clone());
     timeout(Duration::from_secs(30), async {
         loop {
             if bob_rtc
@@ -722,6 +814,7 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
         &bob_account.user_id,
         true,
         RosterPhase::InitialAlice,
+        None,
     )
     .await;
     wait_for_peer(
@@ -730,6 +823,12 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
         &alice_account.user_id,
         true,
         RosterPhase::InitialBob,
+        late_join.then_some(LateJoinDiagnostic {
+            alice: &alice_client,
+            alice_account: &alice_account,
+            bob: &bob_client,
+            membership_id: &alice_call.membership_id,
+        }),
     )
     .await;
     timeout(Duration::from_secs(30), async {
@@ -885,6 +984,7 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
         &bob_account.user_id,
         false,
         RosterPhase::DepartedBob,
+        None,
     )
     .await;
     let rotated_key_index = timeout(Duration::from_secs(40), async {
@@ -930,6 +1030,7 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
         &bob_account.user_id,
         true,
         RosterPhase::RejoinedBob,
+        None,
     )
     .await;
     timeout(Duration::from_secs(30), async {

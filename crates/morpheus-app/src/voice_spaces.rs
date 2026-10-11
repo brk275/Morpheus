@@ -45,6 +45,14 @@ impl VoiceSpaces {
         *self.config.write().expect("voice config lock poisoned") = config.clone();
     }
 
+    #[cfg(feature = "native-calls")]
+    pub fn notifications_enabled(&self, account_id: &str) -> bool {
+        self.config
+            .read()
+            .expect("voice config lock poisoned")
+            .notifications_enabled_for(account_id)
+    }
+
     pub fn local_rooms(&self, account_id: &str) -> HashSet<String> {
         let config = self.config.read().expect("voice config lock poisoned");
         config

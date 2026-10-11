@@ -51,6 +51,13 @@ LIVE_STAGES = frozenset((
 ))
 LIVE_STAGE = re.compile(r"^MORPHEUS_LIVE_STAGE ([a-z_]+)$", re.MULTILINE)
 LATE_JOIN_EVIDENCE = re.compile(r"^MORPHEUS_RTC_LATE_JOIN historical_member=(true|false)$", re.MULTILINE)
+LATE_JOIN_DECRYPT_RESULTS = frozenset((
+    "decrypted", "MissingMegolmSession", "UnknownMegolmMessageIndex", "otherUTD", "unavailable",
+))
+LATE_JOIN_DECRYPT = re.compile(
+    r"^MORPHEUS_RTC_LATE_JOIN_DECRYPT alice_current=(true|false) bob_current=(true|false) result=([A-Za-z]+)$",
+    re.MULTILINE,
+)
 RTC_STAGES = frozenset(("initial_alice_roster", "initial_bob_roster", "departed_bob_roster", "rejoined_bob_roster"))
 RTC_STAGE = re.compile(r"^MORPHEUS_RTC_STAGE ([a-z_]+)$", re.MULTILINE)
 RTC_ROSTER = re.compile(r"^MORPHEUS_RTC_ROSTER expected_present=(true|false) observed_present=(true|false)$", re.MULTILINE)
@@ -107,10 +114,18 @@ RING_CHECK = re.compile(r"^MORPHEUS_RING_CHECK ([a-z_]+)=(true|false)$", re.MULT
 RING_RESULT = re.compile(r"^MORPHEUS_RING_RESULT passed=(true|false)$", re.MULTILINE)
 RING_STAGES = frozenset((
     "fixture", "login", "sticky_sync", "own_crypto", "peer_trust", "targets", "join", "membership",
-    "send", "receive", "fetch", "validate", "redact", "redaction", "receipt_redaction", "cleanup",
+    "observer_open", "observer_roster", "observer_leave",
+    "send", "receive", "fetch", "validate", "admission", "revalidate", "redact", "redaction", "receipt_redaction", "withdraw", "cleanup",
 ))
 RING_STAGE = re.compile(r"^MORPHEUS_RING_STAGE ([a-z_]+)$", re.MULTILINE)
 RING_FAILURE = re.compile(r"^MORPHEUS_RING_FAILURE ([a-z_]+)$", re.MULTILINE)
+RING_OBSERVER_RESULTS = frozenset((
+    "unsupported_dialect", "invalid_room", "not_joined", "unsupported_server", "not_encrypted",
+    "slot_unavailable", "unavailable", "timed_out", "closed", "invalid_membership",
+    "too_many_participants", "not_sampled", "empty_roster", "unexpected_roster",
+    "current_event_mismatch", "membership_still_present", "membership_expired", "leave_unavailable",
+))
+RING_OBSERVER = re.compile(r"^MORPHEUS_RING_OBSERVER result=([a-z_]+)$", re.MULTILINE)
 RING_CASES = tuple((mode, target) for mode in ("current", "sticky-2025") for target in ("dm", "room"))
 CHAT_CHECKS = (*CHAT_TESTS, "search_local-classic")
 OAUTH_LABELS = tuple("oauth-local-" + phase.replace("_", "-") for phase in OAUTH_PHASES)
@@ -164,7 +179,7 @@ def live_diagnostics(output: str) -> dict:
 
 
 def rtc_diagnostics(output: str) -> dict:
-    """Only a fixed call-roster stage and actually sampled presence booleans."""
+    """Only fixed call-roster/decryption categories and sampled booleans."""
     result = {}
     stages = [stage for stage in RTC_STAGE.findall(output) if stage in RTC_STAGES]
     if stages:
@@ -173,6 +188,15 @@ def rtc_diagnostics(output: str) -> dict:
     if observations:
         expected, observed = observations[-1]
         result.update(expected_present=expected == "true", observed_present=observed == "true")
+    decryption = [
+        (alice, bob, category) for alice, bob, category in LATE_JOIN_DECRYPT.findall(output)
+        if category in LATE_JOIN_DECRYPT_RESULTS
+    ]
+    if decryption:
+        alice, bob, category = decryption[-1]
+        result["late_join_decryption"] = {
+            "alice_current": alice == "true", "bob_current": bob == "true", "result": category,
+        }
     return result
 
 
@@ -194,6 +218,9 @@ def ring_diagnostics(output: str) -> dict:
         diagnostics["stage"] = stages[-1]
     if failures:
         diagnostics["failure"] = failures[-1]
+    observer = [value for value in RING_OBSERVER.findall(output) if value in RING_OBSERVER_RESULTS]
+    if observer:
+        diagnostics["observer_result"] = observer[-1]
     results = RING_RESULT.findall(output)
     if results:
         diagnostics["passed"] = all(value == "true" for value in results)
@@ -207,6 +234,7 @@ def ring_passed_tests(output: str) -> int:
     if (passed_tests(output) != 1 or len(RESULT.findall(output)) != 1 or len(named) != 1
             or any(checks.get(name) is not True for name in RING_CHECKS)
             or "failure" in ring_diagnostics(output)
+            or "observer_result" in ring_diagnostics(output)
             or RING_RESULT.findall(output) != ["true"]):
         raise RuntimeError("Outgoing ring acceptance evidence is incomplete")
     return 1

@@ -141,6 +141,57 @@ class WaylandFixtureTests(unittest.TestCase):
         self.assertFalse(MODULE.capture_test_passed(target + summary.replace("1 passed", "0 passed")))
         self.assertFalse(MODULE.capture_test_passed(target.replace("ok", "FAILED") + summary))
 
+    def test_capture_proof_reports_missing_name_and_summary_separately(self):
+        target = f"test {MODULE.TARGET_TEST} ... ok\n"
+        summary = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out;\n"
+        for output, name_ok, summary_ok in [(target, True, False), (summary, False, True),
+                                             (target + summary, True, True)]:
+            facts = MODULE.capture_test_facts(output, 0, "complete")
+            self.assertEqual(facts["named_test_passed"], name_ok)
+            self.assertEqual(facts["single_pass_summary"], summary_ok)
+            self.assertEqual(facts["required_test_passed"], name_ok and summary_ok)
+        # Neither a successful wrapper nor a final stage manufactures proof.
+        self.assertFalse(MODULE.capture_test_facts("", 0, "complete")["required_test_passed"])
+
+    def test_stderr_cannot_supply_a_missing_result_or_zero_test_proof(self):
+        target = f"test {MODULE.TARGET_TEST} ... ok\n"
+        summary = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out;\n"
+        facts = MODULE.capture_test_facts(summary, 0, "complete", stderr=target)
+        self.assertFalse(facts["named_test_passed"])
+        self.assertTrue(facts["single_pass_summary"])
+        self.assertFalse(facts["required_test_passed"])
+        zero = summary.replace("1 passed", "0 passed")
+        facts = MODULE.capture_test_facts(zero, 0, stderr=target + summary)
+        self.assertTrue(facts["zero_tests_passed"])
+        self.assertFalse(facts["required_test_passed"])
+
+    def test_result_proof_rejects_duplicate_and_conflicting_records(self):
+        target = f"test {MODULE.TARGET_TEST} ... ok\n"
+        summary = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out;\n"
+        for output in (target * 2 + summary, target + summary * 2,
+                       target + target.replace("ok", "FAILED") + summary,
+                       target + summary + summary.replace("ok.", "FAILED.")):
+            self.assertFalse(MODULE.capture_test_passed(output))
+            self.assertFalse(MODULE.capture_test_completed(output))
+
+    def test_native_stderr_diagnostics_remain_fixed_and_private(self):
+        facts = MODULE.capture_test_facts("", 101, stderr=(
+            "private identity (signal: 6, SIGABRT: private native error)\n"
+            "panic in a function that cannot unwind\n"))
+        self.assertEqual(facts["test_signal"], 6)
+        self.assertTrue(facts["non_unwinding_panic"])
+        self.assertFalse(facts["required_test_passed"])
+        self.assertNotIn("private", MODULE.json.dumps(facts))
+
+    def test_private_client_retains_its_distinct_exact_result_name(self):
+        target = f"test {MODULE.PROBE_TEST} ... ok\n"
+        summary = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out;\n"
+        facts = MODULE.capture_test_facts(target + summary, 0, private_client=True)
+        self.assertTrue(facts["named_test_passed"])
+        self.assertTrue(facts["single_pass_summary"])
+        self.assertTrue(facts["required_test_passed"])
+        self.assertFalse(MODULE.capture_test_facts(target + summary, 0)["required_test_passed"])
+
     def test_diagnostics_only_emit_literal_facts_not_service_text(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -592,6 +643,101 @@ class OrderedDeliveryTraceTests(unittest.TestCase):
                 self.assertTrue(sink.output.closed)
             finally:
                 os.close(write_fd)
+
+
+class CaptureStreamTests(unittest.TestCase):
+    def test_native_trace_cannot_split_serial_libtest_stdout(self):
+        for private_client in (False, True):
+            with self.subTest(private_client=private_client), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                out_read, out_write = os.pipe()
+                err_read, err_write = os.pipe()
+                process = mock.Mock(stdout=os.fdopen(out_read, "rb", buffering=0),
+                                    stderr=os.fdopen(err_read, "rb", buffering=0))
+                with MODULE.CappedPrivateLog(root / "stdout") as stdout, \
+                     MODULE.CappedPrivateLog(root / "stderr") as stderr:
+                    try:
+                        MODULE.attach_capture_logs(process, stdout, stderr)
+                        name = MODULE.PROBE_TEST if private_client else MODULE.TARGET_TEST
+                        prefix = f"test {name} ... ".encode()
+                        trace = b"[D] pw.stream [stream.c:717 impl_send_command()] 0x123: start 0\n"
+                        suffix = (b"ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; "
+                                  b"0 measured; 3 filtered out; finished in 1.00s\n")
+                        os.write(out_write, prefix)
+                        os.write(err_write, trace)
+                        os.write(out_write, suffix)
+                    finally:
+                        os.close(out_write)
+                        os.close(err_write)
+                        stdout.finish()
+                        stderr.finish()
+                    self.assertTrue(MODULE.complete_capture_logs(stdout, stderr))
+                    evidence = (root / "stdout").read_text()
+                    self.assertTrue(MODULE.capture_test_passed(evidence, private_client=private_client))
+                    self.assertEqual((root / "stderr").read_bytes(), trace)
+                    # The former merged-pipe layout loses exact named proof.
+                    self.assertFalse(MODULE.capture_test_passed(
+                        (prefix + trace + suffix).decode(), private_client=private_client))
+                    self.assertEqual((root / "stdout").stat().st_mode & 0o777, 0o600)
+                    self.assertEqual((root / "stderr").stat().st_mode & 0o777, 0o600)
+                self.assertTrue(process.stdout.closed)
+                self.assertTrue(process.stderr.closed)
+
+    def test_either_reader_start_failure_retains_both_pipe_owners(self):
+        for failing in ("stdout", "stderr"):
+            with self.subTest(failing=failing), tempfile.TemporaryDirectory() as directory:
+                out_read, out_write = os.pipe()
+                err_read, err_write = os.pipe()
+                process = mock.Mock(stdout=os.fdopen(out_read, "rb", buffering=0),
+                                    stderr=os.fdopen(err_read, "rb", buffering=0))
+                with MODULE.CappedPrivateLog(Path(directory) / "stdout") as stdout, \
+                     MODULE.CappedPrivateLog(Path(directory) / "stderr") as stderr:
+                    try:
+                        failed = stdout if failing == "stdout" else stderr
+                        with mock.patch.object(failed, "attach", side_effect=RuntimeError("private start failure")):
+                            with self.assertRaises(RuntimeError):
+                                MODULE.attach_capture_logs(process, stdout, stderr)
+                        self.assertIs(stdout.source, process.stdout)
+                        self.assertIs(stderr.source, process.stderr)
+                    finally:
+                        os.close(out_write)
+                        os.close(err_write)
+                        stdout.finish()
+                        stderr.finish()
+                    self.assertFalse(MODULE.complete_capture_logs(stdout, stderr))
+                self.assertTrue(process.stdout.closed)
+                self.assertTrue(process.stderr.closed)
+                self.assertTrue(stdout.output.closed)
+                self.assertTrue(stderr.output.closed)
+
+    def test_each_stream_has_an_independent_limit_and_drain_requirement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            out_read, out_write = os.pipe()
+            err_read, err_write = os.pipe()
+            process = mock.Mock(stdout=os.fdopen(out_read, "rb", buffering=0),
+                                stderr=os.fdopen(err_read, "rb", buffering=0))
+            with MODULE.CappedPrivateLog(Path(directory) / "stdout", limit=8) as stdout, \
+                 MODULE.CappedPrivateLog(Path(directory) / "stderr", limit=16) as stderr:
+                try:
+                    MODULE.attach_capture_logs(process, stdout, stderr)
+                    os.write(out_write, b"o" * 2048)
+                    os.write(err_write, b"e" * 2048)
+                finally:
+                    os.close(out_write)
+                    os.close(err_write)
+                    stdout.finish()
+                    stderr.finish()
+                self.assertTrue(stdout.drained and stderr.drained)
+                self.assertTrue(stdout.truncated and stderr.truncated)
+                self.assertEqual(stdout.written, 8)
+                self.assertEqual(stderr.written, 16)
+                self.assertFalse(MODULE.complete_capture_logs(stdout, stderr))
+        for field, value in (("drained", False), ("failed", True), ("truncated", True)):
+            for invalid_index in range(2):
+                logs = [mock.Mock(drained=True, failed=False, truncated=False) for _ in range(2)]
+                self.assertTrue(MODULE.complete_capture_logs(*logs))
+                setattr(logs[invalid_index], field, value)
+                self.assertFalse(MODULE.complete_capture_logs(*logs))
 
 
 class DeliveryTraceTests(unittest.TestCase):

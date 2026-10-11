@@ -351,6 +351,20 @@ class CappedPrivateLog:
             raise RuntimeError("Wayland private trace did not stop")
 
 
+def attach_capture_logs(process, stdout_log: CappedPrivateLog, stderr_log: CappedPrivateLog) -> None:
+    # Own both wrappers before starting either reader. If a reader cannot
+    # start, the surrounding owned-process cleanup and both log contexts still
+    # close every pipe; the unstarted peer is not left to Popen finalization.
+    stdout_log.source = process.stdout
+    stderr_log.source = process.stderr
+    stdout_log.attach(process.stdout)
+    stderr_log.attach(process.stderr)
+
+
+def complete_capture_logs(*logs: CappedPrivateLog) -> bool:
+    return all(log.drained and not log.failed and not log.truncated for log in logs)
+
+
 def pipewire_trace_facts(contents: bytes) -> dict:
     """Match only pinned function/message forms; never emit captures/addresses.
 
@@ -504,34 +518,47 @@ def diagnostic_facts(root: Path, stage: str, services: dict[str, subprocess.Pope
     return facts
 
 
+def capture_test_proof(output: str, *, private_client: bool = False) -> dict[str, bool]:
+    """Inspect only libtest stdout; native stderr cannot supply result proof."""
+    target = PROBE_TEST if private_client else TARGET_TEST
+    names = re.findall(rf"^test {re.escape(target)} \.\.\. ([^\r\n]*)$", output, re.MULTILINE)
+    summaries = re.findall(r"^test result: ([^\r\n]*)$", output, re.MULTILINE)
+    return {
+        "named_test_passed": names == ["ok"],
+        "named_test_failed": names == ["FAILED"],
+        "single_pass_summary": len(summaries) == 1 and re.match(
+            r"ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;", summaries[0]) is not None,
+        "single_failure_summary": len(summaries) == 1 and re.match(
+            r"FAILED\. 0 passed; 1 failed; 0 ignored; 0 measured; [0-9]+ filtered out;", summaries[0]) is not None,
+        "single_named_result": len(names) == 1,
+    }
+
+
 def capture_test_passed(output: str, *, private_client: bool = False) -> bool:
     """An existing but no-longer-ignored test must not produce false evidence."""
-    target = PROBE_TEST if private_client else TARGET_TEST
-    target_passed = re.search(rf"^test {re.escape(target)} \.\.\. ok$", output, re.MULTILINE)
-    summary_passed = re.search(
-        r"^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out;",
-        output, re.MULTILINE,
-    )
-    return target_passed is not None and summary_passed is not None
+    proof = capture_test_proof(output, private_client=private_client)
+    return proof["named_test_passed"] and proof["single_pass_summary"]
 
 
 def capture_test_completed(output: str, *, private_client: bool = False) -> bool:
-    if capture_test_passed(output, private_client=private_client):
-        return True
-    target = PROBE_TEST if private_client else TARGET_TEST
-    return (re.search(rf"^test {re.escape(target)} \.\.\. FAILED$", output, re.MULTILINE) is not None
-            and re.search(r"^test result: FAILED\. 0 passed; 1 failed; 0 ignored; 0 measured; [0-9]+ filtered out;",
-                          output, re.MULTILINE) is not None)
+    proof = capture_test_proof(output, private_client=private_client)
+    return ((proof["named_test_passed"] and proof["single_pass_summary"])
+            or (proof["named_test_failed"] and proof["single_failure_summary"]))
 
 
-def capture_test_facts(output: str, status: int | None, stage: str = "unknown", *, private_client: bool = False) -> dict:
+def capture_test_facts(output: str, status: int | None, stage: str = "unknown", *,
+                       private_client: bool = False, stderr: str = "") -> dict:
     """Do not publish libtest panic payloads, even when the test fails."""
     facts = {
         "command": "timed_out" if status is None else "succeeded" if status == 0 else "failed",
         "required_test_passed": capture_test_passed(output, private_client=private_client),
         "zero_tests_passed": "test result: ok. 0 passed;" in output,
         "last_stage": stage if stage in CAPTURE_STAGES else "unknown",
+        **capture_test_proof(output, private_client=private_client),
     }
+    # Result evidence above is stdout-only. Fixed panic/signal categories may
+    # inspect either bounded private stream; never emit their matched text.
+    output = output + "\n" + stderr
     # Cargo commonly exits 101 when its child dies by signal. Keep the
     # wrapper status and the child's reported termination distinct. Never
     # echo the cargo command, native error line, process ID or signal text.
@@ -852,6 +879,11 @@ def session(root: Path, *, private_client=None, record_probe: bool = False) -> i
             binding_path = root / "binding-facts"
             binding_path.write_text("{}", encoding="ascii")
             binding_path.chmod(0o600)
+            # Serial libtest prints the name before running and its result
+            # afterward. PipeWire's native stderr writes bypass Rust's output
+            # capture and would split that line if merged into stdout. Keep
+            # strict result evidence separate from the private native trace.
+            stdout_sink = files.enter_context(CappedPrivateLog(root / "capture-stdout.log"))
             test_sink = files.enter_context(CappedPrivateLog(root / "capture-test.log"))
             capture_env = trace_environment("capture-test")
             if private_client is not None:
@@ -859,20 +891,23 @@ def session(root: Path, *, private_client=None, record_probe: bool = False) -> i
                 # all desktop services keep the ordinary system resolution.
                 capture_env["MORPHEUS_PIPEWIRE_PROBE_ARTIFACT"] = str(private_client.artifact_path)
             test = subprocess.Popen(command + separator + ["--ignored", "--exact", target, "--test-threads=1"], cwd=REPO,
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True,
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
                                     env=capture_env)
             processes.append(test)
             outcome["capture_attempted"] = True
+            trace_sinks["capture-stdout"] = stdout_sink
             trace_sinks["capture-test"] = test_sink
-            test_sink.attach(test.stdout)
+            attach_capture_logs(test, stdout_sink, test_sink)
             try:
                 status = wait_owned_process(test, timeout=180)
             except subprocess.TimeoutExpired:
                 status = None
             trace_boundaries.append((folded_raw_clock(), "test_timeout" if status is None else "test_finished"))
             if status is not None:
+                stdout_sink.finish()
                 test_sink.finish()
-            test_output = (root / "capture-test.log").read_text(errors="replace")
+            test_output = (root / "capture-stdout.log").read_text(errors="replace")
+            test_stderr = (root / "capture-test.log").read_text(errors="replace")
             origins = binding_facts(binding_path)
             origins_passed = bindings_passed(origins)
             if private_client is not None:
@@ -881,11 +916,15 @@ def session(root: Path, *, private_client=None, record_probe: bool = False) -> i
                 origins_passed = origins.get("status") == "valid"
             print("Wayland PipeWire binding facts: " + json.dumps(origins, sort_keys=True))
             outcome["bindings_verified"] = origins_passed
-            outcome["capture_completed"] = (status is not None and not test_sink.failed
-                and not test_sink.truncated and test_sink.drained
+            logs_complete = complete_capture_logs(stdout_sink, test_sink)
+            outcome["capture_completed"] = (status is not None and logs_complete
                 and capture_test_completed(test_output, private_client=private_client is not None))
-            if status != 0 or test_sink.failed or test_sink.truncated or not capture_test_passed(test_output, private_client=private_client is not None) or not origins_passed:
-                print("Wayland capture test facts: " + json.dumps(capture_test_facts(test_output, status, capture_stage(stage_path), private_client=private_client is not None), sort_keys=True), file=sys.stderr)
+            facts = capture_test_facts(test_output, status, capture_stage(stage_path),
+                                       private_client=private_client is not None, stderr=test_stderr)
+            facts["stdout_log"] = stdout_sink.facts()
+            facts["stderr_log"] = test_sink.facts()
+            print("Wayland capture test facts: " + json.dumps(facts, sort_keys=True))
+            if status != 0 or not logs_complete or not facts["required_test_passed"] or not origins_passed:
                 raise RuntimeError("Wayland portal acceptance did not execute and pass its required test")
             outcome["capture_passed"] = True
             if private_client is None:

@@ -9,6 +9,8 @@ mod call_membership;
 #[cfg(feature = "native-calls")]
 mod calls;
 mod drafts;
+#[cfg(feature = "native-calls")]
+mod incoming_ring;
 mod live;
 #[cfg(feature = "native-calls")]
 mod local_video;

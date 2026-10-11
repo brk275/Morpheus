@@ -5,7 +5,54 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
 ## Current hosted acceptance, 2026-10-11
 
-### Corrected SDK tests and next diagnostic candidate
+### Passive observer and capture evidence run
+
+[Run 38129843715](https://github.com/brk275/Morpheus/actions/runs/38129843715)
+tested `27ce324a92676dadb86b6a3b61f829c87c2daa72`. Apple Silicon, Intel Mac and
+Windows passed native check/build and 298 unit/vendor/SDK tests each, including all five new passive
+observer tests and 46 SDK sticky tests. Windows synthetic owned-window/display
+capture passed. Their log scans found no credentials and all cache/checkout
+post-steps completed. Intel also ran ten fixture-selector checks without live
+inputs; these are not live-service acceptance evidence.
+
+Linux passed its native build, Xvfb startup, 324 unit/vendor/SDK checks, 12
+fixture-selector checks without live inputs, and 17 live Rust checks. The helper acceptance summary reported 39 passes and five
+failures. Chat, account/sync isolation, recovery, moderation, search, both HTTPS
+OAuth phases and ordinary encrypted RTC passed. The official Element
+`v0.28.0-rc.1` pre-synced Sticky2025 case passed all 11 required facts; this
+still does not establish Current-format or fresh-device Element acceptance.
+Scope passed 367 helper checks with one skip, including hosted HTTPS cookie
+login/consent.
+
+All four expanded Current/Sticky2025 DM/room invitation cases failed in their
+combined membership/observer stage before receiving an invitation. The new
+passive observer has not passed live acceptance. The original stage discarded
+the observer error category, so the retained evidence cannot identify whether
+opening, roster sampling or the membership cross-check failed. The next
+candidate separates these stages and retains one fixed failure category without
+publishing identifiers, event contents or raw errors. The existing assertions
+and time budgets remain in place.
+
+Fresh-device late join again failed at `initial_bob_roster`: Alice's membership
+was absent from Bob's roster and historical membership was not decrypted. The
+bounded exact-event diagnostic described below has not run yet.
+
+Wayland reached `capture-stage=complete` and exited zero with all 33 PipeWire
+bindings from system libraries. Its private streams drained without truncation
+or capture errors, but the harness did not find the exact named-test result
+required for acceptance. The combined stdout/stderr log was deleted during
+cleanup, so the missing proof cannot be reconstructed. This run is **not** a
+capture pass. The new harness stores bounded stdout separately from native
+stderr and requires both streams to drain, the exact test result, a unique
+one-pass summary, correct bindings and owned cleanup. It does not accept exit
+status or the final stage alone. The separate manual PipeWire experiment
+remains unexecuted while this ordinary evidence gate is corrected.
+
+All Linux fixture/container/network cleanup checks and CI post-steps completed,
+and its cache was saved. Its log scan found no credentials. No installers were
+uploaded. The observer, late-join and capture-evidence failures remain open.
+
+### Previous corrected SDK and receipt baseline
 
 [Run 38127191100](https://github.com/brk275/Morpheus/actions/runs/38127191100)
 tested `139460d946d3fa7367397f9883ce5ebd7da19dd6`. Windows, Apple Silicon and
@@ -49,14 +96,12 @@ unproved. All explicit fixture/container/network cleanup checks and CI posts
 completed; Linux saved its cache. Every job log scanned clean. No installers
 were uploaded. These two Linux failures keep the candidate below beta readiness.
 
-The next implementation adds a passive MatrixRTC observer, with fresh encrypted
-slot reads and bounded cross-checks against actual SDK membership metadata. It
-does not join a call or grant device trust. Existing outgoing membership checks
-are shared with the planned receiver. The four live invitation fixtures now
-also require the observer to see only the caller and to observe departure before
-natural membership expiry. These new native checks have not executed yet;
-incoming UI, audible ringing and Accept behavior are not implemented by this
-change.
+The later passive observer increment requires fresh encrypted slot reads and
+bounded cross-checks against actual SDK membership metadata. It does not join a
+call or grant device trust. The expanded live invitation checks on `27ce324`
+failed as recorded above; the successful receipt baseline on `139460d` does not
+verify the changed observer or receiver inputs. Incoming UI, audible ringing
+and Accept behavior remain unimplemented.
 
 A separate, manual Linux-only [startup comparison](WAYLAND_FIXTURE.md#explicit-systemcontrolpatched-startup-diagnostic)
 implements system/control/patched PipeWire experiments. The ordinary capture
@@ -67,6 +112,40 @@ run; its review and mocked helper checks are preparation, not native validation.
 The owner has deferred Debian packaging until a working public project email
 is provided. Manual Linux package QA defaults to AppImage; Debian acceptance
 remains open.
+
+### Incoming admission and late-join diagnostic candidate
+
+The next receiver increment adds `IncomingOffer` admission and revalidation,
+without connecting the incoming-call UI or starting media. It requires an
+unsolicited encrypted receipt from the selected account's sticky sync, current
+local cross-signing trust bound to the original sender's encryption/signing
+keys, actual valid push/ignore rules, a verified referenced membership, and a
+matching live membership beside a freshly read encrypted call slot. Quiet voice
+spaces and disabled notifications suppress admission. Remote revocations that
+have not reached local sync are not established by these checks.
+
+A process-owned replay ledger retains 1,024 account/room/event identities across
+account switches and never extends their first monotonic deadline. It fails
+closed on capacity exhaustion until restart; replay protection across restarts
+remains open. Reference fetching cannot postpone the semantic ring deadline.
+Any failed or cancelled revalidation permanently revokes that offer. The eventual controller
+still needs change subscriptions, Accept-time revalidation and revocation during
+joining; this snapshot API alone cannot authorize capture.
+
+The existing four invitation fixtures now exercise actual admission, unchanged
+wire dialect, deadline preservation, duplicate rejection, and withdrawal after
+redaction before expiry. Their 13 required facts and overall time budgets stay
+unchanged; fixed stages distinguish admission, revalidation and withdrawal.
+Separate observer open/roster/leave stages retain only allowlisted failure
+categories and cannot turn a failed assertion into passing evidence.
+These changed native checks have **not executed yet**.
+
+Fresh-device late-join failure now has one bounded diagnostic fetch after the
+existing 45-second roster assertion has already failed. It selects Alice's
+exact currently verified membership and reports only pre-fetch presence flags
+and fixed decryption categories. The fetch cannot make the failed acceptance
+pass. No keys are imported, trust changed, membership republished or acceptance
+timeout extended. Hosted execution remains required to identify the failure.
 
 ### Previous SDK test setup failure
 

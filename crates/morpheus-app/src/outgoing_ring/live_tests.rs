@@ -18,12 +18,15 @@ use matrix_sdk::{
 };
 use morpheus_matrix::{AccountManager, SyncBackend, SyncStatus};
 use morpheus_rtc::{
-    CallOptions, PassiveCallObserver, RtcStreamKind,
+    CallOptions, ObserverError, PassiveCallObserver, RtcStreamKind,
     ringing::{
         CallParticipation, ResolvedJoinedCall, RingContext, RingNotification, RoomMentionPermission,
     },
 };
 use serde::Deserialize;
+
+use crate::incoming_ring::{IncomingOffer, ledger::OfferLedger};
+use crate::voice_spaces::VoiceSpaces;
 
 use super::*;
 
@@ -40,13 +43,19 @@ enum Stage {
     Targets,
     Join,
     Membership,
+    ObserverOpen,
+    ObserverRoster,
+    ObserverLeave,
     Send,
     Receive,
     Fetch,
     Validate,
+    Admission,
+    Revalidate,
     Redact,
     Redaction,
     ReceiptRedaction,
+    Withdraw,
     Cleanup,
 }
 
@@ -61,13 +70,19 @@ impl Stage {
             Self::Targets => "targets",
             Self::Join => "join",
             Self::Membership => "membership",
+            Self::ObserverOpen => "observer_open",
+            Self::ObserverRoster => "observer_roster",
+            Self::ObserverLeave => "observer_leave",
             Self::Send => "send",
             Self::Receive => "receive",
             Self::Fetch => "fetch",
             Self::Validate => "validate",
+            Self::Admission => "admission",
+            Self::Revalidate => "revalidate",
             Self::Redact => "redact",
             Self::Redaction => "redaction",
             Self::ReceiptRedaction => "receipt_redaction",
+            Self::Withdraw => "withdraw",
             Self::Cleanup => "cleanup",
         }
     }
@@ -84,6 +99,48 @@ fn fact(name: &'static str) {
 
 fn require(condition: bool) -> Result<(), ()> {
     if condition { Ok(()) } else { Err(()) }
+}
+
+/// Retain only the last fixed observation. Cancellation or a failure emits it;
+/// successful operations disarm it. No SDK error text is stored or printed.
+struct ObserverDiagnostic(Option<&'static str>);
+
+impl ObserverDiagnostic {
+    fn new() -> Self {
+        Self(Some("not_sampled"))
+    }
+
+    fn record(&mut self, result: &'static str) {
+        self.0 = Some(result);
+    }
+
+    fn error(&mut self, error: ObserverError) {
+        self.record(match error {
+            ObserverError::UnsupportedDialect => "unsupported_dialect",
+            ObserverError::InvalidRoom => "invalid_room",
+            ObserverError::NotJoined => "not_joined",
+            ObserverError::UnsupportedServer => "unsupported_server",
+            ObserverError::NotEncrypted => "not_encrypted",
+            ObserverError::SlotUnavailable => "slot_unavailable",
+            ObserverError::Unavailable => "unavailable",
+            ObserverError::TimedOut => "timed_out",
+            ObserverError::Closed => "closed",
+            ObserverError::InvalidMembership => "invalid_membership",
+            ObserverError::TooManyParticipants => "too_many_participants",
+        });
+    }
+
+    fn complete(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ObserverDiagnostic {
+    fn drop(&mut self) {
+        if let Some(result) = self.0 {
+            eprintln!("\nMORPHEUS_RING_OBSERVER result={result}");
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -333,11 +390,17 @@ impl Session {
         .map_err(|_| ())??;
         // Bob observes the actual call without joining it. Keep its feed in
         // Session so cancellation still detaches it during bounded cleanup.
-        self.observer = Some(
-            PassiveCallObserver::open(bob_client.clone(), case.room_id.as_str(), case.mode)
-                .await
-                .map_err(|_| ())?,
-        );
+        phase(&mut self.stage, Stage::ObserverOpen);
+        {
+            let mut diagnostic = ObserverDiagnostic::new();
+            self.observer = Some(
+                PassiveCallObserver::open(bob_client.clone(), case.room_id.as_str(), case.mode)
+                    .await
+                    .map_err(|error| diagnostic.error(error))?,
+            );
+            diagnostic.complete();
+        }
+        phase(&mut self.stage, Stage::ObserverRoster);
         wait_for_passive_caller(
             self.observer.as_mut().ok_or(())?,
             &bob_room,
@@ -545,6 +608,44 @@ impl Session {
             .validate_for(&context, u64::try_from(now).map_err(|_| ())?)
             .map_err(|_| ())?;
         require(window.remaining_ms > 0 && window.remaining_ms <= 30000)?;
+
+        // Exercise the real receiver admission boundary against the receipt
+        // Bob discovered through sync. It independently resolves current
+        // trust, push policy, the reference, open slot and live membership.
+        // This still does not join Bob or open any capture device.
+        let preferences = VoiceSpaces::new(morpheus_config::ConfigStore::at(
+            case.profile.path().join("incoming-config.toml"),
+        ));
+        let mut ledger = OfferLedger::default();
+        phase(&mut self.stage, Stage::Admission);
+        let mut offer = IncomingOffer::admit(
+            &self.bob,
+            &preferences,
+            &case.room_id,
+            &discovered.event_id,
+            &mut ledger,
+        )
+        .await
+        .map_err(|_| ())?;
+        require(offer.mode() == case.mode)?;
+        let original_deadline = offer.deadline();
+        phase(&mut self.stage, Stage::Revalidate);
+        offer
+            .revalidate(&self.bob, &preferences)
+            .await
+            .map_err(|_| ())?;
+        require(offer.deadline() <= original_deadline)?;
+        require(
+            IncomingOffer::admit(
+                &self.bob,
+                &preferences,
+                &case.room_id,
+                &discovered.event_id,
+                &mut ledger,
+            )
+            .await
+            .is_err(),
+        )?;
         fact("targeted_reference");
 
         phase(&mut self.stage, Stage::Redact);
@@ -631,11 +732,19 @@ impl Session {
         })
         .await
         .map_err(|_| ())??;
+        // The admission must withdraw before natural expiry, then remain
+        // revoked even if a caller asks it to revalidate again.
+        phase(&mut self.stage, Stage::Withdraw);
+        require(Instant::now() < offer.deadline())?;
+        require(offer.revalidate(&self.bob, &preferences).await.is_err())?;
+        require(offer.revalidate(&self.bob, &preferences).await.is_err())?;
         fact("unsolicited_redaction_observed");
 
         // This is a separate membership-removal assertion, after all existing
         // invitation checks. A naturally expired membership cannot satisfy it.
-        phase(&mut self.stage, Stage::Membership);
+        phase(&mut self.stage, Stage::ObserverLeave);
+        let mut diagnostic = ObserverDiagnostic::new();
+        diagnostic.record("current_event_mismatch");
         let before_leave = own_membership(&bob_room, &alice, &info, &dialect, case.mode)
             .map_err(|_| ())?
             .ok_or(())?;
@@ -646,28 +755,43 @@ impl Session {
             .find(|event| event.event_id == before_leave)
             .ok_or(())?
             .expires_at;
+        diagnostic.record("membership_expired");
         require(MilliSecondsSinceUnixEpoch::now() < expires_at)?;
+        diagnostic.record("leave_unavailable");
         time::timeout(Duration::from_secs(12), rtc.leave(case.room_id.as_str()))
             .await
             .map_err(|_| ())?
             .map_err(|_| ())?;
         let observer = self.observer.as_mut().ok_or(())?;
+        diagnostic.record("not_sampled");
         time::timeout(Duration::from_secs(20), async {
             loop {
-                require(MilliSecondsSinceUnixEpoch::now() < expires_at)?;
-                if let Ok(snapshot) = observer.snapshot().await {
-                    require(
-                        snapshot.room_id == info.room_id
-                            && snapshot.slot_id == info.slot_id
-                            && snapshot.mode == case.mode,
-                    )?;
-                    if snapshot.participants.is_empty()
-                        && own_membership(&bob_room, &alice, &info, &dialect, case.mode)
-                            .map_err(|_| ())?
-                            .is_none()
-                    {
-                        require(MilliSecondsSinceUnixEpoch::now() < expires_at)?;
-                        return Ok::<_, ()>(());
+                let unexpired = MilliSecondsSinceUnixEpoch::now() < expires_at;
+                if !unexpired {
+                    diagnostic.record("membership_expired");
+                }
+                require(unexpired)?;
+                match observer.snapshot().await {
+                    Err(error) => diagnostic.error(error),
+                    Ok(snapshot) => {
+                        diagnostic.record("unexpected_roster");
+                        require(
+                            snapshot.room_id == info.room_id
+                                && snapshot.slot_id == info.slot_id
+                                && snapshot.mode == case.mode,
+                        )?;
+                        diagnostic.record("membership_still_present");
+                        if snapshot.participants.is_empty() {
+                            diagnostic.record("current_event_mismatch");
+                            if own_membership(&bob_room, &alice, &info, &dialect, case.mode)
+                                .map_err(|_| ())?
+                                .is_none()
+                            {
+                                diagnostic.record("membership_expired");
+                                require(MilliSecondsSinceUnixEpoch::now() < expires_at)?;
+                                return Ok::<_, ()>(());
+                            }
+                        }
                     }
                 }
                 time::sleep(Duration::from_millis(100)).await;
@@ -675,6 +799,7 @@ impl Session {
         })
         .await
         .map_err(|_| ())??;
+        diagnostic.complete();
         Ok(())
     }
 
@@ -731,33 +856,41 @@ async fn wait_for_passive_caller(
     dialect: &NotificationDialect,
     mode: InteropMode,
 ) -> Result<(), ()> {
+    let mut diagnostic = ObserverDiagnostic::new();
     time::timeout(Duration::from_secs(20), async {
         loop {
             // Feed seeding and SDK map updates are independent. Retry only
             // within this existing work budget, never accept an unproven row.
-            if let Ok(snapshot) = observer.snapshot().await {
-                require(
-                    snapshot.room_id == info.room_id
-                        && snapshot.slot_id == info.slot_id
-                        && snapshot.mode == mode
-                        && snapshot.participants.len() <= 1,
-                )?;
-                if let Some(participant) = snapshot.participants.first() {
-                    // Exactly the caller means the receiver has no logical
-                    // membership of its own as a side effect of observing.
+            match observer.snapshot().await {
+                Err(error) => diagnostic.error(error),
+                Ok(snapshot) => {
+                    diagnostic.record("unexpected_roster");
                     require(
-                        participant.user_id == caller.user_id
-                            && participant.device_id == caller.device_id
-                            && participant.membership_id == info.membership_id,
+                        snapshot.room_id == info.room_id
+                            && snapshot.slot_id == info.slot_id
+                            && snapshot.mode == mode
+                            && snapshot.participants.len() <= 1,
                     )?;
-                    // No await between reading the observer and the existing
-                    // independently Verified SDK membership proof. A refresh
-                    // race waits for the two current event IDs to agree.
-                    if own_membership(room, caller, info, dialect, mode)
-                        .map_err(|_| ())?
-                        .is_some_and(|event| event.as_str() == participant.membership_event_id)
-                    {
-                        return Ok::<_, ()>(());
+                    diagnostic.record("empty_roster");
+                    if let Some(participant) = snapshot.participants.first() {
+                        // Exactly the caller means the receiver has no logical
+                        // membership of its own as a side effect of observing.
+                        diagnostic.record("unexpected_roster");
+                        require(
+                            participant.user_id == caller.user_id
+                                && participant.device_id == caller.device_id
+                                && participant.membership_id == info.membership_id,
+                        )?;
+                        // No await between reading the observer and the existing
+                        // independently Verified SDK membership proof. A refresh
+                        // race waits for the two current event IDs to agree.
+                        diagnostic.record("current_event_mismatch");
+                        if own_membership(room, caller, info, dialect, mode)
+                            .map_err(|_| ())?
+                            .is_some_and(|event| event.as_str() == participant.membership_event_id)
+                        {
+                            return Ok::<_, ()>(());
+                        }
                     }
                 }
             }
@@ -765,7 +898,9 @@ async fn wait_for_passive_caller(
         }
     })
     .await
-    .map_err(|_| ())?
+    .map_err(|_| ())??;
+    diagnostic.complete();
+    Ok(())
 }
 
 async fn cleanup_attempt<F: Future<Output = bool>>(limit: Duration, work: F) -> bool {
