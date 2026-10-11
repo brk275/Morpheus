@@ -192,7 +192,7 @@ fn fixtures() -> PreviewState {
                         "Jules",
                         "JN",
                         "9:41 AM",
-                        "Morning everyone! I finished the first pass on the desktop layout. The space rail is intentionally quiet, so channels and conversation can carry the visual weight.",
+                        "Morning! Anyone up for a photo walk by the river on Saturday?",
                         "",
                         "",
                         "♥  4",
@@ -203,17 +203,18 @@ fn fixtures() -> PreviewState {
                             "Sam",
                             "SK",
                             "9:45 AM",
-                            "It looks great. I especially like having a reliable place for account switching. It should feel the same whether I have one account or several.",
+                            "Count me in. Let's meet at the old bridge at ten.",
                             "",
                             "",
                             "✦  2",
                             mint,
                         );
                         sample.rich_body = StyledText::from_markdown(
-                            "It looks **great**. I especially like having a reliable place for account switching. It should feel the same whether I have one account or several.",
+                            "Count me in. Let's meet at the **old bridge** at ten.",
                         )
                         .expect("Preview formatting should be valid");
-                        sample.edit_source = "It looks **great**. I especially like having a reliable place for account switching. It should feel the same whether I have one account or several.".into();
+                        sample.edit_source =
+                            "Count me in. Let's meet at the **old bridge** at ten.".into();
                         sample.edit_markdown = true;
                         sample
                     },
@@ -221,8 +222,8 @@ fn fixtures() -> PreviewState {
                         "Casey",
                         "CY",
                         "9:48 AM",
-                        "The bottom-left card opens upward over the room list. I kept the active identity visible, including the full Matrix ID, so switching contexts is harder to miss.",
-                        "Sam: It looks great.",
+                        "I'll bring coffee. Riley is joining us after breakfast.",
+                        "Sam: Count me in.",
                         "",
                         "",
                         violet,
@@ -231,9 +232,9 @@ fn fixtures() -> PreviewState {
                         "Morgan",
                         "MR",
                         "10:02 AM",
-                        "Here is the palette study. Dark, light, and high contrast use the same layout and can switch at runtime.",
+                        "Here's the route I had in mind. There's a nice spot for a break near the gardens.",
                         "",
-                        "palette-study.png · 1.8 MB",
+                        "riverside-walk-route.png · 1.8 MB",
                         "♥  3",
                         blue,
                     ),
@@ -241,7 +242,7 @@ fn fixtures() -> PreviewState {
                         "Jules",
                         "JN",
                         "10:42 AM",
-                        "I put together a few notes on message density. This longer example is here to make sure lines wrap naturally and that each message row grows with its content. The timeline should never make a conversation feel squeezed into identical blocks.",
+                        "I checked the route this morning. The little footbridge is closed, so we'll take the garden entrance instead. It's a slightly longer walk, but the view is worth it.",
                         "",
                         "",
                         "",
@@ -251,8 +252,8 @@ fn fixtures() -> PreviewState {
                         "Sam",
                         "SK",
                         "10:47 AM",
-                        "A good thread panel needs room to breathe too. We can keep the conversation visible while opening context on the right.",
-                        "Jules: I put together a few notes",
+                        "Good catch. I'll post a photo of the meeting spot so nobody has to hunt for us.",
+                        "Jules: I checked the route this morning.",
                         "",
                         "✦  1",
                         mint,
@@ -608,6 +609,7 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
         ui.set_room_call_mode(0);
     }
     ui.set_live_session(false);
+    ui.set_preview_session(true);
     ui.set_stress_timeline_active(state.stress_backup.is_some());
     let account = &state.accounts[state.active_account];
     ui.set_accounts(ModelRc::new(VecModel::from(
@@ -3974,7 +3976,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 live.manager.stop().await;
             });
             ui.set_login_error("".into());
-            ui.set_session_error("Interactive preview · no Matrix connection".into());
+            ui.set_session_error("".into());
             security::clear_ui(&ui, &preview_live.security_gate);
             ui.set_show_sign_in(false);
             ui.set_composer_text("".into());

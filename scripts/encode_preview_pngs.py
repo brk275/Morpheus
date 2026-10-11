@@ -17,8 +17,8 @@ import sys
 import zlib
 from pathlib import Path
 
-WIDTH, HEIGHT = 1560, 1040
-HEADER = b"P6\n1560 1040\n255\n"
+WIDTH, HEIGHT = 1440, 900
+HEADER = b"P6\n1440 900\n255\n"
 PIXEL_BYTES = WIDTH * HEIGHT * 3
 NAMES = ("desktop-preview", "account-switcher", "sign-in", "incoming-call")
 

@@ -150,6 +150,30 @@ component AvatarBadge inherits Rectangle {
     }
 }
 
+component InterfaceGlyph inherits Path {
+    in property <string> icon;
+    in property <color> ink;
+    width: 20px;
+    height: 20px;
+    viewbox-width: 20;
+    viewbox-height: 20;
+    stroke: ink;
+    stroke-width: 1.6px;
+    fill: transparent;
+    commands: icon == "S" ? "M 14 8 A 6 6 0 1 1 2 8 A 6 6 0 1 1 14 8 M 12.5 12.5 L 18 18"
+        : icon == "C" ? "M 5 2 L 2.5 3.5 C 1 5 3 10 7 14 C 11 18 15 19 16.5 17.5 L 18 15 L 14 12 L 12 14 C 10 13 7 10 6 8 L 8 6 Z"
+        : icon == "P" ? "M 3 3 L 17 3 L 17 17 L 3 17 Z M 12 3 L 12 17"
+        : icon == "⌂" ? "M 2 9 L 10 2 L 18 9 M 4 7 L 4 17 L 8 17 L 8 12 L 12 12 L 12 17 L 16 17 L 16 7"
+        : icon == "+" ? "M 10 3 L 10 17 M 3 10 L 17 10"
+        : icon == "↓" ? "M 10 2 L 10 13 M 5 8 L 10 13 L 15 8 M 3 13 L 3 17 L 17 17 L 17 13"
+        : icon == "F" ? "M 4 2 L 11 2 L 16 7 L 16 18 L 4 18 Z M 11 2 L 11 7 L 16 7 M 7 11 L 13 11 M 7 14 L 12 14"
+        : icon == "↩" ? "M 8 4 L 2 9 L 8 14 M 2 9 L 12 9 C 16 9 18 12 18 16"
+        : icon == "♥" ? "M 10 17 C 8 15 2 11 2 6.5 C 2 2 8 1 10 5 C 12 1 18 2 18 6.5 C 18 11 12 15 10 17 Z"
+        : icon == "⌫" ? "M 3 5 L 17 5 M 7 5 L 7 2 L 13 2 L 13 5 M 5 5 L 6 18 L 14 18 L 15 5 M 8 8 L 8 15 M 12 8 L 12 15"
+        : icon == "✎" ? "M 4 16 L 8 15 L 16 7 L 13 4 L 5 12 Z M 12 5 L 15 8"
+        : "M 3 4 L 17 4 L 17 13 L 10 13 L 6 17 L 6 13 L 3 13 Z M 6 7 L 14 7 M 6 10 L 12 10";
+}
+
 component IconAction inherits Rectangle {
     in property <string> icon;
     in property <string> label;
@@ -158,6 +182,10 @@ component IconAction inherits Rectangle {
     in property <color> hover-surface;
     in property <bool> selected: false;
     in property <bool> enabled: true;
+    in property <bool> quiet: false;
+    in property <bool> context-hover: false;
+    property <bool> vector-icon: icon == "S" || icon == "C" || icon == "P" || icon == "⌂" || icon == "+" || icon == "↓" || icon == "F" || icon == "↩" || icon == "♥" || icon == "⌫" || icon == "✎" || icon == "☷";
+    opacity: !quiet || context-hover || area.has-hover || keyboard-focus.has-focus ? 1 : 0;
     callback activated();
     width: 34px;
     height: 34px;
@@ -168,36 +196,20 @@ component IconAction inherits Rectangle {
     accessible-label: label;
     accessible-enabled: enabled;
     accessible-action-default => { if root.enabled { root.activated(); } }
-    if root.icon != "✎" && root.icon != "☷" : Text {
+    if !root.vector-icon : Text {
         text: root.icon;
         color: root.ink;
-        font-size: 18px;
+        font-size: root.icon == "Md" ? 13px : 18px;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
-    if root.icon == "✎" : Path {
-        x: (parent.width - 18px) / 2;
-        y: (parent.height - 18px) / 2;
+    if root.vector-icon : InterfaceGlyph {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
         width: 18px;
         height: 18px;
-        viewbox-width: 20;
-        viewbox-height: 20;
-        commands: "M 4 16 L 8 15 L 16 7 L 13 4 L 5 12 Z M 12 5 L 15 8";
-        stroke: root.ink;
-        stroke-width: 1.7px;
-        fill: transparent;
-    }
-    if root.icon == "☷" : Path {
-        x: (parent.width - 18px) / 2;
-        y: (parent.height - 18px) / 2;
-        width: 18px;
-        height: 18px;
-        viewbox-width: 20;
-        viewbox-height: 20;
-        commands: "M 3 4 L 17 4 L 17 13 L 10 13 L 6 17 L 6 13 L 3 13 Z M 6 7 L 14 7 M 6 10 L 12 10";
-        stroke: root.ink;
-        stroke-width: 1.7px;
-        fill: transparent;
+        icon: root.icon;
+        ink: root.ink;
     }
     area := TouchArea {
         enabled: root.enabled;
@@ -512,6 +524,7 @@ export component AppWindow inherits Window {
     in-out property <string> ui-font-family: "Inter";
     in-out property <string> config-error;
     in-out property <string> session-error;
+    in-out property <bool> preview-session: false;
     in-out property <string> transfer-notice;
     in-out property <string> config-path;
     in-out property <bool> audio-devices-enabled: false;
@@ -1041,54 +1054,58 @@ export component AppWindow inherits Window {
             VerticalLayout {
                 spacing: 0px;
                 Rectangle {
-                    height: 62px;
+                    height: max(64px, 40px * root.text-scale + 24px);
                     background: root.sidebar;
                     HorizontalLayout {
                         padding-left: 18px;
                         padding-right: 14px;
+                        padding-top: 14px;
+                        padding-bottom: 14px;
                         spacing: 8px;
-                        Text {
-                            text: "Morpheus";
-                            color: root.ink;
-                            font-size: 17px * root.text-scale;
-                            font-weight: 750;
-                            vertical-alignment: center;
-                            horizontal-stretch: 1;
+                        VerticalLayout {
+                            horizontal-stretch: 1; alignment: center; spacing: 3px;
+                            Text { text: "Morpheus"; color: root.ink; font-size: 17px * root.text-scale; font-weight: 750; }
+                            if root.preview-session : Text {
+                                text: "Offline preview"; color: root.muted;
+                                font-size: 10px * root.text-scale; font-weight: 500;
+                                accessible-label: "Offline preview with fictional accounts";
+                            }
                         }
-                        room-action-trigger := Button {
+                        VerticalLayout { width: 34px; alignment: center;
+                            room-action-trigger := IconAction {
                             width: 34px;
                             height: 34px;
-                            text: "+";
-                            accessible-label: "Create or join a Matrix room";
-                            clicked => {
+                            icon: "+";
+                            label: "Create or join a Matrix room";
+                            ink: root.muted; surface: transparent; hover-surface: root.hover;
+                            activated => {
                                 root.room-action-mode = 0;
                                 root.room-action-input = "";
                                 root.room-action-error = "";
                                 root.room-actions-open = true;
                             }
                         }
+                        }
                     }
                 }
                 Rectangle { height: 1px; background: root.divider; }
                 Rectangle {
-                    height: 57px;
+                    height: max(62px, 22px * root.text-scale + 40px);
                     background: root.sidebar;
-                    ActionRect {
-                        x: 12px;
-                        y: 10px;
-                        width: parent.width - 24px;
-                        height: 37px;
-                        border-radius: 9px;
-                        background: root.elevated;
+                    quick-switch-trigger := ActionRect {
+                        x: 12px; y: 12px;
+                        width: parent.width - 24px; height: parent.height - 24px;
+                        border-radius: 8px;
+                        background: self.has-hover ? root.hover : root.elevated;
                         focus-color: root.accent;
-                        label: "Search the public Matrix room directory";
-                        activated => { root.page = 3; root.open-discovery(); }
-                        Text {
-                            x: 12px;
-                            text: "Discover rooms";
-                            color: root.muted;
-                            font-size: 13px * root.text-scale;
-                            vertical-alignment: center;
+                        enabled: root.page != 1 && !root.show-sign-in;
+                        label: "Switch between rooms in the current Home or Space";
+                        activated => { root.open-quick-switcher(); }
+                        HorizontalLayout {
+                            padding-left: 11px; padding-right: 11px;
+                            padding-top: 10px; padding-bottom: 10px; spacing: 9px;
+                            Rectangle { width: 17px; background: transparent; InterfaceGlyph { y: (parent.height - self.height) / 2; width: 17px; height: 17px; icon: "S"; ink: root.muted; } }
+                            Text { text: "Find a conversation"; color: root.muted; font-size: 12px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
                         }
                     }
                 }
@@ -1101,13 +1118,6 @@ export component AppWindow inherits Window {
                         padding-right: 10px;
                         padding-bottom: 18px;
                         spacing: 3px;
-                        quick-switch-trigger := Button {
-                            height: 32px;
-                            text: "Switch room";
-                            enabled: root.page != 1 && !root.show-sign-in;
-                            accessible-label: "Switch between rooms in the current Home or Space";
-                            clicked => { root.open-quick-switcher(); }
-                        }
                         Text {
                             text: root.active-space-id == "" ? "YOUR ROOMS" : "SPACE ROOMS";
                             color: root.muted;
@@ -1238,7 +1248,7 @@ export component AppWindow inherits Window {
                 }
                 Rectangle { height: 1px; background: root.divider; }
                 account-trigger := ActionRect {
-                    height: 69px;
+                    height: max(69px, 38px * root.text-scale + 24px);
                     background: root.rail;
                     focus-color: root.accent;
                     label: "Account menu for " + root.active-account-name + ", " + root.active-account-handle;
@@ -1247,8 +1257,10 @@ export component AppWindow inherits Window {
                     HorizontalLayout {
                         padding-left: 11px;
                         padding-right: 11px;
+                        padding-top: 15px;
+                        padding-bottom: 15px;
                         spacing: 10px;
-                        AvatarBadge { initials: root.active-account-initials; accent: root.active-account-accent; }
+                        VerticalLayout { width: 38px; alignment: center; AvatarBadge { initials: root.active-account-initials; accent: root.active-account-accent; } }
                         VerticalLayout {
                             alignment: center;
                             spacing: 2px;
@@ -1264,9 +1276,9 @@ export component AppWindow inherits Window {
             // Drawn after the sidebar so it opens upward over the room list.
             if root.account-menu-open : Rectangle {
                 x: 9px;
-                y: parent.height - self.height - 74px;
+                y: parent.height - self.height - account-trigger.height - 5px;
                 width: parent.width - 18px;
-                height: root.account-options.length > 5 ? 430px : 170px + root.account-options.length * 44px;
+                height: min(parent.height - account-trigger.height - 14px, 170px + root.account-options.length * (max(42px, 30px * root.text-scale + 12px) + 2px));
                 background: root.elevated;
                 border-color: root.divider;
                 border-width: 1px;
@@ -1293,7 +1305,7 @@ export component AppWindow inherits Window {
                             width: parent.width;
                             spacing: 2px;
                     for account[index] in root.account-options : account-choice := ActionRect {
-                        height: 42px;
+                        height: max(42px, 30px * root.text-scale + 12px);
                         border-radius: 8px;
                         background: account.index == root.active-account-index ? root.hover : self.has-hover ? root.hover : transparent;
                         focus-color: root.accent;
@@ -1320,8 +1332,10 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             padding-left: 5px;
                             padding-right: 5px;
+                            padding-top: 6px;
+                            padding-bottom: 6px;
                             spacing: 9px;
-                            AvatarBadge { width: 30px; height: 30px; border-radius: 10px; initials: account.initials; accent: account.accent; }
+                            VerticalLayout { width: 30px; alignment: center; AvatarBadge { width: 30px; height: 30px; border-radius: 10px; initials: account.initials; accent: account.accent; } }
                             VerticalLayout {
                                 alignment: center;
                                 spacing: 1px;
@@ -1396,11 +1410,13 @@ export component AppWindow inherits Window {
             VerticalLayout {
                 spacing: 0px;
                 Rectangle {
-                    height: 62px;
+                    height: max(64px, 40px * root.text-scale + 24px);
                     background: root.canvas;
                     HorizontalLayout {
-                        padding-left: 22px;
+                        padding-left: 24px;
                         padding-right: 16px;
+                        padding-top: 14px;
+                        padding-bottom: 14px;
                         spacing: 11px;
                         Text {
                             text: root.page == 1 ? "⚙" : root.page == 2 ? "☏" : root.page == 3 ? "⌕" : "#";
@@ -1424,7 +1440,9 @@ export component AppWindow inherits Window {
                             horizontal-stretch: 1;
                             overflow: elide;
                         }
-                        if root.page == 0 : IconAction {
+                        if root.page == 0 : VerticalLayout {
+                            width: 34px; alignment: center;
+                            IconAction {
                             icon: "⚙"; label: "Edit room name and topic"; ink: root.muted; surface: root.canvas; hover-surface: root.hover;
                             enabled: root.live-session && root.active-room-id != "";
                             activated => {
@@ -1438,21 +1456,31 @@ export component AppWindow inherits Window {
                                 root.room-admin-open = true;
                             }
                         }
-                        if root.page == 0 : IconAction {
+                        }
+                        if root.page == 0 : VerticalLayout {
+                            width: 34px; alignment: center;
+                            IconAction {
                             icon: "S"; label: "Search messages in this room"; ink: root.muted; surface: root.canvas; hover-surface: root.hover;
                             selected: root.show-side-panel && root.side-panel-tab == 2;
                             enabled: root.live-session && root.active-room-id != "";
                             activated => { root.show-side-panel = true; root.side-panel-tab = 2; }
                         }
-                        if root.page == 0 : IconAction {
+                        }
+                        if root.page == 0 : VerticalLayout {
+                            width: 34px; alignment: center;
+                            IconAction {
                             icon: "C"; label: "Open current room call stage"; ink: root.muted; surface: root.canvas; hover-surface: root.hover;
                             activated => { root.page = 2; }
                         }
-                        if root.page == 0 : IconAction {
+                        }
+                        if root.page == 0 : VerticalLayout {
+                            width: 34px; alignment: center;
+                            IconAction {
                             icon: "P"; label: root.show-side-panel ? "Hide details panel" : "Show details panel";
                             ink: root.muted; surface: root.canvas; hover-surface: root.hover;
                             selected: root.show-side-panel;
                             activated => { root.set-side-panel(!root.show-side-panel); }
+                        }
                         }
                     }
                 }
@@ -1571,12 +1599,14 @@ export component AppWindow inherits Window {
                     vertical-stretch: 1;
                     spacing: 0px;
                     Rectangle {
-                        height: 76px;
+                        height: max(110px, 54px * root.text-scale + 56px);
                         background: root.canvas;
                         VerticalLayout {
                             padding-left: 24px;
                             padding-right: 24px;
-                            spacing: 5px;
+                            padding-top: 23px;
+                            padding-bottom: 20px;
+                            spacing: 8px;
                             Text { text: "Welcome to #" + root.active-room-name; color: root.ink; font-size: 24px * root.text-scale; font-weight: 780; }
                             Text { text: root.active-room-topic; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         }
@@ -1653,21 +1683,22 @@ export component AppWindow inherits Window {
                                 VerticalLayout {
                                     padding-left: 24px;
                                     padding-right: 24px;
-                                    padding-top: root.density-mode == 0 ? 5px : root.density-mode == 2 ? 15px : 9px;
-                                    padding-bottom: root.density-mode == 0 ? 5px : root.density-mode == 2 ? 16px : 10px;
+                                    padding-top: root.density-mode == 0 ? 5px : root.density-mode == 2 ? 16px : 12px;
+                                    padding-bottom: root.density-mode == 0 ? 5px : root.density-mode == 2 ? 16px : 12px;
                                     spacing: root.density-mode == 0 ? 3px : root.density-mode == 2 ? 8px : 5px;
                                     HorizontalLayout {
                                         spacing: 10px;
-                                        AvatarBadge { width: 36px; height: 36px; border-radius: 12px; initials: message.initials; accent: message.accent; }
+                                        AvatarBadge { width: 38px; height: 38px; border-radius: 13px; initials: message.initials; accent: message.accent; }
                                         VerticalLayout {
                                             horizontal-stretch: 1;
                                             spacing: root.density-mode == 0 ? 3px : root.density-mode == 2 ? 8px : 5px;
                                             HorizontalLayout {
                                                 spacing: 8px;
-                                                Text { text: message.sender; color: root.ink; font-size: 13px * root.text-scale; font-weight: 750; }
+                                                Text { text: message.sender; color: root.ink; font-size: 14px * root.text-scale; font-weight: 700; }
                                                 Text { text: message.time; color: root.muted; font-size: 10px * root.text-scale; vertical-alignment: center; }
                                                 Rectangle { horizontal-stretch: 1; background: transparent; }
                                                 if message.event-id != "" : IconAction {
+                                                    quiet: true; context-hover: message-hover.has-hover;
                                                     width: 28px; height: 26px; icon: "↩"; label: "Reply to " + message.sender;
                                                     ink: root.muted; surface: transparent; hover-surface: root.hover;
                                                     activated => {
@@ -1676,6 +1707,7 @@ export component AppWindow inherits Window {
                                                     }
                                                 }
                                                 if message.event-id != "" && message.is-own && message.attachment == "" : IconAction {
+                                                    quiet: true; context-hover: message-hover.has-hover;
                                                     width: 28px; height: 26px; icon: "✎"; label: "Edit your message";
                                                     ink: root.muted; surface: transparent; hover-surface: root.hover;
                                                     activated => {
@@ -1684,11 +1716,13 @@ export component AppWindow inherits Window {
                                                     }
                                                 }
                                                 if message.event-id != "" : IconAction {
+                                                    quiet: true; context-hover: message-hover.has-hover;
                                                     width: 28px; height: 26px; icon: "♥"; label: "Toggle heart reaction";
                                                     ink: root.muted; surface: transparent; hover-surface: root.hover;
                                                     activated => { root.toggle-message-reaction(message.event-id, "❤️"); }
                                                 }
                                                 if message.event-id != "" : IconAction {
+                                                    quiet: true; context-hover: message-hover.has-hover;
                                                     width: 28px; height: 26px; icon: "☷"; label: "Open thread for " + message.sender;
                                                     ink: root.muted; surface: transparent; hover-surface: root.hover;
                                                     activated => {
@@ -1706,6 +1740,7 @@ export component AppWindow inherits Window {
                                                     }
                                                 }
                                                 if message.event-id != "" : IconAction {
+                                                    quiet: true; context-hover: message-hover.has-hover;
                                                     width: 28px; height: 26px; icon: "⌫"; label: "Redact message from " + message.sender;
                                                     ink: root.muted; surface: transparent; hover-surface: root.hover;
                                                     enabled: root.live-session && !root.room-admin-busy;
@@ -1722,16 +1757,17 @@ export component AppWindow inherits Window {
                                                 }
                                             }
                                             if message.reply-to != "" : Rectangle {
-                                                height: 25px;
+                                                height: max(25px, 16px * root.text-scale + 6px);
                                                 border-radius: 5px;
-                                                background: root.hover;
-                                                Text { x: 8px; text: "Reply to " + message.reply-to; color: root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; overflow: elide; }
+                                                background: transparent;
+                                                Rectangle { x: 0px; y: 4px; width: 2px; height: parent.height - 8px; border-radius: 1px; background: root.divider; }
+                                                Text { x: 10px; width: parent.width - 10px; text: message.reply-to; color: root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; overflow: elide; }
                                             }
                                             StyledText {
                                                 width: max(100px, timeline-list.visible-width - 110px);
                                                 text: message.rich-body;
                                                 default-color: root.ink;
-                                                default-font-size: 13px * root.text-scale;
+                                                default-font-size: 14px * root.text-scale;
                                                 link-color: root.accent;
                                                 accessible-role: text;
                                                 accessible-label: message.rich-accessible-body;
@@ -1756,16 +1792,21 @@ export component AppWindow inherits Window {
                                                 }
                                             }
                                             if message.attachment != "" : Rectangle {
-                                                height: 49px;
-                                                border-radius: 8px;
+                                                width: min(440px, max(100px, timeline-list.visible-width - 110px));
+                                                height: 58px;
+                                                border-radius: 9px;
                                                 border-color: root.divider;
                                                 border-width: 1px;
                                                 background: root.panel;
                                                 HorizontalLayout {
                                                     padding-left: 12px;
                                                     padding-right: 12px;
+                                                    padding-top: 12px;
+                                                    padding-bottom: 12px;
                                                     spacing: 10px;
-                                                    Text { text: "F"; color: root.accent; font-size: 20px * root.text-scale; vertical-alignment: center; }
+                                                    Rectangle { width: 28px; background: transparent;
+                                                        InterfaceGlyph { y: (parent.height - self.height) / 2; icon: "F"; ink: root.accent; }
+                                                    }
                                                     Text { text: message.attachment; color: root.ink; font-size: 12px * root.text-scale; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
                                                     IconAction {
                                                         icon: "↓";
@@ -1777,13 +1818,13 @@ export component AppWindow inherits Window {
                                                 }
                                             }
                                             if message.reaction != "" : Rectangle {
-                                                width: 126px;
-                                                height: 24px;
+                                                width: min(220px, max(56px, reaction-label.preferred-width + 20px));
+                                                height: max(24px, 16px * root.text-scale + 6px);
                                                 border-radius: 8px;
                                                 border-color: root.divider;
                                                 border-width: 1px;
                                                 background: root.panel;
-                                                Text { text: message.reaction; color: root.ink; font-size: 11px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                                                reaction-label := Text { text: message.reaction; color: root.ink; font-size: 11px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
                                             }
                                         }
                                     }
@@ -1840,8 +1881,10 @@ export component AppWindow inherits Window {
                             border-width: 1px;
                             background: root.elevated;
                             HorizontalLayout {
-                                padding-left: 8px;
-                                padding-right: 8px;
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                padding-top: 11px;
+                                padding-bottom: 11px;
                                 spacing: 6px;
                                 IconAction {
                                     icon: "+"; label: "Attach file"; ink: root.muted; surface: transparent; hover-surface: root.hover;
@@ -2935,10 +2978,10 @@ export component AppWindow inherits Window {
             VerticalLayout {
                 spacing: 0px;
                 Rectangle {
-                    height: 62px;
+                    height: max(64px, 40px * root.text-scale + 24px);
                     background: root.panel;
                     HorizontalLayout {
-                        padding-left: 12px; padding-right: 12px; spacing: 4px;
+                        padding-left: 12px; padding-right: 12px; padding-top: 14px; padding-bottom: 14px; spacing: 4px;
                         ActionRect {
                             horizontal-stretch: 1; height: 34px; border-radius: 8px;
                             background: root.side-panel-tab == 0 ? root.hover : transparent;
@@ -3058,8 +3101,8 @@ export component AppWindow inherits Window {
                             height: max(55px, 34px * root.text-scale + 16px);
                             background: transparent;
                             HorizontalLayout {
-                                padding-left: 12px; padding-right: 12px; spacing: 9px;
-                                AvatarBadge { width: 32px; height: 32px; border-radius: 11px; initials: member.initials; accent: member.accent; }
+                                padding-left: 12px; padding-right: 12px; padding-top: 11px; padding-bottom: 11px; spacing: 9px;
+                                VerticalLayout { width: 32px; alignment: center; AvatarBadge { width: 32px; height: 32px; border-radius: 11px; initials: member.initials; accent: member.accent; } }
                                 VerticalLayout {
                                     alignment: center; horizontal-stretch: 1; spacing: 2px;
                                     Text { text: member.name; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; overflow: elide; }
@@ -3089,7 +3132,10 @@ export component AppWindow inherits Window {
                                         horizontal-alignment: center; vertical-alignment: center;
                                     }
                                 }
-                                if !root.live-session : Rectangle { width: 7px; height: 7px; border-radius: 4px; background: member.online ? #64c9a7 : root.muted; }
+                                if !root.live-session : Rectangle {
+                                    width: 7px; background: transparent;
+                                    Rectangle { y: (parent.height - 7px) / 2; width: 7px; height: 7px; border-radius: 4px; background: member.online ? #64c9a7 : root.muted; }
+                                }
                             }
                         }
                     }

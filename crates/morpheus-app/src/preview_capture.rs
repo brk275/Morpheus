@@ -18,8 +18,8 @@ use slint::ComponentHandle;
 
 use super::{AppWindow, Config, apply_config, apply_state, fixtures};
 
-const WIDTH: u32 = 1560;
-const HEIGHT: u32 = 1040;
+const WIDTH: u32 = 1440;
+const HEIGHT: u32 = 900;
 const FILES: [&str; 4] = [
     "desktop-preview.ppm",
     "account-switcher.ppm",
@@ -48,7 +48,7 @@ pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
     ui.set_native_call_status("Select a room to check call availability".into());
     ui.set_show_side_panel(true);
     ui.set_show_sign_in(false);
-    ui.set_session_error("Interactive preview · no Matrix connection".into());
+    ui.set_session_error("".into());
     ui.show()?;
     ui.window()
         .set_size(slint::PhysicalSize::new(WIDTH, HEIGHT));
@@ -88,8 +88,7 @@ pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
                     window.set_live_session(true);
                     window.set_active_account_local_id("preview-casey".into());
                     window.set_incoming_call_account_id("preview-casey".into());
-                    window
-                        .set_session_error("Incoming call layout preview · fictional data".into());
+                    window.set_session_error("".into());
                     window.set_incoming_call_offers(slint::ModelRc::new(slint::VecModel::from(
                         vec![super::IncomingCallItem {
                             token: "preview-offer".into(),

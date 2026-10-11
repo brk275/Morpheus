@@ -31,7 +31,7 @@ class PreviewEncodingTests(unittest.TestCase):
             offset += size + 12
         self.assertEqual(offset, len(data))
         self.assertEqual([kind for kind, _ in blocks], [b"IHDR", b"IDAT", b"IEND"])
-        self.assertEqual(struct.unpack(">IIBBBBB", blocks[0][1]), (1560, 1040, 8, 2, 0, 0, 0))
+        self.assertEqual(struct.unpack(">IIBBBBB", blocks[0][1]), (1440, 900, 8, 2, 0, 0, 0))
         rows = zlib.decompress(blocks[1][1])
         stride = preview.WIDTH * 3
         self.assertEqual(len(rows), (stride + 1) * preview.HEIGHT)
@@ -41,7 +41,7 @@ class PreviewEncodingTests(unittest.TestCase):
 
     def test_noncanonical_ppm_wrong_dimensions_truncation_and_trailing_bytes_fail(self):
         canonical = preview.HEADER + self.pixels()
-        for data in (canonical[:-1], canonical + b"\x00", canonical.replace(b"1560", b"1561", 1),
+        for data in (canonical[:-1], canonical + b"\x00", canonical.replace(b"1440", b"1441", 1),
                      canonical.replace(b"255\n", b"65535\n", 1), canonical.replace(b"P6\n", b"P3\n", 1)):
             with self.subTest(header=data[:24]), self.assertRaises(ValueError):
                 preview.parse_ppm(data)

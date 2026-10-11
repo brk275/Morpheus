@@ -107,7 +107,7 @@ jobs:
             libfontconfig1-dev libgbm-dev libglib2.0-dev libinih-dev libpipewire-0.3-dev libssl-dev libsystemd-dev libudev-dev \
             libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev \
-            libxkbcommon-dev libxkbcommon-x11-dev libxi6 libxrandr-dev meson ninja-build pkg-config wayland-protocols xvfb \
+            libxkbcommon-dev libxkbcommon-x11-dev libxi6 libxrandr-dev meson ninja-build pkg-config wayland-protocols xvfb xdotool \
             dbus-x11 gnome-keyring libsecret-tools libglib2.0-bin \
             sway swaybg pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-wlr
           # Ubuntu 24.04 Chromium dependencies from pinned Playwright 1.62.1.
@@ -162,7 +162,8 @@ jobs:
           # This debug-only early CLI renders fictional fixtures before any
           # account/config store or network service initialization. Native
           # logs and raw frames stay private and are never uploaded.
-          if ! timeout --kill-after=5s 30s xvfb-run -a -s '-screen 0 1560x1040x24' \
+          if ! timeout --kill-after=5s 30s xvfb-run -a -s '-screen 0 1440x900x24' \
+            sh -c 'xdotool mousemove 1 1 && exec "$@"' sh \
             target/debug/morpheus-app --morpheus-capture-preview "$preview_root/raw" \
             >"$preview_root/native.log" 2>&1; then
             echo "Native preview capture failed; private output was not published."

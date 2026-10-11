@@ -1797,6 +1797,7 @@ fn apply_snapshot(
         ui.set_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new())));
     }
     ui.set_live_session(true);
+    ui.set_preview_session(false);
     if account_changed && ui.get_page() == 1 {
         ui.invoke_refresh_security();
     }
