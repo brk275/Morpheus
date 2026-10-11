@@ -91,7 +91,7 @@ fn extension(raw: Raw<AnySyncTimelineEvent>) -> http::Response {
 }
 
 #[async_test]
-async fn keyless_extension_decryption_keeps_actual_unverified_metadata_and_redaction() {
+async fn test_keyless_extension_decryption_keeps_actual_unverified_metadata_and_redaction() {
     let bob = receiver().await;
     let (alice, raw) = encrypted_event().await;
     import_keys(&alice, &bob).await;
@@ -153,7 +153,7 @@ async fn keyless_extension_decryption_keeps_actual_unverified_metadata_and_redac
 }
 
 #[async_test]
-async fn keyless_late_room_key_stream_delivers_extension_receipt() {
+async fn test_keyless_late_room_key_stream_delivers_extension_receipt() {
     let bob = receiver().await;
     let (alice, raw) = encrypted_event().await;
     let room = bob.get_room(room_id!("!ring:example.org")).unwrap();
@@ -179,7 +179,7 @@ async fn keyless_late_room_key_stream_delivers_extension_receipt() {
 }
 
 #[async_test]
-async fn keyless_key_before_initial_park_and_old_repark_generation_are_safe() {
+async fn test_keyless_key_before_initial_park_and_old_repark_generation_are_safe() {
     let bob = receiver().await;
     let (alice, raw) = encrypted_event().await;
     let room = bob.get_room(room_id!("!ring:example.org")).unwrap();
@@ -222,7 +222,7 @@ async fn keyless_key_before_initial_park_and_old_repark_generation_are_safe() {
 }
 
 #[async_test]
-async fn keyless_delayed_key_after_redaction_does_not_revive_receipt() {
+async fn test_keyless_delayed_key_after_redaction_does_not_revive_receipt() {
     let bob = receiver().await;
     let (alice, raw) = encrypted_event().await;
     let room = bob.get_room(room_id!("!ring:example.org")).unwrap();

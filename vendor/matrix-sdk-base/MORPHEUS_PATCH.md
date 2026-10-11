@@ -99,14 +99,13 @@ regressions to execute. Dev/optional resolution added 66 registry identities
 and four SDK git identities, with **zero existing package version upgrades**;
 the exact list is in the provenance JSON.
 
-Required hosted commands (not executed locally):
+Required hosted command (not executed locally):
 
 ```sh
-cargo test --locked -p matrix-sdk-base --no-default-features --features e2e-encryption,unstable-msc4354 --lib sticky::
-cargo test --locked -p matrix-sdk-base --no-default-features --features e2e-encryption,unstable-msc4354 --lib sliding_sync::tests::test_sticky
+cargo test --locked -p matrix-sdk-base --no-default-features --features e2e-encryption,unstable-msc4354 --lib sticky
 ```
 
-The first command includes real extension-only decryption, late key delivery,
+The command includes real extension-only decryption, late key delivery,
 redaction/replay, old-generation retries, unchanged Unverified metadata and
 Arc retention, extraction negatives, byte/count bounds and broadcast lag,
 alongside upstream keyed-map tests. Live application receipt and redaction

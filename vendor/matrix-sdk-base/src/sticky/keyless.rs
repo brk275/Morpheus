@@ -385,7 +385,7 @@ mod tests {
     }
 
     #[matrix_sdk_test::async_test]
-    async fn keyless_lag_is_explicit_and_snapshot_is_complete() {
+    async fn test_keyless_lag_is_explicit_and_snapshot_is_complete() {
         use super::super::{StickyEvents, now_ms};
         let sticky = StickyEvents::new(ruma::owned_room_id!("!ring:example.org"));
         let mut updates = sticky.subscribe_keyless();

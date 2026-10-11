@@ -5,7 +5,49 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
 ## Current hosted acceptance, 2026-10-11
 
-### Latest completed run
+### SDK receipt verification and test setup correction
+
+[Run 38124824005](https://github.com/brk275/Morpheus/actions/runs/38124824005)
+tested `af50e11fbd74c09a7a974ca9b7dc9196f41bfcf6`. Linux built the desktop app,
+passed Xvfb startup, 16 configuration, 44 Matrix, eight RTC protocol, 97 desktop
+and 60 native RTC/device tests, and all four vendor security suites (1/32/10/5).
+The desktop suite reported one explicitly ignored live test. Scope passed
+334 helper tests with one explicit skip, including the hosted HTTPS cookie
+login/consent flow.
+
+Windows and both Mac architectures passed their native check/build, 16 configuration,
+44 Matrix, eight RTC protocol, 82 desktop and 49 native RTC/device tests, and
+the same four vendor security suites. Each desktop suite reported one ignored
+live test. The Windows owned-window/display capture check passed. All three
+jobs then failed at the same five SDK test macro errors.
+
+The new SDK regression test binary did not compile: five async test names
+omitted the `test_` prefix required by the pinned SDK's test macro. No assertions
+in that suite executed. Linux consequently skipped the live Matrix, OAuth,
+invitation, RTC and Element checks. This run supplies no new unsolicited
+invitation or sync-redaction evidence.
+
+Linux's required Wayland gate also failed at the first static selected-display
+frame. All 33 bindings used system PipeWire and all five desktop services
+remained running. The valid producer queue preceded the consumer's local
+Running transition; format and buffer setup completed, but no process callback
+was recorded. Unlike the previous run, the unfinished-graph marker was absent.
+The trace still does not prove why the first frame was not delivered.
+
+All job logs scanned with zero findings and are retained privately with hashes.
+Every cache and checkout post-step completed; Windows and both Macs saved
+caches successfully. No installers were uploaded.
+
+The follow-up changes only the five test names, leaving their assertions and
+production code intact. One `--lib sticky` invocation retains both previous
+filter sets and also includes the undecryptable-sticky and in-memory queue
+tests. An SDK regression failure now permits independently built live app
+checks to run and remains a failure at the final CI gate. Vendored security
+failures still stop the job. Native verification of this correction is pending.
+Its focused local checks passed: 17 CI-selection tests, Actionlint, formatting
+and whitespace checks. No native build, native test or fixture service ran locally.
+
+### Previous completed run with live acceptance
 
 [Run 38122640830](https://github.com/brk275/Morpheus/actions/runs/38122640830)
 tested `954b2a517ce5389045f3deb84ec81e5bcbadd0f7` on all four standard public
@@ -55,15 +97,16 @@ checked container/network absence gates passed. All job logs scanned with zero
 findings and are retained privately with hashes. Every post/cache step
 completed; the caches were already current. No installer was uploaded.
 
-### Next candidate, not yet verified natively
+### Receipt patch and live harness changes awaiting acceptance
 
-A narrow local patch to the pinned `matrix-sdk-base` 0.19.1 retains keyless
-sticky receipts with the SDK's actual encryption metadata. It keeps existing
-keyed semantics, original expiry and room generations; redaction, late keys,
+Candidate `af50e11` adds a narrow patch to pinned `matrix-sdk-base` 0.19.1 that
+retains keyless sticky receipts with the SDK's actual encryption metadata. It
+keeps existing keyed semantics, original expiry and room generations; redaction, late keys,
 replay, byte/count limits and broadcast lag have dedicated regressions. The
 four live invitation cases now require unsolicited receipt **before** any GET,
-then observed sync-cache redaction before expiry. New native tests and these
-stronger live checks have not yet run. See the
+then observed sync-cache redaction before expiry. The SDK test setup failure
+above prevented the new native tests and these stronger live checks from
+executing. See the
 [patch contract](../vendor/matrix-sdk-base/MORPHEUS_PATCH.md).
 
 The live harness now collects independent checks after a contained, scanned

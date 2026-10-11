@@ -184,10 +184,12 @@ jobs:
           cargo test --locked -p matrix-rtc-livekit --lib
           cargo test --locked -p cargo-packager-updater --lib
       - name: Test pinned SDK sticky receipt and redaction regressions
+        id: sdk-receipt-tests
+        # Keep collecting the independently built app's live acceptance. The
+        # final outcome gate still rejects failed SDK unit regressions.
+        continue-on-error: true
         shell: bash
-        run: |
-          cargo test --locked -p matrix-sdk-base --no-default-features --features e2e-encryption,unstable-msc4354 --lib sticky::
-          cargo test --locked -p matrix-sdk-base --no-default-features --features e2e-encryption,unstable-msc4354 --lib sliding_sync::tests::test_sticky
+        run: cargo test --locked -p matrix-sdk-base --no-default-features --features e2e-encryption,unstable-msc4354 --lib sticky
       - name: Test real Matrix accounts, recovery, moderation, and encrypted RTC
         if: runner.os == 'Linux'
         # Four fresh invitation cases each have a bounded 300-second command.
@@ -206,8 +208,8 @@ jobs:
           dbus-run-session -- python3 scripts/run_matrix_acceptance.py \
             --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks"
       - name: Enforce collected acceptance results
-        if: ${{ !cancelled() && (steps.model-tests.outcome == 'failure' || steps.wayland-tests.outcome == 'failure' || steps.windows-capture-tests.outcome == 'failure') }}
+        if: ${{ !cancelled() && (steps.model-tests.outcome == 'failure' || steps.wayland-tests.outcome == 'failure' || steps.windows-capture-tests.outcome == 'failure' || steps.sdk-receipt-tests.outcome == 'failure') }}
         shell: bash
         run: |
-          echo "Protocol model or native capture acceptance tests failed; this candidate is not verified."
+          echo "Protocol model, native capture, or SDK receipt acceptance tests failed; this candidate is not verified."
           exit 1
