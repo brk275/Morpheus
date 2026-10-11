@@ -148,6 +148,40 @@ acceptance, physical capture, screen readers, signed distribution, and updater
 replacement/recovery remain open; this batch does not establish beta readiness.
 Apple Developer and Windows signing credentials are not yet configured.
 
+## Explicit update controls and shortcut compilation fix, 2026-10-10
+
+[Run 38106808405](https://github.com/brk275/Morpheus/actions/runs/38106808405)
+tested `b1d4631d6b3f5f701f28411eb5771235d77ad8c6` on all four standard public
+runners. Each passed 12 configuration, 37 Matrix, and eight RTC protocol model
+tests. Every desktop check then failed because the new shortcut module omitted
+the `slint::ComponentHandle` trait import. Native builds, desktop/device tests,
+and Linux live acceptance were skipped. All four native logs passed credential
+scanning. The missing import is corrected in this follow-up; the Linux fixture
+failures from the earlier run remain unresolved until their checks execute.
+
+The follow-up connects Settings to explicit signed-update Check, Download,
+Discard, and Restart actions. It keeps blocking transfers/preparation off the
+UI thread, reads current status when UI notifications arrive, and retains the
+startup transaction until application workers and the runtime stop. Missing
+compiled feed/key or an unsupported installation disables the controls. No
+public feed, private signing key, or runtime trust override is added.
+
+Independent review fixed two lifecycle races: closing the window stops
+notifications immediately and drains call cleanup alongside updater work;
+queued account-view clearing cannot release an active recovery reservation.
+A newly returned recovery key must be acknowledged before restart can reserve
+the security gate. Nine controller tests and two security regressions were
+added and await hosted execution. Rust formatting, Python helper tests,
+Actionlint, whitespace checks, and a fresh staged-source secret scan passed
+locally. The only scanner match is the previously reviewed public upstream
+JWT fixture; no unresolved credential finding remains. No local native builds,
+source generation, native tests, or Matrix/RTC services ran for this follow-up.
+
+Manual package workflow edits no longer trigger an unrelated automatic native
+matrix; package/install verification still requires an explicit dispatch for
+the affected platforms. This source follow-up does not satisfy installed
+signed-update, physical-device, screen-reader, or beta release acceptance.
+
 ## Public source publication, 2026-10-10
 
 - Published `brk275/Morpheus` as public pre-alpha source at

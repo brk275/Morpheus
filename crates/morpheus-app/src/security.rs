@@ -17,6 +17,7 @@ use crate::{AppWindow, live::LiveUi};
 const SECURITY_IDLE: u8 = 0;
 const SECURITY_BUSY: u8 = 1;
 const SECURITY_KEY_PENDING: u8 = 2;
+const SECURITY_RESTART_PENDING: u8 = 3;
 
 /// Mirrors the account-sensitive UI state across the asynchronous transition
 /// lock. A queued account switch must recheck this after it acquires the lock.
@@ -44,14 +45,72 @@ impl SecurityGate {
     }
 
     fn reset(&self) {
-        self.0.store(SECURITY_IDLE, Ordering::Release);
+        // Ordinary completion/reset cannot acknowledge a recovery key or
+        // release the updater's reservation.
+        let _ = self.0.compare_exchange(
+            SECURITY_BUSY,
+            SECURITY_IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn acknowledge_key(&self) {
+        let _ = self.0.compare_exchange(
+            SECURITY_KEY_PENDING,
+            SECURITY_IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn can_clear_account_view(&self) -> bool {
+        // A queued account snapshot owns neither the recovery reservation nor
+        // its resulting key. It may clear stale busy widgets for a new account,
+        // but cannot change the gate; the old owner will resolve its mismatch.
+        // An actual returned key must remain visible until acknowledged.
+        self.0.load(Ordering::Acquire) != SECURITY_KEY_PENDING
+    }
+
+    /// Reserve restart synchronously, before any preparation worker starts.
+    /// Recovery uses the same CAS before spawning work, so neither operation
+    /// can slip between a status check and the other's reservation.
+    pub(crate) fn try_restart(self: &Arc<Self>) -> Option<RestartLease> {
+        self.0
+            .compare_exchange(
+                SECURITY_IDLE,
+                SECURITY_RESTART_PENDING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| RestartLease(self.clone()))
+    }
+}
+
+pub(crate) struct RestartLease(Arc<SecurityGate>);
+
+impl Drop for RestartLease {
+    fn drop(&mut self) {
+        let _ = self.0.0.compare_exchange(
+            SECURITY_RESTART_PENDING,
+            SECURITY_IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 }
 
 fn close_response(gate: &SecurityGate) -> CloseRequestResponse {
-    if gate.blocked() {
+    if matches!(
+        gate.0.load(Ordering::Acquire),
+        SECURITY_BUSY | SECURITY_KEY_PENDING
+    ) {
         CloseRequestResponse::KeepWindowShown
     } else {
+        // Closing while a restart is preparing drains that authorized worker
+        // through normal shutdown. Also leaves a manual close path if the UI's
+        // quit request fails after the helper has signalled readiness.
         CloseRequestResponse::HideWindow
     }
 }
@@ -115,7 +174,11 @@ fn apply_status(ui: &AppWindow, info: SecurityInfo) {
 /// Clear all account-specific status and secret fields on account change,
 /// logout, or entry into the offline preview.
 pub(crate) fn clear_ui(ui: &AppWindow, gate: &SecurityGate) {
-    gate.reset();
+    // Account transitions are guarded too; this is the final defence against
+    // an ordinary delayed refresh hiding an unacknowledged recovery key.
+    if !gate.can_clear_account_view() {
+        return;
+    }
     crate::verification::clear_ui(ui);
     next_operation(ui);
     ui.set_security_device_status("Unknown".into());
@@ -135,6 +198,11 @@ pub(crate) fn clear_ui(ui: &AppWindow, gate: &SecurityGate) {
 /// before this account can be left. The guard runs before navigation is
 /// invalidated or an account transition is spawned.
 pub(crate) fn block_account_change(ui: &AppWindow, gate: &SecurityGate) -> bool {
+    if gate.0.load(Ordering::Acquire) == SECURITY_RESTART_PENDING {
+        ui.set_page(1);
+        ui.set_security_error("Wait for the application restart before changing accounts.".into());
+        return true;
+    }
     if gate.0.load(Ordering::Acquire) == SECURITY_BUSY {
         ui.set_page(1);
         ui.set_security_error(
@@ -429,7 +497,7 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
             next_operation(&window);
             window.set_security_recovery_key("".into());
             window.set_security_key_revealed(false);
-            dismiss_gate.reset();
+            dismiss_gate.acknowledge_key();
             window.set_security_notice(
                 "Recovery key hidden. Morpheus cannot display it again.".into(),
             );
@@ -471,7 +539,58 @@ mod tests {
         assert!(gate.blocked());
         assert_eq!(close_response(&gate), CloseRequestResponse::KeepWindowShown);
         gate.reset();
+        assert!(gate.blocked());
+        gate.acknowledge_key();
         assert!(!gate.blocked());
         assert_eq!(close_response(&gate), CloseRequestResponse::HideWindow);
+    }
+
+    #[test]
+    fn restart_and_recovery_reservations_exclude_each_other_and_reset_preserves_restart() {
+        let gate = Arc::new(SecurityGate::default());
+        assert!(gate.begin());
+        assert!(gate.try_restart().is_none());
+        gate.key_pending();
+        assert!(gate.try_restart().is_none());
+        gate.reset();
+        assert!(gate.try_restart().is_none());
+        gate.acknowledge_key();
+        let lease = gate.try_restart().unwrap();
+        assert!(gate.blocked());
+        assert!(!gate.begin());
+        assert!(gate.try_restart().is_none());
+        gate.reset();
+        assert!(gate.blocked());
+        assert!(!gate.begin());
+        assert_eq!(close_response(&gate), CloseRequestResponse::HideWindow);
+        drop(lease);
+        assert!(!gate.blocked());
+        assert!(gate.begin());
+    }
+
+    #[test]
+    fn queued_account_clear_cannot_release_an_owned_recovery_or_erase_its_key() {
+        let gate = Arc::new(SecurityGate::default());
+        assert!(gate.begin());
+        // This is the same decision clear_ui makes before touching fields.
+        assert!(gate.can_clear_account_view());
+        assert!(
+            gate.blocked(),
+            "clearing stale widgets does not release ownership"
+        );
+        assert!(
+            !gate.begin(),
+            "a second recovery cannot acquire the old operation's reservation"
+        );
+        assert!(gate.try_restart().is_none());
+        // Successful recovery keeps ownership until the user saves the key.
+        gate.key_pending();
+        assert!(!gate.can_clear_account_view());
+        assert!(gate.try_restart().is_none());
+        gate.reset();
+        assert!(!gate.can_clear_account_view());
+        gate.acknowledge_key();
+        assert!(gate.can_clear_account_view());
+        assert!(gate.try_restart().is_some());
     }
 }

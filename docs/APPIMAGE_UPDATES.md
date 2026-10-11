@@ -1,8 +1,10 @@
 # AppImage update transaction
 
 This is an implemented recovery path awaiting native and installed-package
-acceptance. It is not a completed signed-update release gate. Update controls
-and the public feed remain disabled. No signing credentials ship in source.
+acceptance. It is not a completed signed-update release gate. Settings now has
+explicit Check, Download, Discard and Restart controls; they remain disabled
+without a compiled feed and verification key. The public feed is not enabled.
+No signing credentials ship in source.
 macOS and Windows installation still returns `InstallNotValidated`; they need
 separate platform transactions, signature/notarization checks where applicable,
 and installed-package failure/recovery evidence.
@@ -76,10 +78,20 @@ limited to application bytes before the new process opens account storage.
   replacements, corrupted backups, invalid journals and filesystem failures
   preserve recovery material and stop before account storage is opened.
 
-The UI integration contract is `StagedUpdate::prepare_restart` with the real
-shared `UpdateActivity` and startup `AppImageSession`, followed by explicit
-`PreparedRestart::launch_supervisor`, then orderly app shutdown. The call
-controller retains the same exclusion through join and final cleanup.
+The application update controller runs discovery, download, verification and
+preparation on blocking workers. It calls `StagedUpdate::prepare_restart` with
+the real shared `UpdateActivity` and startup `AppImageSession`, then
+`PreparedRestart::launch_supervisor`. Only the current helper-ready result can
+request UI shutdown. The startup session is owned outside the controller and
+outlives UI, account workers and the runtime. Normal window close also drains
+controller work; cancelling a transfer discards its result after the existing
+bounded network operation finishes. There is no automatic polling or install.
+
+The call controller retains the same exclusion through join and final cleanup.
+Restart also reserves the account security gate, so active recovery and an
+unacknowledged new recovery key block it. Once restart preparation starts, a
+new recovery operation cannot begin. A known preparation failure releases that
+reservation; successful handoff keeps it through orderly shutdown.
 
 ## Verification still required
 
@@ -90,6 +102,10 @@ pre-store commit, and preservation of account-data sentinel files. Python tests
 cover metadata/footer preparation, unchanged ELF/SquashFS bytes, signature
 ordering, permissions, symlinks and malformed metadata. Synthetic filesystem
 fixtures do not claim successful AppImage mounting or encrypted-store recovery.
+Controller tests cover explicit transitions, stale/cancelled results, failed
+call exclusion, uncertain worker failure and draining concurrent shutdowns.
+The new controller/UI integration and security-gate regressions await hosted
+native verification; model tests are not installed signed-update acceptance.
 
 Before enabling a feed, run real signed old/new AppImages through native launch,
 upgrade, power/process interruption, recovery, cancellation, moved paths,

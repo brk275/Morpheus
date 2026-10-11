@@ -13,6 +13,7 @@ mod notifications;
 mod security;
 mod shortcuts;
 mod sso;
+mod update_controller;
 mod updater;
 mod verification;
 #[cfg(feature = "native-calls")]
@@ -25,7 +26,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 #[cfg(feature = "native-calls")]
 use std::sync::atomic::{AtomicBool, AtomicU64};
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::{Arc, Mutex, atomic::Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -1447,8 +1448,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     // Declared first and dropped last, after runtimes/account workers stop.
-    let mut update_session = updater::StartupSession::begin()?;
-    if update_session.restarted {
+    let update_session = Arc::new(Mutex::new(updater::StartupSession::begin()?));
+    if update_session
+        .lock()
+        .map_err(|_| updater::UpdateError::RecoveryRequired)?
+        .restarted
+    {
         return Ok(());
     }
     #[cfg(feature = "native-calls")]
@@ -1456,7 +1461,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ui = AppWindow::new()?;
     ui.set_login_loading(true);
     ui.show()?;
-    update_session.acknowledge_before_store()?;
+    update_session
+        .lock()
+        .map_err(|_| updater::UpdateError::RecoveryRequired)?
+        .acknowledge_before_store()?;
     let qa_profile = qa_profile_root()?;
     let data_dir = if let Some(root) = &qa_profile {
         root.join("data")
@@ -1486,8 +1494,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let uploads = Arc::new(UploadController::default());
     ui.set_native_call_enabled(cfg!(feature = "native-calls"));
     ui.set_native_call_status("Select a room to check call availability".into());
-    #[cfg(feature = "native-calls")]
     let update_activity = updater::UpdateActivity::default();
+    let updates = update_controller::UpdateController::new(
+        runtime.handle().clone(),
+        update_activity.clone(),
+        update_session.clone(),
+        live.security_gate.clone(),
+    );
+    let update_ui_task = updates.bind_ui(&ui);
     #[cfg(feature = "native-calls")]
     let calls = Arc::new(CallController::new(
         manager.clone(),
@@ -4541,12 +4555,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ui_result = ui.run();
     notifications.shutdown();
-    #[cfg(feature = "native-calls")]
-    if let Err(error) = runtime.block_on(calls.end_call()) {
-        eprintln!("Could not leave native call during shutdown: {error}");
-    }
+    update_ui_task.abort();
+    let update_result = runtime.block_on(async {
+        let _ = update_ui_task.await;
+        // A cancelled download may still be waiting for its bounded network
+        // timeout. Stop call capture concurrently, never after that wait.
+        #[cfg(feature = "native-calls")]
+        {
+            let (update_result, call_result) = tokio::join!(updates.shutdown(), calls.end_call());
+            if let Err(error) = call_result {
+                eprintln!("Could not leave native call during shutdown: {error}");
+            }
+            update_result
+        }
+        #[cfg(not(feature = "native-calls"))]
+        updates.shutdown().await
+    });
     let draft_result = runtime.block_on(live.flush_drafts());
     runtime.block_on(manager.stop());
+    if let Err(error) = update_result {
+        // Static diagnostic only; all other app shutdown work still completes.
+        eprintln!("Could not finish update shutdown safely: {error}");
+    }
     ui_result?;
     if let Err(error) = draft_result {
         eprintln!("Could not save drafts during shutdown: {error}");

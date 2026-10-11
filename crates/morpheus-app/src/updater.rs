@@ -10,7 +10,7 @@
 //! retain its CallLease from the start of joining through final call cleanup.
 //! Merely checking a call-status snapshot cannot prevent a concurrent join.
 
-#![allow(dead_code)] // UI bindings land separately; disabled builds do no network work.
+#![allow(dead_code)] // Platform APIs remain compiled while unsupported installs fail closed.
 
 use std::{
     fmt,

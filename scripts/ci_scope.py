@@ -60,6 +60,11 @@ def classify(paths, force_all=False):
         elif path.startswith(("scripts/", "tests/")):
             # Scope job checks Python and JavaScript without external accounts.
             continue
+        elif path == ".github/workflows/package-qa.yml":
+            # This workflow is manual-only. CI compiles do not exercise its
+            # package/install steps; explicitly dispatch the affected package
+            # platforms after review instead of rebuilding every desktop here.
+            continue
         elif path in {".github/CODEOWNERS", ".github/dependabot.yml"} or path.startswith(".github/ISSUE_TEMPLATE/"):
             continue
         else:

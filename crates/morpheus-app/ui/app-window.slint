@@ -355,6 +355,12 @@ export component AppWindow inherits Window {
     in-out property <string> session-error;
     in-out property <string> transfer-notice;
     in-out property <string> config-path;
+    in-out property <string> update-status: "Signed updates are unavailable for this build.";
+    in-out property <string> update-version;
+    in-out property <bool> update-can-check: false;
+    in-out property <bool> update-can-download: false;
+    in-out property <bool> update-can-restart: false;
+    in-out property <bool> update-can-discard: false;
     in-out property <string> shortcut-quick-switcher;
     in-out property <string> shortcut-search;
     in-out property <string> shortcut-next-unread;
@@ -513,6 +519,10 @@ export component AppWindow inherits Window {
     callback set-notification-show-preview(bool);
     callback add-highlight-word(string);
     callback remove-highlight-word(string);
+    callback check-for-updates();
+    callback download-update();
+    callback restart-to-update();
+    callback discard-update();
     callback dispatch-shortcut(string, bool, bool, bool, bool) -> bool;
     callback save-shortcuts();
     callback reset-shortcuts();
@@ -2163,6 +2173,21 @@ export component AppWindow inherits Window {
                         Text { text: "Advanced customization"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Edit your settings and theme pack files. Valid changes appear here automatically."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         Text { text: root.config-path; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+                        Rectangle { height: 1px; background: root.divider; }
+                        Text { text: "Application updates"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
+                        Text { text: "Updates are checked only when you ask. Downloading verifies the application signature; restarting installs the update. Leave any call and finish recovery before restarting."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                        if root.update-version != "" : Text { text: "Available version: " + root.update-version; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                        Text { text: root.update-status; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-label: "Application update status: " + root.update-status; accessible-live-region: polite; }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Button { text: "Check for updates"; enabled: root.update-can-check; clicked => { root.check-for-updates(); } }
+                            Button { text: "Download update"; enabled: root.update-can-download; clicked => { root.download-update(); } }
+                        }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Button { text: "Discard update"; enabled: root.update-can-discard; clicked => { root.discard-update(); } }
+                            Button { text: "Restart to update"; primary: true; enabled: root.update-can-restart && !root.call-connected && !root.security-busy && root.security-recovery-key == ""; clicked => { root.restart-to-update(); } }
+                        }
                         Rectangle { height: 1px; background: root.divider; }
                         Text { text: "About"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Morpheus is an open-source Matrix desktop client."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }

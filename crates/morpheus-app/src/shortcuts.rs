@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use morpheus_config::{
     Config, ConfigStore, Shortcut, ShortcutAction, ShortcutKey, ShortcutModifiers,
 };
-use slint::{Model, ModelRc, SharedString, VecModel, platform::Key};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel, platform::Key};
 
 use crate::{AppWindow, RoomItem};
 

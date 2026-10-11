@@ -119,15 +119,20 @@ The app now has a signed-update discovery and staging service using the pinned
 official `cargo-packager-updater` 0.2.3 with a documented security patch. It
 requires compiled HTTPS feed and public-key configuration, bounds responses,
 refuses redirects, checks the package format and version, and reverifies the
-exact staged bytes. The public feed and updater UI are disabled.
+exact staged bytes. Settings now has explicit Check, Download, Discard and
+Restart controls, disabled when the compiled feed/key or supported installation
+is absent. No public feed is enabled. The controller runs blocking work in the
+background, rejects stale results and drains work before normal shutdown.
 Verified replacement, interrupted-update recovery, rollback, and
 call-controller behavior remain release gates; the original upstream installers cannot run
 through the patched public APIs. Linux now has a durable AppImage transaction
 and startup recovery foundation, with shared call/update exclusion. See
 [AppImage updates](APPIMAGE_UPDATES.md) for its signed compatibility footer,
 pre-store commit boundary, packaging order and remaining acceptance checks.
-The feed and update UI remain disabled; macOS and Windows installation still
-fail closed pending their platform transactions and verification.
+Recovery-key acknowledgement and the shared call lease block unsafe restarts.
+The new UI/controller integration still needs hosted and installed-package
+verification. macOS and Windows installation remains disabled pending their
+platform transactions and verification.
 
 Cargo Packager's default formats produce a macOS `.app` and `.dmg`, a Windows
 NSIS installer, and Linux `.deb`, AppImage, and Pacman packages. An update for

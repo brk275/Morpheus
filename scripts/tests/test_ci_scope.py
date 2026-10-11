@@ -12,6 +12,13 @@ class ScopeTests(unittest.TestCase):
     def test_linux_package_change_only_selects_linux(self):
         self.assertEqual(classify(["packaging/linux.toml"])["native_matrix"]["os"], ["ubuntu-24.04"])
 
+    def test_manual_package_workflow_does_not_duplicate_native_ci(self):
+        self.assertFalse(classify([".github/workflows/package-qa.yml", "scripts/package_scope.py"])["native"])
+        self.assertEqual(
+            classify([".github/workflows/package-qa.yml", "packaging/linux.toml"])["native_matrix"]["os"],
+            ["ubuntu-24.04"],
+        )
+
     def test_linux_acceptance_helpers_are_actually_exercised(self):
         for path in ["scripts/run_matrix_acceptance.py", "scripts/local_matrix_rtc.py", "scripts/local_matrix_env.py", "scripts/run_wayland_acceptance.py", "scripts/wayland_fixture_backend.py", "crates/morpheus-rtc/src/linux_portal.rs", "crates/morpheus-app/src/updater/linux_transaction.rs"]:
             with self.subTest(path=path):
