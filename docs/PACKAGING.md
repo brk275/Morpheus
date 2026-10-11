@@ -22,9 +22,10 @@ appropriate check after confirming no equivalent run is active:
 gh workflow run package-qa.yml --ref main -f platform=linux
 ```
 
-The workflow builds DMGs on the Mac runners, NSIS on Windows, and DEB/AppImage
-on Ubuntu 24.04. It smoke-tests Linux startup and leaves installers on the
-ephemeral runner: there is no artifact upload or release publication. Public
+The workflow builds DMGs on both native Mac architectures, NSIS on Windows,
+and DEB/AppImage on Ubuntu 24.04. It installs, inspects, briefly launches, and
+removes these packages using [`scripts/package_smoke.py`](../scripts/package_smoke.py).
+Installers stay on the ephemeral runner: there is no artifact upload or release publication. Public
 source and logs do not imply tested, signed installers. Native CI and packaging
 share a candidate/platform lock. Their workflow-level groups are separate;
 check active and completed runs before dispatching equivalent work.
@@ -36,6 +37,38 @@ For a local package, use `python3 scripts/package.py --formats deb,appimage`,
 `python3 scripts/package.py --check` to validate configuration without building.
 Direct `cargo packager` calls bypass the Linux overlay and are not the supported
 packaging entry point.
+
+### Automated installed-package checks
+
+The installation helper runs only when `GITHUB_ACTIONS=true`; it is intended
+for disposable hosted runners, never a developer's existing application
+installation. It uses the fresh runner/container application profile and does
+not sign in or operate media devices. The debug-only `MORPHEUS_QA_PROFILE_DIR`
+override is deliberately not used for release packages.
+
+| Target | Automated checks |
+| --- | --- |
+| macOS Apple Silicon and Intel | Verify and mount the DMG read-only without interaction; copy the app into a temporary Applications directory; check native Mach-O architecture, bundle identifier/version, microphone/camera/screen purpose strings, exact license and theme contents; launch the installed executable for 12 seconds, stop it, remove the app, detach the DMG. |
+| Windows x64 | Silently install NSIS into a temporary path containing spaces; check x64 PE32+ GUI subsystem, license/theme and Add/Remove Programs registration/version; require the installed process to survive 12 seconds and create a Win32 window with its visible flag set; close/stop the process, run the real silent uninstaller and verify application directory and registration removal. |
+| Linux x64 DEB | Resolve/install the DEB in a fresh Ubuntu 24.04 container with no compiler or library development packages; verify declared ABI floors and `libxi6`, direct shared libraries and dynamic loading of `libXi.so.6` **before** adding Xvfb; check ELF architecture/symbol floors, desktop entry/icon and license/theme; launch as an unprivileged user under X11/Xvfb for 12 seconds and require a Morpheus window; stop the process and purge the package. |
+| Linux x64 AppImage | In a separate fresh Ubuntu 24.04 container with a minimal X11 desktop runtime, inspect the extracted metadata/resources/ELF, then launch the **AppImage itself** as an unprivileged user using its extract-and-run runtime (no FUSE mount); require a Morpheus X11 window and 12-second survival; stop the process and remove the portable file. No DEB is installed in this container. |
+
+The Linux runtime image is resolved once per job and used by immutable image ID
+for both containers. Logs record that image ID and each installer's filename,
+size and SHA-256, followed by machine-readable results. Multiple matching
+installers are rejected to avoid testing a stale package accidentally. ELF
+requirements above `GLIBC_2.39` or `GLIBCXX_3.4.30` fail the smoke until the
+declared compatibility baseline is deliberately reviewed.
+
+These checks are implemented automation, not evidence that a particular
+candidate passed. A successful run establishes only the checks listed above
+for its exact source and package hashes. macOS startup is process liveness;
+the Windows visible-window flag and virtual X11 window do not establish visual
+quality or accessibility. Signing/notarization, installer UI, full desktop
+integration, real account/credential-vault behavior, native media permissions,
+Wayland, hardware, updates and rollback remain release acceptance gates.
+The helper records a missing Debian `Maintainer` field; it does not waive the
+working project contact requirement below.
 
 Earlier private QA runs uploaded unsigned installers for five days. On
 2026-10-10, their three runs and all ten artifacts were removed before source
@@ -78,7 +111,22 @@ Signing identity and notarization credentials belong in the release environment,
 
 ## Updates and controlled betas
 
-The updater is not integrated yet. Cargo Packager's default formats currently produce a macOS `.app` and `.dmg`, a Windows NSIS installer, and Linux `.deb`, AppImage, and Pacman packages. `cargo-packager-updater` supports installing signed updates into a macOS `.app`, a Windows NSIS installer (or WiX if packaged), and a Linux AppImage. The macOS updater needs an `.app` update bundle even when the installed app originally came from a DMG; a DMG is not an updater payload. Debian and Pacman installations should use their package managers. On Linux, enable self-update only when running from a writable AppImage.
+The app now has a signed-update discovery and staging service using the pinned
+official `cargo-packager-updater` 0.2.3 with a documented security patch. It
+requires compiled HTTPS feed and public-key configuration, bounds responses,
+refuses redirects, checks the package format and version, and reverifies the
+exact staged bytes. There is no configured feed, updater UI, or enabled
+installer. Replacement, interrupted-update recovery, rollback, and call-controller
+integration remain release gates; the original upstream installers cannot run
+through the patched public APIs.
+
+Cargo Packager's default formats produce a macOS `.app` and `.dmg`, a Windows
+NSIS installer, and Linux `.deb`, AppImage, and Pacman packages. An update for
+macOS must be an `.app` bundle even when originally installed from a DMG; a DMG
+is not an updater payload. Debian and Pacman installations use their package
+managers. Linux self-update is limited to a writable AppImage; Windows requires
+an explicitly marked NSIS build. Do not enable installation until the recovery
+and installed-package checks pass.
 
 An updater release needs an HTTPS feed returning `204 No Content` or a `200 OK` JSON response with a newer semantic version, artifact URL, exact artifact signature, and supported format. The app verifies that signature with an embedded public key; the signing private key stays in the release environment. This signature is separate from macOS notarization and Windows code signing. Test the actual installed upgrade, bad signature, interrupted download, failed install, and recovery path on each supported platform before enabling it.
 

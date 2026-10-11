@@ -7,6 +7,21 @@ images, plus the [LiveKit](https://github.com/livekit/livekit) image or native
 macOS binary. It creates no public account, email address, or hosted call
 service.
 
+## Hosted acceptance
+
+The Linux native CI job runs `scripts/run_matrix_acceptance.py` in a fresh
+D-Bus session with an isolated Secret Service vault and disposable Docker
+services. It exercises account restart/isolation, messaging, drafts, discovery,
+moderation, local search on both sync paths, recovery on fresh accounts, and
+encrypted synthetic RTC with reconnect and key rotation. The harness rejects
+skipped/empty test runs. Credentials and raw logs remain outside the checkout;
+only check names, source failure locations, counts and timings are printed.
+Services are stopped even after failure, and no installers are uploaded.
+
+This is automated protocol and persistence coverage on Linux. It does not
+establish physical-device behavior, GUI acceptance, Element Call interoperability,
+or the corresponding macOS/Windows runtime gates.
+
 ## Start
 
 ```sh

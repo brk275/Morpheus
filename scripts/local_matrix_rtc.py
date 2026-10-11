@@ -145,7 +145,10 @@ def write_configs() -> None:
 rtc:
   use_external_ip: false
   node_ip: 127.0.0.1
-  enable_loopback_candidate: true
+  # Docker publishes packets to the container's network interface, not lo.
+  # Including both creates duplicate NAT-rewritten 127.0.0.1 candidates whose
+  # loopback socket cannot receive the host's media packets.
+  enable_loopback_candidate: false
   udp_port: 18012
   tcp_port: 18013
 room:

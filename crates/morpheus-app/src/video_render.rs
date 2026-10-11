@@ -11,7 +11,8 @@ use std::{
 
 use futures_util::{StreamExt, stream::BoxStream};
 use morpheus_rtc::{
-    MediaStreamKind, ParticipantInfo, RtcService, RtcStreamKind, VideoFrame, VideoRotation,
+    MediaStreamKind, ParticipantInfo, RtcCallEvent, RtcService, RtcStreamKind, VideoFrame,
+    VideoRotation,
 };
 use slint::{Rgb8Pixel, SharedPixelBuffer};
 use tokio::{sync::watch, time::MissedTickBehavior};
@@ -53,7 +54,26 @@ struct Source {
     kind: MediaStreamKind,
 }
 
+type Conversion = (
+    Source,
+    tokio::task::JoinHandle<Result<SharedPixelBuffer<Rgb8Pixel>, FrameError>>,
+);
+
 impl Source {
+    fn affected_by(&self, event: &RtcCallEvent) -> bool {
+        match event {
+            RtcCallEvent::StreamStarted { member_id, kind }
+            | RtcCallEvent::StreamStopped { member_id, kind }
+            | RtcCallEvent::StreamMuted { member_id, kind }
+            | RtcCallEvent::StreamUnmuted { member_id, kind } => {
+                self.member_id == *member_id && self.kind == *kind
+            }
+            RtcCallEvent::ParticipantLeft { member_id } => self.member_id == *member_id,
+            RtcCallEvent::Ended { .. } => true,
+            _ => false,
+        }
+    }
+
     fn label(&self) -> String {
         let medium = match self.kind {
             MediaStreamKind::ScreenShare => "Screen",
@@ -79,6 +99,7 @@ pub async fn run_remote_video(
         return;
     };
     let mut roster = call.subscribe_participants();
+    let mut events = call.subscribe_call_events();
     let mut refresh = tokio::time::interval(Duration::from_secs(2));
     refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut presentation = tokio::time::interval(FRAME_INTERVAL);
@@ -86,6 +107,7 @@ pub async fn run_remote_video(
     let mut selected: Option<Source> = None;
     let mut frames: Option<BoxStream<'static, VideoFrame>> = None;
     let mut newest: Option<VideoFrame> = None;
+    let mut conversion: Option<Conversion> = None;
     let select_track = |participants: &[ParticipantInfo], current: &Option<Source>| {
         let mut candidates = Vec::new();
         for participant in participants.iter().filter(|member| !member.is_local) {
@@ -130,18 +152,56 @@ pub async fn run_remote_video(
 
     loop {
         tokio::select! {
+            // Apply queued stop/mute/roster changes before presenting a
+            // conversion that completed at the same time.
+            biased;
+            event = events.recv() => {
+                use tokio::sync::broadcast::error::RecvError;
+                let invalidate = match event {
+                    Ok(RtcCallEvent::Ended { .. }) | Err(RecvError::Closed) => break,
+                    Err(RecvError::Lagged(_)) => true,
+                    Ok(ref event) => selected.as_ref().is_some_and(|source| source.affected_by(event)),
+                };
+                if invalidate {
+                    discard_conversion(&mut conversion);
+                    // A republished track has the same membership and kind,
+                    // but a different decoder stream. The roster's latest
+                    // snapshot can coalesce Stop/Start into an unchanged row.
+                    // Release the old stream and its frozen frame immediately.
+                    change_source(None, &mut selected, &mut frames, &mut newest, token, &updates, active_token);
+                }
+                let participants = rtc.participants(room_id).unwrap_or_default();
+                publish_roster(&roster_updates, token, participants.clone(), active_token);
+                let next = select_track(&participants, &selected);
+                if change_source(next, &mut selected, &mut frames, &mut newest, token, &updates, active_token) {
+                    discard_conversion(&mut conversion);
+                }
+            }
             _ = refresh.tick() => {
                 let participants = rtc.participants(room_id).unwrap_or_default();
                 publish_roster(&roster_updates, token, participants.clone(), active_token);
                 let next = select_track(&participants, &selected);
-                change_source(next, &mut selected, &mut frames, &mut newest, token, &updates, active_token);
+                if change_source(next, &mut selected, &mut frames, &mut newest, token, &updates, active_token) {
+                    discard_conversion(&mut conversion);
+                }
             }
             changed = roster.changed() => {
                 if changed.is_err() { break; }
                 let participants = rtc.participants(room_id).unwrap_or_default();
                 publish_roster(&roster_updates, token, participants.clone(), active_token);
                 let next = select_track(&participants, &selected);
-                change_source(next, &mut selected, &mut frames, &mut newest, token, &updates, active_token);
+                if change_source(next, &mut selected, &mut frames, &mut newest, token, &updates, active_token) {
+                    discard_conversion(&mut conversion);
+                }
+            }
+            converted = async { (&mut conversion.as_mut().expect("guarded conversion").1).await }, if conversion.is_some() => {
+                let (source, _) = conversion.take().expect("completed conversion");
+                if selected.as_ref() == Some(&source)
+                    && active_token.load(Ordering::SeqCst) == token
+                    && let Ok(Ok(pixels)) = converted
+                {
+                    updates.send_replace(VideoUpdate::Frame { token, source: source.label(), pixels });
+                }
             }
             frame = async { frames.as_mut().expect("guarded stream").next().await }, if frames.is_some() => {
                 match frame {
@@ -150,28 +210,35 @@ pub async fn run_remote_video(
                         selected = None;
                         frames = None;
                         newest = None;
+                        discard_conversion(&mut conversion);
                         if active_token.load(Ordering::SeqCst) == token {
                             updates.send_replace(VideoUpdate::Clear { token });
                         }
                     }
                 }
             }
-            _ = presentation.tick() => {
+            _ = presentation.tick(), if conversion.is_none() => {
                 if let (Some(source), Some(frame)) = (selected.as_ref(), newest.take()) {
-                    let source = source.label();
                     // RGB conversion can be expensive at 1080p. Never block
-                    // the Tokio worker that receives MatrixRTC media.
-                    if let Ok(Ok(pixels)) = tokio::task::spawn_blocking(move || rgb_buffer(&frame)).await {
-                        if active_token.load(Ordering::SeqCst) == token {
-                            updates.send_replace(VideoUpdate::Frame { token, source, pixels });
-                        }
-                    }
+                    // receiving stop/mute/leave events while it runs. Source
+                    // changes drop its handle so its result cannot repaint a
+                    // stale screen share, even within the same call token.
+                    conversion = Some((source.clone(), tokio::task::spawn_blocking(move || rgb_buffer(&frame))));
                 }
             }
         }
     }
+    discard_conversion(&mut conversion);
     if active_token.load(Ordering::SeqCst) == token {
         updates.send_replace(VideoUpdate::Clear { token });
+    }
+}
+
+fn discard_conversion(conversion: &mut Option<Conversion>) {
+    if let Some((_, worker)) = conversion.take() {
+        // Cancel queued work; an already running converter may finish but no
+        // longer has a receiver that can publish its result.
+        worker.abort();
     }
 }
 
@@ -202,10 +269,10 @@ fn change_source(
     token: u64,
     updates: &watch::Sender<VideoUpdate>,
     active_token: &AtomicU64,
-) {
+) -> bool {
     let new_source = next.as_ref().map(|(source, _)| source);
     if selected.as_ref() == new_source {
-        return;
+        return false;
     }
     *selected = next.as_ref().map(|(source, _)| source.clone());
     *frames = next.and_then(|(_, frames)| frames);
@@ -213,6 +280,7 @@ fn change_source(
     if active_token.load(Ordering::SeqCst) == token {
         updates.send_replace(VideoUpdate::Clear { token });
     }
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,5 +411,110 @@ mod tests {
             rgb_buffer(&frame).unwrap_err(),
             FrameError::InvalidDimensions
         );
+    }
+
+    #[test]
+    fn republished_video_discards_old_decoder_and_frozen_frame() {
+        let source = Source {
+            member_id: "bob-device-call".into(),
+            user_id: "@bob:example.org".into(),
+            kind: MediaStreamKind::Camera,
+        };
+        let restarted = RtcCallEvent::StreamStarted {
+            member_id: source.member_id.clone(),
+            kind: source.kind,
+        };
+        let token = 9;
+        let active_token = AtomicU64::new(token);
+        let pixels = rgb_buffer(&padded_frame(VideoRotation::Deg0)).unwrap();
+        let (updates, receiver) = watch::channel(VideoUpdate::Frame {
+            token,
+            source: source.label(),
+            pixels,
+        });
+        let mut selected = Some(source.clone());
+        let mut frames: Option<BoxStream<'static, VideoFrame>> =
+            Some(futures_util::stream::pending().boxed());
+        let mut newest = Some(padded_frame(VideoRotation::Deg0));
+        assert!(source.affected_by(&restarted));
+        change_source(
+            None,
+            &mut selected,
+            &mut frames,
+            &mut newest,
+            token,
+            &updates,
+            &active_token,
+        );
+        assert!(selected.is_none() && frames.is_none() && newest.is_none());
+        assert!(matches!(
+            *receiver.borrow(),
+            VideoUpdate::Clear { token: 9 }
+        ));
+        // An identical roster row must now subscribe to the replacement.
+        change_source(
+            Some((source, Some(futures_util::stream::pending().boxed()))),
+            &mut selected,
+            &mut frames,
+            &mut newest,
+            token,
+            &updates,
+            &active_token,
+        );
+        assert!(selected.is_some() && frames.is_some());
+    }
+
+    #[test]
+    fn other_tracks_do_not_interrupt_selected_video() {
+        let source = Source {
+            member_id: "bob-device-call".into(),
+            user_id: "@bob:example.org".into(),
+            kind: MediaStreamKind::ScreenShare,
+        };
+        assert!(!source.affected_by(&RtcCallEvent::StreamStopped {
+            member_id: source.member_id.clone(),
+            kind: MediaStreamKind::Microphone,
+        }));
+        assert!(!source.affected_by(&RtcCallEvent::ParticipantLeft {
+            member_id: "someone-else".into(),
+        }));
+        assert!(source.affected_by(&RtcCallEvent::StreamMuted {
+            member_id: source.member_id.clone(),
+            kind: source.kind,
+        }));
+        assert!(source.affected_by(&RtcCallEvent::ParticipantLeft {
+            member_id: source.member_id.clone(),
+        }));
+    }
+
+    #[tokio::test]
+    async fn stopped_track_discards_an_already_running_conversion() {
+        let source = Source {
+            member_id: "bob-device-call".into(),
+            user_id: "@bob:example.org".into(),
+            kind: MediaStreamKind::ScreenShare,
+        };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let _ = started_tx.send(());
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let pixels = rgb_buffer(&padded_frame(VideoRotation::Deg0));
+            let _ = finished_tx.send(());
+            pixels
+        });
+        let mut conversion = Some((source, worker));
+        started_rx.await.unwrap();
+        // Stop must remain responsive even while a converter is running.
+        discard_conversion(&mut conversion);
+        assert!(conversion.is_none());
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), finished_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        // There is no retained result to present after this late completion.
+        assert!(conversion.is_none());
     }
 }

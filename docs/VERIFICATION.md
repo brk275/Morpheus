@@ -3,6 +3,24 @@
 Morpheus is pre-alpha software with no approved installer release. This log records checks actually completed;
 the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
+## Beta gate implementation batch, 2026-10-10
+
+The next candidate adds delegated OAuth/OIDC and cancellation/refresh cleanup,
+signed-update staging with installation disabled, remote-video track replacement
+handling, installed-package smoke checks, and real Linux Matrix/RTC integration
+on disposable services. Review fixed pending-store creation, partial OAuth token
+revocation, a refresh-subscription race, and a stale video conversion that could
+repaint after a track stopped. The Docker RTC fixture excludes the container's
+unreachable loopback ICE socket while preserving host-loopback endpoints.
+
+Before hosted validation, 39 Python helper tests, Rust formatting, Actionlint,
+and whitespace checks passed locally. No native build was run locally for this
+batch. Hosted compilation, the new Rust regressions, live Linux protocol tests,
+and installed-package checks are still pending. Prior candidate results below
+do not verify these changed inputs. OIDC provider/browser acceptance, physical
+capture, screen readers, signed distribution, and updater replacement/recovery
+remain open; this batch does not establish beta readiness.
+
 ## Public source publication, 2026-10-10
 
 - Published `brk275/Morpheus` as public pre-alpha source at

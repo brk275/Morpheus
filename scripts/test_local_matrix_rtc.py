@@ -110,6 +110,9 @@ class RtcLoopbackTests(unittest.TestCase):
         outputs = dict(item.args for item in write.call_args_list)
         self.assertIn("LIVEKIT_URL=ws://127.0.0.1:18011\n", outputs[rtc.AUTH_ENV])
         self.assertEqual(outputs[rtc.SFU_LOOPBACK_SCRIPT], rtc.SFU_LOOPBACK_SOURCE)
+        self.assertIn("enable_loopback_candidate: false", outputs[rtc.SFU_CONFIG])
+        self.assertIn("enable_loopback_candidate: true", outputs[rtc.NATIVE_SFU_CONFIG])
+        self.assertIn("node_ip: 127.0.0.1", outputs[rtc.SFU_CONFIG])
 
 
 if __name__ == "__main__":

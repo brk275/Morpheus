@@ -11,7 +11,8 @@ per-room drafts, local message search, and native attachment selection and
 save controls are wired into the desktop app. Encrypted attachment transfer
 and persisted search passed disposable two-homeserver tests; the desktop
 attachment controls still need live UI acceptance. The Matrix SSO token flow
-is wired but has not passed a browser login test. An opt-in native call path
+and delegated OAuth/OIDC paths are wired but have not passed provider browser
+login acceptance. An opt-in native call path
 exposes room calls, a remote video tile, participant roster, mute/deafen, and
 an explicit legacy Element Call compatibility choice. Local encrypted
 two-device calls passed synthetic audio and camera transport, a shared
@@ -59,8 +60,9 @@ cargo run -p morpheus-app --features native-calls
 
 The app opens on Matrix sign-in and includes an explicitly labeled interactive
 offline preview. A preview conversation does not send network messages or join
-a call. Browser sign-in uses the Matrix SSO login-token flow; MSC3861 OIDC is
-not implemented yet. The default build has a labeled call preview; the
+a call. Browser sign-in discovers delegated OAuth/OIDC with PKCE where
+available and otherwise uses Matrix SSO login tokens. The OAuth provider must
+support native dynamic client registration. The default build has a labeled call preview; the
 `native-calls` feature enables experimental microphone audio and remote video
 on homeservers that provide a compatible MatrixRTC/LiveKit service. Calls
 require the SDK's sticky sliding-sync path. Live room drafts use the account's encrypted Matrix

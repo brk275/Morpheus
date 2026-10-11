@@ -8,6 +8,7 @@ members = [
     "vendor/lru",
     "vendor/livekit-api",
     "vendor/matrix-rtc-livekit",
+    "vendor/cargo-packager-updater",
 ]
 default-members = [
     "crates/morpheus-app",
@@ -22,6 +23,7 @@ license = "AGPL-3.0-or-later"
 repository = "https://github.com/brk275/Morpheus"
 
 [patch.crates-io]
+cargo-packager-updater = { path = "vendor/cargo-packager-updater" }
 lru = { path = "vendor/lru" }
 # Enforce secure signaling URLs and prohibit authenticated redirects.
 livekit-api = { path = "vendor/livekit-api" }

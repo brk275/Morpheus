@@ -12,6 +12,7 @@ mod local_video;
 mod notifications;
 mod security;
 mod sso;
+mod updater;
 mod verification;
 #[cfg(feature = "native-calls")]
 mod video_render;

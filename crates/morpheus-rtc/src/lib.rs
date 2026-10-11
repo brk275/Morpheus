@@ -24,6 +24,8 @@ mod video_device;
 #[cfg(feature = "device-audio")]
 pub use audio_device::{AudioControls, AudioOutput, AudioState, MicrophoneCapture};
 #[cfg(feature = "native-rtc")]
+pub use matrix_rtc_call_sdk::CallEvent as RtcCallEvent;
+#[cfg(feature = "native-rtc")]
 pub use matrix_rtc_transport::{
     AudioFrame, I420Buffer, MediaStreamKind, VideoFrame, VideoRotation,
 };

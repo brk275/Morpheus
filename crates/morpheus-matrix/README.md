@@ -33,16 +33,21 @@ are kept in the macOS Keychain, Windows Credential Manager, or Linux Secret
 Service through `keyring`. `accounts.json` contains only display identities,
 homeserver URLs, stable local IDs, and the selected ID. A locked or unavailable
 credential store produces an error; it never triggers plaintext token storage.
-Password login and Matrix browser SSO login-token flow are supported. For SSO,
+Password login, delegated OAuth/OIDC with PKCE, and Matrix browser SSO
+login-token paths are implemented. OAuth requires provider support for native
+dynamic client registration; provider browser acceptance remains pending. For browser sign-in,
 the app first binds an HTTP listener on a loopback address and explicit port,
 then calls `begin_sso(homeserver, loopback_redirect_url, identity_provider_id)`.
 Open the returned `browser_url` in the system browser. When the listener
 receives the full callback URL, pass it with the returned `attempt_id` to
 `finish_sso(attempt_id, callback_url)`. The core validates callback origin,
-path, and a random state before using the one-time login token. Do not log the
+path, and a random state before exchanging the authorization code or one-time
+login token. Do not log the
 callback URL. The app is responsible for launching the browser and serving a
-small completion page. MSC3861 OIDC, QR/device login, cross signing UI, and
-key backup/recovery UX remain to be implemented.
+small completion page and cancelling unfinished attempts. OAuth and legacy
+sessions are stored only in the OS credential vault. QR/device login remains
+unimplemented. Native device verification and recovery UI are wired, with the
+remaining acceptance checks recorded in the feature matrix.
 
 ## Messaging API
 

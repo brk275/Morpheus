@@ -6,6 +6,9 @@
 
 #![recursion_limit = "512"]
 
+mod authentication;
+use authentication::{PendingSso, StoredSession};
+
 mod media;
 pub use media::{
     AttachmentKind, AttachmentMetadata, AttachmentSendUpdate, DownloadedAttachment,
@@ -67,7 +70,6 @@ use matrix_sdk::{
     },
     search_index::SearchIndexStoreKind,
     send_queue::RoomSendQueueUpdate,
-    store::RoomLoadSettings,
 };
 use matrix_sdk_ui::sync_service::{Error as ServiceError, State as ServiceState, SyncService};
 use matrix_sdk_ui::timeline::{
@@ -495,11 +497,8 @@ pub struct SsoAttemptInfo {
     pub attempt_id: String,
     pub browser_url: String,
     pub redirect_url: String,
-}
-
-struct PendingSso {
-    homeserver: String,
-    redirect_url: Url,
+    /// Callback state field chosen by the negotiated authentication protocol.
+    pub state_parameter: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -551,7 +550,7 @@ impl Registry {
 struct StoredSecret {
     version: u8,
     store_passphrase: String,
-    session: MatrixSession,
+    session: StoredSession,
 }
 
 struct LoadedAccount {
@@ -613,6 +612,7 @@ impl AccountManager {
             Err(e) => return Err(e.into()),
         };
         registry.validate()?;
+        authentication::cleanup_pending_stores(&data_dir, &registry)?;
         let (active_tx, _) = watch::channel(None);
         let (sync_tx, _) = watch::channel(SyncStatus::Stopped);
         Ok(Self {
@@ -725,164 +725,7 @@ impl AccountManager {
             StoredSecret {
                 version: SECRET_VERSION,
                 store_passphrase: passphrase.clone(),
-                session,
-            },
-        )
-        .await
-        {
-            let _ = client.logout().await;
-            let _ = fs::remove_dir_all(&store_path);
-            return Err(e);
-        }
-        let mut next = state.registry.clone();
-        next.accounts.push(account.clone());
-        next.active_account_id = Some(id.clone());
-        if let Err(e) = save_registry(&self.data_dir, &next) {
-            let _ = delete_secret(&id).await;
-            let _ = client.logout().await;
-            let _ = fs::remove_dir_all(&store_path);
-            return Err(e);
-        }
-        stop_sync(&mut state).await;
-        let loaded = Arc::new(LoadedAccount::new(client, id.clone(), passphrase));
-        state.loaded.insert(id, loaded.clone());
-        state.registry = next;
-        self.active_tx.send_replace(Some(account.clone()));
-        self.start_sync(&mut state, loaded.client.clone()).await;
-        Ok(account)
-    }
-
-    /// Begin Matrix SSO with an application-owned loopback redirect URL.
-    /// This is the Matrix login-token flow, not MSC3861 OIDC.
-    pub async fn begin_sso(
-        &self,
-        homeserver: &str,
-        loopback_redirect_url: &str,
-        identity_provider_id: Option<&str>,
-    ) -> Result<SsoAttemptInfo> {
-        let homeserver = validate_homeserver(homeserver)?;
-        let mut redirect_url = validate_loopback_redirect(loopback_redirect_url)?;
-        let attempt_id = Uuid::new_v4().to_string();
-        redirect_url
-            .query_pairs_mut()
-            .append_pair("morpheus_state", &attempt_id);
-        let client = Client::builder()
-            .homeserver_url(&homeserver)
-            .build()
-            .await
-            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
-        let browser_url = client
-            .matrix_auth()
-            .get_sso_login_url(redirect_url.as_str(), identity_provider_id)
-            .await
-            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
-        self.state.lock().await.pending_sso.insert(
-            attempt_id.clone(),
-            PendingSso {
-                homeserver,
-                redirect_url: redirect_url.clone(),
-            },
-        );
-        Ok(SsoAttemptInfo {
-            attempt_id,
-            browser_url,
-            redirect_url: redirect_url.to_string(),
-        })
-    }
-
-    /// Finish a browser SSO login using the full URL received by the local
-    /// callback server. The callback origin, path, and random state are checked
-    /// before exchanging the one-use login token for a new Matrix device.
-    pub async fn finish_sso(&self, attempt_id: &str, callback_url: &str) -> Result<AccountInfo> {
-        let mut state = self.state.lock().await;
-        let pending = state
-            .pending_sso
-            .remove(attempt_id)
-            .ok_or_else(|| MatrixCoreError::InvalidSession)?;
-        let callback = Url::parse(callback_url)
-            .map_err(|e| MatrixCoreError::InvalidSsoCallback(e.to_string()))?;
-        let expected = &pending.redirect_url;
-        if callback.scheme() != expected.scheme()
-            || callback.host_str() != expected.host_str()
-            || callback.port_or_known_default() != expected.port_or_known_default()
-            || callback.path() != expected.path()
-            || callback.fragment().is_some()
-        {
-            return Err(MatrixCoreError::InvalidSsoCallback(
-                "unexpected redirect origin or path".into(),
-            ));
-        }
-        let mut states = callback
-            .query_pairs()
-            .filter(|(key, _)| key == "morpheus_state");
-        if states.next().is_none_or(|(_, value)| value != attempt_id) || states.next().is_some() {
-            return Err(MatrixCoreError::InvalidSsoCallback(
-                "missing or mismatched state".into(),
-            ));
-        }
-        let mut tokens = callback
-            .query_pairs()
-            .filter(|(key, _)| key == "loginToken");
-        let token = match tokens.next() {
-            Some((_, token)) if !token.is_empty() && tokens.next().is_none() => token.into_owned(),
-            _ => {
-                return Err(MatrixCoreError::InvalidSsoCallback(
-                    "missing or repeated login token".into(),
-                ));
-            }
-        };
-        let id = Uuid::new_v4().to_string();
-        let store_path = self.store_path(&id);
-        fs::create_dir_all(&store_path)?;
-        let passphrase = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-        let client = match build_client(&pending.homeserver, &store_path, &passphrase).await {
-            Ok(client) => client,
-            Err(e) => {
-                let _ = fs::remove_dir_all(&store_path);
-                return Err(e);
-            }
-        };
-        let response = match client
-            .matrix_auth()
-            .login_token(&token)
-            .initial_device_display_name("Morpheus Desktop")
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(e) => {
-                let _ = fs::remove_dir_all(&store_path);
-                return Err(MatrixCoreError::Sdk(e.to_string()));
-            }
-        };
-        let session: MatrixSession = (&response).into();
-        let account = AccountInfo {
-            id: id.clone(),
-            user_id: session.meta.user_id.to_string(),
-            device_id: session.meta.device_id.to_string(),
-            homeserver: pending.homeserver,
-        };
-        if state
-            .registry
-            .accounts
-            .iter()
-            .any(|a| a.user_id == account.user_id && a.device_id == account.device_id)
-        {
-            let _ = client.logout().await;
-            let _ = fs::remove_dir_all(&store_path);
-            return Err(MatrixCoreError::DuplicateAccount);
-        }
-        if let Err(error) = start_event_cache(&client) {
-            let _ = client.logout().await;
-            let _ = fs::remove_dir_all(&store_path);
-            return Err(error);
-        }
-        if let Err(e) = save_secret(
-            &id,
-            StoredSecret {
-                version: SECRET_VERSION,
-                store_passphrase: passphrase.clone(),
-                session,
+                session: StoredSession::Matrix(session),
             },
         )
         .await
@@ -940,8 +783,8 @@ impl AccountManager {
                 let secret = load_secret(id).await?;
                 if secret.version != SECRET_VERSION
                     || secret.store_passphrase.is_empty()
-                    || secret.session.meta.user_id.as_str() != account.user_id
-                    || secret.session.meta.device_id.as_str() != account.device_id
+                    || secret.session.meta().user_id.as_str() != account.user_id
+                    || secret.session.meta().device_id.as_str() != account.device_id
                 {
                     return Err(MatrixCoreError::InvalidSession);
                 }
@@ -952,8 +795,7 @@ impl AccountManager {
                 )
                 .await?;
                 client
-                    .matrix_auth()
-                    .restore_session(secret.session, RoomLoadSettings::default())
+                    .restore_session(secret.session.into_auth())
                     .await
                     .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
                 start_event_cache(&client)?;
@@ -1014,10 +856,7 @@ impl AccountManager {
                     .await
                     {
                         Ok(client) => {
-                            if let Err(e) = client
-                                .matrix_auth()
-                                .restore_session(secret.session, RoomLoadSettings::default())
-                                .await
+                            if let Err(e) = client.restore_session(secret.session.into_auth()).await
                             {
                                 warn!(account_id = id, error = %e, "could not restore session for remote logout");
                                 None
@@ -2252,15 +2091,24 @@ impl LoadedAccount {
         let mut changes = client.subscribe_to_session_changes();
         let (shutdown, mut shutdown_receiver) = oneshot::channel();
         let token_task = tokio::spawn(async move {
+            // Restore/login can refresh tokens before this watcher subscribes.
+            // Save one current snapshot after subscription, then serialize all
+            // subsequent writes so an older snapshot cannot win the race.
+            let mut initial_snapshot = true;
             loop {
-                let change = tokio::select! {
-                    biased;
-                    _ = &mut shutdown_receiver => break,
-                    change = changes.recv() => change,
+                let change = if initial_snapshot {
+                    initial_snapshot = false;
+                    Ok(())
+                } else {
+                    tokio::select! {
+                        biased;
+                        _ = &mut shutdown_receiver => break,
+                        change = changes.recv() => change.map(|_| ()),
+                    }
                 };
                 match change {
                     Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
-                        if let Some(session) = token_client.matrix_auth().session() {
+                        if let Some(session) = StoredSession::from_client(&token_client) {
                             if let Err(e) = save_secret(
                                 &account_id,
                                 StoredSecret {
@@ -2581,6 +2429,7 @@ fn space_node_info(
 async fn build_client(homeserver: &str, store_path: &Path, passphrase: &str) -> Result<Client> {
     fs::create_dir_all(store_path)?;
     let client = Client::builder()
+        .http_client(authentication::http_client()?)
         .homeserver_url(homeserver)
         .sqlite_store(store_path, Some(passphrase))
         .search_index_store(SearchIndexStoreKind::EncryptedDirectory(

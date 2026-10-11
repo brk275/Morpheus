@@ -54,8 +54,11 @@ Tokens live in the operating-system credential vault; if the vault cannot store
 a token, the user signs in again next launch. The app never stores a token in
 TOML or diagnostics.
 
-Matrix SSO launches the system browser and returns through a short-lived
-loopback callback listener. MSC3861 OIDC is a later authentication milestone.
+Browser sign-in launches the system browser and returns through a short-lived
+loopback callback listener. Delegated OAuth/OIDC uses the pinned Matrix SDK's
+PKCE and native client registration; unsupported discovery falls back to Matrix
+SSO login tokens. OAuth session and refresh credentials share the OS-vault
+boundary with legacy sessions. Provider browser acceptance remains pending.
 The app does not embed WebViews. Rich remote HTML and URL previews require
 sanitization and privacy controls before they are enabled in the interface.
 

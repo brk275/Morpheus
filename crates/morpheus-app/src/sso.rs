@@ -4,7 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use morpheus_matrix::{AccountInfo, AccountManager};
+use morpheus_matrix::{AccountInfo, AccountManager, SsoAttemptInfo};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Instant, timeout_at};
@@ -13,6 +13,24 @@ use url::Url;
 const CALLBACK_PATH: &str = "/callback";
 const AUTH_TIMEOUT: Duration = Duration::from_secs(180);
 const MAX_REQUEST_BYTES: usize = 8192;
+
+struct CancelAttempt {
+    manager: Arc<AccountManager>,
+    attempt_id: Option<String>,
+}
+
+impl Drop for CancelAttempt {
+    fn drop(&mut self) {
+        if let Some(attempt_id) = self.attempt_id.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let manager = self.manager.clone();
+            runtime.spawn(async move { manager.cancel_sso(&attempt_id).await });
+        }
+        // During runtime shutdown the manager's pending entries drop instead;
+        // unfinished encrypted stores are also cleaned on the next launch.
+    }
+}
 
 pub async fn sign_in(
     manager: Arc<AccountManager>,
@@ -30,6 +48,22 @@ pub async fn sign_in(
         .await
         .map_err(|error| error.to_string())?;
 
+    let mut cancellation = CancelAttempt {
+        manager: manager.clone(),
+        attempt_id: Some(attempt.attempt_id.clone()),
+    };
+    let result = complete_browser_sign_in(&manager, &attempt, listener, address).await;
+    manager.cancel_sso(&attempt.attempt_id).await;
+    cancellation.attempt_id = None;
+    result
+}
+
+async fn complete_browser_sign_in(
+    manager: &Arc<AccountManager>,
+    attempt: &SsoAttemptInfo,
+    listener: TcpListener,
+    address: std::net::SocketAddr,
+) -> Result<AccountInfo, String> {
     let login_url = Url::parse(&attempt.browser_url)
         .map_err(|_| "Homeserver returned an invalid browser sign-in URL".to_owned())?;
     let is_loopback = login_url
@@ -69,16 +103,18 @@ pub async fn sign_in(
         };
         let callback = format!("http://{address}{target}");
         let url = Url::parse(&callback).map_err(|_| "Invalid callback URL".to_owned())?;
-        let matching_state = url
-            .query_pairs()
-            .filter(|(key, _)| key == "morpheus_state")
-            .map(|(_, value)| value.into_owned())
-            .collect::<Vec<_>>();
-        if matching_state.len() != 1 || matching_state[0] != attempt.attempt_id {
+        if !attempt.accepts_callback(&url) {
             respond(&mut stream, 400, "Invalid sign-in state").await;
             continue;
         }
-        let result = manager.finish_sso(&attempt.attempt_id, &callback).await;
+        // Once accepted, finish credential-vault and registry persistence even
+        // if the UI task is cancelled. Dropping halfway through a vault write
+        // can otherwise leave a saved credential without its account registry.
+        let manager = manager.clone();
+        let attempt_id = attempt.attempt_id.clone();
+        let result = tokio::spawn(async move { manager.finish_sso(&attempt_id, &callback).await })
+            .await
+            .map_err(|_| "Browser sign-in could not be completed".to_owned())?;
         match &result {
             Ok(_) => respond(&mut stream, 200, "Sign-in complete. Return to Morpheus.").await,
             Err(_) => respond(&mut stream, 400, "Sign-in failed. Return to Morpheus.").await,
