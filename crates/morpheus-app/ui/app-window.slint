@@ -504,6 +504,7 @@ export component AppWindow inherits Window {
     callback send-thread-message(string);
     callback open-thread(string, string, string);
     callback close-thread();
+    callback thread-composer-edited(string);
     callback toggle-message-reaction(string, string);
     callback add-account();
     callback manage-accounts();
@@ -638,6 +639,7 @@ export component AppWindow inherits Window {
     in-out property <styled-text> thread-root-rich-body;
     in-out property <string> thread-root-rich-accessible-body;
     in-out property <string> thread-composer-text;
+    in-out property <bool> thread-send-pending: false;
     property <string> login-homeserver: "https://matrix.org";
     property <string> login-username;
     property <string> login-password;
@@ -1386,6 +1388,7 @@ export component AppWindow inherits Window {
                                                         root.thread-root-rich-body = message.rich-body;
                                                         root.thread-root-rich-accessible-body = message.rich-accessible-body;
                                                         root.thread-composer-text = "";
+                                                        root.thread-send-pending = false;
                                                         root.thread-messages = [];
                                                         root.side-panel-tab = 1;
                                                         root.show-side-panel = true;
@@ -2771,6 +2774,7 @@ export component AppWindow inherits Window {
                                 root.thread-root-id = "";
                                 root.thread-messages = [];
                                 root.thread-composer-text = "";
+                                root.thread-send-pending = false;
                                 root.close-thread();
                             }
                         }
@@ -2837,11 +2841,13 @@ export component AppWindow inherits Window {
                                     property <string> thread-context: root.thread-root-id;
                                     init => { self.focus(); }
                                     changed thread-context => { if self.thread-context != "" { self.focus(); } }
-                                    accepted => { root.send-thread-message(root.thread-composer-text); }
+                                    accepted => { if !root.thread-send-pending { root.send-thread-message(root.thread-composer-text); } }
+                                    edited => { root.thread-composer-edited(self.text); }
                                 }
                             }
                             IconAction {
                                 icon: "➤"; label: "Send thread reply"; ink: root.accent;
+                                enabled: !root.thread-send-pending;
                                 surface: root.panel; hover-surface: root.hover;
                                 activated => { root.send-thread-message(root.thread-composer-text); }
                             }

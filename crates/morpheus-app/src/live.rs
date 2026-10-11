@@ -111,9 +111,14 @@ impl LiveUi {
                     }
                 }
                 let mut failed = false;
-                for (account_id, room_id) in draft_worker_store.dirty_keys() {
+                for (account_id, room_id, thread) in draft_worker_store.dirty_keys() {
                     match draft_worker_store
-                        .persist_one(&draft_worker_manager, &account_id, &room_id)
+                        .persist_scoped(
+                            &draft_worker_manager,
+                            &account_id,
+                            &room_id,
+                            thread.as_deref(),
+                        )
                         .await
                     {
                         Ok(()) => {}
@@ -185,6 +190,56 @@ impl LiveUi {
         if !account_id.is_empty() && !room_id.is_empty() {
             self.drafts.set_markdown(account_id, room_id, enabled);
         }
+    }
+
+    pub fn remember_thread_draft(&self, account_id: &str, room_id: &str, root: &str, body: &str) {
+        if !account_id.is_empty() && !room_id.is_empty() && !root.is_empty() {
+            self.drafts
+                .set_scoped(account_id, room_id, Some(root), body);
+            self.queue_draft_write();
+        }
+    }
+
+    pub fn thread_draft(&self, account_id: &str, room_id: &str, root: &str) -> String {
+        self.drafts.get_scoped(account_id, room_id, Some(root))
+    }
+
+    pub fn thread_draft_revision(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        root: &str,
+    ) -> Option<u64> {
+        self.drafts.scoped_revision(account_id, room_id, Some(root))
+    }
+
+    pub fn begin_thread_send(&self, account: &str, room: &str, root: &str) -> bool {
+        self.drafts.begin_thread_send(account, room, root)
+    }
+
+    pub fn thread_send_pending(&self, account: &str, room: &str, root: &str) -> bool {
+        self.drafts.thread_send_pending(account, room, root)
+    }
+
+    pub fn finish_thread_send(&self, account: &str, room: &str, root: &str) {
+        self.drafts.finish_thread_send(account, room, root);
+    }
+
+    pub fn acknowledge_thread_draft(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        root: &str,
+        submitted: &str,
+        revision: u64,
+    ) -> Option<u64> {
+        let cleared = self
+            .drafts
+            .clear_thread_if_unchanged(account_id, room_id, root, submitted, revision);
+        if cleared.is_some() {
+            self.queue_draft_write();
+        }
+        cleared
     }
 
     pub fn draft_revision(&self, account_id: &str, room_id: &str) -> Option<u64> {
@@ -1053,6 +1108,34 @@ impl LiveUi {
                 previous.abort();
             }
         }
+        self.drafts
+            .load_scoped_if_missing(&self.manager, &account_id, &room_id, Some(&root_event_id))
+            .await?;
+        let restore_drafts = self.drafts.clone();
+        let restore_generation = self.thread_generation.clone();
+        let restore_live = self.is_live.clone();
+        let restore_account = account_id.clone();
+        let restore_room = room_id.clone();
+        let restore_root = root_event_id.clone();
+        let _ = ui.upgrade_in_event_loop(move |ui| {
+            if restore_live.load(Ordering::Acquire)
+                && restore_generation.load(Ordering::Acquire) == generation
+                && ui.get_active_account_local_id().as_str() == restore_account
+                && ui.get_active_room_id().as_str() == restore_room
+                && ui.get_thread_root_id().as_str() == restore_root
+            {
+                // Read the current cache on the UI thread: an edit after disk
+                // loading but before this callback also takes precedence.
+                ui.set_thread_composer_text(
+                    restore_drafts
+                        .get_scoped(&restore_account, &restore_room, Some(&restore_root))
+                        .into(),
+                );
+            }
+        });
+        if self.thread_generation.load(Ordering::Acquire) != generation {
+            return Ok(());
+        }
         let feed = self
             .manager
             .thread_message_feed_for(&account_id, &room_id, &root_event_id)
@@ -1262,11 +1345,21 @@ impl LiveUi {
                 .edit_formatted_for(&account_id, &room_id, &event_id, body, format)
                 .await
                 .map(|_| None),
-            MessageTarget::Thread(root_event_id) => self
-                .manager
-                .send_thread_formatted_for(&account_id, &room_id, &root_event_id, body, format)
-                .await
-                .map(|_| None),
+            MessageTarget::Thread(root_event_id) => {
+                self.drafts
+                    .persist_scoped(&self.manager, &account_id, &room_id, Some(&root_event_id))
+                    .await?;
+                self.manager
+                    .send_thread_formatted_tracked_for(
+                        &account_id,
+                        &room_id,
+                        &root_event_id,
+                        body,
+                        format,
+                    )
+                    .await
+                    .map(Some)
+            }
         }
     }
 
@@ -1443,6 +1536,7 @@ fn apply_snapshot(
         ui.set_thread_root_id("".into());
         ui.set_thread_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new())));
         ui.set_thread_composer_text("".into());
+        ui.set_thread_send_pending(false);
     }
     let active_index = view
         .accounts

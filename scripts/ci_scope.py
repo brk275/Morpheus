@@ -11,6 +11,12 @@ from pathlib import PurePosixPath
 
 PLATFORMS = ("macos-15", "macos-15-intel", "ubuntu-24.04", "windows-2025")
 MACOS = PLATFORMS[:2]
+WINDOWS_ACCEPTANCE_INPUTS = {
+    "scripts/run_windows_capture_acceptance.py",
+    "scripts/windows_capture_window.ps1",
+    "scripts/tests/test_windows_capture_acceptance.py",
+    "crates/morpheus-rtc/tests/windows_capture.rs",
+}
 LINUX_ACCEPTANCE_INPUTS = {
     "scripts/run_matrix_acceptance.py",
     "scripts/local_matrix_env.py",
@@ -50,6 +56,8 @@ def classify(paths, force_all=False):
             native.update(PLATFORMS)
         elif path in LINUX_ACCEPTANCE_INPUTS or path.startswith("packaging/linux/") or path == "packaging/linux.toml":
             native.add("ubuntu-24.04")
+        elif path in WINDOWS_ACCEPTANCE_INPUTS:
+            native.add("windows-2025")
         elif path.startswith(("packaging/macos/", "vendor/nokhwa-bindings-macos/")):
             native.update(MACOS)
         elif path.startswith("packaging/windows/"):

@@ -584,6 +584,7 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
         ui.set_thread_root_id("".into());
         ui.set_thread_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new())));
         ui.set_thread_composer_text("".into());
+        ui.set_thread_send_pending(false);
         ui.set_room_actions_open(false);
         ui.set_room_action_busy(false);
         ui.set_room_action_error("".into());
@@ -3907,6 +3908,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let weak = ui.as_weak();
+    let thread_draft_live = live.clone();
+    ui.on_thread_composer_edited(move |body| {
+        if thread_draft_live.is_live.load(Ordering::Acquire)
+            && let Some(ui) = weak.upgrade()
+        {
+            thread_draft_live.remember_thread_draft(
+                ui.get_active_account_local_id().as_str(),
+                ui.get_active_room_id().as_str(),
+                ui.get_thread_root_id().as_str(),
+                body.as_str(),
+            );
+        }
+    });
+
+    let weak = ui.as_weak();
     let thread_state = state.clone();
     let thread_live = live.clone();
     let thread_handle = runtime.handle().clone();
@@ -3918,6 +3934,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let room_id = ui.get_active_room_id().to_string();
         if thread_live.is_live.load(Ordering::Acquire) {
             let account_id = ui.get_active_account_local_id().to_string();
+            ui.set_thread_composer_text(
+                thread_live
+                    .thread_draft(&account_id, &room_id, &event_id)
+                    .into(),
+            );
+            ui.set_thread_send_pending(thread_live.thread_send_pending(
+                &account_id,
+                &room_id,
+                &event_id,
+            ));
+            if ui.get_thread_send_pending() {
+                ui.set_transfer_notice(
+                    "Thread reply is queued or unconfirmed; it may still send".into(),
+                );
+            }
             let live = thread_live.clone();
             let generation = live.begin_thread_request();
             let weak = weak.clone();
@@ -3979,6 +4010,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let room_id = ui.get_active_room_id().to_string();
         if thread_send_live.is_live.load(Ordering::Acquire) {
             let account_id = ui.get_active_account_local_id().to_string();
+            if !thread_send_live.begin_thread_send(&account_id, &room_id, &root_id) {
+                ui.set_transfer_notice("Thread reply is still queued; it may still send".into());
+                return;
+            }
+            thread_send_live.remember_thread_draft(&account_id, &room_id, &root_id, &submitted);
+            let revision = thread_send_live.thread_draft_revision(&account_id, &room_id, &root_id);
+            ui.set_thread_send_pending(true);
+            ui.set_transfer_notice("Thread reply queued; text stays until delivery is confirmed".into());
             let live = thread_send_live.clone();
             let weak = weak.clone();
             thread_send_handle.spawn(async move {
@@ -3992,24 +4031,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .await;
                 match result {
-                    Ok(_) => {
+                    Ok(Some(mut queued)) => loop {
+                        // Queue acceptance is not delivery. Observe this exact
+                        // SDK transaction without holding the account lock.
+                        let update = queued.next_update().await;
+                        let cleared_revision = if update == QueuedSendUpdate::Sent {
+                            revision.and_then(|revision| live.acknowledge_thread_draft(
+                                &account_id, &room_id, &root_id, &submitted, revision,
+                            ))
+                        } else { None };
+                        if matches!(update, QueuedSendUpdate::Sent | QueuedSendUpdate::Cancelled) {
+                            live.finish_thread_send(&account_id, &room_id, &root_id);
+                        }
+                        let notice = match update {
+                            QueuedSendUpdate::Sent => "Thread reply sent",
+                            QueuedSendUpdate::Retained { recoverable: true } => "Thread reply queued for retry; it may still send",
+                            QueuedSendUpdate::Retained { recoverable: false } => "Thread reply paused; the request remains queued. Do not send a duplicate",
+                            QueuedSendUpdate::Cancelled => "Queued thread reply cancelled; draft retained",
+                            QueuedSendUpdate::Unknown => "Could not confirm thread reply; it may still send. Restart, then check the thread before sending again",
+                        };
+                        let account = account_id.clone();
+                        let room = room_id.clone();
+                        let root = root_id.clone();
+                        let current = live.clone();
+                        let _ = weak.upgrade_in_event_loop(move |ui| {
+                            if current.is_live.load(Ordering::Acquire)
+                                && ui.get_active_account_local_id().as_str() == account
+                                && ui.get_active_room_id().as_str() == room
+                                && ui.get_thread_root_id().as_str() == root
+                            {
+                                ui.set_thread_send_pending(current.thread_send_pending(&account, &room, &root));
+                                if cleared_revision.is_some()
+                                    && current.thread_draft_revision(&account, &room, &root) == cleared_revision
+                                {
+                                    ui.set_thread_composer_text("".into());
+                                }
+                                ui.set_transfer_notice(notice.into());
+                            }
+                        });
+                        if matches!(update, QueuedSendUpdate::Sent | QueuedSendUpdate::Cancelled | QueuedSendUpdate::Unknown) {
+                            // Unknown deliberately keeps this session's guard:
+                            // the persistent SDK request might still deliver.
+                            break;
+                        }
+                    },
+                    Ok(None) => {
+                        // This target must return a tracker. Fail closed if a
+                        // future adapter violates that contract after queueing.
                         let _ = weak.upgrade_in_event_loop(move |ui| {
                             if ui.get_active_account_local_id().as_str() == account_id
                                 && ui.get_active_room_id().as_str() == room_id
                                 && ui.get_thread_root_id().as_str() == root_id
-                                && ui.get_thread_composer_text().as_str() == submitted
                             {
-                                ui.set_thread_composer_text("".into());
+                                ui.set_transfer_notice("Thread delivery could not be tracked; the reply may still send. Restart, then check the thread before sending again".into());
                             }
                         });
                     }
                     Err(error) => {
+                        live.finish_thread_send(&account_id, &room_id, &root_id);
                         let message = directory_plain_text(&error.to_string(), 240);
                         let _ = weak.upgrade_in_event_loop(move |ui| {
                             if ui.get_active_account_local_id().as_str() == account_id
                                 && ui.get_active_room_id().as_str() == room_id
                                 && ui.get_thread_root_id().as_str() == root_id
                             {
+                                ui.set_thread_send_pending(live.thread_send_pending(&account_id, &room_id, &root_id));
                                 ui.set_session_error(message.into());
                             }
                         });

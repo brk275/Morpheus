@@ -1,17 +1,32 @@
-//! Account and room scoped composer drafts.
+//! Account, room and optional thread scoped composer drafts.
 //!
 //! The UI cache makes room switches immediate. Persistence uses the Matrix
 //! client's encrypted SQLite state store; no draft body is written to the
 //! application config or to a plaintext fallback file.
 
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Mutex,
+};
 
 use morpheus_matrix::{AccountManager, MatrixCoreError};
 use tokio::sync::Mutex as AsyncMutex;
 
+pub type DraftKey = (String, String, Option<String>);
+
+fn key(account: &str, room: &str, thread: Option<&str>) -> DraftKey {
+    (
+        account.to_owned(),
+        room.to_owned(),
+        thread.map(str::to_owned),
+    )
+}
+
 #[derive(Default)]
 pub struct DraftStore {
-    by_room: Mutex<HashMap<(String, String), CachedDraft>>,
+    by_room: Mutex<HashMap<DraftKey, CachedDraft>>,
+    account_epochs: Mutex<HashMap<String, u64>>,
+    thread_sends: Mutex<HashSet<DraftKey>>,
     markdown_by_room: Mutex<HashMap<(String, String), bool>>,
     write_lock: AsyncMutex<()>,
 }
@@ -48,20 +63,24 @@ impl DraftStore {
             .unwrap_or(false)
     }
 
-    pub fn dirty_keys(&self) -> Vec<(String, String)> {
+    pub fn dirty_keys(&self) -> Vec<DraftKey> {
         self.by_room
             .lock()
             .expect("draft mutex poisoned")
             .iter()
             .filter(|(_, draft)| draft.dirty)
-            .map(|((account, room), _)| (account.clone(), room.clone()))
+            .map(|(key, _)| key.clone())
             .collect()
     }
 
     pub fn set(&self, account_id: &str, room_id: &str, body: &str) {
+        self.set_scoped(account_id, room_id, None, body);
+    }
+
+    pub fn set_scoped(&self, account_id: &str, room_id: &str, thread: Option<&str>, body: &str) {
         let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
         let entry = drafts
-            .entry((account_id.to_owned(), room_id.to_owned()))
+            .entry(key(account_id, room_id, thread))
             .or_insert_with(|| CachedDraft {
                 body: String::new(),
                 revision: 0,
@@ -76,19 +95,32 @@ impl DraftStore {
     }
 
     pub fn get(&self, account_id: &str, room_id: &str) -> String {
+        self.get_scoped(account_id, room_id, None)
+    }
+
+    pub fn get_scoped(&self, account_id: &str, room_id: &str, thread: Option<&str>) -> String {
         self.by_room
             .lock()
             .expect("draft mutex poisoned")
-            .get(&(account_id.to_owned(), room_id.to_owned()))
+            .get(&key(account_id, room_id, thread))
             .map(|draft| draft.body.clone())
             .unwrap_or_default()
     }
 
     pub fn revision(&self, account_id: &str, room_id: &str) -> Option<u64> {
+        self.scoped_revision(account_id, room_id, None)
+    }
+
+    pub fn scoped_revision(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        thread: Option<&str>,
+    ) -> Option<u64> {
         self.by_room
             .lock()
             .expect("draft mutex poisoned")
-            .get(&(account_id.to_owned(), room_id.to_owned()))
+            .get(&key(account_id, room_id, thread))
             .map(|draft| draft.revision)
     }
 
@@ -103,7 +135,7 @@ impl DraftStore {
         transaction_id: &str,
     ) -> bool {
         let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
-        let Some(draft) = drafts.get_mut(&(account_id.to_owned(), room_id.to_owned())) else {
+        let Some(draft) = drafts.get_mut(&key(account_id, room_id, None)) else {
             return false;
         };
         if draft.body != submitted || draft.revision != expected_revision {
@@ -130,7 +162,7 @@ impl DraftStore {
         sent: bool,
     ) -> bool {
         let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
-        let Some(draft) = drafts.get_mut(&(account_id.to_owned(), room_id.to_owned())) else {
+        let Some(draft) = drafts.get_mut(&key(account_id, room_id, None)) else {
             return false;
         };
         if draft
@@ -157,14 +189,46 @@ impl DraftStore {
     }
 
     pub fn forget_account(&self, account_id: &str) {
+        // A disk read begun before logout must not repopulate the erased cache.
+        let mut epochs = self
+            .account_epochs
+            .lock()
+            .expect("draft epoch mutex poisoned");
+        let epoch = epochs.entry(account_id.to_owned()).or_default();
+        *epoch = epoch.wrapping_add(1);
         self.by_room
             .lock()
             .expect("draft mutex poisoned")
-            .retain(|(id, _), _| id != account_id);
+            .retain(|(id, _, _), _| id != account_id);
         self.markdown_by_room
             .lock()
             .expect("draft formatting mutex poisoned")
             .retain(|(id, _), _| id != account_id);
+        self.thread_sends
+            .lock()
+            .expect("thread send mutex poisoned")
+            .retain(|(id, _, _)| id != account_id);
+    }
+
+    pub fn begin_thread_send(&self, account: &str, room: &str, root: &str) -> bool {
+        self.thread_sends
+            .lock()
+            .expect("thread send mutex poisoned")
+            .insert(key(account, room, Some(root)))
+    }
+
+    pub fn thread_send_pending(&self, account: &str, room: &str, root: &str) -> bool {
+        self.thread_sends
+            .lock()
+            .expect("thread send mutex poisoned")
+            .contains(&key(account, room, Some(root)))
+    }
+
+    pub fn finish_thread_send(&self, account: &str, room: &str, root: &str) {
+        self.thread_sends
+            .lock()
+            .expect("thread send mutex poisoned")
+            .remove(&key(account, room, Some(root)));
     }
 
     pub async fn load_if_missing(
@@ -173,7 +237,19 @@ impl DraftStore {
         account_id: &str,
         room_id: &str,
     ) -> Result<(), MatrixCoreError> {
-        let key = (account_id.to_owned(), room_id.to_owned());
+        self.load_scoped_if_missing(manager, account_id, room_id, None)
+            .await
+    }
+
+    pub async fn load_scoped_if_missing(
+        &self,
+        manager: &AccountManager,
+        account_id: &str,
+        room_id: &str,
+        thread: Option<&str>,
+    ) -> Result<(), MatrixCoreError> {
+        let key = key(account_id, room_id, thread);
+        let epoch = self.account_epoch(account_id);
         if self
             .by_room
             .lock()
@@ -182,8 +258,31 @@ impl DraftStore {
         {
             return Ok(());
         }
-        let body = manager.load_composer_draft_for(account_id, room_id).await?;
+        let body = manager
+            .load_scoped_composer_draft_for(account_id, room_id, thread)
+            .await?;
         // An edit made while the disk read was pending wins over stale storage.
+        self.insert_loaded_if_missing(key, body, epoch);
+        Ok(())
+    }
+
+    fn account_epoch(&self, account_id: &str) -> u64 {
+        self.account_epochs
+            .lock()
+            .expect("draft epoch mutex poisoned")
+            .get(account_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn insert_loaded_if_missing(&self, key: DraftKey, body: String, epoch: u64) {
+        let epochs = self
+            .account_epochs
+            .lock()
+            .expect("draft epoch mutex poisoned");
+        if epochs.get(&key.0).copied().unwrap_or_default() != epoch {
+            return;
+        }
         self.by_room
             .lock()
             .expect("draft mutex poisoned")
@@ -194,7 +293,28 @@ impl DraftStore {
                 dirty: false,
                 pending: None,
             });
-        Ok(())
+    }
+
+    /// A direct thread send clears only the exact submitted revision after a
+    /// server acknowledgement. Returning the new revision lets queued UI work
+    /// reject edits made even after this cache clear, including identical text.
+    pub fn clear_thread_if_unchanged(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        thread: &str,
+        submitted: &str,
+        expected_revision: u64,
+    ) -> Option<u64> {
+        let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
+        let draft = drafts.get_mut(&key(account_id, room_id, Some(thread)))?;
+        if draft.body != submitted || draft.revision != expected_revision {
+            return None;
+        }
+        draft.body.clear();
+        draft.revision = draft.revision.wrapping_add(1);
+        draft.dirty = true;
+        Some(draft.revision)
     }
 
     pub async fn persist_one(
@@ -203,10 +323,21 @@ impl DraftStore {
         account_id: &str,
         room_id: &str,
     ) -> Result<(), MatrixCoreError> {
+        self.persist_scoped(manager, account_id, room_id, None)
+            .await
+    }
+
+    pub async fn persist_scoped(
+        &self,
+        manager: &AccountManager,
+        account_id: &str,
+        room_id: &str,
+        thread: Option<&str>,
+    ) -> Result<(), MatrixCoreError> {
         // All writes are serialized so an older edit cannot land after a
         // successful send clears the draft.
         let _write = self.write_lock.lock().await;
-        let key = (account_id.to_owned(), room_id.to_owned());
+        let key = key(account_id, room_id, thread);
         let Some((body, revision)) = self
             .by_room
             .lock()
@@ -218,7 +349,7 @@ impl DraftStore {
             return Ok(());
         };
         manager
-            .save_composer_draft_for(account_id, room_id, &body)
+            .save_scoped_composer_draft_for(account_id, room_id, thread, &body)
             .await?;
         if let Some(draft) = self
             .by_room
@@ -239,8 +370,9 @@ impl DraftStore {
             if dirty.is_empty() {
                 return Ok(());
             }
-            for (account, room) in dirty {
-                self.persist_one(manager, &account, &room).await?;
+            for (account, room, thread) in dirty {
+                self.persist_scoped(manager, &account, &room, thread.as_deref())
+                    .await?;
             }
         }
     }
@@ -248,7 +380,131 @@ impl DraftStore {
 
 #[cfg(test)]
 mod tests {
-    use super::DraftStore;
+    use super::{DraftStore, key};
+
+    #[test]
+    fn pending_thread_send_blocks_only_its_scope_and_keeps_edits() {
+        let drafts = DraftStore::default();
+        drafts.set_scoped("a", "room", Some("one"), "queued");
+        assert!(drafts.begin_thread_send("a", "room", "one"));
+        assert!(!drafts.begin_thread_send("a", "room", "one"));
+        assert!(drafts.begin_thread_send("a", "room", "two"));
+        assert!(drafts.begin_thread_send("a", "another-room", "one"));
+        assert!(drafts.begin_thread_send("b", "room", "one"));
+        drafts.set_scoped("a", "room", Some("one"), "edited while retained");
+        assert_eq!(
+            drafts.get_scoped("a", "room", Some("one")),
+            "edited while retained"
+        );
+        drafts.finish_thread_send("a", "room", "one");
+        assert!(!drafts.thread_send_pending("a", "room", "one"));
+        assert!(drafts.thread_send_pending("a", "room", "two"));
+        drafts.forget_account("a");
+        assert!(!drafts.thread_send_pending("a", "room", "two"));
+        assert!(drafts.thread_send_pending("b", "room", "one"));
+    }
+
+    #[test]
+    fn thread_drafts_are_isolated_from_rooms_other_threads_and_accounts() {
+        let drafts = DraftStore::default();
+        drafts.set("a", "room", "room draft");
+        drafts.set_scoped("a", "room", Some("root-1"), "first thread");
+        drafts.set_scoped("a", "room", Some("root-2"), "second thread");
+        drafts.set_scoped("a", "other-room", Some("root-1"), "other room");
+        drafts.set_scoped("b", "room", Some("root-1"), "other account");
+        assert_eq!(drafts.get("a", "room"), "room draft");
+        assert_eq!(
+            drafts.get_scoped("a", "room", Some("root-1")),
+            "first thread"
+        );
+        assert_eq!(
+            drafts.get_scoped("a", "room", Some("root-2")),
+            "second thread"
+        );
+        assert_eq!(
+            drafts.get_scoped("a", "other-room", Some("root-1")),
+            "other room"
+        );
+        assert_eq!(
+            drafts.get_scoped("b", "room", Some("root-1")),
+            "other account"
+        );
+        assert_eq!(drafts.dirty_keys().len(), 5);
+        drafts.forget_account("a");
+        assert_eq!(drafts.get_scoped("a", "room", Some("root-1")), "");
+        assert_eq!(drafts.get_scoped("a", "room", Some("root-2")), "");
+        assert_eq!(drafts.get("a", "room"), "");
+        assert_eq!(drafts.dirty_keys(), vec![key("b", "room", Some("root-1"))]);
+    }
+
+    #[test]
+    fn thread_acknowledgement_preserves_same_text_edits_and_other_scopes() {
+        let drafts = DraftStore::default();
+        drafts.set("a", "room", "ordinary");
+        drafts.set_scoped("a", "room", Some("root"), "submitted");
+        let submitted_revision = drafts.scoped_revision("a", "room", Some("root")).unwrap();
+        // A failed send does nothing: the submitted text remains available.
+        assert_eq!(drafts.get_scoped("a", "room", Some("root")), "submitted");
+        drafts.set_scoped("a", "room", Some("root"), "submitted");
+        assert_eq!(
+            drafts.clear_thread_if_unchanged("a", "room", "root", "submitted", submitted_revision),
+            None
+        );
+        assert_eq!(drafts.get_scoped("a", "room", Some("root")), "submitted");
+        let newer_revision = drafts.scoped_revision("a", "room", Some("root")).unwrap();
+        let cleared = drafts
+            .clear_thread_if_unchanged("a", "room", "root", "submitted", newer_revision)
+            .unwrap();
+        assert_eq!(drafts.get_scoped("a", "room", Some("root")), "");
+        assert!(
+            drafts
+                .dirty_keys()
+                .contains(&key("a", "room", Some("root")))
+        );
+        assert_eq!(drafts.get("a", "room"), "ordinary");
+        // The UI completion queued after the acknowledgement must also reject
+        // a user edit, even one made back to the originally submitted text.
+        drafts.set_scoped("a", "room", Some("root"), "submitted");
+        assert_ne!(
+            drafts.scoped_revision("a", "room", Some("root")),
+            Some(cleared)
+        );
+        assert_eq!(drafts.get_scoped("a", "room", Some("root")), "submitted");
+    }
+
+    #[test]
+    fn delayed_thread_load_cannot_replace_edit_or_repopulate_logged_out_account() {
+        let drafts = DraftStore::default();
+        let before = drafts.account_epoch("a");
+        drafts.set_scoped("a", "room", Some("root"), "typed during load");
+        drafts.insert_loaded_if_missing(
+            key("a", "room", Some("root")),
+            "older saved text".into(),
+            before,
+        );
+        assert_eq!(
+            drafts.get_scoped("a", "room", Some("root")),
+            "typed during load"
+        );
+        drafts.forget_account("a");
+        drafts.insert_loaded_if_missing(
+            key("a", "room", Some("other-root")),
+            "late disk result".into(),
+            before,
+        );
+        assert_eq!(
+            drafts.scoped_revision("a", "room", Some("other-root")),
+            None
+        );
+        // A normal fresh disk load starts clean and is immediately cached.
+        drafts.insert_loaded_if_missing(
+            key("b", "room", Some("root")),
+            "restored".into(),
+            drafts.account_epoch("b"),
+        );
+        assert_eq!(drafts.get_scoped("b", "room", Some("root")), "restored");
+        assert!(drafts.dirty_keys().is_empty());
+    }
 
     #[test]
     fn drafts_are_scoped_and_failed_send_does_not_clear_them() {
@@ -295,6 +551,9 @@ mod tests {
         assert!(drafts.mark_queued("account", "room", "new thought", revision, "transaction-3"));
         assert!(drafts.resolve_queued("account", "room", "transaction-3", true));
         assert_eq!(drafts.get("account", "room"), "");
-        assert_eq!(drafts.dirty_keys(), vec![("account".into(), "room".into())]);
+        assert_eq!(
+            drafts.dirty_keys(),
+            vec![("account".into(), "room".into(), None)]
+        );
     }
 }

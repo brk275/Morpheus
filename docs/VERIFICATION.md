@@ -240,6 +240,33 @@ covered protocol selection, package/update harnesses, readiness, capture
 cleanup and archive isolation. No local native build, archive transformation,
 link, source generation, native test or Matrix/RTC service ran for this batch.
 
+### Thread drafts and Windows capture follow-up
+
+Per-thread drafts now share the encrypted SDK store and the existing flush
+worker, with separate account/room/root keys. Cached restoration is immediate;
+late disk results cannot overwrite edits or repopulate a logged-out account.
+Review caught that SDK queue acceptance is not server acknowledgement: the
+thread send path now observes the exact transaction, clears only an unchanged
+submitted revision on acknowledgement, and retains drafts on paused, cancelled
+or unknown outcomes. A per-thread session guard prevents duplicate submissions
+while still allowing edits and other threads. Unknown outcomes require a restart
+and checking the thread before resending. Cross-restart queue reconciliation
+and retry/cancel controls remain open.
+
+Four draft-cache regressions and extensions to the existing encrypted draft
+restart/isolation and live thread-send fixtures are prepared. They have not yet
+run natively for this follow-up. The separately selected
+[Windows capture fixture](WINDOWS_CAPTURE_FIXTURE.md) exercises an owned
+synthetic window and covered monitor through the production capture API, with
+Job-object process containment and strict fixed-fact evidence. Its actual
+WinForms/GDI execution also requires the next hosted candidate.
+
+The combined follow-up passed 222 portable Python checks; five platform-specific
+checks were skipped on macOS. Rust formatting, Actionlint, Python compilation,
+JavaScript syntax, package configuration and whitespace checks passed.
+Independent source reviews cleared both changes. No local native build, native
+test, source generation, archive transformation or Matrix/RTC service ran.
+
 ## Public source publication, 2026-10-10
 
 - Published `brk275/Morpheus` as public pre-alpha source at

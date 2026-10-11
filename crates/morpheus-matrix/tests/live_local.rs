@@ -371,15 +371,22 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
         wait_for_reaction(&peer, encrypted_room, &root_event_id, "❤️").await;
 
         let thread_body = format!("Morpheus encrypted thread {}", Uuid::new_v4());
-        restored
-            .send_thread_text_for(
+        let queued_thread = restored
+            .send_thread_formatted_tracked_for(
                 &alice.id,
                 encrypted_room,
                 &root_event_id,
                 thread_body.clone(),
+                morpheus_matrix::TextFormat::Plain,
             )
             .await
             .expect("Encrypted thread reply failed");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(30), queued_thread.wait_outcome())
+                .await
+                .expect("Thread server acknowledgement timed out"),
+            morpheus_matrix::QueuedSendOutcome::Sent,
+        );
         let thread_feed = tokio::time::timeout(
             Duration::from_secs(30),
             peer.thread_message_feed_for(&bob.id, encrypted_room, &root_event_id),

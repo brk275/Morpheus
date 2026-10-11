@@ -108,6 +108,14 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
         let b_room = fixture.room("b_room");
         let a_body = format!("private-draft-A-{}", Uuid::new_v4());
         let b_body = format!("private-draft-B-{}", Uuid::new_v4());
+        // SDK draft keys accept a valid event ID without fetching the event.
+        // Distinct synthetic roots keep this persistence check independent of
+        // timeline delivery; live thread sending has its own acceptance test.
+        let first_thread = "$draft-root-one:fixture.invalid";
+        let second_thread = "$draft-root-two:fixture.invalid";
+        let a_thread_body = format!("private-thread-A-one-{}", Uuid::new_v4());
+        let a_other_thread_body = format!("private-thread-A-two-{}", Uuid::new_v4());
+        let b_thread_body = format!("private-thread-B-one-{}", Uuid::new_v4());
 
         let manager = AccountManager::open(&root).expect("Cannot open account manager");
         let a_account = manager
@@ -119,6 +127,26 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
             .save_composer_draft_for(&a_account.id, a_room, &a_body)
             .await
             .expect("Cannot persist first draft");
+        for (thread, body) in [
+            (first_thread, &a_thread_body),
+            (second_thread, &a_other_thread_body),
+        ] {
+            manager
+                .save_scoped_composer_draft_for(&a_account.id, a_room, Some(thread), body)
+                .await
+                .expect("Cannot persist encrypted thread draft");
+        }
+        assert!(
+            manager
+                .save_scoped_composer_draft_for(
+                    &a_account.id,
+                    a_room,
+                    Some("invalid-event-id"),
+                    "rejected"
+                )
+                .await
+                .is_err()
+        );
         let queued = manager
             .send_text_tracked_for(
                 &a_account.id,
@@ -152,6 +180,22 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
             .expect("Cannot persist second draft");
         assert_eq!(
             manager
+                .load_scoped_composer_draft_for(&b_account.id, b_room, Some(first_thread))
+                .await
+                .unwrap(),
+            ""
+        );
+        manager
+            .save_scoped_composer_draft_for(
+                &b_account.id,
+                b_room,
+                Some(first_thread),
+                &b_thread_body,
+            )
+            .await
+            .expect("Cannot persist second account thread draft");
+        assert_eq!(
+            manager
                 .load_composer_draft_for(&a_account.id, a_room)
                 .await
                 .unwrap(),
@@ -162,6 +206,12 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
         drop(manager);
         assert!(!contains_plaintext(&root, a_body.as_bytes()));
         assert!(!contains_plaintext(&root, b_body.as_bytes()));
+        for body in [&a_thread_body, &a_other_thread_body, &b_thread_body] {
+            assert!(
+                !contains_plaintext(&root, body.as_bytes()),
+                "Thread draft leaked into plaintext storage"
+            );
+        }
 
         let manager = AccountManager::open(&root).expect("Cannot reopen account manager");
         let restored = manager
@@ -176,6 +226,13 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
                 .unwrap(),
             b_body
         );
+        assert_eq!(
+            manager
+                .load_scoped_composer_draft_for(&b_account.id, b_room, Some(first_thread))
+                .await
+                .unwrap(),
+            b_thread_body
+        );
         manager
             .switch_to(&a_account.id)
             .await
@@ -186,6 +243,43 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
                 .await
                 .unwrap(),
             a_body
+        );
+        for (thread, body) in [
+            (first_thread, &a_thread_body),
+            (second_thread, &a_other_thread_body),
+        ] {
+            assert_eq!(
+                &manager
+                    .load_scoped_composer_draft_for(&a_account.id, a_room, Some(thread))
+                    .await
+                    .unwrap(),
+                body
+            );
+        }
+        manager
+            .save_scoped_composer_draft_for(&a_account.id, a_room, Some(first_thread), "")
+            .await
+            .expect("Cannot clear acknowledged thread draft");
+        assert_eq!(
+            manager
+                .load_scoped_composer_draft_for(&a_account.id, a_room, Some(first_thread))
+                .await
+                .unwrap(),
+            ""
+        );
+        assert_eq!(
+            manager
+                .load_composer_draft_for(&a_account.id, a_room)
+                .await
+                .unwrap(),
+            a_body
+        );
+        assert_eq!(
+            manager
+                .load_scoped_composer_draft_for(&a_account.id, a_room, Some(second_thread))
+                .await
+                .unwrap(),
+            a_other_thread_body
         );
         manager
             .save_composer_draft_for(&a_account.id, a_room, "")
@@ -213,6 +307,13 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
                 .await
                 .unwrap(),
             b_body
+        );
+        assert_eq!(
+            manager
+                .load_scoped_composer_draft_for(&b_account.id, b_room, Some(first_thread))
+                .await
+                .unwrap(),
+            b_thread_body
         );
         manager
             .logout_account(&b_account.id)

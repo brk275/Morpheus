@@ -29,6 +29,15 @@ class ScopeTests(unittest.TestCase):
         actual = classify(["vendor/nokhwa-bindings-macos/src/lib.rs"])["native_matrix"]["os"]
         self.assertEqual(actual, list(MACOS))
 
+    def test_windows_capture_fixture_only_selects_windows(self):
+        for path in ("scripts/run_windows_capture_acceptance.py", "scripts/windows_capture_window.ps1",
+                     "scripts/tests/test_windows_capture_acceptance.py", "crates/morpheus-rtc/tests/windows_capture.rs"):
+            with self.subTest(path=path):
+                self.assertEqual(classify([path])["native_matrix"]["os"], ["windows-2025"])
+        # Workflow and scope implementation changes remain shared inputs.
+        self.assertEqual(classify([".github/workflows/ci.yml"])["native_matrix"]["os"], list(PLATFORMS))
+        self.assertEqual(classify(["scripts/ci_scope.py"])["native_matrix"]["os"], list(PLATFORMS))
+
     def test_pipewire_isolation_inputs_only_select_linux(self):
         for path in ("vendor/webrtc-sys/pipewire_isolation.rs", "vendor/webrtc-sys/pipewire-symbols.txt"):
             with self.subTest(path=path):

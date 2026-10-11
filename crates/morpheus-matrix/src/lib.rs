@@ -1102,14 +1102,46 @@ impl AccountManager {
         body: impl Into<String>,
         format: TextFormat,
     ) -> Result<()> {
+        self.send_thread_formatted_tracked_for(
+            expected_account_id,
+            room_id,
+            root_event_id,
+            body,
+            format,
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Subscribe before queueing the thread reply so even an immediate server
+    /// acknowledgement is observed. The returned observer owns no account lock.
+    pub async fn send_thread_formatted_tracked_for(
+        &self,
+        expected_account_id: &str,
+        room_id: &str,
+        root_event_id: &str,
+        body: impl Into<String>,
+        format: TextFormat,
+    ) -> Result<QueuedMessage> {
         let state = self.state.lock().await;
         let loaded = selected_loaded_for(&state, expected_account_id)?;
+        let room = account_room(&state, expected_account_id, room_id)?;
+        let (_, updates) = room
+            .send_queue()
+            .subscribe()
+            .await
+            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
         let timeline = loaded.thread_timeline(room_id, root_event_id).await?;
-        timeline
+        let handle = timeline
             .send(formatting::room_text(body.into(), format).into())
             .await
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
-        Ok(())
+        Ok(QueuedMessage {
+            transaction_id: handle.transaction_id().to_string(),
+            handle,
+            updates,
+            finished: false,
+        })
     }
 
     pub async fn edit_text_for(
@@ -1249,9 +1281,22 @@ impl AccountManager {
     /// The account must already be loaded on this device. A missing draft is
     /// represented by an empty string, matching the native composer.
     pub async fn load_composer_draft_for(&self, account_id: &str, room_id: &str) -> Result<String> {
+        self.load_scoped_composer_draft_for(account_id, room_id, None)
+            .await
+    }
+
+    /// The optional thread root is a separate encrypted SDK storage key, never
+    /// part of the room draft body or a plaintext application preference.
+    pub async fn load_scoped_composer_draft_for(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        thread_root: Option<&str>,
+    ) -> Result<String> {
+        let thread_root = thread_root.map(parse_event_id).transpose()?;
         let state = self.state.lock().await;
         let room = account_room(&state, account_id, room_id)?;
-        room.load_composer_draft(None)
+        room.load_composer_draft(thread_root.as_deref())
             .await
             .map(|draft| draft.map_or_else(String::new, |draft| draft.plain_text))
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
@@ -1266,10 +1311,22 @@ impl AccountManager {
         room_id: &str,
         body: &str,
     ) -> Result<()> {
+        self.save_scoped_composer_draft_for(account_id, room_id, None, body)
+            .await
+    }
+
+    pub async fn save_scoped_composer_draft_for(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        thread_root: Option<&str>,
+        body: &str,
+    ) -> Result<()> {
+        let thread_root = thread_root.map(parse_event_id).transpose()?;
         let state = self.state.lock().await;
         let room = account_room(&state, account_id, room_id)?;
         if body.is_empty() {
-            room.clear_composer_draft(None)
+            room.clear_composer_draft(thread_root.as_deref())
                 .await
                 .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
         } else {
@@ -1280,7 +1337,7 @@ impl AccountManager {
                     draft_type: ComposerDraftType::NewMessage,
                     attachments: Vec::new(),
                 },
-                None,
+                thread_root.as_deref(),
             )
             .await
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))

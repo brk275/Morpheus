@@ -157,6 +157,14 @@ jobs:
         run: cargo test --locked -p morpheus-app --features native-calls --bin morpheus-app
       - name: Test native device and call guards
         run: cargo test --locked -p morpheus-rtc --features native-devices --lib
+      - name: Test Windows capture of an owned synthetic window and display
+        id: windows-capture-tests
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          MORPHEUS_WINDOWS_CAPTURE_ACCEPTANCE: "1"
+        run: python scripts/run_windows_capture_acceptance.py
       - name: Test real Wayland portal streaming, source loss, and cancellation
         id: wayland-tests
         if: runner.os == 'Linux'
@@ -188,8 +196,8 @@ jobs:
           dbus-run-session -- python3 scripts/run_matrix_acceptance.py \
             --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks"
       - name: Enforce collected acceptance results
-        if: ${{ !cancelled() && (steps.model-tests.outcome == 'failure' || steps.wayland-tests.outcome == 'failure') }}
+        if: ${{ !cancelled() && (steps.model-tests.outcome == 'failure' || steps.wayland-tests.outcome == 'failure' || steps.windows-capture-tests.outcome == 'failure') }}
         shell: bash
         run: |
-          echo "Protocol model or Wayland acceptance tests failed; this candidate is not verified."
+          echo "Protocol model or native capture acceptance tests failed; this candidate is not verified."
           exit 1

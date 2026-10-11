@@ -38,8 +38,13 @@ formatting, media, and device-management changes.
 - [ ] Preserve per-room drafts, including across restart; failed sends keep the
       original text. Morpheus room drafts now survive restart in encrypted
       account storage, and a server rejection restores unchanged composer text.
-      Pending sends completed after app exit can leave a stale draft; thread
-      drafts and full UI acceptance are still pending.
+      Thread drafts now use separate encrypted account/room/root keys, with
+      cached restore, guarded disk loads and revision checks. Thread sends
+      retain text until the exact queued transaction is acknowledged; a
+      per-thread guard prevents duplicate submissions during that session.
+      These changes still need hosted and live UI acceptance. Pending sends
+      completed after app exit can leave stale drafts; queue reconciliation
+      after restart and retry/cancel controls remain open.
 - [ ] Render long and mixed-height timelines with virtualization and keyboard
       navigation; benchmark a 10,000-message room.
 
