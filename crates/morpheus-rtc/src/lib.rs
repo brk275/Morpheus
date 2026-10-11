@@ -26,6 +26,8 @@ mod linux_portal;
 mod media;
 #[cfg(feature = "native-rtc")]
 mod native;
+#[cfg(feature = "native-rtc")]
+pub mod ringing;
 #[cfg(any(feature = "device-camera", feature = "device-screen"))]
 mod video_device;
 

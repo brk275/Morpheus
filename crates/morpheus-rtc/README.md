@@ -49,6 +49,31 @@ in a Matrix SDK client. The combined Matrix SDK and LiveKit dependency graph
 enables two rustls providers; choosing AWS-LC explicitly prevents TLS startup
 panics. The service also calls the helper as a fallback.
 
+## Ringing implementation boundary
+
+DM and ordinary-room ringing are not yet connected to the app. The native
+`ringing` module provides bounded parsing of the pinned, deployed
+`m.rtc.notification` format (flat, nested, and consistent duplicated fields).
+It checks explicit recipients/room-mention permission, caps lifetime at two
+minutes, and correlates a referenced membership with the same live logical
+participation across event refreshes. The caller must independently establish
+decryption authenticity, joined room, open slot and current participation;
+parsing alone never authorizes a ring. These new regressions await hosted tests.
+
+The remaining controller must use the account-selection cancellation token,
+deduplicate events, stop on expiry/departure/other-device acceptance or decline,
+keep voice spaces quiet, and request no capture device before Accept. Outgoing
+notifications must reference an observed membership event and retain the actual
+send receipt; server acceptance does not prove a peer rang. No RTC vendor patch
+is required for that send path. The pinned SDK drops keyless events from its
+sticky map while the pinned notification builder omits a sticky key. Ordinary
+timeline reception therefore cannot establish restart/reconnect delivery from
+the sticky extension. Delayed decryption, this compatibility gap, sound, UI and
+stock Element interoperability remain explicit implementation/acceptance work.
+The newer `m.rtc.invite` proposal requires a separate protocol migration.
+
+## Native devices
+
 The optional device features connect native OS media to those frame streams:
 
 - `device-audio`: CPAL 48 kHz mono/stereo microphone capture and speaker

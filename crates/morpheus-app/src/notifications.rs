@@ -17,7 +17,7 @@ use matrix_sdk::{
     sync::Notification as MatrixNotification,
 };
 use morpheus_config::Config;
-use morpheus_matrix::{AccountInfo, AccountManager};
+use morpheus_matrix::{AccountInfo, AccountManager, AccountSelection};
 use notify_rust::Notification;
 use serde_json::Value;
 use slint::{ComponentHandle, Weak as UiWeak};
@@ -74,6 +74,11 @@ struct PlannedNotification {
     sound: bool,
 }
 
+struct QueuedNotification {
+    candidate: Candidate,
+    selection: AccountSelection,
+}
+
 /// The UI supplies the latest valid config. The worker asks Slint whether a
 /// room is on screen at delivery time, so a navigation change cannot leave a
 /// stale room suppression cache.
@@ -85,7 +90,7 @@ pub struct DesktopNotifications {
     config: RwLock<Config>,
     ui: UiWeak<AppWindow>,
     stopped: AtomicBool,
-    queued: mpsc::Sender<Candidate>,
+    queued: mpsc::Sender<QueuedNotification>,
 }
 
 impl DesktopNotifications {
@@ -156,8 +161,16 @@ impl DesktopNotifications {
             .ok()
     }
 
-    async fn enqueue(&self, account: &AccountInfo, notification: MatrixNotification, room: Room) {
+    async fn enqueue(
+        &self,
+        account: &AccountInfo,
+        selection: AccountSelection,
+        notification: MatrixNotification,
+        room: Room,
+    ) {
         if self.stopped.load(Ordering::Acquire)
+            || !selection.is_current()
+            || selection.account_id() != account.id
             || self
                 .manager
                 .active_account()
@@ -177,14 +190,23 @@ impl DesktopNotifications {
             .map(|name| name.to_string())
             .unwrap_or_else(|_| candidate.room_id.clone());
         // Never wait for a desktop notification server inside SDK sync.
-        let _ = self.queued.try_send(candidate);
+        if selection.is_current() {
+            let _ = self.queued.try_send(QueuedNotification {
+                candidate,
+                selection,
+            });
+        }
     }
 
     /// Read the account, UI visibility, and current policy together as late as
     /// possible. A queued event must never carry an earlier account's preview
     /// setting into the native notification presenter.
-    async fn plan_current(&self, candidate: &Candidate) -> Option<PlannedNotification> {
-        if self.stopped.load(Ordering::Acquire) {
+    async fn plan_current(&self, queued: &QueuedNotification) -> Option<PlannedNotification> {
+        let candidate = &queued.candidate;
+        if self.stopped.load(Ordering::Acquire)
+            || !queued.selection.is_current()
+            || queued.selection.account_id() != candidate.account_id
+        {
             return None;
         }
         let active = self.manager.active_account().await?;
@@ -197,6 +219,11 @@ impl DesktopNotifications {
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
+        // Account changes can happen during either await above. Returning to
+        // the same account must not revive this earlier notification.
+        if self.stopped.load(Ordering::Acquire) || !queued.selection.is_current() {
+            return None;
+        }
         plan_notification(
             candidate,
             &active,
@@ -223,11 +250,18 @@ async fn watch_accounts(manager: Arc<AccountManager>, service: Weak<DesktopNotif
             let callback_account = account.clone();
             client
                 .register_notification_handler(move |notification, room, _client| {
-                    let weak = weak.clone();
                     let account = callback_account.clone();
+                    // Capture at callback invocation, before the async body
+                    // can be queued behind an A → B → A transition.
+                    let service = weak.upgrade();
+                    let selection = service
+                        .as_ref()
+                        .and_then(|service| service.manager.account_selection(&account.id));
                     async move {
-                        if let Some(service) = weak.upgrade() {
-                            service.enqueue(&account, notification, room).await;
+                        if let (Some(service), Some(selection)) = (service, selection) {
+                            service
+                                .enqueue(&account, selection, notification, room)
+                                .await;
                         }
                     }
                 })
@@ -242,19 +276,22 @@ async fn watch_accounts(manager: Arc<AccountManager>, service: Weak<DesktopNotif
 
 async fn deliver_queued(
     service: Weak<DesktopNotifications>,
-    mut receiver: mpsc::Receiver<Candidate>,
+    mut receiver: mpsc::Receiver<QueuedNotification>,
 ) {
     let mut seen = HashMap::<String, Instant>::new();
-    while let Some(candidate) = receiver.recv().await {
+    while let Some(queued) = receiver.recv().await {
         let Some(service) = service.upgrade() else {
             return;
         };
-        if service.plan_current(&candidate).await.is_none() {
+        if service.plan_current(&queued).await.is_none() {
             continue;
         }
         let now = Instant::now();
         seen.retain(|_, observed| now.duration_since(*observed) < SEEN_TTL);
-        if seen.insert(candidate.event_key.clone(), now).is_some() {
+        if seen
+            .insert(queued.candidate.event_key.clone(), now)
+            .is_some()
+        {
             continue;
         }
 
@@ -265,7 +302,7 @@ async fn deliver_queued(
             // A blocking worker may begin after account switching, room
             // navigation, or a Settings save. Query all three again directly
             // before handing the notification to the OS.
-            if let Some(plan) = runtime.block_on(service.plan_current(&candidate)) {
+            if let Some(plan) = runtime.block_on(service.plan_current(&queued)) {
                 show_native(plan)
             } else {
                 Ok(())

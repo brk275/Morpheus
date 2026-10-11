@@ -5,8 +5,12 @@ the selected account. This covers both native sliding sync and classic sync.
 Room mutes and other Matrix push rules are evaluated by the SDK before an event
 reaches Morpheus. The app then suppresses its own messages, the room currently
 visible in the conversation pane, duplicate events, and message events more
-than five minutes old. A switch discards queued notifications for the old
-account.
+than five minutes old. A switch permanently invalidates queued notifications
+from the old selection, including a quick switch from A to B and back to A.
+Each SDK callback captures a revocable selection token before its first await;
+logout, sync shutdown and reauthentication also revoke old tokens. The worker
+checks the token again after asynchronous lookups and before native delivery.
+These additional regressions await hosted native verification.
 
 Successful in-app notification setting changes update the presenter before the
 callback returns. External TOML changes are applied only after validation by

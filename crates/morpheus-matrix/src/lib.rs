@@ -23,8 +23,10 @@ mod search;
 pub use search::MessageSearchResult;
 mod formatting;
 pub use formatting::TextFormat;
+mod account_selection;
 mod admin;
 mod rich_text;
+pub use account_selection::AccountSelection;
 pub use admin::RoomMemberInfo;
 
 use std::{
@@ -591,6 +593,7 @@ pub struct AccountManager {
     sync_policy: SyncPolicy,
     state: Mutex<State>,
     active_tx: watch::Sender<Option<AccountInfo>>,
+    selections: account_selection::Selections,
     sync_tx: watch::Sender<SyncStatus>,
 }
 
@@ -626,12 +629,26 @@ impl AccountManager {
                 queue_recovery_task: None,
             }),
             active_tx,
+            selections: account_selection::Selections::default(),
             sync_tx,
         })
     }
 
     pub fn subscribe_active_account(&self) -> watch::Receiver<Option<AccountInfo>> {
         self.active_tx.subscribe()
+    }
+
+    /// Capture ownership of queued work synchronously, before its first await.
+    /// A watch receiver can coalesce A → B → A; this token is still revoked
+    /// by that sequence. None while restoring, switching, logging out or stopped.
+    pub fn account_selection(&self, account_id: &str) -> Option<AccountSelection> {
+        self.selections.for_account(account_id)
+    }
+
+    fn publish_active_account(&self, account: Option<AccountInfo>) {
+        self.selections
+            .replace(account.as_ref().map(|account| account.id.as_str()));
+        self.active_tx.send_replace(account);
     }
 
     pub fn subscribe_sync_status(&self) -> watch::Receiver<SyncStatus> {
@@ -743,11 +760,12 @@ impl AccountManager {
             let _ = fs::remove_dir_all(&store_path);
             return Err(e);
         }
+        self.selections.replace(None);
         stop_sync(&mut state).await;
         let loaded = Arc::new(LoadedAccount::new(client, id.clone(), passphrase));
         state.loaded.insert(id, loaded.clone());
         state.registry = next;
-        self.active_tx.send_replace(Some(account.clone()));
+        self.publish_active_account(Some(account.clone()));
         self.start_sync(&mut state, loaded.client.clone()).await;
         Ok(account)
     }
@@ -811,9 +829,10 @@ impl AccountManager {
         let mut next = state.registry.clone();
         next.active_account_id = Some(id.into());
         save_registry(&self.data_dir, &next)?;
+        self.selections.replace(None);
         stop_sync(&mut state).await;
         state.registry = next;
-        self.active_tx.send_replace(Some(account.clone()));
+        self.publish_active_account(Some(account.clone()));
         self.start_sync(&mut state, loaded.client.clone()).await;
         Ok(account)
     }
@@ -837,6 +856,7 @@ impl AccountManager {
             next.active_account_id = None;
         }
         if was_active {
+            self.selections.replace(None);
             stop_sync(&mut state).await;
             self.sync_tx.send_replace(SyncStatus::Stopped);
         }
@@ -899,7 +919,7 @@ impl AccountManager {
         save_registry(&self.data_dir, &next)?;
         state.registry = next;
         if was_active {
-            self.active_tx.send_replace(None);
+            self.publish_active_account(None);
         }
         let store_result = fs::remove_dir_all(self.data_dir.join("accounts").join(id));
         if let Err(e) = store_result {
@@ -2011,6 +2031,7 @@ impl AccountManager {
 
     pub async fn stop(&self) {
         let mut state = self.state.lock().await;
+        self.selections.replace(None);
         stop_sync(&mut state).await;
         self.sync_tx.send_replace(SyncStatus::Stopped);
     }
@@ -2983,6 +3004,8 @@ mod tests {
             manager.switch_to(&second.id).await.unwrap();
             assert!(!client_a.send_queue().is_enabled());
             assert!(client_b.send_queue().is_enabled());
+            let previous_selection = manager.account_selection(&second.id).unwrap();
+            assert!(previous_selection.is_current());
 
             // Re-selecting an active account is a manual recovery path for
             // a queue paused after a transient error.
@@ -2993,8 +3016,16 @@ mod tests {
             manager.switch_to(&first.id).await.unwrap();
             assert!(client_a.send_queue().is_enabled());
             assert!(!client_b.send_queue().is_enabled());
+            assert!(!previous_selection.is_current());
+            let first_selection = manager.account_selection(&first.id).unwrap();
+            manager.switch_to(&second.id).await.unwrap();
+            assert!(!first_selection.is_current());
+            assert!(!previous_selection.is_current());
+            let current_selection = manager.account_selection(&second.id).unwrap();
+            assert!(current_selection.is_current());
 
             manager.stop().await;
+            assert!(!current_selection.is_current());
             assert!(!client_a.send_queue().is_enabled());
             assert!(!client_b.send_queue().is_enabled());
             drop(manager);

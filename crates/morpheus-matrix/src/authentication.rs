@@ -554,6 +554,7 @@ impl AccountManager {
                 let _ = delete_secret(&store.id).await;
                 return Err(error);
             }
+            self.selections.replace(None);
             stop_sync(&mut state).await;
             let loaded = Arc::new(LoadedAccount::new(
                 (*client).clone(),
@@ -562,7 +563,7 @@ impl AccountManager {
             ));
             state.loaded.insert(store.id.clone(), loaded.clone());
             state.registry = next;
-            self.active_tx.send_replace(Some(account.clone()));
+            self.publish_active_account(Some(account.clone()));
             self.start_sync(&mut state, loaded.client.clone()).await;
             Ok(())
         }
