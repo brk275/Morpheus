@@ -5,3 +5,24 @@ a5074a35d0f8f48bb2f76d4afbbb0dd2418765cd:scripts/element_call_peer.mjs:generic-a
 # Public upstream livekit-api 0.5.3 test JWT; verified with its public dummy key.
 # SHA256: 45fb9c7ff611f830d96b61c071a3b4d6b6b034442e424acef10566fb705838d0
 6888d131799dd715a24f79dd5e03696441d78f05:vendor/livekit-api/src/test_token.txt:jwt:1
+
+# Public matrix-rtc-core 0.5.0-rc.2 test fixtures from pinned revision
+# 53880ef1ef66b62df555ce71ccd1d6c85b813596: synthetic logical-membership
+# IDs and media-key encodings, verified in test-only code against exact upstream
+# file hashes in vendor/matrix-rtc-core/UPSTREAM_FILES.sha256. These exceptions
+# match only the introduction commit, file, rule and line; other matches fail.
+6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/client/tests.rs:generic-api-key:166
+6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/room_state.rs:generic-api-key:1062
+6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/room_state.rs:generic-api-key:1074
+6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/sticky_2025.rs:generic-api-key:628
+6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/sticky_2025.rs:generic-api-key:633
+6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/sticky_2025.rs:generic-api-key:644
+6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/sticky_2025.rs:generic-api-key:738
+6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/sticky_2025.rs:generic-api-key:752
+6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/sticky_2025.rs:generic-api-key:771
+6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/sticky_2025.rs:generic-api-key:772
+6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/sticky_2025.rs:generic-api-key:773
+6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/sticky_2025.rs:generic-api-key:790
+6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/sticky_2025.rs:generic-api-key:801
+6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/host/event.rs:generic-api-key:454
+6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/host/event.rs:generic-api-key:514
