@@ -1,4 +1,4 @@
-name: Unsigned package validation
+name: Package validation
 
 on:
   workflow_dispatch:
@@ -15,6 +15,11 @@ on:
         required: true
         default: both
         options: [both, appimage, deb]
+      appimage_updates:
+        description: Run installed signed AppImage update QA instead of ordinary Linux packaging
+        type: boolean
+        required: true
+        default: false
 
 permissions:
   contents: read
@@ -38,31 +43,19 @@ jobs:
     outputs:
       matrix: ${{ steps.scope.outputs.matrix }}
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Select requested standard runners
         id: scope
         env:
           PACKAGE_PLATFORM: ${{ inputs.platform }}
           LINUX_FORMATS: ${{ inputs.linux_formats }}
-        run: |
-          python3 - <<'PY'
-          import json, os
-          linux_formats = {"both": "deb,appimage", "appimage": "appimage", "deb": "deb"}[os.environ["LINUX_FORMATS"]]
-          options = {
-              "linux": [{"os": "ubuntu-24.04", "label": "linux-x64", "formats": linux_formats}],
-              "windows": [{"os": "windows-2025", "label": "windows-x64", "formats": "nsis"}],
-              "macos": [
-                  {"os": "macos-15", "label": "macos-arm64", "formats": "dmg"},
-                  {"os": "macos-15-intel", "label": "macos-x64", "formats": "dmg"},
-              ],
-          }
-          options["all"] = options["macos"] + options["windows"] + options["linux"]
-          matrix = {"include": options[os.environ["PACKAGE_PLATFORM"]]}
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
-              output.write("matrix=" + json.dumps(matrix) + "\n")
-          PY
+          APPIMAGE_UPDATES: ${{ inputs.appimage_updates }}
+        run: python3 scripts/package_scope.py
 
   package:
-    name: Unsigned validation (${{ matrix.label }})
+    name: Package validation (${{ matrix.label }})
     needs: scope
     if: github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event.repository.private == false
     runs-on: ${{ matrix.os }}
@@ -98,10 +91,34 @@ jobs:
           save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
       - name: Install pinned Cargo Packager
         run: cargo install cargo-packager --version 0.11.8 --locked
+      - name: Linux installed update QA dependencies
+        if: runner.os == 'Linux' && inputs.appimage_updates
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssl ca-certificates python3-pyatspi python3-gi at-spi2-core dbus-x11
       - name: Build unsigned QA package
+        if: runner.os != 'Linux' || !inputs.appimage_updates
         run: python3 scripts/package.py --formats ${{ matrix.formats }}
       - name: Install, inspect, launch and remove unsigned packages
+        if: runner.os != 'Linux' || !inputs.appimage_updates
         timeout-minutes: 35
         run: python3 scripts/package_smoke.py --target ${{ matrix.label }} --formats ${{ matrix.formats }}
+      - name: Test installed AppImage update and rollback
+        if: runner.os == 'Linux' && inputs.appimage_updates
+        env:
+          MORPHEUS_FREE_HOSTED_UPDATE_QA: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
+          curl --fail --silent --show-error --location \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$archive"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
+          /usr/bin/python3 scripts/appimage_update_acceptance.py \
+            --source "$GITHUB_WORKSPACE" --target-dir "$GITHUB_WORKSPACE/target" \
+            --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks" --execute-on-free-hosted-runner
       # Installers deliberately stay on the ephemeral runner. Public artifact
       # uploads and releases require the separate release acceptance gates.
