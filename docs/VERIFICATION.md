@@ -5,7 +5,76 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
 ## Current hosted acceptance, 2026-10-11
 
-### Incoming admission policy regression and correction
+### Policy correction and precise remaining failures
+
+[Run 38134894308](https://github.com/brk275/Morpheus/actions/runs/38134894308)
+tested `ebccda37af584ba2e629ad5e7825f2e2a2a7d8a0`. Scope passed 384 helper
+checks with one skip, including the hosted HTTPS cookie login/callback flow.
+Apple Silicon, Intel Mac and Windows passed native check/build and 327 unit/vendor/SDK
+tests each, plus ten fixture-selector checks without live inputs. Each desktop
+suite reported one deliberately ignored live test. Windows also passed the
+actual owned-window/display capture fixture, including its final fixed success
+facts. All three cache and checkout post-steps completed.
+
+Linux passed native check/build, Xvfb startup, 353 unit/vendor/SDK tests and 12
+fixture-selector checks without live inputs, with one deliberately ignored live
+test. These results include all five policy correction regressions, all five
+passive observer unit tests and all 46 SDK sticky tests. The malformed-policy
+assertion from the previous candidate now passes.
+
+The Linux live harness completed 39 checks successfully and failed five, with
+none left unrun; 17 actual live Rust tests passed. Chat, encrypted drafts,
+room actions, rich messages, media, discovery, moderation, both search/sync
+paths, recovery, both HTTPS OAuth phases and ordinary encrypted RTC passed.
+OAuth included automatic refresh, remote logout and account/vault removal.
+The official Element `v0.28.0-rc.1` pre-synced Sticky2025 case passed all 11
+required facts. This remains a pre-synced compatibility result, not proof of
+Current-format or fresh-device Element interoperability.
+
+All four Current/Sticky2025 DM/room invitation cases failed at
+`observer_roster`, with the fixed category `slot_unavailable`. They passed
+sticky sync, own crypto, peer trust and join-without-media setup, then cleaned
+up. Invitation receipt and incoming admission assertions were not reached.
+Source inspection found a concrete event-type mismatch: the pinned writer sends
+`m.rtc.slot`, while the observer requests `org.matrix.msc4143.rtc.slot`; locked
+Ruma preserves those distinct strings. The observer correction remains pending
+and is excluded from the screenshot candidate.
+Fresh-device late join failed at `initial_bob_roster`: Alice's membership was
+absent from Bob's roster. The bounded diagnostic selected Alice's current
+membership and reported `MissingMegolmSession` on Bob; it did not turn the
+failed roster assertion into a pass.
+
+Wayland's separate stdout proof now confirms an actual named-test failure and
+one-failure summary, with `required_test_passed=false`. The first static frame
+timed out at `first_frame_1`; no consumer processing callback was observed.
+All 33 bindings used system PipeWire, all five services remained running and
+both private output streams drained without truncation. The ordered trace
+recorded an accepted valid producer queue before the consumer's local Running
+transition. It does not establish the cause. The ordinary capture gate remains
+failed; the manual system/control/patched experiment has not run.
+
+All Linux fixture/container/network cleanup checks and cache/checkout
+post-steps completed. All five completed job logs
+scanned with zero findings and are retained privately with metadata and hashes.
+No installers were uploaded. These failures keep the candidate below beta
+readiness.
+
+### Pending screenshot and microphone cancellation candidate
+
+The next candidate adds a debug-only native Slint preview capture before
+account, configuration and network initialization. It will render three actual
+UI states under Xvfb and losslessly encode their RGB snapshots as PNG, with
+source/binary/image provenance. Only the PNGs and provenance may be uploaded;
+raw snapshots and logs remain private. The converter and scope checks passed
+24 Python tests and source review, but native capture has not run and no new
+README screenshot is claimed yet.
+
+The same candidate tightens microphone authorization during delayed device
+opening, account changes and cancellation. Focused fake-device and controller
+regressions have been written and reviewed; their native execution remains
+pending. These changes are not verified by the `ebccda3` results above.
+
+### Previous incoming admission policy regression and correction
 
 [Run 38132968786](https://github.com/brk275/Morpheus/actions/runs/38132968786)
 tested `dcab6296bda12da362e54d6044c29d9de21eed29`. Scope passed 381 helper
@@ -23,8 +92,8 @@ rules, individual rules and conditions, plus ignore-list content and entries.
 It retains Ruma's typed field validation, optional fields, unknown extensions
 and valid empty policy; an empty policy still denies notifications. The
 regressions keep the original malformed-input assertion and add nested shape,
-valid-rule round-trip and empty-policy behavior checks. Native execution of
-the correction remains pending. Unexpected admission and revalidation errors
+valid-rule round-trip and empty-policy behavior checks. The correction passed
+on `ebccda3` as recorded above. Unexpected admission and revalidation errors
 now retain a fixed failure category in the hosted fixture; expected replay and
 withdrawal rejections remain silent. All 83 targeted Python checks and workflow
 validation passed locally. No native test or fixture service ran locally.
@@ -32,7 +101,7 @@ validation passed locally. No native test or fixture service ran locally.
 The desktop unit failure prevented the later native-device, vendor, SDK,
 Wayland and live Matrix/RTC gates from running on Linux. This run therefore
 provides no new live observer, incoming admission, late-join or capture proof.
-The next workflow retains a failed desktop-unit outcome while collecting
+The later workflow retains a failed desktop-unit outcome while collecting
 independent checks from the already-built app, then explicitly fails the final
 gate. Native-device and vendored-security failures still stop subsequent work.
 
@@ -169,14 +238,16 @@ redaction before expiry. Their 13 required facts and overall time budgets stay
 unchanged; fixed stages distinguish admission, revalidation and withdrawal.
 Separate observer open/roster/leave stages retain only allowlisted failure
 categories and cannot turn a failed assertion into passing evidence.
-These changed native checks have **not executed yet**.
+The `ebccda3` fixture executions failed at the preceding observer gate, so the
+incoming admission assertions still have no passing live evidence.
 
 Fresh-device late-join failure now has one bounded diagnostic fetch after the
 existing 45-second roster assertion has already failed. It selects Alice's
 exact currently verified membership and reports only pre-fetch presence flags
 and fixed decryption categories. The fetch cannot make the failed acceptance
 pass. No keys are imported, trust changed, membership republished or acceptance
-timeout extended. Hosted execution remains required to identify the failure.
+timeout extended. On `ebccda3`, this diagnostic reported `MissingMegolmSession`
+for the selected membership, as recorded above.
 
 ### Previous SDK test setup failure
 

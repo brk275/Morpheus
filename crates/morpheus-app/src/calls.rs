@@ -934,6 +934,9 @@ impl CallController {
             };
             let cancel = running.cancel.take();
             running.capture_stop.request();
+            if let Some(audio) = &running.audio_controls {
+                audio.cancel();
+            }
             let done = running.done.clone();
             self.shared.status.send_replace(CallStatus::Ending {
                 account_id: running.account_id.clone(),
@@ -1064,6 +1067,19 @@ async fn wait_cleanup_done(
     .map_err(|_| CallControllerError::TimedOut("waiting for call worker"))?
 }
 
+// Read by the detached audio opener as well as the async call owner. Account
+// and sync invalidation must not wait for the owner's next select-loop poll.
+fn audio_capture_allowed(stop: &CaptureStop, selection_current: bool, sync: &SyncStatus) -> bool {
+    !stop.requested()
+        && selection_current
+        && matches!(
+            sync,
+            SyncStatus::Running {
+                backend: SyncBackend::SlidingSticky
+            }
+        )
+}
+
 struct CallWorker {
     manager: Arc<AccountManager>,
     shared: Arc<Shared>,
@@ -1118,7 +1134,18 @@ impl CallWorker {
                 .await;
             return;
         }
-        let controls = match rtc.audio_controls(&self.room_id) {
+        let mut active = self.manager.subscribe_active_account();
+        let mut sync = self.manager.subscribe_sync_status();
+        let audio_selection = self.selection.clone();
+        let audio_stop = Arc::clone(&self.capture_stop);
+        let audio_sync = sync.clone();
+        let controls = match rtc.audio_controls_cancellable(&self.room_id, move || {
+            audio_capture_allowed(
+                &audio_stop,
+                audio_selection.is_current(),
+                &audio_sync.borrow(),
+            )
+        }) {
             Ok(controls) => controls,
             Err(error) => {
                 let leave = leave_with_timeout(&mut rtc, &self.room_id).await;
@@ -1160,8 +1187,6 @@ impl CallWorker {
             return;
         }
 
-        let mut active = self.manager.subscribe_active_account();
-        let mut sync = self.manager.subscribe_sync_status();
         let account_still_active = active.borrow().as_ref().map(|account| account.id.as_str())
             == Some(self.account_id.as_str());
         let sync_state = sync.borrow().clone();
@@ -1204,6 +1229,7 @@ impl CallWorker {
             let account_id = self.account_id.clone();
             let selection = self.selection.clone();
             let stop = Arc::clone(&self.capture_stop);
+            let audio = controls.clone();
             tokio::spawn(async move {
                 loop {
                     if !selection.is_current()
@@ -1211,16 +1237,19 @@ impl CallWorker {
                             != Some(account_id.as_str())
                     {
                         stop.request();
+                        audio.cancel();
                         break;
                     }
                     tokio::select! {
                         _ = selection.revoked() => {
                             stop.request();
+                            audio.cancel();
                             break;
                         }
                         changed = active.changed() => {
                             if changed.is_err() {
                                 stop.request();
+                                audio.cancel();
                                 break;
                             }
                         }
@@ -1231,6 +1260,7 @@ impl CallWorker {
         let sync_capture_guard = {
             let mut sync = sync.clone();
             let stop = Arc::clone(&self.capture_stop);
+            let audio = controls.clone();
             tokio::spawn(async move {
                 loop {
                     if !matches!(
@@ -1240,10 +1270,12 @@ impl CallWorker {
                         }
                     ) {
                         stop.request();
+                        audio.cancel();
                         break;
                     }
                     if sync.changed().await.is_err() {
                         stop.request();
+                        audio.cancel();
                         break;
                     }
                 }
@@ -1297,6 +1329,7 @@ impl CallWorker {
             let mut video_running = true;
             loop {
                 tokio::select! {
+                    biased;
                     _ = &mut self.cancel => break Ok(()),
                     _ = self.selection.revoked() => break Err(CallControllerError::AccountChanged),
                     changed = active.changed() => {
@@ -1362,6 +1395,7 @@ impl CallWorker {
             }
         };
         self.capture_stop.request();
+        controls.cancel();
         account_capture_guard.abort();
         sync_capture_guard.abort();
         let outgoing_result = outgoing.shutdown().await;
@@ -1574,6 +1608,23 @@ async fn ensure_account(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_permission_reads_stop_selection_and_sync_without_watcher_progress() {
+        let stop = CaptureStop::default();
+        let (sync, current) = watch::channel(SyncStatus::Running {
+            backend: SyncBackend::SlidingSticky,
+        });
+        assert!(audio_capture_allowed(&stop, true, &current.borrow()));
+        assert!(!audio_capture_allowed(&stop, false, &current.borrow()));
+        sync.send_replace(SyncStatus::Stopped);
+        assert!(!audio_capture_allowed(&stop, true, &current.borrow()));
+        sync.send_replace(SyncStatus::Running {
+            backend: SyncBackend::SlidingSticky,
+        });
+        stop.request();
+        assert!(!audio_capture_allowed(&stop, true, &current.borrow()));
+    }
 
     #[tokio::test]
     async fn opening_slot_blocks_account_switch_until_write_finishes() {

@@ -17,6 +17,8 @@ mod local_video;
 mod notifications;
 #[cfg(feature = "native-calls")]
 mod outgoing_ring;
+#[cfg(debug_assertions)]
+mod preview_capture;
 mod security;
 mod shortcuts;
 mod sso;
@@ -174,7 +176,7 @@ fn fixtures() -> PreviewState {
     let blue = rgb(100, 165, 232);
 
     let workshop = PreviewAccount {
-        item: account("Alex", "@alex:example.org", "AM", "Available", violet),
+        item: account("Casey", "@casey:example.org", "CY", "Available", violet),
         channels: vec![
             room(
                 "#general",
@@ -213,8 +215,8 @@ fn fixtures() -> PreviewState {
                         sample
                     },
                     message(
-                        "Alex",
-                        "AM",
+                        "Casey",
+                        "CY",
                         "9:48 AM",
                         "The bottom-left card opens upward over the room list. I kept the active identity visible, including the full Matrix ID, so switching contexts is harder to miss.",
                         "Sam: It looks great.",
@@ -272,8 +274,8 @@ fn fixtures() -> PreviewState {
                         blue,
                     ),
                     message(
-                        "Alex",
-                        "AM",
+                        "Casey",
+                        "CY",
                         "Today",
                         "The account card and member rail are in place. Next I am testing the conversation at narrow desktop widths.",
                         "",
@@ -359,8 +361,8 @@ fn fixtures() -> PreviewState {
                         peach,
                     ),
                     message(
-                        "Alex",
-                        "AM",
+                        "Casey",
+                        "CY",
                         "10:18 AM",
                         "Absolutely. I will attach the current draft here.",
                         "",
@@ -389,7 +391,7 @@ fn fixtures() -> PreviewState {
             ),
         ],
         members: vec![
-            member("Alex", "AM", "Online", violet, true),
+            member("Casey", "CY", "Online", violet, true),
             member("Jules", "JN", "Online", peach, true),
             member("Sam", "SK", "Online", mint, true),
             member("Morgan", "MR", "Away", blue, false),
@@ -399,9 +401,9 @@ fn fixtures() -> PreviewState {
 
     let personal = PreviewAccount {
         item: account(
-            "Alex · personal",
-            "@alex:personal.example",
-            "AP",
+            "Casey · personal",
+            "@casey:personal.example",
+            "CP",
             "Away",
             blue,
         ),
@@ -424,8 +426,8 @@ fn fixtures() -> PreviewState {
                         rgb(231, 139, 164),
                     ),
                     message(
-                        "Alex · personal",
-                        "AP",
+                        "Casey · personal",
+                        "CP",
                         "11:24 AM",
                         "Yes! Saturday afternoon works.",
                         "",
@@ -471,7 +473,7 @@ fn fixtures() -> PreviewState {
             )],
         )],
         members: vec![
-            member("Alex · personal", "AP", "Away", blue, false),
+            member("Casey · personal", "CP", "Away", blue, false),
             member("Riley", "RL", "Online", rgb(231, 139, 164), true),
         ],
     };
@@ -824,8 +826,8 @@ fn make_stress_messages() -> Vec<MessageItem> {
         .map(|index| {
             let index = index as usize;
             message(
-                if index % 3 == 0 { "Alex" } else { "Morgan" },
-                if index % 3 == 0 { "AM" } else { "MR" },
+                if index % 3 == 0 { "Casey" } else { "Morgan" },
+                if index % 3 == 0 { "CY" } else { "MR" },
                 &format!("#{:05}", index + 1),
                 BODIES[index % BODIES.len()],
                 if index % 7 == 0 {
@@ -1458,6 +1460,12 @@ fn continue_account_action(ui: &AppWindow, action: i32) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Screenshot generation uses only the in-memory offline preview. Dispatch
+    // before updater, configuration, credential vault or account initialization.
+    #[cfg(debug_assertions)]
+    if preview_capture::early_dispatch()? {
+        return Ok(());
+    }
     if updater::early_dispatch()? {
         return Ok(());
     }

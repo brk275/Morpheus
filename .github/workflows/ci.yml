@@ -145,6 +145,49 @@ jobs:
         run: cargo check --locked -p morpheus-app -p morpheus-matrix
       - name: Build desktop with native call and device adapters
         run: cargo build --locked -p morpheus-app --features native-calls
+      - name: Capture actual native preview screens
+        id: preview-capture
+        if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name == 'push'
+        continue-on-error: true
+        timeout-minutes: 2
+        env:
+          SLINT_SCALE_FACTOR: "1"
+          SLINT_BACKEND: winit-software
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          preview_root="$RUNNER_TEMP/morpheus-preview-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir "$preview_root"
+          # This debug-only early CLI renders fictional fixtures before any
+          # account/config store or network service initialization. Native
+          # logs and raw frames stay private and are never uploaded.
+          if ! timeout --kill-after=5s 30s xvfb-run -a -s '-screen 0 1560x1040x24' \
+            target/debug/morpheus-app --morpheus-capture-preview "$preview_root/raw" \
+            >"$preview_root/native.log" 2>&1; then
+            echo "Native preview capture failed; private output was not published."
+            exit 1
+          fi
+          python3 scripts/encode_preview_pngs.py \
+            --input-dir "$preview_root/raw" --output-dir "$preview_root/png" \
+            --source-commit "$GITHUB_SHA" --binary target/debug/morpheus-app \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+      - name: Upload native preview PNGs and provenance only
+        id: preview-upload
+        if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.preview-capture.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-preview-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/desktop-preview.png
+            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/account-switcher.png
+            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/sign-in.png
+            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/provenance.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          include-hidden-files: false
       - name: Smoke test Linux desktop startup under Xvfb
         if: runner.os == 'Linux'
         shell: bash
@@ -213,8 +256,8 @@ jobs:
           dbus-run-session -- python3 scripts/run_matrix_acceptance.py \
             --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks"
       - name: Enforce collected acceptance results
-        if: ${{ !cancelled() && (steps.model-tests.outcome == 'failure' || steps.desktop-tests.outcome == 'failure' || steps.wayland-tests.outcome == 'failure' || steps.windows-capture-tests.outcome == 'failure' || steps.sdk-receipt-tests.outcome == 'failure') }}
+        if: ${{ !cancelled() && (steps.model-tests.outcome == 'failure' || steps.preview-capture.outcome == 'failure' || steps.preview-upload.outcome == 'failure' || steps.desktop-tests.outcome == 'failure' || steps.wayland-tests.outcome == 'failure' || steps.windows-capture-tests.outcome == 'failure' || steps.sdk-receipt-tests.outcome == 'failure') }}
         shell: bash
         run: |
-          echo "Protocol model, desktop controller, native capture, or SDK receipt acceptance tests failed; this candidate is not verified."
+          echo "Protocol model, native preview, desktop controller, native capture, or SDK receipt acceptance tests failed; this candidate is not verified."
           exit 1

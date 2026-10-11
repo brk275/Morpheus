@@ -14,7 +14,7 @@ use futures_util::StreamExt;
 use matrix_rtc_call_sdk::CallEvent;
 use matrix_rtc_transport::AudioFrame;
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{Notify, mpsc, watch},
     task::JoinHandle,
     time::{Duration, MissedTickBehavior},
 };
@@ -161,6 +161,23 @@ fn while_open_active<T>(
     Ok(result)
 }
 
+// Keep the startup order testable without opening a real device. Cancellation
+// cannot interrupt an OS call already entered, but its result is discarded and
+// no subsequent prepare/start step is authorized after that call returns.
+fn prepare_audio_pair<M, S>(
+    active: &impl Fn() -> bool,
+    prepare_microphone: impl FnOnce() -> Result<M, MediaError>,
+    prepare_speaker: impl FnOnce() -> Result<S, MediaError>,
+    start_speaker: impl FnOnce(&S) -> Result<(), MediaError>,
+    start_microphone: impl FnOnce(&M) -> Result<(), MediaError>,
+) -> Result<(M, S), MediaError> {
+    let microphone = while_open_active(active, prepare_microphone)?;
+    let speaker = while_open_active(active, prepare_speaker)?;
+    while_open_active(active, || start_speaker(&speaker))?;
+    while_open_active(active, || start_microphone(&microphone))?;
+    Ok((microphone, speaker))
+}
+
 /// Native microphone PCM capture. Frames are 10 ms at 48 kHz, with one or two
 /// channels matching the selected input device. Keep this value alive while
 /// pumping `next_frame()` into a microphone `Publication`.
@@ -205,54 +222,56 @@ impl MicrophoneCapture {
         let stream_error = Arc::new(Mutex::new(None));
         let error_for_callback = Arc::clone(&stream_error);
         let mut pending = VecDeque::<i16>::with_capacity(chunk_len * 2);
-        let stream = device
-            .build_input_stream_raw(
-                config.config(),
-                sample_format,
-                move |data, _| {
-                    match sample_format {
-                        SampleFormat::I16 => {
-                            if let Some(samples) = data.as_slice::<i16>() {
-                                pending.extend(samples.iter().copied());
+        let stream = while_open_active(active, || {
+            device
+                .build_input_stream_raw(
+                    config.config(),
+                    sample_format,
+                    move |data, _| {
+                        match sample_format {
+                            SampleFormat::I16 => {
+                                if let Some(samples) = data.as_slice::<i16>() {
+                                    pending.extend(samples.iter().copied());
+                                }
                             }
-                        }
-                        SampleFormat::F32 => {
-                            if let Some(samples) = data.as_slice::<f32>() {
-                                pending.extend(samples.iter().map(|sample| {
-                                    (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16
-                                }));
+                            SampleFormat::F32 => {
+                                if let Some(samples) = data.as_slice::<f32>() {
+                                    pending.extend(samples.iter().map(|sample| {
+                                        (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)) as i16
+                                    }));
+                                }
                             }
-                        }
-                        SampleFormat::U16 => {
-                            if let Some(samples) = data.as_slice::<u16>() {
-                                pending.extend(
-                                    samples
-                                        .iter()
-                                        .map(|sample| (i32::from(*sample) - 32768) as i16),
-                                );
+                            SampleFormat::U16 => {
+                                if let Some(samples) = data.as_slice::<u16>() {
+                                    pending.extend(
+                                        samples
+                                            .iter()
+                                            .map(|sample| (i32::from(*sample) - 32768) as i16),
+                                    );
+                                }
                             }
+                            _ => return,
                         }
-                        _ => return,
-                    }
-                    while pending.len() >= chunk_len {
-                        let frame = AudioFrame {
-                            data: pending.drain(..chunk_len).collect(),
-                            sample_rate: SAMPLE_RATE,
-                            num_channels: channels,
-                            samples_per_channel: CHUNK_SAMPLES_PER_CHANNEL as u32,
-                        };
-                        // The device callback must never wait for the network.
-                        let _ = tx.try_send(frame);
-                    }
-                },
-                move |error| {
-                    if let Ok(mut last) = error_for_callback.lock() {
-                        *last = Some(error.to_string());
-                    }
-                },
-                None,
-            )
-            .map_err(|error| MediaError::Device(error.to_string()))?;
+                        while pending.len() >= chunk_len {
+                            let frame = AudioFrame {
+                                data: pending.drain(..chunk_len).collect(),
+                                sample_rate: SAMPLE_RATE,
+                                num_channels: channels,
+                                samples_per_channel: CHUNK_SAMPLES_PER_CHANNEL as u32,
+                            };
+                            // The device callback must never wait for the network.
+                            let _ = tx.try_send(frame);
+                        }
+                    },
+                    move |error| {
+                        if let Ok(mut last) = error_for_callback.lock() {
+                            *last = Some(error.to_string());
+                        }
+                    },
+                    None,
+                )
+                .map_err(|error| MediaError::Device(error.to_string()))
+        })?;
         Ok(Self {
             _stream: stream,
             rx,
@@ -408,51 +427,55 @@ impl AudioOutput {
         let mixer_for_callback = Arc::clone(&mixer);
         let stream_error = Arc::new(Mutex::new(None));
         let error_for_callback = Arc::clone(&stream_error);
-        let stream = device
-            .build_output_stream_raw(
-                config.config(),
-                sample_format,
-                move |data, _| {
-                    // A contended mutex must produce silence: output buffers
-                    // are not guaranteed to be pre-filled by the backend.
-                    let mut mixer = mixer_for_callback.try_lock().ok();
-                    match sample_format {
-                        SampleFormat::I16 => {
-                            if let Some(output) = data.as_slice_mut::<i16>() {
-                                for sample in output {
-                                    *sample = mixer.as_mut().map(|m| m.next_sample()).unwrap_or(0);
+        let stream = while_open_active(active, || {
+            device
+                .build_output_stream_raw(
+                    config.config(),
+                    sample_format,
+                    move |data, _| {
+                        // A contended mutex must produce silence: output buffers
+                        // are not guaranteed to be pre-filled by the backend.
+                        let mut mixer = mixer_for_callback.try_lock().ok();
+                        match sample_format {
+                            SampleFormat::I16 => {
+                                if let Some(output) = data.as_slice_mut::<i16>() {
+                                    for sample in output {
+                                        *sample =
+                                            mixer.as_mut().map(|m| m.next_sample()).unwrap_or(0);
+                                    }
                                 }
                             }
-                        }
-                        SampleFormat::F32 => {
-                            if let Some(output) = data.as_slice_mut::<f32>() {
-                                for sample in output {
-                                    *sample = f32::from(
-                                        mixer.as_mut().map(|m| m.next_sample()).unwrap_or(0),
-                                    ) / f32::from(i16::MAX);
+                            SampleFormat::F32 => {
+                                if let Some(output) = data.as_slice_mut::<f32>() {
+                                    for sample in output {
+                                        *sample = f32::from(
+                                            mixer.as_mut().map(|m| m.next_sample()).unwrap_or(0),
+                                        ) / f32::from(i16::MAX);
+                                    }
                                 }
                             }
-                        }
-                        SampleFormat::U16 => {
-                            if let Some(output) = data.as_slice_mut::<u16>() {
-                                for sample in output {
-                                    *sample = (i32::from(
-                                        mixer.as_mut().map(|m| m.next_sample()).unwrap_or(0),
-                                    ) + 32768) as u16;
+                            SampleFormat::U16 => {
+                                if let Some(output) = data.as_slice_mut::<u16>() {
+                                    for sample in output {
+                                        *sample = (i32::from(
+                                            mixer.as_mut().map(|m| m.next_sample()).unwrap_or(0),
+                                        ) + 32768)
+                                            as u16;
+                                    }
                                 }
                             }
+                            _ => {}
                         }
-                        _ => {}
-                    }
-                },
-                move |error| {
-                    if let Ok(mut last) = error_for_callback.lock() {
-                        *last = Some(error.to_string());
-                    }
-                },
-                None,
-            )
-            .map_err(|error| MediaError::Device(error.to_string()))?;
+                    },
+                    move |error| {
+                        if let Ok(mut last) = error_for_callback.lock() {
+                            *last = Some(error.to_string());
+                        }
+                    },
+                    None,
+                )
+                .map_err(|error| MediaError::Device(error.to_string()))
+        })?;
         Ok(Self {
             _stream: stream,
             mixer,
@@ -522,11 +545,25 @@ struct AudioControlState {
     speaker_mixer: Option<Arc<Mutex<AudioMixer>>>,
 }
 
+struct AudioAuthorization {
+    cancelled: AtomicBool,
+    changed: Notify,
+    allowed: Box<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl AudioAuthorization {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+}
+
 /// Commands for one account, room, and MatrixRTC membership. Old controls
 /// cannot operate a subsequent join, even if it is in the same room.
 #[derive(Clone)]
 pub struct AudioControls {
     lease: CallLease,
+    authorization: Arc<AudioAuthorization>,
     state: Arc<Mutex<AudioControlState>>,
     requested: watch::Sender<AudioState>,
     applied: watch::Sender<AudioState>,
@@ -535,6 +572,13 @@ pub struct AudioControls {
 
 impl AudioControls {
     fn new(lease: CallLease) -> Self {
+        Self::new_cancellable(lease, || true)
+    }
+
+    fn new_cancellable(
+        lease: CallLease,
+        allowed: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
         let desired = AudioState {
             microphone_muted: false,
             deafened: false,
@@ -547,6 +591,11 @@ impl AudioControls {
         let (applied_updates, _) = watch::channel(applied);
         Self {
             lease,
+            authorization: Arc::new(AudioAuthorization {
+                cancelled: AtomicBool::new(false),
+                changed: Notify::new(),
+                allowed: Box::new(allowed),
+            }),
             state: Arc::new(Mutex::new(AudioControlState {
                 desired,
                 applied,
@@ -580,7 +629,55 @@ impl AudioControls {
     }
 
     pub fn is_running(&self) -> bool {
-        self.lease.is_active() && self.running.load(Ordering::Acquire)
+        self.is_authorized() && self.running.load(Ordering::Acquire)
+    }
+
+    /// Permanently stop this join's audio permission, even while a device-open
+    /// result receiver is retained or the caller is awaiting other media work.
+    /// This does not interrupt an OS operation that has already been entered.
+    pub fn cancel(&self) {
+        self.authorization.cancel();
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(publication) = state.microphone.take() {
+                let _ = publication.set_muted(true);
+            }
+            if let Some(mixer) = state.speaker_mixer.take()
+                && let Ok(mut mixer) = mixer.lock()
+            {
+                mixer.set_deafened(true);
+            }
+            state.applied.microphone_muted = true;
+            self.applied.send_replace(state.applied);
+        }
+    }
+
+    fn is_authorized(&self) -> bool {
+        if self.authorization.cancelled.load(Ordering::Acquire) {
+            return false;
+        }
+        if !self.lease.is_active() || !(self.authorization.allowed)() {
+            self.authorization.cancel();
+            return false;
+        }
+        !self.authorization.cancelled.load(Ordering::Acquire)
+    }
+
+    fn ensure_authorized(&self) -> Result<(), MediaError> {
+        self.is_authorized()
+            .then_some(())
+            .ok_or(MediaError::CallEnded)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let changed = self.authorization.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.is_authorized() {
+                return;
+            }
+            changed.await;
+        }
     }
 
     fn is_for(&self, lease: &CallLease) -> bool {
@@ -593,6 +690,7 @@ impl AudioControls {
     pub fn set_microphone_muted(&self, muted: bool) -> Result<(), MediaError> {
         self.ensure_running()?;
         let mut state = self.lock_state()?;
+        self.ensure_authorized()?;
         if muted {
             if let Some(publication) = &state.microphone {
                 publication.set_muted(true)?;
@@ -610,6 +708,7 @@ impl AudioControls {
     pub fn set_deafened(&self, deafened: bool) -> Result<(), MediaError> {
         self.ensure_running()?;
         let mut state = self.lock_state()?;
+        self.ensure_authorized()?;
         if let Some(mixer) = &state.speaker_mixer {
             mixer
                 .lock()
@@ -624,9 +723,7 @@ impl AudioControls {
     }
 
     fn ensure_running(&self) -> Result<(), MediaError> {
-        if !self.lease.is_active() {
-            return Err(MediaError::CallEnded);
-        }
+        self.ensure_authorized()?;
         if !self.running.load(Ordering::Acquire) {
             return Err(MediaError::ControlNotRunning);
         }
@@ -648,6 +745,7 @@ impl AudioControls {
         // The transport publishes muted, including while the OS devices open.
         microphone.discard_buffered_frames();
         let mut state = self.lock_state()?;
+        self.ensure_authorized()?;
         speaker.set_deafened(state.desired.deafened)?;
         if !state.desired.microphone_muted {
             publication.set_muted(false)?;
@@ -660,6 +758,7 @@ impl AudioControls {
     }
 
     fn apply_pending_unmute(&self, microphone: &mut MicrophoneCapture) -> Result<(), MediaError> {
+        self.ensure_authorized()?;
         let needs_unmute = {
             let state = self.lock_state()?;
             !state.desired.microphone_muted && state.applied.microphone_muted
@@ -667,6 +766,7 @@ impl AudioControls {
         if needs_unmute {
             microphone.discard_buffered_frames();
             let mut state = self.lock_state()?;
+            self.ensure_authorized()?;
             if !state.desired.microphone_muted && state.applied.microphone_muted {
                 if let Some(publication) = &state.microphone {
                     publication.set_muted(false)?;
@@ -679,6 +779,7 @@ impl AudioControls {
     }
 
     fn should_send_microphone(&self) -> Result<bool, MediaError> {
+        self.ensure_authorized()?;
         let state = self.lock_state()?;
         Ok(!state.applied.microphone_muted)
     }
@@ -688,25 +789,21 @@ struct AudioRunGuard<'a>(&'a AudioControls);
 
 impl AudioRunGuard<'_> {
     fn start(controls: &AudioControls) -> Result<AudioRunGuard<'_>, MediaError> {
+        controls.ensure_authorized()?;
         controls
             .running
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| MediaError::ControlAlreadyRunning)?;
-        Ok(AudioRunGuard(controls))
+        let guard = AudioRunGuard(controls);
+        controls.ensure_authorized()?;
+        Ok(guard)
     }
 }
 
 impl Drop for AudioRunGuard<'_> {
     fn drop(&mut self) {
         self.0.running.store(false, Ordering::Release);
-        if let Ok(mut state) = self.0.state.lock() {
-            if let Some(publication) = state.microphone.take() {
-                let _ = publication.set_muted(true);
-            }
-            state.speaker_mixer = None;
-            state.applied.microphone_muted = true;
-            self.0.applied.send_replace(state.applied);
-        }
+        self.0.cancel();
     }
 }
 
@@ -717,6 +814,19 @@ impl RtcService {
     pub fn audio_controls(&self, room_id: &str) -> Result<AudioControls, MediaError> {
         let lease = self.call_lease(room_id).ok_or(MediaError::NotJoined)?;
         Ok(AudioControls::new(lease.clone()))
+    }
+
+    /// Bind device startup and audio publication to an additional owner policy.
+    /// The predicate runs on async and device-open threads: it must be cheap,
+    /// perform no I/O and be independent of UI/task polling. The first false result
+    /// permanently revokes these controls; use new controls for a new join.
+    pub fn audio_controls_cancellable(
+        &self,
+        room_id: &str,
+        allowed: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Result<AudioControls, MediaError> {
+        let lease = self.call_lease(room_id).ok_or(MediaError::NotJoined)?;
+        Ok(AudioControls::new_cancellable(lease.clone(), allowed))
     }
 
     /// Run the default microphone and speaker for a joined call.
@@ -774,43 +884,49 @@ impl RtcService {
                 "audio device setup is still in progress".into(),
             ));
         }
-        let opening_lease = lease.clone();
+        let opening_guard = DeviceOpenGuard;
+        controls.ensure_authorized()?;
+        let opening_controls = controls.clone();
         let (device_tx, device_rx) = tokio::sync::oneshot::channel();
         let opened = std::thread::Builder::new()
             .name("morpheus-audio-open".into())
             .spawn(move || {
-                let _opening = DeviceOpenGuard;
-                let result = (|| -> Result<_, MediaError> {
-                    // A timed-out or cancelled receiver revokes this request
-                    // even if the call's membership itself is still active.
-                    let active = || opening_lease.is_active() && !device_tx.is_closed();
-                    let microphone = MicrophoneCapture::prepare_selected(
-                        selection.microphone.as_deref(),
-                        &active,
-                    )?;
-                    let speaker =
-                        AudioOutput::prepare_selected(selection.speaker.as_deref(), &active)?;
-                    // Neither stream runs while another device is still being
-                    // opened. In particular a stuck speaker open cannot keep
-                    // an already-started microphone alive after cancellation.
-                    speaker.start(&active)?;
-                    microphone.start(&active)?;
-                    Ok((microphone, speaker))
-                })();
+                let _opening = opening_guard;
+                // Receiver drop is only one stop signal. Leave and account
+                // revocation must also win while the async owner retains this
+                // receiver and is suspended in another media branch.
+                let active = || opening_controls.is_authorized() && !device_tx.is_closed();
+                let result = prepare_audio_pair(
+                    &active,
+                    || {
+                        MicrophoneCapture::prepare_selected(
+                            selection.microphone.as_deref(),
+                            &active,
+                        )
+                    },
+                    || AudioOutput::prepare_selected(selection.speaker.as_deref(), &active),
+                    |speaker| speaker.start(&active),
+                    |microphone| microphone.start(&active),
+                );
                 let _ = device_tx.send(result);
             });
         if opened.is_err() {
-            DEVICE_OPEN_IN_PROGRESS.store(false, Ordering::SeqCst);
+            // The captured opening guard also drops on thread-spawn failure.
             return Err(MediaError::Device(
                 "could not start audio device setup".into(),
             ));
         }
         // The OS thread is deliberately detached. If CoreAudio never returns,
         // Tokio shutdown and the rest of the call UI still make progress.
-        let (mut microphone, speaker) = tokio::time::timeout(Duration::from_secs(30), device_rx)
-            .await
+        let received = tokio::select! {
+            biased;
+            _ = controls.cancelled() => return Err(MediaError::CallEnded),
+            received = tokio::time::timeout(Duration::from_secs(30), device_rx) => received,
+        };
+        let (mut microphone, speaker) = received
             .map_err(|_| MediaError::Device("audio device initialization timed out".into()))?
             .map_err(|_| MediaError::Device("audio device setup task failed".into()))??;
+        controls.ensure_authorized()?;
         let publication = Arc::new(
             self.publish_microphone(
                 room_id,
@@ -821,6 +937,7 @@ impl RtcService {
             .await?,
         );
         let _mute_on_drop = MuteOnDrop(&publication);
+        controls.ensure_authorized()?;
         let mut events = call.subscribe_call_events();
         let (remote_tx, mut remote_rx) = mpsc::channel(REMOTE_FRAME_CHANNEL_CAPACITY);
         let mut remotes = RemoteAudioStreams::new(remote_tx);
@@ -835,6 +952,7 @@ impl RtcService {
             loop {
                 tokio::select! {
                     biased;
+                    _ = controls.cancelled() => break Err(MediaError::CallEnded),
                     changed = requests.changed() => {
                         if changed.is_err() {
                             break Ok(());
@@ -1115,6 +1233,219 @@ fn remix_channels(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn guarded_controls(allowed: impl Fn() -> bool + Send + Sync + 'static) -> AudioControls {
+        AudioControls::new_cancellable(
+            CallLease::new(
+                CallInfo {
+                    room_id: "!room:example.test".into(),
+                    slot_id: "m.call#room".into(),
+                    membership_id: "membership".into(),
+                    local_identity: "identity".into(),
+                },
+                "@alice:example.test".into(),
+                "DEVICE".into(),
+            ),
+            allowed,
+        )
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_first_audio_poll_never_enters_device_startup() {
+        use std::cell::Cell;
+        let controls = guarded_controls(|| true);
+        let entered = Cell::new(false);
+        let audio = async {
+            let _run = AudioRunGuard::start(&controls)?;
+            entered.set(true);
+            Ok::<_, MediaError>(())
+        };
+        controls.cancel();
+        assert!(controls.lease.is_active());
+        assert!(matches!(audio.await, Err(MediaError::CallEnded)));
+        assert!(!entered.get());
+        assert!(!controls.running.load(Ordering::Acquire));
+    }
+
+    // An OS step is deliberately blocked while the async owner keeps the
+    // receiver and lease alive, as when it awaits another media branch. No
+    // cancellation task is polled; the opener must read the owner's policy.
+    fn receiver_retained_startup_cancellation(cancel_explicitly: bool) {
+        use std::sync::atomic::AtomicUsize;
+        let allowed = Arc::new(AtomicBool::new(true));
+        let predicate = allowed.clone();
+        let controls = guarded_controls(move || predicate.load(Ordering::Acquire));
+        let (device_tx, mut device_rx) = tokio::sync::oneshot::channel();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+        let later_steps = Arc::new(AtomicUsize::new(0));
+        let steps = later_steps.clone();
+        let discarded = Arc::new(AtomicBool::new(false));
+        let dropped = discarded.clone();
+        struct Prepared(Arc<AtomicBool>);
+        impl Drop for Prepared {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let opening_controls = controls.clone();
+        let opener = std::thread::spawn(move || {
+            let active = || opening_controls.is_authorized() && !device_tx.is_closed();
+            let result = prepare_audio_pair(
+                &active,
+                || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(Prepared(dropped))
+                },
+                || {
+                    steps.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                |_| {
+                    steps.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+                |_| {
+                    steps.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            );
+            let _ = device_tx.send(result);
+            let _ = finished_tx.send(());
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(controls.lease.is_active());
+        assert!(matches!(
+            device_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        if cancel_explicitly {
+            controls.cancel();
+        } else {
+            allowed.store(false, Ordering::Release);
+        }
+        release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        opener.join().unwrap();
+        assert!(matches!(
+            device_rx.try_recv(),
+            Ok(Err(MediaError::CallEnded))
+        ));
+        assert_eq!(later_steps.load(Ordering::SeqCst), 0);
+        assert!(discarded.load(Ordering::Acquire));
+        allowed.store(true, Ordering::Release);
+        assert!(!controls.is_authorized());
+    }
+
+    #[test]
+    fn explicit_cancel_stops_opening_while_owner_and_receiver_remain_suspended() {
+        receiver_retained_startup_cancellation(true);
+    }
+
+    #[test]
+    fn revoked_owner_stops_opening_without_polling_a_cancellation_watcher() {
+        receiver_retained_startup_cancellation(false);
+    }
+
+    #[test]
+    fn each_prepare_and_play_boundary_discards_cancelled_resources() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        struct Prepared(Rc<Cell<usize>>);
+        impl Drop for Prepared {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        for cancel_at in 0..=4 {
+            let controls = guarded_controls(|| true);
+            let steps = Cell::new(0);
+            let created = Cell::new(0);
+            let dropped = Rc::new(Cell::new(0));
+            let step = || {
+                steps.set(steps.get() + 1);
+                if steps.get() == cancel_at {
+                    controls.cancel();
+                }
+            };
+            let prepare = || {
+                step();
+                created.set(created.get() + 1);
+                Ok(Prepared(dropped.clone()))
+            };
+            if cancel_at == 0 {
+                controls.cancel();
+            }
+            let result = prepare_audio_pair(
+                &|| controls.is_authorized(),
+                &prepare,
+                &prepare,
+                |_| {
+                    step();
+                    Ok(())
+                },
+                |_| {
+                    step();
+                    Ok(())
+                },
+            );
+            assert!(matches!(result, Err(MediaError::CallEnded)));
+            assert_eq!(steps.get(), cancel_at);
+            assert_eq!(dropped.get(), created.get());
+        }
+    }
+
+    #[test]
+    fn cancelled_audio_controls_cannot_unmute_send_or_restart_a_live_lease() {
+        let controls = guarded_controls(|| true);
+        let running = AudioRunGuard::start(&controls).unwrap();
+        {
+            let mut state = controls.lock_state().unwrap();
+            state.applied.microphone_muted = false;
+            controls.applied.send_replace(state.applied);
+        }
+        assert!(!controls.applied_state().microphone_muted);
+        controls.cancel();
+        assert!(controls.lease.is_active());
+        assert!(controls.applied_state().microphone_muted);
+        assert!(matches!(
+            controls.set_microphone_muted(false),
+            Err(MediaError::CallEnded)
+        ));
+        assert!(matches!(
+            controls.set_deafened(false),
+            Err(MediaError::CallEnded)
+        ));
+        assert!(matches!(
+            controls.should_send_microphone(),
+            Err(MediaError::CallEnded)
+        ));
+        drop(running);
+        assert!(matches!(
+            AudioRunGuard::start(&controls),
+            Err(MediaError::CallEnded)
+        ));
+        let fresh = guarded_controls(|| true);
+        assert!(AudioRunGuard::start(&fresh).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancellation_wakes_all_registered_audio_waiters() {
+        let controls = guarded_controls(|| true);
+        let mut first = Box::pin(controls.cancelled());
+        let mut second = Box::pin(controls.cancelled());
+        assert!(futures_util::poll!(first.as_mut()).is_pending());
+        assert!(futures_util::poll!(second.as_mut()).is_pending());
+        controls.cancel();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(first, second);
+            controls.cancelled().await;
+        })
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn selected_ids_are_exact_unique_and_independent_of_catalog_order() {

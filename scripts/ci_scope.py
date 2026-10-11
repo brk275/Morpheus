@@ -18,6 +18,7 @@ WINDOWS_ACCEPTANCE_INPUTS = {
     "crates/morpheus-rtc/tests/windows_capture.rs",
 }
 LINUX_ACCEPTANCE_INPUTS = {
+    "scripts/encode_preview_pngs.py",
     "scripts/run_matrix_acceptance.py",
     "scripts/local_matrix_env.py",
     "scripts/local_matrix_rtc.py",
@@ -51,7 +52,9 @@ def classify(paths, force_all=False):
     config = False
     for raw in paths:
         path = str(PurePosixPath(raw))
-        if path.endswith(".md") or path in {"LICENSE", ".gitignore", ".gitleaksignore"}:
+        if (path.endswith(".md")
+                or (path.startswith("docs/screenshots/") and path.endswith(".png"))
+                or path in {"LICENSE", ".gitignore", ".gitleaksignore"}):
             continue
         if path == "Cargo.lock" or path.endswith("Cargo.toml"):
             native.update(PLATFORMS)
