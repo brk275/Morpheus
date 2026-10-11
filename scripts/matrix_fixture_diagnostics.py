@@ -8,6 +8,11 @@ import re
 STAGES = frozenset((
     "disk_check", "network", "credentials", "registration", "seed_rooms", "verify",
     "recovery", "rtc_gate", "status", "cleanup",
+    "rtc_disk_check", "rtc_network", "rtc_stop_native", "rtc_configs",
+    "rtc_federation", "rtc_sfu", "rtc_auth_bridge", "rtc_auth_service",
+    "rtc_auth_ready", "rtc_synapse_configure", "rtc_synapse_restart",
+    "rtc_synapse_ready", "rtc_versions", "rtc_login", "rtc_transports",
+    "rtc_probe_login", "rtc_openid", "rtc_token_exchange", "rtc_sfu_ready",
     *(f"{operation}_{server}" for operation in
       ("volume", "generate", "configure", "start", "ready") for server in ("a", "b")),
 ))

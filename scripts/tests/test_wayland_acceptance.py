@@ -154,6 +154,43 @@ class WaylandFixtureTests(unittest.TestCase):
         self.assertEqual(facts["portal.process"], "not_started")
         self.assertNotIn("private-stage-name", str(facts))
 
+    def test_backend_exit_status_and_fatal_phases_are_bounded_private_facts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "portal-wlr.log").write_bytes(
+                b"pipewire: fatal error event from core private-id=32767\n"
+                b"pipewire: Format negotiated: PRIVATE-FORMAT\n"
+                b"/private/backend.c: Assertion `PRIVATE-EXPRESSION' failed.\n"
+            )
+            services = {"portal-wlr": mock.Mock(pid=123456)}
+            for code in (1, 255, -6, -11, -64, 999, -999, True, None):
+                with self.subTest(code=code), mock.patch.object(MODULE, "peek_returncode", return_value=code):
+                    facts = MODULE.diagnostic_facts(root, "capture_test", services)
+                self.assertTrue(facts["portal-wlr.pipewire_core_fatal"])
+                self.assertTrue(facts["portal-wlr.pipewire_format_negotiated"])
+                self.assertTrue(facts["portal-wlr.assertion_failed"])
+                self.assertFalse(facts["portal-wlr.pipewire_buffer_added"])
+                if type(code) is int and 0 <= code <= 255:
+                    self.assertEqual(facts["portal-wlr.exit_code"], code)
+                else:
+                    self.assertNotIn("portal-wlr.exit_code", facts)
+                if type(code) is int and -64 <= code < 0:
+                    self.assertEqual(facts["portal-wlr.signal"], -code)
+                else:
+                    self.assertNotIn("portal-wlr.signal", facts)
+                rendered = MODULE.json.dumps(facts)
+                for private in ("PRIVATE", "/private", "123456", "32767", directory):
+                    self.assertNotIn(private, rendered)
+
+    def test_first_frame_failure_distinguishes_fixed_end_and_timeout_reasons(self):
+        ended = MODULE.capture_test_facts("first PipeWire frame: selected screen-sharing source ended PRIVATE", 101)
+        timed_out = MODULE.capture_test_facts("first PipeWire frame: screen-sharing stream stopped producing frames PRIVATE", 101)
+        self.assertTrue(ended["selected_source_ended"])
+        self.assertFalse(ended["frame_delivery_timeout"])
+        self.assertFalse(timed_out["selected_source_ended"])
+        self.assertTrue(timed_out["frame_delivery_timeout"])
+        self.assertNotIn("PRIVATE", MODULE.json.dumps([ended, timed_out]))
+
     def test_diagnostics_bound_reads_and_mark_truncation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

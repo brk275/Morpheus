@@ -240,6 +240,47 @@ covered protocol selection, package/update harnesses, readiness, capture
 cleanup and archive isolation. No local native build, archive transformation,
 link, source generation, native test or Matrix/RTC service ran for this batch.
 
+### Linux capture and fixture follow-up, 2026-10-11
+
+[Run 38110401901](https://github.com/brk275/Morpheus/actions/runs/38110401901)
+tested `16fbd5b1e66b88096838e9955899a48cb5b36e08` on the four standard public
+runners. Linux passed 14 configuration, 37 Matrix, eight protocol, 80 desktop,
+41 native RTC/device tests, all four vendor suites, the native app build and
+Xvfb startup. Its linked-address check confirmed all 33 PipeWire bindings use
+the system library. Capture advanced past the earlier initialization crash,
+then failed awaiting its first frame after the portal backend exited.
+This is progress in diagnosis, not capture acceptance.
+
+Windows, Apple Silicon and Intel Mac passed their native jobs: each ran 14 configuration,
+37 Matrix, eight protocol, 65 desktop and 33 native RTC/device tests, plus the
+vendor suites. Opt-in wrappers without fixture credentials do not establish
+live acceptance. All four native logs passed credential scanning. Cache saves
+completed on the three successful targets before the next candidate was pushed.
+The overall run failed its Linux gates. No installers were built or uploaded.
+
+The independent Matrix fixture now started both homeservers successfully and
+passed its disposable vault checks. RTC setup failed before live acceptance;
+the retained diagnostics cannot identify that operation. The follow-up retries
+direct connection resets within the existing RTC readiness deadline and adds
+fixed phase/error categories, without publishing exception or server bodies.
+Read-only checks found no mismatch in the pinned RTC image manifests or the
+inspected upstream configuration fields. Chat, draft, recovery and OAuth checks
+now precede RTC startup; a failure still rejects the candidate and triggers
+cleanup.
+
+The [capture correction](WAYLAND_FIXTURE.md#spa-format-enumeration-correction)
+adds BGRx to the accepted SPA alternatives as well as the default slot. A
+serialized-offer regression awaits the next Linux native run. This verified
+protocol defect is consistent with the backend failure, but its exact cause
+is still unconfirmed. Native CI can now save dependency caches after a failed
+acceptance check; the existing trusted-main-only write guard remains in place.
+
+Independent source review cleared both fixes and the fixture sequencing.
+The combined follow-up passed 233 portable Python checks with five platform
+skips, Rust formatting, Actionlint, Python compilation, JavaScript syntax,
+package configuration and whitespace checks. No local native build, source
+generation, native test, archive transformation or Matrix/RTC service ran.
+
 ### Thread drafts and Windows capture follow-up
 
 Per-thread drafts now share the encrypted SDK store and the existing flush

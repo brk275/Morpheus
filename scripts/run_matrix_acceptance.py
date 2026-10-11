@@ -370,8 +370,6 @@ def main():
     try:
         acceptance.start_keyring()
         acceptance.script("local_matrix_env", "up")
-        acceptance.script("local_matrix_rtc", "up")
-        acceptance.script("local_matrix_rtc", "probe")
         fixture = fixture_from_output(str(root / "accounts.json"), root)
         for name in CHAT_TESTS:
             acceptance.test(name, fixture)
@@ -379,6 +377,11 @@ def main():
         recovery = fixture_from_output(acceptance.script("local_matrix_env", "recovery-fixture"), root)
         acceptance.test("recovery_local", recovery, extra={"MORPHEUS_MATRIX_TEST_RECOVERY": "1"})
         acceptance.oauth_cases()
+        # Message, draft, recovery and OAuth checks use their own services and
+        # do not require RTC. Collect that evidence before RTC bootstrap, while
+        # preserving fatal failures and the same unconditional cleanup below.
+        acceptance.script("local_matrix_rtc", "up")
+        acceptance.script("local_matrix_rtc", "probe")
         gate = fixture_from_output(acceptance.script("local_matrix_env", "rtc-gate-fixture"), root)
         acceptance.test("unsupported_transport_local", gate, rtc=True,
                         extra={"MORPHEUS_MATRIX_RTC_GATE_TEST_ACCOUNTS": str(gate)})

@@ -10,10 +10,49 @@ import subprocess
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from run_matrix_acceptance import Acceptance, OAUTH_PHASES, fixture_from_output, oauth_diagnostics, oauth_evidence, passed_tests
+import run_matrix_acceptance as acceptance_module
 from run_element_acceptance import CHECKS as ELEMENT_CHECKS
 
 
 class LiveEvidenceTests(unittest.TestCase):
+    def test_rtc_bootstrap_follows_independent_checks_and_failure_stays_fatal(self):
+        for failed in (False, True):
+            with self.subTest(rtc_fails=failed), tempfile.TemporaryDirectory() as folder:
+                runner = Mock()
+                def script(name, command):
+                    if failed and (name, command) == ("local_matrix_rtc", "up"):
+                        raise RuntimeError("fixed RTC bootstrap failure")
+                    return "private-fixture"
+                runner.script.side_effect = script
+                with (patch.object(acceptance_module, "Acceptance", return_value=runner),
+                      patch.object(acceptance_module.shutil, "which", return_value="mock-command"),
+                      patch.object(acceptance_module.subprocess, "run", return_value=subprocess.CompletedProcess([], 1)),
+                      patch.object(acceptance_module.tempfile, "mkdtemp", return_value=folder),
+                      patch.object(acceptance_module, "fixture_from_output", return_value=Path(folder) / "fixture.json"),
+                      patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner"]),
+                      patch.dict(os.environ, {"GITHUB_ACTIONS": "true", "RUNNER_OS": "Linux", "DBUS_SESSION_BUS_ADDRESS": "mock"})):
+                    if failed:
+                        with self.assertRaisesRegex(RuntimeError, "fixed RTC bootstrap failure"):
+                            acceptance_module.main()
+                    else:
+                        acceptance_module.main()
+                calls = runner.mock_calls
+                from unittest.mock import call
+                rtc_up = calls.index(call.script("local_matrix_rtc", "up"))
+                self.assertLess(calls.index(call.oauth_cases()), rtc_up)
+                for name in (*acceptance_module.CHAT_TESTS, "recovery_local"):
+                    indexes = [i for i, item in enumerate(calls) if item[0] == "test" and item.args[0] == name]
+                    self.assertTrue(indexes)
+                    self.assertTrue(all(i < rtc_up for i in indexes))
+                self.assertEqual(calls[-3:], [call.summary(), call.script("local_matrix_rtc", "down"),
+                                             call.script("local_matrix_env", "down")])
+                if failed:
+                    runner.rtc_cases.assert_not_called()
+                    runner.element_case.assert_not_called()
+                    self.assertNotIn(call.script("local_matrix_rtc", "probe"), calls)
+                else:
+                    self.assertLess(calls.index(call.script("local_matrix_rtc", "probe")), calls.index(call.rtc_cases()))
+
     def test_element_containment_is_required_before_any_fixture_or_peer(self):
         with tempfile.TemporaryDirectory() as folder:
             runner = Acceptance(Path(folder), "unused-scanner")

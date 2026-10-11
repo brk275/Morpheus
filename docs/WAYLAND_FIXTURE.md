@@ -81,9 +81,13 @@ prints only fixed category counts. Separate `pipewire_binding_origin` and
 `pipewire_initializer` stages survive a native abort. The
 [vendored build patch](../vendor/webrtc-sys/MORPHEUS_PATCH.md) verifies and
 isolates all 33 WebRTC definitions and 46 internal references in `OUT_DIR`.
-The prior SIGSEGV at `opening_display_1` did not record binding origins, so the
-symbol-collision fix still requires hosted confirmation; no capture pass is
-inferred from source inspection.
+The earlier SIGSEGV at `opening_display_1` did not record binding origins.
+Candidate `16fbd5b`, run `38110401901`, subsequently confirmed all 33 bindings
+resolve to system PipeWire, with zero executable/other/unavailable resolutions.
+That run passed opening and reached `first_frame_1`, where capture failed;
+the wlr backend had exited while the other four services remained running.
+Its retained facts do not include the backend exit status or raw error body.
+This establishes binding-origin progress, not a working capture stream.
 
 The existing acceptance test still verifies the selected second display,
 changing frame contents, repeated start/stop, source departure, refusal to
@@ -112,6 +116,30 @@ categories, and the known fixture source's numeric panic line may be reported.
 A private stage file preserves the last fixed test phase even when a native
 abort prevents libtest from flushing captured output. Neither a missing panic
 marker nor an exit code alone establishes the underlying cause.
+Service diagnostics now also retain bounded exit codes (0–255) or signal
+numbers (1–64), plus literal backend fatal, format-negotiation, buffer-allocation
+and assertion markers. The assertion expression and all other matched text
+remain private. Fixed native error markers distinguish source termination
+from the first-frame delivery deadline.
+
+## SPA format enumeration correction
+
+Source inspection after the `16fbd5b` failure found an independent protocol
+defect: the capture adapter encoded BGRx as the SPA Enum default, but omitted
+it from the accepted alternatives. Pinned libspa 0.10.1 encodes those fields
+separately. PipeWire's
+[`spa_pod_filter_prop`](https://github.com/PipeWire/pipewire/blob/1.0.5/spa/include/spa/pod/filter.h)
+skips the default slot while matching alternatives. Consequently, a BGRx-only
+source cannot negotiate with the old offer, despite the adapter's BGRx decoder.
+
+The corrected offer includes BGRx in both slots. A regression serializes and
+deserializes the actual offer and checks that its accepted alternatives include
+BGRx and the other supported formats, while excluding unsupported NV12. The
+fixture's pinned xdpw source and its SHM adaptation are unchanged. xdpw 0.7.1
+can offer BGRx alone for an XRGB8888 source and exits on a PipeWire core error,
+so this defect is consistent with the observed failure. The deleted raw child
+logs cannot establish that it caused this run's backend exit; the corrected
+candidate still requires actual hosted frame acceptance.
 
 The capture adapter drops PipeWire chunks marked `CORRUPTED` before reading
 their pixels, even when the backend retains a previous nonzero chunk size.

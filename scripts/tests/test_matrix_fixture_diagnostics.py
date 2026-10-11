@@ -5,10 +5,11 @@ import subprocess
 import sys
 import unittest
 import urllib.error
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import local_matrix_env as fixture
+import local_matrix_rtc as rtc
 from matrix_fixture_diagnostics import is_progress_line, matrix_fixture_diagnostics
 
 
@@ -88,6 +89,100 @@ class FixtureDiagnosticsTests(unittest.TestCase):
         with contextlib.redirect_stderr(visible), self.assertRaises(ValueError):
             fixture.stage("private-password")
         self.assertEqual(visible.getvalue(), "")
+
+
+class RtcFixtureDiagnosticsTests(unittest.TestCase):
+    def test_rtc_docker_error_is_classified_without_private_response(self):
+        response = subprocess.CompletedProcess(["private-argument"], 125,
+                                               "private-output", "manifest unknown: private-token")
+        visible = io.StringIO()
+        with (patch.object(rtc.subprocess, "run", return_value=response),
+              patch.object(rtc, "main", side_effect=lambda: rtc.docker("private-argument")),
+              contextlib.redirect_stderr(visible)):
+            self.assertEqual(rtc.run_cli(), 1)
+        self.assertNotIn("private", visible.getvalue())
+        self.assertEqual(matrix_fixture_diagnostics(visible.getvalue()),
+                         {"failure": "docker_registry", "docker_exit": 125})
+
+    def test_rtc_reports_exact_startup_boundary_without_exception_text(self):
+        for operation, phase in (("write_configs", "rtc_configs"),
+                                 ("start_federation_bridge", "rtc_federation")):
+            visible = io.StringIO()
+            with (contextlib.ExitStack() as stack, contextlib.redirect_stderr(visible)):
+                stack.enter_context(patch.object(rtc.shutil, "disk_usage", return_value=Mock(free=9 * 1024**3)))
+                stack.enter_context(patch.object(rtc, "exists", return_value=True))
+                stack.enter_context(patch.object(rtc, "stop_native_sfu"))
+                stack.enter_context(patch.object(rtc, "write_configs"))
+                stack.enter_context(patch.object(rtc, operation, side_effect=RuntimeError("private-value")))
+                stack.enter_context(patch.object(rtc, "main", side_effect=rtc.up))
+                self.assertEqual(rtc.run_cli(), 1)
+            self.assertNotIn("private", visible.getvalue())
+            self.assertEqual(matrix_fixture_diagnostics(visible.getvalue()),
+                             {"stage": phase, "failure": "fixture_operation"})
+
+    def test_rtc_http_failure_and_broken_report_stream_are_safe(self):
+        error = urllib.error.HTTPError("http://fixture.invalid/private-token", 401,
+                                       "private-body", {"Authorization": "private-header"}, None)
+        visible = io.StringIO()
+        with (patch.object(rtc, "main", side_effect=error), contextlib.redirect_stderr(visible)):
+            self.assertEqual(rtc.run_cli(), 1)
+        self.assertEqual(matrix_fixture_diagnostics(visible.getvalue()), {"failure": "http", "http_status": 401})
+        self.assertNotIn("private", visible.getvalue())
+        visible.close()
+        with (patch.object(rtc, "main", side_effect=RuntimeError("private-value")),
+              contextlib.redirect_stderr(visible)):
+            self.assertEqual(rtc.run_cli(), 1)
+        error.close()
+
+    def test_rtc_readiness_retries_direct_connection_reset_then_succeeds(self):
+        response = Mock(status=200)
+        context = Mock()
+        context.__enter__ = Mock(return_value=response)
+        context.__exit__ = Mock(return_value=False)
+        with (patch.object(rtc.urllib.request, "urlopen", side_effect=[ConnectionResetError("private"), context]) as request,
+              patch.object(rtc.time, "monotonic", side_effect=[0, 0, .2, 1.2]),
+              patch.object(rtc.time, "sleep") as sleep):
+            rtc.wait_http("http://fixture.invalid/health", duration=5)
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_rtc_readiness_deadline_bounds_last_request_and_sleep(self):
+        with (patch.object(rtc.urllib.request, "urlopen", side_effect=ConnectionResetError("private")) as request,
+              patch.object(rtc.time, "monotonic", side_effect=[0, .75, .9, 1.0]),
+              patch.object(rtc.time, "sleep") as sleep,
+              self.assertRaises(RuntimeError)):
+            rtc.wait_http("http://fixture.invalid/health", duration=1)
+        self.assertEqual(request.call_args.kwargs["timeout"], .25)
+        self.assertAlmostEqual(sleep.call_args.args[0], .1)
+
+    def test_rtc_readiness_wrong_status_cannot_pass(self):
+        response = Mock(status=204)
+        context = Mock()
+        context.__enter__ = Mock(return_value=response)
+        context.__exit__ = Mock(return_value=False)
+        with (patch.object(rtc.urllib.request, "urlopen", return_value=context),
+              patch.object(rtc.time, "monotonic", side_effect=[0, 0, 1, 1]),
+              patch.object(rtc.time, "sleep"), self.assertRaises(RuntimeError)):
+            rtc.wait_http("http://fixture.invalid/health", duration=1)
+
+    def test_rtc_malformed_error_never_formats_its_payload(self):
+        class UnprintableError(ValueError):
+            def __str__(self):
+                raise AssertionError("private-payload-must-not-be-formatted")
+        visible = io.StringIO()
+        with (patch.object(rtc, "main", side_effect=UnprintableError()),
+              contextlib.redirect_stderr(visible)):
+            self.assertEqual(rtc.run_cli(), 1)
+        self.assertEqual(matrix_fixture_diagnostics(visible.getvalue()), {"failure": "invalid_data"})
+        self.assertNotIn("private", visible.getvalue())
+
+    def test_rtc_phase_allowlist_does_not_reflect_server_or_path(self):
+        self.assertEqual(matrix_fixture_diagnostics(
+            "MORPHEUS_MATRIX_FIXTURE_STAGE rtc_auth_service\n"
+            "MORPHEUS_MATRIX_FIXTURE_STAGE rtc_private_credential\n"
+            "MORPHEUS_MATRIX_FIXTURE_STAGE rtc_transports trailing-private\n"),
+            {"stage": "rtc_auth_service"})
+        self.assertTrue(is_progress_line("MORPHEUS_MATRIX_FIXTURE_STAGE rtc_token_exchange"))
 
 
 if __name__ == "__main__":

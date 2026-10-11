@@ -48,6 +48,14 @@ DIAGNOSTIC_MARKERS = {
         "chooser_cancelled": b"wlroots: output chooser canceled",
         "no_output_selected": b"wlroots: no output found",
         "pipewire_iteration_failed": b"pipewire_loop_iterate failed:",
+        "pipewire_core_fatal": b"pipewire: fatal error event from core",
+        "pipewire_format_negotiated": b"pipewire: Format negotiated:",
+        "pipewire_buffer_added": b"pipewire: add buffer event handle",
+        "pipewire_unsupported_buffer": b"pipewire: unsupported buffer type",
+        "pipewire_buffer_allocation_failed": b"pipewire: failed to create xdpw buffer",
+        "pipewire_stream_create_failed": b"pipewire: failed to create stream",
+        "drm_format_conversion_failed": b"xdg-desktop-portal-wlr: failed to convert drm format",
+        "assertion_failed": b": Assertion ",
     },
     "portal": {
         "backend_call_failed": b"A backend call failed:",
@@ -115,6 +123,10 @@ def diagnostic_facts(root: Path, stage: str, services: dict[str, subprocess.Pope
             try:
                 code = peek_returncode(process)
                 facts[f"{name}.process"] = "running" if code is None else "exited"
+                if type(code) is int and 0 <= code <= 255:
+                    facts[f"{name}.exit_code"] = code
+                elif type(code) is int and -64 <= code < 0:
+                    facts[f"{name}.signal"] = -code
             except (OSError, RuntimeError):
                 facts[f"{name}.process"] = "unavailable"
         if name not in DIAGNOSTIC_MARKERS:
@@ -185,6 +197,8 @@ def capture_test_facts(output: str, status: int | None, stage: str = "unknown") 
         "portal_request_failed": "system screen-sharing portal could not complete the request",
         "initial_selection": "portal display selection",
         "first_frame": "first PipeWire frame",
+        "selected_source_ended": "selected screen-sharing source ended",
+        "frame_delivery_timeout": "screen-sharing stream stopped producing frames",
         "wrong_selected_source": "selected red HEADLESS-2 was not captured",
         "stop_timeout": "session shutdown exceeded stop budget",
         "reopen": "portal reopen",

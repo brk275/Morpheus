@@ -445,6 +445,24 @@ struct StreamData {
     format: VideoInfoRaw,
 }
 
+fn capture_format_choices() -> pod::Property {
+    // SPA Enum encodes the default separately from its admissible values.
+    // Repeat BGRx as an alternative: otherwise a BGRx-only SHM source has no
+    // intersection with this list even though BGRx is our preferred format.
+    pod::property!(
+        FormatProperties::VideoFormat,
+        Choice,
+        Enum,
+        Id,
+        VideoFormat::BGRx,
+        VideoFormat::BGRx,
+        VideoFormat::BGRA,
+        VideoFormat::RGBA,
+        VideoFormat::RGBx,
+        VideoFormat::RGB
+    )
+}
+
 pub(crate) struct PortalCapture {
     // Drop the listener before the stream. StreamRc retains its core/context.
     _listener: StreamListener<StreamData>,
@@ -544,17 +562,7 @@ impl PortalCapture {
             ParamType::EnumFormat,
             pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
             pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
-            pod::property!(
-                FormatProperties::VideoFormat,
-                Choice,
-                Enum,
-                Id,
-                VideoFormat::BGRx,
-                VideoFormat::BGRA,
-                VideoFormat::RGBA,
-                VideoFormat::RGBx,
-                VideoFormat::RGB
-            ),
+            capture_format_choices(),
             pod::property!(
                 FormatProperties::VideoSize,
                 Choice,
@@ -713,6 +721,57 @@ fn unpack_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serialized_format_choices_accept_bgrx_only_shm_source() {
+        use pipewire::spa::{
+            pod::deserialize::PodDeserializer,
+            utils::{ChoiceEnum, Id},
+        };
+        let object = pod::object!(
+            SpaTypes::ObjectParamFormat,
+            ParamType::EnumFormat,
+            capture_format_choices()
+        );
+        let serialized =
+            PodSerializer::serialize(Cursor::new(Vec::new()), &pod::Value::Object(object))
+                .unwrap()
+                .0
+                .into_inner();
+        let (_, value) = PodDeserializer::deserialize_any_from(&serialized).unwrap();
+        let pod::Value::Object(object) = value else {
+            panic!("format object missing");
+        };
+        let property = object
+            .properties
+            .iter()
+            .find(|property| property.key == FormatProperties::VideoFormat.as_raw())
+            .unwrap();
+        let pod::Value::Choice(pod::ChoiceValue::Id(choice)) = &property.value else {
+            panic!("format enumeration missing");
+        };
+        let ChoiceEnum::Enum {
+            default,
+            alternatives,
+        } = &choice.1
+        else {
+            panic!("format alternatives missing");
+        };
+        assert_eq!(*default, Id(VideoFormat::BGRx.as_raw()));
+        // PipeWire's spa_pod_filter_prop skips the default slot when matching
+        // an Enum with a fixed format. Exercise the serialized alternatives,
+        // not a search that would incorrectly accept the default alone.
+        assert!(alternatives.contains(&Id(VideoFormat::BGRx.as_raw())));
+        for format in [
+            VideoFormat::BGRA,
+            VideoFormat::RGBA,
+            VideoFormat::RGBx,
+            VideoFormat::RGB,
+        ] {
+            assert!(alternatives.contains(&Id(format.as_raw())));
+        }
+        assert!(!alternatives.contains(&Id(VideoFormat::NV12.as_raw())));
+    }
 
     #[test]
     fn portal_failures_identify_phase_without_response_payloads() {

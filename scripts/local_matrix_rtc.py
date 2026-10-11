@@ -112,7 +112,7 @@ if __name__ == "__main__":
 def docker(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(["docker", *args], text=True, capture_output=True)
     if check and result.returncode:
-        raise RuntimeError(f"Docker command failed: {result.stderr.strip()[-800:]}")
+        raise matrix_env.DockerFailure(result)
     return result
 
 
@@ -278,18 +278,21 @@ else:
 
 def wait_http(url: str, *, expected: int = 200, duration: int = 40) -> None:
     deadline = time.monotonic() + duration
-    while time.monotonic() < deadline:
+    while (remaining := deadline - time.monotonic()) > 0:
         try:
-            with urllib.request.urlopen(url, timeout=3) as response:
+            with urllib.request.urlopen(url, timeout=min(3, remaining)) as response:
                 if response.status == expected:
                     return
-        except (urllib.error.URLError, TimeoutError, http.client.HTTPException):
+        except (urllib.error.URLError, ConnectionError, TimeoutError, http.client.HTTPException):
+            # A published Docker port can reset before its service accepts
+            # HTTP. urllib can surface that directly, outside URLError.
             pass
-        time.sleep(1)
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
     raise RuntimeError(f"Service did not become ready: {url}")
 
 
 def verify_discovery() -> None:
+    matrix_env.stage("rtc_versions")
     with urllib.request.urlopen("http://127.0.0.1:18008/_matrix/client/versions", timeout=8) as response:
         flags = json.load(response)["unstable_features"]
     if not flags.get("org.matrix.simplified_msc3575") or not flags.get("org.matrix.msc4354"):
@@ -305,12 +308,14 @@ def verify_discovery() -> None:
         }).encode(),
         headers={"Content-Type": "application/json"},
     )
+    matrix_env.stage("rtc_login")
     with urllib.request.urlopen(login, timeout=8) as response:
         token = json.load(response)["access_token"]
     request = urllib.request.Request(
         alice["homeserver_url"] + "/_matrix/client/unstable/org.matrix.msc4143/rtc/transports",
         headers={"Authorization": "Bearer " + token},
     )
+    matrix_env.stage("rtc_transports")
     with urllib.request.urlopen(request, timeout=8) as response:
         transports = json.load(response)["rtc_transports"]
     if not any(item.get("type") == "livekit" and item.get("livekit_service_url") == DISCOVERY_URL for item in transports):
@@ -331,6 +336,7 @@ def probe() -> None:
         }).encode(),
         headers={"Content-Type": "application/json"},
     )
+    matrix_env.stage("rtc_probe_login")
     with urllib.request.urlopen(login_request, timeout=8) as response:
         login = json.load(response)
     openid_request = urllib.request.Request(
@@ -342,6 +348,7 @@ def probe() -> None:
             "Authorization": "Bearer " + login["access_token"],
         },
     )
+    matrix_env.stage("rtc_openid")
     with urllib.request.urlopen(openid_request, timeout=8) as response:
         openid = json.load(response)
     token_request = urllib.request.Request(
@@ -358,10 +365,12 @@ def probe() -> None:
         }).encode(),
         headers={"Content-Type": "application/json"},
     )
+    matrix_env.stage("rtc_token_exchange")
     with urllib.request.urlopen(token_request, timeout=35) as response:
         token = json.load(response)
     if not token.get("jwt") or token.get("url") != SFU_URL:
         raise RuntimeError("RTC service returned no JWT or the wrong local SFU URL")
+    matrix_env.stage("rtc_sfu_ready")
     wait_http("http://127.0.0.1:18011/")
     print("Authenticated RTC discovery and LiveKit JWT exchange passed; SFU is reachable.")
 
@@ -458,6 +467,7 @@ def start_authorization(*, native_sfu: bool) -> None:
     # In Docker mode the bridge resolves the SFU's network alias. Native mode
     # (macOS Docker Desktop only) maps the same name to the host gateway.
     # Recreate both containers on mode changes; remove the namespace user first.
+    matrix_env.stage("rtc_auth_bridge")
     if exists("container", AUTH):
         docker("rm", "-f", AUTH)
     if exists("container", SFU_LOOPBACK):
@@ -476,6 +486,7 @@ def start_authorization(*, native_sfu: bool) -> None:
     args += [matrix_env.IMAGE, "-u", "/sfu_loopback.py"]
     docker(*args)
     try:
+        matrix_env.stage("rtc_auth_service")
         docker(
             "run", "-d", "--name", AUTH,
             "--network", f"container:{SFU_LOOPBACK}",
@@ -571,13 +582,19 @@ def rtc_fixture() -> None:
 
 
 def up() -> None:
+    matrix_env.stage("rtc_disk_check")
     if shutil.disk_usage(FIXTURE_HOME.parent).free < 8 * 1024**3:
         raise RuntimeError("Less than 8 GiB free; refusing to start MatrixRTC images")
+    matrix_env.stage("rtc_network")
     if not exists("network", NETWORK):
         raise RuntimeError("Run scripts/local_matrix_env.py up first")
+    matrix_env.stage("rtc_stop_native")
     stop_native_sfu()
+    matrix_env.stage("rtc_configs")
     write_configs()
+    matrix_env.stage("rtc_federation")
     start_federation_bridge()
+    matrix_env.stage("rtc_sfu")
     if not exists("container", SFU):
         docker(
             "run", "-d", "--name", SFU, "--network", NETWORK,
@@ -591,9 +608,13 @@ def up() -> None:
     elif not running(SFU):
         docker("start", SFU)
     start_authorization(native_sfu=False)
+    matrix_env.stage("rtc_auth_ready")
     wait_http(DISCOVERY_URL + "/healthz")
+    matrix_env.stage("rtc_synapse_configure")
     if configure_synapse():
+        matrix_env.stage("rtc_synapse_restart")
         docker("restart", SYNAPSE)
+    matrix_env.stage("rtc_synapse_ready")
     wait_http("http://127.0.0.1:18008/_matrix/client/versions")
     verify_discovery()
     print("Local MatrixRTC auth/SFU and Synapse A discovery are ready on loopback.")
@@ -605,17 +626,25 @@ def up() -> None:
 def up_native() -> None:
     if sys.platform != "darwin":
         raise RuntimeError("The loopback-only native SFU fixture is currently macOS-only")
+    matrix_env.stage("rtc_network")
     if not exists("network", NETWORK):
         raise RuntimeError("Run scripts/local_matrix_env.py up first")
+    matrix_env.stage("rtc_configs")
     write_configs()
+    matrix_env.stage("rtc_federation")
     start_federation_bridge()
+    matrix_env.stage("rtc_sfu")
     if running(SFU):
         docker("stop", SFU)
     start_native_sfu()
     start_authorization(native_sfu=True)
+    matrix_env.stage("rtc_auth_ready")
     wait_http(DISCOVERY_URL + "/healthz")
+    matrix_env.stage("rtc_synapse_configure")
     if configure_synapse():
+        matrix_env.stage("rtc_synapse_restart")
         docker("restart", SYNAPSE)
+    matrix_env.stage("rtc_synapse_ready")
     wait_http("http://127.0.0.1:18008/_matrix/client/versions")
     verify_discovery()
     print("Native loopback LiveKit and local MatrixRTC authorization are ready.")
@@ -647,9 +676,16 @@ def main() -> None:
      "probe": probe, "status": status, "down": down}[args.command]()
 
 
-if __name__ == "__main__":
+def run_cli() -> int:
     try:
         main()
-    except (RuntimeError, subprocess.SubprocessError, urllib.error.URLError, OSError, KeyError) as error:
-        print(f"Local MatrixRTC setup failed: {error}", file=sys.stderr)
-        raise SystemExit(1)
+    except Exception as error:
+        # HTTP/Docker errors can carry tokens, private paths or server bodies.
+        # Use the existing allowlisted channel; never format the exception.
+        matrix_env.report_failure(error)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run_cli())
