@@ -44,7 +44,8 @@ and video previews are not supported. See [image preview limits](docs/IMAGE_PREV
 
 ![Morpheus native desktop preview with fictional accounts](docs/screenshots/desktop.png)
 
-Actual application capture using fictional preview accounts.
+Actual native application capture with fictional preview accounts.
+[Account switcher, sign-in, and capture details](docs/screenshots/README.md).
 
 ## Direction
 
