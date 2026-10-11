@@ -28,6 +28,38 @@ pub struct VoiceSpaces {
     config: RwLock<Config>,
     shared: Mutex<HashMap<(String, String), CachedMarker>>,
     scan: Mutex<()>,
+    #[cfg(feature = "native-calls")]
+    policy_changed: tokio::sync::watch::Sender<()>,
+    #[cfg(feature = "native-calls")]
+    policy_invalidator: std::sync::Mutex<Option<IncomingPolicyCallback>>,
+}
+
+#[cfg(feature = "native-calls")]
+type IncomingPolicyCallback = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+/// Weak back-reference prevents a worker/config lifetime cycle. Releasing the
+/// exact registration cannot remove a later worker's authorization hook.
+#[cfg(feature = "native-calls")]
+pub(crate) struct IncomingPolicyRegistration {
+    spaces: std::sync::Weak<VoiceSpaces>,
+    callback: IncomingPolicyCallback,
+}
+#[cfg(feature = "native-calls")]
+impl Drop for IncomingPolicyRegistration {
+    fn drop(&mut self) {
+        if let Some(spaces) = self.spaces.upgrade() {
+            let mut registered = spaces
+                .policy_invalidator
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if registered
+                .as_ref()
+                .is_some_and(|current| std::sync::Arc::ptr_eq(current, &self.callback))
+            {
+                *registered = None;
+            }
+        }
+    }
 }
 
 impl VoiceSpaces {
@@ -38,11 +70,63 @@ impl VoiceSpaces {
             config: RwLock::new(config),
             shared: Mutex::new(HashMap::new()),
             scan: Mutex::new(()),
+            #[cfg(feature = "native-calls")]
+            policy_changed: tokio::sync::watch::Sender::new(()),
+            #[cfg(feature = "native-calls")]
+            policy_invalidator: std::sync::Mutex::new(None),
         }
     }
 
     pub fn apply_config(&self, config: &Config) {
-        *self.config.write().expect("voice config lock poisoned") = config.clone();
+        let mut current = self.config.write().expect("voice config lock poisoned");
+        #[cfg(feature = "native-calls")]
+        let policy_changed = incoming_policy_changed(&current, config);
+        #[cfg(feature = "native-calls")]
+        if policy_changed {
+            // Serialize revocation before the new preferences become visible.
+            // A delayed watch receiver cannot undo an A→B→A transition.
+            if let Some(invalidate) = self
+                .policy_invalidator
+                .lock()
+                .expect("policy hook lock poisoned")
+                .as_ref()
+            {
+                invalidate();
+            }
+        }
+        *current = config.clone();
+        drop(current);
+        #[cfg(feature = "native-calls")]
+        if policy_changed {
+            self.policy_changed.send_replace(());
+        }
+    }
+
+    /// Install the one process incoming worker's authorization invalidator.
+    /// It must only invalidate its own signal/presentation; it must never read
+    /// or mutate VoiceSpaces, because it runs under the config write lock.
+    /// A duplicate registration is rejected without replacing the first guard.
+    #[cfg(feature = "native-calls")]
+    pub(crate) fn watch_incoming_invalidation(
+        self: &std::sync::Arc<Self>,
+        callback: IncomingPolicyCallback,
+    ) -> Option<IncomingPolicyRegistration> {
+        let mut registered = self.policy_invalidator.lock().ok()?;
+        if registered.is_some() {
+            return None;
+        }
+        *registered = Some(callback.clone());
+        Some(IncomingPolicyRegistration {
+            spaces: std::sync::Arc::downgrade(self),
+            callback,
+        })
+    }
+
+    /// Subscribe before reading preferences. A wake revokes pending incoming
+    /// offers even if a later edit restores the previous values.
+    #[cfg(feature = "native-calls")]
+    pub(crate) fn subscribe_incoming_policy(&self) -> tokio::sync::watch::Receiver<()> {
+        self.policy_changed.subscribe()
     }
 
     #[cfg(feature = "native-calls")]
@@ -271,9 +355,123 @@ impl VoiceSpaces {
     }
 }
 
+#[cfg(feature = "native-calls")]
+fn incoming_policy_changed(before: &Config, after: &Config) -> bool {
+    if before.notifications.enabled != after.notifications.enabled {
+        return true;
+    }
+    before
+        .account_overrides
+        .keys()
+        .chain(after.account_overrides.keys())
+        .any(|id| {
+            let old = before.account_overrides.get(id);
+            let new = after.account_overrides.get(id);
+            old.and_then(|value| value.notifications_enabled)
+                != new.and_then(|value| value.notifications_enabled)
+                || old
+                    .map(|value| value.local_voice_rooms.as_slice())
+                    .unwrap_or_default()
+                    != new
+                        .map(|value| value.local_voice_rooms.as_slice())
+                        .unwrap_or_default()
+        })
+}
+
 #[cfg(all(test, feature = "native-calls"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incoming_policy_wakes_for_quiet_or_notification_changes_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let spaces = VoiceSpaces::new(ConfigStore::at(directory.path().join("config.toml")));
+        let mut updates = spaces.subscribe_incoming_policy();
+        let mut config = Config::default();
+        spaces.apply_config(&config);
+        assert!(!updates.has_changed().unwrap());
+        config.appearance.scale_percent = 125;
+        spaces.apply_config(&config);
+        assert!(!updates.has_changed().unwrap());
+        config.notifications.enabled = false;
+        spaces.apply_config(&config);
+        assert!(updates.has_changed().unwrap());
+        updates.borrow_and_update();
+        // A→B→A still emits a wake; a stale offer cannot reuse old admission.
+        config.notifications.enabled = true;
+        spaces.apply_config(&config);
+        assert!(updates.has_changed().unwrap());
+        updates.borrow_and_update();
+        config
+            .account_overrides
+            .entry("account-a".into())
+            .or_default()
+            .local_voice_rooms
+            .push("!quiet:example.org".into());
+        spaces.apply_config(&config);
+        assert!(updates.has_changed().unwrap());
+        updates.borrow_and_update();
+        config
+            .account_overrides
+            .get_mut("account-a")
+            .unwrap()
+            .local_voice_rooms
+            .clear();
+        spaces.apply_config(&config);
+        assert!(updates.has_changed().unwrap());
+    }
+
+    #[test]
+    fn policy_reversion_invalidates_synchronously_and_registration_is_owned() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let spaces = Arc::new(VoiceSpaces::new(ConfigStore::at(
+            directory.path().join("config.toml"),
+        )));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let weak = Arc::downgrade(&spaces);
+        let registration = spaces
+            .watch_incoming_invalidation(Arc::new(move || {
+                let spaces = weak.upgrade().unwrap();
+                assert!(
+                    spaces.config.try_read().is_err(),
+                    "hook must precede config publication"
+                );
+                seen.fetch_add(1, Ordering::SeqCst);
+            }))
+            .unwrap();
+        assert!(
+            spaces
+                .watch_incoming_invalidation(Arc::new(|| panic!("duplicate hook installed")))
+                .is_none()
+        );
+        let mut config = Config::default();
+        spaces.apply_config(&config);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        config.notifications.enabled = false;
+        spaces.apply_config(&config);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        config.notifications.enabled = true;
+        spaces.apply_config(&config);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "no watcher poll was required"
+        );
+        drop(registration);
+        config.notifications.enabled = false;
+        spaces.apply_config(&config);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            spaces
+                .watch_incoming_invalidation(Arc::new(|| {}))
+                .is_some()
+        );
+    }
 
     #[tokio::test]
     async fn a_new_scan_waits_for_the_previous_account_scan() {

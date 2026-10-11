@@ -5,6 +5,46 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
 ## Current hosted acceptance, 2026-10-11
 
+### Incoming call controls candidate
+
+The active-account incoming worker, four-offer native banner, exact-key Answer
+and local Dismiss are wired. Answer retains the admitted account, room and
+protocol mode under the account-transition lock. It revalidates before joining
+and requires the actual local device and membership generation after joining,
+before media starts. Successful Answer opens controls for that exact joined
+call; delayed UI completions cannot select a different destination. The pinned
+RTC join does not await its own participant echo. A new readiness wait observes
+both actual rosters within the original invitation deadline, rejects conflicting
+identities and closed sources, and keeps cancellation active before the existing
+full post-join validation. It does not fabricate a participant or extend expiry.
+
+Forty-three added regression tests have been source-reviewed but have not run.
+They cover bounded discovery and commands, single-use actions, cancellation,
+account changes, deadlines, owned authorization, capture revocation, preference
+changes and identity-label controls. In-app notification toggles apply each
+successful change synchronously, including rapid off/on edits; external TOML
+changes take effect when observed by live reload. SDK streams remain asynchronous,
+and the pinned device-update stream omits deletions; fresh admission and
+pre/post-join lookups remain required.
+
+A fourth native preview capture selects the actual incoming-banner layout with
+fictional in-memory Casey/Jules data, before any account, network or media
+initialization. The five lossless-encoder/input-validation Python tests passed;
+Rust formatting and workflow lint passed. Native rendering of this view is still
+pending. A preview capture will verify presentation only; live actor Answer,
+keyboard/screen-reader interaction and physical audio require their own evidence.
+Audible ringing, incoming OS notifications and protocol Decline remain open.
+
+The same four encrypted Current/Sticky2025 DM/room fixtures now select actual
+worker discovery, one-use Answer, the production call controller, exact joined
+identity, unchanged slot, receive-only device failure, leave and account-switch
+revocation. The outer 300-second limits and original thirteen assertions remain.
+The updated harness passed 95 Python checks. Native execution is pending.
+Quiet-state observations are sampled; they do not prove that no transient server
+notification existed. Joined status after SDK receipt removal is also sampled;
+this fixture does not acknowledge complete actor processing of that withdrawal.
+Deterministic authorization tests cover that handoff separately.
+
 ### Fresh-device call membership renewal candidate
 
 The pinned RTC core is now vendored at the same `0.5.0-rc.2` revision, with a
@@ -24,9 +64,76 @@ devices without changing the 45-second roster deadline. Each must observe a
 new encrypted event for the same logical membership after the original event
 preceded the second device's creation. Its historical-event marker means only
 that the original event was absent from the sampled current live map.
-Runtime recovery and native regressions for this candidate await hosted checks.
+Runtime recovery remains unproven; the current hosted results are recorded below.
 Dependency resolution found one patched core instance, no existing version
 changes and no new registry/git package identities.
+
+### Hosted result of the renewal candidate
+
+[Run 38143560227](https://github.com/brk275/Morpheus/actions/runs/38143560227)
+tested `4352c8829c64178dbb0cde857328ad8d4a8150da`. Scope passed 391 helper
+checks with one skip. Linux passed native check/build, preview capture and
+314 unit/vendor tests, plus 12 fixture selectors without live inputs.
+Apple Silicon, Intel Mac and Windows each passed native check/build,
+288 unit/vendor tests and ten fixture selectors without live inputs. Windows
+owned synthetic window/display capture passed.
+
+On all four platforms, the core test command failed to compile with four
+`E0432` imports of
+`crate::testing`: the pinned crate exports that module only with its `testing`
+feature, which the command omitted. No core unit tests, including the 17 new
+renewal regressions, or upstream `key_rotation` tests executed. The later
+updater and SDK sticky suites were not reached. Linux
+live Matrix, OAuth, RTC and Element acceptance was skipped. The
+command now enables the existing feature; the corrected command has not yet run.
+Vendored-test failures are also collected so independent SDK/live checks can
+continue, while the final job still fails.
+Fresh-device membership recovery remains unproven for this candidate.
+
+The separate Linux Wayland test failed at `first_frame_1`: the exact named
+test failed with exit 101 and no consumer process callback. All 33 capture
+bindings resolved to system PipeWire, all five services remained running,
+and portal selection, SHM format negotiation and buffer submission succeeded.
+Both private output streams drained without truncation. The bounded ordered
+trace records a valid accepted producer queue before the consumer's local
+Running transition. It does not establish a lost wake or the cause of the
+intermittent failure; earlier system-library passes remain historical evidence.
+The unchanged static first-frame gate stays mandatory. The separate diagnostic below ran once on the same revision after all four
+jobs and their posts finished.
+
+These results do not establish new live incoming-call or incoming UI acceptance.
+All jobs, cache and checkout post-steps completed. All five completed job
+logs scanned with zero findings. Cache posts reported successful completion;
+no unreported cache artifact identity is inferred from that result.
+
+### Linux PipeWire startup comparison
+
+[Run 38147202698](https://github.com/brk275/Morpheus/actions/runs/38147202698)
+used the same `4352c88` source and one hash-recorded test executable for three
+isolated, owned desktop sessions. The control rebuilt the exact Ubuntu
+`1.0.5-1ubuntu3.3` client sources and distro patches. The patched comparison
+changed only upstream commit `800a25a01f99156d7d954f4d7fe1b0a6cf8ae7e3`;
+all 32 other object hashes matched the control.
+
+| Client library | Actual capture result |
+| --- | --- |
+| Installed system library | Failed at `first_frame_1`, exit 101 |
+| Matching private control rebuild | Failed at `first_frame_1`, exit 101 |
+| Private rebuild with upstream startup fix | Passed the complete named capture test, exit 0 |
+
+Each condition verified all 33 client bindings, kept the desktop services on
+system libraries, drained its captured logs and passed owned cleanup. The patched
+condition's bounded ordered-event summary reached its limit, so it is not a
+complete event chronology. The first two conditions recorded accepted producer
+buffers without the consumer process callback. The fixed client completed the unchanged static first-frame,
+reopen/changed-frame, source-loss, stop, denial and cancellation checks.
+
+This comparison supports the relevance of that upstream startup change. One
+pass does not establish reliability or uniquely prove the eventfd race. It does
+not close the production Ubuntu system-library gate: that condition still
+failed. No replacement library or installer was distributed. The completed job
+log scanned with zero findings; cache and checkout posts finished successfully.
+Production integration and its compatibility checks remain open.
 
 ### Stable call-slot lookup correction
 

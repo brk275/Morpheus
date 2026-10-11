@@ -132,6 +132,32 @@ RING_ADMISSION_RESULTS = frozenset((
 ))
 RING_ADMISSION = re.compile(r"^MORPHEUS_RING_ADMISSION result=([a-z_]+)$", re.MULTILINE)
 RING_CASES = tuple((mode, target) for mode in ("current", "sticky-2025") for target in ("dm", "room"))
+# Actor facts remain separate from the existing sender/receipt contract.
+INCOMING_CHECKS = frozenset((
+    "actor_discovered", "exact_key_once", "actor_withdrew", "admitted_target_preserved",
+    "accepted_join_identity", "slot_unchanged", "quiet_receive_only",
+    "established_after_withdrawal", "accepted_leave_observed", "actor_cleanup",
+))
+INCOMING_REPLAY_CHECK = "account_replay_rejected"
+INCOMING_STAGES = frozenset((
+    "worker_start", "first_discovery", "key_rejection", "worker_withdrawal", "fresh_offer",
+    "answer_reservation", "transition_lock", "accepted_join", "exact_joined_identity",
+    "receive_only_state", "established_withdrawal", "accepted_leave", "account_revocation",
+    "actor_cleanup",
+))
+INCOMING_ERRORS = frozenset((
+    "unavailable", "capacity", "stale", "expired", "busy", "revoked", "admission_account",
+    "admission_sync", "admission_receipt", "admission_replay", "admission_expired",
+    "admission_membership", "admission_trust", "admission_policy", "admission_quiet",
+    "admission_transport", "admission_unavailable", "admission_timed_out", "admission_revoked",
+    "wrong_call", "cancelled", "account_changed", "incoming_offer_unavailable", "room_not_loaded",
+    "encryption_state", "room_state", "matrix", "rtc", "media", "worker_stopped", "timed_out",
+    "cleanup", "update", "assertion",
+))
+INCOMING_CHECK = re.compile(r"^MORPHEUS_INCOMING_CHECK ([a-z_]+)=(true|false)$", re.MULTILINE)
+INCOMING_STAGE = re.compile(r"^MORPHEUS_INCOMING_STAGE ([a-z_]+)$", re.MULTILINE)
+INCOMING_FAILURE = re.compile(r"^MORPHEUS_INCOMING_FAILURE ([a-z_]+)$", re.MULTILINE)
+INCOMING_ERROR = re.compile(r"^MORPHEUS_INCOMING_ERROR ([a-z_]+)$", re.MULTILINE)
 CHAT_CHECKS = (*CHAT_TESTS, "search_local-classic")
 OAUTH_LABELS = tuple("oauth-local-" + phase.replace("_", "-") for phase in OAUTH_PHASES)
 RING_LABELS = tuple(f"outgoing-ring-{mode}-{target}" for mode, target in RING_CASES)
@@ -214,9 +240,49 @@ def ring_evidence(output: str) -> dict[str, bool]:
     return checks
 
 
+def incoming_evidence(output: str) -> dict[str, bool]:
+    """A failed actor assertion stays false even if a later marker says true."""
+    checks = {}
+    for name, value in INCOMING_CHECK.findall(output):
+        if name in INCOMING_CHECKS or name == INCOMING_REPLAY_CHECK:
+            checks[name] = checks.get(name, True) and value == "true"
+    return checks
+
+
+def incoming_diagnostics(output: str) -> dict:
+    """Emit only fixed actor categories; never relay unknown marker contents."""
+    diagnostics = {"checks": incoming_evidence(output)}
+    for name, pattern, allowed in (
+        ("stage", INCOMING_STAGE, INCOMING_STAGES),
+        ("failure", INCOMING_FAILURE, INCOMING_STAGES),
+        ("error", INCOMING_ERROR, INCOMING_ERRORS),
+    ):
+        values = [value for value in pattern.findall(output) if value in allowed]
+        if values:
+            diagnostics[name] = values[-1]
+    for line in output.split("\n"):
+        if not line.startswith("MORPHEUS_INCOMING_"):
+            continue
+        check = INCOMING_CHECK.fullmatch(line)
+        valid = check is not None and (
+            check[1] in INCOMING_CHECKS or check[1] == INCOMING_REPLAY_CHECK
+        )
+        for pattern, allowed in ((INCOMING_STAGE, INCOMING_STAGES),
+                                 (INCOMING_FAILURE, INCOMING_STAGES),
+                                 (INCOMING_ERROR, INCOMING_ERRORS)):
+            match = pattern.fullmatch(line)
+            valid |= match is not None and match[1] in allowed
+        if not valid:
+            diagnostics["malformed"] = True
+    return diagnostics
+
+
 def ring_diagnostics(output: str) -> dict:
     """Only source-defined stages, booleans and failure categories are public."""
     diagnostics = {"checks": ring_evidence(output)}
+    incoming = incoming_diagnostics(output)
+    if incoming != {"checks": {}}:
+        diagnostics["incoming"] = incoming
     stages = [stage for stage in RING_STAGE.findall(output) if stage in RING_STAGES]
     failures = [stage for stage in RING_FAILURE.findall(output) if stage in RING_STAGES]
     if stages:
@@ -235,10 +301,18 @@ def ring_diagnostics(output: str) -> dict:
     return diagnostics
 
 
-def ring_passed_tests(output: str) -> int:
+def ring_passed_tests(output: str, ring_case: tuple[str, str]) -> int:
     """The opt-in app test, complete fixed facts and its final result must agree."""
     named = re.findall(rf"^test {re.escape(RING_TEST)} \.\.\. ok$", output, re.MULTILINE)
     checks = ring_evidence(output)
+    incoming = incoming_diagnostics(output)
+    required = INCOMING_CHECKS | ({INCOMING_REPLAY_CHECK} if ring_case == ("current", "dm") else set())
+    if (ring_case not in RING_CASES
+            or any(incoming["checks"].get(name) is not True for name in required)
+            or any(value is False for value in incoming["checks"].values())
+            or (ring_case != ("current", "dm") and INCOMING_REPLAY_CHECK in incoming["checks"])
+            or any(name in incoming for name in ("failure", "error", "malformed"))):
+        raise RuntimeError("Incoming actor acceptance evidence is incomplete")
     if (passed_tests(output) != 1 or len(RESULT.findall(output)) != 1 or len(named) != 1
             or any(checks.get(name) is not True for name in RING_CHECKS)
             or "failure" in ring_diagnostics(output)
@@ -459,7 +533,10 @@ class Acceptance:
         if element_checks and re.search(r"^MORPHEUS_ELEMENT_FAILURE (?:log_scan|fixture_operation)$", output, re.MULTILINE):
             raise RuntimeError("Element acceptance infrastructure or cleanup failed")
         if ring_case is not None and (ring_evidence(output).get("cleanup") is False
-                                     or ring_diagnostics(output).get("failure") == "cleanup"):
+                                     or ring_diagnostics(output).get("failure") == "cleanup"
+                                     or incoming_evidence(output).get("actor_cleanup") is False
+                                     or "actor_cleanup" in INCOMING_FAILURE.findall(output)
+                                     or "cleanup" in INCOMING_ERROR.findall(output)):
             raise RuntimeError("Outgoing invitation acceptance cleanup failed")
         recoverable = pid_namespace and (
             ((test or ring_case is not None) and ran_native_test(output))
@@ -529,11 +606,16 @@ class Acceptance:
         record = {"check": label}
         if ring_case is not None:
             try:
-                record["passed"] = ring_passed_tests(output)
+                record["passed"] = ring_passed_tests(output, ring_case)
             except RuntimeError:
                 print(json.dumps({"check": label, "ring_diagnostics": ring_diagnostics(output)}), flush=True)
                 raise
             record["ring_checks"] = ring_evidence(output)
+            record["incoming_checks"] = incoming_evidence(output)
+            record["account_replay_exercised"] = ring_case == ("current", "dm")
+            record["quiet_evidence"] = "sampled_cache_and_media_state"
+            record["withdrawal_evidence"] = "joined_after_sdk_cache_removal"
+            record["actor_withdrawal_processing_confirmed"] = False
             record["ring_mode"], record["ring_target"] = ring_case
         elif test:
             record["passed"] = passed_tests(output)
@@ -741,6 +823,11 @@ class Acceptance:
                     output.write("\nInvitation rows verify the actual app sender, unsolicited encrypted sync "
                                  "receipt with authenticated device metadata, independently fetched events, and "
                                  "server and sync-cache redaction for the listed modes and targets. "
+                                 "Actor facts additionally require passive discovery, exact-key one-shot acceptance, "
+                                 "receive-only joining and owned cleanup. Quiet checks sample cache/media state; "
+                                 "withdrawal checks Joined after SDK cache removal, without confirming the actor "
+                                 "processed that removal. "
+                                 "Only Current/DM exercises account-switch replay rejection. "
                                  "They do not verify incoming call UI, audible ringing, offline/restart replay, "
                                  "or Element receipt.\n")
                 output.write("\nNo fixture credentials or installers were uploaded. Physical-device, UI, "

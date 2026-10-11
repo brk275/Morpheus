@@ -1,15 +1,16 @@
 //! Incoming invitation admission, without joining or opening media devices.
 //!
-//! This boundary is exercised by hosted live tests before controller/UI wiring.
-//! An admitted offer is a snapshot, not permission to start capture. A controller
-//! must watch account, crypto, room, receipt and preference changes, withdraw on
-//! uncertainty, and revalidate under its account transition lock before Accept.
-//! Keep one replay ledger across all account switches for the process lifetime.
+//! Hosted live tests exercise admission. The private controller/worker/UI wiring
+//! adds bounded discovery and single-use Answer ownership, but its runtime
+//! acceptance remains pending. An admitted offer is a snapshot, not permission
+//! to capture: account/receipt/trust/policy checks and exact own-join commitment
+//! precede media. One replay ledger survives account switches for this process.
 
-#![allow(dead_code)] // Controller wiring follows hosted admission verification.
-
+pub(crate) mod controller;
 pub(crate) mod ledger;
 mod policy;
+pub(crate) mod ui;
+pub(crate) mod worker;
 
 use std::{
     fmt,
@@ -275,6 +276,36 @@ impl IncomingOffer {
         result
     }
 
+    /// Separate post-join path: the controller has checked the actual RTC
+    /// client's local device, participation and live call handle. This retains
+    /// every receipt/caller/trust/policy check while allowing precisely that own
+    /// participation, never another device or generation of our user.
+    async fn revalidate_after_join(
+        &mut self,
+        manager: &AccountManager,
+        preferences: &VoiceSpaces,
+        own: &controller::JoinedOwn,
+    ) -> Result<(), AdmissionFailure> {
+        if self.revoked {
+            return Err(AdmissionFailure::Revoked);
+        }
+        let limit = ADMISSION_LIMIT.min(self.deadline.saturating_duration_since(Instant::now()));
+        let mut validation = Revalidation {
+            offer: self,
+            succeeded: false,
+        };
+        let result = time::timeout(
+            limit,
+            validation
+                .offer
+                .validate_inner_for(manager, preferences, Some(own)),
+        )
+        .await
+        .unwrap_or(Err(AdmissionFailure::TimedOut));
+        validation.succeeded = result.is_ok();
+        result
+    }
+
     fn current_receipt(&mut self) -> Result<Receipt, AdmissionFailure> {
         if self.revoked || !self.selection.is_current() {
             return Err(AdmissionFailure::Revoked);
@@ -295,6 +326,15 @@ impl IncomingOffer {
         &mut self,
         manager: &AccountManager,
         preferences: &VoiceSpaces,
+    ) -> Result<(), AdmissionFailure> {
+        self.validate_inner_for(manager, preferences, None).await
+    }
+
+    async fn validate_inner_for(
+        &mut self,
+        manager: &AccountManager,
+        preferences: &VoiceSpaces,
+        own_join: Option<&controller::JoinedOwn>,
     ) -> Result<(), AdmissionFailure> {
         require_scope(manager, preferences, &self.selection, &self.room)?;
         require_client(&self.client, &self.own_user, &self.own_device)?;
@@ -333,10 +373,12 @@ impl IncomingOffer {
         if observed.mode != referenced.mode
             || observed.slot_id != "m.call#room"
             || observed.room_id != self.room.room_id().as_str()
-            || observed
-                .participants
-                .iter()
-                .any(|member| member.user_id == self.own_user)
+            || !controller::own_observation_allowed(
+                &observed.participants,
+                &self.own_user,
+                &self.own_device,
+                own_join,
+            )
         {
             return Err(AdmissionFailure::Membership);
         }

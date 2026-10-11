@@ -1,9 +1,12 @@
 //! Hosted, opt-in invitation acceptance. Bob must discover an authenticated
 //! notification from his sync stream before receiving the sender's event ID.
 //! Separate GET and redaction assertions still check the server receipt. This
-//! does not establish incoming call UI, audible ringing, or Element receipt.
+//! also exercises actual incoming actor/Answer with unavailable audio devices.
+//! This does not establish incoming call UI, audible ringing, physical capture,
+//! or Element receipt.
 //! Each invocation requires a fresh private loopback RTC fixture and two fresh
-//! AccountManager stores. No media publication or capture device is opened.
+//! AccountManager stores. Selected fixture audio IDs are verified absent;
+//! native audio failure leaves the accepted call in its receive-only mode.
 
 use std::{collections::HashMap, fs, future::Future, panic::AssertUnwindSafe, path::PathBuf};
 
@@ -30,7 +33,13 @@ use crate::voice_spaces::VoiceSpaces;
 
 use super::*;
 
-const WORK_LIMIT: Duration = Duration::from_secs(210);
+mod actor_tests;
+use actor_tests::ActorAcceptance;
+use std::sync::Arc;
+
+// Leave at least 107 seconds for retained-join/account cleanup inside the
+// unchanged 300-second contained command. Original invitation windows stay 30s.
+const WORK_LIMIT: Duration = Duration::from_secs(180);
 const PHASE_LIMIT: Duration = Duration::from_secs(45);
 
 #[derive(Clone, Copy)]
@@ -262,8 +271,9 @@ impl Case {
 }
 
 struct Session {
-    alice: AccountManager,
-    bob: AccountManager,
+    alice: Arc<AccountManager>,
+    bob: Arc<AccountManager>,
+    actor: Option<ActorAcceptance>,
     rtc: Option<RtcService>,
     observer: Option<PassiveCallObserver>,
     receipt: Option<InvitationReceipt>,
@@ -273,8 +283,11 @@ struct Session {
 impl Session {
     fn open(case: &Case) -> Result<Self, ()> {
         Ok(Self {
-            alice: AccountManager::open(case.profile.path().join("alice")).map_err(|_| ())?,
-            bob: AccountManager::open(case.profile.path().join("bob")).map_err(|_| ())?,
+            alice: Arc::new(
+                AccountManager::open(case.profile.path().join("alice")).map_err(|_| ())?,
+            ),
+            bob: Arc::new(AccountManager::open(case.profile.path().join("bob")).map_err(|_| ())?),
+            actor: None,
             rtc: None,
             observer: None,
             receipt: None,
@@ -433,6 +446,9 @@ impl Session {
         .await?;
         fact("encrypted_membership");
 
+        self.actor = Some(ActorAcceptance::new(case, self.bob.clone(), bob.clone())?);
+        self.actor.as_mut().ok_or(())?.prepare_devices().await?;
+
         // Subscribe before the snapshot and before sending. This receiver
         // learns the event ID only from Bob's SDK sync, never Alice's receipt
         // or a GET request. An overflow/lag cannot count as successful delivery.
@@ -537,6 +553,11 @@ impl Session {
         // Compare only after independently discovering and authenticating it.
         require(discovered.event_id == receipt.event_id)?;
         fact("unsolicited_encrypted_notification");
+        self.actor
+            .as_mut()
+            .ok_or(())?
+            .first_discovery(case, &alice)
+            .await?;
 
         phase(&mut self.stage, Stage::Fetch);
         let notification = fetch_decrypted(&bob_room, &discovered.event_id, &alice).await?;
@@ -634,9 +655,7 @@ impl Session {
         // Bob discovered through sync. It independently resolves current
         // trust, push policy, the reference, open slot and live membership.
         // This still does not join Bob or open any capture device.
-        let preferences = VoiceSpaces::new(morpheus_config::ConfigStore::at(
-            case.profile.path().join("incoming-config.toml"),
-        ));
+        let preferences = self.actor.as_ref().ok_or(())?.preferences.clone();
         let mut ledger = OfferLedger::default();
         phase(&mut self.stage, Stage::Admission);
         let mut offer = IncomingOffer::admit(
@@ -761,6 +780,28 @@ impl Session {
         require(offer.revalidate(&self.bob, &preferences).await.is_err())?;
         fact("unsolicited_redaction_observed");
 
+        self.actor
+            .as_mut()
+            .ok_or(())?
+            .first_withdrawal(original_deadline)
+            .await?;
+        // The known first receipt is already confirmed redacted. The actor
+        // slice owns each later fresh receipt across cancellation for cleanup.
+        self.receipt = None;
+        self.actor
+            .as_mut()
+            .ok_or(())?
+            .answer_and_leave(
+                case,
+                &alice,
+                &self.alice,
+                rtc,
+                &info,
+                &bob_room,
+                self.observer.as_mut().ok_or(())?,
+            )
+            .await?;
+
         // This is a separate membership-removal assertion, after all existing
         // invitation checks. A naturally expired membership cannot satisfy it.
         phase(&mut self.stage, Stage::ObserverLeave);
@@ -828,20 +869,58 @@ impl Session {
     /// after a preceding failure. Client/RTC owners remain here on cancellation.
     async fn cleanup(&mut self, room_id: &OwnedRoomId) -> bool {
         let mut clean = true;
-        // No passive feed remains attached while its account logs out/stops.
+        // Revoke pending/established authority synchronously before any wait.
+        if let Some(actor) = &self.actor {
+            actor.shutdown();
+        }
         self.observer = None;
-        if let Some(rtc) = self.rtc.as_mut() {
-            if let Some(receipt) = self.receipt.take() {
-                clean &= cleanup_attempt(Duration::from_secs(3), async {
-                    receipt.redact(rtc).await == RetractionOutcome::Accepted
-                })
-                .await;
-            }
-            if rtc.call(room_id.as_str()).is_some() {
-                clean &= cleanup_attempt(Duration::from_secs(12), async {
-                    rtc.leave(room_id.as_str()).await.is_ok()
-                })
-                .await;
+        let mut receipts = Vec::new();
+        if let Some(receipt) = self.receipt.take() {
+            receipts.push(receipt);
+        }
+        if let Some(receipt) = self.actor.as_mut().and_then(ActorAcceptance::take_receipt) {
+            receipts.push(receipt);
+        }
+        let had_actor = self.actor.is_some();
+        let actor = self.actor.as_mut();
+        let rtc = self.rtc.as_mut();
+        // Bob's retained join/leave and Alice's receipt/leave cleanup are
+        // independent. Preserve both owners and attempt both even on failure.
+        let (actor_clean, sender_clean) = tokio::join!(
+            async {
+                match actor {
+                    Some(actor) => {
+                        cleanup_attempt(Duration::from_secs(77), actor.cleanup_call()).await
+                    }
+                    None => true,
+                }
+            },
+            async {
+                let mut clean = true;
+                if let Some(rtc) = rtc {
+                    for receipt in receipts {
+                        clean &= cleanup_attempt(Duration::from_secs(3), async {
+                            receipt.redact(rtc).await == RetractionOutcome::Accepted
+                        })
+                        .await;
+                    }
+                    if rtc.call(room_id.as_str()).is_some() {
+                        clean &= cleanup_attempt(Duration::from_secs(12), async {
+                            rtc.leave(room_id.as_str()).await.is_ok()
+                        })
+                        .await;
+                    }
+                } else {
+                    clean &= receipts.is_empty();
+                }
+                clean
+            },
+        );
+        clean &= actor_clean && sender_clean;
+        if had_actor {
+            eprintln!("\nMORPHEUS_INCOMING_CHECK actor_cleanup={clean}");
+            if !clean {
+                eprintln!("\nMORPHEUS_INCOMING_FAILURE actor_cleanup");
             }
         }
         for manager in [&self.alice, &self.bob] {
@@ -1134,6 +1213,9 @@ async fn actual_outgoing_invitation_encrypted_receipt_and_redaction() {
     let passed = matches!(result, Ok(Ok(Ok(()))));
     if !passed {
         eprintln!("MORPHEUS_RING_FAILURE {}", session.stage.name());
+        if let Some(actor) = &session.actor {
+            actor.report_failure();
+        }
     }
     phase(&mut session.stage, Stage::Cleanup);
     let clean = session.cleanup(&case.room_id).await;

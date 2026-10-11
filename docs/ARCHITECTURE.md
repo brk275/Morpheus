@@ -43,6 +43,43 @@ without permission to send the marker; the settings UI for this is pending.
 Native sliding sync is used when available; a classic `/sync` adapter keeps
 older homeservers usable. Both feed the same room/timeline presentation model.
 
+## Incoming call ownership
+
+The native incoming-call path has separate admission, discovery, presentation
+and media owners. Discovery watches unsolicited encrypted sticky receipts for
+the active account, then asks the admission boundary to validate the caller,
+room, original reference, current membership, trust and notification policy.
+A process-wide replay ledger survives account switches. It never evicts old
+invitations to permit replay.
+
+The UI presents at most four offers. Answer carries an opaque single-use key;
+it cannot replace the offer's account, room or protocol mode with the selected
+conversation. The accepted capability is revalidated under the account-switch
+lock before a quiet join. After joining, the actual call and observer must agree
+on the exact local user, device and membership generation before media starts.
+An absent own participant waits on the two actual roster streams within the
+original invitation deadline; conflicting identities, closed sources and
+cancellation fail the join. The call worker owns that authorization until cleanup. Camera capture stays off
+until requested. Dismiss removes the local offer; it sends no protocol decline.
+
+In-app notification and voice-room preference edits synchronously revoke pending
+authorizations before the settings callback completes. External config edits take
+effect at live reload; only observed versions trigger revocation. SDK room,
+receipt and crypto changes use streams and bounded cache reconciliation; these
+are not atomic hooks into remote server or crypto-store mutations. Full admission
+and pre/post-join validation remain required. The pinned SDK device update
+stream omits deletion entries, so fresh device lookups at Answer and post-join
+remain mandatory. Account revocation and shutdown
+also guard capture directly. Ordinary invitation expiry after an established
+join does not terminate that call.
+
+Discovery currently watches up to 128 joined rooms, with bounded commands,
+candidates, cached receipts and membership scans. A relevant uncertainty can
+withdraw every pending offer. Accounts beyond the room bound have incomplete
+incoming discovery. Audible ringing, incoming OS notifications, protocol decline,
+real-device Answer behavior and accessibility acceptance remain release gates.
+Source review and unit guards alone do not establish those behaviors.
+
 ## Local data and security
 
 Configuration lives in the platform's standard config directory. Cached room

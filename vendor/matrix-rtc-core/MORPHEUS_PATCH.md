@@ -64,7 +64,7 @@ ordering and mandatory-refresh coalescing. Hosted verification runs these and
 the upstream key-rotation integration tests:
 
 ```sh
-cargo test --locked -p matrix-rtc-core --lib --test key_rotation
+cargo test --locked -p matrix-rtc-core --features testing --lib --test key_rotation
 ```
 
 The separate live fixtures create the second device only after the first

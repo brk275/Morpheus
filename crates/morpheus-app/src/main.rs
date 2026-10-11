@@ -972,11 +972,14 @@ fn save_notification_config_change(
     ui: &AppWindow,
     store: &ConfigStore,
     notifications: &DesktopNotifications,
+    voice_spaces: &VoiceSpaces,
     change: impl FnOnce(&mut Config),
 ) -> bool {
     if let Some(config) = save_config_change(ui, store, change) {
-        // A privacy toggle must affect the presenter before the 700 ms file
-        // watcher sees the save; the watcher still handles external edits.
+        // Apply each successful in-app privacy change synchronously. Rapid
+        // off/on edits may coalesce in the 700 ms file watcher, but must still
+        // revoke pending incoming offers before this callback returns.
+        voice_spaces.apply_config(&config);
         notifications.apply_config(&config);
         true
     } else {
@@ -1529,6 +1532,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         manager.clone(),
         update_activity.clone(),
     ));
+    #[cfg(feature = "native-calls")]
+    let mut incoming_calls =
+        incoming_ring::ui::IncomingUi::bind(&ui, runtime.handle(), live.clone(), calls.clone());
     #[cfg(feature = "native-calls")]
     let applied_audio_token = Arc::new(AtomicU64::new(0));
     #[cfg(feature = "native-calls")]
@@ -4624,12 +4630,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     let setting_store = store.clone();
     let setting_notifications = notifications.clone();
+    let setting_voice_spaces = voice_spaces.clone();
     ui.on_set_notifications_enabled(move |enabled| {
         if let Some(ui) = weak.upgrade() {
             save_notification_config_change(
                 &ui,
                 &setting_store,
                 &setting_notifications,
+                &setting_voice_spaces,
                 |config| {
                     config.notifications.enabled = enabled;
                 },
@@ -4640,12 +4648,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     let setting_store = store.clone();
     let setting_notifications = notifications.clone();
+    let setting_voice_spaces = voice_spaces.clone();
     ui.on_set_notification_sounds(move |sounds| {
         if let Some(ui) = weak.upgrade() {
             save_notification_config_change(
                 &ui,
                 &setting_store,
                 &setting_notifications,
+                &setting_voice_spaces,
                 |config| {
                     config.notifications.sounds = sounds;
                 },
@@ -4656,12 +4666,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     let setting_store = store.clone();
     let setting_notifications = notifications.clone();
+    let setting_voice_spaces = voice_spaces.clone();
     ui.on_set_notification_show_preview(move |show_preview| {
         if let Some(ui) = weak.upgrade() {
             save_notification_config_change(
                 &ui,
                 &setting_store,
                 &setting_notifications,
+                &setting_voice_spaces,
                 |config| {
                     config.notifications.show_message_preview = show_preview;
                 },
@@ -4672,6 +4684,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     let setting_store = store.clone();
     let setting_notifications = notifications.clone();
+    let setting_voice_spaces = voice_spaces.clone();
     ui.on_add_highlight_word(move |input| {
         let Some(ui) = weak.upgrade() else {
             return;
@@ -4699,6 +4712,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &ui,
             &setting_store,
             &setting_notifications,
+            &setting_voice_spaces,
             |config| {
                 if config.notifications.highlight_words.len() < MAX_HIGHLIGHT_WORDS
                     && !config
@@ -4728,12 +4742,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     let setting_store = store.clone();
     let setting_notifications = notifications.clone();
+    let setting_voice_spaces = voice_spaces.clone();
     ui.on_remove_highlight_word(move |word| {
         if let Some(ui) = weak.upgrade() {
             let saved = save_notification_config_change(
                 &ui,
                 &setting_store,
                 &setting_notifications,
+                &setting_voice_spaces,
                 |config| {
                     config
                         .notifications
@@ -4748,6 +4764,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let ui_result = ui.run();
+    #[cfg(feature = "native-calls")]
+    incoming_calls.shutdown();
     notifications.shutdown();
     update_ui_task.abort();
     let update_result = runtime.block_on(async {
@@ -4756,7 +4774,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // timeout. Stop call capture concurrently, never after that wait.
         #[cfg(feature = "native-calls")]
         {
-            let (update_result, call_result) = tokio::join!(updates.shutdown(), calls.end_call());
+            let (update_result, call_result, ()) = tokio::join!(
+                updates.shutdown(),
+                calls.end_call(),
+                incoming_calls.finish()
+            );
             if let Err(error) = call_result {
                 eprintln!("Could not leave native call during shutdown: {error}");
             }

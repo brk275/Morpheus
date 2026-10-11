@@ -5,7 +5,7 @@
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Mutex as StdMutex,
+        Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
@@ -35,6 +35,7 @@ pub(crate) struct CaptureStop {
     requested: AtomicBool,
     notify: Notify,
     push_gate: StdMutex<()>,
+    authorization: OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl CaptureStop {
@@ -47,8 +48,39 @@ impl CaptureStop {
         self.notify.notify_one();
     }
 
+    /// Bind once, after an incoming Answer commits and before any media starts.
+    /// A failed/repeated binding is terminal, never a replacement authorization.
+    pub(crate) fn bind_authorization(
+        &self,
+        allowed: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> bool {
+        let _gate = self
+            .push_gate
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.requested.load(Ordering::SeqCst)
+            || self.authorization.set(Box::new(allowed)).is_err()
+        {
+            self.requested.store(true, Ordering::SeqCst);
+            self.notify.notify_one();
+            return false;
+        }
+        !self.requested()
+    }
+
     pub(crate) fn requested(&self) -> bool {
-        self.requested.load(Ordering::SeqCst)
+        if self.requested.load(Ordering::SeqCst) {
+            return true;
+        }
+        if self.authorization.get().is_some_and(|allowed| !allowed()) {
+            // This check is also called under push_gate: latch directly rather
+            // than recursively locking request(). No later false result can
+            // revive this call, even if a supplied predicate changes again.
+            self.requested.store(true, Ordering::SeqCst);
+            self.notify.notify_one();
+            return true;
+        }
+        false
     }
 
     async fn cancelled(&self) {
@@ -751,6 +783,47 @@ fn capture_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authorization_revocation_stops_capture_without_async_watcher_progress() {
+        let current = Arc::new(AtomicBool::new(true));
+        let observed = current.clone();
+        let stop = CaptureStop::default();
+        assert!(stop.bind_authorization(move || observed.load(Ordering::SeqCst)));
+        assert_eq!(stop.push_if_active(|| 7), Some(7));
+        current.store(false, Ordering::SeqCst);
+        assert_eq!(
+            stop.push_if_active(|| panic!("revoked frame was pushed")),
+            None::<()>
+        );
+        let (sender, _) = mpsc::channel(1);
+        assert!(
+            capture_loop(
+                CaptureSource::Camera("not-a-camera".into()),
+                1,
+                &AtomicBool::new(false),
+                &stop,
+                &sender
+            )
+            .is_ok()
+        );
+        current.store(true, Ordering::SeqCst);
+        assert!(stop.requested());
+    }
+
+    #[test]
+    fn capture_authorization_cannot_be_replaced_or_clear_an_existing_stop() {
+        let stop = CaptureStop::default();
+        assert!(stop.bind_authorization(|| true));
+        assert!(!stop.bind_authorization(|| true));
+        assert!(stop.requested());
+        let stopped = CaptureStop::default();
+        stopped.request();
+        assert!(!stopped.bind_authorization(|| true));
+        let denied = CaptureStop::default();
+        assert!(!denied.bind_authorization(|| false));
+        assert!(denied.requested());
+    }
 
     #[tokio::test]
     async fn cancelled_or_stale_portal_selection_cannot_restart_capture() {

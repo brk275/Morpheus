@@ -25,9 +25,10 @@
 
 use std::{
     fmt,
+    future::{Future, pending},
     sync::{
         Arc,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -46,6 +47,7 @@ use tokio::{
 };
 
 use crate::{
+    incoming_ring::controller::{AcceptedOffer, EstablishedAuthorization, EstablishedGuard},
     local_video::{
         CaptureCommand, CaptureKind, CaptureSource, CaptureStop, LocalVideoSession,
         LocalVideoStatus,
@@ -168,6 +170,7 @@ pub enum CallControllerError {
     Cancelled,
     AccountChanged,
     StaleCall,
+    IncomingOfferUnavailable,
     RoomNotLoaded,
     UnknownEncryptionState,
     RoomState(String),
@@ -190,6 +193,9 @@ impl fmt::Display for CallControllerError {
             Self::Cancelled => write!(formatter, "call start was cancelled"),
             Self::AccountChanged => write!(formatter, "the active Matrix account changed"),
             Self::StaleCall => write!(formatter, "that call is no longer active"),
+            Self::IncomingOfferUnavailable => {
+                write!(formatter, "that incoming call is no longer available")
+            }
             Self::RoomNotLoaded => {
                 write!(formatter, "the room is not loaded in the active account")
             }
@@ -768,16 +774,70 @@ impl CallController {
         intent: CallStartIntent,
         voice_spaces: Arc<VoiceSpaces>,
     ) -> Result<CallInfo, CallControllerError> {
+        self.start_audio_owned(
+            selection,
+            room_id,
+            mode.options(),
+            audio_devices,
+            intent,
+            voice_spaces,
+            None,
+        )
+        .await
+    }
+
+    /// Answer consumes the admitted capability. Caller must hold its existing
+    /// account-transition lock until this method returns and race acquisition
+    /// of that lock with accepted.cancelled(). No selected-room/preferred-mode
+    /// UI input is accepted here. Setup revalidates immediately before join.
+    pub(crate) async fn start_accepted_audio(
+        &self,
+        accepted: AcceptedOffer,
+        audio_devices: AudioDeviceSelection,
+        voice_spaces: Arc<VoiceSpaces>,
+        _transition: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<CallInfo, CallControllerError> {
+        let target = accepted
+            .target()
+            .map_err(|_| CallControllerError::IncomingOfferUnavailable)?;
+        let mut waiting = accepted.startup_wait_guard();
+        let result = self
+            .start_audio_owned(
+                target.selection().clone(),
+                target.room_id(),
+                target.options().clone(),
+                audio_devices,
+                CallStartIntent::Quiet,
+                voice_spaces,
+                Some(accepted),
+            )
+            .await;
+        if result.is_ok() {
+            waiting.complete();
+        }
+        result
+    }
+
+    async fn start_audio_owned(
+        &self,
+        selection: AccountSelection,
+        room_id: &str,
+        options: CallOptions,
+        audio_devices: AudioDeviceSelection,
+        intent: CallStartIntent,
+        voice_spaces: Arc<VoiceSpaces>,
+        accepted: Option<AcceptedOffer>,
+    ) -> Result<CallInfo, CallControllerError> {
         if !selection.is_current() {
             return Err(CallControllerError::AccountChanged);
         }
-        let account =
-            self.manager
-                .active_account()
-                .await
-                .ok_or(CallControllerError::Unavailable(
-                    AudioCallCapability::SignInRequired,
-                ))?;
+        let account = tokio::select! {
+            biased;
+            _ = selection.revoked() => return Err(CallControllerError::AccountChanged),
+            _ = accepted_cancelled(accepted.as_ref()) => return Err(CallControllerError::IncomingOfferUnavailable),
+            account = self.manager.active_account() => account.ok_or(CallControllerError::Unavailable(
+                AudioCallCapability::SignInRequired))?,
+        };
         if account.id != selection.account_id() || !selection.is_current() {
             return Err(CallControllerError::AccountChanged);
         }
@@ -788,7 +848,12 @@ impl CallController {
         let (done_tx, done_rx) = watch::channel(None);
         let (ready_tx, ready_rx) = oneshot::channel();
         {
-            let mut slot = self.shared.slot.lock().await;
+            let mut slot = tokio::select! {
+                biased;
+                _ = selection.revoked() => return Err(CallControllerError::AccountChanged),
+                _ = accepted_cancelled(accepted.as_ref()) => return Err(CallControllerError::IncomingOfferUnavailable),
+                slot = self.shared.slot.lock() => slot,
+            };
             if !selection.is_current() {
                 return Err(CallControllerError::AccountChanged);
             }
@@ -838,7 +903,7 @@ impl CallController {
             account_id: account.id.clone(),
             account,
             room_id: room_id.to_owned(),
-            options: mode.options(),
+            options,
             audio_devices,
             token,
             cancel: cancel_rx,
@@ -849,6 +914,8 @@ impl CallController {
             selection,
             intent,
             voice_spaces,
+            accepted,
+            established: None,
         };
         tokio::spawn(worker.run());
         ready_rx
@@ -1080,6 +1147,63 @@ fn audio_capture_allowed(stop: &CaptureStop, selection_current: bool, sync: &Syn
         )
 }
 
+fn accepted_cancelled(
+    accepted: Option<&AcceptedOffer>,
+) -> impl Future<Output = ()> + Send + 'static + use<> {
+    let guard = accepted.map(AcceptedOffer::pending_guard);
+    async move {
+        match guard {
+            Some(guard) => guard.cancelled().await,
+            None => pending().await,
+        }
+    }
+}
+async fn established_cancelled(guard: Option<&EstablishedGuard>) {
+    match guard {
+        Some(guard) => guard.cancelled().await,
+        None => pending().await,
+    }
+}
+fn incoming_capture_allowed(guard: Option<&EstablishedGuard>, info: &CallInfo) -> bool {
+    guard.is_none_or(|guard| guard.allows(info))
+}
+
+/// Cancellation observes but never drops an already-started upstream join.
+/// Caller still owns its timeout and explicitly leaves any returned call.
+async fn settle_owned_join<J, C, F>(
+    join: J,
+    cancelled: C,
+    on_cancel: F,
+) -> (Option<J::Output>, bool)
+where
+    J: Future,
+    C: Future<Output = ()>,
+    F: FnOnce(),
+{
+    // Distinguish cancellation before the first join poll from cancellation
+    // after any network work may have started. AtomicBool keeps this future
+    // Send; all reads/writes are in this one async task.
+    let started = AtomicBool::new(false);
+    let join = async {
+        started.store(true, Ordering::Relaxed);
+        join.await
+    };
+    tokio::pin!(join);
+    tokio::pin!(cancelled);
+    tokio::select! {
+        biased;
+        () = &mut cancelled => {
+            on_cancel();
+            if started.load(Ordering::Relaxed) {
+                (Some(join.await), true)
+            } else {
+                (None, true)
+            }
+        },
+        result = &mut join => (Some(result), false),
+    }
+}
+
 struct CallWorker {
     manager: Arc<AccountManager>,
     shared: Arc<Shared>,
@@ -1097,6 +1221,8 @@ struct CallWorker {
     selection: AccountSelection,
     intent: CallStartIntent,
     voice_spaces: Arc<VoiceSpaces>,
+    accepted: Option<AcceptedOffer>,
+    established: Option<EstablishedAuthorization>,
 }
 
 impl CallWorker {
@@ -1134,17 +1260,38 @@ impl CallWorker {
                 .await;
             return;
         }
+        let incoming_guard = self
+            .established
+            .as_ref()
+            .map(EstablishedAuthorization::guard);
+        let capture_authorized = match incoming_guard.clone() {
+            Some(guard) => {
+                let expected = info.clone();
+                self.capture_stop
+                    .bind_authorization(move || guard.allows(&expected))
+            }
+            None => true,
+        };
+        if !capture_authorized || !incoming_capture_allowed(incoming_guard.as_ref(), &info) {
+            let leave = leave_with_timeout(&mut rtc, &self.room_id).await;
+            self.send_ready(Err(CallControllerError::IncomingOfferUnavailable));
+            self.finish(leave.map_err(|error| error.to_string()), None)
+                .await;
+            return;
+        }
         let mut active = self.manager.subscribe_active_account();
         let mut sync = self.manager.subscribe_sync_status();
         let audio_selection = self.selection.clone();
         let audio_stop = Arc::clone(&self.capture_stop);
         let audio_sync = sync.clone();
+        let audio_incoming = incoming_guard.clone();
+        let audio_info = info.clone();
         let controls = match rtc.audio_controls_cancellable(&self.room_id, move || {
             audio_capture_allowed(
                 &audio_stop,
                 audio_selection.is_current(),
                 &audio_sync.borrow(),
-            )
+            ) && incoming_capture_allowed(audio_incoming.as_ref(), &audio_info)
         }) {
             Ok(controls) => controls,
             Err(error) => {
@@ -1162,7 +1309,8 @@ impl CallWorker {
                     if running.token == self.token
                         && running.cancel.is_some()
                         && self.selection.is_current()
-                        && !self.capture_stop.requested() =>
+                        && !self.capture_stop.requested()
+                        && incoming_capture_allowed(incoming_guard.as_ref(), &info) =>
                 {
                     running.audio_controls = Some(controls.clone());
                     self.shared.status.send_replace(CallStatus::Joined {
@@ -1191,6 +1339,7 @@ impl CallWorker {
             == Some(self.account_id.as_str());
         let sync_state = sync.borrow().clone();
         if !account_still_active
+            || !incoming_capture_allowed(incoming_guard.as_ref(), &info)
             || !self.selection.is_current()
             || !matches!(
                 sync_state,
@@ -1281,6 +1430,15 @@ impl CallWorker {
                 }
             })
         };
+        let incoming_capture_guard = incoming_guard.clone().map(|guard| {
+            let stop = Arc::clone(&self.capture_stop);
+            let audio = controls.clone();
+            tokio::spawn(async move {
+                guard.cancelled().await;
+                stop.request();
+                audio.cancel();
+            })
+        });
         let mut invitation_receipt = None;
         let media_result = {
             let voice_spaces = Arc::clone(&self.voice_spaces);
@@ -1331,6 +1489,7 @@ impl CallWorker {
                 tokio::select! {
                     biased;
                     _ = &mut self.cancel => break Ok(()),
+                    _ = established_cancelled(incoming_guard.as_ref()) => break Err(CallControllerError::IncomingOfferUnavailable),
                     _ = self.selection.revoked() => break Err(CallControllerError::AccountChanged),
                     changed = active.changed() => {
                         if changed.is_err() || !self.selection.is_current()
@@ -1383,6 +1542,7 @@ impl CallWorker {
                             break Ok(());
                         }
                         if self.shared.active_video_token.load(Ordering::SeqCst) != self.token
+                            || !incoming_capture_allowed(incoming_guard.as_ref(), &info)
                             || !self.selection.is_current()
                             || active.borrow().as_ref().map(|account| account.id.as_str())
                                 != Some(self.account_id.as_str())
@@ -1398,6 +1558,9 @@ impl CallWorker {
         controls.cancel();
         account_capture_guard.abort();
         sync_capture_guard.abort();
+        if let Some(guard) = incoming_capture_guard {
+            guard.abort();
+        }
         let outgoing_result = outgoing.shutdown().await;
         self.shared.clear_media(self.token);
         // Local media and invitation UI stop before the bounded network
@@ -1428,22 +1591,38 @@ impl CallWorker {
         let probe = tokio::select! {
             biased;
             _ = &mut self.cancel => return Err(CallControllerError::Cancelled),
+            _ = self.selection.revoked() => return Err(CallControllerError::AccountChanged),
+            _ = accepted_cancelled(self.accepted.as_ref()) => return Err(CallControllerError::IncomingOfferUnavailable),
             result = controller.probe_audio() => result?,
         };
         match probe {
             AudioCallCapability::TransportReady { .. } => {}
             unavailable => return Err(CallControllerError::Unavailable(unavailable)),
         }
-        ensure_account(&self.manager, &self.account_id).await?;
+        tokio::select! {
+            biased;
+            _ = &mut self.cancel => return Err(CallControllerError::Cancelled),
+            _ = self.selection.revoked() => return Err(CallControllerError::AccountChanged),
+            _ = accepted_cancelled(self.accepted.as_ref()) => return Err(CallControllerError::IncomingOfferUnavailable),
+            result = ensure_account(&self.manager, &self.account_id) => result?,
+        }
         if !self.selection.is_current() {
             return Err(CallControllerError::AccountChanged);
         }
         let client = tokio::select! {
             biased;
             _ = &mut self.cancel => return Err(CallControllerError::Cancelled),
+            _ = self.selection.revoked() => return Err(CallControllerError::AccountChanged),
+            _ = accepted_cancelled(self.accepted.as_ref()) => return Err(CallControllerError::IncomingOfferUnavailable),
             result = self.manager.active_client() => result?,
         };
-        ensure_account(&self.manager, &self.account_id).await?;
+        tokio::select! {
+            biased;
+            _ = &mut self.cancel => return Err(CallControllerError::Cancelled),
+            _ = self.selection.revoked() => return Err(CallControllerError::AccountChanged),
+            _ = accepted_cancelled(self.accepted.as_ref()) => return Err(CallControllerError::IncomingOfferUnavailable),
+            result = ensure_account(&self.manager, &self.account_id) => result?,
+        }
         if !self.selection.is_current() {
             return Err(CallControllerError::AccountChanged);
         }
@@ -1454,26 +1633,48 @@ impl CallWorker {
         ) {
             return Err(CallControllerError::Cancelled);
         }
+        if let Some(accepted) = &mut self.accepted {
+            tokio::select! {
+                biased;
+                _ = &mut self.cancel => return Err(CallControllerError::Cancelled),
+                result = accepted.revalidate_before_join(&self.manager, &self.voice_spaces) =>
+                    result.map_err(|_| CallControllerError::IncomingOfferUnavailable)?,
+            }
+            let target = accepted
+                .begin_join()
+                .map_err(|_| CallControllerError::IncomingOfferUnavailable)?;
+            // Only this admitted target/options is used; no room selection,
+            // preferred protocol, slot creation, notification, or fallback.
+            self.room_id = target.room_id().to_owned();
+            self.options = target.options().clone();
+        }
         let room_id = self.room_id.clone();
-        let mut cancelled = false;
-        // Once joining starts, keep the upstream join future alive until it
-        // yields a call handle. It can publish membership before connecting
-        // media; dropping it on cancellation would skip an explicit leave.
+        // Keep joining alive after cancellation: a membership can already have
+        // been published. The same existing bound applies, then cleanup leaves
+        // any returned handle before releasing the call slot/update lease.
         let joined = {
             let join = timeout(JOIN_TIMEOUT, rtc.join(&room_id, self.options.clone()));
-            tokio::pin!(join);
-            loop {
+            let cancel = &mut self.cancel;
+            let selection = &self.selection;
+            let offer_cancelled = accepted_cancelled(self.accepted.as_ref());
+            let ready = &mut self.ready;
+            let cancelled = async {
                 tokio::select! {
-                    biased;
-                    _ = &mut self.cancel, if !cancelled => {
-                        cancelled = true;
-                        if let Some(ready) = self.ready.take() {
-                            let _ = ready.send(Err(CallControllerError::Cancelled));
-                        }
-                    }
-                    result = &mut join => break result,
+                    _ = cancel => {},
+                    _ = selection.revoked() => {},
+                    _ = offer_cancelled => {},
                 }
-            }
+            };
+            settle_owned_join(join, cancelled, || {
+                if let Some(ready) = ready.take() {
+                    let _ = ready.send(Err(CallControllerError::Cancelled));
+                }
+            })
+            .await
+        };
+        let (joined, cancelled) = joined;
+        let Some(joined) = joined else {
+            return Err(CallControllerError::Cancelled);
         };
         let info = match joined {
             Ok(Ok(info)) => info,
@@ -1491,7 +1692,13 @@ impl CallWorker {
                 .map_err(|error| CallControllerError::Cleanup(error.to_string()))?;
             return Err(CallControllerError::Cancelled);
         }
-        let account_check = ensure_account(&self.manager, &self.account_id).await;
+        let account_check = tokio::select! {
+            biased;
+            _ = &mut self.cancel => Err(CallControllerError::Cancelled),
+            _ = self.selection.revoked() => Err(CallControllerError::AccountChanged),
+            _ = accepted_cancelled(self.accepted.as_ref()) => Err(CallControllerError::IncomingOfferUnavailable),
+            result = ensure_account(&self.manager, &self.account_id) => result,
+        };
         let account_check = account_check.and_then(|()| {
             self.selection
                 .is_current()
@@ -1508,6 +1715,24 @@ impl CallWorker {
                 })?;
             return Err(error);
         }
+        if let Some(accepted) = self.accepted.take() {
+            let authorized = tokio::select! {
+                biased;
+                _ = &mut self.cancel => Err(CallControllerError::Cancelled),
+                _ = self.selection.revoked() => Err(CallControllerError::AccountChanged),
+                result = accepted.commit_join(&self.manager, &self.voice_spaces, &rtc, &info) =>
+                    result.map_err(|_| CallControllerError::IncomingOfferUnavailable),
+            };
+            match authorized {
+                Ok(owner) => self.established = Some(owner),
+                Err(error) => {
+                    leave_with_timeout(&mut rtc, &room_id)
+                        .await
+                        .map_err(|cleanup| CallControllerError::Cleanup(cleanup.to_string()))?;
+                    return Err(error);
+                }
+            }
+        }
         Ok((rtc, info))
     }
 
@@ -1518,7 +1743,7 @@ impl CallWorker {
             .is_none_or(|sender| sender.send(result).is_err())
     }
 
-    async fn finish(&self, cleanup: Result<(), String>, failure: Option<String>) {
+    async fn finish(&mut self, cleanup: Result<(), String>, failure: Option<String>) {
         self.shared.clear_media(self.token);
         {
             let mut slot = self.shared.slot.lock().await;
@@ -1608,6 +1833,91 @@ async fn ensure_account(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_future_remains_send_with_owned_incoming_offer() {
+        fn require_send<T: Send>(_: T) {}
+        // Type-check the real future without creating accounts or a runtime.
+        let _check: fn(CallWorker) = |worker| require_send(worker.run());
+    }
+
+    #[tokio::test]
+    async fn revoked_start_does_not_poll_the_join_operation() {
+        let entered = AtomicBool::new(false);
+        let notified = AtomicBool::new(false);
+        let result = settle_owned_join(
+            async {
+                entered.store(true, Ordering::SeqCst);
+                7
+            },
+            async {},
+            || {
+                notified.store(true, Ordering::SeqCst);
+            },
+        )
+        .await;
+        assert_eq!(result, (None, true));
+        assert!(!entered.load(Ordering::SeqCst));
+        assert!(notified.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancelled_inflight_join_is_retained_for_returned_handle_cleanup() {
+        let (cancel, cancelled) = oneshot::channel();
+        let (complete, joined) = oneshot::channel();
+        let entered = AtomicBool::new(false);
+        let notified = AtomicBool::new(false);
+        let mut operation = Box::pin(settle_owned_join(
+            async {
+                entered.store(true, Ordering::SeqCst);
+                joined.await.unwrap()
+            },
+            async {
+                let _ = cancelled.await;
+            },
+            || {
+                notified.store(true, Ordering::SeqCst);
+            },
+        ));
+        assert!(futures_util::poll!(operation.as_mut()).is_pending());
+        assert!(entered.load(Ordering::SeqCst));
+        cancel.send(()).unwrap();
+        assert!(futures_util::poll!(operation.as_mut()).is_pending());
+        assert!(notified.load(Ordering::SeqCst));
+        // Cancellation did not discard the receiver/possible call handle.
+        complete.send("owned-call-handle").unwrap();
+        assert_eq!(operation.await, (Some("owned-call-handle"), true));
+    }
+
+    #[tokio::test]
+    async fn retained_join_keeps_its_existing_timeout_after_cancellation() {
+        let (cancel, cancelled) = oneshot::channel();
+        let (elapsed, deadline) = oneshot::channel();
+        // An injected existing deadline models the caller-owned timeout;
+        // cancellation must neither replace it nor re-run a failed join.
+        let mut operation = Box::pin(settle_owned_join(
+            async {
+                deadline.await.unwrap();
+                Err::<(), _>("join-timeout")
+            },
+            async {
+                let _ = cancelled.await;
+            },
+            || {},
+        ));
+        assert!(futures_util::poll!(operation.as_mut()).is_pending());
+        cancel.send(()).unwrap();
+        assert!(futures_util::poll!(operation.as_mut()).is_pending());
+        elapsed.send(()).unwrap();
+        assert_eq!(operation.await, (Some(Err("join-timeout")), true));
+    }
+
+    #[tokio::test]
+    async fn successful_join_does_not_report_cancellation() {
+        let result =
+            settle_owned_join(async { 7 }, pending(), || panic!("unexpected cancellation")).await;
+        assert_eq!(result, (Some(7), false));
+    }
 
     #[test]
     fn audio_permission_reads_stop_selection_and_sync_without_watcher_progress() {

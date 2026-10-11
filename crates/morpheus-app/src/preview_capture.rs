@@ -20,7 +20,12 @@ use super::{AppWindow, Config, apply_config, apply_state, fixtures};
 
 const WIDTH: u32 = 1560;
 const HEIGHT: u32 = 1040;
-const FILES: [&str; 3] = ["desktop-preview.ppm", "account-switcher.ppm", "sign-in.ppm"];
+const FILES: [&str; 4] = [
+    "desktop-preview.ppm",
+    "account-switcher.ppm",
+    "sign-in.ppm",
+    "incoming-call.ppm",
+];
 
 pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
@@ -49,7 +54,7 @@ pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
         .set_size(slint::PhysicalSize::new(WIDTH, HEIGHT));
 
     // Capture after the real window has completed layout/rendering. Advance
-    // only the two preview properties needed for the next screenshot.
+    // only in-memory preview properties needed for the next screenshot.
     let phase = Rc::new(Cell::new(0_usize));
     let outcome = Rc::new(RefCell::new(None));
     let captured = Rc::clone(&outcome);
@@ -74,6 +79,25 @@ pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
                     window.set_account_menu_open(false);
                     window.set_show_sign_in(true);
                     window.set_session_error("".into());
+                }
+                2 => {
+                    // Render the actual incoming banner with fictional rows.
+                    // These are presentation fixtures only: early_dispatch
+                    // never starts an account, actor, network or media device.
+                    window.set_show_sign_in(false);
+                    window.set_live_session(true);
+                    window.set_active_account_local_id("preview-casey".into());
+                    window.set_incoming_call_account_id("preview-casey".into());
+                    window
+                        .set_session_error("Incoming call layout preview · fictional data".into());
+                    window.set_incoming_call_offers(slint::ModelRc::new(slint::VecModel::from(
+                        vec![super::IncomingCallItem {
+                            token: "preview-offer".into(),
+                            caller: "@jules:example.org".into(),
+                            room: "!workshop:example.org".into(),
+                            account: "@casey:example.org".into(),
+                        }],
+                    )));
                 }
                 _ => {
                     *captured.borrow_mut() = Some(Ok(()));

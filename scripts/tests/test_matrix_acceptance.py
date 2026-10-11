@@ -760,12 +760,13 @@ class LiveEvidenceTests(unittest.TestCase):
 class OutgoingRingTests(unittest.TestCase):
     def test_hosted_rust_facts_and_stages_match_public_schema(self):
         source = (acceptance_module.REPO / "crates/morpheus-app/src/outgoing_ring/live_tests.rs").read_text()
-        facts = set(re.findall(r'fact\("([a-z_]+)"\)', source))
+        facts = set(re.findall(r'(?<![A-Za-z_])fact\("([a-z_]+)"\)', source))
         # Cleanup can be false, so its Rust marker prints the actual boolean.
         self.assertIn('MORPHEUS_RING_CHECK cleanup={clean}', source)
         facts.add("cleanup")
         self.assertEqual(facts, acceptance_module.RING_CHECKS)
-        self.assertEqual(set(re.findall(r'Self::\w+ => "([a-z_]+)"', source)),
+        ring_stage_source = source.split("impl Stage {", 1)[1].split("\nfn phase(", 1)[0]
+        self.assertEqual(set(re.findall(r'Self::\w+ => "([a-z_]+)"', ring_stage_source)),
                          acceptance_module.RING_STAGES)
         observer_results = set(re.findall(r'ObserverError::\w+ => "([a-z_]+)"', source))
         observer_results.update(re.findall(r'diagnostic.record\("([a-z_]+)"\)', source))
@@ -778,15 +779,19 @@ class OutgoingRingTests(unittest.TestCase):
         self.assertIn('\\nMORPHEUS_RING_ADMISSION result={result}', source)
         self.assertEqual(source.count('.map_err(admission_failure)?'), 2)
 
-    def output(self):
+    def output(self, ring_case=("current", "dm")):
         facts = "\n".join(f"MORPHEUS_RING_CHECK {name}=true" for name in sorted(acceptance_module.RING_CHECKS))
-        return (f"test {acceptance_module.RING_TEST} ... ok\n{facts}\n"
+        incoming = set(acceptance_module.INCOMING_CHECKS)
+        if ring_case == ("current", "dm"):
+            incoming.add(acceptance_module.INCOMING_REPLAY_CHECK)
+        actor = "\n".join(f"MORPHEUS_INCOMING_CHECK {name}=true" for name in sorted(incoming))
+        return (f"test {acceptance_module.RING_TEST} ... ok\n{facts}\n{actor}\n"
                 "MORPHEUS_RING_RESULT passed=true\n"
                 "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 1.00s\n")
 
     def test_exact_named_test_and_every_fixed_fact_are_required(self):
         complete = self.output()
-        self.assertEqual(acceptance_module.ring_passed_tests(complete), 1)
+        self.assertEqual(acceptance_module.ring_passed_tests(complete, ("current", "dm")), 1)
         invalid = ["", complete.replace(acceptance_module.RING_TEST, "other::test"),
                    complete.replace(" ... ok", " ... ignored"),
                    complete.replace("0 ignored", "1 ignored"),
@@ -806,7 +811,7 @@ class OutgoingRingTests(unittest.TestCase):
                             complete + f"MORPHEUS_RING_CHECK {name}=false\n"))
         for index, output in enumerate(invalid):
             with self.subTest(case=index), self.assertRaises(RuntimeError):
-                acceptance_module.ring_passed_tests(output)
+                acceptance_module.ring_passed_tests(output, ("current", "dm"))
 
     def test_evidence_allows_only_exact_fixed_booleans_and_preserves_false(self):
         output = "\n".join((
@@ -872,7 +877,7 @@ class OutgoingRingTests(unittest.TestCase):
                 })
                 for output in (marker + self.output(), self.output() + marker):
                     with self.assertRaises(RuntimeError):
-                        acceptance_module.ring_passed_tests(output)
+                        acceptance_module.ring_passed_tests(output, ("current", "dm"))
 
     def test_admission_diagnostics_reject_suffixes_unknown_payloads_and_prefixed_lines(self):
         valid = "MORPHEUS_RING_ADMISSION result=policy"
@@ -998,6 +1003,186 @@ class OutgoingRingTests(unittest.TestCase):
             self.assertIn("unsolicited encrypted sync receipt with authenticated device metadata", text)
             self.assertIn("independently fetched events", text)
             self.assertIn("do not verify incoming call UI, audible ringing, offline/restart replay", text)
+
+
+class IncomingActorTests(unittest.TestCase):
+    def output(self, case=("current", "dm")):
+        return OutgoingRingTests().output(case)
+
+    def test_rust_actor_markers_match_the_exact_public_schema(self):
+        root = acceptance_module.REPO / "crates/morpheus-app/src/outgoing_ring"
+        source = (root / "live_tests/actor_tests.rs").read_text()
+        parent = (root / "live_tests.rs").read_text()
+        facts = set(re.findall(r'actor_fact\("([a-z_]+)"\)', source))
+        facts.add("actor_cleanup")
+        self.assertEqual(facts, acceptance_module.INCOMING_CHECKS | {acceptance_module.INCOMING_REPLAY_CHECK})
+        self.assertIn('\\nMORPHEUS_INCOMING_CHECK actor_cleanup={clean}', parent)
+        self.assertIn('\\nMORPHEUS_INCOMING_FAILURE actor_cleanup', parent)
+        stage_source = source.split("impl ActorStage {", 1)[1].split("\nfn actor_fact(", 1)[0]
+        self.assertEqual(set(re.findall(r'Self::\w+ => "([a-z_]+)"', stage_source)),
+                         acceptance_module.INCOMING_STAGES)
+        errors = set(re.findall(r'\berror\("([a-z_]+)"\)', source))
+        error_source = source.split("fn controller_error(", 1)[1].split("async fn bounded", 1)[0]
+        errors.update(re.findall(r'=> "([a-z_]+)"', error_source))
+        self.assertEqual(errors, acceptance_module.INCOMING_ERRORS)
+        for marker in ('CHECK {name}=true', 'STAGE {}', 'FAILURE {}', 'ERROR {category}'):
+            self.assertIn('\\nMORPHEUS_INCOMING_' + marker, source)
+
+    def test_actor_schema_does_not_replace_the_thirteen_sender_checks(self):
+        self.assertEqual(len(acceptance_module.RING_CHECKS), 13)
+        self.assertEqual(acceptance_module.INCOMING_CHECKS, {
+            "actor_discovered", "exact_key_once", "actor_withdrew", "admitted_target_preserved",
+            "accepted_join_identity", "slot_unchanged", "quiet_receive_only",
+            "established_after_withdrawal", "accepted_leave_observed", "actor_cleanup",
+        })
+        self.assertEqual(acceptance_module.INCOMING_REPLAY_CHECK, "account_replay_rejected")
+
+    def test_all_four_cases_require_actor_facts_and_only_current_dm_exercises_replay(self):
+        for case in acceptance_module.RING_CASES:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as folder:
+                output = self.output(case)
+                self.assertEqual(acceptance_module.ring_passed_tests(output, case), 1)
+                runner = Acceptance(Path(folder), "scanner")
+                record = runner.validated_record("fixed-label", output, test=False, ring_case=case,
+                                                 oauth_checks=(), element_checks=False)
+                expected = dict.fromkeys(acceptance_module.INCOMING_CHECKS, True)
+                if case == ("current", "dm"):
+                    expected[acceptance_module.INCOMING_REPLAY_CHECK] = True
+                self.assertEqual(record["incoming_checks"], expected)
+                self.assertEqual(record["ring_checks"], dict.fromkeys(acceptance_module.RING_CHECKS, True))
+                self.assertIs(record["account_replay_exercised"], case == ("current", "dm"))
+                marker = "MORPHEUS_INCOMING_CHECK account_replay_rejected=true\n"
+                invalid = output.replace(marker, "") if case == ("current", "dm") else output + marker
+                with self.assertRaises(RuntimeError):
+                    acceptance_module.ring_passed_tests(invalid, case)
+
+    def test_every_actor_fact_is_mandatory_and_false_is_permanent_for_every_case(self):
+        for case in acceptance_module.RING_CASES:
+            complete = self.output(case)
+            names = acceptance_module.INCOMING_CHECKS | (
+                {acceptance_module.INCOMING_REPLAY_CHECK} if case == ("current", "dm") else set())
+            for name in names:
+                marker = f"MORPHEUS_INCOMING_CHECK {name}=true"
+                for failure, output in (
+                    ("missing", complete.replace(marker, "")),
+                    ("suffix", complete.replace(marker, marker + " private-payload")),
+                    ("early-false", f"MORPHEUS_INCOMING_CHECK {name}=false\n" + complete),
+                    ("late-false", complete + f"MORPHEUS_INCOMING_CHECK {name}=false\n"),
+                ):
+                    with self.subTest(case=case, fact=name, failure=failure), self.assertRaises(RuntimeError):
+                        acceptance_module.ring_passed_tests(output, case)
+
+    def test_each_known_error_or_failure_poisons_otherwise_complete_evidence(self):
+        for kind, allowed in (("ERROR", acceptance_module.INCOMING_ERRORS),
+                              ("FAILURE", acceptance_module.INCOMING_STAGES)):
+            for value in allowed:
+                marker = f"MORPHEUS_INCOMING_{kind} {value}\n"
+                with self.subTest(kind=kind, value=value):
+                    evidence = acceptance_module.incoming_diagnostics(marker)
+                    self.assertEqual(evidence[kind.lower()], value)
+                    for output in (marker + self.output(), self.output() + marker):
+                        with self.assertRaises(RuntimeError):
+                            acceptance_module.ring_passed_tests(output, ("current", "dm"))
+
+    def test_unknown_or_malformed_actor_markers_fail_closed_without_payload(self):
+        malformed = (
+            "MORPHEUS_INCOMING_CHECK actor_cleanup=true private-payload",
+            "MORPHEUS_INCOMING_CHECK actor_cleanup=TRUE",
+            "MORPHEUS_INCOMING_CHECK private_account=true",
+            "MORPHEUS_INCOMING_STAGE first_discovery private-payload",
+            "MORPHEUS_INCOMING_STAGE private_stage",
+            "MORPHEUS_INCOMING_FAILURE first_discovery private-payload",
+            "MORPHEUS_INCOMING_FAILURE private_stage",
+            "MORPHEUS_INCOMING_ERROR unavailable private-payload",
+            "MORPHEUS_INCOMING_ERROR private_error",
+            "MORPHEUS_INCOMING_DATA private-payload",
+        )
+        for marker in malformed:
+            with self.subTest(marker=marker):
+                self.assertEqual(acceptance_module.incoming_diagnostics(marker), {
+                    "checks": {}, "malformed": True,
+                })
+                with self.assertRaises(RuntimeError):
+                    acceptance_module.ring_passed_tests(self.output() + marker + "\n", ("current", "dm"))
+        # Arbitrary text cannot become a diagnostic merely by containing a marker.
+        self.assertEqual(acceptance_module.incoming_diagnostics(
+            "private-prefix MORPHEUS_INCOMING_ERROR unavailable\n"), {"checks": {}})
+
+    def test_fixed_diagnostics_preserve_false_and_last_known_stage(self):
+        output = ("MORPHEUS_INCOMING_STAGE first_discovery\n"
+                  "MORPHEUS_INCOMING_CHECK actor_discovered=false\n"
+                  "MORPHEUS_INCOMING_CHECK actor_discovered=true\n"
+                  "MORPHEUS_INCOMING_STAGE accepted_join\n"
+                  "MORPHEUS_INCOMING_FAILURE accepted_join\n"
+                  "MORPHEUS_INCOMING_ERROR account_changed\n")
+        expected = {"checks": {"actor_discovered": False}, "stage": "accepted_join",
+                    "failure": "accepted_join", "error": "account_changed"}
+        self.assertEqual(acceptance_module.incoming_diagnostics(output), expected)
+        self.assertEqual(acceptance_module.ring_diagnostics(output), {"checks": {}, "incoming": expected})
+
+    def test_actual_run_publishes_case_specific_actor_facts_only_after_clean_scan(self):
+        for case in acceptance_module.RING_CASES:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as folder:
+                runner = Acceptance(Path(folder), "scanner")
+                output = self.output(case) + "private-account-and-keys\n"
+                with OutgoingRingTests().mocked_run(runner, output) as (visible, _, scanner):
+                    runner.run(f"outgoing-ring-{case[0]}-{case[1]}", ["test"], ring_case=case)
+                scanner.assert_called_once()
+                record = json.loads(next(line for line in visible.getvalue().splitlines() if line.startswith("{")))
+                self.assertEqual(record["status"], "passed")
+                self.assertIs(record["account_replay_exercised"], case == ("current", "dm"))
+                self.assertEqual(record["incoming_checks"], acceptance_module.incoming_evidence(output))
+                self.assertEqual(record["quiet_evidence"], "sampled_cache_and_media_state")
+                self.assertEqual(record["withdrawal_evidence"], "joined_after_sdk_cache_removal")
+                self.assertIs(record["actor_withdrawal_processing_confirmed"], False)
+                self.assertNotIn("private-account", visible.getvalue())
+
+    def test_scan_failure_withholds_actor_diagnostics(self):
+        output = ("running 1 test\nMORPHEUS_INCOMING_STAGE accepted_join\n"
+                  "MORPHEUS_INCOMING_ERROR rtc\nMORPHEUS_INCOMING_FAILURE accepted_join\n"
+                  "private-account-and-keys\n")
+        for scan in (0, 1):
+            with self.subTest(scan=scan), tempfile.TemporaryDirectory() as folder:
+                runner = Acceptance(Path(folder), "scanner")
+                with (OutgoingRingTests().mocked_run(runner, output, returncode=1, scanner_code=scan)
+                      as (visible, _, scanner), self.assertRaises(RuntimeError)):
+                    runner.run("outgoing-ring-current-dm", ["test"], ring_case=("current", "dm"))
+                scanner.assert_called_once()
+                self.assertNotIn("private-account", visible.getvalue())
+                if scan:
+                    self.assertNotIn("incoming", visible.getvalue())
+                else:
+                    self.assertEqual(json.loads(next(line for line in visible.getvalue().splitlines() if line.startswith("{")))["ring_diagnostics"]["incoming"], {
+                        "checks": {}, "stage": "accepted_join", "error": "rtc", "failure": "accepted_join",
+                    })
+
+    def test_actor_cleanup_failure_stays_fatal_after_contained_test_entry(self):
+        for marker in ("MORPHEUS_INCOMING_CHECK actor_cleanup=false",
+                       "MORPHEUS_INCOMING_FAILURE actor_cleanup",
+                       "MORPHEUS_INCOMING_ERROR cleanup"):
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as folder:
+                runner = Acceptance(Path(folder), "scanner")
+                # Later error/stage messages must never hide a cleanup failure.
+                output = ("running 1 test\n" + marker + "\n"
+                          "MORPHEUS_INCOMING_FAILURE accepted_join\n"
+                          "MORPHEUS_INCOMING_ERROR rtc\n"
+                          "MORPHEUS_INCOMING_CHECK actor_cleanup=true\n")
+                with (ScopedContinuationTests().contained_child(runner, output),
+                      self.assertRaises(RuntimeError) as caught):
+                    runner.run("outgoing-ring-current-dm", ["test"], ring_case=("current", "dm"), pid_namespace=True)
+                self.assertNotIsInstance(caught.exception, acceptance_module.CheckFailure)
+
+    def test_noncleanup_actor_failure_is_collectible_only_after_scan_and_containment(self):
+        output = ("running 1 test\nMORPHEUS_INCOMING_CHECK actor_cleanup=true\n"
+                  "MORPHEUS_INCOMING_STAGE accepted_join\nMORPHEUS_INCOMING_FAILURE accepted_join\n"
+                  "MORPHEUS_INCOMING_ERROR rtc\nprivate-account-and-keys\n")
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "scanner")
+            with (ScopedContinuationTests().contained_child(runner, output) as (visible, *_),
+                  self.assertRaises(acceptance_module.CheckFailure)):
+                runner.run("outgoing-ring-current-dm", ["test"], ring_case=("current", "dm"), pid_namespace=True)
+            self.assertNotIn("private-account", visible.getvalue())
+            self.assertEqual(runner.results, [])
 
 
 class ScopedContinuationTests(unittest.TestCase):

@@ -183,6 +183,7 @@ jobs:
             ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/desktop-preview.png
             ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/account-switcher.png
             ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/sign-in.png
+            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/incoming-call.png
             ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/provenance.json
           if-no-files-found: error
           retention-days: 1
@@ -225,12 +226,16 @@ jobs:
         timeout-minutes: 15
         run: python3 scripts/run_wayland_acceptance.py
       - name: Test vendored security fixes
+        id: vendor-tests
+        # Keep independent SDK and live checks on the already-built app.
+        # The final gate still rejects any failed vendor regression command.
+        continue-on-error: true
         shell: bash
         run: |
           cargo test --locked -p lru --lib test_pop_panicking_key_drop_keeps_list_consistent
           cargo test --locked -p livekit-api --lib --features signal-client-tokio,rustls-tls-native-roots
           cargo test --locked -p matrix-rtc-livekit --lib
-          cargo test --locked -p matrix-rtc-core --lib --test key_rotation
+          cargo test --locked -p matrix-rtc-core --features testing --lib --test key_rotation
           cargo test --locked -p cargo-packager-updater --lib
       - name: Test pinned SDK sticky receipt and redaction regressions
         id: sdk-receipt-tests
@@ -257,8 +262,8 @@ jobs:
           dbus-run-session -- python3 scripts/run_matrix_acceptance.py \
             --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks"
       - name: Enforce collected acceptance results
-        if: ${{ !cancelled() && (steps.model-tests.outcome == 'failure' || steps.preview-capture.outcome == 'failure' || steps.preview-upload.outcome == 'failure' || steps.desktop-tests.outcome == 'failure' || steps.wayland-tests.outcome == 'failure' || steps.windows-capture-tests.outcome == 'failure' || steps.sdk-receipt-tests.outcome == 'failure') }}
+        if: ${{ !cancelled() && (steps.model-tests.outcome == 'failure' || steps.preview-capture.outcome == 'failure' || steps.preview-upload.outcome == 'failure' || steps.desktop-tests.outcome == 'failure' || steps.wayland-tests.outcome == 'failure' || steps.windows-capture-tests.outcome == 'failure' || steps.sdk-receipt-tests.outcome == 'failure' || steps.vendor-tests.outcome == 'failure') }}
         shell: bash
         run: |
-          echo "Protocol model, native preview, desktop controller, native capture, or SDK receipt acceptance tests failed; this candidate is not verified."
+          echo "Protocol model, native preview, desktop controller, native capture, SDK receipt, or vendor regression tests failed; this candidate is not verified."
           exit 1

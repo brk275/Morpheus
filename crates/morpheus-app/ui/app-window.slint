@@ -68,6 +68,13 @@ export struct MemberItem {
     online: bool,
 }
 
+export struct IncomingCallItem {
+    token: string,
+    caller: string,
+    room: string,
+    account: string,
+}
+
 export struct CallParticipantItem {
     name: string,
     detail: string,
@@ -433,6 +440,10 @@ export component AppWindow inherits Window {
     in-out property <bool> native-call-request-pending: false;
     in-out property <string> native-call-status;
     in-out property <string> native-invitation-status;
+    in-out property <[IncomingCallItem]> incoming-call-offers;
+    in-out property <string> incoming-call-account-id;
+    in-out property <bool> incoming-call-answering: false;
+    in-out property <string> incoming-call-notice;
     in-out property <bool> native-call-joined: false;
     in-out property <bool> native-audio-failed: false;
     in-out property <string> native-audio-error;
@@ -577,6 +588,8 @@ export component AppWindow inherits Window {
     callback composer-formatting-changed(bool);
     callback preview-demo();
     callback toggle-stress-timeline();
+    callback answer-incoming-call(string);
+    callback dismiss-incoming-call(string);
     callback start-native-call();
     callback notify-native-call();
     callback end-native-call();
@@ -668,7 +681,7 @@ export component AppWindow inherits Window {
     property <string> login-password;
 
     // A picker snapshot never survives a change of account or Space.
-    changed active-account-local-id => { root.quick-switcher-open = false; }
+    changed active-account-local-id => { root.quick-switcher-open = false; root.incoming-call-notice = ""; }
     changed active-account-index => { root.quick-switcher-open = false; }
     changed active-space-id => { root.quick-switcher-open = false; }
     changed show-sign-in => { if !root.show-sign-in { shortcut-scope.focus(); } }
@@ -1223,6 +1236,75 @@ export component AppWindow inherits Window {
                     }
                 }
                 Rectangle { height: 1px; background: root.divider; }
+                if root.native-call-enabled && root.live-session && root.incoming-call-account-id == root.active-account-local-id && root.incoming-call-offers.length > 0 : ScrollView {
+                    height: min(220px, root.incoming-call-offers.length * (102px * root.text-scale));
+                    horizontal-stretch: 1;
+                    VerticalLayout {
+                        spacing: 1px;
+                        for offer in root.incoming-call-offers : Rectangle {
+                            height: 102px * root.text-scale;
+                            background: root.panel;
+                            border-width: 1px;
+                            border-color: root.accent;
+                            VerticalLayout {
+                                padding: 10px;
+                                spacing: 3px;
+                                Text {
+                                    text: "Incoming call · " + offer.caller;
+                                    accessible-live-region: polite;
+                                    color: root.ink;
+                                    font-size: 13px * root.text-scale;
+                                    font-weight: 650;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: offer.room + " · " + offer.account;
+                                    color: root.muted;
+                                    font-size: 11px * root.text-scale;
+                                    overflow: elide;
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    ActionRect {
+                                        width: 110px;
+                                        height: 32px * root.text-scale;
+                                        border-radius: 6px;
+                                        background: self.has-hover ? root.accent : root.hover;
+                                        focus-color: root.accent;
+                                        enabled: !root.incoming-call-answering && !root.call-connected && !root.native-call-request-pending;
+                                        label: "Answer call from " + offer.caller + " in " + offer.room + " for " + offer.account;
+                                        activated => { root.answer-incoming-call(offer.token); }
+                                        Text { text: "Answer"; color: root.ink; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                                    }
+                                    ActionRect {
+                                        width: 110px;
+                                        height: 32px * root.text-scale;
+                                        border-radius: 6px;
+                                        background: self.has-hover ? root.hover : root.canvas;
+                                        focus-color: root.accent;
+                                        label: "Dismiss call from " + offer.caller + " in " + offer.room;
+                                        activated => { root.dismiss-incoming-call(offer.token); }
+                                        Text { text: "Dismiss"; color: root.ink; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                            }
+                        }
+                    }
+                }
+                if root.incoming-call-notice != "" && root.live-session : Rectangle {
+                    height: 32px * root.text-scale;
+                    background: root.panel;
+                    Text {
+                        x: 12px; width: parent.width - 24px;
+                        text: root.incoming-call-notice;
+                        accessible-live-region: polite;
+                        color: root.muted;
+                        font-size: 11px * root.text-scale;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
                 if root.config-error != "" : Rectangle {
                     height: 39px;
                     background: #9f3f50;
@@ -2250,7 +2332,7 @@ export component AppWindow inherits Window {
                     spacing: 16px;
                     Text {
                         text: root.live-session
-                            ? ((root.active-voice-local || root.active-voice-shared ? "Voice space · " : "Room call · ") + (root.call-connected ? root.native-call-room-display : root.active-room-name))
+                            ? (root.call-connected ? "Call · " + root.native-call-room-display : (root.active-voice-local || root.active-voice-shared ? "Voice space · " : "Room call · ") + root.active-room-name)
                             : "The Workshop · Lounge";
                         color: root.ink; font-size: 21px * root.text-scale;
                         font-weight: 760; overflow: elide;
@@ -2307,7 +2389,9 @@ export component AppWindow inherits Window {
                     }
                     if root.live-session && root.native-call-enabled : VerticalLayout {
                         spacing: 5px;
-                        HorizontalLayout {
+                        // Saved mode belongs to the selected conversation. An
+                        // answered call can target another room or dialect.
+                        if !root.call-connected && !root.native-call-request-pending : HorizontalLayout {
                             spacing: 6px;
                             for choice[index] in ["Standard", "Element Call Matrix 2.0", "Legacy"] : ActionRect {
                                 height: 38px; border-radius: 8px; horizontal-stretch: 1;
