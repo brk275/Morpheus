@@ -103,7 +103,8 @@ def endpoint(server: dict[str, object]) -> str:
     return f"http://127.0.0.1:{server['port']}"
 
 
-def api(url: str, path: str, *, token: str | None = None, body: dict | None = None) -> dict:
+def api(url: str, path: str, *, token: str | None = None, body: dict | None = None,
+        timeout: float = 10) -> dict:
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -113,19 +114,22 @@ def api(url: str, path: str, *, token: str | None = None, body: dict | None = No
         headers=headers,
         method="POST" if body is not None else "GET",
     )
-    with urllib.request.urlopen(request, timeout=10) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.load(response)
 
 
 def wait_ready(server: dict[str, object]) -> None:
     deadline = time.monotonic() + 120
-    while time.monotonic() < deadline:
+    while (remaining := deadline - time.monotonic()) > 0:
         try:
-            result = api(endpoint(server), "/_matrix/client/versions")
-            if result.get("versions"):
+            result = api(endpoint(server), "/_matrix/client/versions", timeout=min(10, remaining))
+            if isinstance(result, dict) and result.get("versions"):
                 return
-        except (urllib.error.URLError, TimeoutError, ValueError, http.client.HTTPException):
-            time.sleep(2)
+        except (urllib.error.URLError, ConnectionError, TimeoutError, ValueError, http.client.HTTPException):
+            # Docker can expose the port before Synapse accepts HTTP. A peer
+            # reset may escape urllib directly, without a URLError wrapper.
+            pass
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
     raise RuntimeError(f"Synapse {server['name']} did not become ready at {endpoint(server)}")
 
 

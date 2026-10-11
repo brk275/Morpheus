@@ -293,17 +293,17 @@ def http_opener(*, cookies: bool = False):
 def wait_ready(url: str, *, expected_issuer: str | None = None):
     opener = http_opener()
     deadline = time.monotonic() + 120
-    while time.monotonic() < deadline:
+    while (remaining := deadline - time.monotonic()) > 0:
         try:
-            with opener.open(url, timeout=3) as response:
+            with opener.open(url, timeout=min(3, remaining)) as response:
                 data = json.loads(response.read(MAX_BODY))
-                if expected_issuer is None and data.get("versions"):
+                if expected_issuer is None and isinstance(data, dict) and data.get("versions"):
                     return
-                if expected_issuer is not None and data.get("issuer") == expected_issuer:
+                if expected_issuer is not None and isinstance(data, dict) and data.get("issuer") == expected_issuer:
                     return
-        except (urllib.error.URLError, TimeoutError, ValueError, http.client.HTTPException):
+        except (urllib.error.URLError, ConnectionError, TimeoutError, ValueError, http.client.HTTPException):
             pass
-        time.sleep(1)
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
     raise FixtureError("OAuth fixture service did not become ready")
 
 
