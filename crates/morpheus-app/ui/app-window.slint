@@ -1,5 +1,11 @@
 import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView } from "std-widgets.slint";
 
+export struct EmojiItem {
+    key: string,
+    symbol: string,
+    name: string,
+}
+
 export struct MentionItem {
     key: string,
     name: string,
@@ -298,6 +304,96 @@ component MentionPopup inherits Rectangle {
                 Text { text: item.name; color: root.ink; font-size: 12px * root.text-scale; overflow: elide; }
                 Text { text: item.key; color: root.muted; font-size: 10px * root.text-scale; overflow: elide; }
             }
+        }
+    }
+}
+
+component EmojiPopup inherits Rectangle {
+    in property <[EmojiItem]> items;
+    in property <int> current;
+    in-out property <string> query;
+    in property <color> surface;
+    in property <color> elevated;
+    in property <color> hover;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> accent;
+    in property <float> text-scale: 1;
+    callback searched(string);
+    callback navigate(int);
+    callback choose(string);
+    callback dismiss();
+    height: min(380px, 280px * root.text-scale + 70px);
+    background: surface; border-radius: 9px; border-width: 1px; border-color: accent;
+    accessible-role: region; accessible-label: "Emoji picker";
+    FocusScope {
+        width: parent.width; height: parent.height;
+        key-pressed(event) => {
+            if event.text == Key.Escape { root.dismiss(); accept } else { reject }
+        }
+        VerticalLayout {
+        padding: 8px; spacing: 6px;
+        HorizontalLayout {
+            height: 34px * root.text-scale; spacing: 6px;
+            Rectangle {
+                horizontal-stretch: 1; background: root.elevated; border-radius: 6px;
+                if root.query == "" : Text {
+                    x: 8px; width: parent.width - 16px; height: parent.height;
+                    text: "Search emoji"; color: root.muted; font-size: 12px * root.text-scale;
+                    vertical-alignment: center;
+                }
+                emoji-search := TextInput {
+                    x: 8px; width: parent.width - 16px; height: parent.height;
+                    text <=> root.query; color: root.ink; font-size: 12px * root.text-scale;
+                    vertical-alignment: center; accessible-label: "Search emoji by name";
+                    init => { self.focus(); }
+                    edited => { root.searched(self.text); }
+                    key-pressed(event) => {
+                        if !event.modifiers.control && !event.modifiers.meta && !event.modifiers.alt {
+                            if event.text == Key.Escape { root.dismiss(); accept }
+                            else if event.text == Key.UpArrow { root.navigate(-1); accept }
+                            else if event.text == Key.DownArrow { root.navigate(1); accept }
+                            else if event.text == Key.Return {
+                                if root.current >= 0 && root.current < root.items.length { root.choose(root.items[root.current].key); }
+                                accept
+                            } else { reject }
+                        } else { reject }
+                    }
+                }
+            }
+            IconAction {
+                width: 30px * root.text-scale; icon: "×"; label: "Close emoji picker";
+                ink: root.muted; surface: root.surface; hover-surface: root.hover;
+                activated => { root.dismiss(); }
+            }
+        }
+        Text {
+            text: root.current >= 0 && root.current < root.items.length
+                ? "Selected emoji: " + root.items[root.current].name
+                : "No matching emoji";
+            color: root.ink; font-size: 11px * root.text-scale; wrap: word-wrap;
+            accessible-live-region: polite;
+        }
+        Text { text: "Arrows choose · Enter inserts · Escape closes";
+            color: root.muted; font-size: 10px * root.text-scale; wrap: word-wrap; }
+        emoji-list := ListView {
+            vertical-stretch: 1; horizontal-scrollbar-policy: always-off;
+            viewport-y: -max(0px, (root.current + 1) * (34px * root.text-scale + 6px) - self.height);
+            for item[index] in root.items : ActionRect {
+                width: emoji-list.visible-width; height: 34px * root.text-scale + 6px;
+                label: "Insert " + item.name + " " + item.symbol + (index == root.current ? ", selected" : "");
+                background: index == root.current || self.has-hover ? root.hover : root.surface;
+                border-radius: 5px; focus-color: root.accent; cancel-on-escape: true;
+                cancelled => { root.dismiss(); }
+                activated => { root.choose(item.key); }
+                HorizontalLayout {
+                    padding-left: 7px; padding-right: 7px; spacing: 10px;
+                    Text { width: 32px * root.text-scale; text: item.symbol; color: root.ink; font-size: 22px * root.text-scale; vertical-alignment: center; }
+                    Text { text: item.name; color: root.ink; font-size: 12px * root.text-scale;
+                        vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                }
+            }
+        }
         }
     }
 }
@@ -641,6 +737,17 @@ export component AppWindow inherits Window {
     callback mention-key(bool, string) -> bool;
     callback mention-choose(bool, string);
     callback mention-context-changed();
+    callback open-emoji(bool);
+    callback emoji-query(string);
+    callback emoji-navigate(int);
+    callback emoji-choose(string);
+    callback emoji-dismiss();
+    callback focus-composer(bool);
+    focus-composer(threaded) => {
+        root.composer-focus-thread = threaded;
+        root.composer-focus-request = root.composer-focus-request == 2147483647 ? 1 : root.composer-focus-request + 1;
+    }
+
     callback begin-compose(int, string, string, string, bool);
     callback cancel-compose();
     callback mention-cursor(bool, int, int, bool);
@@ -721,6 +828,14 @@ export component AppWindow inherits Window {
     in-out property <[MentionItem]> composer-mentions;
     in-out property <int> composer-mention-index: 0;
     in-out property <[MentionItem]> thread-mentions;
+    in-out property <[EmojiItem]> emoji-items;
+    in-out property <int> emoji-index: 0;
+    in-out property <bool> emoji-open: false;
+    in-out property <bool> emoji-threaded: false;
+    in-out property <string> emoji-query-text;
+    property <bool> composer-focus-thread: false;
+    property <int> composer-focus-request: 0;
+
     in-out property <int> thread-mention-index: 0;
     out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open;
     changed mention-ui-allowed => { if !root.mention-ui-allowed { root.mention-context-changed(); } }
@@ -1697,6 +1812,15 @@ export component AppWindow inherits Window {
                                     activated => { root.attach-file(); }
                                 }
                                 IconAction {
+                                    width: 32px; icon: "☺"; label: "Open emoji picker for message";
+                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                    enabled: root.mention-ui-allowed && !root.composer-busy;
+                                    activated => {
+                                        root.composer-caret = message-input.caret-bytes; root.composer-anchor = message-input.anchor-bytes; root.composer-preedit = message-input.composing;
+                                        root.open-emoji(false);
+                                    }
+                                }
+                                IconAction {
                                     width: 38px;
                                     icon: "Md";
                                     label: root.composer-markdown ? "Clear Markdown formatting" : "Use Markdown formatting";
@@ -1730,6 +1854,9 @@ export component AppWindow inherits Window {
                                         vertical-alignment: center;
                                         accessible-label: root.composer-mode == 1 ? "Reply to " + root.composer-target-label : root.composer-mode == 2 ? "Edit your message" : "Message composer for " + root.active-room-name;
                                         caret-changed => { root.mention-cursor(false, self.caret-bytes, self.anchor-bytes, self.composing); }
+                                        property <int> composer-focus-request: root.composer-focus-request;
+                                        changed composer-focus-request => { if !root.composer-focus-thread { self.focus(); } }
+
                                         property <int> placement-request: root.mention-place-request;
                                         changed placement-request => {
                                             if !root.mention-place-thread {
@@ -1761,7 +1888,19 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
-                        if root.composer-mentions.length > 0 && root.mention-ui-allowed : MentionPopup {
+                        if root.emoji-open && !root.emoji-threaded && root.mention-ui-allowed : EmojiPopup {
+                            x: 18px; y: -self.height; width: parent.width - 36px;
+                            items: root.emoji-items; current: root.emoji-index; query <=> root.emoji-query-text;
+                            surface: root.panel; elevated: root.elevated; hover: root.hover; ink: root.ink; muted: root.muted; accent: root.accent; text-scale: root.text-scale;
+                            searched(query) => { root.emoji-query(query); }
+                            navigate(offset) => { root.emoji-navigate(offset); }
+                            dismiss => { root.emoji-dismiss(); }
+                            choose(key) => {
+                                root.composer-caret = message-input.caret-bytes; root.composer-anchor = message-input.anchor-bytes; root.composer-preedit = message-input.composing;
+                                root.emoji-choose(key);
+                            }
+                        }
+                        if root.composer-mentions.length > 0 && root.mention-ui-allowed && !root.emoji-open : MentionPopup {
                             x: 18px; y: -self.height; width: parent.width - 36px;
                             items: root.composer-mentions; current: root.composer-mention-index;
                             surface: root.panel; hover: root.hover; ink: root.ink; muted: root.muted; accent: root.accent; text-scale: root.text-scale;
@@ -3090,6 +3229,9 @@ export component AppWindow inherits Window {
                                     changed thread-context => { if self.thread-context != "" { self.focus(); } }
                                     accepted => { if !root.thread-send-pending { root.send-thread-message(root.thread-composer-text); } }
                                     caret-changed => { root.mention-cursor(true, self.caret-bytes, self.anchor-bytes, self.composing); }
+                                    property <int> composer-focus-request: root.composer-focus-request;
+                                    changed composer-focus-request => { if root.composer-focus-thread { self.focus(); } }
+
                                     property <int> placement-request: root.mention-place-request;
                                     changed placement-request => {
                                         if root.mention-place-thread {
@@ -3102,6 +3244,15 @@ export component AppWindow inherits Window {
                                             if !event.modifiers.control && !event.modifiers.meta && !event.modifiers.alt && !event.modifiers.shift && root.mention-key(true, event.text) { accept } else { reject }
                                     }
                                     edited => { root.thread-composer-edited(self.text); root.mention-cursor(true, self.caret-bytes, self.anchor-bytes, self.composing); }
+                                }
+                            }
+                            IconAction {
+                                width: 28px; icon: "☺"; label: "Open emoji picker for thread reply";
+                                ink: root.muted; surface: root.panel; hover-surface: root.hover;
+                                enabled: root.mention-ui-allowed && !root.thread-send-pending;
+                                activated => {
+                                    root.thread-caret = thread-input.caret-bytes; root.thread-anchor = thread-input.anchor-bytes; root.thread-preedit = thread-input.composing;
+                                    root.open-emoji(true);
                                 }
                             }
                             IconAction {
@@ -3120,7 +3271,19 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
-                        if root.thread-mentions.length > 0 && root.mention-ui-allowed : MentionPopup {
+                        if root.emoji-open && root.emoji-threaded && root.mention-ui-allowed : EmojiPopup {
+                            x: 4px; y: -self.height; width: parent.width - 8px;
+                            items: root.emoji-items; current: root.emoji-index; query <=> root.emoji-query-text;
+                            surface: root.panel; elevated: root.elevated; hover: root.hover; ink: root.ink; muted: root.muted; accent: root.accent; text-scale: root.text-scale;
+                            searched(query) => { root.emoji-query(query); }
+                            navigate(offset) => { root.emoji-navigate(offset); }
+                            dismiss => { root.emoji-dismiss(); }
+                            choose(key) => {
+                                root.thread-caret = thread-input.caret-bytes; root.thread-anchor = thread-input.anchor-bytes; root.thread-preedit = thread-input.composing;
+                                root.emoji-choose(key);
+                            }
+                        }
+                        if root.thread-mentions.length > 0 && root.mention-ui-allowed && !root.emoji-open : MentionPopup {
                             x: 4px; y: -self.height; width: parent.width - 8px;
                             items: root.thread-mentions; current: root.thread-mention-index;
                             surface: root.panel; hover: root.hover; ink: root.ink; muted: root.muted; accent: root.accent; text-scale: root.text-scale;

@@ -80,7 +80,7 @@ pub(crate) fn compose_related(
     text: &ComposeText,
     own_user: &UserId,
 ) -> Result<RoomMessageEventContentWithoutRelation, ComposeError> {
-    Ok(compose_room(text, own_user)?.without_relation())
+    Ok(compose_room(text, own_user)?.into())
 }
 
 /// Escape original raw HTML before injecting our own anchors. Source operations

@@ -2,6 +2,7 @@
 //! AccountSelection across every asynchronous query and final send.
 
 use morpheus_matrix::{ComposeError, ComposeText, MentionTarget, TextFormat};
+mod emoji;
 mod send;
 pub mod ui;
 
@@ -50,6 +51,17 @@ impl Ticket {
     pub fn account(&self) -> &str {
         &self.scope.account
     }
+}
+
+/// Opaque native-selection capability. Scope generation/revision changes,
+/// cursor movement and preedit all invalidate a deferred literal insertion.
+#[derive(Clone)]
+pub(super) struct Insertion {
+    scope: Scope,
+    generation: u64,
+    revision: u64,
+    caret: i32,
+    anchor: i32,
 }
 
 #[derive(Clone)]
@@ -143,6 +155,54 @@ impl Session {
         } else {
             TextFormat::Plain
         }));
+    }
+
+    pub(super) fn insertion(&self, caret: i32, anchor: i32, preedit: bool) -> Option<Insertion> {
+        let start = usize::try_from(caret.min(anchor)).ok()?;
+        let end = usize::try_from(caret.max(anchor)).ok()?;
+        if preedit || self.text.body.get(start..end).is_none() || self.text.validate().is_err() {
+            return None;
+        }
+        Some(Insertion {
+            scope: self.scope.clone()?,
+            generation: self.generation,
+            revision: self.revision,
+            caret,
+            anchor,
+        })
+    }
+
+    pub(super) fn insertion_matches(
+        &self,
+        ticket: &Insertion,
+        caret: i32,
+        anchor: i32,
+        preedit: bool,
+    ) -> bool {
+        !preedit
+            && self.scope.as_ref() == Some(&ticket.scope)
+            && self.generation == ticket.generation
+            && self.revision == ticket.revision
+            && caret == ticket.caret
+            && anchor == ticket.anchor
+    }
+
+    pub(super) fn insert_literal(
+        &mut self,
+        ticket: &Insertion,
+        literal: &str,
+        caret: i32,
+        anchor: i32,
+        preedit: bool,
+    ) -> Result<usize, ComposeError> {
+        if !self.insertion_matches(ticket, caret, anchor, preedit) {
+            return Err(ComposeError::InvalidMention);
+        }
+        let start = usize::try_from(caret.min(anchor)).map_err(|_| ComposeError::InvalidMention)?;
+        let end = usize::try_from(caret.max(anchor)).map_err(|_| ComposeError::InvalidMention)?;
+        let (text, caret) = self.text.insert_literal(start..end, literal)?;
+        self.replace(text);
+        Ok(caret)
     }
 
     pub fn request(&mut self, caret: i32, anchor: i32, preedit: &str) -> Option<Ticket> {
@@ -398,5 +458,95 @@ mod tests {
         session.clear();
         assert!(!session.publish(&ticket, vec![candidate()]));
         assert!(!format!("{ticket:?}").contains("private"));
+    }
+    #[test]
+    fn deferred_literal_rejects_cursor_preedit_edits_and_returned_scope() {
+        let scope = Scope {
+            account: "a".into(),
+            room: "!r:example.org".into(),
+            target: Target::Room,
+        };
+        let mut session = Session::default();
+        session.reset(scope.clone(), ComposeText::plain("Ω tail"));
+        let ticket = session.insertion(2, 2, false).unwrap();
+        assert!(session.insert_literal(&ticket, "👋", 3, 3, false).is_err());
+        assert!(session.insert_literal(&ticket, "👋", 2, 2, true).is_err());
+        session.edited("Ω tail".into());
+        assert!(session.insert_literal(&ticket, "👋", 2, 2, false).is_err());
+        session.reset(scope.clone(), ComposeText::plain("Ω tail"));
+        let ticket = session.insertion(2, 2, false).unwrap();
+        session.reset(
+            Scope {
+                account: "b".into(),
+                ..scope.clone()
+            },
+            ComposeText::plain("Ω tail"),
+        );
+        session.reset(scope, ComposeText::plain("Ω tail"));
+        assert!(session.insert_literal(&ticket, "👋", 2, 2, false).is_err());
+    }
+
+    #[test]
+    fn deferred_literal_replaces_native_selection_once_and_preserves_format() {
+        let mut session = Session::default();
+        session.reset(
+            Scope {
+                account: "a".into(),
+                room: "!r:example.org".into(),
+                target: Target::Thread("$root".into()),
+            },
+            ComposeText::new("Ω word tail", TextFormat::Markdown),
+        );
+        let ticket = session.insertion(3, 7, false).unwrap();
+        assert_eq!(
+            session.insert_literal(&ticket, "👋", 3, 7, false).unwrap(),
+            7
+        );
+        assert_eq!(session.text().body, "Ω 👋 tail");
+        assert_eq!(session.text().format, TextFormat::Markdown);
+        assert!(session.text().mentions.is_empty());
+        assert!(session.insert_literal(&ticket, "👋", 3, 7, false).is_err());
+    }
+    #[test]
+    fn deferred_literal_is_bound_to_each_composer_target() {
+        let mut session = Session::default();
+        let base = Scope {
+            account: "a".into(),
+            room: "!r:example.org".into(),
+            target: Target::Room,
+        };
+        for target in [
+            Target::Room,
+            Target::Reply("$one".into()),
+            Target::Edit("$one".into()),
+            Target::Thread("$one".into()),
+        ] {
+            session.reset(
+                Scope {
+                    target: target.clone(),
+                    ..base.clone()
+                },
+                ComposeText::plain("abc"),
+            );
+            let ticket = session.insertion(1, 2, false).unwrap();
+            session.reset(
+                Scope {
+                    target: Target::Thread("$other".into()),
+                    ..base.clone()
+                },
+                ComposeText::plain("abc"),
+            );
+            assert!(session.insert_literal(&ticket, "👋", 1, 2, false).is_err());
+            session.reset(
+                Scope {
+                    target,
+                    ..base.clone()
+                },
+                ComposeText::plain("abc"),
+            );
+            let current = session.insertion(1, 2, false).unwrap();
+            session.insert_literal(&current, "👋", 1, 2, false).unwrap();
+            assert_eq!(session.text().body, "a👋c");
+        }
     }
 }

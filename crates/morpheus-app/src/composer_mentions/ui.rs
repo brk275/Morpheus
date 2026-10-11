@@ -1,8 +1,8 @@
 //! Native composer binding. Only owned immutable snapshots cross Tokio/UI
 //! boundaries; account revocation and scope/revision checks precede publication.
 
-use super::{Candidate, Scope, Session, Target, Ticket};
-use crate::{AppWindow, MentionItem, live::LiveUi};
+use super::{Candidate, Insertion, Scope, Session, Target, Ticket, emoji};
+use crate::{AppWindow, EmojiItem, MentionItem, live::LiveUi};
 use morpheus_matrix::{
     AccountSelection, ComposeError, ComposeSendTarget, ComposeText, EditBaseline, TextFormat,
 };
@@ -27,12 +27,21 @@ struct ParkedDraft {
     draft_revision: Option<u64>,
 }
 
+struct EmojiPicker {
+    threaded: bool,
+    ticket: Insertion,
+    selection: AccountSelection,
+    rows: Vec<&'static emoji::Emoji>,
+    highlighted: usize,
+}
+
 #[derive(Default)]
 struct State {
     main: BoundSession,
     thread: BoundSession,
     parked: Option<ParkedDraft>,
     sends: super::send::SendLedger,
+    emoji: Option<EmojiPicker>,
 }
 impl State {
     fn bound(&self, threaded: bool) -> &BoundSession {
@@ -77,6 +86,62 @@ impl Submission {
 impl ComposerUi {
     pub fn install(window: &AppWindow, live: Arc<LiveUi>, runtime: Handle) -> Self {
         let this = Self::default();
+        let weak = window.as_weak();
+        let owner = this.clone();
+        let binding = live.clone();
+        window.on_open_emoji(move |threaded| {
+            if let Some(window) = weak.upgrade() {
+                owner.open_emoji(&window, &binding, threaded);
+            }
+        });
+        let weak = window.as_weak();
+        let owner = this.clone();
+        window.on_emoji_query(move |query| {
+            if let Some(window) = weak.upgrade() {
+                {
+                    let mut state = owner.state.lock().expect("composer mutex poisoned");
+                    if let Some(picker) = state.emoji.as_mut() {
+                        picker.rows = emoji::search(query.as_str());
+                        picker.highlighted = 0;
+                    }
+                }
+                owner.publish_emoji(&window);
+            }
+        });
+        let weak = window.as_weak();
+        let owner = this.clone();
+        window.on_emoji_navigate(move |offset| {
+            if let Some(window) = weak.upgrade() {
+                {
+                    let mut state = owner.state.lock().expect("composer mutex poisoned");
+                    if let Some(picker) = state
+                        .emoji
+                        .as_mut()
+                        .filter(|picker| !picker.rows.is_empty())
+                    {
+                        picker.highlighted = (picker.highlighted as i32 + offset.signum())
+                            .rem_euclid(picker.rows.len() as i32)
+                            as usize;
+                    }
+                }
+                owner.publish_emoji(&window);
+            }
+        });
+        let weak = window.as_weak();
+        let owner = this.clone();
+        let binding = live.clone();
+        window.on_emoji_choose(move |key| {
+            if let Some(window) = weak.upgrade() {
+                owner.choose_emoji(&window, &binding, key.as_str());
+            }
+        });
+        let weak = window.as_weak();
+        let owner = this.clone();
+        window.on_emoji_dismiss(move || {
+            if let Some(window) = weak.upgrade() {
+                owner.close_emoji(&window, true);
+            }
+        });
         let weak = window.as_weak();
         let owner = this.clone();
         let binding = live.clone();
@@ -215,7 +280,156 @@ impl ComposerUi {
         this
     }
 
+    fn open_emoji(&self, window: &AppWindow, live: &Arc<LiveUi>, threaded: bool) {
+        if !allowed(window, threaded) {
+            return;
+        }
+        let (caret, anchor, preedit) = cursor(window, threaded);
+        {
+            let mut state = self.state.lock().expect("composer mutex poisoned");
+            if !ensure_scope(&mut state, window, live, threaded) {
+                return;
+            }
+            let bound = state.bound_mut(threaded);
+            if bound.session.text().body != body(window, threaded) {
+                return;
+            }
+            let Some(ticket) = bound.session.insertion(caret, anchor, preedit) else {
+                return;
+            };
+            let Some(selection) = bound.selection.clone().filter(AccountSelection::is_current)
+            else {
+                return;
+            };
+            bound.session.dismiss();
+            bound.latest = None;
+            state.emoji = Some(EmojiPicker {
+                threaded,
+                ticket,
+                selection,
+                rows: emoji::search(""),
+                highlighted: 0,
+            });
+        }
+        window.set_emoji_query_text("".into());
+        self.publish(window, threaded);
+        self.publish_emoji(window);
+    }
+
+    fn emoji_valid(state: &State, window: &AppWindow, picker: &EmojiPicker) -> bool {
+        let (caret, anchor, preedit) = cursor(window, picker.threaded);
+        let bound = state.bound(picker.threaded);
+        picker.selection.is_current()
+            && allowed(window, picker.threaded)
+            && scope(window, picker.threaded).as_ref() == bound.session.scope()
+            && bound.session.text().body == body(window, picker.threaded)
+            && bound
+                .session
+                .insertion_matches(&picker.ticket, caret, anchor, preedit)
+    }
+
+    fn publish_emoji(&self, window: &AppWindow) {
+        let (open, threaded, selected, rows) = {
+            let mut state = self.state.lock().expect("composer mutex poisoned");
+            if state
+                .emoji
+                .as_ref()
+                .is_some_and(|picker| !Self::emoji_valid(&state, window, picker))
+            {
+                state.emoji = None;
+            }
+            match &state.emoji {
+                Some(picker) => (
+                    true,
+                    picker.threaded,
+                    picker.highlighted as i32,
+                    picker
+                        .rows
+                        .iter()
+                        .map(|entry| EmojiItem {
+                            key: entry.key.into(),
+                            symbol: entry.text.into(),
+                            name: entry.name.into(),
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                None => (false, false, 0, Vec::new()),
+            }
+        };
+        window.set_emoji_items(ModelRc::new(VecModel::from(rows)));
+        window.set_emoji_index(selected);
+        window.set_emoji_threaded(threaded);
+        window.set_emoji_open(open);
+    }
+
+    fn close_emoji(&self, window: &AppWindow, focus: bool) {
+        let target = {
+            let mut state = self.state.lock().expect("composer mutex poisoned");
+            let target = state
+                .emoji
+                .as_ref()
+                .filter(|picker| Self::emoji_valid(&state, window, picker))
+                .map(|picker| picker.threaded);
+            state.emoji = None;
+            target
+        };
+        self.publish_emoji(window);
+        if focus {
+            if let Some(threaded) = target {
+                window.invoke_focus_composer(threaded);
+            }
+        }
+    }
+
+    fn choose_emoji(&self, window: &AppWindow, live: &Arc<LiveUi>, key: &str) {
+        let chosen = {
+            let mut state = self.state.lock().expect("composer mutex poisoned");
+            let Some(picker) = state.emoji.take() else {
+                return;
+            };
+            if !Self::emoji_valid(&state, window, &picker) {
+                None
+            } else {
+                let literal = picker
+                    .rows
+                    .iter()
+                    .find(|entry| entry.key == key)
+                    .map(|entry| entry.text);
+                let (caret, anchor, preedit) = cursor(window, picker.threaded);
+                literal.and_then(|literal| {
+                    state
+                        .bound_mut(picker.threaded)
+                        .session
+                        .insert_literal(&picker.ticket, literal, caret, anchor, preedit)
+                        .ok()
+                        .map(|caret| {
+                            (
+                                picker.threaded,
+                                state.bound(picker.threaded).session.text().clone(),
+                                caret,
+                            )
+                        })
+                })
+            }
+        };
+        self.publish_emoji(window);
+        let Some((threaded, text, caret)) = chosen else {
+            return;
+        };
+        self.remember(window, live, threaded, text.clone());
+        if threaded {
+            window.set_thread_composer_text(text.body.into());
+        } else {
+            window.set_composer_text(text.body.into());
+        }
+        self.publish(window, threaded);
+        if let Ok(caret) = i32::try_from(caret) {
+            window.invoke_place_mention_caret(threaded, caret);
+        }
+    }
+
     fn edited(&self, window: &AppWindow, live: &Arc<LiveUi>, threaded: bool, body: String) {
+        self.close_emoji(window, false);
         let text = {
             let mut state = self.state.lock().expect("composer mutex poisoned");
             if !ensure_scope(&mut state, window, live, threaded) {
@@ -230,6 +444,7 @@ impl ComposerUi {
     }
 
     fn format(&self, window: &AppWindow, live: &Arc<LiveUi>, threaded: bool, markdown: bool) {
+        self.close_emoji(window, false);
         let text = {
             let mut state = self.state.lock().expect("composer mutex poisoned");
             if !ensure_scope(&mut state, window, live, threaded) {
@@ -268,6 +483,10 @@ impl ComposerUi {
         anchor: i32,
         preedit: bool,
     ) {
+        if window.get_emoji_open() {
+            self.publish_emoji(window);
+            return;
+        }
         let spawn = {
             let mut state = self.state.lock().expect("composer mutex poisoned");
             if !allowed(window, threaded) || !ensure_scope(&mut state, window, live, threaded) {
@@ -411,6 +630,7 @@ impl ComposerUi {
     }
 
     fn context_changed(&self, window: &AppWindow) {
+        self.close_emoji(window, false);
         {
             let mut state = self.state.lock().expect("composer mutex poisoned");
             for threaded in [false, true] {
@@ -463,6 +683,7 @@ impl ComposerUi {
         live: &Arc<LiveUi>,
         threaded: bool,
     ) -> Result<Submission, ComposeError> {
+        self.close_emoji(window, false);
         if cursor(window, threaded).2 {
             return Err(ComposeError::InvalidMention);
         }
@@ -534,6 +755,7 @@ impl ComposerUi {
     }
 
     pub fn restore_normal(&self, window: &AppWindow, live: &Arc<LiveUi>) {
+        self.close_emoji(window, false);
         if !window.get_live_session() {
             window.set_composer_mode(0);
             window.set_composer_target_id("".into());
@@ -599,6 +821,7 @@ impl ComposerUi {
         if window.get_composer_busy() || event.is_empty() || !matches!(mode, 1 | 2) {
             return;
         }
+        self.close_emoji(window, false);
         if !window.get_live_session() {
             if window.get_composer_mode() == 0 {
                 window.set_composer_saved_draft(window.get_composer_text());

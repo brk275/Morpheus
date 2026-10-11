@@ -5,6 +5,32 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
 ## Current hosted acceptance, 2026-10-11
 
+### Composer build failure and reviewed follow-up: `56688d0`
+
+[Run 38154958727](https://github.com/brk275/Morpheus/actions/runs/38154958727)
+tested `56688d019b91b07ffa0f1ebab3641e7138fef243`. Scope passed 484 helper
+checks with one skip and scanned all 45 reachable commits with zero findings.
+All four native targets failed on the same Matrix SDK/Ruma API mismatches:
+`MatrixId` was imported from the wrong module, `Room::is_encrypted` was unavailable,
+two calls used private `without_relation`, and a user-ID comparison had ambiguous
+`AsRef` types. No native build completed; no Rust tests, preview capture or live acceptance
+executed. Every job and post-step completed; all four caches restored and reported
+“Cache up-to-date.” All five completed job logs scanned with zero findings.
+
+The reviewed follow-up uses the pinned public APIs and preserves edit metadata.
+Inherited encrypted reply mentions require SDK-Verified evidence bound to the
+exact sender even when current room state is cleartext; unknown room encryption
+and still-encrypted undecryptable events fail closed. One new trust regression
+is source-reviewed but unexecuted. The prior 45 composer regressions, two incoming
+fixture setup regressions and expanded encrypted fixtures remain unexecuted.
+
+The same follow-up adds a local searchable 44-entry starter emoji picker for main
+and thread composers. Insertion checks the account, target, source revision and
+current native selection, preserves unaffected mention intent and creates no new
+mention metadata. Six new regression sources were reviewed but have not run.
+Native compilation, caret/selection, keyboard, IME, font and screen-reader behavior
+remain pending. Full Unicode/skin-tone breadth is not implemented by this catalog.
+
 ### Incoming controls and membership renewal: `c7ad50c`
 
 [Run 38149404773](https://github.com/brk275/Morpheus/actions/runs/38149404773)
@@ -51,7 +77,7 @@ The successful post-step therefore does not establish that Intel saved a cache.
 
 ### Composer candidate: source review only
 
-The next candidate implements caret-based suggestions from cached joined-room
+The composer candidate implements caret-based suggestions from cached joined-room
 members, explicit user/authorized-room mention selection, and typed Plain/Markdown
 source across room, reply, thread and edit composers. Pasted IDs and links do not
 create mention intent. Encrypted draft restoration preserves canonical typed

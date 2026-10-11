@@ -4102,7 +4102,10 @@ mod composed_adapter {
             }
             (replacement.new_content, Some(edit.event_id.to_string()))
         } else {
-            (original.content.without_relation(), None)
+            (
+                RoomMessageEventContentWithoutRelation::from(original.content),
+                None,
+            )
         };
         if !matches!(effective.msgtype, MessageType::Text(_))
             || effective.msgtype.body().len() > compose::MAX_COMPOSE_BYTES
@@ -4153,8 +4156,15 @@ mod composed_adapter {
             _ => return Err(unavailable()),
         };
         context(selection, room)?;
-        let encrypted = room.is_encrypted().await.map_err(|_| unavailable())?;
+        let encryption = room
+            .latest_encryption_state()
+            .await
+            .map_err(|_| unavailable())?;
         context(selection, room)?;
+        if encryption.is_unknown() {
+            return Err(unavailable());
+        }
+        let encrypted = encryption.is_encrypted();
         let event = room
             .event(
                 &reply,
@@ -4177,18 +4187,39 @@ mod composed_adapter {
         {
             return Err(unavailable());
         }
-        if encrypted
-            && !event.encryption_info().is_some_and(|info| {
-                info.sender.as_str() == raw.sender().as_str()
-                    && matches!(
-                        info.verification_state,
-                        matrix_sdk::deserialized_responses::VerificationState::Verified
-                    )
-            })
-        {
+        if !inherited_reply_is_authenticated(
+            encrypted,
+            message,
+            raw.sender(),
+            event.encryption_info().map(|info| info.as_ref()),
+        ) {
             return Err(unavailable());
         }
         Ok(Some(raw.sender().to_owned()))
+    }
+
+    fn inherited_reply_is_authenticated(
+        encrypted_room: bool,
+        message: &AnySyncMessageLikeEvent,
+        sender: &UserId,
+        info: Option<&matrix_sdk::deserialized_responses::EncryptionInfo>,
+    ) -> bool {
+        // An undecrypted event cannot establish inherited intent, even when the
+        // current room state says cleartext. Decrypted metadata also requires
+        // verification independently of that current room state.
+        if matches!(message, AnySyncMessageLikeEvent::RoomEncrypted(_)) {
+            return false;
+        }
+        if !encrypted_room && info.is_none() {
+            return true;
+        }
+        info.is_some_and(|info| {
+            info.sender.as_str() == sender.as_str()
+                && matches!(
+                    info.verification_state,
+                    matrix_sdk::deserialized_responses::VerificationState::Verified
+                )
+        })
     }
 
     fn restore_edit(
@@ -4207,7 +4238,10 @@ mod composed_adapter {
                 .mentions
                 .user_ids
                 .iter()
-                .filter(|id| id.as_ref() != own && Some(id.as_ref()) != inherited)
+                .filter(|id| {
+                    let id: &UserId = id.as_ref();
+                    id != own && Some(id) != inherited
+                })
                 .map(|id| MentionTarget::User(id.to_string()))
                 .collect();
             if revision.mentions.room {
@@ -4306,6 +4340,88 @@ mod composed_adapter {
                 .unwrap(),
             )
         }
+        #[test]
+        fn inherited_reply_requires_event_trust_even_in_cleartext_room() {
+            use matrix_sdk::deserialized_responses::{
+                AlgorithmInfo, EncryptionInfo, VerificationLevel,
+                VerificationState as EventVerificationState,
+            };
+
+            let sender = user_id!("@riley:example.org");
+            let message: AnySyncMessageLikeEvent = serde_json::from_value(json!({
+                "type": "m.room.message", "event_id": "$reply:example.org",
+                "sender": sender, "origin_server_ts": 1,
+                "content": {"msgtype": "m.text", "body": "Fixture reply"},
+            }))
+            .unwrap();
+            let ciphertext: AnySyncMessageLikeEvent = serde_json::from_value(json!({
+                "type": "m.room.encrypted", "event_id": "$reply:example.org",
+                "sender": sender, "origin_server_ts": 1,
+                "content": {
+                    "algorithm": "m.megolm.v1.aes-sha2",
+                    "ciphertext": "fixture", "session_id": "fixture",
+                },
+            }))
+            .unwrap();
+            let mut info = EncryptionInfo {
+                sender: sender.to_owned(),
+                sender_device: None,
+                forwarder: None,
+                algorithm_info: AlgorithmInfo::MegolmV1AesSha2 {
+                    curve25519_key: "fixture".into(),
+                    sender_claimed_keys: Default::default(),
+                    session_id: None,
+                },
+                verification_state: EventVerificationState::Unverified(
+                    VerificationLevel::UnverifiedIdentity,
+                ),
+            };
+            assert!(inherited_reply_is_authenticated(
+                false, &message, sender, None
+            ));
+            assert!(!inherited_reply_is_authenticated(
+                true, &message, sender, None
+            ));
+            assert!(!inherited_reply_is_authenticated(
+                false,
+                &message,
+                sender,
+                Some(&info)
+            ));
+            info.verification_state = EventVerificationState::Verified;
+            assert!(inherited_reply_is_authenticated(
+                false,
+                &message,
+                sender,
+                Some(&info)
+            ));
+            assert!(inherited_reply_is_authenticated(
+                true,
+                &message,
+                sender,
+                Some(&info)
+            ));
+            assert!(!inherited_reply_is_authenticated(
+                false,
+                &ciphertext,
+                sender,
+                None
+            ));
+            assert!(!inherited_reply_is_authenticated(
+                false,
+                &ciphertext,
+                sender,
+                Some(&info)
+            ));
+            info.sender = user_id!("@jules:example.org").to_owned();
+            assert!(!inherited_reply_is_authenticated(
+                false,
+                &message,
+                sender,
+                Some(&info)
+            ));
+        }
+
         fn original(content: serde_json::Value) -> Raw<AnySyncTimelineEvent> {
             raw(content, "$original:example.org", "@casey:example.org")
         }

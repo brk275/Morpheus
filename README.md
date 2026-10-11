@@ -29,9 +29,11 @@ encryption-key recovery yet. The first beta requires the cross-platform
 checks in [the feature matrix](docs/FEATURE_MATRIX.md).
 
 The composer candidate adds explicit mention selection, typed Plain/Markdown
-drafts, and mention-aware replies, threads and edits. Its new regression tests
-and expanded encrypted fixtures await hosted execution; native keyboard, IME
-and accessibility behavior are not yet verified.
+drafts, mention-aware replies, threads and edits, and a searchable 44-entry
+starter emoji picker. Its latest hosted build failed on Matrix SDK API mismatches;
+reviewed repairs, new regressions and expanded encrypted fixtures await execution.
+Native keyboard, IME and accessibility behavior remain unverified; the starter
+picker does not cover the full Unicode emoji catalog or skin-tone variants.
 
 ![Morpheus native desktop preview with fictional accounts](docs/screenshots/desktop.png)
 

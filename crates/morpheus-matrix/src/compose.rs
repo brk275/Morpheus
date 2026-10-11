@@ -4,7 +4,7 @@
 
 use std::{fmt, ops::Range};
 
-use matrix_sdk::ruma::{MatrixId, MatrixToUri, UserId, events::Mentions};
+use matrix_sdk::ruma::{MatrixToUri, UserId, events::Mentions, matrix_uri::MatrixId};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use ruma::html::{Html, NodeData, NodeRef};
 
@@ -305,6 +305,55 @@ impl ComposeText {
             target,
         });
         next.mentions.sort_by_key(|span| span.range.start);
+        next.validate()?;
+        Ok((next, end))
+    }
+
+    /// Replace one known native UTF-8 selection with literal text. Unlike a
+    /// body-only diff, the exact edit can preserve every unaffected selection.
+    /// Literal IDs, links and emoji never add Matrix mention intent.
+    pub fn insert_literal(
+        &self,
+        range: Range<usize>,
+        literal: &str,
+    ) -> Result<(Self, usize), ComposeError> {
+        self.validate()?;
+        if range.start > range.end || self.body.get(range.clone()).is_none() {
+            return Err(ComposeError::InvalidMention);
+        }
+        let length = self
+            .body
+            .len()
+            .checked_sub(range.len())
+            .and_then(|length| length.checked_add(literal.len()))
+            .filter(|length| *length <= MAX_COMPOSE_BYTES)
+            .ok_or(ComposeError::TooLarge)?;
+        let mut body = String::with_capacity(length);
+        body.push_str(&self.body[..range.start]);
+        body.push_str(literal);
+        body.push_str(&self.body[range.end..]);
+        let end = range.start + literal.len();
+        let mut next = Self::new(body, self.format);
+        for span in &self.mentions {
+            let shifted = if span.range.end <= range.start {
+                Some(span.range.clone())
+            } else if span.range.start >= range.end {
+                Some(end + (span.range.start - range.end)..end + (span.range.end - range.end))
+            } else {
+                None
+            };
+            if let Some(range) = shifted {
+                if next.body.get(range.clone()) == Some(span.target.text())
+                    && token_boundaries(&next.body, range.clone())
+                    && next.allows_mention_range(range.clone())
+                {
+                    next.mentions.push(MentionSpan {
+                        range,
+                        target: span.target.clone(),
+                    });
+                }
+            }
+        }
         next.validate()?;
         Ok((next, end))
     }
@@ -682,5 +731,33 @@ mod tests {
                 .mentions
                 .is_empty()
         );
+    }
+    #[test]
+    fn literal_splice_preserves_unaffected_intent_and_replaces_selected_span() {
+        let (source, _) = ComposeText::plain("Ω @ca tail")
+            .insert_mention(3..6, MentionTarget::User("@casey:example.org".into()))
+            .unwrap();
+        let (shifted, caret) = source.insert_literal(0..2, "👋").unwrap();
+        assert_eq!(caret, 4);
+        assert_eq!(shifted.body, "👋 @casey:example.org tail");
+        assert_eq!(shifted.mentions[0].range, 5..23);
+        let (replaced, _) = shifted.insert_literal(5..23, "🎉").unwrap();
+        assert!(replaced.mentions.is_empty());
+        assert_eq!(replaced.body, "👋 🎉 tail");
+    }
+
+    #[test]
+    fn literal_splice_never_confers_intent_and_rejects_invalid_offsets_or_size() {
+        let source = ComposeText::plain("Ω ");
+        assert!(source.insert_literal(1..1, "👋").is_err());
+        assert!(source.insert_literal(3..2, "👋").is_err());
+        assert!(
+            source
+                .insert_literal(3..3, &"x".repeat(MAX_COMPOSE_BYTES))
+                .is_err()
+        );
+        let (text, _) = source.insert_literal(3..3, "@room 👋").unwrap();
+        assert!(text.mentions.is_empty());
+        assert_eq!(source.body, "Ω ");
     }
 }
