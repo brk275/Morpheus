@@ -7,51 +7,74 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
 ### Latest completed run
 
-[Run 38119789400](https://github.com/brk275/Morpheus/actions/runs/38119789400)
-tested `d155e2591545611bf2f465baa491b35394cb538d` on all four standard public
+[Run 38122640830](https://github.com/brk275/Morpheus/actions/runs/38122640830)
+tested `954b2a517ce5389045f3deb84ec81e5bcbadd0f7` on all four standard public
 runners. Windows and both Mac architectures passed their complete jobs, native
-builds, 16 configuration, 40 Matrix, eight RTC protocol, 74 desktop and 47 native
+builds, 16 configuration, 44 Matrix, eight RTC protocol, 82 desktop and 49 native
 RTC/device tests, plus the four vendor suites (1/32/10/5). The hosted Windows
 owned-window/display capture check completed. Linux passed its native build,
-Xvfb startup, the same configuration/Matrix/protocol checks, 89 desktop and
-58 native RTC/device tests, and all vendor suites.
+Xvfb startup, the same configuration/Matrix/protocol checks, 97 desktop and
+60 native RTC/device tests, and all vendor suites. Each desktop suite also
+reported one explicitly ignored live test. Scope passed 314 helper tests with
+one explicit skip, including the real hosted HTTPS cookie login/consent flow.
 
-Linux still failed acceptance. Its Wayland step's API conclusion is **success
-because of `continue-on-error`**; the actual capture test failed at the first
-static selected-display frame. All 33 PipeWire binding origins were correct.
-Producer traces now show successful buffer queueing while driving, the legacy
-driver-trigger branch, a ready but nonactive node and an unfinished graph.
-The consumer reached streaming and received Start/Clock/Position setup, but no
-process callback. The graph warnings were not ordered against shutdown, so they
-may describe teardown. These fixed diagnostics narrow the investigation; they do not
-establish a root cause or a passing capture gate. Final workflow enforcement
-correctly rejected the failed capture result.
+Linux still failed acceptance. The first static selected-display frame did not
+arrive. All 33 PipeWire binding origins were correct; the five desktop services
+remained running. The ordered trace places a valid producer queue and the
+legacy trigger before the consumer's local node reached Running. The unfinished
+graph marker precedes that transition; the nonactive-node marker occurs only
+after teardown starts. Format, buffer allocation and Streaming were established,
+but no consumer process callback was recorded. These facts narrow the startup
+investigation without proving its cause. The required capture gate remains
+failed despite the step's API success from `continue-on-error`.
 
-The separate Matrix harness started disposable services, then `live_local`
-exceeded its 900-second command deadline. The retained public facts do not
-distinguish compilation/startup from a particular SDK await. Later chat tests,
-recovery, OAuth, native RTC and Element Call were not reached. Owned service
-cleanup and the container/network absence checks passed. Completed scope and
-native logs scanned with zero findings and are retained privately with hashes;
-all post/cache steps completed. No installer was uploaded.
+The independent live harness passed account/sync isolation, encrypted drafts,
+room actions, formatted messages, media, discovery, moderation, both search/sync
+paths and encrypted recovery. `live_local` completed in 61.82 seconds. The
+previous run's 900-second timeout did not recur; diagnostic changes alone are
+not evidence of its root cause being fixed.
 
-The next test-only diagnostic change emits 37 fixed phase identifiers and
-requires an entered/completed live test before recording success. Failure output
-contains only the last recognized phase and a deadline category after private
-log scanning. Account-selection source review found no concrete deadlock. These
-diagnostics do not claim to fix the stalled test. The live workflow allowance
-increases from 35 to 55 minutes to accommodate four new bounded invitation cases;
-the standard runner selection and 90-minute native job limit are unchanged.
+Both real HTTPS MAS processes passed: cancellation, login, callback replay
+rejection, token rotation and vault persistence, then restart/restore,
+expired-token rejection, automatic refresh, remote logout, account removal and
+vault removal. This is protocol-fixture evidence; the external browser/provider
+and installed-app handoff gates remain open.
 
-The next Wayland diagnostic also captures the daemon and orders source-verified
-raw-clock records from all three processes. Each raw stream is private and
-capped at 8 MiB; public output contains at most 96 fixed event records, with
-ties, clock discontinuities, repeated node roles and incomplete drains explicit.
-Fixture-only node labels identify producer and consumer; raw identities and
-timestamps are withheld. Upstream scheduling changes were reviewed, but no
-scheduling backport or production capture change is included. The initial static
-frame remains mandatory. Independent source review passed; 48 portable Wayland
-helper tests passed and three Linux-only process checks were skipped locally.
+All four outgoing invitation cases passed: DM and room calls in Current and
+Sticky2025 formats. Each used the actual app sender, a fetched encrypted event,
+verified sender/device metadata, membership and targeting checks, server
+redaction and owned cleanup. These results do **not** prove unsolicited sync
+receipt, incoming UI, audible ringing, offline replay or Element notification
+interoperability.
+
+The baseline encrypted RTC case passed. The fresh-device late-join case then
+failed at its shared 45-second roster wait (`local_rtc.rs:247`); the retained
+facts do not distinguish initial discovery, departure or rejoin. Later RTC and
+Element cases were not reached. Matrix, OAuth and RTC service cleanup and the
+checked container/network absence gates passed. All job logs scanned with zero
+findings and are retained privately with hashes. Every post/cache step
+completed; the caches were already current. No installer was uploaded.
+
+### Next candidate, not yet verified natively
+
+A narrow local patch to the pinned `matrix-sdk-base` 0.19.1 retains keyless
+sticky receipts with the SDK's actual encryption metadata. It keeps existing
+keyed semantics, original expiry and room generations; redaction, late keys,
+replay, byte/count limits and broadcast lag have dedicated regressions. The
+four live invitation cases now require unsolicited receipt **before** any GET,
+then observed sync-cache redaction before expiry. New native tests and these
+stronger live checks have not yet run. See the
+[patch contract](../vendor/matrix-sdk-base/MORPHEUS_PATCH.md).
+
+The live harness now collects independent checks after a contained, scanned
+assertion failure. Chat cases still share a dependent group; OAuth restore
+still requires login; each invitation and RTC case gets fresh users and a room.
+Process-containment, launch, credential-scan and service-cleanup errors remain
+fatal. A fixed deadline permits 43 minutes of work, three minutes for nested
+cleanup and eight minutes for shared cleanup, finishing inside 54 minutes of
+the unchanged 55-minute workflow step. Failed and unexecuted cases remain
+explicit failures. The late-join test now identifies which of its four roster
+waits failed using only fixed phases and sampled presence booleans.
 
 ### Earlier completed candidate
 

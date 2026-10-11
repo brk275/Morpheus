@@ -58,3 +58,18 @@ Enabling either optional backend requires its own security and platform review.
 
 New advisories require fresh review. A previous clean scan does not establish
 the safety of changed dependencies or a release candidate.
+
+## Pinned SDK receipt regression dependencies, 2026-10-11
+
+The local `matrix-sdk-base` receipt patch retains version 0.19.1 and upstream
+revision `c6ad52ecc09eaa36601f55effb0a48a533eb87dd`. Making its own regressions
+selectable adds 66 registry package identities and four SDK Git test/optional
+identities, without upgrading an existing package version. All 66 added
+registry versions returned no advisory matches from the
+[OSV query API](https://google.github.io/osv.dev/api/) on 2026-10-11. The exact
+added identities and upstream file hashes are recorded in the
+[provenance manifest](../vendor/matrix-sdk-base/MORPHEUS_PROVENANCE.json).
+
+This incremental query does not replace the existing maintenance notices or
+source review of the SDK patch. The receipt cache's trust, redaction, bounds,
+and lifecycle tests still require execution on the hosted candidate.

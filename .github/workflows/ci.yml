@@ -183,6 +183,11 @@ jobs:
           cargo test --locked -p livekit-api --lib --features signal-client-tokio,rustls-tls-native-roots
           cargo test --locked -p matrix-rtc-livekit --lib
           cargo test --locked -p cargo-packager-updater --lib
+      - name: Test pinned SDK sticky receipt and redaction regressions
+        shell: bash
+        run: |
+          cargo test --locked -p matrix-sdk-base --no-default-features --features e2e-encryption,unstable-msc4354 --lib sticky::
+          cargo test --locked -p matrix-sdk-base --no-default-features --features e2e-encryption,unstable-msc4354 --lib sliding_sync::tests::test_sticky
       - name: Test real Matrix accounts, recovery, moderation, and encrypted RTC
         if: runner.os == 'Linux'
         # Four fresh invitation cases each have a bounded 300-second command.

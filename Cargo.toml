@@ -9,6 +9,7 @@ members = [
     "vendor/livekit-api",
     "vendor/matrix-rtc-livekit",
     "vendor/cargo-packager-updater",
+    "vendor/matrix-sdk-base",
 ]
 default-members = [
     "crates/morpheus-app",
@@ -41,3 +42,7 @@ nokhwa-bindings-macos = { path = "vendor/nokhwa-bindings-macos" }
 [patch."https://github.com/element-hq/matrix-rust-rtc"]
 # Validate every local/remote focus before exchanging Matrix OpenID credentials.
 matrix-rtc-livekit = { path = "vendor/matrix-rtc-livekit" }
+
+[patch."https://github.com/matrix-org/matrix-rust-sdk"]
+# Preserve decrypted keyless sticky receipts without altering the keyed map.
+matrix-sdk-base = { path = "vendor/matrix-sdk-base" }

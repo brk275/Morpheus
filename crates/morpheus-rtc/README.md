@@ -88,10 +88,20 @@ usable.
 The remaining incoming controller must use the account-selection cancellation token,
 deduplicate events, stop on expiry/departure/other-device acceptance or decline,
 keep voice spaces quiet, and request no capture device before Accept. The pinned SDK drops keyless events from its
-sticky map while the pinned notification builder omits a sticky key. Ordinary
-timeline reception therefore cannot establish restart/reconnect delivery from
-the sticky extension. Delayed decryption, this compatibility gap, sound, UI and
-stock Element interoperability remain explicit implementation/acceptance work.
+sticky map while the pinned notification builder omits a sticky key. A local
+`matrix-sdk-base` patch adds a separate bounded receipt cache that retains actual
+SDK decryption metadata, original deadlines and room-lifetime generations. It
+handles delayed keys and redactions without inventing a sticky key or changing
+the existing membership map. Overflow invalidates the cache; receivers must
+reject invalidation, lag, changed generations and expired receipts.
+
+The hosted invitation cases now require Bob to discover the authenticated
+notification through sync before receiving Alice's event ID, then verify GET,
+the referenced participation, and sync-cache removal on redaction before expiry.
+These new receipt checks still need hosted execution. The cache is not persisted;
+fresh-sync/offline replay, delayed-key integration, sound, incoming call UI and
+stock Element receipt remain explicit acceptance work. A receipt alone grants
+no permission to start capture or join a call.
 The newer `m.rtc.invite` proposal requires a separate protocol migration.
 
 ## Native devices

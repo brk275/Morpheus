@@ -346,3 +346,25 @@ boundary can therefore still be teardown. The report orders logging
 observations, not completion of asynchronous work, and cannot prove absence
 of a callback that upstream compiled out. All static first-frame, selected
 pixels, source-loss, shutdown, denial and cancellation assertions remain intact.
+
+## Startup ordering investigation, 2026-10-11
+
+At `954b2a5`, the complete ordered trace recorded a valid producer queue and
+legacy driver trigger before the consumer's local node became Running. No
+consumer process callback followed; the first static frame failed. The
+nonactive-node warning occurred during teardown and is not startup evidence.
+
+Source review found an applicable upstream race description:
+[PipeWire commit 800a25a](https://github.com/PipeWire/pipewire/commit/800a25a01f99156d7d954f4d7fe1b0a6cf8ae7e3),
+included in 1.2.6, completes exported-node state changes synchronously before
+acknowledging the server. In the runner's 1.0.5 path, completion is queued and
+`do_node_add` clears a pending eventfd before activating the node. The observed
+order is consistent with the described startup race, but the retained trace
+does not show whether that read consumed the producer's wake-up. It therefore
+does not establish the root cause of this fixture failure.
+
+The consumer's Streaming callback runs before this activation and cannot act
+as its completion barrier. Real-time callbacks would require a different thread
+ownership model and do not fix this core ordering. The source review did not
+identify a supported application workaround. The system PipeWire library and
+the mandatory first static-frame assertion remain unchanged; this gate is open.

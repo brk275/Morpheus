@@ -24,6 +24,25 @@ use tokio::time::{sleep, timeout};
 const VIDEO_WIDTH: u32 = 640;
 const VIDEO_HEIGHT: u32 = 360;
 
+#[derive(Clone, Copy)]
+enum RosterPhase {
+    InitialAlice,
+    InitialBob,
+    DepartedBob,
+    RejoinedBob,
+}
+
+impl RosterPhase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::InitialAlice => "initial_alice_roster",
+            Self::InitialBob => "initial_bob_roster",
+            Self::DepartedBob => "departed_bob_roster",
+            Self::RejoinedBob => "rejoined_bob_roster",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct Fixture {
     accounts: Vec<TestAccount>,
@@ -228,23 +247,40 @@ async fn bootstrap_test_identity(client: &Client, account: &TestAccount) {
     );
 }
 
-async fn wait_for_peer(rtc: &RtcService, room_id: &str, peer_user_id: &str, present: bool) {
-    timeout(Duration::from_secs(45), async {
+async fn wait_for_peer(
+    rtc: &RtcService,
+    room_id: &str,
+    peer_user_id: &str,
+    present: bool,
+    phase: RosterPhase,
+) {
+    // Start a new line even when libtest has left its test-name prefix open.
+    // Never put room, user, device, membership or transport values in markers.
+    eprintln!("\nMORPHEUS_RTC_STAGE {}", phase.name());
+    let mut observed = None;
+    let result = timeout(Duration::from_secs(45), async {
         loop {
-            if rtc
+            let found = rtc
                 .participants(room_id)
                 .expect("Call roster vanished")
                 .iter()
-                .any(|member| member.user_id == peer_user_id)
-                == present
-            {
+                .any(|member| member.user_id == peer_user_id);
+            observed = Some(found);
+            if found == present {
                 return;
             }
             sleep(Duration::from_millis(200)).await;
         }
     })
-    .await
-    .unwrap_or_else(|_| panic!("Peer {peer_user_id} did not change roster presence to {present}"));
+    .await;
+    if result.is_err() {
+        if let Some(observed) = observed {
+            eprintln!(
+                "\nMORPHEUS_RTC_ROSTER expected_present={present} observed_present={observed}"
+            );
+        }
+    }
+    result.expect("Peer did not reach the expected roster presence");
 }
 
 /// A red left half and green right half. The split survives VP8 scaling and
@@ -650,7 +686,7 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
             let id = matrix_sdk::ruma::RoomId::parse(room_id).expect("Invalid fixture room ID");
             let room = prepared.1.get_room(&id).expect("Bob room is missing");
             eprintln!(
-                "MORPHEUS_RTC_LATE_JOIN historical_member={}",
+                "\nMORPHEUS_RTC_LATE_JOIN historical_member={}",
                 has_encrypted_membership(&room, &alice_call.membership_id),
             );
             prepared
@@ -680,8 +716,22 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
     .expect("Bob RTC join timed out")
     .expect("Bob RTC join failed");
     assert_ne!(alice_call.local_identity, bob_call.local_identity);
-    wait_for_peer(&alice_rtc, room_id, &bob_account.user_id, true).await;
-    wait_for_peer(&bob_rtc, room_id, &alice_account.user_id, true).await;
+    wait_for_peer(
+        &alice_rtc,
+        room_id,
+        &bob_account.user_id,
+        true,
+        RosterPhase::InitialAlice,
+    )
+    .await;
+    wait_for_peer(
+        &bob_rtc,
+        room_id,
+        &alice_account.user_id,
+        true,
+        RosterPhase::InitialBob,
+    )
+    .await;
     timeout(Duration::from_secs(30), async {
         loop {
             if bob_rtc
@@ -829,7 +879,14 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
         .expect("Alice call vanished before key rotation")
         .subscribe_call_events();
     bob_rtc.leave(room_id).await.expect("Bob leave failed");
-    wait_for_peer(&alice_rtc, room_id, &bob_account.user_id, false).await;
+    wait_for_peer(
+        &alice_rtc,
+        room_id,
+        &bob_account.user_id,
+        false,
+        RosterPhase::DepartedBob,
+    )
+    .await;
     let rotated_key_index = timeout(Duration::from_secs(40), async {
         loop {
             match alice_events.recv().await {
@@ -867,7 +924,14 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
     .expect("Bob rejoin timed out")
     .expect("Bob rejoin failed");
     assert_ne!(bob_call.membership_id, rejoined.membership_id);
-    wait_for_peer(&alice_rtc, room_id, &bob_account.user_id, true).await;
+    wait_for_peer(
+        &alice_rtc,
+        room_id,
+        &bob_account.user_id,
+        true,
+        RosterPhase::RejoinedBob,
+    )
+    .await;
     timeout(Duration::from_secs(30), async {
         loop {
             if bob_rtc

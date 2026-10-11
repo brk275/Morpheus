@@ -51,6 +51,9 @@ LIVE_STAGES = frozenset((
 ))
 LIVE_STAGE = re.compile(r"^MORPHEUS_LIVE_STAGE ([a-z_]+)$", re.MULTILINE)
 LATE_JOIN_EVIDENCE = re.compile(r"^MORPHEUS_RTC_LATE_JOIN historical_member=(true|false)$", re.MULTILINE)
+RTC_STAGES = frozenset(("initial_alice_roster", "initial_bob_roster", "departed_bob_roster", "rejoined_bob_roster"))
+RTC_STAGE = re.compile(r"^MORPHEUS_RTC_STAGE ([a-z_]+)$", re.MULTILINE)
+RTC_ROSTER = re.compile(r"^MORPHEUS_RTC_ROSTER expected_present=(true|false) observed_present=(true|false)$", re.MULTILINE)
 MODERATION_STAGES = frozenset(("invite_initial", "invite_after_kick", "invite_after_unban"))
 MODERATION_FAILURES = frozenset((
     "selected_account_changed", "room_not_found", "invalid_user_id",
@@ -97,17 +100,58 @@ OAUTH_FAILURE = re.compile(r"^MORPHEUS_OAUTH_FAILURE ([a-z_]+)$", re.MULTILINE)
 RING_TEST = "outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction"
 RING_CHECKS = frozenset((
     "sticky_sync", "own_crypto", "peer_trust", "joined_without_media", "encrypted_membership",
-    "invitation_receipt", "fetched_decrypted_notification", "targeted_reference", "redaction_receipt",
-    "redaction_observed", "cleanup",
+    "invitation_receipt", "unsolicited_encrypted_notification", "fetched_decrypted_notification",
+    "targeted_reference", "redaction_receipt", "redaction_observed", "unsolicited_redaction_observed", "cleanup",
 ))
 RING_CHECK = re.compile(r"^MORPHEUS_RING_CHECK ([a-z_]+)=(true|false)$", re.MULTILINE)
 RING_RESULT = re.compile(r"^MORPHEUS_RING_RESULT passed=(true|false)$", re.MULTILINE)
 RING_STAGES = frozenset((
     "fixture", "login", "sticky_sync", "own_crypto", "peer_trust", "targets", "join", "membership",
-    "send", "fetch", "validate", "redact", "redaction", "cleanup",
+    "send", "receive", "fetch", "validate", "redact", "redaction", "receipt_redaction", "cleanup",
 ))
 RING_STAGE = re.compile(r"^MORPHEUS_RING_STAGE ([a-z_]+)$", re.MULTILINE)
 RING_FAILURE = re.compile(r"^MORPHEUS_RING_FAILURE ([a-z_]+)$", re.MULTILINE)
+RING_CASES = tuple((mode, target) for mode in ("current", "sticky-2025") for target in ("dm", "room"))
+CHAT_CHECKS = (*CHAT_TESTS, "search_local-classic")
+OAUTH_LABELS = tuple("oauth-local-" + phase.replace("_", "-") for phase in OAUTH_PHASES)
+RING_LABELS = tuple(f"outgoing-ring-{mode}-{target}" for mode, target in RING_CASES)
+RTC_LABELS = ("local_rtc", "local_rtc-late-join")
+ELEMENT_LABEL = "element-call-rc-sticky2025-presynced"
+# Setup/build/browser-install stages never prove that a peer check entered.
+ELEMENT_TEST_STAGES = frozenset((
+    "browser_login", "browser_identity", "browser_room_sync", "native_join_wait",
+    "browser_join", "browser_roster", "browser_receive_video", "native_media_wait",
+    "browser_leave", "native_test", "complete",
+))
+RTC_CHECKS = ("unsupported_transport_local", *RING_LABELS, *RTC_LABELS, ELEMENT_LABEL)
+PLANNED_CHECKS = (*CHAT_CHECKS, "recovery_local", *OAUTH_LABELS, *RTC_CHECKS)
+# Leave a full minute before the workflow's 55-minute hard kill. Work stops
+# with eleven minutes left: up to three for nested OAuth/Element cleanup, then
+# eight for both shared-service cleanups, checked inventories and log scans.
+TOTAL_SECONDS = 54 * 60
+WORK_RESERVE = 11 * 60
+FINAL_RESERVE = 8 * 60
+COMMAND_FINISH_RESERVE = 45  # retained-child reap plus bounded credential scan
+
+
+class CheckFailure(RuntimeError):
+    """Only a scanned test failure after verified process containment/cleanup."""
+
+    def __init__(self, label: str, reason: str):
+        if label not in PLANNED_CHECKS or reason not in ("test_failed", "deadline", "evidence_incomplete"):
+            raise RuntimeError("Invalid acceptance failure classification")
+        self.label, self.reason = label, reason
+        super().__init__(f"Acceptance check failed: {label} ({reason})")
+
+
+class BudgetSpent(RuntimeError):
+    """No new work may consume the reserved cleanup time."""
+
+
+def ran_native_test(output: str) -> bool:
+    # Cargo compilation/exec errors and namespace launcher failures must not
+    # be mistaken for a failed live test eligible for independent continuation.
+    return re.search(r"^running [1-9][0-9]* tests?$", output, re.MULTILINE) is not None
 
 
 def live_diagnostics(output: str) -> dict:
@@ -116,6 +160,19 @@ def live_diagnostics(output: str) -> dict:
     result = {"test_entered": "fixture" in stages}
     if stages:
         result["stage"] = stages[-1]
+    return result
+
+
+def rtc_diagnostics(output: str) -> dict:
+    """Only a fixed call-roster stage and actually sampled presence booleans."""
+    result = {}
+    stages = [stage for stage in RTC_STAGE.findall(output) if stage in RTC_STAGES]
+    if stages:
+        result["stage"] = stages[-1]
+    observations = RTC_ROSTER.findall(output)
+    if observations:
+        expected, observed = observations[-1]
+        result.update(expected_present=expected == "true", observed_present=observed == "true")
     return result
 
 
@@ -237,7 +294,7 @@ def fixture_from_output(output: str, root: Path) -> Path:
 
 
 class Acceptance:
-    def __init__(self, root: Path, gitleaks: str):
+    def __init__(self, root: Path, gitleaks: str, *, started=None):
         self.root = private_directory(root)
         self.logs = private_directory(root / "logs")
         self.gitleaks = gitleaks
@@ -249,30 +306,83 @@ class Acceptance:
             "RUST_BACKTRACE": "0",
         })
         self.results = []
+        self.failures = []
+        self.not_run = {}
+        self.finalizing = False
+        self.containment_verified = False
+        self.deadline = (time.monotonic() if started is None else started) + TOTAL_SECONDS
         self.sequence = 0
 
+    def available(self, *, cleanup=False):
+        reserve = 0 if self.finalizing else FINAL_RESERVE if cleanup else WORK_RESERVE
+        return self.deadline - time.monotonic() - reserve - COMMAND_FINISH_RESERVE
+
+    def group(self, labels, action):
+        """Continue only after a known test failure, never an infrastructure error."""
+        try:
+            if self.available() <= 0:
+                raise BudgetSpent("Acceptance work budget exhausted")
+            action()
+            return True
+        except CheckFailure as failure:
+            if failure.label not in labels:
+                raise RuntimeError("Acceptance failure escaped its declared group") from None
+            self.failures.append({"check": failure.label, "reason": failure.reason})
+            print(json.dumps({"check": failure.label, "status": "failed", "reason": failure.reason}), flush=True)
+            reason = "dependency_failed"
+        except BudgetSpent:
+            reason = "budget_spent"
+        completed = {item["check"] for item in self.results + self.failures}
+        for label in labels:
+            if label not in completed:
+                self.not_run[label] = reason
+                print(json.dumps({"check": label, "status": "not_run", "reason": reason}), flush=True)
+        return False
+
+    def finish_checks(self):
+        completed = {item["check"] for item in self.results}
+        if self.failures or self.not_run or any(label not in completed for label in PLANNED_CHECKS):
+            raise RuntimeError("Matrix acceptance has failed or unexecuted required checks")
+
+    def require_containment(self):
+        if not self.containment_verified:
+            self.run("acceptance-process-containment", [sys.executable, "scripts/element_process_namespace.py",
+                     "--check", str(self.root / "acceptance-containment-probe")], seconds=60)
+            self.containment_verified = True
+
     def run(self, label: str, args: list[str], *, extra=None, test=False, oauth_checks=(), element_checks=False,
-            ring_case=None, stdin=None, seconds=900, pid_namespace=False) -> str:
+            ring_case=None, stdin=None, seconds=900, pid_namespace=False, cleanup=False) -> str:
         if ring_case is not None and ring_case not in (
                 ("current", "dm"), ("current", "room"), ("sticky-2025", "dm"), ("sticky-2025", "room")):
             raise RuntimeError("Invalid outgoing ring acceptance case")
+        remaining = self.available(cleanup=cleanup)
+        if remaining <= 0:
+            if cleanup or self.finalizing:
+                raise RuntimeError("Acceptance cleanup deadline exhausted")
+            raise BudgetSpent("Acceptance work budget exhausted")
+        seconds = min(seconds, remaining)
         self.sequence += 1
         log = self.logs / f"{self.sequence:02d}-{label}.log"
         started = time.monotonic()
         print(f"Starting {label}", flush=True)
         timed_out = False
         if pid_namespace:
+            if not self.containment_verified:
+                raise RuntimeError("Acceptance process containment has not been verified")
             if stdin is not None:
                 raise RuntimeError("Contained commands require non-TTY stdin")
             args = namespace_command(args, self.root / f"namespace-{self.sequence:02d}", self.env | (extra or {}))
         # Create the private log before the child can write anything to it.
         fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as output:
-            process = subprocess.Popen(
-                args, cwd=REPO, env=self.env | (extra or {}),
-                stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-                stdout=output, stderr=subprocess.STDOUT, start_new_session=True,
-            )
+            try:
+                process = subprocess.Popen(
+                    args, cwd=REPO, env=self.env | (extra or {}),
+                    stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                    stdout=output, stderr=subprocess.STDOUT, start_new_session=True,
+                )
+            except OSError:
+                raise RuntimeError("Acceptance command could not be started") from None
             try:
                 if pid_namespace:
                     wait_owned(process, seconds)
@@ -283,22 +393,41 @@ class Acceptance:
                 # owned group so a timed-out test cannot outlive its services.
                 if not pid_namespace:
                     os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
+                    process.wait(timeout=10)
                 timed_out = True
             finally:
                 if pid_namespace:
                     # Keep the sudo leader unreaped through the group kill.
                     # PID1 death also kills detached browser/native sessions.
-                    stop_owned(process)
+                    try:
+                        stop_owned(process)
+                    except (OSError, RuntimeError, subprocess.SubprocessError):
+                        raise RuntimeError("Acceptance owned process cleanup failed") from None
         output = log.read_text(errors="replace")
         # Scan bytes through stdin: avoid reading the adjacent credential files
         # and avoid source allowlists/inline exclusions applying to fresh logs.
-        scan = subprocess.run(
-            [self.gitleaks, "stdin", "--redact=100", "--ignore-gitleaks-allow", "--no-banner"],
-            input=output, text=True, capture_output=True, cwd=self.root,
-        )
+        try:
+            scan = subprocess.run(
+                [self.gitleaks, "stdin", "--redact=100", "--ignore-gitleaks-allow", "--no-banner"],
+                input=output, text=True, capture_output=True, cwd=self.root, timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            raise RuntimeError("Acceptance log credential scanner failed; raw log withheld") from None
         if scan.returncode:
             raise RuntimeError(f"{label} log failed credential scanning; raw log withheld")
+        # An outer clean scan cannot excuse an inner failed scan or loss of
+        # cleanup ownership. Namespace errors are always infrastructure faults.
+        if pid_namespace and "Element process containment failed; raw diagnostics withheld" in output:
+            raise RuntimeError("Acceptance process containment failed")
+        if element_checks and re.search(r"^MORPHEUS_ELEMENT_FAILURE (?:log_scan|fixture_operation)$", output, re.MULTILINE):
+            raise RuntimeError("Element acceptance infrastructure or cleanup failed")
+        if ring_case is not None and (ring_evidence(output).get("cleanup") is False
+                                     or ring_diagnostics(output).get("failure") == "cleanup"):
+            raise RuntimeError("Outgoing invitation acceptance cleanup failed")
+        recoverable = pid_namespace and (
+            ((test or ring_case is not None) and ran_native_test(output))
+            or (element_checks and element_diagnostics(output).get("stage") in ELEMENT_TEST_STAGES)
+        )
         if process.returncode or timed_out:
             # Scanner coverage is not a guarantee: arbitrary server errors can
             # reflect secrets without a recognizable prefix. Never publish raw
@@ -321,6 +450,8 @@ class Acceptance:
             late_join = LATE_JOIN_EVIDENCE.findall(output)
             if late_join:
                 evidence["late_join_historical_member"] = [value == "true" for value in late_join]
+            if diagnostics := rtc_diagnostics(output):
+                evidence["rtc_diagnostics"] = diagnostics
             if oauth_checks:
                 evidence["oauth_checks"] = oauth_evidence(output)
             if diagnostics := oauth_diagnostics(output):
@@ -339,10 +470,26 @@ class Acceptance:
                 if timed_out:
                     evidence["ring_diagnostics"]["failure"] = "deadline"
             print(json.dumps(evidence), flush=True)
+            if recoverable:
+                raise CheckFailure(label, "deadline" if timed_out else "test_failed")
             if timed_out:
                 raise RuntimeError(f"{label} exceeded its {seconds}-second deadline")
             raise RuntimeError(f"{label} failed with exit status {process.returncode}")
-        record = {"check": label, "seconds": round(time.monotonic() - started, 2)}
+        try:
+            record = self.validated_record(label, output, test=test, ring_case=ring_case,
+                                           oauth_checks=oauth_checks, element_checks=element_checks)
+        except RuntimeError:
+            if recoverable:
+                raise CheckFailure(label, "evidence_incomplete") from None
+            raise
+        record["seconds"] = round(time.monotonic() - started, 2)
+        print(json.dumps(record | {"status": "passed"}), flush=True)
+        self.results.append(record)
+        write_private(self.root / "results.json", json.dumps(self.results, indent=2) + "\n")
+        return output
+
+    def validated_record(self, label, output, *, test, ring_case, oauth_checks, element_checks):
+        record = {"check": label}
         if ring_case is not None:
             try:
                 record["passed"] = ring_passed_tests(output)
@@ -373,14 +520,11 @@ class Acceptance:
             record["element_checks"] = element_evidence(output, complete=True)
             record["element_peer"] = {"version": ELEMENT_VERSION, "image_digest": ELEMENT_IMAGE_DIGEST,
                                       "protocol": "matrix_2_0_sticky2025", "baseline": "presynced"}
-        print(json.dumps(record | {"status": "passed"}), flush=True)
-        self.results.append(record)
-        write_private(self.root / "results.json", json.dumps(self.results, indent=2) + "\n")
-        return output
+        return record
 
     def script(self, name: str, command: str) -> str:
         return self.run(f"{name}-{command}", [sys.executable, f"scripts/{name}.py", command],
-                        seconds=300)
+                        seconds=120 if command == "down" else 300, cleanup=command == "down")
 
     def test(self, name: str, fixture: Path, *, extra=None, rtc=False):
         env = {"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture)} | (extra or {})
@@ -391,33 +535,37 @@ class Acceptance:
         label = name + ("-classic" if env.get("MORPHEUS_MATRIX_SEARCH_CLASSIC") else "")
         if env.get("MORPHEUS_RTC_LATE_JOIN") == "1":
             label += "-late-join"
-        self.run(label, args, extra=env, test=True)
+        self.run(label, args, extra=env, test=True, pid_namespace=True)
 
     def rtc_cases(self):
         # The second run gets different users/room: existing devices and keys
         # would hide a regression in encrypted sticky membership for late join.
         for late_join in (False, True):
-            fixture = fixture_from_output(self.script("local_matrix_rtc", "rtc-fixture"), self.root)
-            extra = {"MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": str(fixture)}
-            if late_join:
-                extra["MORPHEUS_RTC_LATE_JOIN"] = "1"
-            self.test("local_rtc", fixture, rtc=True, extra=extra)
+            def case():
+                fixture = fixture_from_output(self.script("local_matrix_rtc", "rtc-fixture"), self.root)
+                extra = {"MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": str(fixture)}
+                if late_join:
+                    extra["MORPHEUS_RTC_LATE_JOIN"] = "1"
+                self.test("local_rtc", fixture, rtc=True, extra=extra)
+            self.group(("local_rtc-late-join" if late_join else "local_rtc",), case)
 
     def outgoing_ring_cases(self):
         # Each mode/target uses new users and an encrypted room. Existing
         # devices, memberships or notification events cannot satisfy its gate.
-        for mode in ("current", "sticky-2025"):
-            for target in ("dm", "room"):
+        for mode, target in RING_CASES:
+            label = f"outgoing-ring-{mode}-{target}"
+            def case():
                 fixture = fixture_from_output(self.script("local_matrix_rtc", "rtc-fixture"), self.root)
                 self.run(
-                    f"outgoing-ring-{mode}-{target}",
+                    label,
                     ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
                      "--bin", "morpheus-app", RING_TEST, "--", "--ignored", "--exact", "--show-output",
                      "--test-threads=1"],
                     extra={"MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": str(fixture),
                            "MORPHEUS_RING_TEST_MODE": mode, "MORPHEUS_RING_TEST_TARGET": target},
-                    ring_case=(mode, target), seconds=300,
+                    ring_case=(mode, target), seconds=300, pid_namespace=True,
                 )
+            self.group((label,), case)
 
     def oauth_cases(self):
         """Separate processes prove that refresh tokens survive vaulted restart."""
@@ -436,7 +584,7 @@ class Acceptance:
                     extra={"MORPHEUS_MATRIX_OAUTH_FIXTURE": str(fixture),
                            "MORPHEUS_MATRIX_OAUTH_PROFILE": str(profile),
                            "MORPHEUS_MATRIX_OAUTH_PHASE": phase},
-                    test=True, oauth_checks=required, seconds=600,
+                    test=True, oauth_checks=required, seconds=600, pid_namespace=True,
                 )
         except BaseException:
             failed = True
@@ -446,38 +594,29 @@ class Acceptance:
                 cleanup = helper + ["down", "--root", str(services)]
                 if failed:
                     cleanup.append("--keep-data")
-                self.run("oauth-services-down", cleanup, seconds=120)
+                self.run("oauth-services-down", cleanup, seconds=120, cleanup=True)
             except (RuntimeError, OSError):
-                # Keep the failed test as the primary diagnostic, but do not
-                # claim a passing run when its owned service cleanup failed.
-                if not failed:
-                    raise
-                print("OAuth fixture cleanup incomplete; private state retained", file=sys.stderr)
+                # Never let a recoverable assertion hide a failed trust/service
+                # cleanup. Its earlier fixed diagnostics are already public.
+                raise RuntimeError("OAuth fixture cleanup incomplete; private state retained") from None
 
     def element_case(self):
-        self.run("element-process-containment", [sys.executable, "scripts/element_process_namespace.py",
-                 "--check", str(self.root / "element-containment-probe")], seconds=60)
+        self.require_containment()
         fixture = fixture_from_output(self.script("local_matrix_rtc", "rtc-fixture"), self.root)
         root = self.root / "element-interop"
-        failed = False
         try:
             self.run("element-call-rc-sticky2025-presynced", [
                 sys.executable, "scripts/run_element_acceptance.py", "--root", str(root),
                 "--fixture", str(fixture), "--gitleaks", self.gitleaks,
             ], element_checks=True, seconds=1800, pid_namespace=True)
-        except BaseException:
-            failed = True
-            raise
         finally:
             # A separate cleanup also covers a killed helper, using only its
             # private nonce ownership record. It never touches shared services.
             try:
                 self.run("element-fixture-down", [sys.executable, "scripts/element_peer_fixture.py", "down",
-                         "--root", str(root / "service"), "--keep-data"], seconds=100)
+                         "--root", str(root / "service"), "--keep-data"], seconds=100, cleanup=True)
             except (RuntimeError, OSError):
-                if not failed:
-                    raise
-                print("Element peer cleanup incomplete; private state retained", file=sys.stderr)
+                raise RuntimeError("Element peer cleanup incomplete; private state retained") from None
 
     def start_keyring(self):
         # This D-Bus session and empty-password keyring exist only on a fresh
@@ -510,7 +649,7 @@ class Acceptance:
              (FIXTURE_NETWORK,)),
         ):
             try:
-                output = self.run(label, command, seconds=30)
+                output = self.run(label, command, seconds=30, cleanup=True)
             except (RuntimeError, OSError):
                 query_failed = True
                 continue
@@ -521,6 +660,12 @@ class Acceptance:
             raise RuntimeError("Disposable Matrix fixture resources remain after cleanup")
 
     def summary(self):
+        completed = {item["check"] for item in self.results + self.failures}
+        unexecuted = {label: self.not_run.get(label, "prerequisite_failed")
+                      for label in PLANNED_CHECKS if label not in completed}
+        write_private(self.root / "outcomes.json", json.dumps({
+            "passed": self.results, "failed": self.failures, "not_run": unexecuted,
+        }, indent=2) + "\n")
         summary = os.environ.get("GITHUB_STEP_SUMMARY")
         if summary:
             with open(summary, "a", encoding="utf-8") as output:
@@ -533,6 +678,13 @@ class Acceptance:
                         output.write(f"| {item['check']} | {item['passed']} | {item['seconds']} |\n")
                     elif "element_checks" in item:
                         output.write(f"| {item['check']} | {len(item['element_checks'])} protocol assertions | {item['seconds']} |\n")
+                if self.failures or unexecuted:
+                    output.write("\nRequired checks are incomplete; passing rows do not make this run pass.\n\n")
+                    output.write("| Check | Outcome |\n| --- | --- |\n")
+                    for item in self.failures:
+                        output.write(f"| {item['check']} | Failed: {item['reason']} |\n")
+                    for label, reason in unexecuted.items():
+                        output.write(f"| {label} | Not run: {reason} |\n")
                 if any("element_checks" in item for item in self.results):
                     output.write(f"\nElement peer passed: `{ELEMENT_VERSION}`, `{ELEMENT_IMAGE_DIGEST}`. "
                                  "Only its pre-synced Sticky2025 mode was tested, with two-way synthetic video, "
@@ -540,14 +692,17 @@ class Acceptance:
                                  "v0.26.1 Matrix 2.0, Morpheus's Current default, fresh-device late join, "
                                  "native-to-browser audio, or full call release acceptance.\n")
                 if any("ring_checks" in item for item in self.results):
-                    output.write("\nOutgoing invitation rows verify the actual app sender, fetched and decrypted "
-                                 "encrypted events by receipt, and server redaction for the listed modes and targets. "
-                                 "They do not verify incoming ringing, notification presentation, or Element receipt.\n")
+                    output.write("\nInvitation rows verify the actual app sender, unsolicited encrypted sync "
+                                 "receipt with authenticated device metadata, independently fetched events, and "
+                                 "server and sync-cache redaction for the listed modes and targets. "
+                                 "They do not verify incoming call UI, audible ringing, offline/restart replay, "
+                                 "or Element receipt.\n")
                 output.write("\nNo fixture credentials or installers were uploaded. Physical-device, UI, "
                              "OS-browser handoff, broader Element Call interoperability, and installed-package gates remain separate.\n")
 
 
 def main():
+    started = time.monotonic()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gitleaks", required=True)
     args = parser.parse_args()
@@ -574,33 +729,44 @@ def main():
         if set(result.stdout.splitlines()).intersection(names):
             raise RuntimeError("Pre-existing Matrix fixture found; refusing to modify it")
     root = Path(tempfile.mkdtemp(prefix="morpheus-hosted-acceptance-", dir=os.environ.get("RUNNER_TEMP")))
-    acceptance = Acceptance(root, args.gitleaks)
+    acceptance = Acceptance(root, args.gitleaks, started=started)
     body_failed = False
     try:
         acceptance.start_keyring()
+        acceptance.require_containment()
         acceptance.script("local_matrix_env", "up")
         fixture = fixture_from_output(str(root / "accounts.json"), root)
-        for name in CHAT_TESTS:
-            acceptance.test(name, fixture)
-        acceptance.test("search_local", fixture, extra={"MORPHEUS_MATRIX_SEARCH_CLASSIC": "1"})
-        recovery = fixture_from_output(acceptance.script("local_matrix_env", "recovery-fixture"), root)
-        acceptance.test("recovery_local", recovery, extra={"MORPHEUS_MATRIX_TEST_RECOVERY": "1"})
-        acceptance.oauth_cases()
+        def chat():
+            for name in CHAT_TESTS:
+                acceptance.test(name, fixture)
+            acceptance.test("search_local", fixture, extra={"MORPHEUS_MATRIX_SEARCH_CLASSIC": "1"})
+        acceptance.group(CHAT_CHECKS, chat)
+        def recovery_case():
+            recovery = fixture_from_output(acceptance.script("local_matrix_env", "recovery-fixture"), root)
+            acceptance.test("recovery_local", recovery, extra={"MORPHEUS_MATRIX_TEST_RECOVERY": "1"})
+        acceptance.group(("recovery_local",), recovery_case)
+        acceptance.group(OAUTH_LABELS, acceptance.oauth_cases)
         # Message, draft, recovery and OAuth checks use their own services and
         # do not require RTC. Collect that evidence before RTC bootstrap, while
         # preserving fatal failures and the same unconditional cleanup below.
-        acceptance.script("local_matrix_rtc", "up")
-        acceptance.script("local_matrix_rtc", "probe")
-        gate = fixture_from_output(acceptance.script("local_matrix_env", "rtc-gate-fixture"), root)
-        acceptance.test("unsupported_transport_local", gate, rtc=True,
-                        extra={"MORPHEUS_MATRIX_RTC_GATE_TEST_ACCOUNTS": str(gate)})
-        acceptance.outgoing_ring_cases()
-        acceptance.rtc_cases()
-        acceptance.element_case()
+        def rtc_checks():
+            acceptance.script("local_matrix_rtc", "up")
+            acceptance.script("local_matrix_rtc", "probe")
+            def unsupported_case():
+                gate = fixture_from_output(acceptance.script("local_matrix_env", "rtc-gate-fixture"), root)
+                acceptance.test("unsupported_transport_local", gate, rtc=True,
+                                extra={"MORPHEUS_MATRIX_RTC_GATE_TEST_ACCOUNTS": str(gate)})
+            acceptance.group(("unsupported_transport_local",), unsupported_case)
+            acceptance.outgoing_ring_cases()
+            acceptance.rtc_cases()
+            acceptance.group((ELEMENT_LABEL,), acceptance.element_case)
+        acceptance.group(RTC_CHECKS, rtc_checks)
+        acceptance.finish_checks()
     except BaseException:
         body_failed = True
         raise
     finally:
+        acceptance.finalizing = True
         summary_failed = False
         try:
             acceptance.summary()

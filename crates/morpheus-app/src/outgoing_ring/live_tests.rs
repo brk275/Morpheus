@@ -1,5 +1,7 @@
-//! Hosted, opt-in sender-event acceptance. Bob fetches by the actual helper
-//! receipt; this does not establish unsolicited notification delivery or rings.
+//! Hosted, opt-in invitation acceptance. Bob must discover an authenticated
+//! notification from his sync stream before receiving the sender's event ID.
+//! Separate GET and redaction assertions still check the server receipt. This
+//! does not establish incoming call UI, audible ringing, or Element receipt.
 //! Each invocation requires a fresh private loopback RTC fixture and two fresh
 //! AccountManager stores. No media publication or capture device is opened.
 
@@ -10,7 +12,7 @@ use matrix_sdk::{
     Client,
     deserialized_responses::TimelineEvent,
     ruma::{
-        EventId,
+        EventId, MilliSecondsSinceUnixEpoch,
         api::client::{room::get_room_event, uiaa},
     },
 };
@@ -39,10 +41,12 @@ enum Stage {
     Join,
     Membership,
     Send,
+    Receive,
     Fetch,
     Validate,
     Redact,
     Redaction,
+    ReceiptRedaction,
     Cleanup,
 }
 
@@ -58,10 +62,12 @@ impl Stage {
             Self::Join => "join",
             Self::Membership => "membership",
             Self::Send => "send",
+            Self::Receive => "receive",
             Self::Fetch => "fetch",
             Self::Validate => "validate",
             Self::Redact => "redact",
             Self::Redaction => "redaction",
+            Self::ReceiptRedaction => "receipt_redaction",
             Self::Cleanup => "cleanup",
         }
     }
@@ -325,6 +331,21 @@ impl Session {
         .map_err(|_| ())??;
         fact("encrypted_membership");
 
+        // Subscribe before the snapshot and before sending. This receiver
+        // learns the event ID only from Bob's SDK sync, never Alice's receipt
+        // or a GET request. An overflow/lag cannot count as successful delivery.
+        let mut incoming = bob_room.sticky_events().subscribe_keyless();
+        let initial = bob_room.sticky_events().keyless_live();
+        require(!initial.invalidated)?;
+        let incoming_generation = initial.generation;
+        require(initial.events.iter().all(|event| {
+            let kind: Option<String> = event.raw().get_field("type").ok().flatten();
+            !matches!(
+                kind.as_deref(),
+                Some("m.rtc.notification" | "org.matrix.msc4075.rtc.notification")
+            )
+        }))?;
+
         phase(&mut self.stage, Stage::Send);
         let selection = self.alice.account_selection(&alice.id).ok_or(())?;
         let active_token = AtomicU64::new(1);
@@ -349,12 +370,83 @@ impl Session {
         let receipt = self.receipt.as_ref().ok_or(())?;
         fact("invitation_receipt");
 
+        phase(&mut self.stage, Stage::Receive);
+        let discovered = time::timeout(Duration::from_secs(20), async {
+            loop {
+                // Reject an already-lagged stream even when the snapshot
+                // would satisfy this assertion. Bound draining so update floods
+                // cannot keep this task from reaching its outer deadline.
+                let mut drained = false;
+                for _ in 0..64 {
+                    match incoming.try_recv() {
+                        Ok(update) => require(
+                            !update.invalidated && update.generation == incoming_generation,
+                        )?,
+                        Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                            drained = true;
+                            break;
+                        }
+                        Err(_) => return Err(()),
+                    }
+                }
+                require(drained)?;
+                let snapshot = bob_room.sticky_events().keyless_live();
+                require(!snapshot.invalidated && snapshot.generation == incoming_generation)?;
+                let mut found = None;
+                for event in snapshot.events {
+                    let kind: Option<String> = event.raw().get_field("type").map_err(|_| ())?;
+                    if !matches!(
+                        kind.as_deref(),
+                        Some("m.rtc.notification" | "org.matrix.msc4075.rtc.notification")
+                    ) {
+                        continue;
+                    }
+                    require(event.raw().json().get().len() <= MAX_MEMBERSHIP_BYTES)?;
+                    let encryption = event.encryption_info().ok_or(())?;
+                    require(
+                        encryption.verification_state == VerificationState::Verified
+                            && encryption.sender.as_str() == alice.user_id
+                            && encryption
+                                .sender_device
+                                .as_deref()
+                                .is_some_and(|device| device.as_str() == alice.device_id),
+                    )?;
+                    let raw: Value =
+                        serde_json::from_str(event.raw().json().get()).map_err(|_| ())?;
+                    let parsed =
+                        RingNotification::parse(&raw, case.room_id.as_str()).map_err(|_| ())?;
+                    require(
+                        parsed.sender() == alice.user_id
+                            && parsed.sender() == event.sender.as_str()
+                            && parsed.event_id() == event.event_id.as_str()
+                            && found.is_none(),
+                    )?;
+                    found = Some(event);
+                }
+                if let Some(event) = found {
+                    return Ok::<_, ()>(event);
+                }
+                let update = incoming.recv().await.map_err(|_| ())?;
+                require(!update.invalidated && update.generation == incoming_generation)?;
+            }
+        })
+        .await
+        .map_err(|_| ())??;
+        // Compare only after independently discovering and authenticating it.
+        require(discovered.event_id == receipt.event_id)?;
+        fact("unsolicited_encrypted_notification");
+
         phase(&mut self.stage, Stage::Fetch);
-        let notification = fetch_decrypted(&bob_room, &receipt.event_id, &alice).await?;
+        let notification = fetch_decrypted(&bob_room, &discovered.event_id, &alice).await?;
         fact("fetched_decrypted_notification");
         phase(&mut self.stage, Stage::Validate);
         let envelope: Value =
+            serde_json::from_str(discovered.raw().json().get()).map_err(|_| ())?;
+        // GET may include different unsigned metadata; compare the decrypted
+        // content and identity, leaving all ring checks on the unsolicited copy.
+        let fetched: Value =
             serde_json::from_str(notification.raw().json().get()).map_err(|_| ())?;
+        require(envelope.get("content") == fetched.get("content"))?;
         let parsed = RingNotification::parse(&envelope, case.room_id.as_str()).map_err(|_| ())?;
         require(
             parsed.event_id() == receipt.event_id.as_str() && parsed.sender() == alice.user_id,
@@ -484,6 +576,44 @@ impl Session {
         .await
         .map_err(|_| ())??;
         fact("redaction_observed");
+        phase(&mut self.stage, Stage::ReceiptRedaction);
+        time::timeout(Duration::from_secs(20), async {
+            loop {
+                // Reject an already-lagged stream even when the snapshot
+                // would satisfy this assertion. Bound draining so update floods
+                // cannot keep this task from reaching its outer deadline.
+                let mut drained = false;
+                for _ in 0..64 {
+                    match incoming.try_recv() {
+                        Ok(update) => require(
+                            !update.invalidated && update.generation == incoming_generation,
+                        )?,
+                        Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                            drained = true;
+                            break;
+                        }
+                        Err(_) => return Err(()),
+                    }
+                }
+                require(drained)?;
+                let snapshot = bob_room.sticky_events().keyless_live();
+                require(!snapshot.invalidated && snapshot.generation == incoming_generation)?;
+                // Natural expiry must not satisfy the redaction observation.
+                require(MilliSecondsSinceUnixEpoch::now() < discovered.expires_at)?;
+                if snapshot
+                    .events
+                    .iter()
+                    .all(|event| event.event_id != discovered.event_id)
+                {
+                    return Ok::<_, ()>(());
+                }
+                let update = incoming.recv().await.map_err(|_| ())?;
+                require(!update.invalidated && update.generation == incoming_generation)?;
+            }
+        })
+        .await
+        .map_err(|_| ())??;
+        fact("unsolicited_redaction_observed");
         Ok(())
     }
 
