@@ -8,6 +8,7 @@ mod audio_devices;
 mod call_membership;
 #[cfg(feature = "native-calls")]
 mod calls;
+mod composer_mentions;
 mod drafts;
 #[cfg(feature = "native-calls")]
 mod incoming_ring;
@@ -46,7 +47,7 @@ use morpheus_config::{
 };
 use morpheus_matrix::{
     AccountManager, AttachmentSendUpdate, MatrixLinkTarget, MessageInfo, MessageSearchResult,
-    PublicRoomInfo, PublicRoomsQuery, QueuedSendUpdate, TextFormat, parse_matrix_link_target,
+    PublicRoomInfo, PublicRoomsQuery, TextFormat, parse_matrix_link_target,
 };
 use slint::{Color, Model, ModelRc, SharedString, StyledText, VecModel};
 use url::Url;
@@ -56,7 +57,7 @@ use crate::attachments::{UploadCommand, UploadController, mime_type_for};
 use crate::calls::{
     AudioUpdate, CallController, CallControllerError, CallJoinMode, CallStartIntent, CallStatus,
 };
-use crate::live::{LiveUi, MessageTarget, RoomAction, show_error};
+use crate::live::{LiveUi, RoomAction, show_error};
 #[cfg(feature = "native-calls")]
 use crate::local_video::{CaptureKind, CapturePhase, CaptureSource, LocalVideoStatus};
 use crate::notifications::DesktopNotifications;
@@ -3370,40 +3371,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    let weak = ui.as_weak();
-    let draft_live = live.clone();
-    ui.on_composer_edited(move |body| {
-        if !draft_live.is_live.load(Ordering::Acquire) {
-            return;
-        }
-        if let Some(ui) = weak.upgrade() {
-            if ui.get_composer_mode() != 0 {
-                return;
-            }
-            draft_live.remember_draft(
-                ui.get_active_account_local_id().as_str(),
-                ui.get_active_room_id().as_str(),
-                body.as_str(),
-            );
-        }
-    });
-
-    let weak = ui.as_weak();
-    let formatting_live = live.clone();
-    ui.on_composer_formatting_changed(move |enabled| {
-        if !formatting_live.is_live.load(Ordering::Acquire) {
-            return;
-        }
-        if let Some(ui) = weak.upgrade() {
-            if ui.get_composer_mode() == 0 {
-                formatting_live.remember_markdown(
-                    ui.get_active_account_local_id().as_str(),
-                    ui.get_active_room_id().as_str(),
-                    enabled,
-                );
-            }
-        }
-    });
+    let composer_ui =
+        composer_mentions::ui::ComposerUi::install(&ui, live.clone(), runtime.handle().clone());
 
     let weak = ui.as_weak();
     let attach_live = live.clone();
@@ -3658,6 +3627,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let send_state = state.clone();
     let send_live = live.clone();
     let send_handle = runtime.handle().clone();
+    let send_composers = composer_ui.clone();
     ui.on_open_message_link(move |link| {
         if let Some(url) = safe_message_url(link.as_str()) {
             thread::spawn(move || {
@@ -3687,11 +3657,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let mode = ui.get_composer_mode();
         let markdown = ui.get_composer_markdown();
-        let format = if markdown {
-            TextFormat::Markdown
-        } else {
-            TextFormat::Plain
-        };
         let target_id = ui.get_composer_target_id().to_string();
         let saved_draft = ui.get_composer_saved_draft().to_string();
         if mode != 0 && target_id.is_empty() {
@@ -3702,164 +3667,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui.set_composer_operation(operation);
         ui.set_composer_busy(true);
         if send_live.is_live.load(Ordering::Acquire) {
-            let account_id = ui.get_active_account_local_id().to_string();
-            let room_id = ui.get_active_room_id().to_string();
-            let target = match mode {
-                0 => MessageTarget::Room,
-                1 => MessageTarget::Reply(target_id.clone()),
-                2 => MessageTarget::Edit(target_id.clone()),
-                _ => {
-                    ui.set_composer_busy(false);
-                    ui.set_session_error("Unknown composer action".into());
-                    return;
-                }
-            };
-            let account_for_ui = account_id.clone();
-            let room_for_ui = room_id.clone();
-            let draft_revision = if mode == 0 {
-                // Capture the exact UI submission before any asynchronous
-                // work; a later edit must not be cleared by this send.
-                send_live.remember_draft(&account_id, &room_id, &submitted_text);
-                send_live.draft_revision(&account_id, &room_id)
-            } else {
-                None
-            };
-            let live = send_live.clone();
-            let weak = weak.clone();
-            send_handle.spawn(async move {
-                match live.send(account_id, room_id, message_text, target, format).await {
-                    Ok(queued) => {
-                        let tracked = queued.as_ref().is_some_and(|queued| {
-                            draft_revision.is_some_and(|revision| {
-                                live.mark_queued_draft(
-                                    &account_for_ui,
-                                    &room_for_ui,
-                                    &submitted_text,
-                                    revision,
-                                    queued.transaction_id(),
-                                )
-                            })
-                        });
-                        let watcher_ui = weak.clone();
-                        let watcher_live = live.clone();
-                        let watcher_account = account_for_ui.clone();
-                        let watcher_room = room_for_ui.clone();
-                        let watcher_text = submitted_text.clone();
-                        let _ = weak.upgrade_in_event_loop(move |ui| {
-                            if ui.get_active_account_local_id().as_str() == account_for_ui
-                                && ui.get_active_room_id().as_str() == room_for_ui
-                                && ui.get_composer_operation() == operation
-                            {
-                                if mode == 0 && !tracked {
-                                    ui.set_composer_busy(false);
-                                    return;
-                                }
-                                finish_composer_submission(
-                                    &ui,
-                                    operation,
-                                    mode,
-                                    &target_id,
-                                    &submitted_text,
-                                    markdown,
-                                    &saved_draft,
-                                );
-                            }
-                        });
-                        if let Some(mut queued) = queued.filter(|_| tracked) {
-                            tokio::spawn(async move {
-                                let transaction_id = queued.transaction_id().to_owned();
-                                loop {
-                                    match queued.next_update().await {
-                                        QueuedSendUpdate::Sent => {
-                                            watcher_live.resolve_queued_draft(
-                                                &watcher_account,
-                                                &watcher_room,
-                                                &transaction_id,
-                                                true,
-                                            );
-                                            let account = watcher_account.clone();
-                                            let room = watcher_room.clone();
-                                            let _ = watcher_ui.upgrade_in_event_loop(move |ui| {
-                                                if ui.get_active_account_local_id().as_str() == account
-                                                    && ui.get_active_room_id().as_str() == room
-                                                    && ui.get_transfer_notice().as_str()
-                                                        == "Message queued for retry; it may still send"
-                                                {
-                                                    ui.set_transfer_notice("Message sent".into());
-                                                }
-                                            });
-                                            break;
-                                        }
-                                        QueuedSendUpdate::Retained { recoverable } => {
-                                            let account = watcher_account.clone();
-                                            let room = watcher_room.clone();
-                                            let _ = watcher_ui.upgrade_in_event_loop(move |ui| {
-                                                if ui.get_active_account_local_id().as_str() == account
-                                                    && ui.get_active_room_id().as_str() == room
-                                                {
-                                                    if recoverable {
-                                                        ui.set_transfer_notice("Message queued for retry; it may still send".into());
-                                                    } else {
-                                                        ui.set_session_error("Message send paused; the request is still queued. Do not send a duplicate".into());
-                                                    }
-                                                }
-                                            });
-                                        }
-                                        QueuedSendUpdate::Cancelled => {
-                                            let restored = watcher_live.resolve_queued_draft(
-                                                &watcher_account,
-                                                &watcher_room,
-                                                &transaction_id,
-                                                false,
-                                            );
-                                            let _ = watcher_ui.upgrade_in_event_loop(move |ui| {
-                                                if ui.get_active_account_local_id().as_str() == watcher_account
-                                                    && ui.get_active_room_id().as_str() == watcher_room
-                                                {
-                                                    if restored
-                                                        && ui.get_composer_mode() == 0
-                                                        && ui.get_composer_text().is_empty()
-                                                    {
-                                                        ui.set_composer_text(watcher_text.into());
-                                                    }
-                                                    ui.set_transfer_notice("Queued message cancelled; draft retained".into());
-                                                }
-                                            });
-                                            break;
-                                        }
-                                        QueuedSendUpdate::Unknown => {
-                                            let _ = watcher_ui.upgrade_in_event_loop(move |ui| {
-                                                if ui.get_active_account_local_id().as_str() == watcher_account
-                                                    && ui.get_active_room_id().as_str() == watcher_room
-                                                {
-                                                    ui.set_session_error("Could not confirm send; the queued message may still send. Check the room before another message".into());
-                                                }
-                                            });
-                                            break;
-                                        }
-                                    }
-                                }
-                            });
-                        }
-                    }
-                    Err(error) => {
-                        let error = error.to_string();
-                        let _ = weak.upgrade_in_event_loop(move |ui| {
-                            if ui.get_active_account_local_id().as_str() == account_for_ui
-                                && ui.get_active_room_id().as_str() == room_for_ui
-                                && ui.get_composer_operation() == operation
-                            {
-                                ui.set_composer_busy(false);
-                                if ui.get_composer_mode() == mode
-                                    && ui.get_composer_target_id().as_str() == target_id
-                                {
-                                    ui.set_session_error(error.into());
-                                }
-                            }
-                        });
-                    }
-                }
-            });
+            send_composers.send(&ui, &send_live, &send_handle, false);
             return;
         }
         let mut state = send_state.borrow_mut();
@@ -4001,21 +3809,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let weak = ui.as_weak();
-    let thread_draft_live = live.clone();
-    ui.on_thread_composer_edited(move |body| {
-        if thread_draft_live.is_live.load(Ordering::Acquire)
-            && let Some(ui) = weak.upgrade()
-        {
-            thread_draft_live.remember_thread_draft(
-                ui.get_active_account_local_id().as_str(),
-                ui.get_active_room_id().as_str(),
-                ui.get_thread_root_id().as_str(),
-                body.as_str(),
-            );
-        }
-    });
-
-    let weak = ui.as_weak();
     let thread_state = state.clone();
     let thread_live = live.clone();
     let thread_handle = runtime.handle().clone();
@@ -4027,11 +3820,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let room_id = ui.get_active_room_id().to_string();
         if thread_live.is_live.load(Ordering::Acquire) {
             let account_id = ui.get_active_account_local_id().to_string();
-            ui.set_thread_composer_text(
-                thread_live
-                    .thread_draft(&account_id, &room_id, &event_id)
-                    .into(),
-            );
+            let draft = thread_live.composed_draft(&account_id, &room_id, Some(&event_id));
+            ui.set_thread_composer_text(draft.body.into());
+            ui.set_thread_markdown(draft.format == TextFormat::Markdown);
             ui.set_thread_send_pending(thread_live.thread_send_pending(
                 &account_id,
                 &room_id,
@@ -4087,6 +3878,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let thread_send_state = state.clone();
     let thread_send_live = live.clone();
     let thread_send_handle = runtime.handle().clone();
+    let thread_send_composers = composer_ui.clone();
     ui.on_send_thread_message(move |body| {
         let submitted = body.to_string();
         let trimmed = submitted.trim().to_owned();
@@ -4102,99 +3894,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let room_id = ui.get_active_room_id().to_string();
         if thread_send_live.is_live.load(Ordering::Acquire) {
-            let account_id = ui.get_active_account_local_id().to_string();
-            if !thread_send_live.begin_thread_send(&account_id, &room_id, &root_id) {
-                ui.set_transfer_notice("Thread reply is still queued; it may still send".into());
-                return;
-            }
-            thread_send_live.remember_thread_draft(&account_id, &room_id, &root_id, &submitted);
-            let revision = thread_send_live.thread_draft_revision(&account_id, &room_id, &root_id);
-            ui.set_thread_send_pending(true);
-            ui.set_transfer_notice("Thread reply queued; text stays until delivery is confirmed".into());
-            let live = thread_send_live.clone();
-            let weak = weak.clone();
-            thread_send_handle.spawn(async move {
-                let result = live
-                    .send(
-                        account_id.clone(),
-                        room_id.clone(),
-                        trimmed,
-                        MessageTarget::Thread(root_id.clone()),
-                        TextFormat::Plain,
-                    )
-                    .await;
-                match result {
-                    Ok(Some(mut queued)) => loop {
-                        // Queue acceptance is not delivery. Observe this exact
-                        // SDK transaction without holding the account lock.
-                        let update = queued.next_update().await;
-                        let cleared_revision = if update == QueuedSendUpdate::Sent {
-                            revision.and_then(|revision| live.acknowledge_thread_draft(
-                                &account_id, &room_id, &root_id, &submitted, revision,
-                            ))
-                        } else { None };
-                        if matches!(update, QueuedSendUpdate::Sent | QueuedSendUpdate::Cancelled) {
-                            live.finish_thread_send(&account_id, &room_id, &root_id);
-                        }
-                        let notice = match update {
-                            QueuedSendUpdate::Sent => "Thread reply sent",
-                            QueuedSendUpdate::Retained { recoverable: true } => "Thread reply queued for retry; it may still send",
-                            QueuedSendUpdate::Retained { recoverable: false } => "Thread reply paused; the request remains queued. Do not send a duplicate",
-                            QueuedSendUpdate::Cancelled => "Queued thread reply cancelled; draft retained",
-                            QueuedSendUpdate::Unknown => "Could not confirm thread reply; it may still send. Restart, then check the thread before sending again",
-                        };
-                        let account = account_id.clone();
-                        let room = room_id.clone();
-                        let root = root_id.clone();
-                        let current = live.clone();
-                        let _ = weak.upgrade_in_event_loop(move |ui| {
-                            if current.is_live.load(Ordering::Acquire)
-                                && ui.get_active_account_local_id().as_str() == account
-                                && ui.get_active_room_id().as_str() == room
-                                && ui.get_thread_root_id().as_str() == root
-                            {
-                                ui.set_thread_send_pending(current.thread_send_pending(&account, &room, &root));
-                                if cleared_revision.is_some()
-                                    && current.thread_draft_revision(&account, &room, &root) == cleared_revision
-                                {
-                                    ui.set_thread_composer_text("".into());
-                                }
-                                ui.set_transfer_notice(notice.into());
-                            }
-                        });
-                        if matches!(update, QueuedSendUpdate::Sent | QueuedSendUpdate::Cancelled | QueuedSendUpdate::Unknown) {
-                            // Unknown deliberately keeps this session's guard:
-                            // the persistent SDK request might still deliver.
-                            break;
-                        }
-                    },
-                    Ok(None) => {
-                        // This target must return a tracker. Fail closed if a
-                        // future adapter violates that contract after queueing.
-                        let _ = weak.upgrade_in_event_loop(move |ui| {
-                            if ui.get_active_account_local_id().as_str() == account_id
-                                && ui.get_active_room_id().as_str() == room_id
-                                && ui.get_thread_root_id().as_str() == root_id
-                            {
-                                ui.set_transfer_notice("Thread delivery could not be tracked; the reply may still send. Restart, then check the thread before sending again".into());
-                            }
-                        });
-                    }
-                    Err(error) => {
-                        live.finish_thread_send(&account_id, &room_id, &root_id);
-                        let message = directory_plain_text(&error.to_string(), 240);
-                        let _ = weak.upgrade_in_event_loop(move |ui| {
-                            if ui.get_active_account_local_id().as_str() == account_id
-                                && ui.get_active_room_id().as_str() == room_id
-                                && ui.get_thread_root_id().as_str() == root_id
-                            {
-                                ui.set_thread_send_pending(live.thread_send_pending(&account_id, &room_id, &root_id));
-                                ui.set_session_error(message.into());
-                            }
-                        });
-                    }
-                }
-            });
+            thread_send_composers.send(&ui, &thread_send_live, &thread_send_handle, true);
             return;
         }
         let mut state = thread_send_state.borrow_mut();

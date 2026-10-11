@@ -1,0 +1,18 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Original Morpheus launcher. Library lookup uses the packaged ELF RUNPATHs.
+set -eu
+case "$0" in
+    */*) MORPHEUS_APPDIR=$(CDPATH= cd -P -- "${0%/*}" && pwd -P) ;;
+    *) printf '%s\n' 'Morpheus launcher path is invalid' >&2; exit 126 ;;
+esac
+case "$MORPHEUS_APPDIR" in
+    /*) ;;
+    *) printf '%s\n' 'Morpheus launcher path is invalid' >&2; exit 126 ;;
+esac
+MORPHEUS_EXECUTABLE="$MORPHEUS_APPDIR/usr/bin/morpheus-app"
+if [ ! -f "$MORPHEUS_EXECUTABLE" ] || [ ! -x "$MORPHEUS_EXECUTABLE" ] || [ -L "$MORPHEUS_EXECUTABLE" ]; then
+    printf '%s\n' 'Morpheus executable is unavailable' >&2
+    exit 126
+fi
+exec "$MORPHEUS_EXECUTABLE" "$@"

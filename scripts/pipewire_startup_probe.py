@@ -311,7 +311,7 @@ def apply_upstream_patch(source: Path) -> None:
     path.write_bytes(modified)
 
 
-def elf_identity(data: bytes, *, library: bool) -> tuple[str, tuple[str, ...]]:
+def elf_identity(data: bytes, *, library: bool, allow_origin_runpath: bool = False) -> tuple[str, tuple[str, ...]]:
     """Bounded ELF64/x86-64 PT_NOTE/DT_SONAME reader; never execute readelf/ldd."""
     def fail():
         raise ProbeFailure("paired_provenance", "elf_identity")
@@ -370,7 +370,7 @@ def elf_identity(data: bytes, *, library: bool) -> tuple[str, tuple[str, ...]]:
     strings, string_size = only(5), only(10)
     matches = [offset + strings - address for kind, offset, address, size in segments
                if kind == 1 and address <= strings and strings + string_size <= address + size]
-    if len(matches) != 1 or string_size > 4 * 1024 * 1024 or any(tag in (15, 29) for tag, _ in entries):
+    if len(matches) != 1 or string_size > 4 * 1024 * 1024 :
         fail()
     table = data[matches[0]:matches[0] + string_size]
     def string(index):
@@ -383,6 +383,9 @@ def elf_identity(data: bytes, *, library: bool) -> tuple[str, tuple[str, ...]]:
             return table[index:end].decode("ascii")
         except UnicodeError:
             fail()
+    search_paths = [(tag, string(value)) for tag, value in entries if tag in (15, 29)]
+    if search_paths and (not allow_origin_runpath or search_paths != [(29, "$ORIGIN")]):
+        fail()
     needed = tuple(sorted(string(value) for tag, value in entries if tag == 1))
     if (string(only(14)) != SONAME or "libc.so.6" not in needed
             or set(needed) - {"libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "libatomic.so.1"}):

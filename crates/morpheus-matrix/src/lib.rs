@@ -23,6 +23,8 @@ mod search;
 pub use search::MessageSearchResult;
 mod formatting;
 pub use formatting::TextFormat;
+mod compose;
+pub use compose::{ComposeError, ComposeText, MentionSpan, MentionTarget, RestoredCompose};
 mod account_selection;
 mod admin;
 mod rich_text;
@@ -96,6 +98,8 @@ pub type Result<T> = std::result::Result<T, MatrixCoreError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MatrixCoreError {
+    #[error(transparent)]
+    Compose(#[from] ComposeError),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
@@ -112,6 +116,10 @@ pub enum MatrixCoreError {
     SelectedAccountChanged,
     #[error("the selected room changed before this action could run")]
     SelectedRoomChanged,
+    #[error(
+        "The message may already be queued. Keep the draft and check the send queue before retrying."
+    )]
+    ComposedSendUncertain,
     #[error("room not found: {0}")]
     RoomNotFound(String),
     #[error("invalid room ID: {0}")]
@@ -558,6 +566,7 @@ struct StoredSecret {
 struct LoadedAccount {
     client: Client,
     timelines: Mutex<HashMap<String, Arc<Timeline>>>,
+    composed_edits: Mutex<HashMap<(String, String), composed_adapter::PendingEdit>>,
     incoming_verification_tx: watch::Sender<Vec<VerificationInfo>>,
     token_task: Mutex<Option<SyncTask>>,
 }
@@ -1313,13 +1322,28 @@ impl AccountManager {
         room_id: &str,
         thread_root: Option<&str>,
     ) -> Result<String> {
+        self.load_composed_draft_for(account_id, room_id, thread_root)
+            .await
+            .map(|draft| draft.text.body)
+    }
+
+    pub async fn load_composed_draft_for(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        thread_root: Option<&str>,
+    ) -> Result<RestoredCompose> {
         let thread_root = thread_root.map(parse_event_id).transpose()?;
         let state = self.state.lock().await;
         let room = account_room(&state, account_id, room_id)?;
-        room.load_composer_draft(thread_root.as_deref())
+        let draft = room
+            .load_composer_draft(thread_root.as_deref())
             .await
-            .map(|draft| draft.map_or_else(String::new, |draft| draft.plain_text))
-            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
+            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
+        Ok(draft.map_or_else(
+            || ComposeText::restore_draft(String::new(), None),
+            |draft| ComposeText::restore_draft(draft.plain_text, draft.html_text.as_deref()),
+        ))
     }
 
     /// Save or clear a room draft in that account's encrypted Matrix SQLite
@@ -1342,18 +1366,30 @@ impl AccountManager {
         thread_root: Option<&str>,
         body: &str,
     ) -> Result<()> {
+        self.save_composed_draft_for(account_id, room_id, thread_root, &ComposeText::plain(body))
+            .await
+    }
+
+    pub async fn save_composed_draft_for(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        thread_root: Option<&str>,
+        text: &ComposeText,
+    ) -> Result<()> {
+        let html = text.draft_html()?;
         let thread_root = thread_root.map(parse_event_id).transpose()?;
         let state = self.state.lock().await;
         let room = account_room(&state, account_id, room_id)?;
-        if body.is_empty() {
+        if text.body.is_empty() {
             room.clear_composer_draft(thread_root.as_deref())
                 .await
                 .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
         } else {
             room.save_composer_draft(
                 ComposerDraft {
-                    plain_text: body.to_owned(),
-                    html_text: None,
+                    plain_text: text.body.clone(),
+                    html_text: Some(html),
                     draft_type: ComposerDraftType::NewMessage,
                     attachments: Vec::new(),
                 },
@@ -2208,6 +2244,7 @@ impl LoadedAccount {
         Self {
             client,
             timelines: Mutex::new(HashMap::new()),
+            composed_edits: Mutex::new(HashMap::new()),
             incoming_verification_tx,
             token_task: Mutex::new(Some(SyncTask {
                 shutdown,
@@ -3239,5 +3276,1562 @@ mod tests {
             },
         );
         assert!(!room_updates_change_space_graph(&updates));
+    }
+}
+
+/// Selected Matrix identities and immutable edit baselines for the composer.
+pub use composed_adapter::{ComposeSendTarget, EditBaseline, EditComposition, MentionCandidate};
+
+mod composed_adapter {
+    use super::*;
+    use matrix_sdk::{
+        config::RequestConfig,
+        ruma::events::{
+            AnyMessageLikeEventContent, AnySyncMessageLikeEvent, AnySyncTimelineEvent, Mentions,
+            SyncMessageLikeEvent,
+            room::{member::MembershipState, message::Relation},
+        },
+        send_queue::LocalEchoContent,
+    };
+    use matrix_sdk_ui::timeline::EventTimelineItem;
+    use std::fmt;
+
+    const MAX_CANDIDATE_MEMBERS: usize = 4096;
+    const MAX_PENDING_EDITS: usize = 32;
+    const MAX_EVENT_BYTES: usize = 512 * 1024;
+    // Leave room for event headers and encrypted/base64 wrapping. A server can
+    // impose a lower limit; queue failure still retains the user's draft.
+    const MAX_ENCODED_COMPOSITION: usize = 44 * 1024;
+
+    #[derive(Clone)]
+    pub struct MentionCandidate {
+        pub target: MentionTarget,
+        pub label: String,
+    }
+    impl fmt::Debug for MentionCandidate {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("MentionCandidate([redacted])")
+        }
+    }
+
+    #[derive(Clone)]
+    pub enum ComposeSendTarget {
+        Room,
+        Reply(String),
+        Thread(String),
+        Edit(String),
+    }
+    impl fmt::Debug for ComposeSendTarget {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(match self {
+                Self::Room => "Room",
+                Self::Reply(_) => "Reply([redacted])",
+                Self::Thread(_) => "Thread([redacted])",
+                Self::Edit(_) => "Edit([redacted])",
+            })
+        }
+    }
+
+    /// RAM-only baseline. A new selection, revision or pending send invalidates
+    /// it; callers cannot manufacture a baseline from presentation text.
+    #[derive(Clone)]
+    pub struct EditBaseline {
+        selection: AccountSelection,
+        room: String,
+        event: String,
+        revision: EditRevision,
+        inherited_reply_sender: Option<matrix_sdk::ruma::OwnedUserId>,
+    }
+    impl EditBaseline {
+        fn matches(&self, selection: &AccountSelection, room: &str, event: &str) -> bool {
+            self.selection.is_current()
+                && selection.is_current()
+                && self.selection.account_id() == selection.account_id()
+                && self.room == room
+                && self.event == event
+        }
+    }
+    impl fmt::Debug for EditBaseline {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("EditBaseline([redacted])")
+        }
+    }
+    pub struct EditComposition {
+        pub text: ComposeText,
+        pub baseline: EditBaseline,
+    }
+
+    #[derive(Clone)]
+    struct EditRevision {
+        original: serde_json::Value,
+        effective: serde_json::Value,
+        latest_edit: Option<String>,
+        mentions: Mentions,
+    }
+
+    impl PartialEq for EditRevision {
+        fn eq(&self, other: &Self) -> bool {
+            self.original == other.original
+                && self.effective == other.effective
+                && self.latest_edit == other.latest_edit
+        }
+    }
+    fn same_mentions(left: Option<&Mentions>, right: &Mentions) -> bool {
+        left.is_some_and(|left| left.room == right.room && left.user_ids == right.user_ids)
+    }
+
+    /// Reserved before entering enqueue, so dropping an uncertain enqueue
+    /// cannot release the target. Retained across account switches. There is
+    /// deliberately no eviction of unresolved records and no background task.
+    pub(super) struct PendingEdit {
+        transaction: Option<String>,
+        updates: broadcast::Receiver<RoomSendQueueUpdate>,
+        sent: Option<String>,
+        uncertain: bool,
+    }
+    impl PendingEdit {
+        fn resolved(&mut self, revision: &EditRevision) -> bool {
+            if self.uncertain {
+                return false;
+            }
+            let Some(transaction) = self.transaction.as_deref() else {
+                return false;
+            };
+            for _ in 0..256 {
+                match self.updates.try_recv() {
+                    Ok(RoomSendQueueUpdate::CancelledLocalEvent { transaction_id })
+                        if transaction_id.as_str() == transaction =>
+                    {
+                        return true;
+                    }
+                    Ok(RoomSendQueueUpdate::SentEvent {
+                        transaction_id,
+                        event_id,
+                    }) if transaction_id.as_str() == transaction => {
+                        self.sent = Some(event_id.to_string())
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::TryRecvError::Empty) => {
+                        return self
+                            .sent
+                            .as_ref()
+                            .is_some_and(|sent| revision.latest_edit.as_ref() == Some(sent));
+                    }
+                    Err(_) => {
+                        self.uncertain = true;
+                        return false;
+                    }
+                }
+            }
+            // A later call can continue draining; no state is guessed on this call.
+            false
+        }
+    }
+
+    fn unavailable() -> MatrixCoreError {
+        MatrixCoreError::Sdk(
+            "This edit is unavailable or changed. Reopen it before sending.".into(),
+        )
+    }
+    fn pending() -> MatrixCoreError {
+        MatrixCoreError::Sdk(
+            "The previous edit is still pending. Keep this draft until its outcome is known."
+                .into(),
+        )
+    }
+    fn mention_unavailable() -> MatrixCoreError {
+        MatrixCoreError::Sdk(
+            "A selected mention is unavailable or is no longer allowed in this room.".into(),
+        )
+    }
+    fn context(selection: &AccountSelection, room: &Room) -> Result<()> {
+        if !selection.is_current() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        if room.state() != RoomState::Joined {
+            return Err(mention_unavailable());
+        }
+        Ok(())
+    }
+    fn label(source: &str) -> String {
+        source
+            .chars()
+            .filter(|ch| {
+                !ch.is_control()
+                    && !matches!(*ch,
+            '\u{061c}'|'\u{200e}'|'\u{200f}'|'\u{202a}'..='\u{202e}'|'\u{2066}'..='\u{2069}')
+            })
+            .take(80)
+            .collect()
+    }
+
+    impl AccountManager {
+        /// At most seven joined users plus an explicitly permitted room row.
+        /// Only this room's local member cache is read: no directory lookup or
+        /// implicit members request occurs per keystroke. Very large or not yet
+        /// loaded rooms may have no suggestions; explicit sends recheck targets.
+        pub async fn mention_candidates_for(
+            &self,
+            selection: &AccountSelection,
+            room_id: &str,
+            query: &str,
+        ) -> Result<Vec<MentionCandidate>> {
+            if query.len() > 128 || query.chars().any(char::is_control) {
+                return Err(mention_unavailable());
+            }
+            tokio::time::timeout(Duration::from_secs(3), async {
+                let state = self.state.lock().await;
+                selected_loaded_for(&state, selection.account_id())?;
+                let room = account_room(&state, selection.account_id(), room_id)?;
+                context(selection, &room)?;
+                let query = query.to_lowercase();
+                let mut result = Vec::new();
+                if room.joined_members_count() <= MAX_CANDIDATE_MEMBERS as u64 {
+                    let mut ids = room
+                        .joined_user_ids()
+                        .await
+                        .map_err(|_| mention_unavailable())?;
+                    context(selection, &room)?;
+                    if ids.len() <= MAX_CANDIDATE_MEMBERS {
+                        ids.sort();
+                        for id in ids {
+                            if id == room.own_user_id() || id.as_str().len() > 255 {
+                                continue;
+                            }
+                            let Some(member) = room
+                                .get_member_no_sync(&id)
+                                .await
+                                .map_err(|_| mention_unavailable())?
+                            else {
+                                continue;
+                            };
+                            context(selection, &room)?;
+                            if member.membership() != &MembershipState::Join {
+                                continue;
+                            }
+                            let display = label(member.display_name().unwrap_or(id.as_str()));
+                            if id.as_str().to_lowercase().contains(&query)
+                                || display.to_lowercase().contains(&query)
+                            {
+                                result.push(MentionCandidate {
+                                    target: MentionTarget::User(id.to_string()),
+                                    label: display,
+                                });
+                                if result.len() == 7 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if "room".starts_with(&query) {
+                    // Missing/malformed power state never becomes permission.
+                    let allowed = room_mention_allowed(&room).await.unwrap_or(false);
+                    context(selection, &room)?;
+                    if allowed {
+                        result.push(MentionCandidate {
+                            target: MentionTarget::Room,
+                            label: "Notify room".into(),
+                        });
+                    }
+                }
+                Ok(result)
+            })
+            .await
+            .map_err(|_| mention_unavailable())?
+        }
+
+        pub async fn edit_composition_for(
+            &self,
+            selection: &AccountSelection,
+            room_id: &str,
+            event_id: &str,
+        ) -> Result<EditComposition> {
+            tokio::time::timeout(Duration::from_secs(15), async {
+                let state = self.state.lock().await;
+                let loaded = selected_loaded_for(&state, selection.account_id())?;
+                let room = account_room(&state, selection.account_id(), room_id)?;
+                context(selection, &room)?;
+                let event_id = parse_event_id(event_id)?;
+                let revision = current_revision(loaded, &room, &event_id).await?;
+                context(selection, &room)?;
+                pending_ready(loaded, &room, &event_id, &revision).await?;
+                context(selection, &room)?;
+                let inherited = inherited_reply_sender(selection, &room, &revision).await?;
+                context(selection, &room)?;
+                let text = restore_edit(&revision, room.own_user_id(), inherited.as_deref())?;
+                if current_revision(loaded, &room, &event_id).await? != revision {
+                    return Err(unavailable());
+                }
+                context(selection, &room)?;
+                Ok(EditComposition {
+                    text,
+                    baseline: EditBaseline {
+                        selection: selection.clone(),
+                        room: room_id.into(),
+                        event: event_id.to_string(),
+                        revision,
+                        inherited_reply_sender: inherited,
+                    },
+                })
+            })
+            .await
+            .map_err(|_| unavailable())?
+        }
+
+        /// All modes subscribe before enqueue. The account lock keeps a switch
+        /// from redirecting the send; the revocable token also rejects A→B→A.
+        /// Once SDK enqueue has begun it is not an atomic server compare-and-set:
+        /// an external edit arriving afterwards cannot be recalled.
+        pub async fn send_composed_tracked_for(
+            &self,
+            selection: &AccountSelection,
+            room_id: &str,
+            target: ComposeSendTarget,
+            text: &ComposeText,
+            baseline: Option<&EditBaseline>,
+        ) -> Result<QueuedMessage> {
+            let text = text.trimmed_for_send()?;
+            if text.body.is_empty() {
+                return Err(mention_unavailable());
+            }
+            let enqueue_entered = std::sync::atomic::AtomicBool::new(false);
+            tokio::time::timeout(Duration::from_secs(20), async {
+                let state = self.state.lock().await;
+                let loaded = selected_loaded_for(&state, selection.account_id())?;
+                let room = account_room(&state, selection.account_id(), room_id)?;
+                context(selection, &room)?;
+                validate_mentions(selection, &room, &text).await?;
+                let queue = room.send_queue();
+                let (_, updates) = queue.subscribe().await.map_err(|_| mention_unavailable())?;
+                context(selection, &room)?;
+                let handle = match target {
+                    ComposeSendTarget::Edit(ref event_id) => {
+                        let baseline = baseline.ok_or_else(unavailable)?;
+                        if !baseline.matches(selection, room_id, event_id) {
+                            return Err(unavailable());
+                        }
+                        let event_id = parse_event_id(event_id)?;
+                        let revision = current_revision(loaded, &room, &event_id).await?;
+                        if revision != baseline.revision {
+                            return Err(unavailable());
+                        }
+                        pending_ready(loaded, &room, &event_id, &revision).await?;
+                        context(selection, &room)?;
+                        let inherited = inherited_reply_sender(selection, &room, &revision).await?;
+                        if inherited != baseline.inherited_reply_sender {
+                            return Err(unavailable());
+                        }
+                        context(selection, &room)?;
+                        let mut new_content =
+                            formatting::compose_related(&text, room.own_user_id())?;
+                        if let Some(sender) = inherited {
+                            new_content
+                                .mentions
+                                .as_mut()
+                                .ok_or_else(unavailable)?
+                                .user_ids
+                                .insert(sender);
+                        }
+                        let mut content = room
+                            .make_edit_event(&event_id, EditedContent::RoomMessage(new_content))
+                            .await
+                            .map_err(|_| unavailable())?;
+                        context(selection, &room)?;
+                        correct_edit_mentions(&mut content, &event_id, &revision.mentions)?;
+                        bounded_event(&content)?;
+                        // Re-read after the SDK's asynchronous author/type/relation
+                        // work; never silently diff against a changed effective edit.
+                        if current_revision(loaded, &room, &event_id).await? != revision {
+                            return Err(unavailable());
+                        }
+                        validate_mentions(selection, &room, &text).await?;
+                        let (echoes, edit_updates) =
+                            queue.subscribe().await.map_err(|_| pending())?;
+                        reject_pending_echoes(&echoes, &event_id)?;
+                        reconcile_pending_capacity(loaded, selection).await?;
+                        if current_revision(loaded, &room, &event_id).await? != revision {
+                            return Err(unavailable());
+                        }
+                        context(selection, &room)?;
+                        let key = (room_id.to_owned(), event_id.to_string());
+                        let mut pending = loaded.composed_edits.lock().await;
+                        context(selection, &room)?;
+                        reserve_pending(&mut pending, key.clone(), edit_updates)?;
+                        let record = pending.get_mut(&key).ok_or_else(self::pending)?;
+                        // This guard is held only across enqueue, never the earlier
+                        // timeline/network preparation. Record the known handle
+                        // without another await that could lose it to the deadline.
+                        enqueue_entered.store(true, std::sync::atomic::Ordering::Release);
+                        let handle = queue
+                            .send(content)
+                            .await
+                            .map_err(|_| MatrixCoreError::ComposedSendUncertain)?;
+                        record.transaction = Some(handle.transaction_id().to_string());
+                        handle
+                    }
+                    ComposeSendTarget::Room => {
+                        if baseline.is_some() {
+                            return Err(unavailable());
+                        }
+                        let content = formatting::compose_room(&text, room.own_user_id())?;
+                        bounded_event(&AnyMessageLikeEventContent::RoomMessage(content.clone()))?;
+                        context(selection, &room)?;
+                        enqueue_entered.store(true, std::sync::atomic::Ordering::Release);
+                        queue
+                            .send(content.into())
+                            .await
+                            .map_err(|_| MatrixCoreError::ComposedSendUncertain)?
+                    }
+                    ComposeSendTarget::Reply(ref event) => {
+                        if baseline.is_some() {
+                            return Err(unavailable());
+                        }
+                        let content = room
+                            .make_reply_event(
+                                formatting::compose_related(&text, room.own_user_id())?,
+                                matrix_sdk::room::reply::Reply {
+                                    event_id: parse_event_id(event)?,
+                                    enforce_thread:
+                                        matrix_sdk::room::reply::EnforceThread::MaybeThreaded,
+                                    add_mentions:
+                                        matrix_sdk::ruma::events::room::message::AddMentions::Yes,
+                                },
+                            )
+                            .await
+                            .map_err(|_| mention_unavailable())?;
+                        context(selection, &room)?;
+                        validate_mentions(selection, &room, &text).await?;
+                        bounded_event(&AnyMessageLikeEventContent::RoomMessage(content.clone()))?;
+                        enqueue_entered.store(true, std::sync::atomic::Ordering::Release);
+                        queue
+                            .send(content.into())
+                            .await
+                            .map_err(|_| MatrixCoreError::ComposedSendUncertain)?
+                    }
+                    ComposeSendTarget::Thread(ref root) => {
+                        if baseline.is_some() {
+                            return Err(unavailable());
+                        }
+                        let timeline = loaded.thread_timeline(room_id, root).await?;
+                        context(selection, &room)?;
+                        validate_mentions(selection, &room, &text).await?;
+                        let content = formatting::compose_room(&text, room.own_user_id())?;
+                        bounded_event(&AnyMessageLikeEventContent::RoomMessage(content.clone()))?;
+                        // SDK adds the correct current-thread fallback and applies
+                        // its own reply-author policy; do not forge relations.
+                        enqueue_entered.store(true, std::sync::atomic::Ordering::Release);
+                        timeline
+                            .send(content.into())
+                            .await
+                            .map_err(|_| MatrixCoreError::ComposedSendUncertain)?
+                    }
+                };
+                // A known handle is still needed for acknowledgement/cleanup
+                // if selection was revoked during enqueue. It grants no right
+                // to update a stale UI; the caller retains its selection guard.
+                Ok(QueuedMessage {
+                    transaction_id: handle.transaction_id().to_string(),
+                    handle,
+                    updates,
+                    finished: false,
+                })
+            })
+            .await
+            .map_err(|_| preparation_timeout(&enqueue_entered))?
+        }
+    }
+
+    fn preparation_timeout(entered: &std::sync::atomic::AtomicBool) -> MatrixCoreError {
+        if entered.load(std::sync::atomic::Ordering::Acquire) {
+            MatrixCoreError::ComposedSendUncertain
+        } else {
+            MatrixCoreError::Sdk(
+                "Message preparation timed out before enqueue. The draft is unchanged.".into(),
+            )
+        }
+    }
+
+    async fn room_mention_allowed(room: &Room) -> Result<bool> {
+        use matrix_sdk::{
+            deserialized_responses::RawSyncOrStrippedState,
+            ruma::events::room::power_levels::RoomPowerLevelsEventContent,
+        };
+        let state = room
+            .get_state_event_static::<RoomPowerLevelsEventContent>()
+            .await
+            .map_err(|_| mention_unavailable())?
+            .ok_or_else(mention_unavailable)?;
+        let RawSyncOrStrippedState::Sync(raw) = state else {
+            return Err(mention_unavailable());
+        };
+        if raw.json().get().len() > MAX_EVENT_BYTES {
+            return Err(mention_unavailable());
+        }
+        let content = raw
+            .get_field::<serde_json::Value>("content")
+            .map_err(|_| mention_unavailable())?
+            .ok_or_else(mention_unavailable)?;
+        power_content_shape(&content)?;
+        let event = raw.deserialize().map_err(|_| mention_unavailable())?;
+        let rules = room
+            .version()
+            .and_then(|version| version.rules())
+            .ok_or_else(mention_unavailable)?;
+        let creators = room.creators().ok_or_else(mention_unavailable)?;
+        // Compute from this exact validated snapshot; a second cache fetch could
+        // otherwise validate one revision and authorize using another.
+        Ok(event
+            .power_levels(&rules.authorization, creators)
+            .user_can_trigger_room_notification(room.own_user_id()))
+    }
+    fn power_content_shape(content: &serde_json::Value) -> Result<()> {
+        let object = content.as_object().ok_or_else(mention_unavailable)?;
+        for field in ["users", "events", "notifications"] {
+            if object.get(field).is_some_and(|value| !value.is_object()) {
+                return Err(mention_unavailable());
+            }
+        }
+        Ok(())
+    }
+
+    async fn validate_mentions(
+        selection: &AccountSelection,
+        room: &Room,
+        text: &ComposeText,
+    ) -> Result<()> {
+        context(selection, room)?;
+        for span in &text.mentions {
+            match &span.target {
+                MentionTarget::User(id) => {
+                    let id = parse_user_id(id)?;
+                    let member = room
+                        .get_member_no_sync(&id)
+                        .await
+                        .map_err(|_| mention_unavailable())?;
+                    if !member.is_some_and(|member| member.membership() == &MembershipState::Join) {
+                        return Err(mention_unavailable());
+                    }
+                }
+                MentionTarget::Room => {
+                    if !room_mention_allowed(room).await? {
+                        return Err(mention_unavailable());
+                    }
+                }
+            }
+            context(selection, room)?;
+        }
+        Ok(())
+    }
+
+    fn reserve_pending(
+        entries: &mut HashMap<(String, String), PendingEdit>,
+        key: (String, String),
+        updates: broadcast::Receiver<RoomSendQueueUpdate>,
+    ) -> Result<()> {
+        if entries.contains_key(&key) || entries.len() >= MAX_PENDING_EDITS {
+            return Err(pending());
+        }
+        entries.insert(
+            key,
+            PendingEdit {
+                transaction: None,
+                updates,
+                sent: None,
+                uncertain: false,
+            },
+        );
+        Ok(())
+    }
+
+    fn retire_resolved(
+        records: &mut HashMap<(String, String), PendingEdit>,
+        key: &(String, String),
+        revision: &EditRevision,
+    ) -> bool {
+        let resolved = records
+            .get_mut(key)
+            .is_some_and(|record| record.resolved(revision));
+        if resolved {
+            records.remove(key);
+        }
+        resolved
+    }
+
+    async fn reconcile_pending_capacity(
+        loaded: &LoadedAccount,
+        selection: &AccountSelection,
+    ) -> Result<()> {
+        let keys: Vec<_> = {
+            let records = loaded.composed_edits.lock().await;
+            if records.len() < MAX_PENDING_EDITS {
+                return Ok(());
+            }
+            records.keys().cloned().collect()
+        };
+        // Reclaim only records whose SDK acknowledgement and actual current
+        // effective edit agree. Unknown/lagged results are never capacity victims.
+        // No pending-map guard is retained over a timeline/store await.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            for key in keys.into_iter().take(MAX_PENDING_EDITS) {
+                if !selection.is_current() {
+                    return Err(MatrixCoreError::SelectedAccountChanged);
+                }
+                let Ok(room_id) = RoomId::parse(&key.0) else {
+                    continue;
+                };
+                let Some(room) = loaded.client.get_room(&room_id) else {
+                    continue;
+                };
+                if room.state() != RoomState::Joined {
+                    continue;
+                }
+                let Ok(event) = parse_event_id(&key.1) else {
+                    continue;
+                };
+                let revision = current_revision(loaded, &room, &event).await;
+                if !selection.is_current() {
+                    return Err(MatrixCoreError::SelectedAccountChanged);
+                }
+                if room.state() != RoomState::Joined {
+                    continue;
+                }
+                if let Ok(revision) = revision {
+                    let mut records = loaded.composed_edits.lock().await;
+                    if !selection.is_current() {
+                        return Err(MatrixCoreError::SelectedAccountChanged);
+                    }
+                    retire_resolved(&mut records, &key, &revision);
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| pending())?
+    }
+
+    async fn pending_ready(
+        loaded: &LoadedAccount,
+        room: &Room,
+        event: &EventId,
+        revision: &EditRevision,
+    ) -> Result<()> {
+        let (echoes, _) = room.send_queue().subscribe().await.map_err(|_| pending())?;
+        reject_pending_echoes(&echoes, event)?;
+        let key = (room.room_id().to_string(), event.to_string());
+        let mut pending = loaded.composed_edits.lock().await;
+        if pending.contains_key(&key) && !retire_resolved(&mut pending, &key, revision) {
+            return Err(self::pending());
+        }
+        Ok(())
+    }
+    fn reject_pending_echoes(
+        echoes: &[matrix_sdk::send_queue::LocalEcho],
+        event: &EventId,
+    ) -> Result<()> {
+        if echoes.len() > 256 {
+            return Err(pending());
+        }
+        for echo in echoes {
+            if let LocalEchoContent::Event {
+                serialized_event, ..
+            } = &echo.content
+            {
+                if let AnyMessageLikeEventContent::RoomMessage(content) =
+                    serialized_event.deserialize().map_err(|_| pending())?
+                {
+                    if matches!(content.relates_to, Some(Relation::Replacement(ref replacement)) if replacement.event_id == event)
+                    {
+                        return Err(pending());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    fn bounded_event(content: &AnyMessageLikeEventContent) -> Result<()> {
+        let encoded = serde_json::to_vec(content).map_err(|_| mention_unavailable())?;
+        if encoded.len() > MAX_ENCODED_COMPOSITION {
+            return Err(ComposeError::TooLarge.into());
+        }
+        Ok(())
+    }
+
+    async fn current_revision(
+        loaded: &LoadedAccount,
+        room: &Room,
+        event: &EventId,
+    ) -> Result<EditRevision> {
+        // The ordinary room view hides thread messages. Also inspect already
+        // open thread timelines, but never fetch a target into a new view merely
+        // to invent an effective replacement baseline.
+        let timelines: Vec<_> = loaded
+            .timelines
+            .lock()
+            .await
+            .values()
+            .filter(|timeline| timeline.room().room_id() == room.room_id())
+            .cloned()
+            .collect();
+        if timelines.len() > 64 {
+            return Err(unavailable());
+        }
+        let mut found = None;
+        let mut examined = 0usize;
+        for timeline in timelines {
+            let (items, _) = timeline.subscribe().await;
+            examined = examined.saturating_add(items.len());
+            if examined > 16384 {
+                return Err(unavailable());
+            }
+            for item in items.iter().filter_map(|item| item.as_event()) {
+                if item.event_id() != Some(event) {
+                    continue;
+                }
+                let revision = revision_from_item(item, room.own_user_id(), event)?;
+                if found.as_ref().is_some_and(|previous| previous != &revision) {
+                    return Err(unavailable());
+                }
+                found = Some(revision);
+            }
+        }
+        found.ok_or_else(unavailable)
+    }
+    fn revision_from_item(
+        item: &EventTimelineItem,
+        own: &UserId,
+        event: &EventId,
+    ) -> Result<EditRevision> {
+        if !item.is_own() || !item.is_editable() || item.sender() != own {
+            return Err(unavailable());
+        }
+        let message = item.content().as_message().ok_or_else(unavailable)?;
+        let revision = revision_from_raw(
+            item.original_json().ok_or_else(unavailable)?,
+            item.latest_edit_json(),
+            own,
+            event,
+        )?;
+        let effective: RoomMessageEventContentWithoutRelation =
+            serde_json::from_value(revision.effective.clone()).map_err(|_| unavailable())?;
+        if !matches!(message.msgtype(), MessageType::Text(_))
+            || message.body() != effective.msgtype.body()
+            || !same_mentions(message.mentions(), &revision.mentions)
+            || message.is_edited() != revision.latest_edit.is_some()
+        {
+            return Err(unavailable());
+        }
+        Ok(revision)
+    }
+    fn original_message(
+        raw: &Raw<AnySyncTimelineEvent>,
+    ) -> Result<matrix_sdk::ruma::events::room::message::OriginalSyncRoomMessageEvent> {
+        if raw.json().get().len() > MAX_EVENT_BYTES {
+            return Err(unavailable());
+        }
+        let content = raw
+            .get_field::<serde_json::Value>("content")
+            .map_err(|_| unavailable())?
+            .ok_or_else(unavailable)?;
+        content_shape(&content)?;
+        if let Some(replacement) = content.get("m.new_content") {
+            content_shape(replacement)?;
+        }
+        match raw.deserialize().map_err(|_| unavailable())? {
+            AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
+                SyncMessageLikeEvent::Original(event),
+            )) => Ok(event),
+            _ => Err(unavailable()),
+        }
+    }
+    fn content_shape(content: &serde_json::Value) -> Result<()> {
+        let object = content.as_object().ok_or_else(unavailable)?;
+        if !object.get("body").is_some_and(serde_json::Value::is_string)
+            || !object
+                .get("msgtype")
+                .is_some_and(serde_json::Value::is_string)
+        {
+            return Err(unavailable());
+        }
+        if let Some(mentions) = object.get("m.mentions") {
+            let mentions = mentions.as_object().ok_or_else(unavailable)?;
+            if let Some(users) = mentions.get("user_ids") {
+                let users = users.as_array().ok_or_else(unavailable)?;
+                if users.len() > compose::MAX_MENTION_SPANS
+                    || users.iter().any(|value| !value.is_string())
+                {
+                    return Err(unavailable());
+                }
+            }
+            if mentions
+                .get("room")
+                .is_some_and(|value| !value.is_boolean())
+            {
+                return Err(unavailable());
+            }
+        }
+        Ok(())
+    }
+
+    fn revision_from_raw(
+        original: &Raw<AnySyncTimelineEvent>,
+        edit: Option<&Raw<AnySyncTimelineEvent>>,
+        own: &UserId,
+        event_id: &EventId,
+    ) -> Result<EditRevision> {
+        let original = original_message(original)?;
+        if original.event_id != event_id
+            || original.sender != own
+            || !matches!(original.content.msgtype, MessageType::Text(_))
+            || matches!(original.content.relates_to, Some(Relation::Replacement(_)))
+        {
+            return Err(unavailable());
+        }
+        let original_content =
+            serde_json::to_value(&original.content).map_err(|_| unavailable())?;
+        let (effective, latest_edit) = if let Some(edit) = edit {
+            let edit = original_message(edit)?;
+            if edit.sender != own || edit.event_id == event_id {
+                return Err(unavailable());
+            }
+            let Some(Relation::Replacement(replacement)) = edit.content.relates_to else {
+                return Err(unavailable());
+            };
+            if replacement.event_id != event_id {
+                return Err(unavailable());
+            }
+            (replacement.new_content, Some(edit.event_id.to_string()))
+        } else {
+            (original.content.without_relation(), None)
+        };
+        if !matches!(effective.msgtype, MessageType::Text(_))
+            || effective.msgtype.body().len() > compose::MAX_COMPOSE_BYTES
+        {
+            return Err(unavailable());
+        }
+        let mentions = effective.mentions.clone().ok_or_else(unavailable)?;
+        if mentions.user_ids.len() > compose::MAX_MENTION_SPANS {
+            return Err(unavailable());
+        }
+        Ok(EditRevision {
+            original: original_content,
+            effective: serde_json::to_value(effective).map_err(|_| unavailable())?,
+            latest_edit,
+            mentions,
+        })
+    }
+
+    async fn inherited_reply_sender(
+        selection: &AccountSelection,
+        room: &Room,
+        revision: &EditRevision,
+    ) -> Result<Option<matrix_sdk::ruma::OwnedUserId>> {
+        let body = revision
+            .effective
+            .get("body")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(unavailable)?;
+        let hidden: Vec<_> = revision
+            .mentions
+            .user_ids
+            .iter()
+            .filter(|id| id.as_ref() != room.own_user_id() && !body.contains(id.as_str()))
+            .collect();
+        if hidden.is_empty() {
+            return Ok(None);
+        }
+        if hidden.len() != 1 {
+            return Err(unavailable());
+        }
+        let original: RoomMessageEventContent =
+            serde_json::from_value(revision.original.clone()).map_err(|_| unavailable())?;
+        let reply = match original.relates_to {
+            Some(Relation::Reply(reply)) => reply.in_reply_to.event_id,
+            Some(Relation::Thread(thread)) if !thread.is_falling_back => {
+                thread.in_reply_to.ok_or_else(unavailable)?.event_id
+            }
+            _ => return Err(unavailable()),
+        };
+        context(selection, room)?;
+        let encrypted = room.is_encrypted().await.map_err(|_| unavailable())?;
+        context(selection, room)?;
+        let event = room
+            .event(
+                &reply,
+                Some(
+                    RequestConfig::new()
+                        .retry_limit(0)
+                        .timeout(Duration::from_secs(5)),
+                ),
+            )
+            .await
+            .map_err(|_| unavailable())?;
+        context(selection, room)?;
+        let raw = event.raw().deserialize().map_err(|_| unavailable())?;
+        let AnySyncTimelineEvent::MessageLike(ref message) = raw else {
+            return Err(unavailable());
+        };
+        if message.original_content().is_none()
+            || raw.event_id() != reply
+            || raw.sender().as_str() != hidden[0].as_str()
+        {
+            return Err(unavailable());
+        }
+        if encrypted
+            && !event.encryption_info().is_some_and(|info| {
+                info.sender.as_str() == raw.sender().as_str()
+                    && matches!(
+                        info.verification_state,
+                        matrix_sdk::deserialized_responses::VerificationState::Verified
+                    )
+            })
+        {
+            return Err(unavailable());
+        }
+        Ok(Some(raw.sender().to_owned()))
+    }
+
+    fn restore_edit(
+        revision: &EditRevision,
+        own: &UserId,
+        inherited: Option<&UserId>,
+    ) -> Result<ComposeText> {
+        let content: RoomMessageEventContentWithoutRelation =
+            serde_json::from_value(revision.effective.clone()).map_err(|_| unavailable())?;
+        let MessageType::Text(message) = content.msgtype else {
+            return Err(unavailable());
+        };
+        for format in [TextFormat::Plain, TextFormat::Markdown] {
+            let mut text = ComposeText::new(message.body.clone(), format);
+            let mut targets: Vec<_> = revision
+                .mentions
+                .user_ids
+                .iter()
+                .filter(|id| id.as_ref() != own && Some(id.as_ref()) != inherited)
+                .map(|id| MentionTarget::User(id.to_string()))
+                .collect();
+            if revision.mentions.room {
+                targets.push(MentionTarget::Room);
+            }
+            let mut valid = true;
+            for target in targets {
+                let mut spans = Vec::new();
+                for (start, _) in text.body.match_indices(target.text()) {
+                    let span = MentionSpan {
+                        range: start..start + target.text().len(),
+                        target: target.clone(),
+                    };
+                    let mut single = ComposeText::new(text.body.clone(), format);
+                    single.mentions.push(span.clone());
+                    if single.validate().is_ok() {
+                        if spans.len() + text.mentions.len() == compose::MAX_MENTION_SPANS {
+                            valid = false;
+                            break;
+                        }
+                        spans.push(span);
+                    }
+                }
+                if spans.is_empty() {
+                    valid = false;
+                    break;
+                }
+                text.mentions.extend(spans);
+            }
+            text.mentions.sort_by_key(|span| span.range.start);
+            if !valid || text.validate().is_err() {
+                continue;
+            }
+            let encoded = formatting::compose_related(&text, own)?;
+            let MessageType::Text(encoded) = encoded.msgtype else {
+                return Err(unavailable());
+            };
+            // Plain Matrix metadata can be intentional without presentation HTML.
+            // Rich content must reproduce our deterministic encoder exactly;
+            // links alone never become mention intent.
+            if message.formatted.is_none() && format == TextFormat::Plain
+                || match (&encoded.formatted, &message.formatted) {
+                    (None, None) => true,
+                    (Some(encoded), Some(original)) => {
+                        encoded.format == original.format && encoded.body == original.body
+                    }
+                    _ => false,
+                }
+            {
+                return Ok(text);
+            }
+        }
+        Err(unavailable())
+    }
+
+    fn correct_edit_mentions(
+        content: &mut AnyMessageLikeEventContent,
+        event: &EventId,
+        prior: &Mentions,
+    ) -> Result<()> {
+        let AnyMessageLikeEventContent::RoomMessage(content) = content else {
+            return Err(unavailable());
+        };
+        let Some(Relation::Replacement(replacement)) = &content.relates_to else {
+            return Err(unavailable());
+        };
+        if replacement.event_id != event {
+            return Err(unavailable());
+        }
+        let full = replacement
+            .new_content
+            .mentions
+            .as_ref()
+            .ok_or_else(unavailable)?;
+        let mut delta = Mentions::new();
+        delta.user_ids = full.user_ids.difference(&prior.user_ids).cloned().collect();
+        delta.room = full.room && !prior.room;
+        // Only this field changes after SDK construction. In particular the
+        // target, fallback and full replacement payload remain SDK-authored.
+        content.mentions = Some(delta);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use matrix_sdk::ruma::{event_id, events::room::message::ReplacementMetadata, user_id};
+        use serde_json::json;
+
+        fn raw(content: serde_json::Value, id: &str, sender: &str) -> Raw<AnySyncTimelineEvent> {
+            Raw::from_json(
+                serde_json::value::to_raw_value(&json!({
+                    "type": "m.room.message", "event_id": id, "sender": sender,
+                    "origin_server_ts": 1, "content": content,
+                }))
+                .unwrap(),
+            )
+        }
+        fn original(content: serde_json::Value) -> Raw<AnySyncTimelineEvent> {
+            raw(content, "$original:example.org", "@casey:example.org")
+        }
+        fn revision(content: serde_json::Value) -> EditRevision {
+            revision_from_raw(
+                &original(content),
+                None,
+                user_id!("@casey:example.org"),
+                event_id!("$original:example.org"),
+            )
+            .unwrap()
+        }
+        fn users(ids: &[&str], room: bool) -> Mentions {
+            let mut mentions = Mentions::new();
+            mentions.user_ids = ids.iter().map(|id| UserId::parse(*id).unwrap()).collect();
+            mentions.room = room;
+            mentions
+        }
+        fn text(body: &str, format: TextFormat, ids: &[&str]) -> ComposeText {
+            let mut text = ComposeText::new(body, format);
+            for id in ids {
+                let start = body.find(id).unwrap();
+                text.mentions.push(MentionSpan {
+                    range: start..start + id.len(),
+                    target: MentionTarget::User((*id).into()),
+                });
+            }
+            text.mentions.sort_by_key(|span| span.range.start);
+            text
+        }
+        fn pending_record(
+            capacity: usize,
+        ) -> (broadcast::Sender<RoomSendQueueUpdate>, PendingEdit) {
+            let (sender, updates) = broadcast::channel(capacity);
+            (
+                sender,
+                PendingEdit {
+                    transaction: Some("edit-transaction".into()),
+                    updates,
+                    sent: None,
+                    uncertain: false,
+                },
+            )
+        }
+
+        #[test]
+        fn edit_delta_uses_effective_mentions_and_preserves_sdk_replacement() {
+            let full = RoomMessageEventContentWithoutRelation::text_plain("new body")
+                .add_mentions(users(&["@riley:example.org", "@morgan:example.org"], true));
+            let event = event_id!("$original:example.org");
+            // SDK construction can only see original metadata. The current
+            // effective edit has already added Riley and room, so neither rings again.
+            let mut content = AnyMessageLikeEventContent::RoomMessage(full.make_replacement(
+                ReplacementMetadata::new(event.to_owned(), Some(Mentions::new())),
+            ));
+            let before = serde_json::to_value(&content).unwrap();
+            correct_edit_mentions(&mut content, event, &users(&["@riley:example.org"], true))
+                .unwrap();
+            let after = serde_json::to_value(&content).unwrap();
+            assert_eq!(after["m.new_content"], before["m.new_content"]);
+            assert_eq!(after["m.relates_to"], before["m.relates_to"]);
+            assert_eq!(after["body"], before["body"]);
+            assert_eq!(
+                after["m.mentions"],
+                json!({"user_ids":["@morgan:example.org"]})
+            );
+        }
+
+        #[test]
+        fn edits_can_reintroduce_removed_mentions_and_remove_without_notifications() {
+            let event = event_id!("$original:example.org");
+            let riley = users(&["@riley:example.org"], true);
+            let mut content = AnyMessageLikeEventContent::RoomMessage(
+                RoomMessageEventContentWithoutRelation::text_plain("again")
+                    .add_mentions(riley.clone())
+                    .make_replacement(ReplacementMetadata::new(
+                        event.to_owned(),
+                        Some(riley.clone()),
+                    )),
+            );
+            correct_edit_mentions(&mut content, event, &Mentions::new()).unwrap();
+            assert_eq!(
+                serde_json::to_value(&content).unwrap()["m.mentions"],
+                json!({"user_ids":["@riley:example.org"],"room":true})
+            );
+            let mut removal = AnyMessageLikeEventContent::RoomMessage(
+                RoomMessageEventContentWithoutRelation::text_plain("removed")
+                    .add_mentions(Mentions::new())
+                    .make_replacement(ReplacementMetadata::new(
+                        event.to_owned(),
+                        Some(riley.clone()),
+                    )),
+            );
+            correct_edit_mentions(&mut removal, event, &riley).unwrap();
+            let value = serde_json::to_value(&removal).unwrap();
+            assert_eq!(value["m.mentions"], json!({}));
+            assert_eq!(value["m.new_content"]["m.mentions"], json!({}));
+            assert!(
+                correct_edit_mentions(&mut removal, event_id!("$wrong:example.org"), &riley)
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn revision_is_full_latest_content_not_top_level_delta() {
+            let original = original(json!({"msgtype":"m.text","body":"old","m.mentions":{}}));
+            let edit = raw(
+                json!({"msgtype":"m.text","body":"* replacement","m.mentions":{},
+                "m.relates_to":{"rel_type":"m.replace","event_id":"$original:example.org"},
+                "m.new_content":{"msgtype":"m.text","body":"@riley:example.org","m.mentions":{"user_ids":["@riley:example.org"]}}}),
+                "$edit:example.org",
+                "@casey:example.org",
+            );
+            let revision = revision_from_raw(
+                &original,
+                Some(&edit),
+                user_id!("@casey:example.org"),
+                event_id!("$original:example.org"),
+            )
+            .unwrap();
+            assert_eq!(revision.latest_edit.as_deref(), Some("$edit:example.org"));
+            assert_eq!(revision.effective["body"], "@riley:example.org");
+            assert!(
+                revision
+                    .mentions
+                    .user_ids
+                    .contains(user_id!("@riley:example.org"))
+            );
+        }
+
+        #[test]
+        fn revision_rejects_wrong_author_target_type_redaction_and_missing_metadata() {
+            let content = json!({"msgtype":"m.text","body":"old","m.mentions":{}});
+            let original = original(content.clone());
+            for (sender, target, msgtype) in [
+                ("@riley:example.org", "$original:example.org", "m.text"),
+                ("@casey:example.org", "$wrong:example.org", "m.text"),
+                ("@casey:example.org", "$original:example.org", "m.notice"),
+            ] {
+                let edit = raw(
+                    json!({"msgtype":"m.text","body":"* replacement","m.mentions":{},
+                    "m.relates_to":{"rel_type":"m.replace","event_id":target},
+                    "m.new_content":{"msgtype":msgtype,"body":"new","m.mentions":{}}}),
+                    "$edit:example.org",
+                    sender,
+                );
+                assert!(
+                    revision_from_raw(
+                        &original,
+                        Some(&edit),
+                        user_id!("@casey:example.org"),
+                        event_id!("$original:example.org")
+                    )
+                    .is_err()
+                );
+            }
+            for bad in [
+                json!({}),
+                json!({"msgtype":"m.text","body":"legacy"}),
+                json!({"msgtype":"m.text","body":"bad","m.mentions":[]}),
+            ] {
+                assert!(
+                    revision_from_raw(
+                        &self::original(bad),
+                        None,
+                        user_id!("@casey:example.org"),
+                        event_id!("$original:example.org")
+                    )
+                    .is_err()
+                );
+            }
+            assert!(
+                revision_from_raw(
+                    &raw(content, "$original:example.org", "@riley:example.org"),
+                    None,
+                    user_id!("@casey:example.org"),
+                    event_id!("$original:example.org")
+                )
+                .is_err()
+            );
+        }
+
+        #[test]
+        fn malformed_content_and_mentions_shapes_do_not_use_serde_defaults() {
+            for value in [
+                json!([]),
+                json!({"body":1,"msgtype":"m.text"}),
+                json!({"body":"text","msgtype":"m.text","m.mentions":[]}),
+                json!({"body":"text","msgtype":"m.text","m.mentions":{"user_ids":{}}}),
+                json!({"body":"text","msgtype":"m.text","m.mentions":{"user_ids":[1]}}),
+                json!({"body":"text","msgtype":"m.text","m.mentions":{"room":"true"}}),
+            ] {
+                assert!(content_shape(&value).is_err());
+            }
+            assert!(
+                content_shape(
+                    &json!({"body":"text","msgtype":"m.text","m.mentions":{},"extension":[]})
+                )
+                .is_ok()
+            );
+        }
+
+        #[test]
+        fn plain_and_markdown_roundtrip_only_explicit_metadata() {
+            let own = user_id!("@casey:example.org");
+            for format in [TextFormat::Plain, TextFormat::Markdown] {
+                let expected = text(
+                    "Hello @riley:example.org **literal-or-bold**",
+                    format,
+                    &["@riley:example.org"],
+                );
+                let content = formatting::compose_room(&expected, own).unwrap();
+                let baseline = revision(serde_json::to_value(content).unwrap());
+                let restored = restore_edit(&baseline, own, None).unwrap();
+                assert_eq!(restored, expected);
+            }
+        }
+
+        #[test]
+        fn plain_metadata_restores_intent_but_links_do_not_create_it() {
+            let own = user_id!("@casey:example.org");
+            let baseline = revision(
+                json!({"msgtype":"m.text","body":"Hello @riley:example.org","m.mentions":{"user_ids":["@riley:example.org"]}}),
+            );
+            assert_eq!(
+                restore_edit(&baseline, own, None).unwrap().mentions.len(),
+                1
+            );
+            let pasted = revision(
+                json!({"msgtype":"m.text","body":"https://matrix.to/#/@riley:example.org","m.mentions":{}}),
+            );
+            assert!(
+                restore_edit(&pasted, own, None)
+                    .unwrap()
+                    .mentions
+                    .is_empty()
+            );
+            let arbitrary = revision(
+                json!({"msgtype":"m.text","body":"Hello","format":"org.matrix.custom.html","formatted_body":"<a href=\"https://matrix.to/#/@riley:example.org\">Hello</a>","m.mentions":{}}),
+            );
+            assert!(restore_edit(&arbitrary, own, None).is_err());
+        }
+
+        #[test]
+        fn hidden_reply_sender_requires_separate_authenticated_baseline_proof() {
+            let own = user_id!("@casey:example.org");
+            let baseline = revision(
+                json!({"msgtype":"m.text","body":"A reply","m.mentions":{"user_ids":["@riley:example.org"]},"m.relates_to":{"m.in_reply_to":{"event_id":"$reply:example.org"}}}),
+            );
+            assert!(restore_edit(&baseline, own, None).is_err());
+            let restored =
+                restore_edit(&baseline, own, Some(user_id!("@riley:example.org"))).unwrap();
+            assert!(restored.mentions.is_empty());
+            let full = formatting::compose_related(&restored, own)
+                .unwrap()
+                .add_mentions(users(&["@riley:example.org"], false));
+            let event = event_id!("$original:example.org");
+            let mut content = AnyMessageLikeEventContent::RoomMessage(
+                full.make_replacement(ReplacementMetadata::new(event.to_owned(), None)),
+            );
+            correct_edit_mentions(&mut content, event, &baseline.mentions).unwrap();
+            let value = serde_json::to_value(content).unwrap();
+            assert_eq!(value["m.mentions"], json!({}));
+            assert_eq!(
+                value["m.new_content"]["m.mentions"]["user_ids"],
+                json!(["@riley:example.org"])
+            );
+        }
+
+        #[test]
+        fn unrepresentable_intent_and_span_overflow_fail_closed() {
+            let own = user_id!("@casey:example.org");
+            for body in [
+                "a@riley:example.org",
+                "https://matrix.to/#/@riley:example.org",
+            ] {
+                let baseline = revision(
+                    json!({"msgtype":"m.text","body":body,"m.mentions":{"user_ids":["@riley:example.org"]}}),
+                );
+                assert!(restore_edit(&baseline, own, None).is_err());
+            }
+            let body = "@riley:example.org ".repeat(compose::MAX_MENTION_SPANS + 1);
+            let baseline = revision(
+                json!({"msgtype":"m.text","body":body,"m.mentions":{"user_ids":["@riley:example.org"]}}),
+            );
+            assert!(restore_edit(&baseline, own, None).is_err());
+        }
+
+        #[test]
+        fn edit_ack_requires_matching_effective_revision_not_just_http_success() {
+            let mut revision = revision(json!({"msgtype":"m.text","body":"text","m.mentions":{}}));
+            let (sender, mut record) = pending_record(4);
+            sender
+                .send(RoomSendQueueUpdate::SentEvent {
+                    transaction_id: "edit-transaction".into(),
+                    event_id: event_id!("$sent:example.org").to_owned(),
+                })
+                .unwrap();
+            assert!(!record.resolved(&revision));
+            revision.latest_edit = Some("$another:example.org".into());
+            assert!(!record.resolved(&revision));
+            revision.latest_edit = Some("$sent:example.org".into());
+            assert!(record.resolved(&revision));
+        }
+
+        #[test]
+        fn pending_unknown_lagged_and_closed_receivers_never_rearm() {
+            let revision = revision(json!({"msgtype":"m.text","body":"text","m.mentions":{}}));
+            let (sender, mut unknown) = pending_record(4);
+            unknown.transaction = None;
+            sender
+                .send(RoomSendQueueUpdate::CancelledLocalEvent {
+                    transaction_id: "edit-transaction".into(),
+                })
+                .unwrap();
+            assert!(!unknown.resolved(&revision));
+            let (sender, mut lagged) = pending_record(1);
+            for _ in 0..3 {
+                sender
+                    .send(RoomSendQueueUpdate::CancelledLocalEvent {
+                        transaction_id: "unrelated".into(),
+                    })
+                    .unwrap();
+            }
+            assert!(!lagged.resolved(&revision));
+            sender
+                .send(RoomSendQueueUpdate::CancelledLocalEvent {
+                    transaction_id: "edit-transaction".into(),
+                })
+                .unwrap();
+            assert!(!lagged.resolved(&revision));
+            let (sender, mut closed) = pending_record(1);
+            drop(sender);
+            assert!(!closed.resolved(&revision));
+            assert!(closed.uncertain);
+        }
+
+        #[test]
+        fn known_queue_cancellation_releases_only_matching_transaction() {
+            let revision = revision(json!({"msgtype":"m.text","body":"text","m.mentions":{}}));
+            let (sender, mut record) = pending_record(4);
+            sender
+                .send(RoomSendQueueUpdate::CancelledLocalEvent {
+                    transaction_id: "other".into(),
+                })
+                .unwrap();
+            assert!(!record.resolved(&revision));
+            sender
+                .send(RoomSendQueueUpdate::CancelledLocalEvent {
+                    transaction_id: "edit-transaction".into(),
+                })
+                .unwrap();
+            assert!(record.resolved(&revision));
+        }
+
+        #[test]
+        fn edit_reservation_is_bounded_and_never_evicts_unknown_outcomes() {
+            let mut records = HashMap::new();
+            for index in 0..MAX_PENDING_EDITS {
+                let (_, receiver) = broadcast::channel(1);
+                reserve_pending(
+                    &mut records,
+                    (
+                        "!room:example.org".into(),
+                        format!("$event{index}:example.org"),
+                    ),
+                    receiver,
+                )
+                .unwrap();
+            }
+            let (_, receiver) = broadcast::channel(1);
+            assert!(
+                reserve_pending(
+                    &mut records,
+                    ("!room:example.org".into(), "$new:example.org".into()),
+                    receiver
+                )
+                .is_err()
+            );
+            let (_, receiver) = broadcast::channel(1);
+            assert!(
+                reserve_pending(
+                    &mut records,
+                    ("!room:example.org".into(), "$event0:example.org".into()),
+                    receiver
+                )
+                .is_err()
+            );
+            assert_eq!(records.len(), MAX_PENDING_EDITS);
+            assert!(records.values().all(|record| record.transaction.is_none()));
+        }
+
+        #[test]
+        fn successful_distinct_edits_reclaim_capacity_without_discarding_uncertainty() {
+            let mut records = HashMap::new();
+            let mut acknowledged = Vec::new();
+            let mut retained_senders = Vec::new();
+            // One reservation whose enqueue outcome is unknown must survive
+            // successful acknowledgements for every other target.
+            let unknown_key = ("!room:example.org".into(), "$unknown:example.org".into());
+            let (sender, updates) = broadcast::channel(4);
+            retained_senders.push(sender);
+            reserve_pending(&mut records, unknown_key.clone(), updates).unwrap();
+            for index in 0..(MAX_PENDING_EDITS * 2 + 1) {
+                if records.len() == MAX_PENDING_EDITS {
+                    for (key, revision) in &acknowledged {
+                        retire_resolved(&mut records, key, revision);
+                    }
+                    assert_eq!(records.len(), 1);
+                    assert!(records.contains_key(&unknown_key));
+                }
+                let key = (
+                    "!room:example.org".into(),
+                    format!("$event{index}:example.org"),
+                );
+                let (sender, updates) = broadcast::channel(4);
+                reserve_pending(&mut records, key.clone(), updates).unwrap();
+                records.get_mut(&key).unwrap().transaction = Some("edit-transaction".into());
+                let event_id = EventId::parse(format!("$edit{index}:example.org")).unwrap();
+                sender
+                    .send(RoomSendQueueUpdate::SentEvent {
+                        transaction_id: "edit-transaction".into(),
+                        event_id: event_id.clone(),
+                    })
+                    .unwrap();
+                retained_senders.push(sender);
+                let mut observed =
+                    revision(json!({"msgtype":"m.text","body":"changed","m.mentions":{}}));
+                observed.latest_edit = Some(event_id.to_string());
+                acknowledged.push((key, observed));
+            }
+            assert!(records.contains_key(&unknown_key));
+            assert!(records.len() <= MAX_PENDING_EDITS);
+            assert_eq!(acknowledged.len(), MAX_PENDING_EDITS * 2 + 1);
+        }
+
+        #[test]
+        fn edit_baseline_is_revoked_by_account_aba_and_debug_is_redacted() {
+            let selections = account_selection::Selections::default();
+            selections.replace(Some("account-one"));
+            let first = selections.for_account("account-one").unwrap();
+            let baseline = EditBaseline {
+                selection: first.clone(),
+                room: "!private:example.org".into(),
+                event: "$private:example.org".into(),
+                revision: revision(
+                    json!({"msgtype":"m.text","body":"private source","m.mentions":{}}),
+                ),
+                inherited_reply_sender: None,
+            };
+            assert!(baseline.matches(&first, "!private:example.org", "$private:example.org"));
+            assert_eq!(format!("{baseline:?}"), "EditBaseline([redacted])");
+            selections.replace(Some("account-two"));
+            selections.replace(Some("account-one"));
+            assert!(!baseline.matches(
+                &selections.for_account("account-one").unwrap(),
+                "!private:example.org",
+                "$private:example.org"
+            ));
+        }
+
+        #[test]
+        fn power_state_sequence_shapes_never_grant_room_permission() {
+            use matrix_sdk::ruma::events::room::power_levels::RoomPowerLevelsEventContent;
+            let malformed = json!({"users":{"@casey:example.org":100},"notifications":[]});
+            // Pinned Ruma accepts this struct sequence as default notifications.
+            assert!(
+                serde_json::from_value::<RoomPowerLevelsEventContent>(malformed.clone()).is_ok()
+            );
+            for value in [
+                json!([]),
+                malformed,
+                json!({"users":[]}),
+                json!({"events":[]}),
+            ] {
+                assert!(power_content_shape(&value).is_err());
+            }
+        }
+
+        #[test]
+        fn valid_power_state_preserves_real_notification_threshold() {
+            use matrix_sdk::ruma::{
+                RoomVersionId, events::room::power_levels::RoomPowerLevelsEventContent,
+            };
+            let content = json!({"users":{"@casey:example.org":50},"notifications":{"room":75},"extension":[]});
+            power_content_shape(&content).unwrap();
+            let content: RoomPowerLevelsEventContent = serde_json::from_value(content).unwrap();
+            let rules = RoomVersionId::V10.rules().unwrap();
+            let levels = matrix_sdk::ruma::events::room::power_levels::RoomPowerLevels::new(
+                content.into(),
+                &rules.authorization,
+                [user_id!("@casey:example.org").to_owned()],
+            );
+            assert!(!levels.user_can_trigger_room_notification(user_id!("@casey:example.org")));
+            power_content_shape(&json!({})).unwrap();
+            assert!(serde_json::from_value::<RoomPowerLevelsEventContent>(json!({})).is_ok());
+        }
+
+        #[test]
+        fn enqueue_entry_distinguishes_uncertainty_from_safe_preparation_failure() {
+            let entered = std::sync::atomic::AtomicBool::new(false);
+            assert!(!matches!(
+                preparation_timeout(&entered),
+                MatrixCoreError::ComposedSendUncertain
+            ));
+            entered.store(true, std::sync::atomic::Ordering::Release);
+            assert!(matches!(
+                preparation_timeout(&entered),
+                MatrixCoreError::ComposedSendUncertain
+            ));
+            // The state is terminal for this attempt; a later cancellation
+            // cannot reclassify a possibly persisted request as safe to retry.
+            assert!(matches!(
+                preparation_timeout(&entered),
+                MatrixCoreError::ComposedSendUncertain
+            ));
+        }
+
+        #[test]
+        fn final_encoded_event_limit_and_safe_labels_are_bounded() {
+            let oversized =
+                RoomMessageEventContent::text_plain("x".repeat(MAX_ENCODED_COMPOSITION))
+                    .add_mentions(Mentions::new());
+            assert!(bounded_event(&AnyMessageLikeEventContent::RoomMessage(oversized)).is_err());
+            assert_eq!(label("Casey\u{202e}\n\u{2067}"), "Casey");
+            assert_eq!(label(&"界".repeat(100)).chars().count(), 80);
+        }
     }
 }

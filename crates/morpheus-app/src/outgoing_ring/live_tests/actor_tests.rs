@@ -126,6 +126,13 @@ async fn bounded<T>(future: impl Future<Output = Result<T, ()>>) -> Result<T, ()
         .map_err(|_| error("timed_out"))?
 }
 
+/// Match ordinary app startup before mutating preferences in the fresh profile.
+/// Loading defaults in VoiceSpaces alone does not create the backing file.
+fn fixture_preferences(store: morpheus_config::ConfigStore) -> Result<Arc<VoiceSpaces>, ()> {
+    store.load_or_create().map_err(|_| error("unavailable"))?;
+    Ok(Arc::new(VoiceSpaces::new(store)))
+}
+
 pub(super) struct ActorAcceptance {
     worker: IncomingWorker,
     calls: Arc<CallController>,
@@ -145,9 +152,9 @@ impl ActorAcceptance {
         manager: Arc<AccountManager>,
         account: AccountInfo,
     ) -> Result<Self, ()> {
-        let preferences = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
+        let preferences = fixture_preferences(morpheus_config::ConfigStore::at(
             case.profile.path().join("incoming-config.toml"),
-        )));
+        ))?;
         // Set this before actor registration. Answer must use the admitted
         // dialect, not an account/room's different saved outgoing preference.
         preferences
@@ -892,4 +899,36 @@ impl QuietEvidence {
                     .all(|event| event.sender.as_str() != receiver),
         )
     }
+}
+
+#[test]
+fn fresh_fixture_config_supports_persisted_call_mode_before_worker_start() {
+    let profile = tempfile::tempdir().unwrap();
+    let store = morpheus_config::ConfigStore::at(profile.path().join("incoming-config.toml"));
+    assert!(!store.path().exists());
+    let preferences = fixture_preferences(store.clone()).unwrap();
+    preferences
+        .set_room_call_mode(
+            "fixture-account",
+            "!fixture:example.org",
+            RoomCallMode::ElementCallMatrix2,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .load()
+            .unwrap()
+            .room_call_mode("fixture-account", "!fixture:example.org"),
+        RoomCallMode::ElementCallMatrix2
+    );
+}
+
+#[test]
+fn fixture_config_initialization_preserves_invalid_existing_input() {
+    let profile = tempfile::tempdir().unwrap();
+    let store = morpheus_config::ConfigStore::at(profile.path().join("incoming-config.toml"));
+    let original = "schema_version = 99\n";
+    std::fs::write(store.path(), original).unwrap();
+    assert!(fixture_preferences(store.clone()).is_err());
+    assert_eq!(std::fs::read_to_string(store.path()).unwrap(), original);
 }

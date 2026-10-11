@@ -5,7 +5,9 @@ import json
 import os
 
 
-def package_matrix(platform, linux_formats, appimage_updates=False):
+def package_matrix(platform, linux_formats, appimage_updates=False, appimage_capture=False):
+    if appimage_capture and (platform != "linux" or linux_formats != "appimage" or appimage_updates):
+        raise ValueError("Installed capture QA requires Linux/AppImage alone and excludes update QA")
     if appimage_updates and (platform not in {"linux", "all"} or linux_formats != "appimage"):
         raise ValueError("AppImage update QA requires Linux (or all) and the appimage format")
     try:
@@ -31,8 +33,11 @@ def main():
     update_input = os.environ["APPIMAGE_UPDATES"]
     if update_input not in {"true", "false"}:
         raise ValueError("AppImage update selection must be an explicit boolean")
+    capture_input = os.environ.get("APPIMAGE_CAPTURE", "false")
+    if capture_input not in {"true", "false"}:
+        raise ValueError("AppImage capture selection must be an explicit boolean")
     matrix = package_matrix(
-        os.environ["PACKAGE_PLATFORM"], os.environ["LINUX_FORMATS"], update_input == "true"
+        os.environ["PACKAGE_PLATFORM"], os.environ["LINUX_FORMATS"], update_input == "true", capture_input == "true"
     )
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
         output.write("matrix=" + json.dumps(matrix) + "\n")

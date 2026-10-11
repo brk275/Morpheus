@@ -37,6 +37,15 @@ class PackageScopeTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 package_matrix(platform, formats)
 
+    def test_installed_capture_selects_only_linux_and_cannot_hide_other_checks(self):
+        self.assertEqual(package_matrix("linux", "appimage", False, True)["include"],
+                         [{"os": "ubuntu-24.04", "label": "linux-x64", "formats": "appimage"}])
+        for platform, formats, updates in (("all", "appimage", False), ("windows", "appimage", False),
+                                           ("macos", "appimage", False), ("linux", "deb", False),
+                                           ("linux", "appimage", True)):
+            with self.subTest(platform=platform, formats=formats, updates=updates), self.assertRaises(ValueError):
+                package_matrix(platform, formats, updates, True)
+
 
 if __name__ == "__main__":
     unittest.main()

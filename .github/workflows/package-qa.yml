@@ -21,6 +21,12 @@ on:
         required: true
         default: false
 
+      appimage_capture:
+        description: Private installed AppImage fixed-client capture QA (Linux/AppImage only; source gate required)
+        type: boolean
+        required: true
+        default: false
+
 permissions:
   contents: read
 
@@ -52,6 +58,7 @@ jobs:
           PACKAGE_PLATFORM: ${{ inputs.platform }}
           LINUX_FORMATS: ${{ inputs.linux_formats }}
           APPIMAGE_UPDATES: ${{ inputs.appimage_updates }}
+          APPIMAGE_CAPTURE: ${{ inputs.appimage_capture }}
         run: python3 scripts/package_scope.py
 
   package:
@@ -71,6 +78,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      - name: Require reviewed installed capture adapter
+        if: runner.os == 'Linux' && inputs.appimage_capture
+        run: python3 packaging/linux/package_appimage.py --check-readiness
       - name: Linux native dependencies
         if: runner.os == 'Linux'
         run: |
@@ -96,11 +106,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y openssl ca-certificates python3-pyatspi python3-gi at-spi2-core dbus-x11
+      - name: Linux installed capture QA dependencies
+        if: runner.os == 'Linux' && inputs.appimage_capture
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ca-certificates python3-pyatspi python3-gi at-spi2-core dbus-x11 \
+            gnome-keyring libsecret-tools libglib2.0-bin libdrm-dev libinih-dev \
+            libsystemd-dev meson ninja-build wayland-protocols sway swaybg \
+            pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-wlr
       - name: Build unsigned QA package
-        if: runner.os != 'Linux' || !inputs.appimage_updates
+        if: runner.os != 'Linux' || (!inputs.appimage_updates && !inputs.appimage_capture)
         run: python3 scripts/package.py --formats ${{ matrix.formats }}
       - name: Install, inspect, launch and remove unsigned packages
-        if: runner.os != 'Linux' || !inputs.appimage_updates
+        if: runner.os != 'Linux' || (!inputs.appimage_updates && !inputs.appimage_capture)
         timeout-minutes: 35
         run: python3 scripts/package_smoke.py --target ${{ matrix.label }} --formats ${{ matrix.formats }}
       - name: Test installed AppImage update and rollback
@@ -120,5 +139,18 @@ jobs:
           /usr/bin/python3 scripts/appimage_update_acceptance.py \
             --source "$GITHUB_WORKSPACE" --target-dir "$GITHUB_WORKSPACE/target" \
             --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks" --execute-on-free-hosted-runner
+      - name: Test actual installed AppImage capture and imported client bindings
+        if: runner.os == 'Linux' && inputs.appimage_capture
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
+          curl --fail --silent --show-error --location \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$archive"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
+          /usr/bin/python3 packaging/linux/package_appimage.py --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks"
       # Installers deliberately stay on the ephemeral runner. Public artifact
       # uploads and releases require the separate release acceptance gates.

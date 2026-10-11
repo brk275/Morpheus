@@ -114,7 +114,7 @@ RING_CHECK = re.compile(r"^MORPHEUS_RING_CHECK ([a-z_]+)=(true|false)$", re.MULT
 RING_RESULT = re.compile(r"^MORPHEUS_RING_RESULT passed=(true|false)$", re.MULTILINE)
 RING_STAGES = frozenset((
     "fixture", "login", "sticky_sync", "own_crypto", "peer_trust", "targets", "join", "membership",
-    "observer_open", "observer_roster", "observer_leave",
+    "observer_open", "observer_roster", "actor_setup", "observer_leave",
     "send", "receive", "fetch", "validate", "admission", "revalidate", "redact", "redaction", "receipt_redaction", "withdraw", "cleanup",
 ))
 RING_STAGE = re.compile(r"^MORPHEUS_RING_STAGE ([a-z_]+)$", re.MULTILINE)

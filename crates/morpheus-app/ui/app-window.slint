@@ -1,5 +1,23 @@
 import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView } from "std-widgets.slint";
 
+export struct MentionItem {
+    key: string,
+    name: string,
+}
+
+// Pinned Slint 1.18.1 adapter. Only these three reads use its documented-as-
+// internal test/IME properties; placement uses the public UTF-8 offset setter.
+// This wrapper must receive native caret/selection/IME acceptance on upgrades.
+component MentionInput inherits TextInput {
+    out property <int> caret-bytes: self.cursor-position-byte-offset;
+    out property <int> anchor-bytes: self.anchor-position-byte-offset;
+    out property <bool> composing: self.preedit-text != "";
+    callback caret-changed();
+    changed caret-bytes => { root.caret-changed(); }
+    changed anchor-bytes => { root.caret-changed(); }
+    changed composing => { root.caret-changed(); }
+}
+
 export struct AudioDeviceItem {
     id: string,
     name: string,
@@ -249,6 +267,38 @@ component ActionRect inherits Rectangle {
         border-width: 2px;
         border-color: root.focus-color;
         background: transparent;
+    }
+}
+
+component MentionPopup inherits Rectangle {
+    in property <[MentionItem]> items;
+    in property <int> current;
+    in property <color> surface;
+    in property <color> hover;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> accent;
+    in property <float> text-scale: 1;
+    callback choose(string);
+    height: min(360px, self.items.length * (36px * root.text-scale + 10px) + 8px);
+    background: surface; border-radius: 8px; border-width: 1px; border-color: accent;
+    accessible-role: region; accessible-label: "Mention suggestions; arrows select, Enter or Tab inserts, Escape closes";
+    mention-list := ListView {
+        x: 4px; y: 4px; width: parent.width - 8px; height: parent.height - 8px;
+        horizontal-scrollbar-policy: always-off;
+        viewport-y: -max(0px, (root.current + 1) * (36px * root.text-scale + 10px) - self.height);
+        for item[index] in root.items : ActionRect {
+            width: mention-list.visible-width; height: 36px * root.text-scale + 10px;
+            label: item.name + " " + item.key + (index == root.current ? ", selected" : "");
+            focus-color: root.accent; border-radius: 5px;
+            background: index == root.current || self.has-hover ? root.hover : root.surface;
+            activated => { root.choose(item.key); }
+            VerticalLayout {
+                padding: 5px; spacing: 2px;
+                Text { text: item.name; color: root.ink; font-size: 12px * root.text-scale; overflow: elide; }
+                Text { text: item.key; color: root.muted; font-size: 10px * root.text-scale; overflow: elide; }
+            }
+        }
     }
 }
 
@@ -586,6 +636,24 @@ export component AppWindow inherits Window {
     callback submit-sso(string);
     callback composer-edited(string);
     callback composer-formatting-changed(bool);
+    callback thread-formatting-changed(bool);
+    callback mention-query(bool, int, int, bool);
+    callback mention-key(bool, string) -> bool;
+    callback mention-choose(bool, string);
+    callback mention-context-changed();
+    callback begin-compose(int, string, string, string, bool);
+    callback cancel-compose();
+    callback mention-cursor(bool, int, int, bool);
+    mention-cursor(threaded, caret, anchor, preedit) => {
+        if threaded { root.thread-caret = caret; root.thread-anchor = anchor; root.thread-preedit = preedit; }
+        else { root.composer-caret = caret; root.composer-anchor = anchor; root.composer-preedit = preedit; }
+        root.mention-query(threaded, caret, anchor, preedit);
+    }
+    callback place-mention-caret(bool, int);
+    place-mention-caret(threaded, position) => {
+        root.mention-place-thread = threaded; root.mention-place-position = position;
+        root.mention-place-request = root.mention-place-request == 2147483647 ? 1 : root.mention-place-request + 1;
+    }
     callback preview-demo();
     callback toggle-stress-timeline();
     callback answer-incoming-call(string);
@@ -650,6 +718,23 @@ export component AppWindow inherits Window {
     in-out property <bool> leave-call-dialog: false;
     in-out property <bool> leave-call-busy: false;
     in-out property <int> pending-account-index: -1;
+    in-out property <[MentionItem]> composer-mentions;
+    in-out property <int> composer-mention-index: 0;
+    in-out property <[MentionItem]> thread-mentions;
+    in-out property <int> thread-mention-index: 0;
+    out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open;
+    changed mention-ui-allowed => { if !root.mention-ui-allowed { root.mention-context-changed(); } }
+    // Input IDs live inside conditional subtrees; callbacks cross that boundary.
+    in-out property <int> composer-caret: -1;
+    in-out property <int> composer-anchor: -1;
+    in-out property <bool> composer-preedit: false;
+    in-out property <int> thread-caret: -1;
+    in-out property <int> thread-anchor: -1;
+    in-out property <bool> thread-preedit: false;
+    property <int> mention-place-request: 0;
+    property <int> mention-place-position: 0;
+    property <bool> mention-place-thread: false;
+    in-out property <bool> thread-markdown: false;
     in-out property <string> composer-text;
     in-out property <bool> composer-markdown: false;
     in-out property <bool> composer-saved-markdown: false;
@@ -681,8 +766,10 @@ export component AppWindow inherits Window {
     property <string> login-password;
 
     // A picker snapshot never survives a change of account or Space.
-    changed active-account-local-id => { root.quick-switcher-open = false; root.incoming-call-notice = ""; }
-    changed active-account-index => { root.quick-switcher-open = false; }
+    changed active-account-local-id => { root.quick-switcher-open = false; root.incoming-call-notice = ""; root.mention-context-changed(); }
+    changed active-account-index => { root.quick-switcher-open = false; root.mention-context-changed(); }
+    changed active-room-id => { root.mention-context-changed(); }
+    changed thread-root-id => { root.mention-context-changed(); }
     changed active-space-id => { root.quick-switcher-open = false; }
     changed show-sign-in => { if !root.show-sign-in { shortcut-scope.focus(); } }
 
@@ -1224,7 +1311,7 @@ export component AppWindow inherits Window {
                             activated => { root.show-side-panel = true; root.side-panel-tab = 2; }
                         }
                         if root.page == 0 : IconAction {
-                            icon: "C"; label: "Open call stage"; ink: root.muted; surface: root.canvas; hover-surface: root.hover;
+                            icon: "C"; label: "Open current room call stage"; ink: root.muted; surface: root.canvas; hover-surface: root.hover;
                             activated => { root.page = 2; }
                         }
                         if root.page == 0 : IconAction {
@@ -1450,15 +1537,7 @@ export component AppWindow inherits Window {
                                                     width: 28px; height: 26px; icon: "↩"; label: "Reply to " + message.sender;
                                                     ink: root.muted; surface: transparent; hover-surface: root.hover;
                                                     activated => {
-                                                        if root.composer-mode == 0 {
-                                                            root.composer-saved-draft = root.composer-text;
-                                                            root.composer-saved-markdown = root.composer-markdown;
-                                                        }
-                                                        root.composer-mode = 1;
-                                                        root.composer-target-id = message.event-id;
-                                                        root.composer-target-label = message.sender;
-                                                        root.composer-text = "";
-                                                        root.composer-markdown = false;
+                                                        if !root.composer-busy { root.begin-compose(1, message.event-id, message.sender, "", false); }
                                                         message-input.focus();
                                                     }
                                                 }
@@ -1466,15 +1545,7 @@ export component AppWindow inherits Window {
                                                     width: 28px; height: 26px; icon: "✎"; label: "Edit your message";
                                                     ink: root.muted; surface: transparent; hover-surface: root.hover;
                                                     activated => {
-                                                        if root.composer-mode == 0 {
-                                                            root.composer-saved-draft = root.composer-text;
-                                                            root.composer-saved-markdown = root.composer-markdown;
-                                                        }
-                                                        root.composer-mode = 2;
-                                                        root.composer-target-id = message.event-id;
-                                                        root.composer-target-label = message.sender;
-                                                        root.composer-text = message.edit-source;
-                                                        root.composer-markdown = message.edit-markdown;
+                                                        if !root.composer-busy { root.begin-compose(2, message.event-id, message.sender, message.edit-source, message.edit-markdown); }
                                                         message-input.focus();
                                                     }
                                                 }
@@ -1603,13 +1674,7 @@ export component AppWindow inherits Window {
                                 width: 26px; height: 25px; icon: "×"; label: "Cancel reply or edit";
                                 ink: root.muted; surface: transparent; hover-surface: root.hover;
                                 activated => {
-                                    root.composer-mode = 0;
-                                    root.composer-target-id = "";
-                                    root.composer-target-label = "";
-                                    root.composer-text = root.composer-saved-draft;
-                                    root.composer-markdown = root.composer-saved-markdown;
-                                    root.composer-saved-draft = "";
-                                    root.composer-saved-markdown = false;
+                                    if !root.composer-busy { root.cancel-compose(); }
                                 }
                             }
                         }
@@ -1641,9 +1706,7 @@ export component AppWindow inherits Window {
                                     enabled: root.active-room-id != "" && !root.composer-busy;
                                     activated => {
                                         root.composer-markdown = !root.composer-markdown;
-                                        if root.composer-mode == 0 {
-                                            root.composer-formatting-changed(root.composer-markdown);
-                                        }
+                                        root.composer-formatting-changed(root.composer-markdown);
                                         message-input.focus();
                                     }
                                 }
@@ -1657,7 +1720,7 @@ export component AppWindow inherits Window {
                                         font-size: 13px * root.text-scale;
                                         vertical-alignment: center;
                                     }
-                                    message-input := TextInput {
+                                    message-input := MentionInput {
                                         x: 3px;
                                         width: parent.width - 6px;
                                         height: parent.height;
@@ -1666,8 +1729,22 @@ export component AppWindow inherits Window {
                                         font-size: 13px * root.text-scale;
                                         vertical-alignment: center;
                                         accessible-label: root.composer-mode == 1 ? "Reply to " + root.composer-target-label : root.composer-mode == 2 ? "Edit your message" : "Message composer for " + root.active-room-name;
+                                        caret-changed => { root.mention-cursor(false, self.caret-bytes, self.anchor-bytes, self.composing); }
+                                        property <int> placement-request: root.mention-place-request;
+                                        changed placement-request => {
+                                            if !root.mention-place-thread {
+                                                self.set-selection-offsets(root.mention-place-position, root.mention-place-position); self.focus();
+                                                root.mention-cursor(false, self.caret-bytes, self.anchor-bytes, self.composing);
+                                            }
+                                        }
+                                        init => { root.mention-cursor(false, self.caret-bytes, self.anchor-bytes, self.composing); }
+                                        key-pressed(event) => {
+                                            root.composer-caret = self.caret-bytes; root.composer-anchor = self.anchor-bytes; root.composer-preedit = self.composing;
+                                            if !event.modifiers.control && !event.modifiers.meta && !event.modifiers.alt && !event.modifiers.shift && root.mention-key(false, event.text) { accept } else { reject }
+                                        }
                                         edited => {
                                             root.composer-edited(root.composer-text);
+                                            root.mention-cursor(false, self.caret-bytes, self.anchor-bytes, self.composing);
                                         }
                                         accepted => {
                                             root.send-message(root.composer-text);
@@ -1677,8 +1754,20 @@ export component AppWindow inherits Window {
                                 IconAction {
                                     icon: "➤"; label: root.composer-mode == 2 ? "Save edit" : root.composer-mode == 1 ? "Send reply" : "Send message"; ink: root.accent;
                                     surface: transparent; hover-surface: root.hover;
-                                    activated => { root.send-message(root.composer-text); }
+                                    activated => {
+                                        root.composer-caret = message-input.caret-bytes; root.composer-anchor = message-input.anchor-bytes; root.composer-preedit = message-input.composing;
+                                        root.send-message(root.composer-text);
+                                    }
                                 }
+                            }
+                        }
+                        if root.composer-mentions.length > 0 && root.mention-ui-allowed : MentionPopup {
+                            x: 18px; y: -self.height; width: parent.width - 36px;
+                            items: root.composer-mentions; current: root.composer-mention-index;
+                            surface: root.panel; hover: root.hover; ink: root.ink; muted: root.muted; accent: root.accent; text-scale: root.text-scale;
+                            choose(key) => {
+                                root.composer-caret = message-input.caret-bytes; root.composer-anchor = message-input.anchor-bytes; root.composer-preedit = message-input.composing;
+                                root.mention-choose(false, key);
                             }
                         }
                     }
@@ -2778,7 +2867,8 @@ export component AppWindow inherits Window {
                         vertical-stretch: 1;
                         horizontal-scrollbar-policy: always-off;
                         for member in root.members : Rectangle {
-                            width: member-list.visible-width; height: 55px;
+                            width: member-list.visible-width;
+                            height: max(55px, 34px * root.text-scale + 16px);
                             background: transparent;
                             HorizontalLayout {
                                 padding-left: 12px; padding-right: 12px; spacing: 9px;
@@ -2788,11 +2878,14 @@ export component AppWindow inherits Window {
                                     Text { text: member.name; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; overflow: elide; }
                                     Text { text: member.detail; color: root.muted; font-size: 10px * root.text-scale; overflow: elide; }
                                 }
-                                if root.live-session : Button {
-                                    width: 57px; text: "Manage";
+                                if root.live-session : ActionRect {
+                                    width: 72px * root.text-scale; height: 30px * root.text-scale;
+                                    horizontal-stretch: 0; border-radius: 7px;
+                                    background: self.has-hover ? root.hover : root.elevated;
+                                    focus-color: root.accent;
                                     enabled: !root.member-action-busy;
-                                    accessible-label: "Manage room member " + member.name;
-                                    clicked => {
+                                    label: "Manage room member " + member.name + " · " + member.user-id;
+                                    activated => {
                                         root.member-selected-user-id = member.user-id;
                                         root.member-selected-name = member.name;
                                         root.member-selected-membership = member.membership;
@@ -2801,6 +2894,12 @@ export component AppWindow inherits Window {
                                         root.member-selected-creator = member.is-creator;
                                         root.member-action-error = "";
                                         root.member-action-notice = "";
+                                    }
+                                    Text {
+                                        text: "Manage";
+                                        color: root.member-action-busy ? root.muted : root.ink;
+                                        font-size: 11px * root.text-scale;
+                                        horizontal-alignment: center; vertical-alignment: center;
                                     }
                                 }
                                 if !root.live-session : Rectangle { width: 7px; height: 7px; border-radius: 4px; background: member.online ? #64c9a7 : root.muted; }
@@ -2982,22 +3081,52 @@ export component AppWindow inherits Window {
                             padding-left: 10px; padding-right: 10px; padding-top: 8px; padding-bottom: 8px; spacing: 5px;
                             Rectangle {
                                 horizontal-stretch: 1; background: root.elevated; border-radius: 8px;
-                                thread-input := TextInput {
+                                thread-input := MentionInput {
                                     x: 8px; width: parent.width - 16px; height: parent.height;
                                     text <=> root.thread-composer-text; color: root.ink; font-size: 12px * root.text-scale;
                                     accessible-label: "Reply in thread started by " + root.thread-root-sender;
                                     property <string> thread-context: root.thread-root-id;
-                                    init => { self.focus(); }
+                                    init => { self.focus(); root.mention-cursor(true, self.caret-bytes, self.anchor-bytes, self.composing); }
                                     changed thread-context => { if self.thread-context != "" { self.focus(); } }
                                     accepted => { if !root.thread-send-pending { root.send-thread-message(root.thread-composer-text); } }
-                                    edited => { root.thread-composer-edited(self.text); }
+                                    caret-changed => { root.mention-cursor(true, self.caret-bytes, self.anchor-bytes, self.composing); }
+                                    property <int> placement-request: root.mention-place-request;
+                                    changed placement-request => {
+                                        if root.mention-place-thread {
+                                            self.set-selection-offsets(root.mention-place-position, root.mention-place-position); self.focus();
+                                            root.mention-cursor(true, self.caret-bytes, self.anchor-bytes, self.composing);
+                                        }
+                                    }
+                                    key-pressed(event) => {
+                                            root.thread-caret = self.caret-bytes; root.thread-anchor = self.anchor-bytes; root.thread-preedit = self.composing;
+                                            if !event.modifiers.control && !event.modifiers.meta && !event.modifiers.alt && !event.modifiers.shift && root.mention-key(true, event.text) { accept } else { reject }
+                                    }
+                                    edited => { root.thread-composer-edited(self.text); root.mention-cursor(true, self.caret-bytes, self.anchor-bytes, self.composing); }
                                 }
+                            }
+                            IconAction {
+                                width: 32px; icon: "Md"; label: root.thread-markdown ? "Thread plain text" : "Thread Markdown";
+                                selected: root.thread-markdown; enabled: !root.thread-send-pending;
+                                ink: root.thread-markdown ? root.accent : root.muted; surface: root.panel; hover-surface: root.hover;
+                                activated => { root.thread-markdown = !root.thread-markdown; root.thread-formatting-changed(root.thread-markdown); thread-input.focus(); }
                             }
                             IconAction {
                                 icon: "➤"; label: "Send thread reply"; ink: root.accent;
                                 enabled: !root.thread-send-pending;
                                 surface: root.panel; hover-surface: root.hover;
-                                activated => { root.send-thread-message(root.thread-composer-text); }
+                                activated => {
+                                    root.thread-caret = thread-input.caret-bytes; root.thread-anchor = thread-input.anchor-bytes; root.thread-preedit = thread-input.composing;
+                                    root.send-thread-message(root.thread-composer-text);
+                                }
+                            }
+                        }
+                        if root.thread-mentions.length > 0 && root.mention-ui-allowed : MentionPopup {
+                            x: 4px; y: -self.height; width: parent.width - 8px;
+                            items: root.thread-mentions; current: root.thread-mention-index;
+                            surface: root.panel; hover: root.hover; ink: root.ink; muted: root.muted; accent: root.accent; text-scale: root.text-scale;
+                            choose(key) => {
+                                root.thread-caret = thread-input.caret-bytes; root.thread-anchor = thread-input.anchor-bytes; root.thread-preedit = thread-input.composing;
+                                root.mention-choose(true, key);
                             }
                         }
                     }

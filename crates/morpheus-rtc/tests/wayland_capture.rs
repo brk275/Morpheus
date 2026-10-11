@@ -3,6 +3,9 @@
 //! chooser. Pixel data never leaves this process and is never written to disk.
 #![cfg(all(target_os = "linux", feature = "device-screen"))]
 
+#[path = "../../../packaging/linux/appimage_peer.rs"]
+mod appimage_peer;
+
 #[path = "support/pipewire_probe.rs"]
 mod pipewire_probe;
 

@@ -18,13 +18,20 @@ an explicit legacy Element Call compatibility choice. Local encrypted
 two-device calls passed synthetic audio and camera transport, a shared
 voice-space marker, and real macOS display/window screen-track transport. A
 real Element Call v0.26.1 browser peer passed encrypted microphone/video
-receive and departure in the legacy room-state mode. Current Element Call
-mode, live remote-frame rendering, packaged-app permissions, and three-platform
+receive and departure in the legacy room-state mode. A stock Element Call v0.28.0-rc.1 peer passed the pre-synced Matrix 2.0
+(`Sticky2025`) protocol fixture. Fresh-device native peers passed Current and
+Sticky2025 membership renewal in Linux CI. Fresh-device Element interoperability,
+live remote-frame rendering, packaged-app permissions, and three-platform
 runtime behavior remain unverified. Rich formatting, media previews, full
 call controls, recovery screens, and platform acceptance tests remain in
 progress. Do not rely on this client for important conversations or
 encryption-key recovery yet. The first beta requires the cross-platform
 checks in [the feature matrix](docs/FEATURE_MATRIX.md).
+
+The composer candidate adds explicit mention selection, typed Plain/Markdown
+drafts, and mention-aware replies, threads and edits. Its new regression tests
+and expanded encrypted fixtures await hosted execution; native keyboard, IME
+and accessibility behavior are not yet verified.
 
 ![Morpheus native desktop preview with fictional accounts](docs/screenshots/desktop.png)
 

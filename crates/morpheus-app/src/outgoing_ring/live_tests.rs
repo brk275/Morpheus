@@ -54,6 +54,7 @@ enum Stage {
     Membership,
     ObserverOpen,
     ObserverRoster,
+    ActorSetup,
     ObserverLeave,
     Send,
     Receive,
@@ -81,6 +82,7 @@ impl Stage {
             Self::Membership => "membership",
             Self::ObserverOpen => "observer_open",
             Self::ObserverRoster => "observer_roster",
+            Self::ActorSetup => "actor_setup",
             Self::ObserverLeave => "observer_leave",
             Self::Send => "send",
             Self::Receive => "receive",
@@ -446,6 +448,7 @@ impl Session {
         .await?;
         fact("encrypted_membership");
 
+        phase(&mut self.stage, Stage::ActorSetup);
         self.actor = Some(ActorAcceptance::new(case, self.bob.clone(), bob.clone())?);
         self.actor.as_mut().ok_or(())?.prepare_devices().await?;
 

@@ -11,9 +11,10 @@ use std::time::{Duration, Instant};
 
 use chrono::{Local, TimeZone};
 use morpheus_matrix::{
-    AccountInfo, AccountManager, DownloadedAttachment, MatrixCoreError, MatrixLinkTarget,
-    MessageInfo, MessageSendState, QueuedAttachment, QueuedMessage, RoomInfo, RoomMemberInfo,
-    RoomMembership, SyncBackend, SyncStatus, TextFormat,
+    AccountInfo, AccountManager, AccountSelection, ComposeSendTarget, ComposeText,
+    DownloadedAttachment, EditBaseline, MatrixCoreError, MatrixLinkTarget, MessageInfo,
+    MessageSendState, QueuedAttachment, QueuedMessage, RoomInfo, RoomMemberInfo, RoomMembership,
+    SyncBackend, SyncStatus, TextFormat,
 };
 use slint::{Color, Model, ModelRc, StyledText, VecModel, Weak};
 use tokio::{
@@ -177,6 +178,63 @@ impl LiveUi {
 
     pub(crate) fn current_navigation_epoch(&self) -> u64 {
         self.navigation_epoch.load(Ordering::Acquire)
+    }
+
+    pub fn composed_draft(&self, account: &str, room: &str, thread: Option<&str>) -> ComposeText {
+        self.drafts.get_composed_scoped(account, room, thread)
+    }
+
+    pub fn remember_composed_draft(
+        &self,
+        account: &str,
+        room: &str,
+        thread: Option<&str>,
+        text: ComposeText,
+    ) -> Result<(), MatrixCoreError> {
+        if !account.is_empty() && !room.is_empty() {
+            self.drafts
+                .set_composed_scoped(account, room, thread, text)?;
+            self.queue_draft_write();
+        }
+        Ok(())
+    }
+
+    pub fn take_draft_recovery_notice(
+        &self,
+        account: &str,
+        room: &str,
+        thread: Option<&str>,
+    ) -> bool {
+        self.drafts.take_rich_recovery_notice(account, room, thread)
+    }
+
+    pub fn mark_composed_queued(
+        &self,
+        account: &str,
+        room: &str,
+        text: &ComposeText,
+        revision: u64,
+        transaction: &str,
+    ) -> bool {
+        self.drafts
+            .mark_composed_queued(account, room, text, revision, transaction)
+    }
+
+    pub fn acknowledge_composed_thread(
+        &self,
+        account: &str,
+        room: &str,
+        root: &str,
+        text: &ComposeText,
+        revision: u64,
+    ) -> Option<u64> {
+        let cleared = self
+            .drafts
+            .clear_composed_thread_if_unchanged(account, room, root, text, revision);
+        if cleared.is_some() {
+            self.queue_draft_write();
+        }
+        cleared
     }
 
     pub fn remember_draft(&self, account_id: &str, room_id: &str, body: &str) {
@@ -1126,11 +1184,16 @@ impl LiveUi {
             {
                 // Read the current cache on the UI thread: an edit after disk
                 // loading but before this callback also takes precedence.
-                ui.set_thread_composer_text(
-                    restore_drafts
-                        .get_scoped(&restore_account, &restore_room, Some(&restore_root))
-                        .into(),
+                let restored = restore_drafts.get_composed_scoped(
+                    &restore_account,
+                    &restore_room,
+                    Some(&restore_root),
                 );
+                ui.set_thread_composer_text(restored.body.into());
+                ui.set_thread_markdown(restored.format == TextFormat::Markdown);
+                if restore_drafts.take_rich_recovery_notice(&restore_account, &restore_room, Some(&restore_root)) {
+                    ui.set_transfer_notice("Draft text restored; unsupported saved formatting and mention selections were discarded.".into());
+                }
             }
         });
         if self.thread_generation.load(Ordering::Acquire) != generation {
@@ -1312,6 +1375,33 @@ impl LiveUi {
             .await
             .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?
             .map_err(MatrixCoreError::Io)
+    }
+
+    pub async fn send_composed(
+        &self,
+        selection: AccountSelection,
+        room_id: String,
+        target: ComposeSendTarget,
+        text: ComposeText,
+        baseline: Option<EditBaseline>,
+    ) -> Result<QueuedMessage, MatrixCoreError> {
+        self.require_selected_room(&room_id).await?;
+        match &target {
+            ComposeSendTarget::Room => {
+                self.drafts
+                    .persist_one(&self.manager, selection.account_id(), &room_id)
+                    .await?
+            }
+            ComposeSendTarget::Thread(root) => {
+                self.drafts
+                    .persist_scoped(&self.manager, selection.account_id(), &room_id, Some(root))
+                    .await?
+            }
+            _ => {}
+        }
+        self.manager
+            .send_composed_tracked_for(&selection, &room_id, target, &text, baseline.as_ref())
+            .await
     }
 
     pub async fn send(
@@ -1526,6 +1616,9 @@ fn apply_snapshot(
         ui.set_room_call_mode(0);
         ui.set_composer_text(drafts.get(&view.active.id, next_room_id).into());
         ui.set_composer_markdown(drafts.markdown(&view.active.id, next_room_id));
+        if drafts.take_rich_recovery_notice(&view.active.id, next_room_id, None) {
+            ui.set_transfer_notice("Draft text restored; unsupported saved formatting and mention selections were discarded.".into());
+        }
         ui.set_composer_saved_markdown(false);
         ui.set_composer_mode(0);
         ui.set_composer_target_id("".into());
@@ -1536,6 +1629,7 @@ fn apply_snapshot(
         ui.set_thread_root_id("".into());
         ui.set_thread_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new())));
         ui.set_thread_composer_text("".into());
+        ui.set_thread_markdown(false);
         ui.set_thread_send_pending(false);
     }
     let active_index = view

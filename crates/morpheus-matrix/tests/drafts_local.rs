@@ -10,7 +10,11 @@ use std::{
     time::Duration,
 };
 
-use morpheus_matrix::{AccountManager, QueuedSendOutcome};
+use matrix_sdk::{
+    ComposerDraft, ComposerDraftType,
+    ruma::{EventId, RoomId},
+};
+use morpheus_matrix::{AccountManager, ComposeText, MentionTarget, QueuedSendOutcome, TextFormat};
 use serde::Deserialize;
 use tokio::time::{Instant, sleep};
 use uuid::Uuid;
@@ -25,6 +29,7 @@ struct Fixture {
 struct TestAccount {
     label: String,
     username: String,
+    user_id: String,
     homeserver_url: String,
     password: String,
 }
@@ -106,16 +111,44 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
         let carol = fixture.account("b_primary");
         let a_room = fixture.room("a_room");
         let b_room = fixture.room("b_room");
-        let a_body = format!("private-draft-A-{}", Uuid::new_v4());
+        let target = &fixture.account("a_second_device").user_id;
+        let a_body = format!("private-draft-A-{} **saved** {target}", Uuid::new_v4());
         let b_body = format!("private-draft-B-{}", Uuid::new_v4());
         // SDK draft keys accept a valid event ID without fetching the event.
         // Distinct synthetic roots keep this persistence check independent of
         // timeline delivery; live thread sending has its own acceptance test.
         let first_thread = "$draft-root-one:fixture.invalid";
         let second_thread = "$draft-root-two:fixture.invalid";
-        let a_thread_body = format!("private-thread-A-one-{}", Uuid::new_v4());
+        let a_thread_body = format!("private-thread-A-one-{} {target} @room", Uuid::new_v4());
         let a_other_thread_body = format!("private-thread-A-two-{}", Uuid::new_v4());
-        let b_thread_body = format!("private-thread-B-one-{}", Uuid::new_v4());
+        let b_thread_body = format!("private-thread-B-one-{} {target}", Uuid::new_v4());
+        let mut typed_room = ComposeText::new(a_body.clone(), TextFormat::Markdown);
+        let start = a_body.find(target).expect("Draft target missing");
+        typed_room = typed_room
+            .insert_mention(
+                start..start + target.len(),
+                MentionTarget::User(target.clone()),
+            )
+            .expect("Cannot encode room draft mention")
+            .0;
+        let mut typed_thread = ComposeText::new(a_thread_body.clone(), TextFormat::Plain);
+        let start = a_thread_body.find(target).expect("Thread target missing");
+        typed_thread = typed_thread
+            .insert_mention(
+                start..start + target.len(),
+                MentionTarget::User(target.clone()),
+            )
+            .expect("Cannot encode thread draft mention")
+            .0;
+        let start = a_thread_body
+            .find("@room")
+            .expect("Thread room target missing");
+        typed_thread = typed_thread
+            .insert_mention(start..start + 5, MentionTarget::Room)
+            .expect("Cannot encode room selection")
+            .0;
+        let legacy_root = "$legacy-plain-draft:fixture.invalid";
+        let legacy_text = format!("legacy-plain-{} {target} @room", Uuid::new_v4());
 
         let manager = AccountManager::open(&root).expect("Cannot open account manager");
         let a_account = manager
@@ -124,7 +157,7 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
             .expect("First login failed");
         wait_for_room(&manager, a_room).await;
         manager
-            .save_composer_draft_for(&a_account.id, a_room, &a_body)
+            .save_composed_draft_for(&a_account.id, a_room, None, &typed_room)
             .await
             .expect("Cannot persist first draft");
         for (thread, body) in [
@@ -136,6 +169,27 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
                 .await
                 .expect("Cannot persist encrypted thread draft");
         }
+        manager
+            .save_composed_draft_for(&a_account.id, a_room, Some(first_thread), &typed_thread)
+            .await
+            .expect("Cannot persist typed thread draft");
+        let client = manager.active_client().await.expect("Draft client missing");
+        let room = client
+            .get_room(&RoomId::parse(a_room).expect("Invalid draft room"))
+            .expect("Draft room missing");
+        room.save_composer_draft(
+            ComposerDraft {
+                plain_text: legacy_text.clone(),
+                html_text: None,
+                draft_type: ComposerDraftType::NewMessage,
+                attachments: Vec::new(),
+            },
+            Some(&EventId::parse(legacy_root).expect("Invalid legacy root")),
+        )
+        .await
+        .expect("Cannot seed legacy plain draft");
+        drop(room);
+        drop(client);
         assert!(
             manager
                 .save_scoped_composer_draft_for(
@@ -206,13 +260,26 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
         drop(manager);
         assert!(!contains_plaintext(&root, a_body.as_bytes()));
         assert!(!contains_plaintext(&root, b_body.as_bytes()));
-        for body in [&a_thread_body, &a_other_thread_body, &b_thread_body] {
+        for body in [
+            &a_thread_body,
+            &a_other_thread_body,
+            &b_thread_body,
+            &legacy_text,
+        ] {
             assert!(
                 !contains_plaintext(&root, body.as_bytes()),
                 "Thread draft leaked into plaintext storage"
             );
         }
 
+        assert!(
+            !contains_plaintext(&root, typed_room.draft_html().unwrap().as_bytes()),
+            "Typed room intent encoding leaked into plaintext storage"
+        );
+        assert!(
+            !contains_plaintext(&root, typed_thread.draft_html().unwrap().as_bytes()),
+            "Typed thread intent encoding leaked into plaintext storage"
+        );
         let manager = AccountManager::open(&root).expect("Cannot reopen account manager");
         let restored = manager
             .restore_last_active()
@@ -256,6 +323,41 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
                 body
             );
         }
+        let restored_room = manager
+            .load_composed_draft_for(&a_account.id, a_room, None)
+            .await
+            .expect("Cannot restore typed room draft");
+        assert!(
+            restored_room.text == typed_room && !restored_room.discarded_rich_intent,
+            "Room format or explicit mention intent changed across restart"
+        );
+        let restored_thread = manager
+            .load_composed_draft_for(&a_account.id, a_room, Some(first_thread))
+            .await
+            .expect("Cannot restore typed thread draft");
+        assert!(
+            restored_thread.text == typed_thread && !restored_thread.discarded_rich_intent,
+            "Thread format or explicit mention intent changed across restart"
+        );
+        let legacy = manager
+            .load_composed_draft_for(&a_account.id, a_room, Some(legacy_root))
+            .await
+            .expect("Cannot restore legacy draft");
+        assert!(
+            legacy.text.body == legacy_text
+                && legacy.text.format == TextFormat::Plain
+                && legacy.text.mentions.is_empty()
+                && !legacy.discarded_rich_intent,
+            "Legacy text inferred mention intent"
+        );
+        let other = manager
+            .load_composed_draft_for(&b_account.id, b_room, Some(first_thread))
+            .await
+            .expect("Cannot restore other-account typed draft");
+        assert!(
+            other.text.body == b_thread_body && other.text.mentions.is_empty(),
+            "Selected mentions crossed account/room boundaries"
+        );
         manager
             .save_scoped_composer_draft_for(&a_account.id, a_room, Some(first_thread), "")
             .await

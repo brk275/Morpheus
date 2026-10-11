@@ -1,0 +1,36 @@
+{
+  "schema": 1,
+  "cargo_packager": "0.11.8",
+  "tools": [
+    {
+      "cache_name": "linuxdeploy-x86_64.AppImage",
+      "url": "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage",
+      "asset_id": 602438599,
+      "release_id": 363379357,
+      "release_target": "07333c6e942c7d71782b66be924c5d867f9dfdfc",
+      "sha256": "8aea8da0f7f7039d2a2cecb14657d752a222a5e1d3825caeef186c82f751cdd1",
+      "size": 19806712,
+      "updated_at": "2026-10-01T04:32:50Z"
+    },
+    {
+      "cache_name": "linuxdeploy-plugin-appimage.AppImage",
+      "url": "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage",
+      "asset_id": 602435573,
+      "release_id": 335652184,
+      "release_target": "536b068787179ea901964bd7dabc7bf61e4941c3",
+      "sha256": "49d6a17160675a6bd1781699aae6bdf7692d98552e02a3671d2183d10547842e",
+      "size": 16488952,
+      "updated_at": "2026-10-01T04:30:37Z"
+    },
+    {
+      "cache_name": "runtime-x86_64",
+      "url": "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64",
+      "asset_id": 596078161,
+      "release_id": 398504756,
+      "release_target": "8f39b89e2ac31e1640b3d3f7e9a5108e6ce805fa",
+      "sha256": "156f4bdbde9c52d01814600013e0a273f0118dc2de98975f3c8c63427ec79074",
+      "size": 944632,
+      "updated_at": "2026-09-28T18:16:03Z"
+    }
+  ]
+}

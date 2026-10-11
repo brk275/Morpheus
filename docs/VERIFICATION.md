@@ -5,7 +5,89 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
 ## Current hosted acceptance, 2026-10-11
 
-### Incoming call controls candidate
+### Incoming controls and membership renewal: `c7ad50c`
+
+[Run 38149404773](https://github.com/brk275/Morpheus/actions/runs/38149404773)
+tested `c7ad50cedc2559e3acfded13f135c735c2070be8`. The scope job passed
+402 helper/selection checks with one skip and scanned all 44 commits with zero
+secret findings. Apple Silicon, Intel Mac and Windows passed native check/build,
+679 unit/vendor checks and ten selectors without live fixture inputs. Windows
+also passed the owned synthetic window/display capture check. Linux passed
+native check/build, 705 unit/vendor checks and twelve selectors without live inputs.
+All four platforms passed 280 RTC core tests, including all 17 membership-renewal
+regressions, and 17 upstream key-rotation tests. Every job and post-step completed;
+Linux's final failure reflects the four incoming fixture setup failures below.
+
+Linux passed 19 live Rust checks covering accounts, encrypted drafts and media,
+room actions, formatting, discovery, moderation, both search sync paths,
+recovery, OAuth login/refresh/restore/logout, unsupported transport and RTC.
+Fresh-device late joins passed for both Current and Sticky2025: each receiving
+device decrypted a newly renewed encrypted membership after its creation. The
+historical marker only proves absence from the sampled current live map;
+historical key recovery is not claimed. The stock Element Call
+`v0.28.0-rc.1` pre-synced Sticky2025 case passed all eleven fixture facts. This
+does not establish fresh-device Element or Current-format Element acceptance.
+
+All four expanded incoming-call cases failed during fixture actor setup. The
+passive observer had already passed and the encrypted membership was confirmed.
+Source diagnosis found that `ActorAcceptance::new` called the persistent call
+mode setter before creating its fresh `incoming-config.toml`. The old outer
+`observer_roster` label therefore identified an earlier stage, not the failing
+operation. No invitation was sent and no live incoming worker/Answer assertion
+was reached. A focused repair initializes the fixture configuration and gives
+actor setup its own diagnostic stage; its hosted execution is still pending.
+
+Linux Wayland capture passed the exact named test with exit zero, all 33 system
+PipeWire bindings and complete, untruncated stdout/stderr. Its ordered diagnostic
+summary reached its event limit. This pass does not explain earlier intermittent
+first-frame failures or establish installed-package capture. The four native
+preview PNGs were captured from the actual Slint application; the incoming view
+was visually inspected and the three existing README previews remained byte
+identical. The incoming capture verifies presentation, not live Answer behavior.
+No installers were uploaded. All four complete native logs scanned with zero
+findings, and their cache and checkout post-steps completed successfully. Intel
+restored no cache; its attempted save could not reserve a cache entry (HTTP 429).
+The successful post-step therefore does not establish that Intel saved a cache.
+
+### Composer candidate: source review only
+
+The next candidate implements caret-based suggestions from cached joined-room
+members, explicit user/authorized-room mention selection, and typed Plain/Markdown
+source across room, reply, thread and edit composers. Pasted IDs and links do not
+create mention intent. Encrypted draft restoration preserves canonical typed
+intent; unsupported or legacy rich data restores plain source without inferred
+mentions. Effective-edit baselines retain full replacement metadata while notifying
+only newly added targets. Unknown enqueue outcomes retain their scope guard and
+source instead of inviting a duplicate send.
+
+Forty-five new Rust regression tests and two incoming-fixture setup regressions
+were added and source-reviewed but have not executed. The existing encrypted
+formatting and draft fixtures were expanded for selected metadata, effective-edit
+deltas, authenticated inherited reply mentions and restart persistence; those
+changed fixtures have not executed either. No native build or runtime result above
+verifies this candidate.
+
+Caret/selection integration uses internal properties of pinned Slint 1.18.1 and
+still needs native keyboard, IME, popup and accessibility acceptance. Suggestions
+may be unavailable until ordinary room-member loading completes. Unsupported rich
+edits fail closed; editing an encrypted reply with an invisible inherited sender
+requires that sender's fetched event to be SDK-Verified. Cross-restart queued-send
+reconciliation and complete retry/cancel controls remain open. The incoming actor
+setup repair also awaits the same four hosted live cases.
+
+### Installed AppImage capture candidate
+
+The Linux-only [AppImage capture adapter](APPIMAGE_PIPEWIRE_PROPOSAL.md) now
+passes its source-review gate and 87 focused pure/mocked Python checks. It builds
+a private package with the reviewed PipeWire client fix, operates the actual
+installed app through accessibility controls, and requires an independent encrypted
+receiver plus live process/library identity and binding evidence. Both ordinary
+loading and a separate eager-binding run are required. Two native color guards
+and the installed flow remain unexecuted. The source gate does not establish
+installed capture success or distribution readiness; installer uploads remain
+disabled and licensing/source-provenance requirements remain open.
+
+### Incoming call controls implementation
 
 The active-account incoming worker, four-offer native banner, exact-key Answer
 and local Dismiss are wired. Answer retains the admitted account, room and
@@ -18,7 +100,8 @@ both actual rosters within the original invitation deadline, rejects conflicting
 identities and closed sources, and keeps cancellation active before the existing
 full post-join validation. It does not fabricate a participant or extend expiry.
 
-Forty-three added regression tests have been source-reviewed but have not run.
+Forty-three added regression tests were source-reviewed and are included in the
+native execution results above.
 They cover bounded discovery and commands, single-use actions, cancellation,
 account changes, deadlines, owned authorization, capture revocation, preference
 changes and identity-label controls. In-app notification toggles apply each
@@ -30,8 +113,8 @@ pre/post-join lookups remain required.
 A fourth native preview capture selects the actual incoming-banner layout with
 fictional in-memory Casey/Jules data, before any account, network or media
 initialization. The five lossless-encoder/input-validation Python tests passed;
-Rust formatting and workflow lint passed. Native rendering of this view is still
-pending. A preview capture will verify presentation only; live actor Answer,
+Rust formatting and workflow lint passed. The actual native capture passed and
+was visually reviewed. It verifies presentation only; live actor Answer,
 keyboard/screen-reader interaction and physical audio require their own evidence.
 Audible ringing, incoming OS notifications and protocol Decline remain open.
 
@@ -39,7 +122,8 @@ The same four encrypted Current/Sticky2025 DM/room fixtures now select actual
 worker discovery, one-use Answer, the production call controller, exact joined
 identity, unchanged slot, receive-only device failure, leave and account-switch
 revocation. The outer 300-second limits and original thirteen assertions remain.
-The updated harness passed 95 Python checks. Native execution is pending.
+The updated harness passed 95 Python checks. Native execution failed in fixture
+setup as recorded above; the actor path has no live pass yet.
 Quiet-state observations are sampled; they do not prove that no transient server
 notification existed. Joined status after SDK receipt removal is also sampled;
 this fixture does not acknowledge complete actor processing of that withdrawal.
@@ -64,7 +148,8 @@ devices without changing the 45-second roster deadline. Each must observe a
 new encrypted event for the same logical membership after the original event
 preceded the second device's creation. Its historical-event marker means only
 that the original event was absent from the sampled current live map.
-Runtime recovery remains unproven; the current hosted results are recorded below.
+Both native fresh-device recovery fixtures passed at `c7ad50c`, as recorded
+above. Installed UI and production-provider behavior remain unverified.
 Dependency resolution found one patched core instance, no existing version
 changes and no new registry/git package identities.
 

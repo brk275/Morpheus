@@ -9,7 +9,7 @@ use std::{
     sync::Mutex,
 };
 
-use morpheus_matrix::{AccountManager, MatrixCoreError};
+use morpheus_matrix::{AccountManager, ComposeError, ComposeText, MatrixCoreError, TextFormat};
 use tokio::sync::Mutex as AsyncMutex;
 
 pub type DraftKey = (String, String, Option<String>);
@@ -27,12 +27,13 @@ pub struct DraftStore {
     by_room: Mutex<HashMap<DraftKey, CachedDraft>>,
     account_epochs: Mutex<HashMap<String, u64>>,
     thread_sends: Mutex<HashSet<DraftKey>>,
-    markdown_by_room: Mutex<HashMap<(String, String), bool>>,
+    rich_recovery_notices: Mutex<HashSet<DraftKey>>,
     write_lock: AsyncMutex<()>,
 }
 
+#[derive(Default)]
 struct CachedDraft {
-    body: String,
+    text: ComposeText,
     revision: u64,
     dirty: bool,
     pending: Option<PendingDraft>,
@@ -40,27 +41,83 @@ struct CachedDraft {
 
 struct PendingDraft {
     transaction_id: String,
-    submitted: String,
+    submitted: ComposeText,
     queued_revision: u64,
 }
 
 impl DraftStore {
-    /// Formatting is a session-local compose choice. The source text remains
-    /// in the encrypted room draft when the app closes.
+    /// Formatting and explicit mention intent share the encrypted draft snapshot.
     pub fn set_markdown(&self, account_id: &str, room_id: &str, enabled: bool) {
-        self.markdown_by_room
-            .lock()
-            .expect("draft formatting mutex poisoned")
-            .insert((account_id.to_owned(), room_id.to_owned()), enabled);
+        self.set_scoped_markdown(account_id, room_id, None, enabled);
     }
 
-    pub fn markdown(&self, account_id: &str, room_id: &str) -> bool {
-        self.markdown_by_room
+    pub fn set_scoped_markdown(
+        &self,
+        account: &str,
+        room: &str,
+        thread: Option<&str>,
+        enabled: bool,
+    ) {
+        let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
+        let draft = drafts
+            .entry(key(account, room, thread))
+            .or_insert_with(CachedDraft::default);
+        let format = if enabled {
+            TextFormat::Markdown
+        } else {
+            TextFormat::Plain
+        };
+        draft.text = draft.text.with_format(format);
+        draft.revision = draft.revision.wrapping_add(1);
+        draft.dirty = true;
+    }
+
+    pub fn markdown(&self, account: &str, room: &str) -> bool {
+        self.get_composed_scoped(account, room, None).format == TextFormat::Markdown
+    }
+
+    pub fn get_composed_scoped(
+        &self,
+        account: &str,
+        room: &str,
+        thread: Option<&str>,
+    ) -> ComposeText {
+        self.by_room
             .lock()
-            .expect("draft formatting mutex poisoned")
-            .get(&(account_id.to_owned(), room_id.to_owned()))
-            .copied()
-            .unwrap_or(false)
+            .expect("draft mutex poisoned")
+            .get(&key(account, room, thread))
+            .map(|draft| draft.text.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_composed_scoped(
+        &self,
+        account: &str,
+        room: &str,
+        thread: Option<&str>,
+        text: ComposeText,
+    ) -> Result<(), ComposeError> {
+        text.validate()?;
+        let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
+        let draft = drafts
+            .entry(key(account, room, thread))
+            .or_insert_with(CachedDraft::default);
+        draft.text = text;
+        draft.revision = draft.revision.wrapping_add(1);
+        draft.dirty = true;
+        Ok(())
+    }
+
+    pub fn take_rich_recovery_notice(
+        &self,
+        account: &str,
+        room: &str,
+        thread: Option<&str>,
+    ) -> bool {
+        self.rich_recovery_notices
+            .lock()
+            .expect("draft notice mutex poisoned")
+            .remove(&key(account, room, thread))
     }
 
     pub fn dirty_keys(&self) -> Vec<DraftKey> {
@@ -81,15 +138,10 @@ impl DraftStore {
         let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
         let entry = drafts
             .entry(key(account_id, room_id, thread))
-            .or_insert_with(|| CachedDraft {
-                body: String::new(),
-                revision: 0,
-                dirty: false,
-                pending: None,
-            });
+            .or_insert_with(CachedDraft::default);
         // `set` is called only for a user edit. Even an edit that ends with
         // the same text must prevent an old failed send from restoring over it.
-        entry.body = body.to_owned();
+        entry.text = entry.text.rebase_body(body.to_owned());
         entry.revision = entry.revision.wrapping_add(1);
         entry.dirty = true;
     }
@@ -103,7 +155,7 @@ impl DraftStore {
             .lock()
             .expect("draft mutex poisoned")
             .get(&key(account_id, room_id, thread))
-            .map(|draft| draft.body.clone())
+            .map(|draft| draft.text.body.clone())
             .unwrap_or_default()
     }
 
@@ -138,15 +190,42 @@ impl DraftStore {
         let Some(draft) = drafts.get_mut(&key(account_id, room_id, None)) else {
             return false;
         };
-        if draft.body != submitted || draft.revision != expected_revision {
+        if draft.text.body != submitted || draft.revision != expected_revision {
             return false;
         }
-        draft.body.clear();
+        let submitted = draft.text.clone();
+        draft.text = ComposeText::new(String::new(), submitted.format);
         draft.revision = draft.revision.wrapping_add(1);
         draft.dirty = false;
         draft.pending = Some(PendingDraft {
             transaction_id: transaction_id.to_owned(),
-            submitted: submitted.to_owned(),
+            submitted,
+            queued_revision: draft.revision,
+        });
+        true
+    }
+
+    pub fn mark_composed_queued(
+        &self,
+        account: &str,
+        room: &str,
+        submitted: &ComposeText,
+        revision: u64,
+        transaction: &str,
+    ) -> bool {
+        let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
+        let Some(draft) = drafts.get_mut(&key(account, room, None)) else {
+            return false;
+        };
+        if draft.text != *submitted || draft.revision != revision {
+            return false;
+        }
+        draft.text = ComposeText::new(String::new(), submitted.format);
+        draft.revision = draft.revision.wrapping_add(1);
+        draft.dirty = false;
+        draft.pending = Some(PendingDraft {
+            transaction_id: transaction.to_owned(),
+            submitted: submitted.clone(),
             queued_revision: draft.revision,
         });
         true
@@ -174,14 +253,14 @@ impl DraftStore {
             return false;
         }
         let pending = draft.pending.take().expect("checked pending transaction");
-        if draft.revision != pending.queued_revision || !draft.body.is_empty() {
+        if draft.revision != pending.queued_revision || !draft.text.body.is_empty() {
             return false;
         }
         draft.revision = draft.revision.wrapping_add(1);
         if sent {
             draft.dirty = true;
         } else {
-            draft.body = pending.submitted;
+            draft.text = pending.submitted;
             // `mark_queued` ran after a successful encrypted store flush.
             draft.dirty = false;
         }
@@ -200,10 +279,10 @@ impl DraftStore {
             .lock()
             .expect("draft mutex poisoned")
             .retain(|(id, _, _), _| id != account_id);
-        self.markdown_by_room
+        self.rich_recovery_notices
             .lock()
-            .expect("draft formatting mutex poisoned")
-            .retain(|(id, _), _| id != account_id);
+            .expect("draft notice mutex poisoned")
+            .retain(|(id, _, _)| id != account_id);
         self.thread_sends
             .lock()
             .expect("thread send mutex poisoned")
@@ -258,11 +337,11 @@ impl DraftStore {
         {
             return Ok(());
         }
-        let body = manager
-            .load_scoped_composer_draft_for(account_id, room_id, thread)
+        let restored = manager
+            .load_composed_draft_for(account_id, room_id, thread)
             .await?;
-        // An edit made while the disk read was pending wins over stale storage.
-        self.insert_loaded_if_missing(key, body, epoch);
+        // Cache and recovery notice share the logout epoch critical section.
+        self.insert_restored_if_missing(key, restored.text, epoch, restored.discarded_rich_intent);
         Ok(())
     }
 
@@ -275,7 +354,18 @@ impl DraftStore {
             .unwrap_or_default()
     }
 
-    fn insert_loaded_if_missing(&self, key: DraftKey, body: String, epoch: u64) {
+    #[cfg(test)]
+    fn insert_loaded_if_missing(&self, key: DraftKey, text: ComposeText, epoch: u64) {
+        self.insert_restored_if_missing(key, text, epoch, false);
+    }
+
+    fn insert_restored_if_missing(
+        &self,
+        key: DraftKey,
+        text: ComposeText,
+        epoch: u64,
+        discarded: bool,
+    ) {
         let epochs = self
             .account_epochs
             .lock()
@@ -283,16 +373,21 @@ impl DraftStore {
         if epochs.get(&key.0).copied().unwrap_or_default() != epoch {
             return;
         }
-        self.by_room
-            .lock()
-            .expect("draft mutex poisoned")
-            .entry(key)
-            .or_insert(CachedDraft {
-                body,
+        let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
+        if let std::collections::hash_map::Entry::Vacant(entry) = drafts.entry(key.clone()) {
+            entry.insert(CachedDraft {
+                text,
                 revision: 0,
                 dirty: false,
                 pending: None,
             });
+            if discarded {
+                self.rich_recovery_notices
+                    .lock()
+                    .expect("draft notice mutex poisoned")
+                    .insert(key);
+            }
+        }
     }
 
     /// A direct thread send clears only the exact submitted revision after a
@@ -308,10 +403,29 @@ impl DraftStore {
     ) -> Option<u64> {
         let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
         let draft = drafts.get_mut(&key(account_id, room_id, Some(thread)))?;
-        if draft.body != submitted || draft.revision != expected_revision {
+        if draft.text.body != submitted || draft.revision != expected_revision {
             return None;
         }
-        draft.body.clear();
+        draft.text = ComposeText::new(String::new(), draft.text.format);
+        draft.revision = draft.revision.wrapping_add(1);
+        draft.dirty = true;
+        Some(draft.revision)
+    }
+
+    pub fn clear_composed_thread_if_unchanged(
+        &self,
+        account: &str,
+        room: &str,
+        thread: &str,
+        submitted: &ComposeText,
+        revision: u64,
+    ) -> Option<u64> {
+        let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
+        let draft = drafts.get_mut(&key(account, room, Some(thread)))?;
+        if draft.text != *submitted || draft.revision != revision {
+            return None;
+        }
+        draft.text = ComposeText::new(String::new(), submitted.format);
         draft.revision = draft.revision.wrapping_add(1);
         draft.dirty = true;
         Some(draft.revision)
@@ -344,12 +458,12 @@ impl DraftStore {
             .expect("draft mutex poisoned")
             .get(&key)
             .filter(|draft| draft.dirty)
-            .map(|draft| (draft.body.clone(), draft.revision))
+            .map(|draft| (draft.text.clone(), draft.revision))
         else {
             return Ok(());
         };
         manager
-            .save_scoped_composer_draft_for(account_id, room_id, thread, &body)
+            .save_composed_draft_for(account_id, room_id, thread, &body)
             .await?;
         if let Some(draft) = self
             .by_room
@@ -555,5 +669,79 @@ mod tests {
             drafts.dirty_keys(),
             vec![("account".into(), "room".into(), None)]
         );
+    }
+    fn mention_text() -> morpheus_matrix::ComposeText {
+        let text = morpheus_matrix::ComposeText::plain("@casey:example.org");
+        text.insert_mention(
+            0..text.body.len(),
+            morpheus_matrix::MentionTarget::User(text.body.clone()),
+        )
+        .unwrap()
+        .0
+    }
+
+    #[test]
+    fn queued_failure_restores_full_intent_but_same_text_edit_does_not() {
+        let drafts = DraftStore::default();
+        let text = mention_text();
+        drafts
+            .set_composed_scoped("a", "room", None, text.clone())
+            .unwrap();
+        let revision = drafts.revision("a", "room").unwrap();
+        assert!(drafts.mark_composed_queued("a", "room", &text, revision, "tx"));
+        assert!(drafts.resolve_queued("a", "room", "tx", false));
+        assert_eq!(drafts.get_composed_scoped("a", "room", None), text);
+        let revision = drafts.revision("a", "room").unwrap();
+        assert!(drafts.mark_composed_queued("a", "room", &text, revision, "tx2"));
+        drafts.set("a", "room", &text.body);
+        assert!(!drafts.resolve_queued("a", "room", "tx2", false));
+        assert!(
+            drafts
+                .get_composed_scoped("a", "room", None)
+                .mentions
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn intent_only_thread_change_and_late_account_load_preserve_scope() {
+        let drafts = DraftStore::default();
+        let text = mention_text();
+        drafts
+            .set_composed_scoped("a", "room", Some("root"), text.clone())
+            .unwrap();
+        let revision = drafts.scoped_revision("a", "room", Some("root")).unwrap();
+        drafts.set_scoped("a", "room", Some("root"), &text.body);
+        assert!(
+            drafts
+                .clear_composed_thread_if_unchanged("a", "room", "root", &text, revision)
+                .is_none()
+        );
+        let epoch = drafts.account_epoch("a");
+        drafts.forget_account("a");
+        drafts.insert_loaded_if_missing(key("a", "room", Some("root")), text, epoch);
+        assert_eq!(
+            drafts.get_composed_scoped("a", "room", Some("root")),
+            morpheus_matrix::ComposeText::default()
+        );
+    }
+    #[test]
+    fn rich_restore_notice_is_epoch_guarded_and_never_overwrites_a_new_edit() {
+        let drafts = DraftStore::default();
+        let scope = key("a", "room", None);
+        let epoch = drafts.account_epoch("a");
+        drafts.forget_account("a");
+        drafts.insert_restored_if_missing(scope.clone(), "late".into(), epoch, true);
+        assert_eq!(drafts.get("a", "room"), "");
+        assert!(!drafts.take_rich_recovery_notice("a", "room", None));
+        drafts.set("a", "room", "edited while loading");
+        drafts.insert_restored_if_missing(
+            scope,
+            "old disk text".into(),
+            drafts.account_epoch("a"),
+            true,
+        );
+        assert_eq!(drafts.get("a", "room"), "edited while loading");
+        assert!(!drafts.take_rich_recovery_notice("a", "room", None));
     }
 }

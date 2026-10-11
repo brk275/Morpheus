@@ -845,7 +845,7 @@ class OutgoingRingTests(unittest.TestCase):
                 self.assertEqual(acceptance_module.ring_diagnostics(output), {
                     "checks": {}, "observer_result": category,
                 })
-        for stage in ("observer_open", "observer_roster", "observer_leave"):
+        for stage in ("observer_open", "observer_roster", "actor_setup", "observer_leave"):
             with self.subTest(stage=stage):
                 output = f"MORPHEUS_RING_STAGE {stage}\nMORPHEUS_RING_FAILURE {stage}\n"
                 self.assertEqual(acceptance_module.ring_diagnostics(output), {

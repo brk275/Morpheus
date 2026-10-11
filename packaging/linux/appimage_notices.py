@@ -1,0 +1,333 @@
+"""Inventory AppImage dependencies without executing a target or calling ldd.
+
+This records exact host package provenance and ships its copyright notices.
+It deliberately does not equate notices or a GNU build ID with complete source
+compliance. Static runtime/Rust dependencies and corresponding-source assembly
+remain release gates; this adapter permits private QA, never publication.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import stat
+
+import appimage_client as client
+
+
+MAX_ELF = 512 * 1024 * 1024
+MAX_NOTICE = 4 * 1024 * 1024
+MAX_COMPONENTS = 256
+NOTICE_ROOT = "usr/share/doc/morpheus-app/bundled-components"
+SYSTEM_DIRS = (Path("/usr/lib/x86_64-linux-gnu"), Path("/lib/x86_64-linux-gnu"),
+               Path("/usr/lib"), Path("/lib"))
+PACKAGE = re.compile(r"[a-z0-9][a-z0-9+.-]*(?::[a-z0-9][a-z0-9-]*)?")
+SONAME = re.compile(r"[A-Za-z0-9_+.-]+")
+HEX = re.compile(r"[0-9a-f]{64}")
+VERSION = re.compile(r"[A-Za-z0-9.+:~_-]{1,160}")
+
+
+class InventoryFailure(RuntimeError):
+    def __init__(self, reason):
+        allowed = {"input", "tool", "elf", "dependency", "package", "notice", "deployment", "limit"}
+        self.reason = reason if reason in allowed else "input"
+        super().__init__("AppImage inventory failed: " + self.reason)
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def regular(path, bound):
+    try:
+        return client.read_regular(Path(path), bound)
+    except (OSError, client.PackageFailure):
+        raise InventoryFailure("input") from None
+
+
+def root_owned(path):
+    """Follow only a root-controlled system path; preserve no ambient overrides."""
+    try:
+        path = Path(path).absolute()
+        for candidate in (path, path.resolve(strict=True)):
+            for item in (candidate, *candidate.parents):
+                info = item.lstat()
+                if info.st_uid != 0 or (not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022):
+                    raise InventoryFailure("tool")
+        resolved = path.resolve(strict=True)
+        if not resolved.is_file():
+            raise InventoryFailure("tool")
+        return resolved
+    except OSError:
+        raise InventoryFailure("tool") from None
+
+
+def command(runner, label, argv, root, environment, *, limit=1024 * 1024, expected_status=(0,)):
+    try:
+        output = runner.run(label, argv, cwd=root, env=environment, timeout=30,
+                            output_limit=limit, expected_status=expected_status)
+        if type(output) is not bytes or len(output) > limit:
+            raise InventoryFailure("limit")
+        return output.decode("utf-8", errors="strict")
+    except (OSError, UnicodeError):
+        raise InventoryFailure("input") from None
+
+
+def parse_elf_report(output):
+    ids = re.findall(r"^\s*Build ID:\s*([0-9a-f]+)\s*$", output, re.MULTILINE)
+    needed = re.findall(r"\(NEEDED\).*?Shared library: \[([^\]\n]+)\]", output)
+    names = re.findall(r"\(SONAME\).*?Library soname: \[([^\]\n]+)\]", output)
+    searches = re.findall(r"\((?:RPATH|RUNPATH)\).*?: \[([^\]\n]*)\]", output)
+    if (len(ids) != 1 or not 8 <= len(ids[0]) <= 128 or len(ids[0]) % 2
+            or len(needed) > 128 or len(needed) != len(set(needed)) or len(names) > 1
+            or len(searches) > 1 or any(not SONAME.fullmatch(value) for value in needed + names)):
+        raise InventoryFailure("elf")
+    return {"build_id": ids[0], "needed": sorted(needed), "soname": names[0] if names else None,
+            "search": searches[0].split(":") if searches else []}
+
+
+def elf_record(runner, path, root, environment):
+    data = regular(path, MAX_ELF)
+    # This distribution is x86-64 little-endian ELF, ET_EXEC or ET_DYN only.
+    if (len(data) < 64 or data[:7] != b"\x7fELF\x02\x01\x01"
+            or int.from_bytes(data[16:18], "little") not in (2, 3)
+            or int.from_bytes(data[18:20], "little") != 62):
+        raise InventoryFailure("elf")
+    readelf = root_owned("/usr/bin/readelf")
+    output = command(runner, "inventory-elf", [str(readelf), "--wide", "--dynamic", "--notes", str(path)],
+                     root, environment)
+    return {**parse_elf_report(output), "sha256": digest(data)}
+
+
+def resolve_library(name):
+    if not SONAME.fullmatch(name):
+        raise InventoryFailure("dependency")
+    found = set()
+    for directory in SYSTEM_DIRS:
+        path = directory / name
+        if path.exists() or path.is_symlink():
+            found.add(root_owned(path))
+    if len(found) != 1:
+        raise InventoryFailure("dependency")
+    return found.pop()
+
+
+def parse_package_record(output, expected):
+    lines = output.splitlines()
+    if len(lines) != 1:
+        raise InventoryFailure("package")
+    fields = lines[0].split("\t")
+    if len(fields) != 4:
+        raise InventoryFailure("package")
+    package, version, source, source_version = fields
+    if (package != expected or not PACKAGE.fullmatch(package) or not PACKAGE.fullmatch(source)
+            or not VERSION.fullmatch(version) or not VERSION.fullmatch(source_version)):
+        raise InventoryFailure("package")
+    return {"package": package, "version": version, "source_package": source,
+            "source_version": source_version}
+
+
+def package_record(runner, path, root, environment):
+    dpkg = root_owned("/usr/bin/dpkg-query")
+    # dpkg may retain the pre-usrmerge spelling in its file list. Query both
+    # owned aliases and accept only the same single owning package.
+    aliases = [str(path)]
+    if str(path).startswith("/usr/lib/"):
+        aliases.append(str(path)[4:])
+    owners = set()
+    for alias in aliases:
+        # dpkg --search uses status 1 with empty stdout for an absent alias.
+        # Ownership/deadline/output failures must propagate, never try another
+        # alias after cleanup failed.
+        output = command(runner, "inventory-owner", [str(dpkg), "--search", alias],
+                         root, environment, expected_status=(0, 1))
+        for line in output.splitlines():
+            match = re.fullmatch(r"([a-z0-9][a-z0-9+.-]*(?::[a-z0-9][a-z0-9-]*)?): (/.+)", line)
+            if not match or match[2] != alias:
+                raise InventoryFailure("package")
+            owners.add(match[1])
+    if len(owners) != 1:
+        raise InventoryFailure("package")
+    owner = owners.pop()
+    output = command(runner, "inventory-package", [str(dpkg), "--show",
+                     "--showformat=${binary:Package}\t${Version}\t${source:Package}\t${source:Version}\n",
+                     "--", owner], root, environment)
+    record = parse_package_record(output, owner)
+    notice = root_owned(Path("/usr/share/doc") / owner.split(":")[0] / "copyright")
+    data = regular(notice, MAX_NOTICE)
+    if not data.strip():
+        raise InventoryFailure("notice")
+    # Retain complete copyright prose, including its common-license references.
+    common = {}
+    for name in set(re.findall(rb"/usr/share/common-licenses/([A-Za-z0-9.+-]+)", data)):
+        text = name.rstrip(b".").decode("ascii")
+        if not text:
+            raise InventoryFailure("notice")
+        common[text] = regular(root_owned(Path("/usr/share/common-licenses") / text), MAX_NOTICE)
+    return record, data, common
+
+
+def add_notice(directory, config, notices, name, data):
+    if not re.fullmatch(r"[A-Za-z0-9_+.-]+", name) or not 0 < len(data) <= MAX_NOTICE:
+        raise InventoryFailure("notice")
+    destination = NOTICE_ROOT + "/" + name
+    path = directory / name
+    if destination in notices:
+        if notices[destination] != digest(data):
+            raise InventoryFailure("notice")
+        return destination
+    files = config["appimage"]["files"]
+    if destination in files.values() or str(path) in files:
+        raise InventoryFailure("notice")
+    client.write_new(path, data)
+    files[str(path)] = destination
+    notices[destination] = digest(data)
+    return destination
+
+
+def prepare(runner, root, binary, stage, source_metadata, config, environment):
+    root = client.private_directory(root)
+    stage = Path(stage)
+    if not isinstance(config.get("appimage", {}).get("files"), dict):
+        raise InventoryFailure("input")
+    directory = root / "component-notices"
+    directory.mkdir(mode=0o700)
+    notices = {}
+    components = {}
+    main = elf_record(runner, binary, root, environment)
+    if main["search"]:
+        raise InventoryFailure("dependency")
+    components["morpheus-app"] = {**main, "kind": "project"}
+    pending = list(main["needed"])
+    while pending:
+        name = pending.pop()
+        if name in components:
+            continue
+        if len(components) >= MAX_COMPONENTS:
+            raise InventoryFailure("limit")
+        if name == client.SONAME:
+            path = stage / name
+            record = elf_record(runner, path, root, environment)
+            if (record["sha256"] != source_metadata.get("source_client_sha256")
+                    or record["build_id"] != source_metadata.get("build_id")):
+                raise InventoryFailure("input")
+            record.update(kind="pipewire", source_version=source_metadata["source_version"])
+        else:
+            path = resolve_library(name)
+            record = elf_record(runner, path, root, environment)
+            package, copyright_text, common = package_record(runner, path, root, environment)
+            key = package["package"].replace(":", "_")
+            notice = add_notice(directory, config, notices, key + ".copyright", copyright_text)
+            for common_name, content in common.items():
+                add_notice(directory, config, notices, "common-" + common_name, content)
+            record.update(kind="system-package", **package, copyright_notice=notice)
+        if record["soname"] != name or record["search"]:
+            raise InventoryFailure("dependency")
+        components[name] = record
+        pending.extend(record["needed"])
+    add_notice(directory, config, notices, "Morpheus-LICENSE", regular(client.ROOT / "LICENSE", MAX_NOTICE))
+    # PipeWire provenance/notices are staged by appimage_config; pin every byte.
+    for source, destination in config["appimage"]["files"].items():
+        if destination.startswith(client.NOTICE_DIR + "/"):
+            data = regular(source, 64 * 1024 * 1024)
+            notices[destination] = digest(data)
+    return {"schema": 1, "components": components, "notices": notices,
+            "launcher_sha256": digest(client.launcher_bytes()),
+            "runtime_pin": next(pin for pin in client.pinned_tools() if pin["cache_name"] == "runtime-x86_64")}
+
+
+def walk_regular_files(appdir):
+    """Bound traversal and reject symlinks outside the exact extracted AppDir."""
+    appdir = Path(appdir).absolute()
+    if appdir.resolve(strict=True) != appdir or not appdir.is_dir():
+        raise InventoryFailure("deployment")
+    count = 0
+    for folder, dirs, files in os.walk(appdir, followlinks=False):
+        for name in [*dirs, *files]:
+            count += 1
+            if count > 10000:
+                raise InventoryFailure("limit")
+            path = Path(folder) / name
+            info = path.lstat()
+            if (info.st_uid != os.getuid() or info.st_mode & (stat.S_ISUID | stat.S_ISGID)
+                    or (not stat.S_ISLNK(info.st_mode) and info.st_mode & 0o022)):
+                raise InventoryFailure("deployment")
+            if stat.S_ISLNK(info.st_mode):
+                resolved = path.resolve(strict=True)
+                if appdir not in resolved.parents or not resolved.is_file():
+                    raise InventoryFailure("deployment")
+            elif stat.S_ISREG(info.st_mode):
+                if info.st_nlink != 1:
+                    raise InventoryFailure("deployment")
+                yield path
+            elif not stat.S_ISDIR(info.st_mode):
+                raise InventoryFailure("deployment")
+
+
+def validate_search(record, path, appdir):
+    for entry in record["search"]:
+        # No ambient paths, empty components, LD override or unresolved tokens.
+        if entry != "$ORIGIN" and not entry.startswith("$ORIGIN/"):
+            raise InventoryFailure("deployment")
+        suffix = entry[len("$ORIGIN"):].lstrip("/")
+        if "$" in suffix or "\\" in suffix:
+            raise InventoryFailure("deployment")
+        resolved = (path.parent / suffix).resolve(strict=True)
+        if (resolved != appdir and appdir not in resolved.parents) or not resolved.is_dir():
+            raise InventoryFailure("deployment")
+
+
+def verify(runner, appdir, notice_record, shipped_pipewire, environment):
+    appdir = Path(appdir).absolute()
+    components = notice_record["components"]
+    seen = set()
+    deployed = []
+    files = list(walk_regular_files(appdir))
+    for path in files:
+        with path.open("rb") as stream:
+            prefix = stream.read(4)
+        if prefix != b"\x7fELF":
+            continue
+        relative = path.relative_to(appdir).as_posix()
+        record = elf_record(runner, path, appdir, environment)
+        key = "morpheus-app" if relative == "usr/bin/morpheus-app" else record["soname"]
+        original = components.get(key)
+        if (original is None or key in seen or record["build_id"] != original["build_id"]
+                or record["needed"] != original["needed"] or record["soname"] != original["soname"]):
+            raise InventoryFailure("deployment")
+        validate_search(record, path, appdir)
+        if key == client.SONAME and (relative != shipped_pipewire["relative_path"]
+                                    or record["sha256"] != shipped_pipewire["sha256"]):
+            raise InventoryFailure("deployment")
+        seen.add(key)
+        deployed.append({"relative_path": relative, "source_sha256": original["sha256"],
+                         "deployed_sha256": record["sha256"], "build_id": record["build_id"],
+                         "needed": record["needed"], "kind": original["kind"],
+                         **{field: original[field] for field in ("package", "version", "source_package", "source_version")
+                            if field in original}})
+    if not {"morpheus-app", client.SONAME}.issubset(seen):
+        raise InventoryFailure("deployment")
+    launcher = appdir / "AppRun"
+    if (launcher not in files or not launcher.stat().st_mode & stat.S_IXUSR
+            or digest(regular(launcher, 4096)) != notice_record["launcher_sha256"]
+            or not (appdir / "usr/bin/morpheus-app").stat().st_mode & stat.S_IXUSR):
+        raise InventoryFailure("deployment")
+    for relative, expected in notice_record["notices"].items():
+        pure = PurePosixPath(relative)
+        if pure.is_absolute() or ".." in pure.parts or not HEX.fullmatch(expected):
+            raise InventoryFailure("notice")
+        path = appdir / relative
+        if path not in files or digest(regular(path, 64 * 1024 * 1024)) != expected:
+            raise InventoryFailure("notice")
+    return {"schema": 1, "deployed": sorted(deployed, key=lambda item: item["relative_path"]),
+            "external_dependencies": sorted(set(components) - seen),
+            "notice_sha256": notice_record["notices"], "launcher_sha256": notice_record["launcher_sha256"],
+            "runtime_input_sha256": notice_record["runtime_pin"]["sha256"],
+            "identity_basis": "owned deployment; pre/post hashes and matching build IDs, SONAMEs, DT_NEEDED",
+            "identity_is_reproducible_build_proof": False, "distribution_ready": False,
+            "unresolved_release_inputs": ["runtime-static-dependency-exact-provenance-and-sources",
+                                           "rust-and-vendored-static-dependency-notices-and-sources",
+                                           "bundled-system-package-corresponding-sources"]}
