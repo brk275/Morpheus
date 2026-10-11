@@ -376,6 +376,7 @@ export component AppWindow inherits Window {
     in-out property <bool> native-screen-active: false;
     in-out property <bool> native-camera-busy: false;
     in-out property <bool> native-screen-busy: false;
+    in-out property <bool> native-screen-selecting: false;
     in-out property <bool> native-camera-stopping: false;
     in-out property <bool> native-screen-stopping: false;
     in-out property <string> native-camera-source;
@@ -2305,12 +2306,12 @@ export component AppWindow inherits Window {
                                 width: 106px; height: 43px; border-radius: 9px;
                                 background: root.native-screen-active ? root.hover : root.elevated;
                                 focus-color: root.accent;
-                                label: root.native-screen-active ? "Stop screen sharing" : "Choose a display or window to share";
+                                label: root.native-screen-selecting ? "Cancel system screen selection" : root.native-screen-active ? "Stop screen sharing" : "Choose a display or window to share";
                                 accessible-checkable: true;
                                 accessible-checked: root.native-screen-active;
-                                enabled: root.native-call-enabled && root.native-call-joined && !root.native-screen-busy;
+                                enabled: root.native-call-enabled && root.native-call-joined && (!root.native-screen-busy || root.native-screen-selecting);
                                 activated => {
-                                    if root.native-screen-active { root.stop-native-capture(1); }
+                                    if root.native-screen-active || root.native-screen-selecting { root.stop-native-capture(1); }
                                     else {
                                         root.native-capture-picker-kind = 1;
                                         root.native-capture-picker-open = true;
@@ -2318,7 +2319,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 Text {
-                                    text: root.native-screen-stopping ? "Stopping…" : root.native-screen-busy ? "Sharing…" : root.native-screen-active ? "Stop share" : "Share screen";
+                                    text: root.native-screen-stopping ? "Stopping…" : root.native-screen-selecting ? "Cancel selection" : root.native-screen-busy ? "Starting…" : root.native-screen-active ? "Stop share" : "Share screen";
                                     color: root.native-call-joined ? root.ink : root.muted;
                                     font-size: 11px * root.text-scale; font-weight: 700;
                                     horizontal-alignment: center; vertical-alignment: center;

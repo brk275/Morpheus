@@ -2,8 +2,9 @@
 //!
 //! Release endpoints and the public verification key are compiled into a build,
 //! never read from user-editable TOML. No feed or private signing keys ship in
-//! development builds. Installation remains disabled until each platform has a
-//! recoverable transaction and passes installed-package acceptance.
+//! development builds. Linux has an AppImage transaction and startup recovery;
+//! public activation still requires signed installed-package acceptance.
+//! macOS/Windows installation remains disabled pending platform transactions.
 //!
 //! UI integration must share one UpdateActivity with the call controller and
 //! retain its CallLease from the start of joining through final call cleanup.
@@ -28,6 +29,11 @@ use tempfile::NamedTempFile;
 
 const MAX_UPDATE_BYTES: u64 = 512 * 1024 * 1024;
 
+#[cfg(target_os = "linux")]
+mod linux_transaction;
+#[cfg(target_os = "linux")]
+pub use linux_transaction::{AppImageSession, PreparedRestart};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UpdateError {
     NotConfigured,
@@ -44,6 +50,9 @@ pub enum UpdateError {
     CallActive,
     UpdateActive,
     InstallNotValidated,
+    IncompatibleUpdate,
+    RecoveryRequired,
+    RestartFailed,
 }
 
 impl fmt::Display for UpdateError {
@@ -67,6 +76,9 @@ impl fmt::Display for UpdateError {
             Self::InstallNotValidated => {
                 "Update installation is disabled until platform recovery checks pass."
             }
+            Self::IncompatibleUpdate => "This update requires a separately verified data migration. Install it manually after reviewing the release instructions.",
+            Self::RecoveryRequired => "Application update recovery could not finish. The retained previous application has not been deleted.",
+            Self::RestartFailed => "The updated application could not start. Recovery keeps the previous application when safe.",
         })
     }
 }
@@ -335,6 +347,59 @@ impl StagedUpdate {
             _ => UpdateError::CorruptStage,
         })
     }
+
+    /// Prepare a signed, compatible Linux update while the current process
+    /// retains its lifetime lock. The caller must explicitly hand off and quit.
+    #[cfg(target_os = "linux")]
+    pub fn prepare_restart<'a>(
+        &mut self,
+        activity: &UpdateActivity,
+        session: &'a mut AppImageSession,
+    ) -> Result<PreparedRestart<'a>, UpdateError> {
+        let lease = activity.try_install()?;
+        if !matches!(self.update.format, UpdateFormat::AppImage) {
+            return Err(UpdateError::UnsupportedFormat);
+        }
+        let bytes = self.verified_bytes()?;
+        linux_transaction::prepare_restart(session, &bytes, &self.update.version, lease)
+    }
+}
+
+/// Must be called before constructing UI, runtimes, or account stores.
+pub fn early_dispatch() -> Result<bool, UpdateError> {
+    #[cfg(target_os = "linux")]
+    return linux_transaction::early_dispatch();
+    #[cfg(not(target_os = "linux"))]
+    Ok(false)
+}
+
+pub struct StartupSession {
+    #[cfg(target_os = "linux")]
+    pub appimage: Option<AppImageSession>,
+    pub restarted: bool,
+}
+
+impl StartupSession {
+    pub fn begin() -> Result<Self, UpdateError> {
+        #[cfg(target_os = "linux")]
+        {
+            let (appimage, restarted) = linux_transaction::begin_startup()?;
+            Ok(Self {
+                appimage,
+                restarted,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        Ok(Self { restarted: false })
+    }
+
+    pub fn acknowledge_before_store(&mut self) -> Result<(), UpdateError> {
+        #[cfg(target_os = "linux")]
+        if let Some(session) = self.appimage.as_mut() {
+            session.acknowledge_before_store()?;
+        }
+        Ok(())
+    }
 }
 
 /// One shared exclusion gate for call joins and updater installation.
@@ -342,7 +407,7 @@ impl StagedUpdate {
 pub struct UpdateActivity(Arc<AtomicU8>);
 
 pub struct CallLease(Arc<AtomicU8>);
-struct InstallLease(Arc<AtomicU8>);
+pub(crate) struct InstallLease(Arc<AtomicU8>);
 
 impl UpdateActivity {
     pub fn try_start_call(&self) -> Result<CallLease, UpdateError> {
@@ -358,7 +423,7 @@ impl UpdateActivity {
         Ok(CallLease(self.0.clone()))
     }
 
-    fn try_install(&self) -> Result<InstallLease, UpdateError> {
+    pub(crate) fn try_install(&self) -> Result<InstallLease, UpdateError> {
         self.0
             .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|state| {

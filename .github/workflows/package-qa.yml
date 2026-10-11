@@ -9,6 +9,12 @@ on:
         required: true
         default: linux
         options: [linux, windows, macos, all]
+      linux_formats:
+        description: Linux package formats (both required for release acceptance)
+        type: choice
+        required: true
+        default: both
+        options: [both, appimage, deb]
 
 permissions:
   contents: read
@@ -36,11 +42,13 @@ jobs:
         id: scope
         env:
           PACKAGE_PLATFORM: ${{ inputs.platform }}
+          LINUX_FORMATS: ${{ inputs.linux_formats }}
         run: |
           python3 - <<'PY'
           import json, os
+          linux_formats = {"both": "deb,appimage", "appimage": "appimage", "deb": "deb"}[os.environ["LINUX_FORMATS"]]
           options = {
-              "linux": [{"os": "ubuntu-24.04", "label": "linux-x64", "formats": "deb,appimage"}],
+              "linux": [{"os": "ubuntu-24.04", "label": "linux-x64", "formats": linux_formats}],
               "windows": [{"os": "windows-2025", "label": "windows-x64", "formats": "nsis"}],
               "macos": [
                   {"os": "macos-15", "label": "macos-arm64", "formats": "dmg"},
@@ -94,6 +102,6 @@ jobs:
         run: python3 scripts/package.py --formats ${{ matrix.formats }}
       - name: Install, inspect, launch and remove unsigned packages
         timeout-minutes: 35
-        run: python3 scripts/package_smoke.py --target ${{ matrix.label }}
+        run: python3 scripts/package_smoke.py --target ${{ matrix.label }} --formats ${{ matrix.formats }}
       # Installers deliberately stay on the ephemeral runner. Public artifact
       # uploads and releases require the separate release acceptance gates.

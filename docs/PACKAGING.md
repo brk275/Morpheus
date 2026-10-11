@@ -14,12 +14,15 @@ The package output goes to `dist/`. This command does not make a public release.
 The manual [`package-qa.yml`](../.github/workflows/package-qa.yml) workflow runs
 only on public `main` using standard hosted runners. It requires an explicit
 platform choice (`linux`, `windows`, `macos`, or `all`), defaulting to Linux.
-Shared release candidates require `all`; a Linux-only packaging edit selects
-only Linux. It pins Rust 1.99.0 and Cargo Packager 0.11.8. To dispatch an
+Shared release candidates require `all` and `linux_formats=both`; a Linux-only
+packaging edit selects only Linux. The additional `linux_formats` choice
+(`both`, `appimage`, or `deb`) permits a focused check of one Linux format.
+Results name the formats actually tested; a partial run cannot satisfy the
+complete Linux release gate. It pins Rust 1.99.0 and Cargo Packager 0.11.8. To dispatch an
 appropriate check after confirming no equivalent run is active:
 
 ```sh
-gh workflow run package-qa.yml --ref main -f platform=linux
+gh workflow run package-qa.yml --ref main -f platform=linux -f linux_formats=both
 ```
 
 The workflow builds DMGs on both native Mac architectures, NSIS on Windows,
@@ -67,8 +70,9 @@ the Windows visible-window flag and virtual X11 window do not establish visual
 quality or accessibility. Signing/notarization, installer UI, full desktop
 integration, real account/credential-vault behavior, native media permissions,
 Wayland, hardware, updates and rollback remain release acceptance gates.
-The helper records a missing Debian `Maintainer` field; it does not waive the
-working project contact requirement below.
+The helper rejects a missing Debian `Maintainer` field. The packaging wrapper
+also checks this metadata before compiling a DEB; a working public project
+contact remains required. Other package formats can be checked independently.
 
 Earlier private QA runs uploaded unsigned installers for five days. On
 2026-10-10, their three runs and all ten artifacts were removed before source
@@ -115,10 +119,15 @@ The app now has a signed-update discovery and staging service using the pinned
 official `cargo-packager-updater` 0.2.3 with a documented security patch. It
 requires compiled HTTPS feed and public-key configuration, bounds responses,
 refuses redirects, checks the package format and version, and reverifies the
-exact staged bytes. There is no configured feed, updater UI, or enabled
-installer. Replacement, interrupted-update recovery, rollback, and call-controller
-integration remain release gates; the original upstream installers cannot run
-through the patched public APIs.
+exact staged bytes. The public feed and updater UI are disabled.
+Verified replacement, interrupted-update recovery, rollback, and
+call-controller behavior remain release gates; the original upstream installers cannot run
+through the patched public APIs. Linux now has a durable AppImage transaction
+and startup recovery foundation, with shared call/update exclusion. See
+[AppImage updates](APPIMAGE_UPDATES.md) for its signed compatibility footer,
+pre-store commit boundary, packaging order and remaining acceptance checks.
+The feed and update UI remain disabled; macOS and Windows installation still
+fail closed pending their platform transactions and verification.
 
 Cargo Packager's default formats produce a macOS `.app` and `.dmg`, a Windows
 NSIS installer, and Linux `.deb`, AppImage, and Pacman packages. An update for
@@ -134,7 +143,7 @@ This source repository is public; its releases and Actions artifacts cannot prov
 
 ## Platform acceptance
 
-Build and install on macOS Apple Silicon and Intel, Windows x64, and Linux x64 under both Wayland and X11. Include an Ubuntu 24.04 Linux desktop to check the current compatibility baseline. Check install, launch, update, uninstall, credential storage, and native call devices on each system. The updater and signed release pipeline have not been implemented or validated yet.
+Build and install on macOS Apple Silicon and Intel, Windows x64, and Linux x64 under both Wayland and X11. Include an Ubuntu 24.04 Linux desktop to check the current compatibility baseline. Check install, launch, update, uninstall, credential storage, and native call devices on each system. The signed release pipeline and installed update acceptance remain incomplete. The owner confirmed on 2026-10-10 that neither Apple Developer membership nor Windows code signing is configured; unsigned QA does not satisfy these gates.
 
 For Linux attachment open/save dialogs, the app builds `rfd` with its XDG portal backend. Runtime testing needs a working `xdg-desktop-portal` service and a desktop-specific portal implementation; `rfd` can fall back to `zenity` when the portal request fails. Test attachment pickers under both Wayland and X11 with the packaged app. The packaging runner's successful compile does not prove that a target desktop provides either dialog path.
 

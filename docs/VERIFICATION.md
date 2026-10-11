@@ -5,7 +5,7 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
 ## Beta gate implementation batch, 2026-10-10
 
-The next candidate adds delegated OAuth/OIDC and cancellation/refresh cleanup,
+Candidate `e411b0e` added delegated OAuth/OIDC and cancellation/refresh cleanup,
 signed-update staging with installation disabled, remote-video track replacement
 handling, installed-package smoke checks, and real Linux Matrix/RTC integration
 on disposable services. Review fixed pending-store creation, partial OAuth token
@@ -15,11 +15,47 @@ unreachable loopback ICE socket while preserving host-loopback endpoints.
 
 Before hosted validation, 39 Python helper tests, Rust formatting, Actionlint,
 and whitespace checks passed locally. No native build was run locally for this
-batch. Hosted compilation, the new Rust regressions, live Linux protocol tests,
-and installed-package checks are still pending. Prior candidate results below
-do not verify these changed inputs. OIDC provider/browser acceptance, physical
-capture, screen readers, signed distribution, and updater replacement/recovery
-remain open; this batch does not establish beta readiness.
+batch. [Run 38100413791](https://github.com/brk275/Morpheus/actions/runs/38100413791)
+tested `e411b0ebdf6200cf68c3c4708f2b33bbf4c17596` on all four standard public
+runners. Security/scope passed. Every native job reached the Matrix tests:
+30 passed and the new OAuth fixture test failed. Linux, Windows, and Intel Mac
+rejected incomplete fixture provider metadata; Apple Silicon exposed an
+accepted-socket nonblocking inheritance race and selected the fixture's legacy
+fallback. Later native build and integration steps were skipped, so this run
+does not verify the desktop candidate. Its four native logs passed credential
+scanning. No installers were built or uploaded.
+
+The follow-up fixes the fixture's required response modes and accepted socket
+handling without relaxing production OAuth validation. Delayed/split requests,
+malformed successful discovery responses, and a fresh-device RTC late join now
+have explicit regressions awaiting hosted execution. Independent desktop checks
+can finish even when model tests fail; the final job still fails in that case.
+
+The follow-up also adds a Wayland screen-capture adapter through the system
+portal and PipeWire, with cancellable source selection and no source fallback.
+A disposable Sway/wlr portal acceptance test checks actual selected-output
+pixels, live changes, source removal, denial, cancellation, and cleanup of the
+owned process groups. This virtual display check awaits Linux CI and cannot
+replace GNOME/KDE window selection or physical desktop acceptance.
+
+The Linux [AppImage transaction](APPIMAGE_UPDATES.md) now provides durable
+replacement/recovery before account stores open, with cancellation and shared
+call/update exclusion. Its tests use synthetic files; real signed installed
+updates are still required. Package QA can select one Linux format and records
+only that format as evidence. A missing Debian project contact fails preflight.
+
+Before this follow-up's hosted validation, 61 Python helper tests passed
+locally; three Linux process tests were skipped on macOS. Rust formatting,
+locked offline dependency metadata, Actionlint, package configuration and
+whitespace checks passed. Full-history scanning found no unresolved credentials;
+the working-tree scan matched only the documented public upstream test JWT,
+whose hash matches the reviewed fixture. Native compile/test results are still pending.
+
+Live Linux protocol tests and installed-package checks remain pending. Prior
+candidate results below do not verify these changed inputs. OIDC provider/browser
+acceptance, physical capture, screen readers, signed distribution, and updater
+replacement/recovery remain open; this batch does not establish beta readiness.
+Apple Developer and Windows signing credentials are not yet configured.
 
 ## Public source publication, 2026-10-10
 
@@ -666,7 +702,11 @@ frame counts/dimensions, and any timeout. Keep the disposable credential file
 out of logs. This checks one macOS run; Windows/Linux and packaged-app
 permissions remain separate release gates.
 
-## GitHub CI
+## Earlier GitHub CI history
+
+These results predate public-source publication. The newest candidate and its
+remaining gates are recorded at the top of this log. Historical unsigned
+package runs and their downloadable artifacts were removed before publication.
 
 [Run 38012987752](https://github.com/brk275/Morpheus/actions/runs/38012987752)
 passed on macOS Apple Silicon and Intel; Windows lacked `sqlite3.lib`, and
@@ -686,15 +726,14 @@ commit.
 passed all four jobs for the encrypted-drafts and macOS real-capture commit.
 [Run 38026269910](https://github.com/brk275/Morpheus/actions/runs/38026269910)
 passed all four jobs for the encrypted-attachment and native call-stage commit.
-The newer discovery, streaming media, call-control, and slot changes above
-have not yet run in GitHub CI.
+At that point, the newer discovery, streaming media, call-control, and slot
+changes had not yet run in GitHub CI.
 [Unsigned internal package QA run 38029335100](https://github.com/brk275/Morpheus/actions/runs/38029335100)
 passed macOS Intel, Linux x64, and Windows x64 packaging jobs; its macOS
 Apple Silicon job failed before steps due Actions capacity/budget. The latest
 [CI run 38032533729](https://github.com/brk275/Morpheus/actions/runs/38032533729)
 did not start any platform job because GitHub reported an Actions budget
-preventing further use. Current source therefore has no four-platform CI
-result.
+preventing further use. That candidate had no four-platform CI result.
 [Run 38042914642](https://github.com/brk275/Morpheus/actions/runs/38042914642)
 for commit `31a2d65` also failed before any job steps on all four runners:
 GitHub reported the same Actions budget restriction. This is a CI capacity

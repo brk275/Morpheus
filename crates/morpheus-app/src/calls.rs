@@ -48,6 +48,7 @@ use crate::{
         CaptureCommand, CaptureKind, CaptureSource, CaptureStop, LocalVideoSession,
         LocalVideoStatus,
     },
+    updater::{CallLease as UpdateCallLease, UpdateActivity, UpdateError},
     video_render::{RosterUpdate, VideoUpdate, run_remote_video},
 };
 
@@ -148,6 +149,7 @@ pub enum CallControllerError {
     WorkerStopped,
     TimedOut(&'static str),
     Cleanup(String),
+    Update(UpdateError),
 }
 
 impl fmt::Display for CallControllerError {
@@ -175,6 +177,7 @@ impl fmt::Display for CallControllerError {
             Self::WorkerStopped => write!(formatter, "the call worker stopped unexpectedly"),
             Self::TimedOut(phase) => write!(formatter, "timed out while {phase}"),
             Self::Cleanup(error) => write!(formatter, "could not leave the call cleanly: {error}"),
+            Self::Update(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -255,6 +258,11 @@ enum CallSlot {
 
 struct Shared {
     slot: Mutex<CallSlot>,
+    update_activity: UpdateActivity,
+    // Access while holding `slot`. Keeping this separate from the state enum
+    // preserves the same lease through Running -> CleanupFailed transitions.
+    // A worker panic retains the lease until explicit completed cleanup.
+    update_call_lease: std::sync::Mutex<Option<UpdateCallLease>>,
     status: watch::Sender<CallStatus>,
     video: watch::Sender<VideoUpdate>,
     roster: watch::Sender<RosterUpdate>,
@@ -267,6 +275,25 @@ struct Shared {
 }
 
 impl Shared {
+    fn reserve_update_lease(&self) -> Result<(), CallControllerError> {
+        let lease = self
+            .update_activity
+            .try_start_call()
+            .map_err(CallControllerError::Update)?;
+        *self
+            .update_call_lease
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(lease);
+        Ok(())
+    }
+
+    fn release_update_lease(&self) {
+        self.update_call_lease
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+    }
+
     async fn reserve_open_slot(
         &self,
         account_id: &str,
@@ -276,6 +303,7 @@ impl Shared {
         if !matches!(*slot, CallSlot::Idle) {
             return Err(CallControllerError::AlreadyBusy);
         }
+        self.reserve_update_lease()?;
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         let (done_tx, done_rx) = watch::channel(false);
         *slot = CallSlot::OpeningSlot {
@@ -295,6 +323,7 @@ impl Shared {
         let mut slot = self.slot.lock().await;
         if matches!(&*slot, CallSlot::OpeningSlot { token: current, .. } if *current == token) {
             *slot = CallSlot::Idle;
+            self.release_update_lease();
             self.status.send_replace(CallStatus::Idle);
         }
     }
@@ -359,7 +388,7 @@ pub struct CallController {
 }
 
 impl CallController {
-    pub fn new(manager: Arc<AccountManager>) -> Self {
+    pub fn new(manager: Arc<AccountManager>, update_activity: UpdateActivity) -> Self {
         let (status, _) = watch::channel(CallStatus::Idle);
         let (video, _) = watch::channel(VideoUpdate::Clear { token: 0 });
         let (roster, _) = watch::channel(RosterUpdate {
@@ -372,6 +401,8 @@ impl CallController {
             manager,
             shared: Arc::new(Shared {
                 slot: Mutex::new(CallSlot::Idle),
+                update_activity,
+                update_call_lease: std::sync::Mutex::new(None),
                 status,
                 video,
                 roster,
@@ -671,6 +702,7 @@ impl CallController {
             if !matches!(*slot, CallSlot::Idle) {
                 return Err(CallControllerError::AlreadyBusy);
             }
+            self.shared.reserve_update_lease()?;
             *slot = CallSlot::Running(RunningCall {
                 token,
                 account_id: account.id.clone(),
@@ -783,6 +815,7 @@ impl CallController {
                 if matches!(&*slot, CallSlot::CleanupFailed { token: current, .. } if *current == token)
                 {
                     *slot = CallSlot::Idle;
+                    self.shared.release_update_lease();
                     self.shared.status.send_replace(CallStatus::Idle);
                 }
                 return Ok(());
@@ -869,6 +902,7 @@ impl CallController {
         let mut slot = self.shared.slot.lock().await;
         if matches!(&*slot, CallSlot::CleanupFailed { token: current, .. } if *current == token) {
             *slot = CallSlot::Idle;
+            self.shared.release_update_lease();
             self.shared.status.send_replace(CallStatus::Idle);
         }
         Ok(())
@@ -1286,6 +1320,7 @@ impl CallWorker {
                     });
                 } else {
                     *slot = CallSlot::Idle;
+                    self.shared.release_update_lease();
                     self.shared.status.send_replace(match failure {
                         None => CallStatus::Idle,
                         Some(ref reason) => CallStatus::Failed {
@@ -1354,13 +1389,17 @@ mod tests {
     async fn opening_slot_blocks_account_switch_until_write_finishes() {
         let root = tempfile::tempdir().unwrap();
         let manager = Arc::new(AccountManager::open(root.path()).unwrap());
-        let controller = Arc::new(CallController::new(manager));
+        let controller = Arc::new(CallController::new(manager, UpdateActivity::default()));
         let (token, done) = controller
             .shared
             .reserve_open_slot("account-a", "!room-a:example.org")
             .await
             .unwrap();
         assert!(controller.status().blocks_account_switch());
+        assert!(matches!(
+            controller.shared.update_activity.try_install(),
+            Err(UpdateError::CallActive)
+        ));
         assert!(matches!(
             controller.status(),
             CallStatus::OpeningSlot { room_id, .. } if room_id == "!room-a:example.org"
@@ -1376,16 +1415,48 @@ mod tests {
         done.send_replace(true);
         waiting.await.unwrap().unwrap();
         assert!(!controller.status().blocks_account_switch());
+        assert!(controller.shared.update_activity.try_install().is_ok());
+    }
+
+    #[tokio::test]
+    async fn update_reservation_blocks_room_state_writes_and_stale_completion_cannot_unlock() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Arc::new(AccountManager::open(root.path()).unwrap());
+        let activity = UpdateActivity::default();
+        let controller = CallController::new(manager, activity.clone());
+        let installation = activity.try_install().unwrap();
+        assert!(matches!(
+            controller
+                .shared
+                .reserve_open_slot("account", "!room:example.org")
+                .await,
+            Err(CallControllerError::Update(UpdateError::UpdateActive))
+        ));
+        assert!(matches!(controller.status(), CallStatus::Idle));
+        drop(installation);
+        let (token, _done) = controller
+            .shared
+            .reserve_open_slot("account", "!room:example.org")
+            .await
+            .unwrap();
+        controller.shared.finish_open_slot(token + 1).await;
+        assert!(matches!(
+            activity.try_install(),
+            Err(UpdateError::CallActive)
+        ));
+        controller.shared.finish_open_slot(token).await;
+        assert!(activity.try_install().is_ok());
     }
 
     #[tokio::test]
     async fn failed_leave_requires_distinct_acknowledgement_after_worker_terminates() {
         let root = tempfile::tempdir().unwrap();
         let manager = Arc::new(AccountManager::open(root.path()).unwrap());
-        let controller = Arc::new(CallController::new(manager));
+        let controller = Arc::new(CallController::new(manager, UpdateActivity::default()));
         let (done_tx, done_rx) = watch::channel(None);
         {
             let mut slot = controller.shared.slot.lock().await;
+            controller.shared.reserve_update_lease().unwrap();
             *slot = CallSlot::CleanupFailed {
                 token: 7,
                 done: done_rx,
@@ -1412,15 +1483,20 @@ mod tests {
             Err(CallControllerError::Cleanup(reason)) if reason == "server leave failed"
         ));
         assert!(controller.status().blocks_account_switch());
+        assert!(matches!(
+            controller.shared.update_activity.try_install(),
+            Err(UpdateError::CallActive)
+        ));
         controller.abandon_failed_leave().await.unwrap();
         assert!(!controller.status().blocks_account_switch());
+        assert!(controller.shared.update_activity.try_install().is_ok());
     }
 
     #[tokio::test]
     async fn acknowledgement_waits_for_worker_completion() {
         let root = tempfile::tempdir().unwrap();
         let manager = Arc::new(AccountManager::open(root.path()).unwrap());
-        let controller = Arc::new(CallController::new(manager));
+        let controller = Arc::new(CallController::new(manager, UpdateActivity::default()));
         let (done_tx, done_rx) = watch::channel(None);
         {
             let mut slot = controller.shared.slot.lock().await;
@@ -1453,7 +1529,7 @@ mod tests {
     async fn stuck_capture_worker_keeps_account_switch_blocked() {
         let root = tempfile::tempdir().unwrap();
         let manager = Arc::new(AccountManager::open(root.path()).unwrap());
-        let controller = CallController::new(manager);
+        let controller = CallController::new(manager, UpdateActivity::default());
         let (_, done_rx) = watch::channel(Some(Err("native capture still stopping".into())));
         {
             let mut slot = controller.shared.slot.lock().await;
@@ -1504,7 +1580,7 @@ mod tests {
     async fn stale_generation_cannot_start_native_capture() {
         let root = tempfile::tempdir().unwrap();
         let manager = Arc::new(AccountManager::open(root.path()).unwrap());
-        let controller = CallController::new(manager);
+        let controller = CallController::new(manager, UpdateActivity::default());
         controller
             .shared
             .active_video_token
@@ -1534,6 +1610,8 @@ mod tests {
         });
         let shared = Shared {
             slot: Mutex::new(CallSlot::Idle),
+            update_activity: UpdateActivity::default(),
+            update_call_lease: std::sync::Mutex::new(None),
             status,
             video,
             roster,
@@ -1595,6 +1673,8 @@ mod tests {
         });
         let shared = Shared {
             slot: Mutex::new(CallSlot::Idle),
+            update_activity: UpdateActivity::default(),
+            update_call_lease: std::sync::Mutex::new(None),
             status,
             video,
             roster,

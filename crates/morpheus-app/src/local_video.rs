@@ -20,6 +20,7 @@ use tokio::{
 
 const CAPTURE_QUEUE: usize = 3;
 const START_TIMEOUT: Duration = Duration::from_secs(20);
+const SELECT_TIMEOUT: Duration = Duration::from_secs(180);
 const PUBLISH_TIMEOUT: Duration = Duration::from_secs(12);
 const UNPUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 const USER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
@@ -88,6 +89,10 @@ pub(crate) enum CaptureSource {
 }
 
 impl CaptureSource {
+    fn needs_system_selection(&self) -> bool {
+        matches!(self, Self::Display(key) | Self::Window(key) if key.starts_with("portal:"))
+    }
+
     pub(crate) fn kind(&self) -> CaptureKind {
         match self {
             Self::Camera(_) => CaptureKind::Camera,
@@ -100,6 +105,7 @@ impl CaptureSource {
 pub(crate) enum CapturePhase {
     #[default]
     Off,
+    Selecting,
     Starting,
     Stopping,
     Active,
@@ -132,6 +138,10 @@ pub(crate) enum CaptureCommand {
 }
 
 pub(crate) enum Captured {
+    SourceReady {
+        kind: CaptureKind,
+        generation: u64,
+    },
     Frame {
         kind: CaptureKind,
         generation: u64,
@@ -260,6 +270,9 @@ impl LocalVideoSession {
         event: LocalVideoEvent,
     ) {
         match event {
+            LocalVideoEvent::Frame(Captured::SourceReady { kind, generation }) => {
+                self.source_ready(kind, generation);
+            }
             LocalVideoEvent::Command(CaptureCommand::Start {
                 source,
                 label,
@@ -291,14 +304,25 @@ impl LocalVideoSession {
             }
             LocalVideoEvent::Tick => {
                 for kind in [CaptureKind::Camera, CaptureKind::Screen] {
+                    let selecting = self.current_state(kind).phase == CapturePhase::Selecting;
+                    let budget = if selecting {
+                        SELECT_TIMEOUT
+                    } else {
+                        START_TIMEOUT
+                    };
                     if self
                         .slot(kind)
                         .started
-                        .is_some_and(|since| since.elapsed() > START_TIMEOUT)
+                        .is_some_and(|since| since.elapsed() > budget)
                     {
                         self.fail(
                             kind,
-                            "native capture did not produce a frame in 20 seconds".into(),
+                            if selecting {
+                                "system screen selection timed out"
+                            } else {
+                                "native capture did not produce a frame in 20 seconds"
+                            }
+                            .into(),
                         )
                         .await;
                     }
@@ -312,6 +336,7 @@ impl LocalVideoSession {
             return Err(MediaError::CallEnded);
         }
         let kind = source.kind();
+        let selecting = source.needs_system_selection();
         self.stop(kind).await?;
         // Most capture workers finish within one frame interval after Stop.
         // Wait briefly rather than rejecting an immediate source change.
@@ -362,8 +387,33 @@ impl LocalVideoSession {
         slot.stop = Some(stop);
         slot.worker = Some(worker);
         slot.started = Some(Instant::now());
-        self.set_phase(kind, CapturePhase::Starting, label);
+        self.set_phase(
+            kind,
+            if selecting {
+                CapturePhase::Selecting
+            } else {
+                CapturePhase::Starting
+            },
+            label,
+        );
         Ok(())
+    }
+
+    fn source_ready(&mut self, kind: CaptureKind, generation: u64) {
+        if self.stop.requested()
+            || self.slot(kind).generation != generation
+            || self.slot(kind).stop.is_none()
+        {
+            return;
+        }
+        if self.current_state(kind).phase == CapturePhase::Selecting {
+            self.slot_mut(kind).started = Some(Instant::now());
+            self.set_phase(
+                kind,
+                CapturePhase::Starting,
+                "System-selected source".into(),
+            );
+        }
     }
 
     async fn stop(&mut self, kind: CaptureKind) -> Result<(), MediaError> {
@@ -638,6 +688,7 @@ fn capture_loop(
         Screen(ScreenCapture),
     }
     let cancelled = || stop.load(Ordering::Acquire) || call_stop.requested();
+    let selecting = source.needs_system_selection();
     if cancelled() {
         return Ok(());
     }
@@ -648,21 +699,36 @@ fn capture_loop(
             CaptureKind::Camera,
         ),
         CaptureSource::Display(key) => (
-            Device::Screen(ScreenCapture::open_key(&key)?),
+            Device::Screen(ScreenCapture::open_key_cancellable(&key, &cancelled)?),
             SCREEN_INTERVAL,
             CaptureKind::Screen,
         ),
         CaptureSource::Window(key) => (
-            Device::Screen(ScreenCapture::open_key(&key)?),
+            Device::Screen(ScreenCapture::open_key_cancellable(&key, &cancelled)?),
             SCREEN_INTERVAL,
             CaptureKind::Screen,
         ),
     };
+    if selecting {
+        let mut ready = Captured::SourceReady { kind, generation };
+        while !cancelled() {
+            match sender.try_send(ready) {
+                Ok(()) => break,
+                Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
+                Err(mpsc::error::TrySendError::Full(event)) => {
+                    ready = event;
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
     while !cancelled() {
         let started = Instant::now();
         let frame = match &mut device {
             Device::Camera(camera) => camera.next_frame()?,
-            Device::Screen(screen) => screen.next_frame_sized(SCREEN_WIDTH, SCREEN_HEIGHT)?,
+            Device::Screen(screen) => {
+                screen.next_frame_sized_cancellable(SCREEN_WIDTH, SCREEN_HEIGHT, &cancelled)?
+            }
         };
         if cancelled() {
             break;
@@ -685,6 +751,62 @@ fn capture_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_or_stale_portal_selection_cannot_restart_capture() {
+        let (_, commands) = mpsc::channel(1);
+        let (status, _) = watch::channel(LocalVideoStatus {
+            token: 7,
+            ..Default::default()
+        });
+        let mut session = LocalVideoSession::new(
+            7,
+            commands,
+            status,
+            Arc::new(CaptureStop::default()),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        session.screen.generation = 3;
+        session.screen.stop = Some(Arc::new(AtomicBool::new(false)));
+        session.set_phase(
+            CaptureKind::Screen,
+            CapturePhase::Selecting,
+            "Choose a display".into(),
+        );
+        session.source_ready(CaptureKind::Screen, 2);
+        assert_eq!(
+            session.current_state(CaptureKind::Screen).phase,
+            CapturePhase::Selecting
+        );
+        session.source_ready(CaptureKind::Screen, 3);
+        assert_eq!(
+            session.current_state(CaptureKind::Screen).phase,
+            CapturePhase::Starting
+        );
+        assert!(session.screen.started.is_some());
+        session.stop(CaptureKind::Screen).await.unwrap();
+        session.source_ready(CaptureKind::Screen, 3);
+        assert_eq!(
+            session.current_state(CaptureKind::Screen).phase,
+            CapturePhase::Off
+        );
+        assert!(session.screen.started.is_none());
+    }
+
+    #[test]
+    fn cancelled_screen_selection_skips_native_open() {
+        let (sender, _receiver) = mpsc::channel(1);
+        assert!(
+            capture_loop(
+                CaptureSource::Display("portal:monitor".into()),
+                1,
+                &AtomicBool::new(true),
+                &CaptureStop::default(),
+                &sender
+            )
+            .is_ok()
+        );
+    }
 
     #[test]
     fn stopped_source_skips_native_capture_open() {

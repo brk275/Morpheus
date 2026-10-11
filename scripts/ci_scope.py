@@ -11,6 +11,17 @@ from pathlib import PurePosixPath
 
 PLATFORMS = ("macos-15", "macos-15-intel", "ubuntu-24.04", "windows-2025")
 MACOS = PLATFORMS[:2]
+LINUX_ACCEPTANCE_INPUTS = {
+    "scripts/run_matrix_acceptance.py",
+    "scripts/local_matrix_env.py",
+    "scripts/local_matrix_rtc.py",
+    "scripts/run_wayland_acceptance.py",
+    "scripts/prepare_appimage_update.py",
+    "crates/morpheus-rtc/src/linux_portal.rs",
+    "crates/morpheus-rtc/tests/wayland_capture.rs",
+    "crates/morpheus-app/src/updater/linux_transaction.rs",
+    "crates/morpheus-app/src/updater/linux_transaction_tests.rs",
+}
 
 
 def classify(paths, force_all=False):
@@ -22,7 +33,7 @@ def classify(paths, force_all=False):
             continue
         if path == "Cargo.lock" or path.endswith("Cargo.toml"):
             native.update(PLATFORMS)
-        elif path.startswith("packaging/linux/") or path == "packaging/linux.toml":
+        elif path in LINUX_ACCEPTANCE_INPUTS or path.startswith("packaging/linux/") or path == "packaging/linux.toml":
             native.add("ubuntu-24.04")
         elif path.startswith(("packaging/macos/", "vendor/nokhwa-bindings-macos/")):
             native.update(MACOS)

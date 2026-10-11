@@ -1278,6 +1278,7 @@ fn clear_native_capture(ui: &AppWindow) {
     ui.set_native_screen_active(false);
     ui.set_native_camera_busy(false);
     ui.set_native_screen_busy(false);
+    ui.set_native_screen_selecting(false);
     ui.set_native_camera_stopping(false);
     ui.set_native_screen_stopping(false);
     ui.set_native_camera_source(SharedString::default());
@@ -1390,8 +1391,9 @@ fn apply_capture_status(ui: &AppWindow, status: LocalVideoStatus) {
     ));
     ui.set_native_screen_busy(matches!(
         &status.screen.phase,
-        CapturePhase::Starting | CapturePhase::Stopping
+        CapturePhase::Selecting | CapturePhase::Starting | CapturePhase::Stopping
     ));
+    ui.set_native_screen_selecting(matches!(&status.screen.phase, CapturePhase::Selecting));
     ui.set_native_camera_stopping(matches!(&status.camera.phase, CapturePhase::Stopping));
     ui.set_native_screen_stopping(matches!(&status.screen.phase, CapturePhase::Stopping));
     ui.set_native_camera_source(status.camera.source.into());
@@ -1438,10 +1440,20 @@ fn continue_account_action(ui: &AppWindow, action: i32) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if updater::early_dispatch()? {
+        return Ok(());
+    }
+    // Declared first and dropped last, after runtimes/account workers stop.
+    let mut update_session = updater::StartupSession::begin()?;
+    if update_session.restarted {
+        return Ok(());
+    }
     #[cfg(feature = "native-calls")]
     morpheus_rtc::install_crypto_provider();
     let ui = AppWindow::new()?;
     ui.set_login_loading(true);
+    ui.show()?;
+    update_session.acknowledge_before_store()?;
     let qa_profile = qa_profile_root()?;
     let data_dir = if let Some(root) = &qa_profile {
         root.join("data")
@@ -1472,7 +1484,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_native_call_enabled(cfg!(feature = "native-calls"));
     ui.set_native_call_status("Select a room to check call availability".into());
     #[cfg(feature = "native-calls")]
-    let calls = Arc::new(CallController::new(manager.clone()));
+    let update_activity = updater::UpdateActivity::default();
+    #[cfg(feature = "native-calls")]
+    let calls = Arc::new(CallController::new(
+        manager.clone(),
+        update_activity.clone(),
+    ));
     #[cfg(feature = "native-calls")]
     let applied_audio_token = Arc::new(AtomicU64::new(0));
     #[cfg(feature = "native-calls")]

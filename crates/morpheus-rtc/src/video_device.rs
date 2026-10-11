@@ -257,6 +257,8 @@ pub struct ScreenCapture {
 enum ScreenSource {
     Display(xcap::Monitor),
     Window(xcap::Window),
+    #[cfg(target_os = "linux")]
+    Portal(crate::linux_portal::PortalCapture),
 }
 
 /// Identity captured at picker time. All fields participate in the opaque
@@ -264,6 +266,8 @@ enum ScreenSource {
 #[cfg(feature = "device-screen")]
 #[derive(Clone, Eq, Hash, PartialEq)]
 enum ScreenFingerprint {
+    #[cfg(target_os = "linux")]
+    Portal,
     Display {
         id: u32,
         name: String,
@@ -295,6 +299,8 @@ impl ScreenFingerprint {
             hasher.finish()
         };
         let kind = match self {
+            #[cfg(target_os = "linux")]
+            Self::Portal => "portal",
             Self::Display { .. } => "display",
             Self::Window { .. } => "window",
         };
@@ -340,6 +346,10 @@ impl ScreenCapture {
     /// Opening a key succeeds only while the complete picker-time fingerprint
     /// still matches exactly one native display.
     pub fn display_sources() -> Result<Vec<(String, String)>, MediaError> {
+        #[cfg(target_os = "linux")]
+        if crate::linux_portal::is_wayland() {
+            return crate::linux_portal::sources(1);
+        }
         let monitors =
             xcap::Monitor::all().map_err(|error| MediaError::Device(error.to_string()))?;
         let mut sources = Vec::new();
@@ -368,6 +378,10 @@ impl ScreenCapture {
     /// Return process-local opaque keys and current application/title labels.
     /// A closed window or reused native ID cannot silently change the target.
     pub fn window_sources() -> Result<Vec<(String, String)>, MediaError> {
+        #[cfg(target_os = "linux")]
+        if crate::linux_portal::is_wayland() {
+            return crate::linux_portal::sources(2);
+        }
         let windows = xcap::Window::all().map_err(|error| MediaError::Device(error.to_string()))?;
         let mut sources = Vec::new();
         for window in windows {
@@ -390,6 +404,28 @@ impl ScreenCapture {
     /// Open the selected source only if exactly one currently enumerated
     /// display or window matches its complete picker-time fingerprint.
     pub fn open_key(key: &str) -> Result<Self, MediaError> {
+        Self::open_key_cancellable(key, &|| false)
+    }
+
+    /// Portal keys describe a category; the system dialog selects the exact
+    /// source. Cancellation closes both outstanding requests and the session.
+    pub fn open_key_cancellable(
+        key: &str,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Self, MediaError> {
+        if cancelled() {
+            return Err(MediaError::Device("screen sharing cancelled".into()));
+        }
+        #[cfg(target_os = "linux")]
+        if crate::linux_portal::is_wayland() {
+            return Ok(Self {
+                source: ScreenSource::Portal(crate::linux_portal::PortalCapture::open(
+                    key, cancelled,
+                )?),
+                fingerprint: ScreenFingerprint::Portal,
+                started: Instant::now(),
+            });
+        }
         if key.starts_with("display:") {
             let monitors =
                 xcap::Monitor::all().map_err(|error| MediaError::Device(error.to_string()))?;
@@ -436,6 +472,10 @@ impl ScreenCapture {
     /// Resolve a display by ID for older callers. The complete current
     /// fingerprint is still checked on every frame after opening.
     pub fn open_display_id(id: u32) -> Result<Self, MediaError> {
+        #[cfg(target_os = "linux")]
+        if crate::linux_portal::is_wayland() {
+            return Err(source_changed());
+        }
         let monitor = xcap::Monitor::all()
             .map_err(|error| MediaError::Device(error.to_string()))?
             .into_iter()
@@ -447,6 +487,10 @@ impl ScreenCapture {
     /// Resolve a window by ID for older callers. Prefer the picker-time key:
     /// an ID alone cannot detect a reused window between picking and opening.
     pub fn open_window_id(id: u32) -> Result<Self, MediaError> {
+        #[cfg(target_os = "linux")]
+        if crate::linux_portal::is_wayland() {
+            return Err(source_changed());
+        }
         let window = xcap::Window::all()
             .map_err(|error| MediaError::Device(error.to_string()))?
             .into_iter()
@@ -497,7 +541,7 @@ impl ScreenCapture {
     /// Capture one still frame. The caller must pace repeated captures; a
     /// first native proof can use 5-10 fps before a streaming capture path.
     pub fn next_frame(&self) -> Result<VideoFrame, MediaError> {
-        let image = self.capture_image()?;
+        let image = self.capture_image(&|| false)?;
         let (width, height) = image.dimensions();
         rgb_to_i420(
             width,
@@ -513,7 +557,16 @@ impl ScreenCapture {
     /// high-resolution displays and keeps the publication format stable if a
     /// window resizes during a call.
     pub fn next_frame_sized(&self, width: u32, height: u32) -> Result<VideoFrame, MediaError> {
-        let image = self.capture_image()?;
+        self.next_frame_sized_cancellable(width, height, &|| false)
+    }
+
+    pub fn next_frame_sized_cancellable(
+        &self,
+        width: u32,
+        height: u32,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<VideoFrame, MediaError> {
+        let image = self.capture_image(cancelled)?;
         let (source_width, source_height) = image.dimensions();
         let pixels = fit_rgba(source_width, source_height, image.as_raw(), width, height)?;
         rgb_to_i420(
@@ -525,11 +578,23 @@ impl ScreenCapture {
         )
     }
 
-    fn capture_image(&self) -> Result<xcap::image::RgbaImage, MediaError> {
+    fn capture_image(
+        &self,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<xcap::image::RgbaImage, MediaError> {
+        if cancelled() {
+            return Err(MediaError::Device("screen sharing cancelled".into()));
+        }
+        #[cfg(target_os = "linux")]
+        if let ScreenSource::Portal(portal) = &self.source {
+            return portal.next_image(cancelled);
+        }
         self.validate_source()?;
         let result = match &self.source {
             ScreenSource::Display(monitor) => monitor.capture_image(),
             ScreenSource::Window(window) => window.capture_image(),
+            #[cfg(target_os = "linux")]
+            ScreenSource::Portal(_) => unreachable!("handled above"),
         };
         let image = result.map_err(|error| MediaError::Device(error.to_string()))?;
         // A window can close and its native ID can be reused during capture.
@@ -541,6 +606,8 @@ impl ScreenCapture {
 
     fn validate_source(&self) -> Result<(), MediaError> {
         let count = match &self.fingerprint {
+            #[cfg(target_os = "linux")]
+            ScreenFingerprint::Portal => return Ok(()),
             ScreenFingerprint::Display { .. } => xcap::Monitor::all()
                 .map_err(|error| MediaError::Device(error.to_string()))?
                 .iter()

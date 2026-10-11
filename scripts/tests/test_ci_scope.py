@@ -12,6 +12,12 @@ class ScopeTests(unittest.TestCase):
     def test_linux_package_change_only_selects_linux(self):
         self.assertEqual(classify(["packaging/linux.toml"])["native_matrix"]["os"], ["ubuntu-24.04"])
 
+    def test_linux_acceptance_helpers_are_actually_exercised(self):
+        for path in ["scripts/run_matrix_acceptance.py", "scripts/local_matrix_rtc.py", "scripts/local_matrix_env.py", "scripts/run_wayland_acceptance.py", "crates/morpheus-rtc/src/linux_portal.rs", "crates/morpheus-app/src/updater/linux_transaction.rs"]:
+            with self.subTest(path=path):
+                self.assertEqual(classify([path])["native_matrix"]["os"], ["ubuntu-24.04"])
+        self.assertFalse(classify(["scripts/tests/test_matrix_acceptance.py"])["native"])
+
     def test_macos_capture_change_selects_both_macs(self):
         actual = classify(["vendor/nokhwa-bindings-macos/src/lib.rs"])["native_matrix"]["os"]
         self.assertEqual(actual, list(MACOS))

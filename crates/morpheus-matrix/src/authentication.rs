@@ -510,7 +510,7 @@ mod tests {
     use super::*;
     use std::{
         io::{Read, Write},
-        net::TcpListener,
+        net::{TcpListener, TcpStream},
         sync::atomic::{AtomicBool, AtomicUsize, Ordering},
         thread,
     };
@@ -526,10 +526,16 @@ mod tests {
 
     impl AuthServer {
         fn start(discovery_status: u16) -> Self {
+            Self::start_with_response_modes(discovery_status, &["query", "fragment"])
+        }
+
+        fn start_with_response_modes(discovery_status: u16, response_modes: &[&str]) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
             let origin = url.clone();
+            let response_modes: Vec<String> =
+                response_modes.iter().map(|mode| (*mode).into()).collect();
             let stopped = Arc::new(AtomicBool::new(false));
             let stop = stopped.clone();
             let redirects_followed = Arc::new(AtomicUsize::new(0));
@@ -544,6 +550,10 @@ mod tests {
                         }
                         Err(_) => break,
                     };
+                    // Darwin inherits O_NONBLOCK from the listener. Reading an
+                    // accepted socket before its request arrives must wait,
+                    // rather than treating WouldBlock as an unknown endpoint.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
@@ -600,7 +610,7 @@ mod tests {
                                     "token_endpoint": format!("{origin}/token"),
                                     "registration_endpoint": format!("{origin}/register"),
                                     "revocation_endpoint": format!("{origin}/revoke"),
-                                    "response_types_supported": ["code"], "response_modes_supported": ["query"],
+                                    "response_types_supported": ["code"], "response_modes_supported": response_modes,
                                     "grant_types_supported": ["authorization_code", "refresh_token"],
                                     "code_challenge_methods_supported": ["S256"]
                                 }),
@@ -659,6 +669,33 @@ mod tests {
                 worker.join().unwrap();
             }
         }
+    }
+
+    #[test]
+    fn auth_fixture_waits_for_delayed_and_split_requests() {
+        let server = AuthServer::start(200);
+        let mut stream = TcpStream::connect(server.url.trim_start_matches("http://")).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        thread::sleep(Duration::from_millis(50));
+        stream.write_all(b"GET /_matrix/client/v1/auth_").unwrap();
+        thread::sleep(Duration::from_millis(50));
+        stream
+            .write_all(b"metadata HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 "));
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        // Exercise the pinned SDK's metadata type, including the required
+        // response modes, before using this server for an OAuth flow.
+        let metadata: matrix_sdk::ruma::api::client::discovery::get_authorization_server_metadata::v1::AuthorizationServerMetadata =
+            serde_json::from_str(body).unwrap();
+        metadata.insecure_validate_urls().unwrap();
     }
 
     struct PrivateTestDir(PathBuf);
@@ -747,8 +784,17 @@ mod tests {
                     .await
                     .unwrap();
                 let authorization = Url::parse(&attempt.browser_url).unwrap();
+                assert_eq!(
+                    attempt.state_parameter, "state",
+                    "OAuth fixture unexpectedly selected legacy SSO"
+                );
                 let parameters: HashMap<_, _> = authorization.query_pairs().into_owned().collect();
-                assert_eq!(parameters["state"], attempt.attempt_id);
+                assert!(
+                    parameters
+                        .get("state")
+                        .is_some_and(|state| state == &attempt.attempt_id),
+                    "SDK OAuth state was absent or mismatched"
+                );
                 assert_eq!(parameters["code_challenge_method"], "S256");
                 assert!(!parameters["code_challenge"].is_empty());
                 assert!(!parameters.contains_key("code_verifier"));
@@ -862,6 +908,15 @@ mod tests {
                 assert!(
                     manager
                         .begin_sso(&failure.url, "http://127.0.0.1:45678/callback", None)
+                        .await
+                        .is_err()
+                );
+                // A malformed successful discovery response must remain an
+                // error, even when a legacy SSO endpoint could be constructed.
+                let invalid = AuthServer::start_with_response_modes(200, &["query"]);
+                assert!(
+                    manager
+                        .begin_sso(&invalid.url, "http://127.0.0.1:45678/callback", None)
                         .await
                         .is_err()
                 );

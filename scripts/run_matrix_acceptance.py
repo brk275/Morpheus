@@ -29,6 +29,7 @@ CHAT_TESTS = (
     "media_local", "discovery_local", "moderation_local", "search_local",
 )
 RESULT = re.compile(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;")
+LATE_JOIN_EVIDENCE = re.compile(r"^MORPHEUS_RTC_LATE_JOIN historical_member=(true|false)$", re.MULTILINE)
 
 
 def passed_tests(output: str) -> int:
@@ -106,7 +107,14 @@ class Acceptance:
             # test identifiers are useful public diagnostics here.
             failed = re.findall(r"^test ([A-Za-z0-9_:]+) \.\.\. FAILED$", output, re.MULTILINE)
             locations = re.findall(r"panicked at (crates/[A-Za-z0-9_./-]+\.rs:\d+:\d+)", output)
-            print(json.dumps({"check": label, "failed_tests": failed, "panic_locations": locations}), flush=True)
+            evidence = {"check": label, "failed_tests": failed, "panic_locations": locations}
+            # This exact boolean-only marker says whether a fresh device could
+            # already decrypt the old membership. Never print event/account
+            # identifiers, arbitrary server text, ciphertext, or raw logs.
+            late_join = LATE_JOIN_EVIDENCE.findall(output)
+            if late_join:
+                evidence["late_join_historical_member"] = [value == "true" for value in late_join]
+            print(json.dumps(evidence), flush=True)
             raise RuntimeError(f"{label} failed with exit status {process.returncode}")
         record = {"check": label, "seconds": round(time.monotonic() - started, 2)}
         if test:
@@ -127,7 +135,19 @@ class Acceptance:
             args += ["--features", "native-devices"]
         args += ["--test", name, "--", "--nocapture", "--test-threads=1"]
         label = name + ("-classic" if env.get("MORPHEUS_MATRIX_SEARCH_CLASSIC") else "")
+        if env.get("MORPHEUS_RTC_LATE_JOIN") == "1":
+            label += "-late-join"
         self.run(label, args, extra=env, test=True)
+
+    def rtc_cases(self):
+        # The second run gets different users/room: existing devices and keys
+        # would hide a regression in encrypted sticky membership for late join.
+        for late_join in (False, True):
+            fixture = fixture_from_output(self.script("local_matrix_rtc", "rtc-fixture"), self.root)
+            extra = {"MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": str(fixture)}
+            if late_join:
+                extra["MORPHEUS_RTC_LATE_JOIN"] = "1"
+            self.test("local_rtc", fixture, rtc=True, extra=extra)
 
     def start_keyring(self):
         # This D-Bus session and empty-password keyring exist only on a fresh
@@ -193,9 +213,7 @@ def main():
         gate = fixture_from_output(acceptance.script("local_matrix_env", "rtc-gate-fixture"), root)
         acceptance.test("unsupported_transport_local", gate, rtc=True,
                         extra={"MORPHEUS_MATRIX_RTC_GATE_TEST_ACCOUNTS": str(gate)})
-        rtc = fixture_from_output(acceptance.script("local_matrix_rtc", "rtc-fixture"), root)
-        acceptance.test("local_rtc", rtc, rtc=True,
-                        extra={"MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS": str(rtc)})
+        acceptance.rtc_cases()
     finally:
         acceptance.summary()
         # Only these containers belong to this fresh, explicitly checked run.

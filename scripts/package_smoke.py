@@ -117,7 +117,8 @@ def desktop_metadata(text):
     require(entry.get("Name") == PRODUCT and entry.get("Type") == "Application", "Invalid desktop identity")
     require(entry.get("Terminal") == "false", "Desktop launcher must not open a terminal")
     executable = shlex.split(entry.get("Exec", ""))
-    require(bool(executable) and Path(executable[0]).name == BINARY, "Desktop entry points at the wrong executable")
+    require(bool(executable) and executable[0] in (BINARY, f"/usr/bin/{BINARY}")
+            and executable[1:] in ([], ["%U"]), "Desktop entry points at the wrong executable or arguments")
     require(entry.get("Icon") == BINARY, "Desktop entry has the wrong icon")
     return entry
 
@@ -128,6 +129,11 @@ def check_desktop(root):
     run(["desktop-file-validate", str(desktop)])
     require(bool(list((root / "usr/share/icons").glob(f"**/{BINARY}.png"))), "Installed desktop icon is absent")
     record("desktop_entry_and_icon")
+
+
+def maintainer_metadata(value):
+    require(re.fullmatch(r"[^<>\r\n]+ <[^<>\s@]+@[^<>\s@]+>", value) is not None,
+            "DEB needs a project Maintainer name and working public email address")
 
 
 def visible_windows(pid):
@@ -152,9 +158,45 @@ def visible_windows(pid):
     return found
 
 
+def require_nonreaping_wait():
+    require(all(hasattr(os, name) for name in ("waitid", "P_PID", "WEXITED", "WNOHANG", "WNOWAIT")),
+            "POSIX package smoke requires nonreaping waitid support")
+
+
+def process_status(process):
+    if os.name == "nt":
+        return process.poll()
+    # Linux and macOS support WNOWAIT. Keep even an exited group leader as
+    # our child until group cleanup, so its PID cannot name a recycled group.
+    require(process.returncode is None, "Package smoke process was reaped before group cleanup")
+    result = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    if result is None:
+        return None
+    return result.si_status if result.si_code == os.CLD_EXITED else -result.si_status
+
+
+def signal_process_group(process, sig):
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        # XNU's killpg skips zombie members and returns EPERM if none remain
+        # signalable. Distinguish that case from a real denied live group;
+        # keeping the leader unreaped prevents this group ID being recycled.
+        if sys.platform != "darwin" or process_status(process) is None:
+            raise
+        snapshot = subprocess.run(["ps", "-axo", "pgid=,stat="], check=True,
+                                  capture_output=True, text=True, timeout=3).stdout
+        for line in snapshot.splitlines():
+            group, state = line.split()
+            if int(group) == process.pid and not state.startswith("Z"):
+                raise
+
+
 def stop_process(process):
-    if process.poll() is None:
-        if os.name == "nt":
+    if os.name == "nt":
+        if process.poll() is None:
             from ctypes import wintypes
             user32 = ctypes.WinDLL("user32", use_last_error=True)
             user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
@@ -164,30 +206,31 @@ def stop_process(process):
             except RuntimeError:
                 # Window enumeration failure must not bypass process cleanup.
                 pass
-        else:
             try:
-                os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            if os.name == "nt":
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
                 process.kill()
-            else:
-                os.killpg(process.pid, signal.SIGKILL)
-            process.wait(timeout=5)
-    if os.name != "nt":
-        # An AppImage wrapper can exit before its child. Reap any remaining
-        # members of this smoke's process group before removing the package.
+                process.wait(timeout=5)
+    else:
+        process_status(process)  # Reject an already-reaped, unowned PID.
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-    require(process.poll() is not None, "Smoke app did not stop")
+            signal_process_group(process, signal.SIGTERM)
+            deadline = time.monotonic() + 5
+            while process_status(process) is None and time.monotonic() < deadline:
+                time.sleep(0.05)
+        finally:
+            # A wrapper may exit on TERM while descendants ignore it. Kill
+            # the whole group before releasing the anchored leader PID.
+            try:
+                signal_process_group(process, signal.SIGKILL)
+            finally:
+                process.wait(timeout=5)
+    require(process.returncode is not None, "Smoke app did not stop")
 
 
 def launch_smoke(executable, window_check=None, seconds=12):
+    if os.name != "nt":
+        require_nonreaping_wait()
     env = os.environ.copy()
     # The QA profile override is debug-only. Release packages use the fresh
     # ephemeral runner/container profile, without signing in to any account.
@@ -201,7 +244,8 @@ def launch_smoke(executable, window_check=None, seconds=12):
         try:
             deadline = time.monotonic() + seconds
             while time.monotonic() < deadline:
-                require(process.poll() is None, f"Installed app exited during startup (status {process.returncode})")
+                status = process_status(process)
+                require(status is None, f"Installed app exited during startup (status {status})")
                 if window_check == "win32":
                     saw_window = saw_window or bool(visible_windows(process.pid))
                 elif window_check == "x11" and not saw_window:
@@ -323,8 +367,9 @@ def linux_container_smoke(dist, kind):
                 and fields["Version"] == package_version(), "Incorrect Debian package identity")
         require(re.search(r"(?:^|,\s*)libxi6(?:\s|,|$)", fields["Depends"]) is not None, "DEB does not declare libxi6")
         require("libc6 (>= 2.39)" in fields["Depends"] and "libstdc++6 (>= 12.1.0)" in fields["Depends"], "DEB is missing its declared ABI floors")
+        maintainer_metadata(fields["Maintainer"])
         record("deb_control", package=fields["Package"], version=fields["Version"], architecture=fields["Architecture"],
-               maintainer_present=bool(fields["Maintainer"]))
+               maintainer_present=True)
         apt_install(str(package))
         try:
             executable = Path("/usr/bin") / BINARY
@@ -362,31 +407,73 @@ def linux_container_smoke(dist, kind):
             check_resources(extracted / "usr/lib" / BINARY)
             check_desktop(extracted)
             check_elf(extracted / "usr/bin" / BINARY)
+            # Exercise the normal per-user AppImage startup lock/recovery
+            # path, not the root-owned read-only fallback.
+            shutil.chown(work, user="packageqa", group="packageqa")
+            shutil.chown(installed, user="packageqa", group="packageqa")
             linux_display_launch(installed)
+            sidecar = work / ("." + installed.name + ".morpheus-update")
+            require(sidecar.is_dir() and (sidecar.stat().st_mode & 0o777) == 0o700,
+                    "AppImage did not establish its private update recovery directory")
+            require({path.name for path in sidecar.iterdir()} == {"lock"},
+                    "Ordinary AppImage startup left a pending update transaction")
+            record("appimage_private_startup_lock")
             installed.unlink()
+            (sidecar / "lock").unlink()
+            sidecar.rmdir()
             require(not installed.exists(), "AppImage was not removed")
             record("appimage_portable_removal")
 
 
-def linux_smoke(dist):
+def package_formats(target, value=None):
+    supported = {"linux-x64": ["deb", "appimage"], "windows-x64": ["nsis"],
+                 "macos-arm64": ["dmg"], "macos-x64": ["dmg"]}
+    require(target in supported, "Unknown package target")
+    formats = value.split(",") if value is not None else supported[target]
+    require(bool(formats) and len(formats) == len(set(formats))
+            and all(kind in supported[target] for kind in formats), "Package formats do not match the target")
+    return formats
+
+
+def linux_smoke(dist, formats):
     run(["docker", "pull", "ubuntu:24.04"])
     image = output(["docker", "image", "inspect", "--format", "{{.Id}}", "ubuntu:24.04"])
     require(re.fullmatch(r"sha256:[a-f0-9]{64}", image) is not None, "Unexpected Docker image identity")
     record("clean_ubuntu_runtime_image", image_id=image)
-    for kind in ["deb", "appimage"]:
+    for kind in formats:
         command = ["docker", "run", "--rm", "--platform", "linux/amd64", "-e", "GITHUB_ACTIONS=true",
                    "-v", f"{ROOT / 'scripts'}:/qa/scripts:ro", "-v", f"{dist}:/qa/dist:ro",
                    "-v", f"{ROOT / 'Packager.toml'}:/qa/Packager.toml:ro",
                    "-v", f"{ROOT / 'LICENSE'}:/qa/LICENSE:ro", "-v", f"{ROOT / 'themes'}:/qa/themes:ro",
                    image, "bash", "-euc", "apt-get update\napt-get install -y --no-install-recommends python3 ca-certificates\n"
                    f"python3 /qa/scripts/package_smoke.py --linux-container {kind}"]
-        subprocess.run(command, check=True, timeout=900)
+        run_owned_container(command)
+
+
+def run_owned_container(command):
+    # Killing a Docker CLI on timeout does not stop its daemon-owned container.
+    # The fresh cidfile identifies only a container created by this invocation.
+    with tempfile.TemporaryDirectory(prefix="morpheus-package-container-") as folder:
+        cidfile = Path(folder) / "container.id"
+        require(command[:2] == ["docker", "run"], "Expected an owned Docker run command")
+        command = command[:2] + ["--cidfile", str(cidfile)] + command[2:]
+        try:
+            subprocess.run(command, check=True, timeout=900)
+        finally:
+            if cidfile.exists():
+                identity = cidfile.read_text().strip()
+                require(re.fullmatch(r"[a-f0-9]{64}", identity) is not None, "Invalid owned container identity")
+                removal = subprocess.run(["docker", "rm", "--force", identity],
+                                         capture_output=True, text=True, timeout=30)
+                require(removal.returncode == 0 or "No such container" in removal.stderr,
+                        "Could not remove the package smoke container")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dist", type=Path, default=ROOT / "dist")
     parser.add_argument("--target", choices=["linux-x64", "windows-x64", "macos-arm64", "macos-x64"])
+    parser.add_argument("--formats", help="Comma-separated package formats to inspect; defaults to every target format")
     parser.add_argument("--linux-container", choices=["deb", "appimage"], help=argparse.SUPPRESS)
     parser.add_argument("--launch-x11", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -400,13 +487,14 @@ def main():
         expected = {"linux-x64": ("linux", "x86_64"), "windows-x64": ("win32", "AMD64"),
                     "macos-arm64": ("darwin", "arm64"), "macos-x64": ("darwin", "x86_64")}
         require(args.target in expected and (sys.platform, platform.machine()) == expected[args.target], "Runner does not match requested package architecture")
+        formats = package_formats(args.target, args.formats)
         if sys.platform == "darwin":
             macos_smoke(args.dist.resolve(), expected[args.target][1])
         elif sys.platform == "win32":
             windows_smoke(args.dist.resolve())
         else:
-            linux_smoke(args.dist.resolve())
-        record("unsigned_package_smoke_complete", target=args.target,
+            linux_smoke(args.dist.resolve(), formats)
+        record("unsigned_package_smoke_complete", target=args.target, formats=formats,
                excluded=["account_login", "media_devices", "accessibility", "wayland", "signing", "updates"])
 
 

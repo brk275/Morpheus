@@ -2,10 +2,25 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.package import package_config
+from scripts.package import package_config, preflight_deb_authors
 
 
 class PackageConfigTests(unittest.TestCase):
+    def test_missing_deb_maintainer_fails_before_build_but_other_formats_do_not(self):
+        for formats in [None, "deb", "deb,appimage", "all", "default"]:
+            with self.subTest(formats=formats), self.assertRaises(ValueError):
+                preflight_deb_authors({}, formats, "linux")
+        for formats in ["appimage", "pacman"]:
+            preflight_deb_authors({}, formats, "linux")
+        preflight_deb_authors({}, "nsis", "win32")
+        preflight_deb_authors({}, "app", "darwin")
+
+    def test_deb_maintainer_needs_name_and_public_email(self):
+        for author in ["Name", "name@example.org", "Name <bad>", "Name <n@example.org>\nInjected: header"]:
+            with self.subTest(author=author), self.assertRaises(ValueError):
+                preflight_deb_authors({"authors": [author]}, "deb", "linux")
+        preflight_deb_authors({"authors": ["Fixture Maintainer <fixture@example.org>"]}, "deb", "linux")
+
     def test_linux_includes_platform_dependencies(self):
         config = package_config(platform="linux")
         self.assertIn("libxi6", config["deb"]["depends"])

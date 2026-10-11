@@ -10,7 +10,7 @@ use futures_util::StreamExt;
 use livekit::SimulateScenario;
 use matrix_rtc_call_sdk::CallEvent;
 use matrix_sdk::{Client, ruma::api::client::uiaa};
-use morpheus_matrix::{AccountManager, SyncBackend, SyncStatus};
+use morpheus_matrix::{AccountInfo, AccountManager, SyncBackend, SyncStatus};
 #[cfg(feature = "device-screen")]
 use morpheus_rtc::ScreenCapture;
 use morpheus_rtc::{
@@ -77,6 +77,62 @@ async fn wait_for_room(manager: &AccountManager, room_id: &str) {
     })
     .await
     .expect("RTC fixture room was not loaded");
+}
+
+async fn prepare_bob(
+    manager: &AccountManager,
+    account: &TestAccount,
+    room_id: &str,
+    unencrypted_room_id: &str,
+) -> (AccountInfo, Client) {
+    let saved = manager
+        .add_password_account(
+            &account.homeserver_url,
+            &account.username,
+            &account.password,
+        )
+        .await
+        .expect("Bob sign-in failed");
+    wait_for_sticky_sync(manager).await;
+    wait_for_room(manager, room_id).await;
+    wait_for_room(manager, unencrypted_room_id).await;
+    let client = manager.active_client().await.expect("No Bob client");
+    bootstrap_test_identity(&client, account).await;
+    (saved, client)
+}
+
+fn has_encrypted_membership(room: &matrix_sdk::Room, membership_id: &str) -> bool {
+    room.sticky_events().live().iter().any(|entry| {
+        entry.encryption_info().is_some()
+            && entry
+                .raw()
+                .get_field::<serde_json::Value>("content")
+                .ok()
+                .flatten()
+                .and_then(|content| {
+                    content
+                        .get("member")?
+                        .get("id")?
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .is_some_and(|id| id == membership_id)
+    })
+}
+
+async fn wait_for_encrypted_membership(client: &Client, room_id: &str, membership_id: &str) {
+    let room_id = matrix_sdk::ruma::RoomId::parse(room_id).expect("Invalid fixture room ID");
+    let room = client.get_room(&room_id).expect("Alice room is missing");
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if has_encrypted_membership(&room, membership_id) {
+                return;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("Alice encrypted membership did not arrive before Bob's device creation");
 }
 
 async fn bootstrap_test_identity(client: &Client, account: &TestAccount) {
@@ -471,6 +527,11 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
         eprintln!("Skipped local RTC acceptance; set MORPHEUS_MATRIX_RTC_TEST_ACCOUNTS to opt in.");
         return;
     };
+    let late_join = match std::env::var("MORPHEUS_RTC_LATE_JOIN").as_deref() {
+        Ok("1") => true,
+        Err(std::env::VarError::NotPresent) => false,
+        _ => panic!("MORPHEUS_RTC_LATE_JOIN must be absent or 1"),
+    };
     let fixture: Fixture = serde_json::from_slice(
         &fs::read(PathBuf::from(path)).expect("Cannot read protected local Matrix fixture"),
     )
@@ -514,22 +575,14 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
         .add_password_account(&alice.homeserver_url, &alice.username, &alice.password)
         .await
         .expect("Alice sign-in failed");
-    let bob_account = bob_manager
-        .add_password_account(&bob.homeserver_url, &bob.username, &bob.password)
-        .await
-        .expect("Bob sign-in failed");
     wait_for_sticky_sync(&alice_manager).await;
-    wait_for_sticky_sync(&bob_manager).await;
     wait_for_room(&alice_manager, room_id).await;
-    wait_for_room(&bob_manager, room_id).await;
     wait_for_room(&alice_manager, unencrypted_room_id).await;
-    wait_for_room(&bob_manager, unencrypted_room_id).await;
 
     let alice_client = alice_manager
         .active_client()
         .await
         .expect("No Alice client");
-    let bob_client = bob_manager.active_client().await.expect("No Bob client");
     let mut unencrypted_call = RtcService::new(alice_client.clone());
     timeout(Duration::from_secs(30), async {
         loop {
@@ -552,10 +605,13 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
         Err(RtcError::UnencryptedRoomUnsupported)
     ));
     bootstrap_test_identity(&alice_client, alice).await;
-    bootstrap_test_identity(&bob_client, bob).await;
+    let early_bob = if late_join {
+        None
+    } else {
+        Some(prepare_bob(&bob_manager, bob, room_id, unencrypted_room_id).await)
+    };
 
-    let mut alice_rtc = RtcService::new(alice_client);
-    let mut bob_rtc = RtcService::new(bob_client);
+    let mut alice_rtc = RtcService::new(alice_client.clone());
     assert!(
         alice_rtc
             .discover_transport()
@@ -567,21 +623,6 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
         .set_voice_space_marker(room_id, true)
         .await
         .expect("Cannot designate shared voice space");
-    timeout(Duration::from_secs(30), async {
-        loop {
-            if bob_rtc
-                .voice_space_marker(room_id)
-                .await
-                .expect("Cannot read shared voice-space marker")
-                == Some(VoiceSpaceMarker::ENABLED)
-            {
-                break;
-            }
-            sleep(Duration::from_millis(200)).await;
-        }
-    })
-    .await
-    .expect("Bob did not receive the shared voice-space marker");
     alice_rtc
         .open_slot(room_id, "m.call#room", true)
         .await
@@ -597,6 +638,40 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
     .await
     .expect("Alice RTC join timed out")
     .expect("Alice RTC join failed");
+    let (bob_account, bob_client) = match early_bob {
+        Some(bob) => bob,
+        None => {
+            // A prior call leave/rejoin reuses Bob's old Megolm keys and does
+            // not cover this case. His receiving device must not exist until
+            // Alice's encrypted sticky membership has actually been sent.
+            wait_for_encrypted_membership(&alice_client, room_id, &alice_call.membership_id).await;
+            assert!(bob_manager.accounts().await.is_empty());
+            let prepared = prepare_bob(&bob_manager, bob, room_id, unencrypted_room_id).await;
+            let id = matrix_sdk::ruma::RoomId::parse(room_id).expect("Invalid fixture room ID");
+            let room = prepared.1.get_room(&id).expect("Bob room is missing");
+            eprintln!(
+                "MORPHEUS_RTC_LATE_JOIN historical_member={}",
+                has_encrypted_membership(&room, &alice_call.membership_id),
+            );
+            prepared
+        }
+    };
+    let mut bob_rtc = RtcService::new(bob_client);
+    timeout(Duration::from_secs(30), async {
+        loop {
+            if bob_rtc
+                .voice_space_marker(room_id)
+                .await
+                .expect("Cannot read shared voice-space marker")
+                == Some(VoiceSpaceMarker::ENABLED)
+            {
+                break;
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("Bob did not receive the shared voice-space marker");
     let bob_call = timeout(
         Duration::from_secs(join_timeout),
         bob_rtc.join(room_id, CallOptions::default()),
@@ -838,4 +913,9 @@ async fn encrypted_two_device_audio_video_and_reconnect() {
     eprintln!(
         "Local encrypted MatrixRTC call, synthetic audio, camera, screen stream, leave-triggered media-key rotation, rejoin, and post-rejoin video passed."
     );
+    if late_join {
+        eprintln!(
+            "Fresh-device late join passed without historical key import or membership refresh injection."
+        );
+    }
 }

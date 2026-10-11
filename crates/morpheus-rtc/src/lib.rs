@@ -14,6 +14,8 @@ mod voice_space;
 
 #[cfg(feature = "device-audio")]
 mod audio_device;
+#[cfg(all(feature = "device-screen", target_os = "linux"))]
+mod linux_portal;
 #[cfg(feature = "native-rtc")]
 mod media;
 #[cfg(feature = "native-rtc")]
