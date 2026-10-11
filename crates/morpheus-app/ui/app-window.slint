@@ -412,7 +412,8 @@ export component AppWindow inherits Window {
     in-out property <string> sas-incoming-user-id;
     in-out property <bool> sas-incoming-loading: false;
     in-out property <bool> native-call-enabled: false;
-    in-out property <bool> element-call-compatibility: false;
+    in-out property <int> room-call-mode: 0;
+    in-out property <bool> native-call-request-pending: false;
     in-out property <string> native-call-status;
     in-out property <bool> native-call-joined: false;
     in-out property <bool> native-audio-failed: false;
@@ -487,7 +488,7 @@ export component AppWindow inherits Window {
     callback open-voice-space(string);
     callback set-local-voice-space(bool);
     callback set-shared-voice-space(bool);
-    callback choose-element-call-legacy(bool);
+    callback choose-room-call-mode(int);
     callback load-older-messages();
     callback refresh-room-members();
     callback submit-member-action(int, string, string);
@@ -2252,26 +2253,35 @@ export component AppWindow inherits Window {
                         color: #ef9da9; font-size: 11px * root.text-scale;
                         wrap: word-wrap; accessible-live-region: polite;
                     }
-                    if root.live-session && root.native-call-enabled : ActionRect {
-                        height: 60px; border-radius: 10px;
-                        background: root.element-call-compatibility ? root.hover : root.panel;
-                        border-color: root.element-call-compatibility ? root.accent : root.divider;
-                        border-width: 1px; focus-color: root.accent;
-                        label: "Use legacy Element Call mode for this room and account";
-                        accessible-checkable: true;
-                        accessible-checked: root.element-call-compatibility;
-                        enabled: !root.call-connected && root.active-room-id != "";
-                        activated => { root.choose-element-call-legacy(!root.element-call-compatibility); }
-                        VerticalLayout {
-                            padding-left: 14px; padding-right: 14px; alignment: center; spacing: 3px;
-                            Text {
-                                text: (root.element-call-compatibility ? "✓ " : "○ ") + "Legacy Element Call for this room";
-                                color: root.ink; font-size: 12px * root.text-scale; font-weight: 700;
+                    if root.live-session && root.native-call-enabled : VerticalLayout {
+                        spacing: 5px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            for choice[index] in ["Standard", "Element Call Matrix 2.0", "Legacy"] : ActionRect {
+                                height: 38px; border-radius: 8px; horizontal-stretch: 1;
+                                background: root.room-call-mode == index ? root.hover : root.panel;
+                                border-color: root.room-call-mode == index ? root.accent : root.divider;
+                                border-width: 1px; focus-color: root.accent;
+                                label: choice + " call mode for this room and account";
+                                accessible-checkable: true;
+                                accessible-checked: root.room-call-mode == index;
+                                enabled: !root.call-connected && !root.native-call-request-pending && root.active-room-id != "";
+                                activated => { root.choose-room-call-mode(index); }
+                                Text {
+                                    text: choice; color: root.ink; font-size: 11px * root.text-scale; font-weight: 700;
+                                    horizontal-alignment: center; vertical-alignment: center; overflow: elide;
+                                }
                             }
-                            Text {
-                                text: "Saved for this account. Older room-state calls only; room power may be required.";
-                                color: root.muted; font-size: 11px * root.text-scale; overflow: elide;
-                            }
+                        }
+                        Text {
+                            text: root.call-connected || root.native-call-request-pending
+                                ? "Call mode is fixed until this call ends. Saved edits apply to your next call."
+                                : root.room-call-mode == 1
+                                    ? "Match Element Call's Matrix 2.0 setting. Encrypted rooms only; Open room call requires room permission."
+                                    : root.room-call-mode == 2
+                                        ? "Older Element Call room-state calls; room permission may be required."
+                                        : "Standard MatrixRTC. Saved for this account and room; no automatic compatibility fallback.";
+                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
                         }
                     }
                     if root.live-session : Rectangle {
@@ -2297,7 +2307,7 @@ export component AppWindow inherits Window {
                             width: parent.width - 276px; height: 132px;
                             alignment: center; spacing: 12px;
                             Text {
-                                text: root.call-connected ? "Waiting for participant video" : (root.element-call-compatibility ? "Join the legacy room call" : "Join the room call");
+                                text: root.call-connected ? "Waiting for participant video" : (root.room-call-mode == 2 ? "Join the legacy room call" : "Join the room call");
                                 color: root.ink; font-size: 19px * root.text-scale;
                                 font-weight: 700; horizontal-alignment: center;
                             }
@@ -2350,7 +2360,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
-                        if root.native-call-enabled && !root.call-connected && !root.element-call-compatibility : ActionRect {
+                        if root.native-call-enabled && !root.call-connected && !root.native-call-request-pending && root.room-call-mode != 2 : ActionRect {
                             x: (parent.width - 220px - 176px) / 2; y: parent.height - 76px;
                             width: 176px; height: 42px; border-radius: 9px;
                             background: root.hover; border-color: root.divider; border-width: 1px;
@@ -2481,7 +2491,7 @@ export component AppWindow inherits Window {
                                         }
                                     } else { root.call-connected = !root.call-connected; }
                                 }
-                                Text { text: root.live-session ? (root.native-call-enabled ? (root.native-leave-unconfirmed ? "Review leave" : (root.call-connected ? "Leave call" : (root.element-call-compatibility ? "Join legacy call" : "Join call"))) : "Unavailable") : (root.call-connected ? "End preview" : "Start preview"); color: #ffffff; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                                Text { text: root.live-session ? (root.native-call-enabled ? (root.native-leave-unconfirmed ? "Review leave" : (root.call-connected ? "Leave call" : (root.room-call-mode == 2 ? "Join legacy call" : "Join call"))) : "Unavailable") : (root.call-connected ? "End preview" : "Start preview"); color: #ffffff; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                             }
                             IconAction { width: 40px; height: 43px; icon: "R"; label: "Return to chat"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.page = 0; } }
                         }

@@ -669,20 +669,18 @@ impl LiveUi {
             space_children,
             all_space_children,
             local_voice_rooms: self.voice_spaces.local_rooms(&member_account_id),
-            legacy_element_call_rooms: self
-                .voice_spaces
-                .legacy_element_call_rooms(&member_account_id),
             shared_voice_rooms: self.voice_spaces.shared_rooms(&member_account_id).await,
         };
         let current_epoch = self.render_epoch.clone();
         let is_live = self.is_live.clone();
         let drafts = self.drafts.clone();
         let security_gate = self.security_gate.clone();
+        let voice_spaces = self.voice_spaces.clone();
         let _ = ui.upgrade_in_event_loop(move |ui| {
             if is_live.load(Ordering::Acquire)
                 && current_epoch.load(Ordering::Acquire) == render_epoch
             {
-                apply_snapshot(&ui, view, &drafts, &security_gate);
+                apply_snapshot(&ui, view, &drafts, &security_gate, &voice_spaces);
             }
         });
         if let Some(room_id) = selected {
@@ -1365,7 +1363,6 @@ struct Snapshot {
     space_children: HashMap<String, HashSet<String>>,
     all_space_children: HashSet<String>,
     local_voice_rooms: HashSet<String>,
-    legacy_element_call_rooms: HashSet<String>,
     shared_voice_rooms: HashSet<String>,
 }
 
@@ -1374,6 +1371,7 @@ fn apply_snapshot(
     view: Snapshot,
     drafts: &DraftStore,
     security_gate: &crate::security::SecurityGate,
+    voice_spaces: &VoiceSpaces,
 ) {
     let next_room_id = view.selected.as_deref().unwrap_or("");
     let account_changed = ui.get_active_account_local_id().as_str() != view.active.id;
@@ -1432,7 +1430,7 @@ fn apply_snapshot(
         ui.set_member_confirm_open(false);
         crate::reset_attachment_view(ui);
         crate::reset_room_search(ui);
-        ui.set_element_call_compatibility(false);
+        ui.set_room_call_mode(0);
         ui.set_composer_text(drafts.get(&view.active.id, next_room_id).into());
         ui.set_composer_markdown(drafts.markdown(&view.active.id, next_room_id));
         ui.set_composer_saved_markdown(false);
@@ -1585,8 +1583,12 @@ fn apply_snapshot(
             ui.set_active_room_id(room.room_id.as_str().into());
             ui.set_active_room_name(room.name.as_str().into());
             ui.set_active_room_topic_raw(room.topic.as_deref().unwrap_or("").into());
-            ui.set_element_call_compatibility(
-                view.legacy_element_call_rooms.contains(&room.room_id),
+            // Settings can change while this room snapshot is queued. Read
+            // the same latest checked preference that a new join will capture.
+            ui.set_room_call_mode(
+                voice_spaces
+                    .room_call_mode(&view.active.id, &room.room_id)
+                    .index(),
             );
             ui.set_active_voice_local(view.local_voice_rooms.contains(&room.room_id));
             ui.set_active_voice_shared(view.shared_voice_rooms.contains(&room.room_id));
@@ -1600,7 +1602,7 @@ fn apply_snapshot(
         ui.set_active_room_id("".into());
         ui.set_active_room_name("No rooms yet".into());
         ui.set_active_room_topic_raw("".into());
-        ui.set_element_call_compatibility(false);
+        ui.set_room_call_mode(0);
         ui.set_active_voice_local(false);
         ui.set_active_voice_shared(false);
         ui.set_active_room_topic("Join or create a Matrix room to begin".into());

@@ -32,7 +32,9 @@ use std::time::Duration;
 
 use chrono::{Local, TimeZone};
 use directories::ProjectDirs;
-use morpheus_config::{Config, ConfigStore, Density, LoadedConfig, ThemeMode, ThemePack};
+use morpheus_config::{
+    Config, ConfigStore, Density, LoadedConfig, RoomCallMode, ThemeMode, ThemePack,
+};
 use morpheus_matrix::{
     AccountManager, AttachmentSendUpdate, MatrixLinkTarget, MessageInfo, MessageSearchResult,
     PublicRoomInfo, PublicRoomsQuery, QueuedSendUpdate, TextFormat, parse_matrix_link_target,
@@ -588,7 +590,7 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
         ui.set_invite_error("".into());
         ui.set_room_action_operation(ui.get_room_action_operation().wrapping_add(1));
         reset_room_search(ui);
-        ui.set_element_call_compatibility(false);
+        ui.set_room_call_mode(0);
     }
     ui.set_live_session(false);
     ui.set_stress_timeline_active(state.stress_backup.is_some());
@@ -1809,7 +1811,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(window) = weak.upgrade() else {
                 return;
             };
-            if !window.get_live_session() || window.get_element_call_compatibility() {
+            if !window.get_live_session()
+                || window.get_call_connected()
+                || window.get_native_call_request_pending()
+                || window.get_room_call_mode() == RoomCallMode::ElementCallLegacy.index()
+            {
                 return;
             }
             let account_id = window.get_active_account_local_id().to_string();
@@ -1817,6 +1823,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if account_id.is_empty() || room_id.is_empty() {
                 return;
             }
+            window.set_native_call_request_pending(true);
             let calls = calls.clone();
             let call_live = call_live.clone();
             let weak = weak.clone();
@@ -1824,9 +1831,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _transition = call_live.account_transition.lock().await;
                 let result = calls.open_slot(&account_id, &room_id).await;
                 let _ = weak.upgrade_in_event_loop(move |ui| {
+                    ui.set_native_call_request_pending(false);
                     if ui.get_active_account_local_id().as_str() != account_id
                         || ui.get_active_room_id().as_str() != room_id
-                        || ui.get_element_call_compatibility()
+                        || ui.get_room_call_mode() == RoomCallMode::ElementCallLegacy.index()
                     {
                         return;
                     }
@@ -2087,7 +2095,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let Some(window) = weak.upgrade() else {
                 return;
             };
-            if !window.get_live_session() || window.get_call_connected() {
+            if !window.get_live_session()
+                || window.get_call_connected()
+                || window.get_native_call_request_pending()
+            {
                 return;
             }
             let account_id = window.get_active_account_local_id().to_string();
@@ -2095,25 +2106,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if account_id.is_empty() || room_id.is_empty() {
                 return;
             }
-            let mode = if window.get_element_call_compatibility() {
-                CallJoinMode::ElementCallRoomState
-            } else {
-                CallJoinMode::Standard
-            };
+            // Read the account-scoped checked preferences, not a potentially
+            // queued UI snapshot. The worker owns this immutable choice.
+            let mode =
+                CallJoinMode::from(call_live.voice_spaces.room_call_mode(&account_id, &room_id));
+            window.set_native_call_request_pending(true);
             let calls = calls.clone();
             let call_live = call_live.clone();
             let weak = weak.clone();
             handle.spawn(async move {
                 let _transition = call_live.account_transition.lock().await;
-                if let Err(error) = calls.start_audio(&account_id, &room_id, mode).await {
-                    let _ = weak.upgrade_in_event_loop(move |ui| {
-                        if ui.get_active_account_local_id().as_str() == account_id
-                            && ui.get_active_room_id().as_str() == room_id
-                        {
-                            ui.set_session_error(error.to_string().into());
-                        }
-                    });
-                }
+                let result = calls.start_audio(&account_id, &room_id, mode).await;
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    ui.set_native_call_request_pending(false);
+                    if ui.get_active_account_local_id().as_str() == account_id
+                        && ui.get_active_room_id().as_str() == room_id
+                        && let Err(error) = result
+                    {
+                        ui.set_session_error(error.to_string().into());
+                    }
+                });
             });
         });
     }
@@ -2347,30 +2359,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let weak = ui.as_weak();
-    let legacy_live = live.clone();
-    ui.on_choose_element_call_legacy(move |enabled| {
+    let mode_live = live.clone();
+    #[cfg(feature = "native-calls")]
+    let mode_calls = calls.clone();
+    ui.on_choose_room_call_mode(move |index| {
         let Some(window) = weak.upgrade() else {
             return;
         };
-        if !legacy_live.is_live.load(Ordering::Acquire) || window.get_call_connected() {
+        if !mode_live.is_live.load(Ordering::Acquire)
+            || window.get_call_connected()
+            || window.get_native_call_request_pending()
+        {
             return;
         }
+        #[cfg(feature = "native-calls")]
+        if mode_calls.status().blocks_account_switch() {
+            return;
+        }
+        let Some(mode) = RoomCallMode::from_index(index) else {
+            return;
+        };
         let account_id = window.get_active_account_local_id().to_string();
         let room_id = window.get_active_room_id().to_string();
         if account_id.is_empty() || room_id.is_empty() {
             return;
         }
-        match legacy_live
+        match mode_live
             .voice_spaces
-            .set_legacy_element_call(&account_id, &room_id, enabled)
+            .set_room_call_mode(&account_id, &room_id, mode)
         {
-            Ok(()) => window.set_element_call_compatibility(enabled),
+            Ok(()) => window.set_room_call_mode(mode.index()),
             Err(error) => window.set_session_error(
-                directory_plain_text(
-                    &format!("Could not save legacy Element Call choice: {error}"),
-                    240,
-                )
-                .into(),
+                directory_plain_text(&format!("Could not save room call mode: {error}"), 240)
+                    .into(),
             ),
         }
     });

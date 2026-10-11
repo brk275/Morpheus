@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "native-calls")]
 use futures_util::{StreamExt, stream};
-use morpheus_config::{Config, ConfigError, ConfigStore};
+use morpheus_config::{Config, ConfigError, ConfigStore, RoomCallMode};
 use morpheus_matrix::AccountManager;
 #[cfg(feature = "native-calls")]
 use morpheus_rtc::RtcService;
@@ -54,31 +54,23 @@ impl VoiceSpaces {
             .unwrap_or_default()
     }
 
-    pub fn legacy_element_call_rooms(&self, account_id: &str) -> HashSet<String> {
-        let config = self.config.read().expect("voice config lock poisoned");
-        config
-            .account_overrides
-            .get(account_id)
-            .map(|overrides| {
-                overrides
-                    .legacy_element_call_rooms
-                    .iter()
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
+    pub fn room_call_mode(&self, account_id: &str, room_id: &str) -> RoomCallMode {
+        self.config
+            .read()
+            .expect("voice config lock poisoned")
+            .room_call_mode(account_id, room_id)
     }
 
-    pub fn set_legacy_element_call(
+    pub fn set_room_call_mode(
         &self,
         account_id: &str,
         room_id: &str,
-        enabled: bool,
+        mode: RoomCallMode,
     ) -> Result<(), ConfigError> {
-        // A malformed external edit must remain untouched. Only a successful
-        // atomic save updates the checked state in the app's config snapshot.
+        // Invalid external edits remain untouched. Only an atomic successful
+        // save changes the preferences used by the next join.
         let mut config = self.store.load()?;
-        if config.set_legacy_element_call_room(account_id, room_id, enabled)? {
+        if config.set_room_call_mode(account_id, room_id, mode)? {
             self.store.save(&config)?;
         }
         self.apply_config(&config);
@@ -102,8 +94,8 @@ impl VoiceSpaces {
 
     pub fn clear_logged_out_account(&self, account_id: &str) -> Result<(), ConfigError> {
         let mut config = self.store.load()?;
-        let changed = config.clear_local_voice_rooms(account_id)
-            | config.clear_legacy_element_call_rooms(account_id);
+        let changed =
+            config.clear_local_voice_rooms(account_id) | config.clear_room_call_modes(account_id);
         if changed {
             self.store.save(&config)?;
         }

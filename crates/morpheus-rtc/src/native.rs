@@ -62,6 +62,23 @@ impl Default for CallOptions {
 }
 
 impl CallOptions {
+    /// Element Call's Matrix 2.0 setting still speaks the 2025 sticky dialect.
+    /// Keep the core's lowercase slot; the pinned adapter converts its wire
+    /// membership and authorization request together. This is never a fallback.
+    pub fn element_call_matrix_2_0() -> Self {
+        Self {
+            slot_id: "m.call#room".to_owned(),
+            interop_mode: InteropMode::Sticky2025,
+        }
+    }
+
+    fn validate_encryption(&self, encrypted: bool) -> Result<(), RtcError> {
+        if !encrypted && self.interop_mode != InteropMode::RoomState {
+            return Err(RtcError::UnencryptedRoomUnsupported);
+        }
+        Ok(())
+    }
+
     /// Join the pre-sticky Element Call room-state dialect. Its empty legacy
     /// `call_id` maps to the RTC core's lowercase `room` sentinel. Element
     /// Call's current-mode uppercase `ROOM` slot has separate interoperability
@@ -227,6 +244,18 @@ impl RtcService {
         Ok(classify_transports(&value))
     }
 
+    async fn ensure_sticky_support(&self) -> Result<(), RtcError> {
+        if !self
+            .client
+            .supports_sticky_events()
+            .await
+            .map_err(|error| RtcError::Discovery(error.to_string()))?
+        {
+            return Err(RtcError::StickyEventsUnsupported);
+        }
+        Ok(())
+    }
+
     /// Publish `m.rtc.slot` before starting a new call. This requires room
     /// state-event power. For encrypted rooms, use `encrypted = true` to select
     /// MatrixRTC's `m.per_member` media-key policy.
@@ -260,6 +289,7 @@ impl RtcService {
         ) {
             return Err(RtcError::NoLiveKitTransport);
         }
+        self.ensure_sticky_support().await?;
         if encrypted {
             self.ensure_encrypted_call_ready().await?;
         }
@@ -297,13 +327,14 @@ impl RtcService {
         if encryption_state.is_unknown() {
             return Err(RtcError::UnknownEncryptionState);
         }
-        if !encryption_state.is_encrypted() && options.interop_mode == InteropMode::Current {
-            return Err(RtcError::UnencryptedRoomUnsupported);
-        }
+        options.validate_encryption(encryption_state.is_encrypted())?;
         let service_url = match self.discover_transport().await? {
             TransportSupport::LiveKit { service_url } => service_url,
             TransportSupport::NoLiveKitTransport => return Err(RtcError::NoLiveKitTransport),
         };
+        if options.interop_mode != InteropMode::RoomState {
+            self.ensure_sticky_support().await?;
+        }
         if encryption_state.is_encrypted() {
             self.ensure_encrypted_call_ready().await?;
         }
@@ -489,6 +520,39 @@ mod tests {
     #[test]
     fn default_slot_matches_pinned_rtc_room_slot() {
         assert_eq!(CallOptions::default().slot_id, "m.call#room");
+        assert_eq!(CallOptions::default().interop_mode, InteropMode::Current);
+    }
+
+    #[test]
+    fn element_matrix_2_0_converts_wire_slot_without_changing_core_slot() {
+        let options = CallOptions::element_call_matrix_2_0();
+        assert_eq!(options.slot_id, "m.call#room");
+        let format = MembershipFormat::from(options.interop_mode);
+        assert_eq!(format, MembershipFormat::Sticky2025);
+        assert_eq!(format.token_slot_id(&options.slot_id), "m.call#ROOM");
+        assert_eq!(
+            MembershipFormat::Current.token_slot_id(&options.slot_id),
+            "m.call#room"
+        );
+    }
+
+    #[test]
+    fn exposed_sticky_modes_reject_plaintext_without_changing_legacy_policy() {
+        for options in [
+            CallOptions::default(),
+            CallOptions::element_call_matrix_2_0(),
+        ] {
+            assert!(matches!(
+                options.validate_encryption(false),
+                Err(RtcError::UnencryptedRoomUnsupported)
+            ));
+            assert!(options.validate_encryption(true).is_ok());
+        }
+        assert!(
+            CallOptions::room_state_compatibility()
+                .validate_encryption(false)
+                .is_ok()
+        );
     }
 
     #[test]

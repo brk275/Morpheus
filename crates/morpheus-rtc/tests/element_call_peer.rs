@@ -287,10 +287,7 @@ async fn element_call_browser_peer_encrypted_media_and_departure() {
             rtc.open_slot(room_id, NATIVE_ROOM_SLOT_ID, true)
                 .await
                 .expect("Cannot open native encrypted slot");
-            CallOptions {
-                slot_id: NATIVE_ROOM_SLOT_ID.to_owned(),
-                interop_mode,
-            }
+            CallOptions::element_call_matrix_2_0()
         }
         InteropMode::Current => {
             rtc.open_slot(room_id, ELEMENT_ROOM_SLOT_ID, true)

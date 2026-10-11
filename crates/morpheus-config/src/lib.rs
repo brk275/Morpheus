@@ -111,6 +111,18 @@ impl Config {
                     ));
                 }
             }
+            for room_id in &overrides.element_call_matrix_2_0_rooms {
+                if !room_id.starts_with('!') || !room_id.contains(':') {
+                    return Err(ConfigError::Invalid(
+                        "account_overrides.element_call_matrix_2_0_rooms must contain Matrix room IDs".into(),
+                    ));
+                }
+                if overrides.legacy_element_call_rooms.contains(room_id) {
+                    return Err(ConfigError::Invalid(
+                        "a room cannot use both Element Call compatibility modes".into(),
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -188,42 +200,92 @@ impl Config {
             })
     }
 
+    pub fn room_call_mode(&self, account_id: &str, room_id: &str) -> RoomCallMode {
+        let Some(overrides) = self.account_overrides.get(account_id) else {
+            return RoomCallMode::Standard;
+        };
+        if overrides
+            .element_call_matrix_2_0_rooms
+            .iter()
+            .any(|id| id == room_id)
+        {
+            RoomCallMode::ElementCallMatrix2
+        } else if self.is_legacy_element_call_room(account_id, room_id) {
+            RoomCallMode::ElementCallLegacy
+        } else {
+            RoomCallMode::Standard
+        }
+    }
+
+    /// One explicit local choice. Changing it does not change room state or an
+    /// already-created call. The existing legacy list remains schema-compatible.
+    pub fn set_room_call_mode(
+        &mut self,
+        account_id: &str,
+        room_id: &str,
+        mode: RoomCallMode,
+    ) -> Result<bool, ConfigError> {
+        if account_id.is_empty() || !room_id.starts_with('!') || !room_id.contains(':') {
+            return Err(ConfigError::Invalid(
+                "call mode requires an account and Matrix room ID".into(),
+            ));
+        }
+        self.validate()?;
+        if self.room_call_mode(account_id, room_id) == mode {
+            return Ok(false);
+        }
+        let overrides = self
+            .account_overrides
+            .entry(account_id.to_owned())
+            .or_default();
+        overrides
+            .legacy_element_call_rooms
+            .retain(|id| id != room_id);
+        overrides
+            .element_call_matrix_2_0_rooms
+            .retain(|id| id != room_id);
+        let rooms = match mode {
+            RoomCallMode::Standard => None,
+            RoomCallMode::ElementCallMatrix2 => Some(&mut overrides.element_call_matrix_2_0_rooms),
+            RoomCallMode::ElementCallLegacy => Some(&mut overrides.legacy_element_call_rooms),
+        };
+        if let Some(rooms) = rooms {
+            rooms.push(room_id.to_owned());
+            rooms.sort();
+        }
+        if *overrides == AccountOverrides::default() {
+            self.account_overrides.remove(account_id);
+        }
+        Ok(true)
+    }
+
+    pub fn clear_room_call_modes(&mut self, account_id: &str) -> bool {
+        let Some(overrides) = self.account_overrides.get_mut(account_id) else {
+            return false;
+        };
+        let changed = !overrides.legacy_element_call_rooms.is_empty()
+            || !overrides.element_call_matrix_2_0_rooms.is_empty();
+        overrides.legacy_element_call_rooms.clear();
+        overrides.element_call_matrix_2_0_rooms.clear();
+        if *overrides == AccountOverrides::default() {
+            self.account_overrides.remove(account_id);
+        }
+        changed
+    }
+
     pub fn set_legacy_element_call_room(
         &mut self,
         account_id: &str,
         room_id: &str,
         enabled: bool,
     ) -> Result<bool, ConfigError> {
-        if account_id.is_empty() || !room_id.starts_with('!') || !room_id.contains(':') {
-            return Err(ConfigError::Invalid(
-                "legacy Element Call mode requires an account and Matrix room ID".into(),
-            ));
-        }
         if enabled {
-            let rooms = &mut self
-                .account_overrides
-                .entry(account_id.to_owned())
-                .or_default()
-                .legacy_element_call_rooms;
-            if rooms.iter().any(|id| id == room_id) {
-                return Ok(false);
-            }
-            rooms.push(room_id.to_owned());
-            rooms.sort();
-            return Ok(true);
+            self.set_room_call_mode(account_id, room_id, RoomCallMode::ElementCallLegacy)
+        } else if self.is_legacy_element_call_room(account_id, room_id) {
+            self.set_room_call_mode(account_id, room_id, RoomCallMode::Standard)
+        } else {
+            Ok(false)
         }
-        let Some(overrides) = self.account_overrides.get_mut(account_id) else {
-            return Ok(false);
-        };
-        let before = overrides.legacy_element_call_rooms.len();
-        overrides
-            .legacy_element_call_rooms
-            .retain(|id| id != room_id);
-        let changed = before != overrides.legacy_element_call_rooms.len();
-        if *overrides == AccountOverrides::default() {
-            self.account_overrides.remove(account_id);
-        }
-        Ok(changed)
     }
 
     pub fn clear_legacy_element_call_rooms(&mut self, account_id: &str) -> bool {
@@ -379,6 +441,35 @@ pub struct AccountOverrides {
     pub local_voice_rooms: Vec<String>,
     /// Account-local rooms that use Element Call's older room-state dialect.
     pub legacy_element_call_rooms: Vec<String>,
+    /// Account-local rooms explicitly using Element Call's sticky 2025 dialect.
+    pub element_call_matrix_2_0_rooms: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RoomCallMode {
+    #[default]
+    Standard,
+    ElementCallMatrix2,
+    ElementCallLegacy,
+}
+
+impl RoomCallMode {
+    pub fn from_index(index: i32) -> Option<Self> {
+        match index {
+            0 => Some(Self::Standard),
+            1 => Some(Self::ElementCallMatrix2),
+            2 => Some(Self::ElementCallLegacy),
+            _ => None,
+        }
+    }
+
+    pub fn index(self) -> i32 {
+        match self {
+            Self::Standard => 0,
+            Self::ElementCallMatrix2 => 1,
+            Self::ElementCallLegacy => 2,
+        }
+    }
 }
 
 pub fn default_shortcuts() -> BTreeMap<String, String> {
@@ -1173,5 +1264,97 @@ mod tests {
             Some(false)
         );
         assert!(!config.clear_legacy_element_call_rooms("alice"));
+    }
+
+    #[test]
+    fn matrix_2_0_choice_preserves_legacy_configs_and_switches_atomically() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        fs::write(
+            store.path(),
+            "[account_overrides.alice]\nlegacy_element_call_rooms = [\"!old:example.org\"]\n",
+        )
+        .unwrap();
+        let mut config = store.load().unwrap();
+        assert_eq!(
+            config.room_call_mode("alice", "!old:example.org"),
+            RoomCallMode::ElementCallLegacy
+        );
+        let room = "!call:example.org";
+        config
+            .set_room_call_mode("alice", room, RoomCallMode::ElementCallMatrix2)
+            .unwrap();
+        let captured_join_mode = config.room_call_mode("alice", room);
+        assert_eq!(captured_join_mode, RoomCallMode::ElementCallMatrix2);
+        assert_eq!(config.room_call_mode("bob", room), RoomCallMode::Standard);
+        assert_eq!(
+            config.room_call_mode("alice", "!other:example.org"),
+            RoomCallMode::Standard
+        );
+        store.save(&config).unwrap();
+        let mut config = store.load().unwrap();
+        assert_eq!(
+            config.room_call_mode("alice", room),
+            RoomCallMode::ElementCallMatrix2
+        );
+        assert_eq!(
+            config.room_call_mode("alice", "!old:example.org"),
+            RoomCallMode::ElementCallLegacy
+        );
+        config
+            .set_room_call_mode("alice", room, RoomCallMode::ElementCallLegacy)
+            .unwrap();
+        assert!(
+            !config.account_overrides["alice"]
+                .element_call_matrix_2_0_rooms
+                .contains(&room.to_owned())
+        );
+        config.validate().unwrap();
+        config
+            .set_room_call_mode("alice", room, RoomCallMode::Standard)
+            .unwrap();
+        assert_eq!(config.room_call_mode("alice", room), RoomCallMode::Standard);
+        assert_eq!(captured_join_mode, RoomCallMode::ElementCallMatrix2);
+        assert!(config.clear_room_call_modes("alice"));
+        assert!(!config.account_overrides.contains_key("alice"));
+    }
+
+    #[test]
+    fn conflicting_call_modes_cannot_replace_valid_preferences() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let mut config = Config::default();
+        let room = "!call:example.org";
+        config
+            .set_room_call_mode("alice", room, RoomCallMode::ElementCallMatrix2)
+            .unwrap();
+        store.save(&config).unwrap();
+        let valid = fs::read(store.path()).unwrap();
+        config
+            .account_overrides
+            .get_mut("alice")
+            .unwrap()
+            .legacy_element_call_rooms
+            .push(room.into());
+        assert!(config.validate().is_err());
+        assert!(store.save(&config).is_err());
+        assert_eq!(fs::read(store.path()).unwrap(), valid);
+        for index in [-1, 3, i32::MAX] {
+            assert_eq!(RoomCallMode::from_index(index), None);
+        }
+        assert!(
+            Config::default()
+                .set_room_call_mode(
+                    "alice",
+                    "#alias:example.org",
+                    RoomCallMode::ElementCallMatrix2
+                )
+                .is_err()
+        );
+        assert!(
+            Config::default()
+                .set_room_call_mode("", room, RoomCallMode::ElementCallMatrix2)
+                .is_err()
+        );
     }
 }

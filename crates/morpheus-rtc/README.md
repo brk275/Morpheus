@@ -30,9 +30,19 @@ available there. The separate Synapse B service-gate acceptance test checks
 this against authoritative room state and an encrypted chat send.
 The current format needs an encrypted room: its cleartext membership does not
 carry an attributable sender device, which the pinned LiveKit transport needs
-to identify remote media. `open_slot()` and a default `join()` reject an
-unencrypted room before publishing a call; explicit legacy joins remain a
-separate compatibility path.
+to identify remote media. `open_slot()` and both modern `join()` modes reject an
+unencrypted room before publishing a call. Both also require advertised sticky
+event support; explicit legacy room-state joins retain their separate policy.
+
+`CallOptions::element_call_matrix_2_0()` selects the pinned `Sticky2025` adapter
+for Element Call's Matrix 2.0 setting. It keeps the internal lowercase
+`m.call#room` slot and lets the adapter translate the outgoing membership and
+authorization slot together. The app exposes it as an explicit account/room
+choice; the default remains `Current`. No protocol negotiation, automatic
+fallback, or room-marker override is performed. A room must still have the
+lowercase slot opened by a member with sufficient power. The stock RC test now
+uses this same constructor; compilation and new production UI/runtime
+acceptance remain pending. See [the peer scope](../../docs/ELEMENT_CALL_ACCEPTANCE.md).
 
 Call `install_crypto_provider()` at process startup, before creating or logging
 in a Matrix SDK client. The combined Matrix SDK and LiveKit dependency graph

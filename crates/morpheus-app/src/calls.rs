@@ -70,13 +70,12 @@ pub enum AudioCallCapability {
     TransportReady { livekit_service_url: String },
 }
 
-/// Choose the MatrixRTC membership format before joining. The compatibility
-/// mode is only for Element Call's legacy room-state format; it does not
-/// advertise support for current MatrixRTC/Matrix 2.0 calls.
+/// Choose one MatrixRTC format before joining; no runtime protocol fallback.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CallJoinMode {
     #[default]
     Standard,
+    ElementCallMatrix2,
     ElementCallRoomState,
 }
 
@@ -84,7 +83,18 @@ impl CallJoinMode {
     fn options(self) -> CallOptions {
         match self {
             Self::Standard => CallOptions::default(),
+            Self::ElementCallMatrix2 => CallOptions::element_call_matrix_2_0(),
             Self::ElementCallRoomState => CallOptions::room_state_compatibility(),
+        }
+    }
+}
+
+impl From<morpheus_config::RoomCallMode> for CallJoinMode {
+    fn from(mode: morpheus_config::RoomCallMode) -> Self {
+        match mode {
+            morpheus_config::RoomCallMode::Standard => Self::Standard,
+            morpheus_config::RoomCallMode::ElementCallMatrix2 => Self::ElementCallMatrix2,
+            morpheus_config::RoomCallMode::ElementCallLegacy => Self::ElementCallRoomState,
         }
     }
 }
@@ -1570,6 +1580,11 @@ mod tests {
         let standard = CallJoinMode::Standard.options();
         assert_eq!(standard.interop_mode, InteropMode::Current);
         assert_eq!(standard.slot_id, "m.call#room");
+
+        let sticky =
+            CallJoinMode::from(morpheus_config::RoomCallMode::ElementCallMatrix2).options();
+        assert_eq!(sticky, CallOptions::element_call_matrix_2_0());
+        assert_eq!(sticky.interop_mode, InteropMode::Sticky2025);
 
         let legacy = CallJoinMode::ElementCallRoomState.options();
         assert_eq!(legacy.interop_mode, InteropMode::RoomState);

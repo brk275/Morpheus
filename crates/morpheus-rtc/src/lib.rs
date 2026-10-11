@@ -176,6 +176,8 @@ pub enum RtcError {
     NotJoined,
     #[error("the homeserver advertises no usable LiveKit MatrixRTC transport")]
     NoLiveKitTransport,
+    #[error("the homeserver does not advertise sticky events required by this call mode")]
+    StickyEventsUnsupported,
     #[error("MatrixRTC transport discovery failed: {0}")]
     Discovery(String),
     #[cfg(feature = "native-rtc")]
@@ -185,9 +187,7 @@ pub enum RtcError {
     #[error("room encryption state is unknown; retry after room state loads")]
     UnknownEncryptionState,
     #[cfg(feature = "native-rtc")]
-    #[error(
-        "current MatrixRTC calls need an encrypted room to identify remote media devices; use an encrypted room"
-    )]
+    #[error("Standard and Element Call Matrix 2.0 calls require an encrypted room")]
     UnencryptedRoomUnsupported,
     #[cfg(feature = "native-rtc")]
     #[error(

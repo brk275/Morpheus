@@ -47,15 +47,31 @@ causes a reload.
 The schema is versioned. Morpheus rejects an unknown schema version instead of
 silently discarding settings.
 
-The call stage can remember **Legacy Element Call for this room** separately
-for each signed-in account. This is also an account override in TOML:
+The call stage remembers one **Call mode** separately for each account and
+room: **Standard** (the default), **Element Call Matrix 2.0**, or **Legacy**.
+The same choices are available in TOML:
 
 ```toml
 [account_overrides."<local account ID>"]
-legacy_element_call_rooms = ["!room-id:example.org"]
+element_call_matrix_2_0_rooms = ["!sticky-call:example.org"]
+legacy_element_call_rooms = ["!older-call:example.org"]
 ```
 
-It joins Element Call's older room-state call format and does not open a
-MatrixRTC call slot. Standard calls remain the default for every other room.
-This setting does not add support for Element Call's current `matrix_2_0`
-format. Logging out removes this account's saved room choices.
+A room in neither list uses Standard. Existing `legacy_element_call_rooms`
+preferences retain their meaning. A room cannot appear in both lists; invalid
+edits retain the last valid configuration. The UI moves a room between modes
+atomically. Logging out clears both lists for that account.
+
+Element Call Matrix 2.0 uses the pinned RTC library's `Sticky2025` adapter.
+It requires an encrypted room, advertised sticky-event and MatrixRTC service
+support, working sticky sync, and a verified/recovered device. Use **Open room
+call** when the required slot has not been created; that explicit action needs
+room permission. Legacy uses older room-state membership without that slot.
+These formats do not negotiate or automatically fall back to each other.
+
+The mode chosen when starting is fixed until the call ends. Mode controls are
+disabled while opening, connecting, joined, or cleaning up a call. External
+TOML edits apply to the next call, never an existing one. The voice-space marker
+does not select a protocol. Native compilation, UI interaction, and production
+Element Call acceptance for the new Matrix 2.0 choice remain pending; see
+[the exact peer assertions and limits](ELEMENT_CALL_ACCEPTANCE.md).

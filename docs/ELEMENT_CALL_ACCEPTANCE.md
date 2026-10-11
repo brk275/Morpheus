@@ -95,10 +95,19 @@ compatibility dialect, not its 2026 **`Current`** dialect. The test keeps the
 Rust internal lowercase slot and uses that dialect's existing wire conversion.
 
 Morpheus's production default remains `Current` with lowercase `m.call#room`.
-Even a successful RC test does **not** close production-default interoperability
-or the stable v0.26.1 Matrix 2.0 gate. No app call-setting/default change is part
-of this fixture. The previously observed legacy `RoomState` success is also a
-different protocol path.
+The app now implements an explicit **Element Call Matrix 2.0** choice for one
+account and room; it uses the same `CallOptions::element_call_matrix_2_0()`
+constructor as this test. It does not silently select or fall back to that mode.
+The existing legacy room-state choice is preserved. Both modern modes require
+encrypted rooms, sticky-event support and the existing service/device checks;
+opening the lowercase slot remains an explicit action requiring room power.
+
+This source integration has not yet passed native compilation, targeted tests,
+or desktop interaction acceptance. The fixture calls `RtcService` directly;
+it does not verify the app's configuration, selector, controller or physical
+devices. Even a successful RC test does **not** close production-default
+interoperability or the stable v0.26.1 Matrix 2.0 gate. The previously observed
+legacy `RoomState` success is also a different protocol path.
 
 ## Privacy and lifecycle
 
