@@ -3,7 +3,73 @@
 Morpheus is pre-alpha software with no approved installer release. This log records checks actually completed;
 the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
+## Account access and style expansion, 2026-10-12
+
+The next source batch implements the local app password, protected activation
+and startup, direct account removal, durable incomplete-cleanup states and a
+reset allowed only after every account has been removed. It also adds original
+Nocturne/Terminal/Paper presets and explicit typography, geometry and message
+layout preferences. Independent source review resolved cancellation, partial
+logout/removal, profile-lock lifetime, preview-transition and update/recovery
+exclusion findings. Fifteen new core password/removal regression tests and
+real-vault integration checks are prepared. Local source checks passed: 487
+Python helper tests with six platform-only skips, direct Rust formatting,
+workflow validation and four-platform scope selection. No local native build
+or test has run. Native/UI acceptance remains pending.
+
+### Completed prior candidate: `6abdfb7`
+
+[Run 38171690229](https://github.com/brk275/Morpheus/actions/runs/38171690229)
+tested `6abdfb7495a8d9ab9531fd051df52acd6fabe63c`. All four native builds
+passed. Windows and both Macs each passed 791 unit/vendor/SDK tests; Linux passed
+817. Each target had one ignored test. Scope passed 489 helper tests with one
+skip and scanned 53 reachable commits with zero findings. Complete logs were
+scanned without secret findings; cache and checkout post steps completed.
+
+Linux's real Matrix/RTC acceptance failed in two places: the room-settings
+fixture's first concurrent topic write and the Current DM ringing controller's
+account-revocation phase. Twenty live Rust tests passed. The other three ringing
+cases passed all ten actor facts, and the stock Element Call peer passed all
+11 assertions. Windows synthetic capture and strict Linux Wayland capture
+passed. These results do not establish real-device or installed-package
+acceptance. The next batch adds fixed, secret-free error categories and finer
+phase markers for the two failures; no unchanged rerun was dispatched.
+
+The five actual native preview captures at this revision passed provenance,
+image integrity and visual review, including the room-settings view. They do
+not verify the new account controls, theme changes, emoji catalog or ringtone.
+
 ## Current hosted acceptance, 2026-10-11
+
+### Pending native verification: emoji catalog and incoming-call sound
+
+The next source batch expands the offline emoji picker to the pinned Unicode 17
+catalog, including skin-tone combinations and name/shortcode/glyph search. It
+preserves the original starter order and guarded literal insertion path. The
+emoji catalog dependency change is a direct app edge to the already locked `emojis`
+0.9.0 package; no package version or checksum changes. Five new regression
+sources await execution; picker responsiveness and platform fonts remain open.
+
+Native incoming-call sound now uses the existing CPAL output path, an original
+synthesized tone, exact admitted-offer leases and the selected speaker. Initial
+source review found missing failure presentation, insufficient cancellation
+between device queries and a pending outgoing-request interval without sound
+suppression. The revised implementation adds a subtle fixed status, checks each
+native query and reserves an outgoing-request veto before waiting. Independent
+source review cleared those findings. Fifteen new regression sources and one
+extended existing assertion await native execution and actual device checks.
+See [incoming-call behavior and limits](INCOMING_CALLS.md).
+
+Direct formatting and patch/whitespace checks passed for this batch. Its changes
+are not part of `6abdfb7` or its current CI run; earlier passing suites provide
+no runtime evidence for this expansion. No beta/release gate is closed here.
+
+The `6abdfb7` preview also exposed light system-style controls in the dark live
+chat view. Five voice/history/member-invite buttons now use the existing themed
+action component through a small text adapter. The independent pinned-Slint
+source review checked their unchanged guards, accessible labels and actions,
+text sizing and focus behavior. The changed controls still need native capture
+and interaction checks; the `6abdfb7` images show the earlier controls.
 
 ### Room-settings candidate stopped at compilation: `8a1ca01`
 

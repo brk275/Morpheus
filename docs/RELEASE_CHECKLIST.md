@@ -21,6 +21,16 @@ when publication inputs change.
 - [ ] Switch accounts with cached content shown immediately. Confirm only the
       active account syncs by default and active calls block switching until
       the user leaves.
+- [ ] Offer one optional local app password for protected account switches.
+      Require a fresh authorization for each activation, including startup
+      restore and automatic fallback routes; cancellation, stale targets and
+      failed/locked credential-vault access must not reveal protected content.
+      Require the existing password to change or disable protection.
+- [ ] Remove any saved account directly from the account manager without first
+      switching to it. Clearly distinguish local credential/cache removal from
+      homeserver logout and account deletion. Verify offline removal, partial
+      cleanup failure, pending refresh/write tasks and no automatic activation
+      of a remaining protected account.
 - [ ] Verify devices and recover encrypted messages/media after restart using
       key backup. A lost credential-vault entry must request sign-in without
       reading a plaintext token file.
@@ -45,6 +55,9 @@ when publication inputs change.
 
 - [ ] Review the README, setup instructions, feature status, contribution and
       support paths for clarity and consistency with the verified beta.
+- [ ] Make multi-account use for separate aliases prominent in the README and
+      product presentation. Explain switch-password and removal controls using
+      their verified behavior and describe the scope of local account isolation.
 - [ ] Capture a fresh, heavily customized view of the actual native app for the
       README. Use fictional people and example-domain account IDs, excluding
       the owner's personal names and GitHub handle from app users. Review every

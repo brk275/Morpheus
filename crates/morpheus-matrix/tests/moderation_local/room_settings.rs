@@ -38,6 +38,30 @@ async fn private_directory(client: &Client, room_id: &str) {
     assert!(matches!(response.visibility, Visibility::Private));
 }
 
+// All inputs to this reporter are compile-time operation names and a fixed
+// data-free enum. Arbitrary homeserver text never reaches the public runner.
+fn settings_failed(operation: &'static str, error: RoomSettingsError) -> ! {
+    let category = match error {
+        RoomSettingsError::Cancelled => "cancelled",
+        RoomSettingsError::AccountChanged => "account_changed",
+        RoomSettingsError::NotJoined => "not_joined",
+        RoomSettingsError::Unavailable => "unavailable",
+        RoomSettingsError::RateLimited => "rate_limited",
+        RoomSettingsError::TimedOut => "timed_out",
+        RoomSettingsError::InvalidState => "invalid_state",
+        RoomSettingsError::PermissionDenied => "permission_denied",
+        RoomSettingsError::ReadOnly => "read_only",
+        RoomSettingsError::BaselineChanged => "baseline_changed",
+        RoomSettingsError::InvalidAvatar => "invalid_avatar",
+        RoomSettingsError::InvalidJoinRule => "invalid_join_rule",
+        RoomSettingsError::InvalidText => "invalid_text",
+        RoomSettingsError::EncryptedPreviewDisabled => "encrypted_preview_disabled",
+    };
+    eprintln!("MORPHEUS_SETTINGS_OPERATION {operation}");
+    eprintln!("MORPHEUS_SETTINGS_FAILURE {category}");
+    panic!("Room settings acceptance failed; fixed operation and category emitted");
+}
+
 pub(super) async fn exercise(
     creator: &AccountManager,
     peer: &AccountManager,
@@ -63,15 +87,15 @@ pub(super) async fn exercise(
     let settings = creator
         .open_room_settings_for(&selection, room_id, cancellation.clone())
         .await
-        .expect("Cannot open creator room settings");
+        .unwrap_or_else(|error| settings_failed("open_creator", error));
     let stale = creator
         .open_room_settings_for(&selection, room_id, RoomSettingsCancellation::new())
         .await
-        .expect("Cannot open concurrent room settings");
+        .unwrap_or_else(|error| settings_failed("open_concurrent", error));
     let peer_settings = peer
         .open_room_settings_for(&peer_selection, room_id, RoomSettingsCancellation::new())
         .await
-        .expect("Cannot open member room settings");
+        .unwrap_or_else(|error| settings_failed("open_member", error));
     let initial = settings.snapshot();
     assert!(initial.encrypted && initial.permissions.avatar && initial.permissions.join_rule);
     assert!(matches!(
@@ -102,7 +126,7 @@ pub(super) async fn exercise(
         !settings
             .refresh()
             .await
-            .expect("Cannot refresh after rejected avatar")
+            .unwrap_or_else(|error| settings_failed("refresh_permission_denial", error))
             .avatar
             .present
     );
@@ -111,11 +135,11 @@ pub(super) async fn exercise(
     stale
         .set_topic("Concurrent topic")
         .await
-        .expect("Cannot make independent topic edit");
+        .unwrap_or_else(|error| settings_failed("concurrent_topic", error));
     let named = settings
         .set_name("  Morpheus room details  ")
         .await
-        .expect("Cannot save room name through session");
+        .unwrap_or_else(|error| settings_failed("save_name", error));
     assert!(named.name == "Morpheus room details");
     assert!(
         named.topic == initial.topic,
@@ -132,7 +156,7 @@ pub(super) async fn exercise(
     settings
         .refresh()
         .await
-        .expect("Cannot explicitly refresh conflicted topic");
+        .unwrap_or_else(|error| settings_failed("refresh_topic_conflict", error));
     assert!(
         read_state(client, room_id, StateEventType::RoomName, "").await["name"]
             == "Morpheus room details"
@@ -140,7 +164,7 @@ pub(super) async fn exercise(
     let topic = settings
         .set_topic("  Room avatar and access checks\n")
         .await
-        .expect("Cannot save room topic through session");
+        .unwrap_or_else(|error| settings_failed("save_topic", error));
     assert!(topic.topic == "  Room avatar and access checks\n");
     assert!(
         read_state(client, room_id, StateEventType::RoomTopic, "").await["topic"]
@@ -165,7 +189,7 @@ pub(super) async fn exercise(
     let cleared = settings
         .set_topic("")
         .await
-        .expect("Cannot clear topic through session");
+        .unwrap_or_else(|error| settings_failed("clear_topic", error));
     assert!(cleared.topic.is_empty());
     assert!(read_state(client, room_id, StateEventType::RoomTopic, "").await["topic"] == "");
     eprintln!("MORPHEUS_MODERATION_CHECK settings_text_roundtrip=true");
@@ -173,7 +197,7 @@ pub(super) async fn exercise(
     let uploaded = settings
         .set_avatar(image())
         .await
-        .expect("Creator avatar upload failed");
+        .unwrap_or_else(|error| settings_failed("upload_avatar", error));
     assert!(uploaded.avatar.present && uploaded.avatar.preview_available);
     assert!(uploaded.avatar.width == Some(1) && uploaded.avatar.height == Some(1));
     let avatar = read_state(client, room_id, StateEventType::RoomAvatar, "").await;
@@ -192,7 +216,7 @@ pub(super) async fn exercise(
     let preview = peer_settings
         .download_avatar_preview(true)
         .await
-        .expect("Explicit member avatar preview failed")
+        .unwrap_or_else(|error| settings_failed("preview_avatar", error))
         .expect("Uploaded avatar missing");
     assert!(
         preview.bytes == PNG,
@@ -212,7 +236,7 @@ pub(super) async fn exercise(
     let removed = settings
         .remove_avatar()
         .await
-        .expect("Creator cannot remove avatar");
+        .unwrap_or_else(|error| settings_failed("remove_avatar", error));
     assert!(!removed.avatar.present && !removed.avatar.preview_available);
     let empty = read_state(client, room_id, StateEventType::RoomAvatar, "").await;
     assert!(empty["url"].is_null());
@@ -220,7 +244,7 @@ pub(super) async fn exercise(
         peer_settings
             .download_avatar_preview(true)
             .await
-            .expect("Cannot check removed avatar")
+            .unwrap_or_else(|error| settings_failed("preview_removed_avatar", error))
             .is_none()
     );
     eprintln!("MORPHEUS_MODERATION_CHECK settings_avatar_remove=true");
@@ -229,7 +253,7 @@ pub(super) async fn exercise(
     let changed = settings
         .set_join_rule(EditableJoinRule::Public)
         .await
-        .expect("Cannot enable public joining");
+        .unwrap_or_else(|error| settings_failed("public_join_rule", error));
     assert!(matches!(
         changed.join_rule,
         CurrentJoinRule::Editable(EditableJoinRule::Public)
@@ -271,7 +295,7 @@ pub(super) async fn exercise(
         let snapshot = settings
             .set_join_rule(rule.clone())
             .await
-            .expect("Cannot save supported access rule");
+            .unwrap_or_else(|error| settings_failed("supported_join_rule", error));
         assert!(snapshot.join_rule == CurrentJoinRule::Editable(rule.clone()));
         let state = read_state(client, room_id, StateEventType::RoomJoinRules, "").await;
         assert!(state["join_rule"] == wire);

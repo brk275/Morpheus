@@ -410,6 +410,11 @@ pub struct CallLease(Arc<AtomicU8>);
 pub(crate) struct InstallLease(Arc<AtomicU8>);
 
 impl UpdateActivity {
+    /// Lock-free read for output-only incoming sound suppression.
+    pub(crate) fn idle(&self) -> bool {
+        self.0.load(Ordering::Acquire) == 0
+    }
+
     pub fn try_start_call(&self) -> Result<CallLease, UpdateError> {
         self.0
             .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)

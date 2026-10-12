@@ -11,17 +11,129 @@ while the app runs. A broken edit produces an error, and the last valid
 configuration remains active. The file never contains Matrix access tokens or
 recovery keys.
 
-The current settings screen edits dark/light/high-contrast/system theme,
-font scale (75–200%), compact/comfortable/spacious density, unread-first room
-sorting, pane widths, and the details panel. These values apply to the live
-Matrix view and the offline preview. The Notifications section edits the
-desktop notification switch, sounds, message previews, and local highlight
-words or phrases. Each highlight is trimmed, repeated whitespace is collapsed,
-duplicates are rejected without regard to case, and hidden control or direction
-characters are rejected. The editor accepts up to 32 highlights of at most 64
-characters each. Changes are saved to the same versioned TOML file and appear
-in the app when that file changes externally. Additional font, shortcut, and
-media controls are tracked in the beta feature matrix.
+Settings edits appearance presets, interface/message/monospace fonts, message
+layout, avatars, timestamps, sender colors, spacing, corner radius and rail
+width. Existing controls cover font scale (75–200%), room/message density,
+unread-first sorting, pane widths and the details panel. These preferences use
+the same configuration path in live sessions and the offline preview.
+
+The appearance expansion is implemented in source. Native compilation,
+rendered layout, font fallback and keyboard/screen-reader acceptance on all
+supported desktops remain required; see [verification](VERIFICATION.md).
+
+## Appearance starting points
+
+**Settings → Appearance → Starting points** offers three original presets:
+
+| Preset | Typography and layout | Surfaces and geometry |
+| --- | --- | --- |
+| Nocturne | Sans-serif messages, stacked names, avatars and room context | Charcoal, pale mint accents, soft edges |
+| Terminal | Monospaced messages, aligned timestamp/nickname columns, no avatars | Dark green charcoal, square edges, narrow rail and tight spacing |
+| Paper | Serif messages, compact headers, no avatars | Warm light surfaces, forest accents, broad conversation inset |
+
+Choosing a preset fills in ordinary appearance, typography, geometry and chat
+settings, including pane sizes and details-panel visibility. Subsequent edits
+remain yours: there is no separate preset layer overriding them. Presets keep
+text scale, unread sorting, notifications, shortcuts, media preferences and
+account settings intact. **Base palette** changes the palette alone.
+
+The corresponding built-in theme names are `nocturne`, `terminal` and `paper`.
+Their palette files are embedded in the app. Setting only
+`appearance.theme_pack = "terminal"` selects its colors; use the in-app preset
+or set the fields below to select its fonts and layout too.
+
+## Typography, geometry and messages
+
+These tables are optional in schema version 1. Older configuration files receive
+defaults for omitted fields. Unknown fields and unsupported values reject the
+edit, so spelling mistakes do not silently become inactive settings.
+
+| Field | Default | Accepted values / effect |
+| --- | --- | --- |
+| `appearance.font_family` | `"Inter"` | Interface font family |
+| `typography.message_font_family` | Omitted | Message and composer family; omission follows the interface font |
+| `typography.monospace_font_family` | `"monospace"` | Timestamp and security-code family |
+| `typography.message_size` | `14` | 10–32 logical pixels before text scaling |
+| `geometry.corner_radius` | `10` | 0–24; base radius for core controls and conversation surfaces |
+| `geometry.message_gap` | `12` | 0–32; base vertical message padding, adjusted by density |
+| `geometry.content_padding` | `24` | 0–48; conversation inset and composer margin |
+| `geometry.rail_width` | `70` | 44–100; Space rail width |
+| `chat.layout` | `"stacked"` | `"stacked"`, `"compact"` or `"columns"` |
+| `chat.show_avatars` | `true` | Show message avatars; hiding them also removes their gutter |
+| `chat.show_timestamps` | `true` | Show optional message timestamps; pending/failed delivery labels remain visible |
+| `chat.color_senders` | `false` | Use the current sender palette for name text |
+| `chat.nickname_width` | `128` | 64–240; desired nickname column width |
+
+Font names must be nonblank, at most 128 UTF-8 bytes, and contain no control or
+direction-format characters. The app selects installed font families; it does
+not fetch font files. Missing families use the renderer's fallback. In Settings,
+leave the message family blank to inherit the interface font and choose
+**Apply fonts**. In TOML, omit `message_font_family` to inherit; an explicitly
+empty string is invalid.
+
+Geometry values are logical pixels, independent of desktop DPI. Global text
+scale still multiplies message size. Compact density uses half the configured
+message padding; comfortable uses it unchanged; spacious uses about 1.33 times
+that padding. Density also changes room row height. Core controls use
+proportions of the base radius, so setting it to zero makes those controls
+square.
+
+Stacked places names above messages. Compact uses smaller name headers and
+avatars. Columns aligns nicknames and timestamps beside the message body;
+long names may elide visually but keep their complete accessibility label.
+When the conversation is narrower than 640 logical pixels, or 640 multiplied by
+a text scale above 100%, columns uses a compact header. Nickname columns also
+stay within 20% of the conversation width. Desired room/details widths shrink
+when necessary to preserve conversation space in a smaller window.
+
+For example, this creates a compact, square, monospaced workspace:
+
+```toml
+schema_version = 1
+
+[appearance]
+theme = "dark"
+theme_pack = "terminal"
+font_family = "monospace"
+density = "compact"
+scale_percent = 100
+
+[typography]
+message_font_family = "monospace"
+monospace_font_family = "monospace"
+message_size = 13
+
+[geometry]
+corner_radius = 0
+message_gap = 2
+content_padding = 10
+rail_width = 52
+
+[chat]
+layout = "columns"
+show_avatars = false
+show_timestamps = true
+color_senders = true
+nickname_width = 112
+```
+
+The first appearance expansion covers the main conversation, navigation,
+composer and reusable controls. Some call and modal surfaces still have fixed
+geometry. Theme packs currently contain eleven color tokens; semantic status
+colors, custom sender palettes, font weights/line-height controls, timestamp
+formatting, background images and arbitrary pane arrangements remain future
+work. Theme packs cannot execute code. The presence of older configuration
+fields such as `reduce_motion`, `show_space_labels` or `group_direct_messages`
+does not imply those controls are implemented.
+
+## Notifications
+
+The Notifications section edits desktop notifications, sounds, message previews
+and local highlight words or phrases. Each highlight is trimmed, repeated
+whitespace is collapsed, duplicates are rejected without regard to case, and
+hidden control or direction characters are rejected. The editor accepts up to 32
+highlights of at most 64 characters each. Saved changes appear in the app when
+that file changes externally.
 
 The corresponding TOML fields are:
 
@@ -37,15 +149,27 @@ Message previews are off by default because a desktop banner may show
 decrypted text. Matrix push rules and operating-system notification settings
 still decide whether a banner or sound is delivered.
 
+## Theme files
+
 Set `appearance.theme_pack = "aurora"` and place a copy of
 [`aurora.toml`](../themes/aurora.toml) at `themes/aurora.toml` beside your
-`config.toml` to try the theme format. A theme is data only; it supplies color
-tokens and cannot execute code. Names use ASCII letters, digits, `_`, or `-`
-and cannot be paths. Changing either the settings file or active theme file
-causes a reload.
+`config.toml` to create an editable theme. A theme is data only and supplies
+color tokens. Names use ASCII letters, digits, `_` or `-`; they cannot be paths.
+Colors use `#RRGGBB`. Changing the settings file or active theme file causes a
+reload.
 
-The schema is versioned. Morpheus rejects an unknown schema version instead of
-silently discarding settings.
+The same mechanism overrides an embedded theme: place your own `nocturne.toml`,
+`terminal.toml` or `paper.toml` in that themes directory. A missing override uses
+the embedded palette. A present but malformed or unreadable override shows an
+error and retains the last valid appearance. Other missing theme names are
+errors. The original palettes are available in
+[Nocturne](../themes/nocturne.toml), [Terminal](../themes/terminal.toml) and
+[Paper](../themes/paper.toml).
+
+Morpheus rejects an unknown schema version instead of silently discarding
+settings. New versions read existing schema 1 files with defaults for the new
+appearance tables; older app versions may reject files containing those new
+tables.
 
 ## Call audio devices
 

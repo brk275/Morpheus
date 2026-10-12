@@ -37,7 +37,14 @@ pub(super) enum ActorStage {
     ReceiveOnlyState,
     EstablishedWithdrawal,
     AcceptedLeave,
-    AccountRevocation,
+    AccountFreshOffer,
+    AccountAnswer,
+    AccountAlternateLogin,
+    AccountCancellation,
+    AccountRestore,
+    AccountOldKey,
+    AccountOldJoin,
+    AccountRoster,
     ActorCleanup,
 }
 impl ActorStage {
@@ -55,7 +62,14 @@ impl ActorStage {
             Self::ReceiveOnlyState => "receive_only_state",
             Self::EstablishedWithdrawal => "established_withdrawal",
             Self::AcceptedLeave => "accepted_leave",
-            Self::AccountRevocation => "account_revocation",
+            Self::AccountFreshOffer => "account_fresh_offer",
+            Self::AccountAnswer => "account_answer",
+            Self::AccountAlternateLogin => "account_alternate_login",
+            Self::AccountCancellation => "account_cancellation",
+            Self::AccountRestore => "account_restore",
+            Self::AccountOldKey => "account_old_key",
+            Self::AccountOldJoin => "account_old_join",
+            Self::AccountRoster => "account_roster",
             Self::ActorCleanup => "actor_cleanup",
         }
     }
@@ -595,11 +609,12 @@ impl ActorAcceptance {
         room: &Room,
         observer: &mut PassiveCallObserver,
     ) -> Result<(), ()> {
-        self.phase(ActorStage::AccountRevocation);
+        self.phase(ActorStage::AccountFreshOffer);
         let row = self
             .fresh_offer(case, caller, alice, rtc, info, room)
             .await?;
         let key = row.token.ui_key();
+        self.phase(ActorStage::AccountAnswer);
         let accepted = self
             .worker
             .handle()
@@ -609,6 +624,7 @@ impl ActorAcceptance {
         let selected = accepted.selection().clone();
         let pending = accepted.pending_guard();
         let fixture = case.account("a_primary")?;
+        self.phase(ActorStage::AccountAlternateLogin);
         let alternate = self
             .manager
             .add_password_account(
@@ -623,16 +639,20 @@ impl ActorAcceptance {
                 && !selected.is_current()
                 && self.worker.handle().snapshot().is_empty(),
         )?;
+        self.phase(ActorStage::AccountCancellation);
         bounded(async {
             pending.cancelled().await;
             Ok(())
         })
         .await?;
+        self.phase(ActorStage::AccountRestore);
         self.manager
             .switch_to(&self.account.id)
             .await
             .map_err(|_| error("matrix"))?;
+        self.phase(ActorStage::AccountOldKey);
         check(!selected.is_current() && self.worker.handle().answer(key).await.is_err())?;
+        self.phase(ActorStage::AccountOldJoin);
         let transition = self.transition.lock().await;
         check(
             self.calls
@@ -647,6 +667,7 @@ impl ActorAcceptance {
         )?;
         drop(transition);
         check(self.calls.status() == CallStatus::Idle)?;
+        self.phase(ActorStage::AccountRoster);
         let snapshot = observer.snapshot().await.map_err(|_| error("rtc"))?;
         check(
             snapshot.participants.len() == 1

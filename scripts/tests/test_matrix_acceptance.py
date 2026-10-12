@@ -350,11 +350,14 @@ class LiveStageTests(unittest.TestCase):
     def test_source_emits_exact_allowlisted_stage_identifiers(self):
         source = (Path(__file__).resolve().parents[2]
                   / "crates/morpheus-matrix/tests/live_local.rs").read_text()
+        outer = re.findall(r"phase!\(([a-z_]+)\)", source)
+        self.assertEqual(outer[0], "fixture")
+        self.assertEqual(outer[-1], "complete")
+        source += (Path(__file__).resolve().parents[2]
+                   / "crates/morpheus-matrix/tests/live_local/account_access.rs").read_text()
         emitted = re.findall(r"phase!\(([a-z_]+)\)", source)
         self.assertEqual(set(emitted), acceptance_module.LIVE_STAGES)
         self.assertEqual(len(emitted), len(set(emitted)))
-        self.assertEqual(emitted[0], "fixture")
-        self.assertEqual(emitted[-1], "complete")
 
     @contextlib.contextmanager
     def child(self, runner, output, *, timeout=False, scanner_code=0):
@@ -613,6 +616,45 @@ class LiveEvidenceTests(unittest.TestCase):
             "stage": "invite_after_kick", "failure": "history_sender_unverified",
             "checks": {"reinvite_identity_unverified": False},
         })
+
+    def test_settings_failure_categories_and_operations_never_reflect_server_text(self):
+        for operation in acceptance_module.SETTINGS_OPERATIONS:
+            for category in acceptance_module.SETTINGS_FAILURES:
+                output = "\n".join((
+                    f"MORPHEUS_SETTINGS_OPERATION {operation}",
+                    f"MORPHEUS_SETTINGS_FAILURE {category}",
+                    "MORPHEUS_SETTINGS_OPERATION private_operation",
+                    "MORPHEUS_SETTINGS_FAILURE private_credential",
+                    "MORPHEUS_SETTINGS_FAILURE rate_limited private_response",
+                    "prefix MORPHEUS_SETTINGS_FAILURE unavailable",
+                    "private-server-body",
+                ))
+                with self.subTest(operation=operation, category=category):
+                    self.assertEqual(acceptance_module.moderation_diagnostics(output), {
+                        "settings_operation": operation, "settings_failure": category,
+                    })
+
+    def test_settings_failure_cannot_be_hidden_by_success_facts(self):
+        complete = "\n".join(f"MORPHEUS_MODERATION_CHECK {name}=true"
+                             for name in acceptance_module.MODERATION_CHECKS)
+        for category in acceptance_module.SETTINGS_FAILURES:
+            with self.subTest(category=category), self.assertRaisesRegex(RuntimeError, "Moderation acceptance evidence"):
+                acceptance_module.moderation_evidence(
+                    "MORPHEUS_SETTINGS_FAILURE " + category + "\n" + complete)
+
+    def test_account_replay_subphases_distinguish_offers_from_cancellation(self):
+        phases = {"account_fresh_offer", "account_answer", "account_alternate_login",
+                  "account_cancellation", "account_restore", "account_old_key",
+                  "account_old_join", "account_roster"}
+        self.assertTrue(phases <= acceptance_module.INCOMING_STAGES)
+        for phase in phases:
+            output = f"MORPHEUS_INCOMING_STAGE {phase}\nMORPHEUS_INCOMING_FAILURE {phase}\nMORPHEUS_INCOMING_ERROR timed_out"
+            with self.subTest(phase=phase):
+                self.assertEqual(acceptance_module.incoming_diagnostics(output), {
+                    "checks": {}, "stage": phase, "failure": phase, "error": "timed_out",
+                })
+                self.assertNotIn("private", json.dumps(acceptance_module.incoming_diagnostics(
+                    output + "\nMORPHEUS_INCOMING_STAGE account_private_payload")))
 
     def test_moderation_success_requires_actual_unverified_reinvites_and_unchanged_trust(self):
         output = "\n".join(f"MORPHEUS_MODERATION_CHECK {name}=true"

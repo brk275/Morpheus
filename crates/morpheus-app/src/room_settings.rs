@@ -930,6 +930,9 @@ fn settings_error(error: RoomSettingsError) -> &'static str {
         RoomSettingsError::Unavailable => {
             "The homeserver could not complete this room-settings request."
         }
+        RoomSettingsError::RateLimited => {
+            "The homeserver is limiting requests. Wait, then refresh before saving again."
+        }
         RoomSettingsError::TimedOut => "The room-settings request timed out.",
         RoomSettingsError::InvalidState => "The room returned unsupported or invalid settings.",
         RoomSettingsError::PermissionDenied => {

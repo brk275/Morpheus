@@ -4,7 +4,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicU8, Ordering},
+    atomic::{AtomicU8, AtomicU64, Ordering},
 };
 
 use morpheus_matrix::{BackupStatus, DeviceVerificationStatus, RecoveryStatus, SecurityInfo};
@@ -18,26 +18,60 @@ const SECURITY_IDLE: u8 = 0;
 const SECURITY_BUSY: u8 = 1;
 const SECURITY_KEY_PENDING: u8 = 2;
 const SECURITY_RESTART_PENDING: u8 = 3;
+const SECURITY_ACCOUNT_ACCESS: u8 = 4;
 
 /// Mirrors the account-sensitive UI state across the asynchronous transition
 /// lock. A queued account switch must recheck this after it acquires the lock.
 #[derive(Default)]
-pub(crate) struct SecurityGate(AtomicU8);
+pub(crate) struct SecurityGate(AtomicU8, AtomicU64);
 
 impl SecurityGate {
+    pub(crate) fn try_account_access(self: &Arc<Self>) -> Option<AccountAccessLease> {
+        self.0
+            .compare_exchange(
+                SECURITY_IDLE,
+                SECURITY_ACCOUNT_ACCESS,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()
+            .map(|_| {
+                self.advance_ring_epoch();
+                AccountAccessLease(self.clone())
+            })
+    }
     pub(crate) fn blocked(&self) -> bool {
         self.0.load(Ordering::Acquire) != SECURITY_IDLE
     }
 
     fn begin(&self) -> bool {
-        self.0
+        let reserved = self
+            .0
             .compare_exchange(
                 SECURITY_IDLE,
                 SECURITY_BUSY,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_ok()
+            .is_ok();
+        if reserved {
+            self.advance_ring_epoch();
+        }
+        reserved
+    }
+
+    pub(crate) fn ringing_generation(&self) -> u64 {
+        self.1.load(Ordering::Acquire)
+    }
+    pub(crate) fn ringing_allowed(&self, generation: u64) -> bool {
+        generation != u64::MAX && !self.blocked() && self.ringing_generation() == generation
+    }
+    fn advance_ring_epoch(&self) {
+        let _ = self
+            .1
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                Some(n.saturating_add(1))
+            });
     }
 
     fn key_pending(&self) {
@@ -84,11 +118,26 @@ impl SecurityGate {
                 Ordering::Acquire,
             )
             .ok()
-            .map(|_| RestartLease(self.clone()))
+            .map(|_| {
+                self.advance_ring_epoch();
+                RestartLease(self.clone())
+            })
     }
 }
 
 pub(crate) struct RestartLease(Arc<SecurityGate>);
+
+pub(crate) struct AccountAccessLease(Arc<SecurityGate>);
+impl Drop for AccountAccessLease {
+    fn drop(&mut self) {
+        let _ = self.0.0.compare_exchange(
+            SECURITY_ACCOUNT_ACCESS,
+            SECURITY_IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
 
 impl Drop for RestartLease {
     fn drop(&mut self) {
@@ -104,7 +153,7 @@ impl Drop for RestartLease {
 fn close_response(gate: &SecurityGate) -> CloseRequestResponse {
     if matches!(
         gate.0.load(Ordering::Acquire),
-        SECURITY_BUSY | SECURITY_KEY_PENDING
+        SECURITY_BUSY | SECURITY_KEY_PENDING | SECURITY_ACCOUNT_ACCESS
     ) {
         CloseRequestResponse::KeepWindowShown
     } else {
@@ -198,6 +247,10 @@ pub(crate) fn clear_ui(ui: &AppWindow, gate: &SecurityGate) {
 /// before this account can be left. The guard runs before navigation is
 /// invalidated or an account transition is spawned.
 pub(crate) fn block_account_change(ui: &AppWindow, gate: &SecurityGate) -> bool {
+    if gate.0.load(Ordering::Acquire) == SECURITY_ACCOUNT_ACCESS {
+        ui.set_account_access_notice("Wait for the account operation to finish.".into());
+        return true;
+    }
     if gate.0.load(Ordering::Acquire) == SECURITY_RESTART_PENDING {
         ui.set_page(1);
         ui.set_security_error("Wait for the application restart before changing accounts.".into());
@@ -223,14 +276,28 @@ pub(crate) fn block_account_change(ui: &AppWindow, gate: &SecurityGate) -> bool 
 pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
     crate::verification::register(ui, live.clone(), handle.clone());
     let close_gate = live.security_gate.clone();
+    let close_manager = live.manager.clone();
     let close_weak = ui.as_weak();
     ui.window().on_close_requested(move || {
+        if close_manager.account_access_busy() {
+            if let Some(window) = close_weak.upgrade() {
+                window.set_account_access_notice(
+                    "The credential store is still working. Keep Morpheus open until it finishes."
+                        .into(),
+                );
+            }
+            return CloseRequestResponse::KeepWindowShown;
+        }
         let response = close_response(&close_gate);
         if response == CloseRequestResponse::KeepWindowShown
             && let Some(window) = close_weak.upgrade()
         {
-            window.set_page(1);
-            if close_gate.0.load(Ordering::Acquire) == SECURITY_BUSY {
+            if close_gate.0.load(Ordering::Acquire) == SECURITY_ACCOUNT_ACCESS {
+                window.set_account_access_notice(
+                    "Wait for the account operation to finish before closing Morpheus.".into(),
+                );
+            } else if close_gate.0.load(Ordering::Acquire) == SECURITY_BUSY {
+                window.set_page(1);
                 window.set_security_error(
                     "Recovery is still running. Keep Morpheus open until it finishes.".into(),
                 );
@@ -510,6 +577,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn account_password_work_excludes_restart_recovery_and_ringing() {
+        let gate = Arc::new(SecurityGate::default());
+        let old_generation = gate.ringing_generation();
+        let lease = gate.try_account_access().unwrap();
+        assert!(gate.blocked());
+        assert!(gate.try_restart().is_none());
+        assert!(!gate.begin());
+        assert!(!gate.ringing_allowed(old_generation));
+        assert_eq!(close_response(&gate), CloseRequestResponse::KeepWindowShown);
+        gate.reset();
+        assert!(gate.blocked());
+        drop(lease);
+        assert!(!gate.blocked());
+        assert!(!gate.ringing_allowed(old_generation));
+        assert!(gate.try_restart().is_some());
+    }
+
+    #[test]
     fn setup_requires_disabled_recovery_and_statuses_are_distinct() {
         let disabled = status_labels(SecurityInfo {
             device_verification: DeviceVerificationStatus::Unverified,
@@ -592,5 +677,18 @@ mod tests {
         gate.acknowledge_key();
         assert!(gate.can_clear_account_view());
         assert!(gate.try_restart().is_some());
+    }
+    #[test]
+    fn recovery_or_restart_roundtrip_cannot_revive_an_existing_ring() {
+        let gate = Arc::new(SecurityGate::default());
+        let initial = gate.ringing_generation();
+        assert!(gate.ringing_allowed(initial));
+        assert!(gate.begin());
+        gate.reset();
+        assert!(!gate.ringing_allowed(initial));
+        let current = gate.ringing_generation();
+        let lease = gate.try_restart().unwrap();
+        drop(lease);
+        assert!(!gate.ringing_allowed(current));
     }
 }

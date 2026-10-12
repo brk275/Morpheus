@@ -450,6 +450,7 @@ struct Shared {
     startup: Arc<Mutex<StartupSession>>,
     activity: UpdateActivity,
     security: Arc<SecurityGate>,
+    account_access_busy: Arc<dyn Fn() -> bool + Send + Sync>,
     shutdown: tokio::sync::Mutex<()>,
 }
 
@@ -502,6 +503,7 @@ impl UpdateController {
         activity: UpdateActivity,
         startup: Arc<Mutex<StartupSession>>,
         security: Arc<SecurityGate>,
+        account_access_busy: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Self {
         let configured = option_env!("MORPHEUS_UPDATE_FEED").is_some_and(|value| !value.is_empty())
             && option_env!("MORPHEUS_UPDATE_PUBLIC_KEY").is_some_and(|value| !value.is_empty());
@@ -536,6 +538,7 @@ impl UpdateController {
                 startup,
                 activity,
                 security,
+                account_access_busy,
                 shutdown: tokio::sync::Mutex::new(()),
             }),
             runtime,
@@ -620,6 +623,9 @@ impl UpdateController {
         } else {
             None
         };
+        if action == Action::Restart && (self.shared.account_access_busy)() {
+            return Err(ControllerError::RecoveryActive);
+        }
         let (generation, work) = inner.workflow.begin(action)?;
         if restart_lease.is_some() {
             inner.restart_lease = restart_lease;
@@ -1038,6 +1044,7 @@ mod tests {
                 })),
                 activity: UpdateActivity::default(),
                 security: security.clone(),
+                account_access_busy: Arc::new(|| false),
                 shutdown: tokio::sync::Mutex::new(()),
             };
             (shared, security)
@@ -1108,6 +1115,7 @@ mod tests {
             UpdateActivity::default(),
             startup.clone(),
             Arc::new(SecurityGate::default()),
+            Arc::new(|| false),
         );
         let mut status = controller.subscribe();
         let started = Arc::new(tokio::sync::Notify::new());

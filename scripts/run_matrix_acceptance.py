@@ -40,14 +40,50 @@ CHAT_TESTS = (
 )
 RESULT = re.compile(r"test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;")
 LIVE_STAGES = frozenset((
-    "fixture", "login_alice", "sync_alice", "send_alice", "login_carol", "sync_carol",
-    "switch_alice", "cached_alice", "switch_carol", "stop_primary", "restore_carol",
-    "sync_restored", "restore_alice", "cached_restored", "login_bob", "sync_bob",
-    "encrypted_send", "encrypted_edit", "encrypted_reply", "encrypted_reaction",
-    "encrypted_thread_send", "encrypted_thread_receive", "action_isolation", "return_alice",
-    "stop_peer", "restore_peer", "encrypted_restart", "logout_bob", "logout_alice",
-    "logout_carol", "stop_restored", "classic_login", "classic_sync", "classic_logout",
-    "classic_stop", "profile_cleanup", "complete",
+    'action_isolation',
+    'cached_alice',
+    'cached_restored',
+    'classic_login',
+    'classic_logout',
+    'classic_stop',
+    'classic_sync',
+    'complete',
+    'encrypted_edit',
+    'encrypted_reaction',
+    'encrypted_reply',
+    'encrypted_restart',
+    'encrypted_send',
+    'encrypted_thread_receive',
+    'encrypted_thread_send',
+    'fixture',
+    'login_alice',
+    'login_bob',
+    'login_carol',
+    'logout_bob',
+    'password_cached_switch',
+    'password_classic_enable',
+    'password_enable',
+    'password_rejected_switches',
+    'password_reset',
+    'password_restart',
+    'profile_cleanup',
+    'protected_login_paused',
+    'remove_active',
+    'remove_inactive',
+    'restore_alice',
+    'restore_carol',
+    'restore_peer',
+    'return_alice',
+    'send_alice',
+    'stop_peer',
+    'stop_primary',
+    'stop_restored',
+    'switch_alice',
+    'switch_carol',
+    'sync_alice',
+    'sync_bob',
+    'sync_carol',
+    'sync_restored',
 ))
 LIVE_STAGE = re.compile(r"^MORPHEUS_LIVE_STAGE ([a-z_]+)$", re.MULTILINE)
 LATE_JOIN_EVIDENCE = re.compile(r"^MORPHEUS_RTC_LATE_JOIN historical_member=(true|false)$", re.MULTILINE)
@@ -76,6 +112,14 @@ MODERATION_CHECKS = frozenset((
 MODERATION_STAGE = re.compile(r"^MORPHEUS_MODERATION_STAGE ([a-z_]+)$", re.MULTILINE)
 MODERATION_FAILURE = re.compile(r"^MORPHEUS_MODERATION_FAILURE ([a-z_]+)$", re.MULTILINE)
 MODERATION_EVIDENCE = re.compile(r"^MORPHEUS_MODERATION_CHECK ([a-z_]+)=(true|false)$", re.MULTILINE)
+SETTINGS_OPERATIONS = frozenset(('open_creator', 'open_concurrent', 'open_member', 'refresh_permission_denial', 'concurrent_topic', 'save_name', 'refresh_topic_conflict', 'save_topic', 'clear_topic', 'upload_avatar', 'preview_avatar', 'remove_avatar', 'preview_removed_avatar', 'public_join_rule', 'supported_join_rule'))
+SETTINGS_FAILURES = frozenset((
+    "cancelled", "account_changed", "not_joined", "unavailable", "rate_limited", "timed_out",
+    "invalid_state", "permission_denied", "read_only", "baseline_changed", "invalid_avatar",
+    "invalid_join_rule", "invalid_text", "encrypted_preview_disabled",
+))
+SETTINGS_OPERATION = re.compile(r"^MORPHEUS_SETTINGS_OPERATION ([a-z_]+)$", re.MULTILINE)
+SETTINGS_FAILURE = re.compile(r"^MORPHEUS_SETTINGS_FAILURE ([a-z_]+)$", re.MULTILINE)
 OAUTH_PHASES = {
     "login_refresh": (
         "cancelled", "login", "callback_replay_rejected", "refresh", "vaulted",
@@ -146,8 +190,9 @@ INCOMING_REPLAY_CHECK = "account_replay_rejected"
 INCOMING_STAGES = frozenset((
     "worker_start", "first_discovery", "key_rejection", "worker_withdrawal", "fresh_offer",
     "answer_reservation", "transition_lock", "accepted_join", "exact_joined_identity",
-    "receive_only_state", "established_withdrawal", "accepted_leave", "account_revocation",
+    "receive_only_state", "established_withdrawal", "accepted_leave",
     "actor_cleanup",
+    'account_fresh_offer', 'account_answer', 'account_alternate_login', 'account_cancellation', 'account_restore', 'account_old_key', 'account_old_join', 'account_roster',
 ))
 INCOMING_ERRORS = frozenset((
     "unavailable", "capacity", "stale", "expired", "busy", "revoked", "admission_account",
@@ -365,6 +410,12 @@ def moderation_diagnostics(output: str) -> dict:
         result["stage"] = stages[-1]
     if failures:
         result["failure"] = failures[-1]
+    operations = [value for value in SETTINGS_OPERATION.findall(output) if value in SETTINGS_OPERATIONS]
+    settings_failures = [value for value in SETTINGS_FAILURE.findall(output) if value in SETTINGS_FAILURES]
+    if operations:
+        result["settings_operation"] = operations[-1]
+    if settings_failures:
+        result["settings_failure"] = settings_failures[-1]
     for name, value in MODERATION_EVIDENCE.findall(output):
         if name in MODERATION_CHECKS:
             checks = result.setdefault("checks", {})
@@ -375,7 +426,8 @@ def moderation_diagnostics(output: str) -> dict:
 def moderation_evidence(output: str) -> dict[str, bool]:
     evidence = moderation_diagnostics(output)
     checks = evidence.get("checks", {})
-    if "failure" in evidence or any(checks.get(name) is not True for name in MODERATION_CHECKS):
+    if ("failure" in evidence or "settings_failure" in evidence
+            or any(checks.get(name) is not True for name in MODERATION_CHECKS)):
         raise RuntimeError("Moderation acceptance evidence is incomplete")
     return checks
 

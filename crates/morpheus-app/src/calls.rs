@@ -322,7 +322,41 @@ enum CallSlot {
     },
 }
 
+/// Synchronous UI-request veto held across account-transition waits and through
+/// queued completion. Its epoch survives a failed/cancelled request, so an old
+/// ring cannot resume after a brief request that never reserved a native call.
+#[derive(Default)]
+struct RingRequestGate {
+    pending: AtomicBool,
+    epoch: AtomicU64,
+}
+pub(crate) struct RingRequestLease(Arc<RingRequestGate>);
+impl RingRequestGate {
+    fn reserve(self: &Arc<Self>) -> Option<RingRequestLease> {
+        self.pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        let _ = self
+            .epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                Some(n.saturating_add(1))
+            });
+        Some(RingRequestLease(self.clone()))
+    }
+    fn allowed(&self, epoch: u64) -> bool {
+        epoch != u64::MAX
+            && !self.pending.load(Ordering::Acquire)
+            && self.epoch.load(Ordering::Acquire) == epoch
+    }
+}
+impl Drop for RingRequestLease {
+    fn drop(&mut self) {
+        self.0.pending.store(false, Ordering::Release);
+    }
+}
+
 struct Shared {
+    ring_request: Arc<RingRequestGate>,
     slot: Mutex<CallSlot>,
     update_activity: UpdateActivity,
     // Access while holding `slot`. Keeping this separate from the state enum
@@ -481,6 +515,7 @@ impl CallController {
         Self {
             manager,
             shared: Arc::new(Shared {
+                ring_request: Arc::new(RingRequestGate::default()),
                 slot: Mutex::new(CallSlot::Idle),
                 update_activity,
                 update_call_lease: std::sync::Mutex::new(None),
@@ -650,6 +685,23 @@ impl CallController {
             .ok_or(CallControllerError::Media(MediaError::ControlNotRunning))?;
         change(controls)?;
         Ok(())
+    }
+
+    /// Snapshot/read use no watch lock on a native audio callback. A new call
+    /// token permanently invalidates an earlier ring even after that call ends.
+    pub(crate) fn reserve_ringing_request(&self) -> Option<RingRequestLease> {
+        self.shared.ring_request.reserve()
+    }
+    pub(crate) fn ringing_generation(&self) -> (u64, u64) {
+        (
+            self.shared.next_token.load(Ordering::Acquire),
+            self.shared.ring_request.epoch.load(Ordering::Acquire),
+        )
+    }
+    pub(crate) fn ringing_allowed(&self, generation: (u64, u64)) -> bool {
+        self.shared.update_activity.idle()
+            && self.shared.ring_request.allowed(generation.1)
+            && self.ringing_generation() == generation
     }
 
     pub fn status(&self) -> CallStatus {
@@ -1947,6 +1999,7 @@ mod tests {
             .await
             .unwrap();
         assert!(controller.status().blocks_account_switch());
+        assert!(!controller.ringing_allowed(controller.ringing_generation()));
         assert!(matches!(
             controller.shared.update_activity.try_install(),
             Err(UpdateError::CallActive)
@@ -2165,6 +2218,7 @@ mod tests {
             ..LocalVideoStatus::default()
         });
         let shared = Shared {
+            ring_request: Arc::new(RingRequestGate::default()),
             slot: Mutex::new(CallSlot::Idle),
             update_activity: UpdateActivity::default(),
             update_call_lease: std::sync::Mutex::new(None),
@@ -2245,6 +2299,7 @@ mod tests {
             ..LocalVideoStatus::default()
         });
         let shared = Shared {
+            ring_request: Arc::new(RingRequestGate::default()),
             slot: Mutex::new(CallSlot::Idle),
             update_activity: UpdateActivity::default(),
             update_call_lease: std::sync::Mutex::new(None),
@@ -2314,5 +2369,19 @@ mod tests {
             *shared.audio.borrow(),
             AudioUpdate::Applied { token: 6, state }
         );
+    }
+    #[test]
+    fn queued_outgoing_request_suppresses_ring_before_call_token_or_lock_changes() {
+        let gate = Arc::new(RingRequestGate::default());
+        let initial = gate.epoch.load(Ordering::Acquire);
+        assert!(gate.allowed(initial));
+        let pending = gate.reserve().unwrap();
+        let pending_epoch = gate.epoch.load(Ordering::Acquire);
+        assert!(!gate.allowed(pending_epoch));
+        assert!(gate.reserve().is_none());
+        // Models cancellation or failure before account_transition/native join.
+        drop(pending);
+        assert!(!gate.allowed(initial));
+        assert!(gate.allowed(pending_epoch));
     }
 }

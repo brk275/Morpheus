@@ -39,6 +39,9 @@ pub enum ConfigError {
 pub struct Config {
     pub schema_version: u32,
     pub appearance: Appearance,
+    pub typography: Typography,
+    pub geometry: Geometry,
+    pub chat: ChatStyle,
     pub layout: Layout,
     pub notifications: Notifications,
     pub media: Media,
@@ -52,6 +55,9 @@ impl Default for Config {
         Self {
             schema_version: SCHEMA_VERSION,
             appearance: Appearance::default(),
+            typography: Typography::default(),
+            geometry: Geometry::default(),
+            chat: ChatStyle::default(),
             layout: Layout::default(),
             notifications: Notifications::default(),
             media: Media::default(),
@@ -82,11 +88,10 @@ impl Config {
                 "layout.details_width must be between 200 and 520".into(),
             ));
         }
-        if self.appearance.font_family.trim().is_empty() {
-            return Err(ConfigError::Invalid(
-                "appearance.font_family cannot be empty".into(),
-            ));
-        }
+        validate_font_family("appearance.font_family", &self.appearance.font_family)?;
+        self.typography.validate()?;
+        self.geometry.validate()?;
+        self.chat.validate()?;
         if let Some(name) = &self.appearance.theme_pack
             && (name.is_empty()
                 || !name.chars().all(|character| {
@@ -129,6 +134,62 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// Materialize a built-in style into the same preferences edited by TOML
+    /// and Settings. No hidden preset layer overrides subsequent custom edits.
+    /// Account, notification, shortcut and media preferences are untouched.
+    pub fn apply_style_preset(&mut self, preset: BuiltInStylePreset) {
+        self.appearance.theme_pack = Some(preset.theme_name().into());
+        self.typography = Typography::default();
+        self.geometry = Geometry::default();
+        self.chat = ChatStyle::default();
+        match preset {
+            BuiltInStylePreset::Nocturne => {
+                self.appearance.theme = ThemeMode::Dark;
+                self.appearance.font_family = "Inter".into();
+                self.appearance.density = Density::Comfortable;
+                self.geometry.corner_radius = 8;
+                self.geometry.message_gap = 10;
+                self.layout.room_list_width = 260;
+                self.layout.details_width = 280;
+                self.layout.show_member_panel = true;
+            }
+            BuiltInStylePreset::Terminal => {
+                self.appearance.theme = ThemeMode::Dark;
+                self.appearance.font_family = "monospace".into();
+                self.appearance.density = Density::Compact;
+                self.typography.message_font_family = Some("monospace".into());
+                self.typography.message_size = 13;
+                self.geometry.corner_radius = 0;
+                self.geometry.message_gap = 2;
+                self.geometry.content_padding = 10;
+                self.geometry.rail_width = 52;
+                self.chat.layout = MessageLayout::Columns;
+                self.chat.show_avatars = false;
+                self.chat.color_senders = true;
+                self.chat.nickname_width = 112;
+                self.layout.room_list_width = 220;
+                self.layout.details_width = 240;
+                self.layout.show_member_panel = false;
+            }
+            BuiltInStylePreset::Paper => {
+                self.appearance.theme = ThemeMode::Light;
+                self.appearance.font_family = "sans-serif".into();
+                self.appearance.density = Density::Comfortable;
+                self.typography.message_font_family = Some("serif".into());
+                self.typography.message_size = 16;
+                self.geometry.corner_radius = 3;
+                self.geometry.message_gap = 14;
+                self.geometry.content_padding = 32;
+                self.geometry.rail_width = 60;
+                self.chat.layout = MessageLayout::Compact;
+                self.chat.show_avatars = false;
+                self.layout.room_list_width = 240;
+                self.layout.details_width = 280;
+                self.layout.show_member_panel = false;
+            }
+        }
     }
 
     /// Local voice-space presentation is scoped to one signed-in account.
@@ -358,6 +419,179 @@ impl Default for Appearance {
             scale_percent: 100,
             reduce_motion: false,
         }
+    }
+}
+
+/// Message typography is independent of interface scale and its font family.
+/// `None` inherits `appearance.font_family`; fonts are installed family names,
+/// never URLs or paths. Missing families use the renderer's normal fallback.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Typography {
+    pub message_font_family: Option<String>,
+    pub monospace_font_family: String,
+    pub message_size: u16,
+}
+
+impl Default for Typography {
+    fn default() -> Self {
+        Self {
+            message_font_family: None,
+            monospace_font_family: "monospace".into(),
+            message_size: 14,
+        }
+    }
+}
+
+impl Typography {
+    fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(family) = &self.message_font_family {
+            validate_font_family("typography.message_font_family", family)?;
+        }
+        validate_font_family(
+            "typography.monospace_font_family",
+            &self.monospace_font_family,
+        )?;
+        validate_range("typography.message_size", self.message_size, 10, 32)
+    }
+
+    pub fn message_family<'a>(&'a self, appearance: &'a Appearance) -> &'a str {
+        self.message_font_family
+            .as_deref()
+            .unwrap_or(&appearance.font_family)
+    }
+}
+
+/// Pixel values are logical pixels before desktop DPI scaling. The app's text
+/// scale remains independent so users can enlarge text without widening panes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Geometry {
+    pub corner_radius: u16,
+    pub message_gap: u16,
+    pub content_padding: u16,
+    pub rail_width: u16,
+}
+
+impl Default for Geometry {
+    fn default() -> Self {
+        Self {
+            corner_radius: 10,
+            message_gap: 12,
+            content_padding: 24,
+            rail_width: 70,
+        }
+    }
+}
+
+impl Geometry {
+    fn validate(&self) -> Result<(), ConfigError> {
+        validate_range("geometry.corner_radius", self.corner_radius, 0, 24)?;
+        validate_range("geometry.message_gap", self.message_gap, 0, 32)?;
+        validate_range("geometry.content_padding", self.content_padding, 0, 48)?;
+        validate_range("geometry.rail_width", self.rail_width, 44, 100)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageLayout {
+    #[default]
+    Stacked,
+    Compact,
+    Columns,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChatStyle {
+    pub layout: MessageLayout,
+    pub show_avatars: bool,
+    pub show_timestamps: bool,
+    pub color_senders: bool,
+    pub nickname_width: u16,
+}
+
+impl Default for ChatStyle {
+    fn default() -> Self {
+        Self {
+            layout: MessageLayout::Stacked,
+            show_avatars: true,
+            show_timestamps: true,
+            color_senders: false,
+            nickname_width: 128,
+        }
+    }
+}
+
+impl ChatStyle {
+    fn validate(&self) -> Result<(), ConfigError> {
+        validate_range("chat.nickname_width", self.nickname_width, 64, 240)
+    }
+}
+
+fn validate_range(name: &str, value: u16, minimum: u16, maximum: u16) -> Result<(), ConfigError> {
+    if !(minimum..=maximum).contains(&value) {
+        return Err(ConfigError::Invalid(format!(
+            "{name} must be between {minimum} and {maximum}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_font_family(name: &str, family: &str) -> Result<(), ConfigError> {
+    if family.trim().is_empty()
+        || family.len() > 128
+        || family.chars().any(|character| {
+            character.is_control()
+                || matches!(character, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+    {
+        return Err(ConfigError::Invalid(format!(
+            "{name} must be a nonempty font family of at most 128 bytes without control or direction characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Original starting points shipped with Morpheus. Users can override any
+/// built-in palette with a TOML file of the same name in their themes folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuiltInStylePreset {
+    Nocturne,
+    Terminal,
+    Paper,
+}
+
+impl BuiltInStylePreset {
+    pub const ALL: [Self; 3] = [Self::Nocturne, Self::Terminal, Self::Paper];
+
+    pub fn theme_name(self) -> &'static str {
+        match self {
+            Self::Nocturne => "nocturne",
+            Self::Terminal => "terminal",
+            Self::Paper => "paper",
+        }
+    }
+
+    fn theme_source(self) -> &'static str {
+        match self {
+            Self::Nocturne => include_str!("../../../themes/nocturne.toml"),
+            Self::Terminal => include_str!("../../../themes/terminal.toml"),
+            Self::Paper => include_str!("../../../themes/paper.toml"),
+        }
+    }
+
+    pub fn theme(self) -> Result<ThemePack, ConfigError> {
+        let theme: ThemePack = toml::from_str(self.theme_source())?;
+        theme.validate()?;
+        Ok(theme)
+    }
+
+    fn from_theme_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|preset| preset.theme_name() == name)
     }
 }
 
@@ -775,7 +1009,16 @@ impl ConfigStore {
         };
         config.validate()?;
         let path = self.themes_dir()?.join(format!("{name}.toml"));
-        let raw = fs::read_to_string(path)?;
+        let raw = match fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(preset) = BuiltInStylePreset::from_theme_name(name) {
+                    return preset.theme().map(Some);
+                }
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        };
         let theme: ThemePack = toml::from_str(&raw)?;
         theme.validate()?;
         Ok(Some(theme))
@@ -1529,5 +1772,150 @@ mod tests {
                 assert_eq!(store.load().unwrap(), valid);
             }
         }
+    }
+
+    #[test]
+    fn old_schema_one_configs_get_complete_style_defaults() {
+        let config: Config = toml::from_str(
+            "schema_version = 1\n[appearance]\ndensity = 'compact'\nfont_family = 'Custom Font'\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.typography, Typography::default());
+        assert_eq!(config.geometry, Geometry::default());
+        assert_eq!(config.chat, ChatStyle::default());
+        assert_eq!(config.appearance.density, Density::Compact);
+        assert_eq!(
+            config.typography.message_family(&config.appearance),
+            "Custom Font"
+        );
+    }
+
+    #[test]
+    fn style_values_reject_out_of_bounds_and_unknown_options() {
+        for raw in [
+            "[typography]\nmessage_size=9",
+            "[typography]\nmessage_size=33",
+            "[geometry]\ncorner_radius=25",
+            "[geometry]\nmessage_gap=33",
+            "[geometry]\ncontent_padding=49",
+            "[geometry]\nrail_width=43",
+            "[geometry]\nrail_width=101",
+            "[chat]\nnickname_width=63",
+            "[chat]\nnickname_width=241",
+        ] {
+            let config: Config = toml::from_str(raw).unwrap();
+            assert!(config.validate().is_err(), "accepted {raw}");
+        }
+        for raw in [
+            "[chat]\nlayout='unknown'",
+            "[geometry]\ncorner_raduis=2",
+            "[typography]\nmessage_size=-1",
+        ] {
+            assert!(toml::from_str::<Config>(raw).is_err(), "accepted {raw}");
+        }
+        let bounds: Config = toml::from_str("[typography]\nmessage_size=32\n[geometry]\ncorner_radius=0\nmessage_gap=0\ncontent_padding=0\nrail_width=44\n[chat]\nnickname_width=240").unwrap();
+        bounds.validate().unwrap();
+    }
+
+    #[test]
+    fn font_names_reject_hidden_controls_and_excessive_size() {
+        for family in [
+            "".to_owned(),
+            "   ".into(),
+            "A\nB".into(),
+            "A\u{202e}B".into(),
+            "A\u{2067}B".into(),
+            "a".repeat(129),
+        ] {
+            let mut config = Config::default();
+            config.appearance.font_family = family.clone();
+            assert!(config.validate().is_err());
+            config.appearance.font_family = "Inter".into();
+            config.typography.message_font_family = Some(family.clone());
+            assert!(config.validate().is_err());
+            config.typography.message_font_family = None;
+            config.typography.monospace_font_family = family;
+            assert!(config.validate().is_err());
+        }
+        let mut config = Config::default();
+        config.typography.message_font_family = Some("Noto Sans 日本語".into());
+        config.validate().unwrap();
+        assert_eq!(
+            config.typography.message_family(&config.appearance),
+            "Noto Sans 日本語"
+        );
+    }
+
+    #[test]
+    fn presets_materialize_distinct_styles_and_preserve_other_preferences() {
+        let mut config = Config::default();
+        config.notifications.enabled = false;
+        config.notifications.sounds = false;
+        config.shortcuts.clear();
+        config.appearance.scale_percent = 150;
+        config.appearance.reduce_motion = true;
+        config.layout.sort_unread_first = true;
+        let original = config.clone();
+        let mut styles = Vec::new();
+        for preset in BuiltInStylePreset::ALL {
+            config.apply_style_preset(preset);
+            config.validate().unwrap();
+            preset.theme().unwrap();
+            assert_eq!(config.notifications, original.notifications);
+            assert_eq!(config.media, original.media);
+            assert_eq!(config.shortcuts, original.shortcuts);
+            assert_eq!(config.account_overrides, original.account_overrides);
+            assert_eq!(config.appearance.scale_percent, 150);
+            assert!(config.appearance.reduce_motion);
+            assert!(config.layout.sort_unread_first);
+            assert_eq!(
+                config.appearance.theme_pack.as_deref(),
+                Some(preset.theme_name())
+            );
+            styles.push((
+                config.chat.layout,
+                config.geometry.corner_radius,
+                config.typography.message_size,
+            ));
+        }
+        assert_ne!(styles[0], styles[1]);
+        assert_ne!(styles[1], styles[2]);
+        assert_ne!(styles[0], styles[2]);
+    }
+
+    #[test]
+    fn builtin_theme_override_errors_never_fall_back_silently() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let mut config = Config::default();
+        config.apply_style_preset(BuiltInStylePreset::Terminal);
+        let embedded = BuiltInStylePreset::Terminal.theme().unwrap();
+        assert_eq!(store.load_theme(&config).unwrap(), Some(embedded.clone()));
+        fs::create_dir(store.themes_dir().unwrap()).unwrap();
+        let path = store.themes_dir().unwrap().join("terminal.toml");
+        let mut custom = embedded.clone();
+        custom.colors.accent = "#abcdef".into();
+        fs::write(&path, toml::to_string_pretty(&custom).unwrap()).unwrap();
+        assert_eq!(store.load_theme(&config).unwrap(), Some(custom));
+        fs::write(&path, "broken = [").unwrap();
+        assert!(store.load_theme(&config).is_err());
+        fs::remove_file(&path).unwrap();
+        assert_eq!(store.load_theme(&config).unwrap(), Some(embedded));
+        config.appearance.theme_pack = Some("unknown".into());
+        assert!(store.load_theme(&config).is_err());
+    }
+
+    #[test]
+    fn custom_style_round_trips_without_a_hidden_preset_layer() {
+        let mut config = Config::default();
+        config.apply_style_preset(BuiltInStylePreset::Terminal);
+        config.geometry.corner_radius = 19;
+        config.chat.show_timestamps = false;
+        config.typography.message_font_family = Some("User Font".into());
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let restored: Config = toml::from_str(&serialized).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored, config);
     }
 }

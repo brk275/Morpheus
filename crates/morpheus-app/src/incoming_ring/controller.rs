@@ -22,7 +22,7 @@ use std::{
     future::Future,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Instant,
 };
@@ -66,10 +66,66 @@ pub(crate) struct OfferPresentation {
     pub room_id: String,
     pub caller_user_id: String,
     pub mode: InteropMode,
+    pub audible: AudibleOffer,
 }
 impl fmt::Debug for OfferPresentation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("OfferPresentation { .. }")
+    }
+}
+
+/// Non-forgeable, single-use audible authority derived only from an admitted
+/// stored offer. Cloned presentations share the same claim/stop state. Callback
+/// checks use only immutable data and atomics; no room IDs or UI keys are used.
+#[derive(Clone)]
+pub(crate) struct AudibleOffer {
+    selection: AccountSelection,
+    sound: Arc<AudibleState>,
+    signal: Arc<Signal>,
+    epoch: u64,
+}
+struct AudibleState {
+    alive: AtomicBool,
+    claimed: AtomicBool,
+    deadline: Instant,
+}
+impl AudibleState {
+    fn new(deadline: Instant) -> Self {
+        Self {
+            alive: AtomicBool::new(true),
+            claimed: AtomicBool::new(false),
+            deadline,
+        }
+    }
+    fn claim(&self) -> bool {
+        !self.claimed.swap(true, Ordering::AcqRel)
+    }
+    fn stop(&self) {
+        self.alive.store(false, Ordering::Release);
+    }
+    fn current(&self, epoch_current: bool, selection_current: bool, now: Instant) -> bool {
+        self.alive.load(Ordering::Acquire)
+            && epoch_current
+            && selection_current
+            && now < self.deadline
+    }
+}
+impl AudibleOffer {
+    pub(crate) fn claim(&self) -> bool {
+        self.sound.claim()
+    }
+    pub(crate) fn stop(&self) {
+        self.sound.stop();
+    }
+    pub(crate) fn deadline(&self) -> Instant {
+        self.sound.deadline
+    }
+    pub(crate) fn allowed(&self) -> bool {
+        self.sound.current(
+            self.signal.audio_epoch.load(Ordering::Acquire) == self.epoch,
+            self.selection.is_current(),
+            Instant::now(),
+        )
     }
 }
 
@@ -78,12 +134,14 @@ struct SignalState {
     stopped: bool,
 }
 struct Signal {
+    audio_epoch: AtomicU64,
     state: Mutex<SignalState>,
     changed: Notify,
 }
 impl Default for Signal {
     fn default() -> Self {
         Self {
+            audio_epoch: AtomicU64::new(1),
             state: Mutex::new(SignalState {
                 epoch: 1,
                 stopped: false,
@@ -110,10 +168,15 @@ impl InvalidationHandle {
         } else {
             state.stopped = true;
         }
+        self.0.audio_epoch.store(
+            if state.stopped { 0 } else { state.epoch },
+            Ordering::Release,
+        );
         drop(state);
         self.0.changed.notify_waiters();
     }
     pub(crate) fn shutdown(&self) {
+        self.0.audio_epoch.store(0, Ordering::Release);
         self.0
             .state
             .lock()
@@ -138,6 +201,7 @@ struct LeaseState {
 }
 struct Lease {
     epoch: u64,
+    audible: Arc<AudibleState>,
     state: Mutex<LeaseState>,
     changed: Notify,
 }
@@ -145,6 +209,7 @@ impl Lease {
     fn new(epoch: u64, deadline: Instant) -> Self {
         Self {
             epoch,
+            audible: Arc::new(AudibleState::new(deadline)),
             state: Mutex::new(LeaseState {
                 phase: Phase::Offered,
                 deadline,
@@ -153,6 +218,7 @@ impl Lease {
         }
     }
     fn revoke(&self) {
+        self.audible.stop();
         self.state
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -187,6 +253,7 @@ impl Lease {
         to: Phase,
         deadline: Instant,
     ) -> Result<(), ControllerFailure> {
+        self.audible.stop();
         // Serialize commitment with invalidation. A signal observed before this
         // transition cannot be discarded as "the call is already established".
         let global = signal
@@ -388,6 +455,12 @@ impl IncomingController {
                 room_id: pending.payload.room.room_id().to_string(),
                 caller_user_id: pending.payload.ring.sender().to_owned(),
                 mode: pending.payload.mode(),
+                audible: AudibleOffer {
+                    selection: pending.payload.selection.clone(),
+                    sound: pending.lease.audible.clone(),
+                    signal: self.signal.clone(),
+                    epoch: pending.lease.epoch,
+                },
             })
             .collect()
     }
@@ -1511,5 +1584,51 @@ mod tests {
         InvalidationHandle(signal.clone()).shutdown();
         time::timeout(Duration::from_secs(1), first).await.unwrap();
         time::timeout(Duration::from_secs(1), second).await.unwrap();
+    }
+    #[test]
+    fn audible_claim_is_shared_once_and_stop_cannot_be_reversed() {
+        let now = Instant::now();
+        let sound = Arc::new(AudibleState::new(now + Duration::from_secs(30)));
+        assert!(sound.claim());
+        assert!(!sound.clone().claim());
+        assert!(sound.current(true, true, now));
+        sound.stop();
+        assert!(!sound.current(true, true, now));
+        assert!(!sound.claim());
+    }
+    #[test]
+    fn audible_expiry_selection_and_observed_epoch_are_independent_vetoes() {
+        let now = Instant::now();
+        let sound = AudibleState::new(now + Duration::from_secs(1));
+        assert!(!sound.current(false, true, now));
+        assert!(!sound.current(true, false, now));
+        assert!(!sound.current(true, true, now + Duration::from_secs(1)));
+        let signal = Arc::new(Signal::default());
+        let handle = InvalidationHandle(signal.clone());
+        let before = signal.audio_epoch.load(Ordering::Acquire);
+        handle.invalidate();
+        handle.invalidate();
+        assert_ne!(signal.audio_epoch.load(Ordering::Acquire), before);
+        handle.shutdown();
+        assert_eq!(signal.audio_epoch.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn answer_reservation_and_dismiss_revoke_audio_before_network_work() {
+        let (signal, lease, now) = setup();
+        assert!(lease.audible.current(true, true, now));
+        lease
+            .advance(
+                &signal,
+                now,
+                true,
+                Phase::Offered,
+                Phase::Reserved,
+                now + Duration::from_secs(30),
+            )
+            .unwrap();
+        assert!(!lease.audible.current(true, true, now));
+        let other = Lease::new(1, now + Duration::from_secs(30));
+        other.revoke();
+        assert!(!other.audible.current(true, true, now));
     }
 }

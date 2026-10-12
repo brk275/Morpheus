@@ -19,6 +19,9 @@ macro_rules! phase {
     };
 }
 
+#[path = "live_local/account_access.rs"]
+mod account_access;
+
 #[derive(Deserialize)]
 struct Fixture {
     accounts: Vec<TestAccount>,
@@ -517,16 +520,16 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
             .logout_account(&bob.id)
             .await
             .expect("Cannot remove peer test session");
-        phase!(logout_alice);
-        restored
-            .logout_account(&alice.id)
-            .await
-            .expect("Cannot remove Alice test session");
-        phase!(logout_carol);
-        restored
-            .logout_account(&carol.id)
-            .await
-            .expect("Cannot remove Carol test session");
+        let restored = account_access::verify_existing_accounts(
+            restored,
+            &primary_store,
+            &alice,
+            &carol,
+            a_room,
+            b_room,
+            &a_body,
+        )
+        .await;
         phase!(stop_restored);
         peer_restored.stop().await;
         restored.stop().await;
@@ -538,6 +541,7 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
         let classic =
             AccountManager::open_with_sync_policy(root.join("classic"), SyncPolicy::ClassicOnly)
                 .expect("Cannot open classic-sync test store");
+        let classic_password = account_access::prepare_protected_login(&classic).await;
         let classic_carol = classic
             .add_password_account(
                 &carol_fixture.homeserver_url,
@@ -546,6 +550,7 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
             )
             .await
             .expect("Carol classic-sync login failed");
+        account_access::verify_new_login_paused(&classic, &classic_carol, &classic_password).await;
         phase!(classic_sync);
         wait_for_sync_backend(&classic, SyncBackend::Classic).await;
         let classic_rooms = wait_for_room(&classic, b_room).await;
@@ -555,6 +560,10 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
             .logout_account(&classic_carol.id)
             .await
             .expect("Cannot remove classic-sync test session");
+        classic
+            .reset_app_password_after_removal()
+            .await
+            .expect("Cannot reset empty classic test profile");
         phase!(classic_stop);
         classic.stop().await;
     });
@@ -562,6 +571,6 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
     fs::remove_dir_all(&root).expect("Cannot remove local test account stores");
     phase!(complete);
     eprintln!(
-        "Live local Matrix acceptance passed: account isolation, restore, both sync adapters, encrypted edit/reply/reaction/thread, and message after restart."
+        "Live local Matrix acceptance passed: account isolation, restore, both sync adapters, encrypted edit/reply/reaction/thread, message after restart, protected account activation, and local removal."
     );
 }

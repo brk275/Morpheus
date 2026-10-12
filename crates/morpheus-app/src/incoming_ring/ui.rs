@@ -11,7 +11,10 @@ use morpheus_rtc::{AudioDeviceSelection, CallInfo};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use tokio::{runtime::Handle, sync::mpsc, task::JoinHandle};
 
-use super::worker::{IncomingHandle, IncomingWorker};
+use super::{
+    audio::IncomingAudio,
+    worker::{IncomingHandle, IncomingWorker},
+};
 use crate::{AppWindow, IncomingCallItem, audio_devices, calls::CallController, live::LiveUi};
 
 struct AnswerCommand {
@@ -26,6 +29,8 @@ pub(crate) struct IncomingUi {
     stopped: Arc<AtomicBool>,
     presentation: Option<JoinHandle<()>>,
     answer: Option<JoinHandle<()>>,
+    audio: Arc<IncomingAudio>,
+    audio_task: Option<JoinHandle<()>>,
 }
 
 impl IncomingUi {
@@ -39,19 +44,25 @@ impl IncomingUi {
             IncomingWorker::start(runtime, live.manager.clone(), live.voice_spaces.clone());
         let handle = worker.handle();
         let stopped = Arc::new(AtomicBool::new(false));
+        let (audio, audio_task) =
+            IncomingAudio::start(runtime, handle.clone(), live.clone(), calls.clone());
         let (answers, mut commands) = mpsc::channel::<AnswerCommand>(1);
 
         let presentation = {
+            let audio = audio.clone();
             let handle = handle.clone();
             let account_updates = live.manager.subscribe_active_account();
             let weak = ui.as_weak();
             let stopped = stopped.clone();
             runtime.spawn(async move {
                 let mut updates = handle.subscribe();
+                let mut sound_updates = audio.subscribe();
                 let queued = Arc::new(AtomicBool::new(false));
                 loop {
                     updates.borrow_and_update();
+                    sound_updates.borrow_and_update();
                     let current = handle.clone();
+                    let audio = audio.clone();
                     let account_updates = account_updates.clone();
                     let stopped = stopped.clone();
                     // A stalled native UI retains at most one refresh closure.
@@ -73,10 +84,14 @@ impl IncomingUi {
                                 let account_label =
                                     account.as_ref().map(|a| a.user_id.as_str()).unwrap_or("");
                                 ui.set_incoming_call_account_id(account_id.into());
-                                let rows: Vec<_> = current
+                                let visible: Vec<_> = current
                                     .snapshot()
                                     .into_iter()
                                     .filter(|offer| offer.account_id == account_id)
+                                    .collect();
+                                ui.set_incoming_call_sound_status(audio.notice(&visible).into());
+                                let rows: Vec<_> = visible
+                                    .into_iter()
                                     .map(|offer| IncomingCallItem {
                                         token: offer.token.ui_key().into(),
                                         caller: label(&offer.caller_user_id).into(),
@@ -91,14 +106,16 @@ impl IncomingUi {
                             break;
                         }
                     }
-                    if updates.changed().await.is_err() {
-                        break;
+                    tokio::select! {
+                        changed = updates.changed() => { if changed.is_err() { break; } },
+                        changed = sound_updates.changed() => { if changed.is_err() { break; } },
                     }
                 }
             })
         };
 
         let answer = {
+            let audio = audio.clone();
             let handle = handle.clone();
             let live = live.clone();
             let calls = calls.clone();
@@ -108,6 +125,7 @@ impl IncomingUi {
                 while let Some(command) = commands.recv().await {
                     let selection = command.selection.clone();
                     let result = answer_once(&handle, &live, &calls, &stopped, command).await;
+                    let audio = audio.clone();
                     let calls_for_ui = calls.clone();
                     let stopped = stopped.clone();
                     if weak
@@ -117,6 +135,7 @@ impl IncomingUi {
                             }
                             // This callback is the only place that releases these
                             // flags. A second UI action cannot overtake completion.
+                            audio.end_answer();
                             ui.set_incoming_call_answering(false);
                             ui.set_native_call_request_pending(false);
                             if selection.is_current()
@@ -166,6 +185,8 @@ impl IncomingUi {
         {
             let weak = ui.as_weak();
             let stopped = stopped.clone();
+            let audio = audio.clone();
+            let ring_handle = handle.clone();
             ui.on_answer_incoming_call(move |key| {
                 let Some(ui) = weak.upgrade() else {
                     return;
@@ -190,7 +211,9 @@ impl IncomingUi {
                     selection,
                     audio: audio_devices::selection(&ui),
                 };
+                audio.begin_answer(&ring_handle);
                 if answers.try_send(command).is_err() {
+                    audio.end_answer();
                     ui.set_incoming_call_notice("That call is no longer available.".into());
                     return;
                 }
@@ -202,6 +225,7 @@ impl IncomingUi {
         {
             let weak = ui.as_weak();
             let stopped = stopped.clone();
+            let audio = audio.clone();
             ui.on_dismiss_incoming_call(move |key| {
                 let Some(ui) = weak.upgrade() else {
                     return;
@@ -209,6 +233,7 @@ impl IncomingUi {
                 if stopped.load(Ordering::Acquire) {
                     return;
                 }
+                audio.silence(&handle);
                 // Dismiss withdraws the local banner. It sends no decline.
                 if handle.dismiss(key.to_string()).is_err() {
                     ui.set_incoming_call_notice("That call is no longer available.".into());
@@ -221,12 +246,18 @@ impl IncomingUi {
             stopped,
             presentation: Some(presentation),
             answer: Some(answer),
+            audio,
+            audio_task: Some(audio_task),
         }
     }
 
     /// Revoke synchronously before waiting for any other shutdown operation.
     pub(crate) fn shutdown(&self) {
         self.stopped.store(true, Ordering::Release);
+        self.audio.shutdown();
+        if let Some(task) = &self.audio_task {
+            task.abort();
+        }
         self.worker.shutdown();
         if let Some(task) = &self.presentation {
             task.abort();
@@ -244,6 +275,9 @@ impl IncomingUi {
             let _ = task.await;
         }
         if let Some(task) = self.answer.take() {
+            let _ = task.await;
+        }
+        if let Some(task) = self.audio_task.take() {
             let _ = task.await;
         }
         self.worker.finish().await;

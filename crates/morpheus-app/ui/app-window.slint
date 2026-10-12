@@ -1,5 +1,10 @@
 import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView } from "std-widgets.slint";
 
+// Runtime geometry shared by small reusable controls and the main view.
+export global StyleTokens {
+    in-out property <length> radius: 10px;
+}
+
 export struct EmojiItem {
     key: string,
     symbol: string,
@@ -38,11 +43,19 @@ export struct AccountItem {
 }
 
 export struct AccountOption {
+    local-id: string,
     index: int,
     name: string,
     handle: string,
     initials: string,
     accent: color,
+}
+
+export struct SavedAccountItem {
+    id: string,
+    handle: string,
+    active: bool,
+    removal-pending: bool,
 }
 
 export struct SpaceItem {
@@ -138,7 +151,7 @@ component AvatarBadge inherits Rectangle {
     in property <color> ink: #ffffff;
     width: 38px;
     height: 38px;
-    border-radius: 13px;
+    border-radius: StyleTokens.radius * 1.3;
     background: accent;
     Text {
         text: root.initials;
@@ -189,7 +202,7 @@ component IconAction inherits Rectangle {
     callback activated();
     width: 34px;
     height: 34px;
-    border-radius: 9px;
+    border-radius: StyleTokens.radius * 0.9;
     background: area.has-hover || selected ? hover-surface : surface;
     forward-focus: keyboard-focus;
     accessible-role: button;
@@ -289,6 +302,36 @@ component ActionRect inherits Rectangle {
     }
 }
 
+component TextAction inherits ActionRect {
+    in property <string> text;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> surface;
+    in property <color> hover-surface;
+    in property <color> outline;
+    in property <float> text-scale: 1;
+    label: text;
+    min-width: max(32px, caption.preferred-width + 24px * root.text-scale);
+    min-height: 32px * root.text-scale;
+    horizontal-stretch: 0;
+    border-radius: StyleTokens.radius * 0.7;
+    border-width: 1px;
+    border-color: outline;
+    background: enabled && has-hover ? hover-surface : surface;
+    focus-color: ink;
+    caption := Text {
+        x: 12px * root.text-scale;
+        width: parent.width - 24px * root.text-scale;
+        height: parent.height;
+        text: root.text;
+        color: root.enabled ? root.ink : root.muted;
+        font-size: 12px * root.text-scale;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+}
+
 component MentionPopup inherits Rectangle {
     in property <[MentionItem]> items;
     in property <int> current;
@@ -300,7 +343,7 @@ component MentionPopup inherits Rectangle {
     in property <float> text-scale: 1;
     callback choose(string);
     height: min(360px, self.items.length * (36px * root.text-scale + 10px) + 8px);
-    background: surface; border-radius: 8px; border-width: 1px; border-color: accent;
+    background: surface; border-radius: StyleTokens.radius * 0.8; border-width: 1px; border-color: accent;
     accessible-role: region; accessible-label: "Mention suggestions; arrows select, Enter or Tab inserts, Escape closes";
     mention-list := ListView {
         x: 4px; y: 4px; width: parent.width - 8px; height: parent.height - 8px;
@@ -309,7 +352,7 @@ component MentionPopup inherits Rectangle {
         for item[index] in root.items : ActionRect {
             width: mention-list.visible-width; height: 36px * root.text-scale + 10px;
             label: item.name + " " + item.key + (index == root.current ? ", selected" : "");
-            focus-color: root.accent; border-radius: 5px;
+            focus-color: root.accent; border-radius: StyleTokens.radius * 0.5;
             background: index == root.current || self.has-hover ? root.hover : root.surface;
             activated => { root.choose(item.key); }
             VerticalLayout {
@@ -337,7 +380,7 @@ component EmojiPopup inherits Rectangle {
     callback choose(string);
     callback dismiss();
     height: min(380px, 280px * root.text-scale + 70px);
-    background: surface; border-radius: 9px; border-width: 1px; border-color: accent;
+    background: surface; border-radius: StyleTokens.radius * 0.9; border-width: 1px; border-color: accent;
     accessible-role: region; accessible-label: "Emoji picker";
     FocusScope {
         width: parent.width; height: parent.height;
@@ -349,7 +392,7 @@ component EmojiPopup inherits Rectangle {
         HorizontalLayout {
             height: 34px * root.text-scale; spacing: 6px;
             Rectangle {
-                horizontal-stretch: 1; background: root.elevated; border-radius: 6px;
+                horizontal-stretch: 1; background: root.elevated; border-radius: StyleTokens.radius * 0.6;
                 if root.query == "" : Text {
                     x: 8px; width: parent.width - 16px; height: parent.height;
                     text: "Search emoji"; color: root.muted; font-size: 12px * root.text-scale;
@@ -396,7 +439,7 @@ component EmojiPopup inherits Rectangle {
                 width: emoji-list.visible-width; height: 34px * root.text-scale + 6px;
                 label: "Insert " + item.name + " " + item.symbol + (index == root.current ? ", selected" : "");
                 background: index == root.current || self.has-hover ? root.hover : root.surface;
-                border-radius: 5px; focus-color: root.accent; cancel-on-escape: true;
+                border-radius: StyleTokens.radius * 0.5; focus-color: root.accent; cancel-on-escape: true;
                 cancelled => { root.dismiss(); }
                 activated => { root.choose(item.key); }
                 HorizontalLayout {
@@ -426,7 +469,7 @@ component ShortcutSetting inherits Rectangle {
         spacing: 12px;
         Text { text: root.label; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; }
         Rectangle {
-            width: 200px; height: 38px; background: root.surface; border-radius: 7px;
+            width: 200px; height: 38px; background: root.surface; border-radius: StyleTokens.radius * 0.7;
             border-width: shortcut-input.has-focus ? 2px : 0px; border-color: root.accent;
             if root.binding == "" : Text { x: 9px; text: "Disabled"; color: root.muted; font-size: 12px * root.text-scale; vertical-alignment: center; }
             shortcut-input := TextInput {
@@ -434,6 +477,56 @@ component ShortcutSetting inherits Rectangle {
                 text <=> root.binding; color: root.ink; font-size: 12px * root.text-scale;
                 single-line: true; accessible-label: root.label + " keyboard shortcut; blank disables";
                 edited => { root.edited(); }
+            }
+        }
+    }
+}
+
+component StyleNumberSetting inherits Rectangle {
+    in property <string> label;
+    in property <int> value;
+    in property <int> minimum;
+    in property <int> maximum;
+    in property <int> step: 1;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> surface;
+    in property <color> hover-surface;
+    in property <float> text-scale: 1;
+    callback changed-value(int);
+    height: max(58px, 34px * root.text-scale + 20px);
+    background: surface; border-radius: StyleTokens.radius;
+    HorizontalLayout {
+        padding: 10px; spacing: 8px;
+        Text { text: root.label; color: root.ink; font-size: 12px * root.text-scale;
+            vertical-alignment: center; horizontal-stretch: 1; wrap: word-wrap; }
+        Text { text: root.value + " px"; color: root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; }
+        IconAction { icon: "−"; label: "Decrease " + root.label; ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
+            enabled: root.value > root.minimum; activated => { root.changed-value(max(root.minimum, root.value - root.step)); } }
+        IconAction { icon: "+"; label: "Increase " + root.label; ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
+            enabled: root.value < root.maximum; activated => { root.changed-value(min(root.maximum, root.value + root.step)); } }
+    }
+}
+
+component StyleFontSetting inherits Rectangle {
+    in property <string> label;
+    in-out property <string> family;
+    in property <color> ink;
+    in property <color> surface;
+    in property <color> accent;
+    in property <float> text-scale: 1;
+    height: 74px * root.text-scale;
+    VerticalLayout {
+        spacing: 7px;
+        Text { text: root.label; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; }
+        Rectangle {
+            height: 38px * root.text-scale; background: root.surface; border-radius: StyleTokens.radius * 0.7;
+            border-width: input.has-focus ? 2px : 0px; border-color: root.accent;
+            input := TextInput {
+                x: 10px; width: max(0px, parent.width - 20px); height: parent.height;
+                text <=> root.family; single-line: true;
+                color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center;
+                accessible-label: root.label;
             }
         }
     }
@@ -543,6 +636,27 @@ export component AppWindow inherits Window {
     in-out property <int> details-width: 250;
     in-out property <bool> show-side-panel: true;
     in-out property <string> ui-font-family: "Inter";
+    in-out property <string> message-font-family: "Inter";
+    in-out property <string> monospace-font-family: "monospace";
+    in-out property <int> message-font-size: 14;
+    in-out property <int> corner-radius-px: 10;
+    in-out property <int> message-gap-px: 12;
+    in-out property <int> content-padding-px: 24;
+    in-out property <int> rail-width-px: 70;
+    in-out property <int> message-layout: 0;
+    in-out property <bool> show-message-avatars: true;
+    in-out property <bool> show-message-timestamps: true;
+    in-out property <bool> color-message-senders: false;
+    in-out property <int> nickname-width-px: 128;
+    in-out property <string> appearance-ui-font-input;
+    in-out property <string> appearance-message-font-input;
+    in-out property <string> appearance-mono-font-input;
+    callback choose-style-preset(int);
+    callback set-style-fonts(string, string, string);
+    callback change-style-number(int, int);
+    callback choose-message-layout(int);
+    callback set-style-flag(int, bool);
+
     in-out property <string> config-error;
     in-out property <string> session-error;
     in-out property <bool> preview-session: false;
@@ -625,6 +739,7 @@ export component AppWindow inherits Window {
     in-out property <string> incoming-call-account-id;
     in-out property <bool> incoming-call-answering: false;
     in-out property <string> incoming-call-notice;
+    in-out property <string> incoming-call-sound-status;
     in-out property <bool> native-call-joined: false;
     in-out property <bool> native-audio-failed: false;
     in-out property <string> native-audio-error;
@@ -825,6 +940,7 @@ export component AppWindow inherits Window {
         root.mention-place-request = root.mention-place-request == 2147483647 ? 1 : root.mention-place-request + 1;
     }
     callback preview-demo();
+    callback preview-demo-ready();
     callback toggle-stress-timeline();
     callback answer-incoming-call(string);
     callback dismiss-incoming-call(string);
@@ -859,6 +975,23 @@ export component AppWindow inherits Window {
 
     in-out property <bool> account-menu-open: false;
     in-out property <bool> manage-accounts-open: false;
+    in-out property <[SavedAccountItem]> saved-accounts;
+    in-out property <bool> app-password-enabled: false;
+    in-out property <string> account-access-notice;
+    in-out property <bool> access-open: false;
+    in-out property <bool> access-busy: false;
+    in-out property <int> access-mode: 0;
+    in-out property <string> access-target;
+    in-out property <string> access-current-password;
+    in-out property <string> access-new-password;
+    in-out property <string> access-confirm-password;
+    in-out property <string> access-error;
+    callback activate-saved-account(string);
+    callback remove-saved-account(string);
+    callback open-app-password(int);
+    callback submit-account-access();
+    callback cancel-account-access();
+
     in-out property <bool> room-actions-open: false;
     in-out property <int> room-action-mode: 0; // 0 private room, 1 join, 2 Space
     in-out property <string> room-action-input;
@@ -902,7 +1035,7 @@ export component AppWindow inherits Window {
     property <int> composer-focus-request: 0;
 
     in-out property <int> thread-mention-index: 0;
-    out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open && !root.image-preview-open;
+    out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.access-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open && !root.image-preview-open;
     changed mention-ui-allowed => { if !root.mention-ui-allowed { root.mention-context-changed(); } }
     // Input IDs live inside conditional subtrees; callbacks cross that boundary.
     in-out property <int> composer-caret: -1;
@@ -967,6 +1100,10 @@ export component AppWindow inherits Window {
 
     property <bool> light-palette: root.theme-mode == 1 || (root.theme-mode == 3 && Palette.color-scheme == ColorScheme.light);
     property <float> text-scale: root.font-scale-percent / 100.0;
+    property <length> message-font-px: root.message-font-size * 1px * root.text-scale;
+    property <length> message-row-gap: root.message-gap-px * 1px * (root.density-mode == 0 ? 0.5 : root.density-mode == 2 ? 1.333 : 1);
+    property <length> content-inset: root.content-padding-px * 1px;
+
     property <color> rail: custom-theme-active ? custom-rail : light-palette ? #e7ebf3 : theme-mode == 2 ? #000000 : #10131b;
     property <color> sidebar: custom-theme-active ? custom-sidebar : light-palette ? #f1f3f8 : theme-mode == 2 ? #101010 : #171b26;
     property <color> canvas: custom-theme-active ? custom-canvas : light-palette ? #ffffff : theme-mode == 2 ? #000000 : #1e2330;
@@ -997,14 +1134,14 @@ export component AppWindow inherits Window {
 
         // Space and navigation rail.
         Rectangle {
-            width: 70px;
+            width: root.rail-width-px * 1px;
             background: root.rail;
             VerticalLayout {
-                padding: 9px;
+                padding: 6px;
                 spacing: 10px;
                 Rectangle {
                     height: 48px;
-                    border-radius: 15px;
+                    border-radius: StyleTokens.radius * 1.5;
                     background: root.accent;
                     Text {
                         text: "M";
@@ -1017,7 +1154,7 @@ export component AppWindow inherits Window {
                 }
                 Rectangle { height: 1px; background: root.divider; }
                 IconAction {
-                    width: 52px;
+                    width: root.rail-width-px * 1px - 12px;
                     height: 48px;
                     icon: "⌂";
                     label: "Home and all rooms";
@@ -1034,9 +1171,9 @@ export component AppWindow inherits Window {
                         width: parent.width;
                         spacing: 8px;
                         for space in root.spaces : ActionRect {
-                            width: 52px;
+                            width: root.rail-width-px * 1px - 12px;
                             height: 48px;
-                            border-radius: 12px;
+                            border-radius: StyleTokens.radius * 1.2;
                             background: root.active-space-id == space.id && root.page == 0 ? root.hover : self.has-hover ? root.hover : transparent;
                             focus-color: root.accent;
                             label: "Select space " + space.name;
@@ -1057,7 +1194,7 @@ export component AppWindow inherits Window {
                 }
                 Rectangle { height: 1px; background: root.divider; }
                 IconAction {
-                    width: 52px;
+                    width: root.rail-width-px * 1px - 12px;
                     height: 48px;
                     icon: "S";
                     label: "Explore public Matrix rooms";
@@ -1068,7 +1205,7 @@ export component AppWindow inherits Window {
                     activated => { root.page = 3; root.open-discovery(); }
                 }
                 IconAction {
-                    width: 52px;
+                    width: root.rail-width-px * 1px - 12px;
                     height: 48px;
                     icon: "C";
                     label: "Open call stage";
@@ -1079,7 +1216,7 @@ export component AppWindow inherits Window {
                     activated => { root.page = 2; }
                 }
                 IconAction {
-                    width: 52px;
+                    width: root.rail-width-px * 1px - 12px;
                     height: 48px;
                     icon: "⚙";
                     label: "Open settings";
@@ -1094,7 +1231,7 @@ export component AppWindow inherits Window {
 
         // Room list and Discord-style account control.
         Rectangle {
-            width: root.room-list-width * 1px;
+            width: min(root.room-list-width * 1px, max(180px, root.width * 0.25));
             background: root.sidebar;
             VerticalLayout {
                 spacing: 0px;
@@ -1140,7 +1277,7 @@ export component AppWindow inherits Window {
                     quick-switch-trigger := ActionRect {
                         x: 12px; y: 12px;
                         width: parent.width - 24px; height: parent.height - 24px;
-                        border-radius: 8px;
+                        border-radius: StyleTokens.radius * 0.8;
                         background: self.has-hover ? root.hover : root.elevated;
                         focus-color: root.accent;
                         enabled: root.page != 1 && !root.show-sign-in;
@@ -1202,7 +1339,7 @@ export component AppWindow inherits Window {
                         }
                         for invite in root.invitations : Rectangle {
                             height: 58px;
-                            border-radius: 8px;
+                            border-radius: StyleTokens.radius * 0.8;
                             background: root.elevated;
                             HorizontalLayout {
                                 padding-left: 9px;
@@ -1233,7 +1370,7 @@ export component AppWindow inherits Window {
                         }
                         for room in root.channels : ActionRect {
                             height: max(root.density-mode == 0 ? 30px : root.density-mode == 2 ? 44px : 36px, 22px * root.text-scale);
-                            border-radius: 8px;
+                            border-radius: StyleTokens.radius * 0.8;
                             background: room.id == root.active-room-id && root.page == 0 ? root.hover : self.has-hover ? root.elevated : transparent;
                             focus-color: root.accent;
                             label: room.voice-space ? "Enter voice space " + room.name : "Open room " + room.name;
@@ -1265,7 +1402,7 @@ export component AppWindow inherits Window {
                         }
                         for room in root.direct-messages : ActionRect {
                             height: max(root.density-mode == 0 ? 32px : root.density-mode == 2 ? 47px : 39px, 22px * root.text-scale);
-                            border-radius: 8px;
+                            border-radius: StyleTokens.radius * 0.8;
                             background: room.id == root.active-room-id && root.page == 0 ? root.hover : self.has-hover ? root.elevated : transparent;
                             focus-color: root.accent;
                             label: room.voice-space ? "Enter voice space with " + room.name : "Open direct message with " + room.name;
@@ -1278,7 +1415,7 @@ export component AppWindow inherits Window {
                                 padding-right: 9px;
                                 spacing: 9px;
                                 Rectangle {
-                                    width: 25px; height: 25px; border-radius: 9px; background: root.accent;
+                                    width: 25px; height: 25px; border-radius: StyleTokens.radius * 0.9; background: root.accent;
                                     Text { text: room.voice-space ? "◖" : "@"; color: root.accent-ink; font-size: 13px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
                                 }
                                 Text { text: room.name; color: room.unread > 0 ? root.ink : root.muted; font-size: 13px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
@@ -1579,6 +1716,13 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
+                if root.incoming-call-sound-status != "" && root.live-session && root.incoming-call-account-id == root.active-account-local-id && root.incoming-call-offers.length > 0 : Text {
+                    text: root.incoming-call-sound-status;
+                    accessible-label: "Incoming call sound: " + root.incoming-call-sound-status;
+                    accessible-live-region: polite;
+                    color: root.muted; font-size: 11px * root.text-scale;
+                    wrap: word-wrap;
+                }
                 if root.incoming-call-notice != "" && root.live-session : Rectangle {
                     height: 32px * root.text-scale;
                     background: root.panel;
@@ -1637,20 +1781,20 @@ export component AppWindow inherits Window {
                     vertical-stretch: 1;
                     spacing: 0px;
                     Rectangle {
-                        height: max(110px, 54px * root.text-scale + 56px);
+                        height: root.message-layout == 0 ? max(110px, 54px * root.text-scale + 56px) : max(48px, 24px * root.text-scale + 24px);
                         background: root.canvas;
                         VerticalLayout {
                             padding-left: 24px;
                             padding-right: 24px;
-                            padding-top: 23px;
-                            padding-bottom: 20px;
+                            padding-top: root.message-layout == 0 ? 23px : 8px;
+                            padding-bottom: root.message-layout == 0 ? 20px : 8px;
                             spacing: 8px;
-                            Text { text: "Welcome to #" + root.active-room-name; color: root.ink; font-size: 24px * root.text-scale; font-weight: 780; }
+                            if root.message-layout == 0 : Text { text: "Welcome to #" + root.active-room-name; color: root.ink; font-size: 24px * root.text-scale; font-weight: 780; }
                             Text { text: root.active-room-topic; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         }
                     }
                     if root.live-session && root.active-room-id != "" : HorizontalLayout {
-                        height: 39px;
+                        height: max(39px, 32px * root.text-scale);
                         padding-left: 24px;
                         padding-right: 24px;
                         spacing: 8px;
@@ -1662,23 +1806,29 @@ export component AppWindow inherits Window {
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
-                        Button {
+                        TextAction {
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                            outline: root.divider; text-scale: root.text-scale;
                             text: root.active-voice-local ? "✓ Mine" : "Mine";
                             enabled: !root.voice-designation-busy;
                             accessible-label: root.active-voice-local ? "Remove this room from my local voice spaces" : "Mark this room as a voice space only for my account";
-                            clicked => { root.set-local-voice-space(!root.active-voice-local); }
+                            activated => { root.set-local-voice-space(!root.active-voice-local); }
                         }
-                        if root.native-call-enabled : Button {
+                        if root.native-call-enabled : TextAction {
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                            outline: root.divider; text-scale: root.text-scale;
                             text: root.active-voice-shared ? "✓ Shared" : "Share";
                             enabled: !root.voice-designation-busy;
                             accessible-label: root.active-voice-shared ? "Remove shared voice-space marker from this Matrix room" : "Share a voice-space marker with this Matrix room";
-                            clicked => { root.set-shared-voice-space(!root.active-voice-shared); }
+                            activated => { root.set-shared-voice-space(!root.active-voice-shared); }
                         }
-                        if root.active-voice-local || root.active-voice-shared : Button {
+                        if root.active-voice-local || root.active-voice-shared : TextAction {
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                            outline: root.divider; text-scale: root.text-scale;
                             text: "Join";
                             enabled: !root.voice-designation-busy;
                             accessible-label: "Join this room's MatrixRTC voice space without ringing members";
-                            clicked => { root.open-voice-space(root.active-room-id); }
+                            activated => { root.open-voice-space(root.active-room-id); }
                         }
                     }
                     if root.voice-designation-error != "" || root.voice-designation-notice != "" : Text {
@@ -1690,15 +1840,17 @@ export component AppWindow inherits Window {
                         overflow: elide;
                     }
                     if root.live-session && root.active-room-id != "" : HorizontalLayout {
-                        height: 36px;
+                        height: max(36px, 32px * root.text-scale);
                         padding-left: 24px;
                         padding-right: 24px;
                         spacing: 10px;
-                        Button {
+                        TextAction {
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                            outline: root.divider; text-scale: root.text-scale;
                             text: root.history-loading ? "Loading earlier messages…" : root.history-at-start ? "Start of room history" : "Load earlier messages";
                             enabled: !root.history-loading && !root.history-at-start;
                             accessible-label: root.history-at-start ? "Start of room history reached" : "Load earlier messages in this Matrix room";
-                            clicked => { root.load-older-messages(); }
+                            activated => { root.load-older-messages(); }
                         }
                         if root.history-error != "" : Text {
                             text: root.history-error;
@@ -1713,164 +1865,214 @@ export component AppWindow inherits Window {
                     timeline-list := ListView {
                         vertical-stretch: 1;
                         horizontal-scrollbar-policy: always-off;
-                        for message[index] in root.messages : Rectangle {
-                                width: timeline-list.visible-width;
-                                background: root.room-search-selected-event-id != "" && message.event-id == root.room-search-selected-event-id ? root.hover : message-hover.has-hover ? root.elevated : transparent;
-                                min-height: root.density-mode == 0 ? 52px : root.density-mode == 2 ? 80px : 65px;
-                                message-hover := TouchArea { mouse-cursor: default; }
-                                VerticalLayout {
-                                    padding-left: 24px;
-                                    padding-right: 24px;
-                                    padding-top: root.density-mode == 0 ? 5px : root.density-mode == 2 ? 16px : 12px;
-                                    padding-bottom: root.density-mode == 0 ? 5px : root.density-mode == 2 ? 16px : 12px;
-                                    spacing: root.density-mode == 0 ? 3px : root.density-mode == 2 ? 8px : 5px;
-                                    HorizontalLayout {
-                                        spacing: 10px;
-                                        AvatarBadge { width: 38px; height: 38px; border-radius: 13px; initials: message.initials; accent: message.accent; }
-                                        VerticalLayout {
-                                            horizontal-stretch: 1;
-                                            spacing: root.density-mode == 0 ? 3px : root.density-mode == 2 ? 8px : 5px;
-                                            HorizontalLayout {
-                                                spacing: 8px;
-                                                Text { text: message.sender; color: root.ink; font-size: 14px * root.text-scale; font-weight: 700; }
-                                                Text { text: message.time; color: root.muted; font-size: 10px * root.text-scale; vertical-alignment: center; }
-                                                Rectangle { horizontal-stretch: 1; background: transparent; }
-                                                if message.event-id != "" : IconAction {
-                                                    quiet: true; context-hover: message-hover.has-hover;
-                                                    width: 28px; height: 26px; icon: "↩"; label: "Reply to " + message.sender;
-                                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
-                                                    activated => {
-                                                        if !root.composer-busy { root.begin-compose(1, message.event-id, message.sender, "", false); }
-                                                        message-input.focus();
-                                                    }
-                                                }
-                                                if message.event-id != "" && message.is-own && message.attachment == "" : IconAction {
-                                                    quiet: true; context-hover: message-hover.has-hover;
-                                                    width: 28px; height: 26px; icon: "✎"; label: "Edit your message";
-                                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
-                                                    activated => {
-                                                        if !root.composer-busy { root.begin-compose(2, message.event-id, message.sender, message.edit-source, message.edit-markdown); }
-                                                        message-input.focus();
-                                                    }
-                                                }
-                                                if message.event-id != "" : IconAction {
-                                                    quiet: true; context-hover: message-hover.has-hover;
-                                                    width: 28px; height: 26px; icon: "♥"; label: "Toggle heart reaction";
-                                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
-                                                    activated => { root.toggle-message-reaction(message.event-id, "❤️"); }
-                                                }
-                                                if message.event-id != "" : IconAction {
-                                                    quiet: true; context-hover: message-hover.has-hover;
-                                                    width: 28px; height: 26px; icon: "☷"; label: "Open thread for " + message.sender;
-                                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
-                                                    activated => {
-                                                        root.thread-root-id = message.event-id;
-                                                        root.thread-root-sender = message.sender;
-                                                        root.thread-root-body = message.body;
-                                                        root.thread-root-rich-body = message.rich-body;
-                                                        root.thread-root-rich-accessible-body = message.rich-accessible-body;
-                                                        root.thread-composer-text = "";
-                                                        root.thread-send-pending = false;
-                                                        root.thread-messages = [];
-                                                        root.side-panel-tab = 1;
-                                                        root.show-side-panel = true;
-                                                        root.open-thread(message.event-id, message.sender, message.body);
-                                                    }
-                                                }
-                                                if message.event-id != "" : IconAction {
-                                                    quiet: true; context-hover: message-hover.has-hover;
-                                                    width: 28px; height: 26px; icon: "⌫"; label: "Redact message from " + message.sender;
-                                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
-                                                    enabled: root.live-session && !root.room-admin-busy;
-                                                    activated => {
-                                                        root.room-admin-mode = 2;
-                                                        root.room-admin-event-id = message.event-id;
-                                                        root.room-admin-event-preview = message.sender + ": " + message.body;
-                                                        root.room-admin-account-id = root.active-account-local-id;
-                                                        root.room-admin-room-id = root.active-room-id;
-                                                        root.room-admin-error = "";
-                                                        root.room-admin-notice = "";
-                                                        root.room-admin-open = true;
-                                                    }
-                                                }
+                        for message[index] in root.messages : message-row := Rectangle {
+                            width: timeline-list.visible-width;
+                            // The timeline uses time for local delivery status too. Hiding
+                            // optional timestamps must keep pending and failed sends visible.
+                            property <bool> show-time: root.show-message-timestamps || message.time == "Sending…" || message.time == "Failed to send";
+                            property <bool> columns: root.message-layout == 2 && self.width >= max(640px, 640px * root.text-scale);
+                            property <length> avatar-size: root.message-layout == 0 ? 38px : 26px;
+                            property <length> action-width: message.event-id == "" ? 0px : (message.is-own && message.attachment == "" ? 172px : 136px);
+                            property <length> column-width: self.columns ? min(root.nickname-width-px * 1px, self.width * 0.2) : 0px;
+                            property <bool> tight-header: !self.columns && self.body-width < self.action-width + 180px * root.text-scale;
+                            property <length> body-width: max(0px, self.width - 2 * root.content-inset
+                                - (root.show-message-avatars ? self.avatar-size + (root.message-layout == 0 ? 10px : 7px) : 0px)
+                                - (self.columns ? self.column-width + 7px + (message-row.show-time ? 72px * root.text-scale + 7px : 0px) : 0px));
+                            min-height: max(28px + 2 * root.message-row-gap, root.show-message-avatars ? self.avatar-size + 2 * root.message-row-gap : 0px);
+                            background: root.room-search-selected-event-id != "" && message.event-id == root.room-search-selected-event-id ? root.hover : message-hover.has-hover ? root.elevated : transparent;
+                            message-hover := TouchArea { mouse-cursor: default; }
+                            message-flow := HorizontalLayout {
+                                padding-left: root.content-inset; padding-right: root.content-inset;
+                                padding-top: root.message-row-gap; padding-bottom: root.message-row-gap;
+                                spacing: root.message-layout == 0 ? 10px : 7px;
+                                cross-axis-alignment: start;
+                                if root.show-message-avatars : AvatarBadge {
+                                    width: message-row.avatar-size; height: message-row.avatar-size;
+                                    border-radius: StyleTokens.radius * 1.3;
+                                    initials: message.initials; accent: message.accent;
+                                }
+                                if message-row.columns && message-row.show-time : Text {
+                                    width: 72px * root.text-scale; text: message.time;
+                                    color: root.muted; font-family: root.monospace-font-family;
+                                    font-size: 10px * root.text-scale; overflow: elide;
+                                    accessible-label: message.time;
+                                }
+                                if message-row.columns : Text {
+                                    width: message-row.column-width; text: message.sender;
+                                    color: root.color-message-senders ? message.accent : root.ink;
+                                    font-family: root.message-font-family; font-size: root.message-font-px;
+                                    font-weight: 650; horizontal-alignment: right; overflow: elide;
+                                    accessible-label: message.sender;
+                                }
+                                message-content := VerticalLayout {
+                                    width: message-row.body-width; min-width: 0px;
+                                    spacing: root.message-layout == 0 ? 5px : 2px;
+                                    padding-right: message-row.columns ? message-row.action-width + 8px : 0px;
+                                    if !message-row.columns : HorizontalLayout {
+                                        min-height: message-row.tight-header ? max(26px, root.message-font-px * 1.4) + 26px : max(26px, root.message-font-px * 1.4);
+                                        padding-right: message-row.tight-header ? 0px : message-row.action-width + 8px;
+                                        spacing: 8px;
+                                        if message-row.tight-header : Text {
+                                            text: message.sender + (message-row.show-time ? " · " + message.time : "");
+                                            color: root.color-message-senders ? message.accent : root.ink;
+                                            font-family: root.message-font-family; font-size: root.message-font-px;
+                                            font-weight: 650; overflow: elide; vertical-alignment: top;
+                                            accessible-label: message.sender + (message-row.show-time ? ", " + message.time : "");
+                                        }
+                                        if !message-row.tight-header : Text {
+                                            text: message.sender; color: root.color-message-senders ? message.accent : root.ink;
+                                            font-family: root.message-font-family;
+                                            font-size: root.message-layout == 0 ? root.message-font-px : max(10px, root.message-font-px - 2px);
+                                            font-weight: 650; overflow: elide; horizontal-stretch: 1;
+                                            accessible-label: message.sender;
+                                        }
+                                        if !message-row.tight-header && message-row.show-time : Text {
+                                            text: message.time; color: root.muted; font-family: root.monospace-font-family;
+                                            font-size: 10px * root.text-scale; vertical-alignment: center;
+                                        }
+                                    }
+                                    if message.reply-to != "" : Rectangle {
+                                        height: max(25px, 16px * root.text-scale + 6px);
+                                        border-radius: StyleTokens.radius * 0.5;
+                                        background: transparent;
+                                        Rectangle { x: 0px; y: 4px; width: 2px; height: parent.height - 8px; border-radius: StyleTokens.radius * 0.1; background: root.divider; }
+                                        Text { x: 10px; width: parent.width - 10px; text: message.reply-to; color: root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; overflow: elide; }
+                                    }
+                                    StyledText {
+                                        width: max(0px, message-content.width - (message-row.columns ? message-row.action-width + 8px : 0px));
+                                        text: message.rich-body;
+                                        default-color: root.ink;
+                                        default-font-size: root.message-font-px;
+                                        default-font-family: root.message-font-family;
+                                        link-color: root.accent;
+                                        accessible-role: text;
+                                        accessible-label: message.rich-accessible-body;
+                                        link-clicked(url) => { root.open-message-link(url); }
+                                    }
+                                    if message.attachment-is-image && message.event-id != "" : ActionRect {
+                                        height: 67px; border-radius: StyleTokens.radius * 1;
+                                        background: self.has-hover ? root.hover : root.elevated;
+                                        border-width: 1px; border-color: root.divider; focus-color: root.accent;
+                                        label: "Preview image " + message.attachment;
+                                        enabled: root.live-session;
+                                        activated => { root.preview-image-attachment(message.event-id, message.attachment); }
+                                        HorizontalLayout {
+                                            padding: 11px; spacing: 12px;
+                                            Rectangle { width: 45px; border-radius: StyleTokens.radius * 0.8; background: root.panel;
+                                                Text { text: "▧"; color: root.accent; font-size: 27px; horizontal-alignment: center; vertical-alignment: center; }
                                             }
-                                            if message.reply-to != "" : Rectangle {
-                                                height: max(25px, 16px * root.text-scale + 6px);
-                                                border-radius: 5px;
-                                                background: transparent;
-                                                Rectangle { x: 0px; y: 4px; width: 2px; height: parent.height - 8px; border-radius: 1px; background: root.divider; }
-                                                Text { x: 10px; width: parent.width - 10px; text: message.reply-to; color: root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; overflow: elide; }
-                                            }
-                                            StyledText {
-                                                width: max(100px, timeline-list.visible-width - 110px);
-                                                text: message.rich-body;
-                                                default-color: root.ink;
-                                                default-font-size: 14px * root.text-scale;
-                                                link-color: root.accent;
-                                                accessible-role: text;
-                                                accessible-label: message.rich-accessible-body;
-                                                link-clicked(url) => { root.open-message-link(url); }
-                                            }
-                                            if message.attachment-is-image && message.event-id != "" : ActionRect {
-                                                height: 67px; border-radius: 10px;
-                                                background: self.has-hover ? root.hover : root.elevated;
-                                                border-width: 1px; border-color: root.divider; focus-color: root.accent;
-                                                label: "Preview image " + message.attachment;
-                                                enabled: root.live-session;
-                                                activated => { root.preview-image-attachment(message.event-id, message.attachment); }
-                                                HorizontalLayout {
-                                                    padding: 11px; spacing: 12px;
-                                                    Rectangle { width: 45px; border-radius: 8px; background: root.panel;
-                                                        Text { text: "▧"; color: root.accent; font-size: 27px; horizontal-alignment: center; vertical-alignment: center; }
-                                                    }
-                                                    VerticalLayout { spacing: 3px;
-                                                        Text { text: message.attachment; color: root.ink; font-size: 12px * root.text-scale; overflow: elide; }
-                                                        Text { text: "Open image · loads only when clicked"; color: root.muted; font-size: 10px * root.text-scale; }
-                                                    }
-                                                }
-                                            }
-                                            if message.attachment != "" : Rectangle {
-                                                width: min(440px, max(100px, timeline-list.visible-width - 110px));
-                                                height: 58px;
-                                                border-radius: 9px;
-                                                border-color: root.divider;
-                                                border-width: 1px;
-                                                background: root.panel;
-                                                HorizontalLayout {
-                                                    padding-left: 12px;
-                                                    padding-right: 12px;
-                                                    padding-top: 12px;
-                                                    padding-bottom: 12px;
-                                                    spacing: 10px;
-                                                    Rectangle { width: 28px; background: transparent;
-                                                        InterfaceGlyph { y: (parent.height - self.height) / 2; icon: "F"; ink: root.accent; }
-                                                    }
-                                                    Text { text: message.attachment; color: root.ink; font-size: 12px * root.text-scale; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
-                                                    IconAction {
-                                                        icon: "↓";
-                                                        label: "Save attachment " + message.attachment;
-                                                        ink: root.accent; surface: transparent; hover-surface: root.hover;
-                                                        enabled: root.live-session && message.event-id != "" && root.downloading-event-id == "";
-                                                        activated => { root.save-attachment(message.event-id, message.attachment); }
-                                                    }
-                                                }
-                                            }
-                                            if message.reaction != "" : Rectangle {
-                                                width: min(220px, max(56px, reaction-label.preferred-width + 20px));
-                                                height: max(24px, 16px * root.text-scale + 6px);
-                                                border-radius: 8px;
-                                                border-color: root.divider;
-                                                border-width: 1px;
-                                                background: root.panel;
-                                                reaction-label := Text { text: message.reaction; color: root.ink; font-size: 11px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                                            VerticalLayout { spacing: 3px;
+                                                Text { text: message.attachment; color: root.ink; font-size: 12px * root.text-scale; overflow: elide; }
+                                                Text { text: "Open image · loads only when clicked"; color: root.muted; font-size: 10px * root.text-scale; }
                                             }
                                         }
                                     }
+                                    if message.attachment != "" : Rectangle {
+                                        width: min(440px, max(0px, message-content.width - (message-row.columns ? message-row.action-width + 8px : 0px)));
+                                        height: 58px;
+                                        border-radius: StyleTokens.radius * 0.9;
+                                        border-color: root.divider;
+                                        border-width: 1px;
+                                        background: root.panel;
+                                        HorizontalLayout {
+                                            padding-left: 12px;
+                                            padding-right: 12px;
+                                            padding-top: 12px;
+                                            padding-bottom: 12px;
+                                            spacing: 10px;
+                                            Rectangle { width: 28px; background: transparent;
+                                                InterfaceGlyph { y: (parent.height - self.height) / 2; icon: "F"; ink: root.accent; }
+                                            }
+                                            Text { text: message.attachment; color: root.ink; font-size: 12px * root.text-scale; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
+                                            IconAction {
+                                                icon: "↓";
+                                                label: "Save attachment " + message.attachment;
+                                                ink: root.accent; surface: transparent; hover-surface: root.hover;
+                                                enabled: root.live-session && message.event-id != "" && root.downloading-event-id == "";
+                                                activated => { root.save-attachment(message.event-id, message.attachment); }
+                                            }
+                                        }
+                                    }
+                                    if message.reaction != "" : Rectangle {
+                                        width: min(220px, max(56px, reaction-label.preferred-width + 20px));
+                                        height: max(24px, 16px * root.text-scale + 6px);
+                                        border-radius: StyleTokens.radius * 0.8;
+                                        border-color: root.divider;
+                                        border-width: 1px;
+                                        background: root.panel;
+                                        reaction-label := Text { text: message.reaction; color: root.ink; font-size: 11px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                                    }
                                 }
+                            }
+                            // Keep the existing action controls and their keyboard/accessibility
+                            // paths. Reserve their width in the header/column body before overlaying.
+                            HorizontalLayout {
+                                x: parent.width - root.content-inset - message-row.action-width;
+                                y: root.message-row-gap + (message-row.tight-header ? max(26px, root.message-font-px * 1.4) : 0px); width: message-row.action-width; height: 26px;
+                                spacing: 8px; alignment: end;
+                                if message.event-id != "" : IconAction {
+                                    quiet: true; context-hover: message-hover.has-hover;
+                                    width: 28px; height: 26px; icon: "↩"; label: "Reply to " + message.sender;
+                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                    activated => {
+                                        if !root.composer-busy { root.begin-compose(1, message.event-id, message.sender, "", false); }
+                                        message-input.focus();
+                                    }
+                                }
+                                if message.event-id != "" && message.is-own && message.attachment == "" : IconAction {
+                                    quiet: true; context-hover: message-hover.has-hover;
+                                    width: 28px; height: 26px; icon: "✎"; label: "Edit your message";
+                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                    activated => {
+                                        if !root.composer-busy { root.begin-compose(2, message.event-id, message.sender, message.edit-source, message.edit-markdown); }
+                                        message-input.focus();
+                                    }
+                                }
+                                if message.event-id != "" : IconAction {
+                                    quiet: true; context-hover: message-hover.has-hover;
+                                    width: 28px; height: 26px; icon: "♥"; label: "Toggle heart reaction";
+                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                    activated => { root.toggle-message-reaction(message.event-id, "❤️"); }
+                                }
+                                if message.event-id != "" : IconAction {
+                                    quiet: true; context-hover: message-hover.has-hover;
+                                    width: 28px; height: 26px; icon: "☷"; label: "Open thread for " + message.sender;
+                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                    activated => {
+                                        root.thread-root-id = message.event-id;
+                                        root.thread-root-sender = message.sender;
+                                        root.thread-root-body = message.body;
+                                        root.thread-root-rich-body = message.rich-body;
+                                        root.thread-root-rich-accessible-body = message.rich-accessible-body;
+                                        root.thread-composer-text = "";
+                                        root.thread-send-pending = false;
+                                        root.thread-messages = [];
+                                        root.side-panel-tab = 1;
+                                        root.show-side-panel = true;
+                                        root.open-thread(message.event-id, message.sender, message.body);
+                                    }
+                                }
+                                if message.event-id != "" : IconAction {
+                                    quiet: true; context-hover: message-hover.has-hover;
+                                    width: 28px; height: 26px; icon: "⌫"; label: "Redact message from " + message.sender;
+                                    ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                    enabled: root.live-session && !root.room-admin-busy;
+                                    activated => {
+                                        root.room-admin-mode = 2;
+                                        root.room-admin-event-id = message.event-id;
+                                        root.room-admin-event-preview = message.sender + ": " + message.body;
+                                        root.room-admin-account-id = root.active-account-local-id;
+                                        root.room-admin-room-id = root.active-room-id;
+                                        root.room-admin-error = "";
+                                        root.room-admin-notice = "";
+                                        root.room-admin-open = true;
+                                    }
+                                }
+                            }
                         }
                     }
                     Rectangle {
-                        height: (root.composer-mode == 0 ? 78px : 109px) + (root.attachment-busy ? 29px : 0px);
+                        height: (root.composer-mode == 0 ? max(78px, 1.5 * root.message-font-px + 48px) : max(109px, 1.5 * root.message-font-px + 79px)) + (root.attachment-busy ? 29px : 0px);
                         background: root.canvas;
                         if root.attachment-busy : HorizontalLayout {
                             x: 22px; y: root.composer-mode == 0 ? 2px : 33px;
@@ -1910,11 +2112,11 @@ export component AppWindow inherits Window {
                             }
                         }
                         Rectangle {
-                            x: 18px;
+                            x: root.content-inset;
                             y: (root.composer-mode == 0 ? 7px : 38px) + (root.attachment-busy ? 29px : 0px);
-                            width: parent.width - 36px;
-                            height: 58px;
-                            border-radius: 11px;
+                            width: max(0px, parent.width - 2 * root.content-inset);
+                            height: max(58px, 1.5 * root.message-font-px + 28px);
+                            border-radius: StyleTokens.radius * 1.1;
                             border-color: root.divider;
                             border-width: 1px;
                             background: root.elevated;
@@ -1963,12 +2165,13 @@ export component AppWindow inherits Window {
                                         vertical-alignment: center;
                                     }
                                     message-input := MentionInput {
+                                        font-family: root.message-font-family;
                                         x: 3px;
                                         width: parent.width - 6px;
                                         height: parent.height;
                                         text <=> root.composer-text;
                                         color: root.ink;
-                                        font-size: 13px * root.text-scale;
+                                        font-size: root.message-font-px;
                                         vertical-alignment: center;
                                         accessible-label: root.composer-mode == 1 ? "Reply to " + root.composer-target-label : root.composer-mode == 2 ? "Edit your message" : "Message composer for " + root.active-room-name;
                                         caret-changed => { root.mention-cursor(false, self.caret-bytes, self.anchor-bytes, self.composing); }
@@ -2007,7 +2210,7 @@ export component AppWindow inherits Window {
                             }
                         }
                         if root.emoji-open && !root.emoji-threaded && root.mention-ui-allowed : EmojiPopup {
-                            x: 18px; y: -self.height; width: parent.width - 36px;
+                            x: root.content-inset; y: -self.height; width: max(0px, parent.width - 2 * root.content-inset);
                             items: root.emoji-items; current: root.emoji-index; query <=> root.emoji-query-text;
                             surface: root.panel; elevated: root.elevated; hover: root.hover; ink: root.ink; muted: root.muted; accent: root.accent; text-scale: root.text-scale;
                             searched(query) => { root.emoji-query(query); }
@@ -2019,7 +2222,7 @@ export component AppWindow inherits Window {
                             }
                         }
                         if root.composer-mentions.length > 0 && root.mention-ui-allowed && !root.emoji-open : MentionPopup {
-                            x: 18px; y: -self.height; width: parent.width - 36px;
+                            x: root.content-inset; y: -self.height; width: max(0px, parent.width - 2 * root.content-inset);
                             items: root.composer-mentions; current: root.composer-mention-index;
                             surface: root.panel; hover: root.hover; ink: root.ink; muted: root.muted; accent: root.accent; text-scale: root.text-scale;
                             choose(key) => {
@@ -2052,7 +2255,7 @@ export component AppWindow inherits Window {
                         height: 39px; spacing: 8px;
                         Rectangle {
                             horizontal-stretch: 2; height: 39px;
-                            background: root.elevated; border-radius: 8px;
+                            background: root.elevated; border-radius: StyleTokens.radius * 0.8;
                             if root.directory-search == "" : Text {
                                 x: 10px; width: parent.width - 20px; height: parent.height;
                                 text: "Room name or topic"; color: root.muted;
@@ -2069,7 +2272,7 @@ export component AppWindow inherits Window {
                         }
                         Rectangle {
                             width: 190px; height: 39px;
-                            background: root.elevated; border-radius: 8px;
+                            background: root.elevated; border-radius: StyleTokens.radius * 0.8;
                             if root.directory-server == "" : Text {
                                 x: 10px; width: parent.width - 20px; height: parent.height;
                                 text: "Server (optional)"; color: root.muted;
@@ -2106,7 +2309,7 @@ export component AppWindow inherits Window {
                         height: 39px; spacing: 8px;
                         Rectangle {
                             horizontal-stretch: 1; height: 39px;
-                            background: root.elevated; border-radius: 8px;
+                            background: root.elevated; border-radius: StyleTokens.radius * 0.8;
                             if root.directory-join-input == "" : Text {
                                 x: 10px; width: parent.width - 20px; height: parent.height;
                                 text: "#room:server or matrix.to link"; color: root.muted;
@@ -2167,7 +2370,7 @@ export component AppWindow inherits Window {
                         horizontal-scrollbar-policy: always-off;
                         for room in root.directory-results : Rectangle {
                             width: directory-list.visible-width; height: 101px;
-                            background: root.elevated; border-radius: 9px;
+                            background: root.elevated; border-radius: StyleTokens.radius * 0.9;
                             HorizontalLayout {
                                 padding-left: 14px; padding-right: 12px; padding-top: 10px; padding-bottom: 10px;
                                 spacing: 12px;
@@ -2206,7 +2409,78 @@ export component AppWindow inherits Window {
                         padding: 26px;
                         spacing: 18px;
                         Text { text: "Appearance"; color: root.ink; font-size: 24px * root.text-scale; font-weight: 780; }
-                        Text { text: "Choose a theme that feels right in every room."; color: root.muted; font-size: 13px * root.text-scale; }
+                        Text { text: "Shape your workspace: typography, spacing, geometry and conversation style."; color: root.muted; font-size: 13px * root.text-scale; }
+                        Text { text: "Starting points"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
+                        Text { text: "Presets fill in editable settings. Fonts use installed families; a missing family falls back to your system font."; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+                        for name[index] in ["Nocturne", "Terminal", "Paper"] : ActionRect {
+                            height: 66px * root.text-scale;
+                            label: "Apply " + name + " appearance preset";
+                            background: self.has-hover ? root.hover : root.elevated;
+                            border-radius: StyleTokens.radius; focus-color: root.accent;
+                            activated => { root.choose-style-preset(index); }
+                            VerticalLayout {
+                                padding: 12px; spacing: 5px;
+                                Text { text: name; color: root.ink; font-size: 13px * root.text-scale; font-weight: 650; }
+                                Text { text: index == 0 ? "Charcoal · soft edges · avatars and room context" : index == 1 ? "Monospaced · square edges · aligned nickname columns" : "Warm paper · serif messages · quiet, open space";
+                                    color: root.muted; font-size: 10px * root.text-scale; wrap: word-wrap; }
+                            }
+                        }
+                        Text { text: "Fonts"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
+                        StyleFontSetting { label: "Interface font family"; family <=> root.appearance-ui-font-input;
+                            ink: root.ink; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; }
+                        StyleFontSetting { label: "Message font family · blank follows interface"; family <=> root.appearance-message-font-input;
+                            ink: root.ink; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; }
+                        StyleFontSetting { label: "Monospaced font family · timestamps and security codes"; family <=> root.appearance-mono-font-input;
+                            ink: root.ink; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; }
+                        TextAction {
+                            text: "Apply fonts"; ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                            outline: root.divider; text-scale: root.text-scale;
+                            activated => { root.set-style-fonts(root.appearance-ui-font-input, root.appearance-message-font-input, root.appearance-mono-font-input); }
+                        }
+                        StyleNumberSetting { label: "Message font size"; value: root.message-font-size; minimum: 10; maximum: 32;
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
+                            changed-value(value) => { root.change-style-number(0, value); } }
+                        Text { text: "Conversation style"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
+                        for name[index] in ["Stacked · names above messages", "Compact · smaller names and avatars", "Columns · aligned timestamps and nicknames"] : ActionRect {
+                            height: 40px * root.text-scale;
+                            label: name + (root.message-layout == index ? ", selected" : "");
+                            background: root.message-layout == index || self.has-hover ? root.hover : root.elevated;
+                            border-radius: StyleTokens.radius * 0.8; border-width: root.message-layout == index ? 1px : 0px; border-color: root.accent;
+                            focus-color: root.accent; activated => { root.choose-message-layout(index); }
+                            Text { x: 12px; width: parent.width - 24px; height: parent.height;
+                                text: name; color: root.ink; font-size: 11px * root.text-scale; vertical-alignment: center; overflow: elide; }
+                        }
+                        Text { text: "Columns use a compact header when the conversation is too narrow. Text scale and room density continue to apply.";
+                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+                        for name[index] in ["Message avatars", "Message timestamps", "Colored sender names"] : style-toggle := ActionRect {
+                            property <bool> selected: index == 0 ? root.show-message-avatars : index == 1 ? root.show-message-timestamps : root.color-message-senders;
+                            height: 42px * root.text-scale;
+                            label: name + (self.selected ? ", on" : ", off");
+                            background: self.has-hover ? root.hover : root.elevated; border-radius: StyleTokens.radius * 0.8; focus-color: root.accent;
+                            activated => { root.set-style-flag(index, !self.selected); }
+                            HorizontalLayout { padding: 12px; spacing: 8px;
+                                Text { text: name; color: root.ink; font-size: 12px * root.text-scale; horizontal-stretch: 1; }
+                                Text { text: style-toggle.selected ? "On" : "Off"; color: root.accent; font-size: 12px * root.text-scale; }
+                            }
+                        }
+                        Text { text: "Geometry"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
+                        StyleNumberSetting { label: "Corner radius"; value: root.corner-radius-px; minimum: 0; maximum: 24;
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
+                            changed-value(value) => { root.change-style-number(1, value); } }
+                        StyleNumberSetting { label: "Message spacing"; value: root.message-gap-px; minimum: 0; maximum: 32;
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
+                            changed-value(value) => { root.change-style-number(2, value); } }
+                        StyleNumberSetting { label: "Conversation inset"; value: root.content-padding-px; minimum: 0; maximum: 48; step: 2;
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
+                            changed-value(value) => { root.change-style-number(3, value); } }
+                        StyleNumberSetting { label: "Space rail width"; value: root.rail-width-px; minimum: 44; maximum: 100; step: 2;
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
+                            changed-value(value) => { root.change-style-number(4, value); } }
+                        StyleNumberSetting { label: "Nickname column width"; value: root.nickname-width-px; minimum: 64; maximum: 240; step: 8;
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
+                            changed-value(value) => { root.change-style-number(5, value); } }
+                        Rectangle { height: 1px; background: root.divider; }
+                        Text { text: "Base palette"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         HorizontalLayout {
                             spacing: 12px;
                             for choice[index] in ["Dark", "Light", "High contrast", "System"] : Rectangle {
@@ -2215,7 +2489,7 @@ export component AppWindow inherits Window {
                                 background: index == root.theme-mode ? root.hover : root.elevated;
                                 border-color: index == root.theme-mode ? root.accent : root.divider;
                                 border-width: index == root.theme-mode ? 2px : 1px;
-                                border-radius: 11px;
+                                border-radius: StyleTokens.radius * 1.1;
                                 accessible-role: button;
                                 accessible-label: "Use " + choice + " theme";
                                 accessible-action-default => { root.choose-theme(index); }
@@ -2224,10 +2498,10 @@ export component AppWindow inherits Window {
                                     spacing: 9px;
                                     Rectangle {
                                         height: 42px;
-                                        border-radius: 6px;
+                                        border-radius: StyleTokens.radius * 0.6;
                                         background: index == 1 ? #e6eaf2 : #11151f;
                                         Rectangle {
-                                            x: 8px; y: 8px; width: 30px; height: 26px; border-radius: 4px;
+                                            x: 8px; y: 8px; width: 30px; height: 26px; border-radius: StyleTokens.radius * 0.4;
                                             background: index == 1 ? #6545b5 : index == 2 ? #ffff00 : #ad91ff;
                                         }
                                     }
@@ -2237,7 +2511,7 @@ export component AppWindow inherits Window {
                             }
                         }
                         Rectangle {
-                            height: 70px; border-radius: 10px; background: root.elevated;
+                            height: 70px; border-radius: StyleTokens.radius * 1; background: root.elevated;
                             HorizontalLayout {
                                 padding-left: 16px; padding-right: 16px; spacing: 9px;
                                 VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 3px;
@@ -2252,7 +2526,7 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             spacing: 10px;
                             for choice[index] in ["Compact", "Comfortable", "Spacious"] : Rectangle {
-                                width: 142px; height: 40px; border-radius: 9px;
+                                width: 142px; height: 40px; border-radius: StyleTokens.radius * 0.9;
                                 background: index == root.density-mode ? root.hover : root.elevated;
                                 border-color: index == root.density-mode ? root.accent : root.divider;
                                 border-width: index == root.density-mode ? 2px : 1px;
@@ -2266,7 +2540,7 @@ export component AppWindow inherits Window {
                         Rectangle { height: 1px; background: root.divider; }
                         Text { text: "Layout"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Rectangle {
-                            height: 70px; border-radius: 10px; background: root.elevated;
+                            height: 70px; border-radius: StyleTokens.radius * 1; background: root.elevated;
                             HorizontalLayout {
                                 padding-left: 16px; padding-right: 16px; spacing: 12px;
                                 VerticalLayout {
@@ -2283,7 +2557,7 @@ export component AppWindow inherits Window {
                             }
                         }
                         Rectangle {
-                            height: 70px; border-radius: 10px; background: root.elevated;
+                            height: 70px; border-radius: StyleTokens.radius * 1; background: root.elevated;
                             HorizontalLayout {
                                 padding-left: 16px; padding-right: 16px; spacing: 9px;
                                 VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 3px;
@@ -2295,7 +2569,7 @@ export component AppWindow inherits Window {
                             }
                         }
                         Rectangle {
-                            height: 70px; border-radius: 10px; background: root.elevated;
+                            height: 70px; border-radius: StyleTokens.radius * 1; background: root.elevated;
                             HorizontalLayout {
                                 padding-left: 16px; padding-right: 16px; spacing: 9px;
                                 VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 3px;
@@ -2307,7 +2581,7 @@ export component AppWindow inherits Window {
                             }
                         }
                         Rectangle {
-                            height: 70px; border-radius: 10px; background: root.elevated;
+                            height: 70px; border-radius: StyleTokens.radius * 1; background: root.elevated;
                             HorizontalLayout {
                                 padding-left: 16px; padding-right: 16px; spacing: 12px;
                                 VerticalLayout {
@@ -2324,7 +2598,7 @@ export component AppWindow inherits Window {
                             }
                         }
                         Rectangle {
-                            height: 70px; border-radius: 10px; background: root.elevated;
+                            height: 70px; border-radius: StyleTokens.radius * 1; background: root.elevated;
                             HorizontalLayout {
                                 padding-left: 16px; padding-right: 16px; spacing: 9px;
                                 VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 3px;
@@ -2500,7 +2774,7 @@ export component AppWindow inherits Window {
                                     }
                                     if root.sas-stage == 4 && root.sas-decimals != "" : Text {
                                         text: "Numbers: " + root.sas-decimals; color: root.ink;
-                                        font-family: "monospace"; font-size: 14px * root.text-scale;
+                                        font-family: root.monospace-font-family; font-size: 14px * root.text-scale;
                                         accessible-label: "SAS number comparison: " + root.sas-decimals;
                                     }
                                     if root.sas-stage == 4 : ActionRect {
@@ -3009,7 +3283,7 @@ export component AppWindow inherits Window {
         }
 
         if root.show-side-panel && root.page == 0 : Rectangle {
-            width: root.details-width * 1px;
+            width: min(root.details-width * 1px, max(200px, root.width * 0.25));
             background: root.panel;
             border-color: root.divider;
             border-width: 1px;
@@ -3097,7 +3371,7 @@ export component AppWindow inherits Window {
                         font-weight: 700;
                     }
                     if root.live-session && root.active-room-id != "" : HorizontalLayout {
-                        height: 42px; padding-left: 10px; padding-right: 10px; spacing: 6px;
+                        height: max(42px, 32px * root.text-scale); padding-left: 10px; padding-right: 10px; spacing: 6px;
                         Rectangle {
                             horizontal-stretch: 1; background: root.elevated;
                             border-radius: 7px; border-color: root.divider; border-width: 1px;
@@ -3114,11 +3388,13 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
-                        Button {
-                            width: 62px; text: "Invite";
+                        TextAction {
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                            outline: root.divider; text-scale: root.text-scale;
+                            text: "Invite";
                             enabled: !root.member-action-busy && root.member-invite-user-id != "";
                             accessible-label: "Invite Matrix user to this room";
-                            clicked => { root.submit-member-action(0, root.member-invite-user-id, ""); }
+                            activated => { root.submit-member-action(0, root.member-invite-user-id, ""); }
                         }
                     }
                     if root.member-action-error != "" : Text {
@@ -3329,14 +3605,15 @@ export component AppWindow inherits Window {
                                 min-height: 43px;
                                 vertical-stretch: 0;
                                 background: root.elevated;
-                                border-radius: 8px;
+                                border-radius: StyleTokens.radius * 0.8;
                                 VerticalLayout {
-                                    padding: 9px; spacing: 4px;
-                                    Text { text: reply.sender + " · " + reply.time; color: root.accent; font-size: 11px * root.text-scale; font-weight: 700; }
+                                    padding: min(12px, root.content-inset); spacing: max(2px, root.message-row-gap);
+                                    Text { text: reply.sender + (root.show-message-timestamps || reply.time == "Sending…" || reply.time == "Failed to send" ? " · " + reply.time : ""); color: root.color-message-senders ? reply.accent : root.ink; font-size: 11px * root.text-scale; font-weight: 700; }
                                     StyledText {
                                         text: reply.rich-body;
                                         default-color: root.ink;
-                                        default-font-size: 12px * root.text-scale;
+                                        default-font-size: root.message-font-px;
+                                        default-font-family: root.message-font-family;
                                         link-color: root.accent;
                                         accessible-role: text;
                                         accessible-label: reply.rich-accessible-body;
@@ -3352,14 +3629,15 @@ export component AppWindow inherits Window {
                         }
                     }
                     if root.thread-root-id != "" : Rectangle {
-                        height: 64px; background: root.panel;
+                        height: max(64px, 1.5 * root.message-font-px + 24px); background: root.panel;
                         HorizontalLayout {
                             padding-left: 10px; padding-right: 10px; padding-top: 8px; padding-bottom: 8px; spacing: 5px;
                             Rectangle {
                                 horizontal-stretch: 1; background: root.elevated; border-radius: 8px;
                                 thread-input := MentionInput {
+                                    font-family: root.message-font-family;
                                     x: 8px; width: parent.width - 16px; height: parent.height;
-                                    text <=> root.thread-composer-text; color: root.ink; font-size: 12px * root.text-scale;
+                                    text <=> root.thread-composer-text; color: root.ink; font-size: root.message-font-px;
                                     accessible-label: "Reply in thread started by " + root.thread-root-sender;
                                     property <string> thread-context: root.thread-root-id;
                                     init => { self.focus(); root.mention-cursor(true, self.caret-bytes, self.anchor-bytes, self.composing); }
@@ -4414,92 +4692,6 @@ export component AppWindow inherits Window {
         }
     }
 
-    if root.manage-accounts-open && !root.show-sign-in : Rectangle {
-        background: #000000aa;
-        FocusScope {
-            width: parent.width;
-            height: parent.height;
-            focus-on-tab-navigation: false;
-            init => { done-manage.focus(); }
-            capture-key-pressed(event) => {
-                if event.text == Key.Tab && !event.modifiers.shift && done-manage.has-focus {
-                    add-manage.focus();
-                    accept
-                } else if (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) && add-manage.has-focus {
-                    done-manage.focus();
-                    accept
-                } else { reject }
-            }
-            key-pressed(event) => {
-                if event.text == Key.Escape {
-                    root.manage-accounts-open = false;
-                    account-trigger.focus();
-                    accept
-                } else { reject }
-            }
-        Rectangle {
-            x: (parent.width - 460px) / 2;
-            y: (parent.height - 430px) / 2;
-            width: 460px;
-            height: 430px;
-            border-radius: 14px;
-            border-color: root.divider;
-            border-width: 1px;
-            background: root.canvas;
-            accessible-role: region;
-            accessible-label: "Manage Matrix accounts";
-            VerticalLayout {
-                padding: 20px;
-                spacing: 10px;
-                Text { text: "Manage accounts"; color: root.ink; font-size: 21px * root.text-scale; font-weight: 760; }
-                Text { text: "The current account appears first. Each account keeps its own rooms and session."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
-                ScrollView {
-                    vertical-stretch: 1;
-                    horizontal-scrollbar-policy: always-off;
-                    VerticalLayout {
-                        width: parent.width;
-                        spacing: 7px;
-                        for account in root.account-options : Rectangle {
-                            height: 56px; border-radius: 9px; background: root.elevated;
-                            HorizontalLayout {
-                                padding-left: 10px; padding-right: 10px; spacing: 10px;
-                                AvatarBadge { width: 35px; height: 35px; border-radius: 11px; initials: account.initials; accent: account.accent; }
-                                VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 2px;
-                                    Text { text: account.name; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; }
-                                    Text { text: account.handle; color: root.muted; font-size: 10px * root.text-scale; }
-                                }
-                                if account.index == root.active-account-index : Text { text: "CURRENT"; color: root.accent; font-size: 10px * root.text-scale; font-weight: 700; vertical-alignment: center; }
-                            }
-                        }
-                    }
-                }
-                HorizontalLayout {
-                    spacing: 8px;
-                    add-manage := ActionRect {
-                        width: 120px; height: 38px; background: root.elevated; border-radius: 8px;
-                        focus-color: root.accent;
-                        label: "Add Matrix account";
-                        cancel-on-escape: true;
-                        cancelled => { root.manage-accounts-open = false; account-trigger.focus(); }
-                        activated => { root.manage-accounts-open = false; root.add-account(); }
-                        Text { text: "Add account"; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
-                    }
-                    Rectangle { horizontal-stretch: 1; background: transparent; }
-                    done-manage := ActionRect {
-                        width: 80px; height: 38px; background: root.accent; border-radius: 8px;
-                        focus-color: root.accent-ink;
-                        label: "Close account manager";
-                        cancel-on-escape: true;
-                        cancelled => { root.manage-accounts-open = false; account-trigger.focus(); }
-                        activated => { root.manage-accounts-open = false; account-trigger.focus(); }
-                        Text { text: "Done"; color: root.accent-ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
-                    }
-                }
-            }
-        }
-        }
-    }
-
     if root.show-sign-in : Rectangle {
         background: root.rail;
         Rectangle {
@@ -4522,6 +4714,16 @@ export component AppWindow inherits Window {
                 }
                 Text { text: "Welcome to Morpheus"; color: root.ink; font-size: 22px * root.text-scale; font-weight: 770; }
                 Text { text: "Sign in with an existing Matrix account."; color: root.muted; font-size: 12px * root.text-scale; }
+                if root.saved-accounts.length > 0 : TextAction {
+                    text: "Choose a saved account"; ink: root.ink; muted: root.muted;
+                    surface: root.panel; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                    activated => { root.manage-accounts-open = true; root.manage-accounts(); }
+                }
+                if root.account-access-notice != "" : Text {
+                    text: root.account-access-notice; color: root.muted; font-size: 11px * root.text-scale;
+                    wrap: word-wrap; accessible-live-region: polite;
+                }
+
                 Rectangle { height: 6px; background: transparent; }
                 Text { text: "HOMESERVER"; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
                 Rectangle {
@@ -4635,7 +4837,7 @@ export component AppWindow inherits Window {
                         if root.security-key-revealed : Text {
                             x: 12px; y: 8px; width: parent.width - 24px; height: parent.height - 16px;
                             text: root.security-recovery-key; color: root.ink; font-size: 14px * root.text-scale;
-                            font-family: "monospace"; wrap: word-wrap;
+                            font-family: root.monospace-font-family; wrap: word-wrap;
                             accessible-label: "Recovery key shown once: " + root.security-recovery-key;
                         }
                         if !root.security-key-revealed : Text {
@@ -4668,4 +4870,190 @@ export component AppWindow inherits Window {
         }
     }
     } // shortcut-scope
+    if root.manage-accounts-open : FocusScope {
+        focus-on-tab-navigation: false;
+        init => { manage-close.focus(); }
+        capture-key-pressed(event) => {
+            if event.text == Key.Escape { root.manage-accounts-open = false; accept }
+            else if event.text == Key.Tab && !event.modifiers.shift && manage-close.has-focus { manage-add.focus(); accept }
+            else if (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) && manage-add.has-focus { manage-close.focus(); accept }
+            else { reject }
+        }
+        Rectangle {
+            background: #000000aa;
+            TouchArea { }
+            Rectangle {
+                width: min(620px * root.text-scale, parent.width - 32px);
+                height: min(680px * root.text-scale, parent.height - 32px);
+                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                background: root.canvas; border-radius: 14px; border-width: 1px; border-color: root.divider;
+                accessible-role: region; accessible-label: "Manage saved Matrix accounts";
+                VerticalLayout {
+                    padding: 20px; spacing: 12px;
+                    Text { text: "Your accounts"; color: root.ink; font-size: 22px * root.text-scale; font-weight: 750; }
+                    Text { text: "Separate aliases, one app. Open an account or remove it directly from this device."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                    manage-add := TextAction {
+                        text: "Add account"; ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                        activated => { root.manage-accounts-open = false; root.add-account(); }
+                    }
+                    ScrollView {
+                        vertical-stretch: 1; horizontal-scrollbar-policy: always-off;
+                        VerticalLayout {
+                            spacing: 8px;
+                            for account in root.saved-accounts : Rectangle {
+                                min-height: 88px * root.text-scale; background: root.elevated; border-radius: 9px;
+                                VerticalLayout {
+                                    padding: 10px; spacing: 7px;
+                                    Text { text: account.handle; color: root.ink; font-size: 13px * root.text-scale; overflow: elide; accessible-label: account.handle; }
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Text { text: account.removal-pending ? "Removal pending" : account.active ? "Current account" : "Paused"; color: root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; }
+                                        TextAction {
+                                            text: root.app-password-enabled ? "Unlock" : "Open"; enabled: !account.removal-pending;
+                                            label: "Open " + account.handle;
+                                            ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                                            activated => { root.activate-saved-account(account.id); }
+                                        }
+                                        TextAction {
+                                            text: account.removal-pending ? "Retry removal" : "Remove"; label: "Remove " + account.handle + " from this app";
+                                            ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                                            activated => { root.remove-saved-account(account.id); }
+                                        }
+                                    }
+                                }
+                            }
+                            if root.saved-accounts.length == 0 : Text { text: "No saved accounts. Add a Matrix account to get started."; color: root.muted; wrap: word-wrap; font-size: 12px * root.text-scale; }
+                        }
+                    }
+                    Rectangle { height: 1px; background: root.divider; }
+                    Text { text: root.app-password-enabled ? "Switch protection is on" : "Switch protection is off"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
+                    Text { text: "One local app password for every account switch and startup restore. Works with SSO accounts too."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        TextAction {
+                            text: root.app-password-enabled ? "Change password" : "Set app password";
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                            activated => { root.open-app-password(root.app-password-enabled ? 2 : 1); }
+                        }
+                        if root.app-password-enabled : TextAction {
+                            text: "Turn off"; label: "Turn off account switch protection";
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                            activated => { root.open-app-password(3); }
+                        }
+                    }
+                    if root.saved-accounts.length == 0 && root.app-password-enabled : TextAction {
+                        text: "Reset password after removing all accounts";
+                        ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                        activated => { root.open-app-password(5); }
+                    }
+                    Text { text: root.account-access-notice; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+                    manage-close := TextAction {
+                        text: "Done"; ink: root.accent-ink; muted: root.muted; surface: root.accent; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                        activated => { root.manage-accounts-open = false; }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.access-open : FocusScope {
+        focus-on-tab-navigation: false;
+        init => { access-cancel.focus(); }
+        capture-key-pressed(event) => {
+            if event.text == Key.Escape {
+                if !root.access-busy || root.access-mode == 0 { root.cancel-account-access(); }
+                accept
+            } else if root.access-busy && (event.text == Key.Tab || event.text == Key.Backtab) { accept }
+            else if event.text == Key.Tab && !event.modifiers.shift && access-submit.has-focus {
+                if root.access-mode >= 4 { access-cancel.focus(); }
+                else if root.access-mode == 1 { access-new.focus(); }
+                else { access-current.focus(); }
+                accept
+            } else if (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) &&
+                ((root.access-mode >= 4 && access-cancel.has-focus) || (root.access-mode == 1 && access-new.has-focus) || ((root.access-mode == 0 || root.access-mode == 2 || root.access-mode == 3) && access-current.has-focus)) {
+                access-submit.focus(); accept
+            } else { reject }
+        }
+        Rectangle {
+            background: #000000bb;
+            TouchArea { }
+            Rectangle {
+                width: min(540px * root.text-scale, parent.width - 32px);
+                height: min(610px * root.text-scale, parent.height - 32px);
+                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
+                background: root.canvas; border-radius: 14px; border-width: 1px; border-color: root.divider;
+                accessible-role: form; accessible-label: root.access-mode == 4 ? "Remove saved account" : "Local app password";
+                VerticalLayout {
+                    padding: 22px; spacing: 12px;
+                    Text {
+                        text: root.access-mode == 0 ? "Unlock account" : root.access-mode == 1 ? "Set app password" : root.access-mode == 2 ? "Change app password" : root.access-mode == 3 ? "Turn off protection?" : root.access-mode == 5 ? "Reset app password?" : "Remove from this app?";
+                        color: root.ink; font-size: 21px * root.text-scale; font-weight: 750; wrap: word-wrap;
+                    }
+                    ScrollView {
+                        vertical-stretch: 1; horizontal-scrollbar-policy: always-off;
+                        VerticalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: root.access-mode == 5 ? "Reset is available only after every saved account and its local credentials and history have been removed. You can then set a new password and sign in again. This cannot unlock an existing account."
+                                    : root.access-mode == 4 ? "This removes the saved session and local history for this account. It works offline. It does not log out the homeserver device; revoke that device from another client if needed. Keep your recovery key before removing your last verified device."
+                                    : root.access-mode == 0 ? "Enter your local app password to open this account."
+                                    : root.access-mode == 3 ? "Your current app password is required. Saved accounts will then open without this prompt."
+                                    : "Choose one password for protected switches on this device. Use at least 12 characters. Keep it in your password manager; Morpheus cannot recover it. This protects access through Morpheus, not access by someone who controls your operating system.";
+                                color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap;
+                            }
+                            if root.access-target != "" : Text { text: root.access-target; color: root.ink; font-size: 13px * root.text-scale; wrap: word-wrap; }
+                            if root.access-mode == 0 || root.access-mode == 2 || root.access-mode == 3 : Text { text: "Current app password"; color: root.ink; font-size: 12px * root.text-scale; }
+                            Rectangle {
+                                visible: root.access-mode == 0 || root.access-mode == 2 || root.access-mode == 3;
+                                height: self.visible ? 42px * root.text-scale : 0px; background: root.elevated; border-radius: 8px;
+                                access-current := TextInput {
+                                    x: 12px; width: parent.width - 24px; height: parent.height; single-line: true; input-type: password;
+                                    enabled: parent.visible && !root.access-busy; text <=> root.access-current-password;
+                                    color: root.ink; font-size: 14px * root.text-scale; vertical-alignment: center; accessible-label: "Current local app password";
+                                    accepted => { if !root.access-busy && root.access-mode != 2 { root.submit-account-access(); } }
+                                }
+                            }
+                            if root.access-mode == 1 || root.access-mode == 2 : Text { text: "New app password"; color: root.ink; font-size: 12px * root.text-scale; }
+                            Rectangle {
+                                visible: root.access-mode == 1 || root.access-mode == 2;
+                                height: self.visible ? 42px * root.text-scale : 0px; background: root.elevated; border-radius: 8px;
+                                access-new := TextInput {
+                                    x: 12px; width: parent.width - 24px; height: parent.height; single-line: true; input-type: password;
+                                    enabled: parent.visible && !root.access-busy; text <=> root.access-new-password;
+                                    color: root.ink; font-size: 14px * root.text-scale; vertical-alignment: center; accessible-label: "New local app password";
+                                }
+                            }
+                            if root.access-mode == 1 || root.access-mode == 2 : Text { text: "Confirm new password"; color: root.ink; font-size: 12px * root.text-scale; }
+                            Rectangle {
+                                visible: root.access-mode == 1 || root.access-mode == 2;
+                                height: self.visible ? 42px * root.text-scale : 0px; background: root.elevated; border-radius: 8px;
+                                access-confirm := TextInput {
+                                    x: 12px; width: parent.width - 24px; height: parent.height; single-line: true; input-type: password;
+                                    enabled: parent.visible && !root.access-busy; text <=> root.access-confirm-password;
+                                    color: root.ink; font-size: 14px * root.text-scale; vertical-alignment: center; accessible-label: "Confirm new local app password";
+                                    accepted => { if !root.access-busy { root.submit-account-access(); } }
+                                }
+                            }
+                            Text { text: root.access-error; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 10px; alignment: end;
+                        access-cancel := TextAction {
+                            text: "Cancel"; enabled: !root.access-busy || root.access-mode == 0;
+                            ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                            activated => { root.cancel-account-access(); }
+                        }
+                        access-submit := TextAction {
+                            text: root.access-busy ? "Working…" : root.access-mode == 0 ? "Unlock" : root.access-mode == 3 ? "Turn off" : root.access-mode == 4 ? "Remove account" : root.access-mode == 5 ? "Reset password" : "Save password";
+                            enabled: !root.access-busy;
+                            ink: root.accent-ink; muted: root.muted; surface: root.accent; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                            activated => { root.submit-account-access(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
 }

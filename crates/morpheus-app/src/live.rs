@@ -368,6 +368,94 @@ impl LiveUi {
         }
     }
 
+    /// Complete a core-authorized account activation while holding account_transition.
+    pub(crate) async fn account_activated(
+        self: &Arc<Self>,
+        ui: Weak<AppWindow>,
+    ) -> Result<(), MatrixCoreError> {
+        self.invalidate_navigation();
+        self.clear_feed().await;
+        *self.selected_room.lock().await = None;
+        *self.selected_space.lock().await = None;
+        self.invalidate_space_scan().await;
+        self.space_children.lock().await.clear();
+        self.is_live.store(true, Ordering::Release);
+        if let Err(error) = self.refresh(ui.clone()).await {
+            self.manager.stop().await;
+            self.account_detached(ui).await;
+            return Err(error);
+        }
+        let _ = ui.upgrade_in_event_loop(|ui| {
+            ui.set_login_loading(false);
+            ui.set_login_error("".into());
+            ui.set_show_sign_in(false);
+        });
+        tokio::spawn(self.clone().scan_spaces(ui));
+        Ok(())
+    }
+
+    /// Hide revoked account data without automatically activating another account.
+    pub(crate) async fn account_detached(self: &Arc<Self>, ui: Weak<AppWindow>) {
+        self.is_live.store(false, Ordering::Release);
+        self.invalidate_navigation();
+        self.render_epoch.fetch_add(1, Ordering::AcqRel);
+        self.clear_feed().await;
+        *self.selected_room.lock().await = None;
+        *self.selected_space.lock().await = None;
+        self.invalidate_space_scan().await;
+        self.space_children.lock().await.clear();
+        let gate = self.security_gate.clone();
+        let _ = ui.upgrade_in_event_loop(move |ui| {
+            ui.invoke_cancel_room_settings();
+            ui.invoke_close_image_preview();
+            crate::reset_room_search(&ui);
+            crate::reset_attachment_view(&ui);
+            clear_account_context(&ui, &gate);
+            ui.set_live_session(false);
+            ui.set_preview_session(false);
+            ui.set_active_account_local_id("".into());
+            ui.set_active_account_index(-1);
+            ui.set_active_account_name("Choose an account".into());
+            ui.set_active_account_handle("".into());
+            ui.set_active_account_initials("".into());
+            ui.set_active_account_status("Locked".into());
+            ui.set_account_options(ModelRc::new(VecModel::<AccountOption>::default()));
+            ui.set_accounts(ModelRc::new(VecModel::<AccountItem>::default()));
+            ui.set_active_room_id("".into());
+            ui.set_active_room_name("".into());
+            ui.set_active_room_topic("".into());
+            ui.set_active_space_id("".into());
+            ui.set_active_space_name("Home".into());
+            ui.set_spaces(ModelRc::new(VecModel::<SpaceItem>::default()));
+            ui.set_channels(ModelRc::new(VecModel::<RoomItem>::default()));
+            ui.set_direct_messages(ModelRc::new(VecModel::<RoomItem>::default()));
+            ui.set_unsorted_channels(ModelRc::new(VecModel::<RoomItem>::default()));
+            ui.set_unsorted_direct_messages(ModelRc::new(VecModel::<RoomItem>::default()));
+            ui.set_messages(ModelRc::new(VecModel::<MessageItem>::default()));
+            ui.set_thread_messages(ModelRc::new(VecModel::<MessageItem>::default()));
+            ui.set_members(ModelRc::new(VecModel::<MemberItem>::default()));
+            ui.set_composer_text("".into());
+            ui.set_composer_saved_draft("".into());
+            ui.set_composer_mode(0);
+            ui.set_composer_target_id("".into());
+            ui.set_composer_target_label("".into());
+            ui.set_composer_busy(false);
+            ui.set_thread_root_id("".into());
+            ui.set_thread_root_sender("".into());
+            ui.set_thread_root_body("".into());
+            ui.set_thread_root_rich_body(Default::default());
+            ui.set_thread_root_rich_accessible_body("".into());
+            ui.set_thread_composer_text("".into());
+            ui.set_thread_send_pending(false);
+            ui.set_room_actions_open(false);
+            ui.set_member_confirm_open(false);
+            ui.set_quick_switcher_open(false);
+            ui.set_show_sign_in(true);
+            ui.set_login_loading(false);
+            ui.set_session_error("".into());
+        });
+    }
+
     pub async fn select_account(
         self: &Arc<Self>,
         index: usize,
@@ -1561,25 +1649,7 @@ fn apply_snapshot(
     let close_sign_in = snapshot_closes_sign_in(ui.get_live_session(), account_changed);
     let selection_changed = account_changed || ui.get_active_room_id().as_str() != next_room_id;
     if account_changed {
-        crate::security::clear_ui(ui, security_gate);
-        ui.set_room_actions_open(false);
-        ui.set_room_action_busy(false);
-        ui.set_room_action_error("".into());
-        ui.set_invite_error("".into());
-        ui.set_room_action_operation(ui.get_room_action_operation().wrapping_add(1));
-        ui.set_directory_operation(ui.get_directory_operation().wrapping_add(1));
-        ui.set_directory_join_operation(ui.get_directory_join_operation().wrapping_add(1));
-        ui.set_directory_loading(false);
-        ui.set_directory_join_busy(false);
-        ui.set_directory_joining_room_id("".into());
-        ui.set_directory_searched(false);
-        ui.set_directory_results(ModelRc::new(VecModel::from(Vec::<PublicRoomItem>::new())));
-        ui.set_directory_next_batch("".into());
-        ui.set_directory_error("".into());
-        ui.set_directory_join_error("".into());
-        ui.set_directory_search("".into());
-        ui.set_directory_server("".into());
-        ui.set_directory_join_input("".into());
+        clear_account_context(ui, security_gate);
     }
     if selection_changed {
         ui.set_room_admin_open(false);
@@ -1648,6 +1718,7 @@ fn apply_snapshot(
         .map(|index| {
             let item = &items[index];
             AccountOption {
+                local_id: view.accounts[index].id.as_str().into(),
                 index: index as i32,
                 name: item.name.clone(),
                 handle: item.handle.clone(),
@@ -1806,6 +1877,75 @@ fn apply_snapshot(
         ui.set_login_error("".into());
         ui.set_show_sign_in(false);
     }
+}
+
+fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::SecurityGate) {
+    crate::security::clear_ui(ui, security_gate);
+    ui.set_room_actions_open(false);
+    ui.set_room_action_busy(false);
+    ui.set_room_action_error("".into());
+    ui.set_invite_error("".into());
+    ui.set_room_action_operation(ui.get_room_action_operation().wrapping_add(1));
+    ui.set_directory_operation(ui.get_directory_operation().wrapping_add(1));
+    ui.set_directory_join_operation(ui.get_directory_join_operation().wrapping_add(1));
+    ui.set_directory_loading(false);
+    ui.set_directory_join_busy(false);
+    ui.set_directory_joining_room_id("".into());
+    ui.set_directory_searched(false);
+    ui.set_directory_results(ModelRc::new(VecModel::from(Vec::<PublicRoomItem>::new())));
+    ui.set_directory_next_batch("".into());
+    ui.set_directory_error("".into());
+    ui.set_directory_join_error("".into());
+    ui.set_directory_search("".into());
+    ui.set_directory_server("".into());
+    ui.set_directory_join_input("".into());
+    ui.set_invitations(ModelRc::new(VecModel::<RoomItem>::default()));
+    ui.set_quick_switcher_results(ModelRc::new(VecModel::<RoomItem>::default()));
+    ui.set_quick_switcher_open(false);
+    ui.set_quick_switcher_index(-1);
+    ui.set_quick_switcher_match_count(0);
+    ui.set_quick_switcher_account_index(-1);
+    ui.set_member_loading(false);
+    ui.set_member_action_busy(false);
+    ui.set_member_confirm_open(false);
+    ui.set_member_action_operation(ui.get_member_action_operation().wrapping_add(1));
+    ui.set_quick_switcher_query("".into());
+    ui.set_quick_switcher_account_id("".into());
+    ui.set_quick_switcher_space_id("".into());
+    ui.set_member_invite_user_id("".into());
+    ui.set_member_selected_user_id("".into());
+    ui.set_member_selected_name("".into());
+    ui.set_member_selected_membership("".into());
+    ui.set_member_selected_power("".into());
+    ui.set_member_confirm_user_id("".into());
+    ui.set_member_confirm_name("".into());
+    ui.set_member_confirm_value("".into());
+    ui.set_member_confirm_account_id("".into());
+    ui.set_member_confirm_room_id("".into());
+    ui.set_member_error("".into());
+    ui.set_member_action_error("".into());
+    ui.set_member_action_notice("".into());
+    ui.set_active_room_topic_raw("".into());
+    ui.set_room_admin_open(false);
+    ui.set_room_admin_busy(false);
+    ui.set_room_admin_operation(ui.get_room_admin_operation().wrapping_add(1));
+    ui.set_room_admin_event_id("".into());
+    ui.set_room_admin_event_preview("".into());
+    ui.set_room_admin_account_id("".into());
+    ui.set_room_admin_room_id("".into());
+    ui.set_room_admin_name_input("".into());
+    ui.set_room_admin_topic_input("".into());
+    ui.set_room_admin_error("".into());
+    ui.set_room_admin_notice("".into());
+    ui.set_voice_designation_operation(ui.get_voice_designation_operation().wrapping_add(1));
+    ui.set_voice_designation_busy(false);
+    ui.set_voice_designation_error("".into());
+    ui.set_voice_designation_notice("".into());
+    ui.set_history_operation(ui.get_history_operation().wrapping_add(1));
+    ui.set_history_loading(false);
+    ui.set_history_at_start(false);
+    ui.set_history_error("".into());
+    ui.set_transfer_notice("".into());
 }
 
 fn account_item(account: &AccountInfo, selected: bool) -> AccountItem {

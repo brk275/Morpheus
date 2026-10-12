@@ -245,7 +245,7 @@ impl AccountManager {
         // Hold the switch lock through queueing. If the user changed accounts
         // while the file was read, no upload can be directed to the old room.
         let state = self.state.lock().await;
-        if state.registry.active_account_id.as_deref() != Some(expected_account_id) {
+        if state.active_account_id.as_deref() != Some(expected_account_id) {
             return Err(MatrixCoreError::SelectedAccountChanged);
         }
         let room = account_room(&state, expected_account_id, room_id)?;
@@ -284,7 +284,7 @@ impl AccountManager {
     ) -> Result<AttachmentMetadata> {
         let room = {
             let state = self.state.lock().await;
-            if state.registry.active_account_id.as_deref() != Some(expected_account_id) {
+            if state.active_account_id.as_deref() != Some(expected_account_id) {
                 return Err(MatrixCoreError::SelectedAccountChanged);
             }
             account_room(&state, expected_account_id, room_id)?
@@ -306,7 +306,7 @@ impl AccountManager {
     ) -> Result<DownloadedAttachment> {
         let room = {
             let state = self.state.lock().await;
-            if state.registry.active_account_id.as_deref() != Some(expected_account_id) {
+            if state.active_account_id.as_deref() != Some(expected_account_id) {
                 return Err(MatrixCoreError::SelectedAccountChanged);
             }
             account_room(&state, expected_account_id, room_id)?
@@ -337,7 +337,7 @@ impl AccountManager {
         let room = {
             let state = self.state.lock().await;
             if !selection.is_current()
-                || state.registry.active_account_id.as_deref() != Some(selection.account_id())
+                || state.active_account_id.as_deref() != Some(selection.account_id())
             {
                 return Err(MatrixCoreError::SelectedAccountChanged);
             }

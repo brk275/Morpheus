@@ -40,6 +40,11 @@ do not override a muted room. Sounds play only when both the local switch and
 the Matrix push action request a sound. The operating system's notification and
 Focus settings still control presentation.
 
+[Incoming-call sounds](INCOMING_CALLS.md) use a separate native speaker path
+and the same local enabled/sounds preferences. They do not yet integrate with
+system Focus/Do Not Disturb or produce incoming-call OS banners. Their native
+tests and actual device behavior remain unverified.
+
 Notifications are delivered by the running desktop process. Morpheus does not
 install a background notification helper or register a push endpoint, so a
 fully quit app has no notification producer. Background sync for inactive

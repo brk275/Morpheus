@@ -69,6 +69,8 @@ pub enum RoomSettingsError {
     NotJoined,
     #[error("Room settings are unavailable; refresh before retrying")]
     Unavailable,
+    #[error("The homeserver is limiting requests; wait and refresh before retrying")]
+    RateLimited,
     #[error("The operation timed out; refresh before retrying")]
     TimedOut,
     #[error("The server returned unsupported or invalid room state")]
@@ -646,6 +648,18 @@ fn missing(error: &HttpError) -> bool {
         e.status_code.as_u16() == 404 && e.error_kind() == Some(&ErrorKind::NotFound)
     })
 }
+// Keep only a fixed category. Never retain reflected response bodies, URLs or
+// server-provided Retry-After text, and never retry a state write automatically.
+fn request_failure(error: HttpError) -> RoomSettingsError {
+    if error.as_client_api_error().is_some_and(|error| {
+        error.status_code.as_u16() == 429
+            || matches!(error.error_kind(), Some(ErrorKind::LimitExceeded(_)))
+    }) {
+        RoomSettingsError::RateLimited
+    } else {
+        RoomSettingsError::Unavailable
+    }
+}
 async fn state(room: &Room, kind: StateEventType, key: &str) -> Result<Option<StateEnvelope>> {
     let mut request = get_state_event_for_key::v3::Request::new(
         room.room_id().to_owned(),
@@ -663,7 +677,7 @@ async fn state(room: &Room, kind: StateEventType, key: &str) -> Result<Option<St
             parse_state(response.event_or_content.get(), room.room_id(), &kind, key).map(Some)
         }
         Err(error) if missing(&error) => Ok(None),
-        Err(_) => Err(RoomSettingsError::Unavailable),
+        Err(error) => Err(request_failure(error)),
     }
 }
 // The pinned client has encrypted-state events disabled; these standard room
@@ -681,7 +695,7 @@ async fn send_state(
         .send(request)
         .with_request_config(RequestConfig::new().retry_limit(0).timeout(REQUEST_TIMEOUT))
         .await
-        .map_err(|_| RoomSettingsError::Unavailable)?;
+        .map_err(request_failure)?;
     Ok(())
 }
 fn content<T: serde::de::DeserializeOwned>(event: &StateEnvelope) -> Result<T> {
@@ -984,6 +998,36 @@ mod tests {
     use matrix_sdk::ruma::{room_id, user_id};
     use serde_json::json;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn request_errors_keep_only_fixed_rate_limit_or_unavailable_categories() {
+        use matrix_sdk::ruma::api::{
+            client::uiaa::UiaaResponse,
+            error::{Error, ErrorBody, FromHttpResponseError, StandardErrorBody},
+        };
+        for (status, wire_kind, expected) in [
+            (429, "M_UNKNOWN", RoomSettingsError::RateLimited),
+            (400, "M_LIMIT_EXCEEDED", RoomSettingsError::RateLimited),
+            (403, "M_FORBIDDEN", RoomSettingsError::Unavailable),
+            (500, "M_UNKNOWN", RoomSettingsError::Unavailable),
+        ] {
+            let body: StandardErrorBody = serde_json::from_value(json!({
+                "errcode": wire_kind, "error": "private reflected response",
+                "retry_after_ms": 60000
+            }))
+            .unwrap();
+            let error = HttpError::Api(Box::new(FromHttpResponseError::Server(
+                UiaaResponse::MatrixError(Error::new(
+                    reqwest::StatusCode::from_u16(status).unwrap(),
+                    ErrorBody::Standard(body),
+                )),
+            )));
+            let public = request_failure(error);
+            assert_eq!(public, expected);
+            assert!(!public.to_string().contains("private"));
+            assert!(!format!("{public:?}").contains("60000"));
+        }
+    }
 
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()

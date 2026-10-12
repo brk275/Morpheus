@@ -1,8 +1,25 @@
 # Morpheus
 
-Morpheus is an original, native Rust Matrix desktop client in development. The
-interface is inspired by familiar community-chat navigation, with a distinct
-design, deep configuration, and fast Matrix account switching.
+Morpheus is a native Rust Matrix client for keeping your separate identities
+in one app. Switch between personal, community and project aliases from the
+bottom-left account menu, with familiar community-chat navigation and deep
+customization.
+
+## Separate aliases, one app
+
+- **Multiple Matrix accounts, including different homeservers.** Keep the right
+  identity, rooms and conversations together, without repeatedly signing out.
+- **Independent account data.** Each account has its own session, device identity,
+  encrypted room/crypto store, drafts and credential-vault entry. Inactive
+  accounts pause by default.
+- **Optional local switch password and direct account removal.** The new
+  [account controls](docs/ACCOUNT_ACCESS.md) use one app password for protected
+  switches and startup restore. Remove any saved account without opening it;
+  incomplete cleanup stays visible for retry. Native verification is pending.
+
+Each alias remains a normal Matrix account with its own homeserver identity.
+
+## Development status
 
 **Status:** public source pre-alpha; no installer release. Password sign-in, account switching, Spaces,
 room creation and joining, invitations, public room discovery, basic room
@@ -29,12 +46,14 @@ encryption-key recovery yet. The first beta requires the cross-platform
 checks in [the feature matrix](docs/FEATURE_MATRIX.md).
 
 The composer includes explicit mention selection, typed Plain/Markdown drafts,
-mention-aware replies, threads and edits, and a searchable 44-entry starter
-emoji picker. Native builds and their focused guards passed on all four
-platforms at `c02a1b7`. The expanded encrypted formatting and typed-draft
-fixtures passed in Linux at `c02a1b7`, including the room-mention projection repair.
-Keyboard, IME and accessibility acceptance remain open;
-the picker does not cover the full Unicode catalog or skin-tone variants.
+mention-aware replies, threads and edits, and a searchable emoji picker. The
+new [Unicode catalog](docs/EMOJI_CATALOG.md) expands its 44 starter choices to
+3,944 canonical entries, including skin-tone combinations, with offline name,
+shortcode and glyph search. This expansion is source-reviewed; its native tests,
+performance and platform font behavior are not yet verified. The prior composer
+and starter-picker guards passed on all four platforms at `c02a1b7`. Expanded
+encrypted formatting and typed-draft fixtures also passed in Linux at that
+revision. Keyboard, IME and accessibility acceptance remain open.
 
 A native click-to-preview image viewer is now implemented for bounded PNG and
 baseline JPEG attachments in rooms and threads. It keeps preview data in memory
@@ -45,15 +64,29 @@ and video previews are not supported. See [image preview limits](docs/IMAGE_PREV
 
 A [room-settings extension](docs/ROOM_SETTINGS.md) adds guarded name/topic,
 avatar and join-rule controls.
-Its source has been reviewed; compilation, live settings fixtures and native
-interaction acceptance are pending. Incoming Answer/Dismiss are wired, but three
-of four current hosted controller cases still fail departure observation; audible
-ringing and protocol Decline remain incomplete.
+At `6abdfb7`, all four native builds passed; its live room-settings fixture
+failed at a topic update. Incoming Answer/Dismiss passed three of four hosted
+controller cases; the remaining Current DM case timed out during account
+revocation. Narrow diagnostics are added for the next run. Native
+[incoming-call sound](docs/INCOMING_CALLS.md) is source-reviewed and awaits
+native tests and device acceptance; protocol Decline remains unimplemented.
 
 ![Morpheus native desktop preview with fictional accounts](docs/screenshots/desktop.png)
 
 Actual native application capture with fictional preview accounts.
 [Account switcher, sign-in, and capture details](docs/screenshots/README.md).
+
+## Make it yours
+
+Morpheus is growing a TOML-driven style system that changes more than colors.
+The first expansion adds independent interface/message/monospace fonts,
+message size, spacing, corners, rail and pane widths, optional avatars and
+timestamps, and stacked, compact or aligned nickname-column layouts.
+**Nocturne, Terminal and Paper** are editable starting points. In-app controls
+and live TOML reload use the same preferences; invalid edits keep the last valid
+style. This expansion awaits native visual verification. More granular theme
+roles and layout controls remain in development; Halloy-level breadth is the
+target, not a completed claim. See [customization](docs/CUSTOMIZATION.md).
 
 ## Direction
 

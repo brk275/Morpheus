@@ -25,7 +25,11 @@ mod formatting;
 pub use formatting::TextFormat;
 mod compose;
 pub use compose::{ComposeError, ComposeText, MentionSpan, MentionTarget, RestoredCompose};
+mod account_access;
 mod account_selection;
+pub use account_access::{
+    ActivationCancellation, ActivationChallenge, ActivationGrant, AppPasswordStatus, RemovalResult,
+};
 mod admin;
 mod room_settings;
 pub use room_settings::{
@@ -118,6 +122,24 @@ pub enum MatrixCoreError {
     AccountNotFound(String),
     #[error("this Matrix account and device is already saved")]
     DuplicateAccount,
+    #[error("Enter the local app password to open this account.")]
+    AppPasswordRequired,
+    #[error("The local app password is incorrect.")]
+    AppPasswordIncorrect,
+    #[error("Use an app password at least 12 characters and at most 1024 UTF-8 bytes.")]
+    AppPasswordInvalid,
+    #[error(
+        "The local app password could not be read or saved securely. Check the OS credential vault."
+    )]
+    AppPasswordUnavailable,
+    #[error("This account activation expired or was cancelled. Choose the account again.")]
+    ActivationExpired,
+    #[error("This account is awaiting local removal. Retry removal to finish cleanup.")]
+    AccountRemovalPending,
+    #[error(
+        "Account access is busy. Wait for the current operation or close another Morpheus instance."
+    )]
+    AccountAccessBusy,
     #[error("no active Matrix account")]
     NoActiveAccount,
     #[error("the selected Matrix account changed before this action could run")]
@@ -527,6 +549,8 @@ struct Registry {
     version: u8,
     active_account_id: Option<String>,
     accounts: Vec<AccountInfo>,
+    #[serde(default)]
+    pending_removals: Vec<String>,
 }
 
 impl Default for Registry {
@@ -535,6 +559,7 @@ impl Default for Registry {
             version: REGISTRY_VERSION,
             active_account_id: None,
             accounts: Vec::new(),
+            pending_removals: Vec::new(),
         }
     }
 }
@@ -554,6 +579,16 @@ impl Registry {
                 ));
             }
             validate_homeserver(&account.homeserver)?;
+        }
+        let mut pending = HashSet::new();
+        if self
+            .pending_removals
+            .iter()
+            .any(|id| !ids.contains(id.as_str()) || !pending.insert(id))
+        {
+            return Err(MatrixCoreError::InvalidRegistry(
+                "invalid pending account removal".into(),
+            ));
         }
         if let Some(id) = &self.active_account_id {
             if !ids.contains(id.as_str()) {
@@ -592,6 +627,8 @@ impl Drop for LoadedAccount {
 
 struct State {
     registry: Registry,
+    active_account_id: Option<String>,
+    access: account_access::AccessFence,
     loaded: HashMap<String, Arc<LoadedAccount>>,
     pending_sso: HashMap<String, PendingSso>,
     sync_task: Option<SyncTask>,
@@ -599,7 +636,7 @@ struct State {
 }
 
 struct SyncTask {
-    shutdown: oneshot::Sender<()>,
+    shutdown: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
 }
 
@@ -610,6 +647,10 @@ struct SyncTask {
 /// without losing access to the account picker.
 pub struct AccountManager {
     data_dir: PathBuf,
+    _access_lock: Arc<fs::File>,
+    access_instance: Uuid,
+    access_epoch: std::sync::atomic::AtomicU64,
+    access_worker: Arc<tokio::sync::Semaphore>,
     sync_policy: SyncPolicy,
     state: Mutex<State>,
     active_tx: watch::Sender<Option<AccountInfo>>,
@@ -628,6 +669,8 @@ impl AccountManager {
     ) -> Result<Self> {
         let data_dir = data_dir.into();
         fs::create_dir_all(data_dir.join("accounts"))?;
+        let access_lock = account_access::lock_profile(&data_dir)?;
+        let access = account_access::AccessFence::open(&data_dir)?;
         let registry_path = data_dir.join("accounts.json");
         let registry: Registry = match fs::read(registry_path) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
@@ -640,9 +683,15 @@ impl AccountManager {
         let (sync_tx, _) = watch::channel(SyncStatus::Stopped);
         Ok(Self {
             data_dir,
+            _access_lock: Arc::new(access_lock),
+            access_instance: Uuid::new_v4(),
+            access_epoch: std::sync::atomic::AtomicU64::new(0),
+            access_worker: Arc::new(tokio::sync::Semaphore::new(1)),
             sync_policy,
             state: Mutex::new(State {
                 registry,
+                active_account_id: None,
+                access,
                 loaded: HashMap::new(),
                 pending_sso: HashMap::new(),
                 sync_task: None,
@@ -666,6 +715,8 @@ impl AccountManager {
     }
 
     fn publish_active_account(&self, account: Option<AccountInfo>) {
+        self.access_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.selections
             .replace(account.as_ref().map(|account| account.id.as_str()));
         self.active_tx.send_replace(account);
@@ -681,7 +732,7 @@ impl AccountManager {
 
     pub async fn active_account(&self) -> Option<AccountInfo> {
         let state = self.state.lock().await;
-        let id = state.registry.active_account_id.as_ref()?;
+        let id = state.active_account_id.as_ref()?;
         state
             .registry
             .accounts
@@ -694,7 +745,7 @@ impl AccountManager {
     /// locked OS credential store is returned as an error, never replaced by a
     /// plaintext token file.
     pub async fn restore_last_active(&self) -> Result<Option<AccountInfo>> {
-        let id = self.state.lock().await.registry.active_account_id.clone();
+        let id = self.last_active_account_id().await;
         match id {
             Some(id) => self.switch_to(&id).await.map(Some),
             None => Ok(None),
@@ -710,7 +761,9 @@ impl AccountManager {
         password: &str,
     ) -> Result<AccountInfo> {
         let homeserver = validate_homeserver(homeserver)?;
+        let _permit = self.access_permit()?;
         let mut state = self.state.lock().await;
+        state.access = account_access::AccessFence::read(&self.data_dir)?;
         let id = Uuid::new_v4().to_string();
         let store_path = self.store_path(&id);
         fs::create_dir_all(&store_path)?;
@@ -764,6 +817,7 @@ impl AccountManager {
                 store_passphrase: passphrase.clone(),
                 session: StoredSession::Matrix(session),
             },
+            self._access_lock.clone(),
         )
         .await
         {
@@ -773,18 +827,32 @@ impl AccountManager {
         }
         let mut next = state.registry.clone();
         next.accounts.push(account.clone());
-        next.active_account_id = Some(id.clone());
+        if !state.access.enabled {
+            next.active_account_id = Some(id.clone());
+        }
         if let Err(e) = save_registry(&self.data_dir, &next) {
-            let _ = delete_secret(&id).await;
+            let _ = delete_secret(&id, self._access_lock.clone()).await;
             let _ = client.logout().await;
             let _ = fs::remove_dir_all(&store_path);
             return Err(e);
         }
+        if state.access.enabled {
+            // The Matrix password authenticates this new device, not the app
+            // access policy. Save it paused and let the caller request a grant.
+            state.registry = next;
+            return Ok(account);
+        }
         self.selections.replace(None);
         stop_sync(&mut state).await;
-        let loaded = Arc::new(LoadedAccount::new(client, id.clone(), passphrase));
+        let loaded = Arc::new(LoadedAccount::new(
+            client,
+            id.clone(),
+            passphrase,
+            self._access_lock.clone(),
+        ));
         state.loaded.insert(id, loaded.clone());
         state.registry = next;
+        state.active_account_id = Some(account.id.clone());
         self.publish_active_account(Some(account.clone()));
         self.start_sync(&mut state, loaded.client.clone()).await;
         Ok(account)
@@ -793,7 +861,23 @@ impl AccountManager {
     /// Select an existing account. This completes only after the previous
     /// account's sync task has stopped; the new one then starts in background.
     pub async fn switch_to(&self, id: &str) -> Result<AccountInfo> {
+        let _permit = self.access_permit()?;
         let mut state = self.state.lock().await;
+        state.access = account_access::AccessFence::read(&self.data_dir)?;
+        account_access::ensure_eligible(&state, id)?;
+        if state.access.enabled && state.active_account_id.as_deref() != Some(id) {
+            return Err(MatrixCoreError::AppPasswordRequired);
+        }
+        self.switch_locked(&mut state, id, None).await
+    }
+
+    async fn switch_locked(
+        &self,
+        state: &mut State,
+        id: &str,
+        challenge: Option<&ActivationChallenge>,
+    ) -> Result<AccountInfo> {
+        account_access::ensure_eligible(state, id)?;
         let account = state
             .registry
             .accounts
@@ -801,7 +885,7 @@ impl AccountManager {
             .find(|a| a.id == id)
             .cloned()
             .ok_or_else(|| MatrixCoreError::AccountNotFound(id.into()))?;
-        if state.registry.active_account_id.as_deref() == Some(id)
+        if state.active_account_id.as_deref() == Some(id)
             && state
                 .sync_task
                 .as_ref()
@@ -818,7 +902,7 @@ impl AccountManager {
         let loaded = match state.loaded.get(id) {
             Some(loaded) => loaded.clone(),
             None => {
-                let secret = load_secret(id).await?;
+                let secret = load_secret(id, self._access_lock.clone()).await?;
                 if secret.version != SECRET_VERSION
                     || secret.store_passphrase.is_empty()
                     || secret.session.meta().user_id.as_str() != account.user_id
@@ -841,19 +925,32 @@ impl AccountManager {
                     client,
                     id.into(),
                     secret.store_passphrase,
+                    self._access_lock.clone(),
                 ));
                 state.loaded.insert(id.into(), loaded.clone());
                 loaded
             }
         };
+        if let Some(challenge) = challenge {
+            self.validate_challenge(state, challenge)?;
+        }
         let mut next = state.registry.clone();
         next.active_account_id = Some(id.into());
         save_registry(&self.data_dir, &next)?;
         self.selections.replace(None);
-        stop_sync(&mut state).await;
+        stop_sync(state).await;
+        if let Some(challenge) = challenge {
+            if let Err(error) = self.validate_challenge(state, challenge) {
+                state.active_account_id = None;
+                self.publish_active_account(None);
+                self.sync_tx.send_replace(SyncStatus::Stopped);
+                return Err(error);
+            }
+        }
         state.registry = next;
+        state.active_account_id = Some(account.id.clone());
         self.publish_active_account(Some(account.clone()));
-        self.start_sync(&mut state, loaded.client.clone()).await;
+        self.start_sync(state, loaded.client.clone()).await;
         Ok(account)
     }
 
@@ -861,6 +958,7 @@ impl AccountManager {
     /// but a network failure cannot prevent removal of local credentials.
     /// The result reports whether the server accepted the logout.
     pub async fn logout_account(&self, id: &str) -> Result<LogoutResult> {
+        let _permit = self.access_permit()?;
         let mut state = self.state.lock().await;
         let account = state
             .registry
@@ -869,15 +967,21 @@ impl AccountManager {
             .find(|a| a.id == id)
             .cloned()
             .ok_or_else(|| MatrixCoreError::AccountNotFound(id.into()))?;
-        let was_active = state.registry.active_account_id.as_deref() == Some(id);
+        let was_active = state.active_account_id.as_deref() == Some(id);
         let mut next = state.registry.clone();
-        next.accounts.retain(|a| a.id != id);
-        if was_active {
+        if !next.pending_removals.iter().any(|pending| pending == id) {
+            next.pending_removals.push(id.into());
+        }
+        if next.active_account_id.as_deref() == Some(id) {
             next.active_account_id = None;
         }
+        save_registry(&self.data_dir, &next)?;
+        state.registry = next;
         if was_active {
             self.selections.replace(None);
             stop_sync(&mut state).await;
+            state.active_account_id = None;
+            self.publish_active_account(None);
             self.sync_tx.send_replace(SyncStatus::Stopped);
         }
         let client = if let Some(loaded) = state.loaded.remove(id) {
@@ -886,7 +990,7 @@ impl AccountManager {
             loaded.stop_token_persistence().await;
             Some(loaded.client.clone())
         } else {
-            match load_secret(id).await {
+            match load_secret(id, self._access_lock.clone()).await {
                 Ok(secret) if secret.version == SECRET_VERSION => {
                     match build_client(
                         &account.homeserver,
@@ -932,20 +1036,13 @@ impl AccountManager {
         } else {
             false
         };
-        // Keep the account in the registry until the credential is gone. A
-        // keyring failure may leave a valid local token, so the user must be
-        // able to find this account and retry the logout.
-        delete_secret(id).await?;
-        save_registry(&self.data_dir, &next)?;
-        state.registry = next;
-        if was_active {
-            self.publish_active_account(None);
-        }
-        let store_result = fs::remove_dir_all(self.data_dir.join("accounts").join(id));
-        if let Err(e) = store_result {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(e.into());
-            }
+        // Use the same retryable local removal path. In particular, a Windows
+        // sharing violation must never erase the row needed to retry cleanup.
+        drop(state);
+        drop(_permit);
+        let removal = self.remove_account(id).await?;
+        if !removal.complete {
+            return Err(MatrixCoreError::AccountRemovalPending);
         }
         Ok(LogoutResult {
             remote_logout_succeeded,
@@ -965,7 +1062,6 @@ impl AccountManager {
     ) -> Result<(String, broadcast::Receiver<matrix_sdk::sync::RoomUpdates>)> {
         let state = self.state.lock().await;
         let id = state
-            .registry
             .active_account_id
             .as_ref()
             .ok_or(MatrixCoreError::NoActiveAccount)?;
@@ -1035,7 +1131,6 @@ impl AccountManager {
     pub async fn messages_snapshot(&self, room_id: &str) -> Result<Vec<MessageInfo>> {
         let state = self.state.lock().await;
         let id = state
-            .registry
             .active_account_id
             .as_ref()
             .ok_or(MatrixCoreError::NoActiveAccount)?;
@@ -1053,7 +1148,6 @@ impl AccountManager {
     pub async fn message_feed(&self, room_id: &str) -> Result<MessageFeed> {
         let state = self.state.lock().await;
         let account_id = state
-            .registry
             .active_account_id
             .as_ref()
             .ok_or(MatrixCoreError::NoActiveAccount)?
@@ -1286,11 +1380,10 @@ impl AccountManager {
         // Hold the switch lock through queueing the send. A switch cannot
         // redirect a command issued for the previously selected account.
         let state = self.state.lock().await;
-        if state.registry.active_account_id.as_deref() != Some(expected_account_id) {
+        if state.active_account_id.as_deref() != Some(expected_account_id) {
             return Err(MatrixCoreError::SelectedAccountChanged);
         }
         let id = state
-            .registry
             .active_account_id
             .as_ref()
             .ok_or(MatrixCoreError::NoActiveAccount)?;
@@ -1894,7 +1987,6 @@ impl AccountManager {
     ) -> Result<(String, watch::Receiver<Vec<VerificationInfo>>)> {
         let state = self.state.lock().await;
         let id = state
-            .registry
             .active_account_id
             .as_ref()
             .ok_or(MatrixCoreError::NoActiveAccount)?;
@@ -2080,7 +2172,17 @@ impl AccountManager {
         let mut state = self.state.lock().await;
         self.selections.replace(None);
         stop_sync(&mut state).await;
+        state.active_account_id = None;
+        self.publish_active_account(None);
         self.sync_tx.send_replace(SyncStatus::Stopped);
+        // Whole-manager shutdown is an awaited vault-write boundary. An
+        // immediately reopened profile must not race a dropped token watcher.
+        for loaded in state.loaded.values() {
+            loaded.stop_token_persistence().await;
+        }
+        // A subsequent selection restores from the persistent cache and
+        // starts a new token watcher; stopped watchers are never reused.
+        state.loaded.clear();
     }
 
     async fn start_sync(&self, state: &mut State, client: Client) {
@@ -2103,7 +2205,7 @@ impl AccountManager {
         let status = self.sync_tx.clone();
         let (shutdown, receiver) = oneshot::channel();
         state.sync_task = Some(SyncTask {
-            shutdown,
+            shutdown: Some(shutdown),
             task: tokio::spawn(
                 async move { run_sync(client, status, receiver, sync_policy).await },
             ),
@@ -2113,7 +2215,6 @@ impl AccountManager {
     async fn active_loaded(&self) -> Result<Arc<LoadedAccount>> {
         let state = self.state.lock().await;
         let id = state
-            .registry
             .active_account_id
             .as_ref()
             .ok_or(MatrixCoreError::NoActiveAccount)?;
@@ -2177,7 +2278,12 @@ pub fn room_updates_change_space_graph(updates: &matrix_sdk::sync::RoomUpdates) 
 }
 
 impl LoadedAccount {
-    fn new(client: Client, account_id: String, store_passphrase: String) -> Self {
+    fn new(
+        client: Client,
+        account_id: String,
+        store_passphrase: String,
+        profile_lock: Arc<fs::File>,
+    ) -> Self {
         let (incoming_verification_tx, _) = watch::channel(Vec::<VerificationInfo>::new());
         if let Some(own_user_id) = client.user_id().map(ToOwned::to_owned) {
             let incoming_tx = incoming_verification_tx.clone();
@@ -2241,6 +2347,7 @@ impl LoadedAccount {
                                     store_passphrase: store_passphrase.clone(),
                                     session,
                                 },
+                                profile_lock.clone(),
                             )
                             .await
                             {
@@ -2258,17 +2365,34 @@ impl LoadedAccount {
             composed_edits: Mutex::new(HashMap::new()),
             incoming_verification_tx,
             token_task: Mutex::new(Some(SyncTask {
-                shutdown,
+                shutdown: Some(shutdown),
                 task: token_task,
             })),
         }
     }
 
     async fn stop_token_persistence(&self) {
-        if let Some(token_task) = self.token_task.lock().await.take() {
-            let _ = token_task.shutdown.send(());
+        if let Some(mut token_task) = self.token_task.lock().await.take() {
+            if let Some(shutdown) = token_task.shutdown.take() {
+                let _ = shutdown.send(());
+            }
             let _ = token_task.task.await;
         }
+    }
+
+    async fn try_stop_token_persistence(&self, timeout: Duration) -> bool {
+        let mut slot = self.token_task.lock().await;
+        let Some(task) = slot.as_mut() else {
+            return true;
+        };
+        if let Some(shutdown) = task.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if tokio::time::timeout(timeout, &mut task.task).await.is_err() {
+            return false;
+        }
+        slot.take();
+        true
     }
 
     async fn timeline(&self, room_id: &str) -> Result<Arc<Timeline>> {
@@ -2352,7 +2476,7 @@ fn selected_loaded_for<'a>(
     state: &'a State,
     expected_account_id: &str,
 ) -> Result<&'a Arc<LoadedAccount>> {
-    if state.registry.active_account_id.as_deref() != Some(expected_account_id) {
+    if state.active_account_id.as_deref() != Some(expected_account_id) {
         return Err(MatrixCoreError::SelectedAccountChanged);
     }
     selected_loaded(state)
@@ -2360,7 +2484,6 @@ fn selected_loaded_for<'a>(
 
 fn selected_loaded(state: &State) -> Result<&Arc<LoadedAccount>> {
     let id = state
-        .registry
         .active_account_id
         .as_ref()
         .ok_or(MatrixCoreError::NoActiveAccount)?;
@@ -2599,7 +2722,6 @@ fn start_event_cache(client: &Client) -> Result<()> {
 
 async fn stop_sync(state: &mut State) {
     if let Some(loaded) = state
-        .registry
         .active_account_id
         .as_ref()
         .and_then(|id| state.loaded.get(id))
@@ -2612,8 +2734,10 @@ async fn stop_sync(state: &mut State) {
         recovery.abort();
         let _ = recovery.await;
     }
-    if let Some(sync) = state.sync_task.take() {
-        let _ = sync.shutdown.send(());
+    if let Some(mut sync) = state.sync_task.take() {
+        if let Some(shutdown) = sync.shutdown.take() {
+            let _ = shutdown.send(());
+        }
         let _ = sync.task.await;
     }
 }
@@ -2939,11 +3063,12 @@ fn save_registry(data_dir: &Path, registry: &Registry) -> Result<()> {
     write_result
 }
 
-async fn save_secret(id: &str, secret: StoredSecret) -> Result<()> {
+async fn save_secret(id: &str, secret: StoredSecret, profile_lock: Arc<fs::File>) -> Result<()> {
     let id = id.to_owned();
-    let payload = serde_json::to_string(&secret)?;
+    let payload = Zeroizing::new(serde_json::to_string(&secret)?);
     tokio::task::spawn_blocking(move || {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, &id)
+        let _profile_lock = profile_lock;
+        let entry = account_access::vault_entry(KEYRING_SERVICE, &id)
             .map_err(|e| MatrixCoreError::Keyring(e.to_string()))?;
         entry
             .set_password(&payload)
@@ -2953,12 +3078,13 @@ async fn save_secret(id: &str, secret: StoredSecret) -> Result<()> {
     .map_err(|e| MatrixCoreError::Keyring(e.to_string()))?
 }
 
-async fn load_secret(id: &str) -> Result<StoredSecret> {
+async fn load_secret(id: &str, profile_lock: Arc<fs::File>) -> Result<StoredSecret> {
     let id = id.to_owned();
     let payload = tokio::time::timeout(
         Duration::from_secs(30),
         tokio::task::spawn_blocking(move || {
-            let entry = keyring::Entry::new(KEYRING_SERVICE, &id)
+        let _profile_lock = profile_lock;
+            let entry = account_access::vault_entry(KEYRING_SERVICE, &id)
                 .map_err(|e| MatrixCoreError::Keyring(e.to_string()))?;
             entry
                 .get_password()
@@ -2972,13 +3098,15 @@ async fn load_secret(id: &str) -> Result<StoredSecret> {
         )
     })?
     .map_err(|e| MatrixCoreError::Keyring(e.to_string()))??;
+    let payload = Zeroizing::new(payload);
     serde_json::from_str(&payload).map_err(Into::into)
 }
 
-async fn delete_secret(id: &str) -> Result<()> {
+async fn delete_secret(id: &str, profile_lock: Arc<fs::File>) -> Result<()> {
     let id = id.to_owned();
     tokio::task::spawn_blocking(move || {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, &id)
+        let _profile_lock = profile_lock;
+        let entry = account_access::vault_entry(KEYRING_SERVICE, &id)
             .map_err(|e| MatrixCoreError::Keyring(e.to_string()))?;
         match entry.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -3029,13 +3157,14 @@ mod tests {
             {
                 let mut state = manager.state.lock().await;
                 state.registry.accounts = vec![first.clone(), second.clone()];
-                state.registry.active_account_id = Some(first.id.clone());
+                state.active_account_id = Some(first.id.clone());
                 state.loaded.insert(
                     first.id.clone(),
                     Arc::new(LoadedAccount::new(
                         client_a.clone(),
                         first.id.clone(),
                         String::new(),
+                        manager._access_lock.clone(),
                     )),
                 );
                 state.loaded.insert(
@@ -3044,6 +3173,7 @@ mod tests {
                         client_b.clone(),
                         second.id.clone(),
                         String::new(),
+                        manager._access_lock.clone(),
                     )),
                 );
             }
@@ -3179,6 +3309,7 @@ mod tests {
         let registry = Registry {
             version: REGISTRY_VERSION,
             active_account_id: Some("../outside".into()),
+            pending_removals: Vec::new(),
             accounts: vec![AccountInfo {
                 id: "../outside".into(),
                 user_id: "@a:b".into(),

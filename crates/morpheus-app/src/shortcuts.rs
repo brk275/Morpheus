@@ -136,6 +136,7 @@ fn blocked(ui: &AppWindow) -> bool {
         || ui.get_page() == 1
         || ui.get_account_menu_open()
         || ui.get_manage_accounts_open()
+        || ui.get_access_open()
         || ui.get_room_actions_open()
         || ui.get_room_admin_open()
         || ui.get_member_confirm_open()

@@ -537,6 +537,8 @@ impl AccountManager {
             {
                 return Err(MatrixCoreError::DuplicateAccount);
             }
+            let _permit = self.access_permit()?;
+            state.access = account_access::AccessFence::read(&self.data_dir)?;
             start_event_cache(client)?;
             save_secret(
                 &store.id,
@@ -545,14 +547,21 @@ impl AccountManager {
                     store_passphrase: passphrase.to_string(),
                     session,
                 },
+                self._access_lock.clone(),
             )
             .await?;
             let mut next = state.registry.clone();
             next.accounts.push(account.clone());
-            next.active_account_id = Some(store.id.clone());
+            if !state.access.enabled {
+                next.active_account_id = Some(store.id.clone());
+            }
             if let Err(error) = save_registry(&self.data_dir, &next) {
-                let _ = delete_secret(&store.id).await;
+                let _ = delete_secret(&store.id, self._access_lock.clone()).await;
                 return Err(error);
+            }
+            if state.access.enabled {
+                state.registry = next;
+                return Ok(());
             }
             self.selections.replace(None);
             stop_sync(&mut state).await;
@@ -560,9 +569,11 @@ impl AccountManager {
                 (*client).clone(),
                 store.id.clone(),
                 passphrase.to_string(),
+                self._access_lock.clone(),
             ));
             state.loaded.insert(store.id.clone(), loaded.clone());
             state.registry = next;
+            state.active_account_id = Some(account.id.clone());
             self.publish_active_account(Some(account.clone()));
             self.start_sync(&mut state, loaded.client.clone()).await;
             Ok(())

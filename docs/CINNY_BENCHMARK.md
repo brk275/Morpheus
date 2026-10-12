@@ -31,8 +31,10 @@ see [the current verification results](VERIFICATION.md).
       the native Markdown toggle and send path passed a macOS click-through.
       A safe subset of rich text renders in the offline timeline and thread
       preview, and decrypted events passed that rich-text projection. Member
-      suggestions and a searchable 44-entry starter emoji picker are implemented;
-      their guards passed on all four native targets at `c02a1b7`. The room-mention
+      suggestions and the original 44-entry starter picker guards passed on all
+      four native targets at `c02a1b7`. The source-reviewed full catalog now adds
+      3,944 canonical entries including skin-tone combinations; its native tests,
+      performance and font behavior remain unverified. The room-mention
       projection repair and expanded encrypted room/reply/thread/edit fixture
       passed in Linux at `c02a1b7`. Native keyboard/IME/accessibility, live rendered
       UI, full emoji breadth, stickers and the complete behavior set remain open.
@@ -88,8 +90,11 @@ see [the current verification results](VERIFICATION.md).
       progressed through discovery and accepted join identity; Current/room passed,
       while Current/DM and both Sticky2025 cases failed departure observation.
       The bounded missing-reference observation change is source-only and is not
-      a confirmed repair of those generic errors. Actual Answer UI, audible ringing,
-      protocol Decline and voice-space drop-in acceptance remain open.
+      a confirmed repair of those generic errors. A source-reviewed native
+      ringtone now follows the exact admitted offer, configured speaker and
+      local sound policy; its new regressions and real output have not run.
+      Actual Answer UI, audible ringing, protocol Decline and voice-space
+      drop-in acceptance remain open.
 - [ ] Encrypted voice and video, reconnect, device selection, and screen share
       interoperate with Element Call on compatible homeservers. Local encrypted
       transport has carried synthetic camera/audio and real macOS display and

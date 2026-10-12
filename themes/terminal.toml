@@ -1,0 +1,15 @@
+schema_version = 1
+name = "Terminal"
+
+[colors]
+rail = "#111614"
+sidebar = "#111614"
+canvas = "#111614"
+panel = "#171E1A"
+elevated = "#1E2922"
+hover = "#293B2F"
+ink = "#DCE9DC"
+muted = "#A0B59F"
+divider = "#3B4D40"
+accent = "#A7D9A0"
+accent_ink = "#102010"

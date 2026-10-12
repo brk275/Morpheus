@@ -6,6 +6,7 @@
 //! to capture: account/receipt/trust/policy checks and exact own-join commitment
 //! precede media. One replay ledger survives account switches for this process.
 
+mod audio;
 pub(crate) mod controller;
 pub(crate) mod ledger;
 mod policy;

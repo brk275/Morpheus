@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+use morpheus_config::BuiltInStylePreset;
 use slint::ComponentHandle;
 
 use super::{AppWindow, Config, apply_config, apply_state, fixtures};
@@ -43,7 +44,13 @@ pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
     // Never overwrite existing screenshots or follow an existing output link.
     fs::create_dir(&output)?;
     let ui = AppWindow::new()?;
-    apply_config(&ui, &Config::default(), None);
+    let mut nocturne = Config::default();
+    nocturne.apply_style_preset(BuiltInStylePreset::Nocturne);
+    let nocturne_theme = BuiltInStylePreset::Nocturne.theme()?;
+    let mut terminal = Config::default();
+    terminal.apply_style_preset(BuiltInStylePreset::Terminal);
+    let terminal_theme = BuiltInStylePreset::Terminal.theme()?;
+    apply_config(&ui, &nocturne, Some(&nocturne_theme));
     apply_state(&ui, &fixtures());
     ui.set_native_call_enabled(cfg!(feature = "native-calls"));
     ui.set_native_call_status("Select a room to check call availability".into());
@@ -75,9 +82,15 @@ pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
                 return;
             }
             match index {
-                0 => window.set_account_menu_open(true),
+                0 => {
+                    // Same native window and fictional data: show a genuinely
+                    // different preset without touching saved preferences.
+                    apply_config(&window, &terminal, Some(&terminal_theme));
+                    window.set_account_menu_open(true);
+                }
                 1 => {
                     window.set_account_menu_open(false);
+                    apply_config(&window, &nocturne, Some(&nocturne_theme));
                     window.set_show_sign_in(true);
                     window.set_session_error("".into());
                 }

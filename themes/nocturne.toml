@@ -1,0 +1,15 @@
+schema_version = 1
+name = "Nocturne"
+
+[colors]
+rail = "#111216"
+sidebar = "#17191F"
+canvas = "#1D2028"
+panel = "#181B22"
+elevated = "#252A34"
+hover = "#303745"
+ink = "#E8EDF2"
+muted = "#A5AFBE"
+divider = "#353D4A"
+accent = "#9CD7CD"
+accent_ink = "#122622"

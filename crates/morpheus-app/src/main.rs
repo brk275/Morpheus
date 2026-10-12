@@ -2,6 +2,8 @@
 #![recursion_limit = "512"]
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod account_access;
+mod appearance;
 mod attachments;
 mod audio_devices;
 #[cfg(feature = "native-calls")]
@@ -625,6 +627,7 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
         .map(|index| {
             let item = &state.accounts[index].item;
             AccountOption {
+                local_id: "".into(),
                 index: index as i32,
                 name: item.name.clone(),
                 handle: item.handle.clone(),
@@ -890,6 +893,7 @@ fn apply_notification_settings(ui: &AppWindow, config: &Config) {
 }
 
 fn apply_config(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
+    appearance::apply_config(ui, config);
     shortcuts::apply_config(ui, config);
     audio_devices::apply_config(ui, config);
     image_previews::apply_config(ui, config);
@@ -1533,11 +1537,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_native_call_enabled(cfg!(feature = "native-calls"));
     ui.set_native_call_status("Select a room to check call availability".into());
     let update_activity = updater::UpdateActivity::default();
+    let update_accounts = manager.clone();
     let updates = update_controller::UpdateController::new(
         runtime.handle().clone(),
         update_activity.clone(),
         update_session.clone(),
         live.security_gate.clone(),
+        Arc::new(move || update_accounts.account_access_busy()),
     );
     let update_ui_task = updates.bind_ui(&ui);
     #[cfg(feature = "native-calls")]
@@ -1545,6 +1551,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         manager.clone(),
         update_activity.clone(),
     ));
+    #[cfg(feature = "native-calls")]
+    let access_calls = calls.clone();
+    let account_access = account_access::AccountAccessUi::register(
+        &ui,
+        live.clone(),
+        runtime.handle().clone(),
+        move || {
+            #[cfg(feature = "native-calls")]
+            {
+                !access_calls.status().blocks_account_switch()
+            }
+            #[cfg(not(feature = "native-calls"))]
+            {
+                true
+            }
+        },
+    );
     #[cfg(feature = "native-calls")]
     let mut incoming_calls =
         incoming_ring::ui::IncomingUi::bind(&ui, runtime.handle(), live.clone(), calls.clone());
@@ -1866,9 +1889,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
     {
-        let live = live.clone();
-        let weak = ui.as_weak();
-        runtime.spawn(async move { live.restore(weak).await });
+        let access = account_access.clone();
+        runtime.spawn(async move { access.restore().await });
     }
 
     let state = Rc::new(RefCell::new(fixtures()));
@@ -1896,6 +1918,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if account_id.is_empty() || room_id.is_empty() {
                 return;
             }
+            let Some(ring_request) = calls.reserve_ringing_request() else {
+                return;
+            };
             window.set_native_call_request_pending(true);
             let calls = calls.clone();
             let call_live = call_live.clone();
@@ -1904,6 +1929,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let _transition = call_live.account_transition.lock().await;
                 let result = calls.open_slot(&account_id, &room_id).await;
                 let _ = weak.upgrade_in_event_loop(move |ui| {
+                    drop(ring_request);
                     ui.set_native_call_request_pending(false);
                     if ui.get_active_account_local_id().as_str() != account_id
                         || ui.get_active_room_id().as_str() != room_id
@@ -2194,6 +2220,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             }
             let audio_selection = audio_devices::selection(&window);
+            let Some(ring_request) = calls.reserve_ringing_request() else {
+                return;
+            };
             window.set_native_call_request_pending(true);
             let calls = calls.clone();
             let call_live = call_live.clone();
@@ -2222,6 +2251,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )
                     .await;
                 let _ = weak.upgrade_in_event_loop(move |ui| {
+                    drop(ring_request);
                     ui.set_native_call_request_pending(false);
                     if selection.is_current()
                         && ui.get_active_account_local_id().as_str() == account_id
@@ -2256,7 +2286,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     let switch_state = state.clone();
     let switch_live = live.clone();
-    let switch_handle = runtime.handle().clone();
+    let switch_access = account_access.clone();
     #[cfg(feature = "native-calls")]
     let switch_calls = calls.clone();
     ui.on_switch_account(move |index| {
@@ -2274,41 +2304,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if ask_to_leave_call(&weak, &switch_calls, index) {
                 return;
             }
-            if let Ok(index) = usize::try_from(index) {
-                switch_live.invalidate_navigation();
-                let live = switch_live.clone();
-                let security_gate = switch_live.security_gate.clone();
-                let ui = weak.clone();
-                #[cfg(feature = "native-calls")]
-                let calls = switch_calls.clone();
-                switch_handle.spawn(async move {
-                    #[cfg(feature = "native-calls")]
-                    let result = live
-                        .select_account_guarded(index, ui.clone(), || {
-                            !calls.status().blocks_account_switch() && !security_gate.blocked()
-                        })
-                        .await;
-                    #[cfg(not(feature = "native-calls"))]
-                    let result = live
-                        .select_account_guarded(index, ui.clone(), || !security_gate.blocked())
-                        .await;
-                    match result {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            if security_gate.blocked() {
-                                let _ = ui.upgrade_in_event_loop(move |window| {
-                                    security::block_account_change(&window, &security_gate);
-                                });
-                            } else {
-                                let _ = ui.upgrade_in_event_loop(move |window| {
-                                    window.set_pending_account_index(index as i32);
-                                    window.set_leave_call_dialog(true);
-                                });
-                            }
-                        }
-                        Err(error) => show_error(&ui, error.to_string()),
+            if let Some(window) = weak.upgrade() {
+                if let Some(account) = window
+                    .get_account_options()
+                    .iter()
+                    .find(|a| a.index == index)
+                {
+                    if !account.local_id.is_empty() {
+                        switch_access.request(account.local_id.to_string());
                     }
-                });
+                }
             }
             return;
         }
@@ -3920,6 +3925,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let preview_live = live.clone();
     let preview_handle = runtime.handle().clone();
     let preview_state = state.clone();
+    #[cfg(feature = "native-calls")]
+    let preview_calls = calls.clone();
+    let ready_ui = ui.as_weak();
+    ui.on_preview_demo_ready(move || {
+        if let Some(ui) = ready_ui.upgrade() {
+            ui.set_login_error("".into());
+            ui.set_session_error("".into());
+            ui.set_login_loading(false);
+            ui.set_show_sign_in(false);
+            ui.set_composer_text("".into());
+            apply_state(&ui, &preview_state.borrow());
+        }
+    });
     ui.on_preview_demo(move || {
         if let Some(ui) = weak.upgrade() {
             if ui.get_login_loading() {
@@ -3928,26 +3946,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if security::block_account_change(&ui, &preview_live.security_gate) {
                 return;
             }
-            ui.invoke_cancel_room_settings();
-            preview_live.invalidate_navigation();
-            preview_live.is_live.store(false, Ordering::Release);
+            ui.set_login_loading(true);
             let live = preview_live.clone();
+            let weak = weak.clone();
+            #[cfg(feature = "native-calls")]
+            let calls = preview_calls.clone();
             preview_handle.spawn(async move {
+                let _transition = live.account_transition.lock().await;
+                #[cfg(feature = "native-calls")]
+                if calls.status().blocks_account_switch() {
+                    show_login_error(
+                        &weak,
+                        "Leave the active call before opening the preview.".into(),
+                    );
+                    return;
+                }
+                let Some(security) = live.security_gate.try_account_access() else {
+                    show_login_error(
+                        &weak,
+                        "Finish the current security operation before opening the preview.".into(),
+                    );
+                    return;
+                };
+                if let Err(error) = live.flush_drafts().await {
+                    show_login_error(&weak, format!("Could not save current draft: {error}"));
+                    return;
+                }
                 live.clear_feed().await;
                 live.manager.stop().await;
+                live.account_detached(weak.clone()).await;
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    // Retain the reservation through publication of the preview
+                    // so a queued activation cannot be overwritten by this view.
+                    let _security = security;
+                    ui.invoke_preview_demo_ready();
+                });
             });
-            ui.set_login_error("".into());
-            ui.set_session_error("".into());
-            security::clear_ui(&ui, &preview_live.security_gate);
-            ui.set_show_sign_in(false);
-            ui.set_composer_text("".into());
-            apply_state(&ui, &preview_state.borrow());
         }
     });
 
     let weak = ui.as_weak();
     let login_live = live.clone();
     let login_handle = runtime.handle().clone();
+    let login_access = account_access.clone();
     #[cfg(feature = "native-calls")]
     let login_calls = calls.clone();
     ui.on_submit_login(move |homeserver, username, password| {
@@ -3966,6 +4007,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ui = weak.clone();
         #[cfg(feature = "native-calls")]
         let calls = login_calls.clone();
+        let access = login_access.clone();
         login_handle.spawn(async move {
             let _transition = live.account_transition.lock().await;
             if security_gate.blocked() {
@@ -3983,6 +4025,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 return;
             }
+            let Some(_security) = security_gate.try_account_access() else {
+                show_login_error(
+                    &ui,
+                    "Finish the current security operation before signing in.".into(),
+                );
+                return;
+            };
             if let Err(error) = live.flush_drafts().await {
                 show_login_error(&ui, format!("Could not save current draft: {error}"));
                 return;
@@ -3992,9 +4041,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .add_password_account(&homeserver, &username, &password)
                 .await
             {
-                Ok(_) => {
-                    live.is_live.store(true, Ordering::Release);
-                    if let Err(error) = live.refresh(ui.clone()).await {
+                Ok(account) => {
+                    access.refresh_accounts().await;
+                    if live
+                        .manager
+                        .active_account()
+                        .await
+                        .as_ref()
+                        .map(|a| a.id.as_str())
+                        != Some(account.id.as_str())
+                    {
+                        access.request(account.id);
+                        let _ = ui.upgrade_in_event_loop(|window| {
+                            window.set_login_loading(false);
+                            window.set_login_error(
+                                "Account saved. Enter your app password to open it.".into(),
+                            );
+                        });
+                        return;
+                    }
+                    if let Err(error) = live.account_activated(ui.clone()).await {
                         show_login_error(&ui, error.to_string());
                     } else {
                         let _ = ui.upgrade_in_event_loop(|window| {
@@ -4002,7 +4068,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             window.set_login_error("".into());
                             window.set_show_sign_in(false);
                         });
-                        tokio::spawn(live.clone().scan_spaces(ui));
                     }
                 }
                 Err(error) => show_login_error(&ui, error.to_string()),
@@ -4013,6 +4078,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     let sso_live = live.clone();
     let sso_handle = runtime.handle().clone();
+    let sso_access = account_access.clone();
     #[cfg(feature = "native-calls")]
     let sso_calls = calls.clone();
     ui.on_submit_sso(move |homeserver| {
@@ -4031,6 +4097,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ui = weak.clone();
         #[cfg(feature = "native-calls")]
         let calls = sso_calls.clone();
+        let access = sso_access.clone();
         sso_handle.spawn(async move {
             let _transition = live.account_transition.lock().await;
             if security_gate.blocked() {
@@ -4048,14 +4115,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 return;
             }
+            let Some(_security) = security_gate.try_account_access() else {
+                show_login_error(
+                    &ui,
+                    "Finish the current security operation before signing in.".into(),
+                );
+                return;
+            };
             if let Err(error) = live.flush_drafts().await {
                 show_login_error(&ui, format!("Could not save current draft: {error}"));
                 return;
             }
             match sso::sign_in(live.manager.clone(), homeserver.to_string()).await {
-                Ok(_) => {
-                    live.is_live.store(true, Ordering::Release);
-                    if let Err(error) = live.refresh(ui.clone()).await {
+                Ok(account) => {
+                    access.refresh_accounts().await;
+                    if live
+                        .manager
+                        .active_account()
+                        .await
+                        .as_ref()
+                        .map(|a| a.id.as_str())
+                        != Some(account.id.as_str())
+                    {
+                        access.request(account.id);
+                        let _ = ui.upgrade_in_event_loop(|window| {
+                            window.set_login_loading(false);
+                            window.set_login_error(
+                                "Account saved. Enter your app password to open it.".into(),
+                            );
+                        });
+                        return;
+                    }
+                    if let Err(error) = live.account_activated(ui.clone()).await {
                         show_login_error(&ui, error.to_string());
                     } else {
                         let _ = ui.upgrade_in_event_loop(|window| {
@@ -4063,7 +4154,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             window.set_login_error("".into());
                             window.set_show_sign_in(false);
                         });
-                        tokio::spawn(live.clone().scan_spaces(ui));
                     }
                 }
                 Err(error) => show_login_error(&ui, error),
@@ -4104,6 +4194,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     let logout_live = live.clone();
     let logout_handle = runtime.handle().clone();
+    let logout_access = account_access.clone();
     #[cfg(feature = "native-calls")]
     let logout_calls = calls.clone();
     ui.on_log_out(move || {
@@ -4132,6 +4223,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ui = weak.clone();
         #[cfg(feature = "native-calls")]
         let calls = logout_calls.clone();
+        let access = logout_access.clone();
         logout_handle.spawn(async move {
             let transition = live.account_transition.lock().await;
             if security_gate.blocked() {
@@ -4148,6 +4240,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 return;
             }
+            let Some(_security) = security_gate.try_account_access() else { return; };
             let Some(active) = live.manager.active_account().await else {
                 return;
             };
@@ -4155,29 +4248,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // needed: in-flight draft writes share the manager's state lock,
             // and writes after deletion reject the missing account ID.
             let result = live.manager.logout_account(&active.id).await;
+            if live.manager.active_account().await.is_none() {
+                live.account_detached(ui.clone()).await;
+            }
+            access.refresh_accounts().await;
             drop(transition);
             match result {
-                Ok(_) => {
+                Ok(result) => {
                     if let Err(error) = live.voice_spaces.clear_logged_out_account(&active.id) {
                         show_error(&ui, format!("Could not remove local voice labels: {error}"));
                     }
                     live.voice_spaces.forget_account(&active.id).await;
                     live.forget_account_drafts(&active.id);
                     live.clear_feed().await;
-                    let accounts = live.manager.accounts().await;
-                    if accounts.is_empty() {
-                        live.is_live.store(false, Ordering::Release);
-                        let security_gate = live.security_gate.clone();
-                        let _ = ui.upgrade_in_event_loop(move |ui| {
-                            reset_room_search(&ui);
-                            security::clear_ui(&ui, &security_gate);
-                            ui.set_live_session(false);
-                            ui.set_show_sign_in(true);
-                            ui.set_session_error("".into());
-                        });
-                    } else if let Err(error) = live.select_account(0, ui.clone()).await {
-                        show_error(&ui, error.to_string());
-                    }
+                    live.account_detached(ui.clone()).await;
+                    let _ = ui.upgrade_in_event_loop(move |ui| {
+                        ui.set_account_access_notice(if result.remote_logout_succeeded {
+                            "Logged out and removed from this app."
+                        } else {
+                            "Removed locally, but homeserver logout was not confirmed. Revoke this device from another client."
+                        }.into());
+                    });
                 }
                 Err(error) => show_error(&ui, error.to_string()),
             }
@@ -4232,6 +4323,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let weak = ui.as_weak();
     let setting_store = store.clone();
+    appearance::install_callbacks(&ui, &store);
     ui.on_choose_theme(move |index| {
         if let Some(ui) = weak.upgrade() {
             let theme = match index {

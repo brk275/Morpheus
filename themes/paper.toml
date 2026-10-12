@@ -1,0 +1,15 @@
+schema_version = 1
+name = "Paper"
+
+[colors]
+rail = "#E8E5DD"
+sidebar = "#F0EEE8"
+canvas = "#FAF8F2"
+panel = "#F2EFE7"
+elevated = "#EAE6DC"
+hover = "#DFE8E2"
+ink = "#25342F"
+muted = "#596B61"
+divider = "#C9CEC2"
+accent = "#366B5A"
+accent_ink = "#FFFFFF"

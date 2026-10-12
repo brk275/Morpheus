@@ -31,6 +31,8 @@ pub struct VoiceSpaces {
     #[cfg(feature = "native-calls")]
     policy_changed: tokio::sync::watch::Sender<()>,
     #[cfg(feature = "native-calls")]
+    ring_policy_epoch: std::sync::atomic::AtomicU64,
+    #[cfg(feature = "native-calls")]
     policy_invalidator: std::sync::Mutex<Option<IncomingPolicyCallback>>,
 }
 
@@ -73,6 +75,8 @@ impl VoiceSpaces {
             #[cfg(feature = "native-calls")]
             policy_changed: tokio::sync::watch::Sender::new(()),
             #[cfg(feature = "native-calls")]
+            ring_policy_epoch: std::sync::atomic::AtomicU64::new(1),
+            #[cfg(feature = "native-calls")]
             policy_invalidator: std::sync::Mutex::new(None),
         }
     }
@@ -93,6 +97,17 @@ impl VoiceSpaces {
             {
                 invalidate();
             }
+        }
+        #[cfg(feature = "native-calls")]
+        if incoming_policy_changed(&current, config)
+            || current.notifications.sounds != config.notifications.sounds
+            || current.media.speaker_device != config.media.speaker_device
+        {
+            let _ = self.ring_policy_epoch.fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |n| Some(n.saturating_add(1)),
+            );
         }
         *current = config.clone();
         drop(current);
@@ -135,6 +150,29 @@ impl VoiceSpaces {
             .read()
             .expect("voice config lock poisoned")
             .notifications_enabled_for(account_id)
+    }
+
+    #[cfg(feature = "native-calls")]
+    pub(crate) fn ringing_policy(&self, account: &str) -> (u64, bool, Option<String>) {
+        let config = self.config.read().expect("voice config lock poisoned");
+        let epoch = self
+            .ring_policy_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        (
+            epoch,
+            epoch != u64::MAX
+                && config.notifications_enabled_for(account)
+                && config.notifications.sounds,
+            config.media.speaker_device.clone(),
+        )
+    }
+    #[cfg(feature = "native-calls")]
+    pub(crate) fn ringing_policy_current(&self, epoch: u64) -> bool {
+        epoch != u64::MAX
+            && self
+                .ring_policy_epoch
+                .load(std::sync::atomic::Ordering::Acquire)
+                == epoch
     }
 
     pub fn local_rooms(&self, account_id: &str) -> HashSet<String> {
@@ -505,5 +543,47 @@ mod tests {
                 .expect("queued scan did not finish")
                 .expect("queued scan panicked")
         );
+    }
+    #[test]
+    fn sound_policy_off_on_revokes_old_audio_without_changing_visible_offer_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let spaces = VoiceSpaces::new(ConfigStore::at(dir.path().join("config.toml")));
+        let mut config = Config::default();
+        spaces.apply_config(&config);
+        let (epoch, enabled, _) = spaces.ringing_policy("account");
+        assert!(enabled);
+        config.notifications.sounds = false;
+        spaces.apply_config(&config);
+        assert!(!spaces.ringing_policy_current(epoch));
+        assert!(!spaces.ringing_policy("account").1);
+        config.notifications.sounds = true;
+        spaces.apply_config(&config);
+        assert!(!spaces.ringing_policy_current(epoch));
+        assert!(spaces.ringing_policy("account").1);
+    }
+    #[test]
+    fn audio_policy_honors_account_override_and_output_changes_revoke_old_ring() {
+        let dir = tempfile::tempdir().unwrap();
+        let spaces = VoiceSpaces::new(ConfigStore::at(dir.path().join("config.toml")));
+        let mut config = Config::default();
+        config
+            .account_overrides
+            .entry("account".into())
+            .or_default()
+            .notifications_enabled = Some(false);
+        spaces.apply_config(&config);
+        assert!(!spaces.ringing_policy("account").1);
+        assert!(spaces.ringing_policy("other-account").1);
+        let mut notifications = spaces.subscribe_incoming_policy();
+        notifications.borrow_and_update();
+        let epoch = spaces.ringing_policy("other-account").0;
+        config.media.speaker_device = Some("wasapi:test-output".into());
+        spaces.apply_config(&config);
+        assert!(!spaces.ringing_policy_current(epoch));
+        assert_eq!(
+            spaces.ringing_policy("other-account").2.as_deref(),
+            Some("wasapi:test-output")
+        );
+        assert!(!notifications.has_changed().unwrap());
     }
 }
