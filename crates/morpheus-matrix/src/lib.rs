@@ -615,6 +615,7 @@ struct LoadedAccount {
     composed_edits: Mutex<HashMap<(String, String), composed_adapter::PendingEdit>>,
     incoming_verification_tx: watch::Sender<Vec<VerificationInfo>>,
     token_task: Mutex<Option<SyncTask>>,
+    notification_handler_registered: Mutex<bool>,
 }
 
 impl Drop for LoadedAccount {
@@ -1053,6 +1054,43 @@ impl AccountManager {
     /// features. Callers must discard it when `subscribe_active_account` changes.
     pub async fn active_client(&self) -> Result<Client> {
         Ok(self.active_loaded().await?.client.clone())
+    }
+
+    /// Install the process desktop-notification owner's handler once for this
+    /// loaded SDK client. Morpheus creates one notification owner per manager
+    /// lifetime; a restored client gets a fresh registration slot.
+    ///
+    /// SDK registration appends a callback without invoking it. It releases its
+    /// notification-handler read lock before awaiting callback futures. This
+    /// method never awaits a callback while holding either Morpheus guard.
+    pub async fn register_notification_handler_for<H, Fut>(
+        &self,
+        account_id: &str,
+        handler: H,
+    ) -> Result<bool>
+    where
+        H: Fn(matrix_sdk::sync::Notification, Room, Client) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let state = self.state.lock().await;
+        if state.active_account_id.as_deref() != Some(account_id) {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        account_access::ensure_eligible(&state, account_id)?;
+        let loaded = state
+            .loaded
+            .get(account_id)
+            .ok_or(MatrixCoreError::NoActiveAccount)?;
+        let mut registered = loaded.notification_handler_registered.lock().await;
+        if *registered {
+            return Ok(false);
+        }
+        // Cancellation while waiting leaves false. The pinned SDK has no
+        // await between appending the callback and returning; publication of
+        // true therefore occurs in the same poll as the append.
+        loaded.client.register_notification_handler(handler).await;
+        *registered = true;
+        Ok(true)
     }
 
     /// Room updates are scoped to the returned account ID. Resubscribe after
@@ -2364,6 +2402,7 @@ impl LoadedAccount {
             timelines: Mutex::new(HashMap::new()),
             composed_edits: Mutex::new(HashMap::new()),
             incoming_verification_tx,
+            notification_handler_registered: Mutex::new(false),
             token_task: Mutex::new(Some(SyncTask {
                 shutdown: Some(shutdown),
                 task: token_task,
@@ -2499,14 +2538,9 @@ fn selected_room(state: &State, room_id: &str) -> Result<Room> {
 }
 
 fn account_room(state: &State, account_id: &str, room_id: &str) -> Result<Room> {
-    if !state
-        .registry
-        .accounts
-        .iter()
-        .any(|account| account.id == account_id)
-    {
-        return Err(MatrixCoreError::AccountNotFound(account_id.into()));
-    }
+    // A timed-out credential refresh can retain a loaded client while removal
+    // is pending. That ownership permits cleanup, never further room access.
+    account_access::ensure_eligible(state, account_id)?;
     let loaded = state
         .loaded
         .get(account_id)
@@ -3209,6 +3243,126 @@ mod tests {
             assert!(!client_b.send_queue().is_enabled());
             drop(manager);
             fs::remove_dir_all(root).unwrap();
+        });
+    }
+
+    #[test]
+    fn notification_registration_tracks_loaded_client_lifetime_and_cancelled_waits() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let directory = std::env::temp_dir().join(format!(
+                "morpheus-notification-registration-{}",
+                Uuid::new_v4()
+            ));
+            let manager = Arc::new(AccountManager::open(&directory).unwrap());
+            let account = AccountInfo {
+                id: Uuid::new_v4().to_string(),
+                user_id: "@casey:example.org".into(),
+                device_id: "FIXTURE".into(),
+                homeserver: "http://127.0.0.1:9".into(),
+            };
+            let client = Client::new(Url::parse(&account.homeserver).unwrap())
+                .await
+                .unwrap();
+            let loaded = Arc::new(LoadedAccount::new(
+                client,
+                account.id.clone(),
+                "fixture".into(),
+                manager._access_lock.clone(),
+            ));
+            let old_lifetime = Arc::downgrade(&loaded);
+            {
+                let mut state = manager.state.lock().await;
+                state.registry.accounts.push(account.clone());
+                state.active_account_id = Some(account.id.clone());
+                state.loaded.insert(account.id.clone(), loaded.clone());
+                manager.publish_active_account(Some(account.clone()));
+            }
+            assert!(matches!(
+                manager
+                    .register_notification_handler_for("stale-account", |_, _, _| async {})
+                    .await,
+                Err(MatrixCoreError::SelectedAccountChanged)
+            ));
+
+            // Cancel a real registration future while its per-client slot is
+            // reserved elsewhere, before SDK append. The next attempt must work.
+            let reservation = loaded.notification_handler_registered.lock().await;
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let waiting_manager = manager.clone();
+            let waiting_id = account.id.clone();
+            let waiting = tokio::spawn(async move {
+                let _ = started_tx.send(());
+                waiting_manager
+                    .register_notification_handler_for(&waiting_id, |_, _, _| async {})
+                    .await
+            });
+            started_rx.await.unwrap();
+            assert!(manager.state.try_lock().is_err());
+            waiting.abort();
+            assert!(waiting.await.unwrap_err().is_cancelled());
+            assert!(!*reservation);
+            drop(reservation);
+            assert!(
+                manager
+                    .register_notification_handler_for(&account.id, |_, _, _| async {})
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !manager
+                    .register_notification_handler_for(&account.id, |_, _, _| async {})
+                    .await
+                    .unwrap()
+            );
+            drop(loaded);
+            manager.stop().await;
+            assert!(
+                old_lifetime.upgrade().is_none(),
+                "registration must not retain the removed loaded account"
+            );
+            assert!(matches!(
+                manager
+                    .register_notification_handler_for(&account.id, |_, _, _| async {})
+                    .await,
+                Err(MatrixCoreError::SelectedAccountChanged)
+            ));
+
+            // Reusing the saved account UUID after stop means a fresh SDK
+            // client, even if an active-account watch coalesces None -> Some.
+            let client = Client::new(Url::parse(&account.homeserver).unwrap())
+                .await
+                .unwrap();
+            let restored = Arc::new(LoadedAccount::new(
+                client,
+                account.id.clone(),
+                "fixture".into(),
+                manager._access_lock.clone(),
+            ));
+            {
+                let mut state = manager.state.lock().await;
+                state.active_account_id = Some(account.id.clone());
+                state.loaded.insert(account.id.clone(), restored);
+                manager.publish_active_account(Some(account.clone()));
+            }
+            assert!(
+                manager
+                    .register_notification_handler_for(&account.id, |_, _, _| async {})
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !manager
+                    .register_notification_handler_for(&account.id, |_, _, _| async {})
+                    .await
+                    .unwrap()
+            );
+            manager.stop().await;
+            drop(manager);
+            fs::remove_dir_all(directory).unwrap();
         });
     }
 

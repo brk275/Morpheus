@@ -1,8 +1,33 @@
 import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView } from "std-widgets.slint";
 
+// Optional overrides retain each control's existing color when absent.
+export struct ColorRole {
+    present: bool,
+    color: color,
+}
+
+export struct ThemeRoleSet {
+    error: ColorRole,
+    error-surface: ColorRole,
+    error-ink: ColorRole,
+    success: ColorRole,
+    success-surface: ColorRole,
+    success-ink: ColorRole,
+    selection: ColorRole,
+    selection-ink: ColorRole,
+    focus: ColorRole,
+    link: ColorRole,
+    unread: ColorRole,
+    unread-ink: ColorRole,
+    destructive: ColorRole,
+    destructive-ink: ColorRole,
+    voice: ColorRole,
+}
+
 // Runtime geometry shared by small reusable controls and the main view.
 export global StyleTokens {
     in-out property <length> radius: 10px;
+    in-out property <ThemeRoleSet> roles;
 }
 
 export struct EmojiItem {
@@ -16,10 +41,18 @@ export struct MentionItem {
     name: string,
 }
 
+// These Palette fallbacks match Slint 1.18.1's TextInput defaults.
+component ThemedTextInput inherits TextInput {
+    selection-background-color: StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : Palette.selection-background;
+    selection-foreground-color: StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : Palette.selection-foreground;
+}
+
 // Pinned Slint 1.18.1 adapter. Only these three reads use its documented-as-
 // internal test/IME properties; placement uses the public UTF-8 offset setter.
 // This wrapper must receive native caret/selection/IME acceptance on upgrades.
 component MentionInput inherits TextInput {
+    selection-background-color: StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : Palette.selection-background;
+    selection-foreground-color: StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : Palette.selection-foreground;
     out property <int> caret-bytes: self.cursor-position-byte-offset;
     out property <int> anchor-bytes: self.anchor-position-byte-offset;
     out property <bool> composing: self.preedit-text != "";
@@ -79,6 +112,7 @@ export struct MessageItem {
     event-id: string,
     is-own: bool,
     sender: string,
+    sender-palette-index: int,
     initials: string,
     time: string,
     body: string,
@@ -203,7 +237,7 @@ component IconAction inherits Rectangle {
     width: 34px;
     height: 34px;
     border-radius: StyleTokens.radius * 0.9;
-    background: area.has-hover || selected ? hover-surface : surface;
+    background: selected ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : hover-surface) : area.has-hover ? hover-surface : surface;
     forward-focus: keyboard-focus;
     accessible-role: button;
     accessible-label: label;
@@ -211,7 +245,7 @@ component IconAction inherits Rectangle {
     accessible-action-default => { if root.enabled { root.activated(); } }
     if !root.vector-icon : Text {
         text: root.icon;
-        color: root.ink;
+        color: root.selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink;
         font-size: root.icon == "Md" ? 13px : 18px;
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -222,7 +256,7 @@ component IconAction inherits Rectangle {
         width: 18px;
         height: 18px;
         icon: root.icon;
-        ink: root.ink;
+        ink: root.selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink;
     }
     area := TouchArea {
         enabled: root.enabled;
@@ -244,7 +278,7 @@ component IconAction inherits Rectangle {
     if keyboard-focus.has-focus : Rectangle {
         border-radius: parent.border-radius;
         border-width: 2px;
-        border-color: root.ink;
+        border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.ink;
         background: transparent;
     }
 }
@@ -297,7 +331,7 @@ component ActionRect inherits Rectangle {
     if keyboard-focus.has-focus : Rectangle {
         border-radius: parent.border-radius;
         border-width: 2px;
-        border-color: root.focus-color;
+        border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.focus-color;
         background: transparent;
     }
 }
@@ -317,7 +351,7 @@ component TextAction inherits ActionRect {
     border-radius: StyleTokens.radius * 0.7;
     border-width: 1px;
     border-color: outline;
-    background: enabled && has-hover ? hover-surface : surface;
+    background: self.enabled && self.has-hover ? hover-surface : surface;
     focus-color: ink;
     caption := Text {
         x: 12px * root.text-scale;
@@ -398,7 +432,7 @@ component EmojiPopup inherits Rectangle {
                     text: "Search emoji"; color: root.muted; font-size: 12px * root.text-scale;
                     vertical-alignment: center;
                 }
-                emoji-search := TextInput {
+                emoji-search := ThemedTextInput {
                     x: 8px; width: parent.width - 16px; height: parent.height;
                     text <=> root.query; color: root.ink; font-size: 12px * root.text-scale;
                     vertical-alignment: center; accessible-label: "Search emoji by name";
@@ -470,9 +504,9 @@ component ShortcutSetting inherits Rectangle {
         Text { text: root.label; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; }
         Rectangle {
             width: 200px; height: 38px; background: root.surface; border-radius: StyleTokens.radius * 0.7;
-            border-width: shortcut-input.has-focus ? 2px : 0px; border-color: root.accent;
+            border-width: shortcut-input.has-focus ? 2px : 0px; border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent;
             if root.binding == "" : Text { x: 9px; text: "Disabled"; color: root.muted; font-size: 12px * root.text-scale; vertical-alignment: center; }
-            shortcut-input := TextInput {
+            shortcut-input := ThemedTextInput {
                 x: 9px; width: parent.width - 18px; height: parent.height;
                 text <=> root.binding; color: root.ink; font-size: 12px * root.text-scale;
                 single-line: true; accessible-label: root.label + " keyboard shortcut; blank disables";
@@ -521,8 +555,8 @@ component StyleFontSetting inherits Rectangle {
         Text { text: root.label; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; }
         Rectangle {
             height: 38px * root.text-scale; background: root.surface; border-radius: StyleTokens.radius * 0.7;
-            border-width: input.has-focus ? 2px : 0px; border-color: root.accent;
-            input := TextInput {
+            border-width: input.has-focus ? 2px : 0px; border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent;
+            input := ThemedTextInput {
                 x: 10px; width: max(0px, parent.width - 20px); height: parent.height;
                 text <=> root.family; single-line: true;
                 color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center;
@@ -536,7 +570,10 @@ export component AppWindow inherits Window {
     title: "Morpheus";
     preferred-width: 1310px;
     preferred-height: 820px;
-    min-width: 940px;
+    // Derive the minimum from saved pane sizes, not the window width. A
+    // width-dependent pane constraint creates a layout-info binding cycle.
+    min-width: max(940px, root.rail-width-px * 1px + root.room-list-width * 1px
+        + (root.show-side-panel && root.page == 0 ? root.details-width * 1px : 0px) + 360px);
     min-height: 620px;
 
     in-out property <[AccountItem]> accounts;
@@ -647,6 +684,7 @@ export component AppWindow inherits Window {
     in-out property <bool> show-message-avatars: true;
     in-out property <bool> show-message-timestamps: true;
     in-out property <bool> color-message-senders: false;
+    in-out property <[color]> sender-palette;
     in-out property <int> nickname-width-px: 128;
     in-out property <string> appearance-ui-font-input;
     in-out property <string> appearance-message-font-input;
@@ -1174,7 +1212,7 @@ export component AppWindow inherits Window {
                             width: root.rail-width-px * 1px - 12px;
                             height: 48px;
                             border-radius: StyleTokens.radius * 1.2;
-                            background: root.active-space-id == space.id && root.page == 0 ? root.hover : self.has-hover ? root.hover : transparent;
+                            background: root.active-space-id == space.id && root.page == 0 ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : self.has-hover ? root.hover : transparent;
                             focus-color: root.accent;
                             label: "Select space " + space.name;
                             activated => {
@@ -1231,7 +1269,7 @@ export component AppWindow inherits Window {
 
         // Room list and Discord-style account control.
         Rectangle {
-            width: min(root.room-list-width * 1px, max(180px, root.width * 0.25));
+            width: root.room-list-width * 1px;
             background: root.sidebar;
             VerticalLayout {
                 spacing: 0px;
@@ -1332,7 +1370,7 @@ export component AppWindow inherits Window {
                         }
                         if root.invite-error != "" : Text {
                             text: root.invite-error;
-                            color: #ff8d9d;
+                            color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #ff8d9d;
                             font-size: 11px * root.text-scale;
                             wrap: word-wrap;
                             height: 40px;
@@ -1371,7 +1409,7 @@ export component AppWindow inherits Window {
                         for room in root.channels : ActionRect {
                             height: max(root.density-mode == 0 ? 30px : root.density-mode == 2 ? 44px : 36px, 22px * root.text-scale);
                             border-radius: StyleTokens.radius * 0.8;
-                            background: room.id == root.active-room-id && root.page == 0 ? root.hover : self.has-hover ? root.elevated : transparent;
+                            background: room.id == root.active-room-id && root.page == 0 ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : self.has-hover ? root.elevated : transparent;
                             focus-color: root.accent;
                             label: room.voice-space ? "Enter voice space " + room.name : "Open room " + room.name;
                             activated => {
@@ -1382,12 +1420,12 @@ export component AppWindow inherits Window {
                                 padding-left: 10px;
                                 padding-right: 9px;
                                 spacing: 8px;
-                                Text { text: room.voice-space ? "◖" : (room.private-room ? "⌑" : "#"); color: room.voice-space ? #78c8b1 : root.muted; font-size: 18px * root.text-scale; vertical-alignment: center; }
-                                Text { text: room.name; color: room.unread > 0 ? root.ink : root.muted; font-size: 13px * root.text-scale; font-weight: room.unread > 0 ? 700 : 500; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
-                                if room.voice-space : Text { text: "VOICE"; color: #78c8b1; font-size: 9px * root.text-scale; font-weight: 750; vertical-alignment: center; }
+                                Text { text: room.voice-space ? "◖" : (room.private-room ? "⌑" : "#"); color: room.id == root.active-room-id && root.page == 0 && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : room.voice-space ? (StyleTokens.roles.voice.present ? StyleTokens.roles.voice.color : #78c8b1) : root.muted; font-size: 18px * root.text-scale; vertical-alignment: center; }
+                                Text { text: room.name; color: room.id == root.active-room-id && root.page == 0 && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : (room.unread > 0 ? root.ink : root.muted); font-size: 13px * root.text-scale; font-weight: room.unread > 0 ? 700 : 500; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                                if room.voice-space : Text { text: "VOICE"; color: room.id == root.active-room-id && root.page == 0 && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : StyleTokens.roles.voice.present ? StyleTokens.roles.voice.color : #78c8b1; font-size: 9px * root.text-scale; font-weight: 750; vertical-alignment: center; }
                                 if room.unread > 0 : Rectangle {
-                                    width: 20px; height: 20px; border-radius: 10px; background: root.accent;
-                                    Text { text: room.unread; color: root.accent-ink; font-size: 10px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                                    width: 20px; height: 20px; border-radius: 10px; background: StyleTokens.roles.unread.present ? StyleTokens.roles.unread.color : root.accent;
+                                    Text { text: room.unread; color: StyleTokens.roles.unread-ink.present ? StyleTokens.roles.unread-ink.color : root.accent-ink; font-size: 10px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                                 }
                             }
                         }
@@ -1403,7 +1441,7 @@ export component AppWindow inherits Window {
                         for room in root.direct-messages : ActionRect {
                             height: max(root.density-mode == 0 ? 32px : root.density-mode == 2 ? 47px : 39px, 22px * root.text-scale);
                             border-radius: StyleTokens.radius * 0.8;
-                            background: room.id == root.active-room-id && root.page == 0 ? root.hover : self.has-hover ? root.elevated : transparent;
+                            background: room.id == root.active-room-id && root.page == 0 ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : self.has-hover ? root.elevated : transparent;
                             focus-color: root.accent;
                             label: room.voice-space ? "Enter voice space with " + room.name : "Open direct message with " + room.name;
                             activated => {
@@ -1418,11 +1456,11 @@ export component AppWindow inherits Window {
                                     width: 25px; height: 25px; border-radius: StyleTokens.radius * 0.9; background: root.accent;
                                     Text { text: room.voice-space ? "◖" : "@"; color: root.accent-ink; font-size: 13px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
                                 }
-                                Text { text: room.name; color: room.unread > 0 ? root.ink : root.muted; font-size: 13px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
-                                if room.voice-space : Text { text: "VOICE"; color: #78c8b1; font-size: 9px * root.text-scale; font-weight: 750; vertical-alignment: center; }
+                                Text { text: room.name; color: room.id == root.active-room-id && root.page == 0 && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : (room.unread > 0 ? root.ink : root.muted); font-size: 13px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                                if room.voice-space : Text { text: "VOICE"; color: room.id == root.active-room-id && root.page == 0 && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : StyleTokens.roles.voice.present ? StyleTokens.roles.voice.color : #78c8b1; font-size: 9px * root.text-scale; font-weight: 750; vertical-alignment: center; }
                                 if room.unread > 0 : Rectangle {
-                                    width: 20px; height: 20px; border-radius: 10px; background: root.accent;
-                                    Text { text: room.unread; color: root.accent-ink; font-size: 10px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                                    width: 20px; height: 20px; border-radius: 10px; background: StyleTokens.roles.unread.present ? StyleTokens.roles.unread.color : root.accent;
+                                    Text { text: room.unread; color: StyleTokens.roles.unread-ink.present ? StyleTokens.roles.unread-ink.color : root.accent-ink; font-size: 10px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                                 }
                             }
                         }
@@ -1579,7 +1617,7 @@ export component AppWindow inherits Window {
                             if root.call-connected { root.pending-account-index = -3; root.leave-call-dialog = true; root.account-menu-open = false; }
                             else { root.log-out(); root.account-menu-open = false; }
                         }
-                        Text { x: 9px; text: "↪   Log out"; color: #e47483; font-size: 12px * root.text-scale; vertical-alignment: center; }
+                        Text { x: 9px; text: "↪   Log out"; color: StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : #e47483; font-size: 12px * root.text-scale; vertical-alignment: center; }
                     }
                 }
             }
@@ -1738,12 +1776,12 @@ export component AppWindow inherits Window {
                 }
                 if root.config-error != "" : Rectangle {
                     height: 39px;
-                    background: #9f3f50;
+                    background: StyleTokens.roles.error-surface.present ? StyleTokens.roles.error-surface.color : #9f3f50;
                     Text {
                         x: 16px;
                         width: parent.width - 32px;
                         text: "Settings file: " + root.config-error;
-                        color: #ffffff;
+                        color: StyleTokens.roles.error-ink.present ? StyleTokens.roles.error-ink.color : #ffffff;
                         font-size: 11px * root.text-scale;
                         vertical-alignment: center;
                         overflow: elide;
@@ -1751,13 +1789,13 @@ export component AppWindow inherits Window {
                 }
                 if root.session-error != "" : Rectangle {
                     height: 34px;
-                    background: #613743;
+                    background: StyleTokens.roles.error-surface.present ? StyleTokens.roles.error-surface.color : #613743;
                     Text {
                         x: 16px;
                         width: parent.width - 32px;
                         text: root.session-error;
                         accessible-live-region: polite;
-                        color: #ffffff;
+                        color: StyleTokens.roles.error-ink.present ? StyleTokens.roles.error-ink.color : #ffffff;
                         font-size: 11px * root.text-scale;
                         vertical-alignment: center;
                         overflow: elide;
@@ -1765,12 +1803,12 @@ export component AppWindow inherits Window {
                 }
                 if root.transfer-notice != "" : Rectangle {
                     height: 30px;
-                    background: #214a46;
+                    background: StyleTokens.roles.success-surface.present ? StyleTokens.roles.success-surface.color : #214a46;
                     Text {
                         x: 16px; width: parent.width - 32px;
                         text: root.transfer-notice;
                         accessible-live-region: polite;
-                        color: #ffffff;
+                        color: StyleTokens.roles.success-ink.present ? StyleTokens.roles.success-ink.color : #ffffff;
                         font-size: 11px * root.text-scale;
                         vertical-alignment: center;
                         overflow: elide;
@@ -1800,7 +1838,7 @@ export component AppWindow inherits Window {
                         spacing: 8px;
                         Text {
                             text: root.active-voice-local || root.active-voice-shared ? "◖ VOICE" : "Voice";
-                            color: root.active-voice-local || root.active-voice-shared ? #78c8b1 : root.muted;
+                            color: root.active-voice-local || root.active-voice-shared ? (StyleTokens.roles.voice.present ? StyleTokens.roles.voice.color : #78c8b1) : root.muted;
                             font-size: 11px * root.text-scale;
                             font-weight: 700;
                             vertical-alignment: center;
@@ -1834,7 +1872,7 @@ export component AppWindow inherits Window {
                     if root.voice-designation-error != "" || root.voice-designation-notice != "" : Text {
                         height: 25px;
                         text: root.voice-designation-error != "" ? root.voice-designation-error : root.voice-designation-notice;
-                        color: root.voice-designation-error != "" ? #ff8d9d : #78c8b1;
+                        color: root.voice-designation-error != "" ? (StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #ff8d9d) : (StyleTokens.roles.success.present ? StyleTokens.roles.success.color : #78c8b1);
                         font-size: 11px * root.text-scale;
                         accessible-live-region: polite;
                         overflow: elide;
@@ -1854,7 +1892,7 @@ export component AppWindow inherits Window {
                         }
                         if root.history-error != "" : Text {
                             text: root.history-error;
-                            color: #e47483;
+                            color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483;
                             font-size: 11px * root.text-scale;
                             vertical-alignment: center;
                             horizontal-stretch: 1;
@@ -1871,6 +1909,7 @@ export component AppWindow inherits Window {
                             // optional timestamps must keep pending and failed sends visible.
                             property <bool> show-time: root.show-message-timestamps || message.time == "Sending…" || message.time == "Failed to send";
                             property <bool> columns: root.message-layout == 2 && self.width >= max(640px, 640px * root.text-scale);
+                            property <bool> selected-message: root.room-search-selected-event-id != "" && message.event-id == root.room-search-selected-event-id;
                             property <length> avatar-size: root.message-layout == 0 ? 38px : 26px;
                             property <length> action-width: message.event-id == "" ? 0px : (message.is-own && message.attachment == "" ? 172px : 136px);
                             property <length> column-width: self.columns ? min(root.nickname-width-px * 1px, self.width * 0.2) : 0px;
@@ -1879,7 +1918,7 @@ export component AppWindow inherits Window {
                                 - (root.show-message-avatars ? self.avatar-size + (root.message-layout == 0 ? 10px : 7px) : 0px)
                                 - (self.columns ? self.column-width + 7px + (message-row.show-time ? 72px * root.text-scale + 7px : 0px) : 0px));
                             min-height: max(28px + 2 * root.message-row-gap, root.show-message-avatars ? self.avatar-size + 2 * root.message-row-gap : 0px);
-                            background: root.room-search-selected-event-id != "" && message.event-id == root.room-search-selected-event-id ? root.hover : message-hover.has-hover ? root.elevated : transparent;
+                            background: message-row.selected-message ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : message-hover.has-hover ? root.elevated : transparent;
                             message-hover := TouchArea { mouse-cursor: default; }
                             message-flow := HorizontalLayout {
                                 padding-left: root.content-inset; padding-right: root.content-inset;
@@ -1893,19 +1932,19 @@ export component AppWindow inherits Window {
                                 }
                                 if message-row.columns && message-row.show-time : Text {
                                     width: 72px * root.text-scale; text: message.time;
-                                    color: root.muted; font-family: root.monospace-font-family;
+                                    color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.muted; font-family: root.monospace-font-family;
                                     font-size: 10px * root.text-scale; overflow: elide;
                                     accessible-label: message.time;
                                 }
                                 if message-row.columns : Text {
                                     width: message-row.column-width; text: message.sender;
-                                    color: root.color-message-senders ? message.accent : root.ink;
+                                    color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.color-message-senders ? (root.sender-palette.length > 0 ? root.sender-palette[mod(message.sender-palette-index, max(1, root.sender-palette.length))] : message.accent) : root.ink;
                                     font-family: root.message-font-family; font-size: root.message-font-px;
                                     font-weight: 650; horizontal-alignment: right; overflow: elide;
                                     accessible-label: message.sender;
                                 }
                                 message-content := VerticalLayout {
-                                    width: message-row.body-width; min-width: 0px;
+                                    width: message-row.body-width;
                                     spacing: root.message-layout == 0 ? 5px : 2px;
                                     padding-right: message-row.columns ? message-row.action-width + 8px : 0px;
                                     if !message-row.columns : HorizontalLayout {
@@ -1914,20 +1953,20 @@ export component AppWindow inherits Window {
                                         spacing: 8px;
                                         if message-row.tight-header : Text {
                                             text: message.sender + (message-row.show-time ? " · " + message.time : "");
-                                            color: root.color-message-senders ? message.accent : root.ink;
+                                            color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.color-message-senders ? (root.sender-palette.length > 0 ? root.sender-palette[mod(message.sender-palette-index, max(1, root.sender-palette.length))] : message.accent) : root.ink;
                                             font-family: root.message-font-family; font-size: root.message-font-px;
                                             font-weight: 650; overflow: elide; vertical-alignment: top;
                                             accessible-label: message.sender + (message-row.show-time ? ", " + message.time : "");
                                         }
                                         if !message-row.tight-header : Text {
-                                            text: message.sender; color: root.color-message-senders ? message.accent : root.ink;
+                                            text: message.sender; color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.color-message-senders ? (root.sender-palette.length > 0 ? root.sender-palette[mod(message.sender-palette-index, max(1, root.sender-palette.length))] : message.accent) : root.ink;
                                             font-family: root.message-font-family;
                                             font-size: root.message-layout == 0 ? root.message-font-px : max(10px, root.message-font-px - 2px);
                                             font-weight: 650; overflow: elide; horizontal-stretch: 1;
                                             accessible-label: message.sender;
                                         }
                                         if !message-row.tight-header && message-row.show-time : Text {
-                                            text: message.time; color: root.muted; font-family: root.monospace-font-family;
+                                            text: message.time; color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.muted; font-family: root.monospace-font-family;
                                             font-size: 10px * root.text-scale; vertical-alignment: center;
                                         }
                                     }
@@ -1936,15 +1975,15 @@ export component AppWindow inherits Window {
                                         border-radius: StyleTokens.radius * 0.5;
                                         background: transparent;
                                         Rectangle { x: 0px; y: 4px; width: 2px; height: parent.height - 8px; border-radius: StyleTokens.radius * 0.1; background: root.divider; }
-                                        Text { x: 10px; width: parent.width - 10px; text: message.reply-to; color: root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; overflow: elide; }
+                                        Text { x: 10px; width: parent.width - 10px; text: message.reply-to; color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; overflow: elide; }
                                     }
                                     StyledText {
                                         width: max(0px, message-content.width - (message-row.columns ? message-row.action-width + 8px : 0px));
                                         text: message.rich-body;
-                                        default-color: root.ink;
+                                        default-color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink;
                                         default-font-size: root.message-font-px;
                                         default-font-family: root.message-font-family;
-                                        link-color: root.accent;
+                                        link-color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : StyleTokens.roles.link.present ? StyleTokens.roles.link.color : root.accent;
                                         accessible-role: text;
                                         accessible-label: message.rich-accessible-body;
                                         link-clicked(url) => { root.open-message-link(url); }
@@ -2261,7 +2300,7 @@ export component AppWindow inherits Window {
                                 text: "Room name or topic"; color: root.muted;
                                 font-size: 12px * root.text-scale; vertical-alignment: center;
                             }
-                            directory-search-input := TextInput {
+                            directory-search-input := ThemedTextInput {
                                 x: 10px; y: 2px; width: parent.width - 20px; height: parent.height - 4px;
                                 text <=> root.directory-search;
                                 color: root.ink; font-size: 13px * root.text-scale;
@@ -2278,7 +2317,7 @@ export component AppWindow inherits Window {
                                 text: "Server (optional)"; color: root.muted;
                                 font-size: 12px * root.text-scale; vertical-alignment: center;
                             }
-                            TextInput {
+                            ThemedTextInput {
                                 x: 10px; y: 2px; width: parent.width - 20px; height: parent.height - 4px;
                                 text <=> root.directory-server;
                                 color: root.ink; font-size: 12px * root.text-scale;
@@ -2299,7 +2338,7 @@ export component AppWindow inherits Window {
                         color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
                     }
                     if root.directory-error != "" : Text {
-                        text: root.directory-error; color: #ff8d9d;
+                        text: root.directory-error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #ff8d9d;
                         font-size: 12px * root.text-scale; wrap: word-wrap;
                         accessible-live-region: polite;
                     }
@@ -2315,7 +2354,7 @@ export component AppWindow inherits Window {
                                 text: "#room:server or matrix.to link"; color: root.muted;
                                 font-size: 12px * root.text-scale; vertical-alignment: center;
                             }
-                            TextInput {
+                            ThemedTextInput {
                                 x: 10px; y: 2px; width: parent.width - 20px; height: parent.height - 4px;
                                 text <=> root.directory-join-input;
                                 color: root.ink; font-size: 12px * root.text-scale;
@@ -2332,7 +2371,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     if root.directory-join-error != "" : Text {
-                        text: root.directory-join-error; color: #ff8d9d;
+                        text: root.directory-join-error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #ff8d9d;
                         font-size: 12px * root.text-scale; wrap: word-wrap;
                         accessible-live-region: polite;
                     }
@@ -2664,7 +2703,7 @@ export component AppWindow inherits Window {
                             height: 38px; spacing: 8px;
                             Rectangle {
                                 horizontal-stretch: 1; background: root.panel; border-radius: 8px; border-color: root.divider; border-width: 1px;
-                                TextInput {
+                                ThemedTextInput {
                                     x: 10px; width: parent.width - 20px; height: parent.height;
                                     text <=> root.notification-highlight-input;
                                     color: root.ink; font-size: 12px * root.text-scale;
@@ -2680,7 +2719,7 @@ export component AppWindow inherits Window {
                             }
                         }
                         if root.notification-highlight-error != "" : Text {
-                            text: root.notification-highlight-error; color: #e47483;
+                            text: root.notification-highlight-error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483;
                             font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite;
                         }
                         for word in root.notification-highlight-words : Rectangle {
@@ -2715,8 +2754,8 @@ export component AppWindow inherits Window {
                                     Text { text: "Recovery: " + root.security-recovery-status + "  ·  Key backup: " + root.security-backup-status; color: root.muted; font-size: 12px * root.text-scale; accessible-live-region: polite; }
                                 }
                             }
-                            if root.security-error != "" : Text { text: root.security-error; color: #e47483; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
-                            if root.security-notice != "" : Text { text: root.security-notice; color: root.accent; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+                            if root.security-error != "" : Text { text: root.security-error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+                            if root.security-notice != "" : Text { text: root.security-notice; color: StyleTokens.roles.success.present ? StyleTokens.roles.success.color : root.accent; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
                             Timer {
                                 interval: 3s;
                                 running: root.page == 1 && !root.sas-busy && (root.sas-stage == 1 || root.sas-stage == 3 || root.sas-stage == 5);
@@ -2792,8 +2831,8 @@ export component AppWindow inherits Window {
                                             color: root.ink; font-size: 11px * root.text-scale; vertical-alignment: center;
                                         }
                                     }
-                                    if root.sas-error != "" : Text { text: root.sas-error; color: #e47483; font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
-                                    if root.sas-notice != "" : Text { text: root.sas-notice; color: root.accent; font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+                                    if root.sas-error != "" : Text { text: root.sas-error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483; font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+                                    if root.sas-notice != "" : Text { text: root.sas-notice; color: StyleTokens.roles.success.present ? StyleTokens.roles.success.color : root.accent; font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
                                     if root.sas-stage != 0 : HorizontalLayout {
                                         spacing: 8px;
                                         if root.sas-stage == 1 || root.sas-stage == 3 || root.sas-stage == 5 : Button {
@@ -2848,7 +2887,7 @@ export component AppWindow inherits Window {
                                         spacing: 8px;
                                         Rectangle {
                                             height: 38px; horizontal-stretch: 1; background: root.panel; border-radius: 8px; border-color: root.divider; border-width: 1px;
-                                            TextInput {
+                                            ThemedTextInput {
                                                 x: 10px; width: parent.width - 20px; height: parent.height;
                                                 text <=> root.security-recovery-input; input-type: password;
                                                 enabled: root.sas-stage == 0 && !root.sas-busy && !root.security-busy;
@@ -2928,8 +2967,8 @@ export component AppWindow inherits Window {
                             Button { text: "Restore defaults"; clicked => { root.reset-shortcuts(); } }
                             Button { text: "Save shortcuts"; primary: true; enabled: root.shortcuts-dirty; clicked => { root.save-shortcuts(); } }
                         }
-                        if root.shortcut-error != "" : Text { text: root.shortcut-error; color: #e58e9b; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: assertive; }
-                        if root.shortcut-notice != "" : Text { text: root.shortcut-notice; color: root.accent; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+                        if root.shortcut-error != "" : Text { text: root.shortcut-error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: assertive; }
+                        if root.shortcut-notice != "" : Text { text: root.shortcut-notice; color: StyleTokens.roles.success.present ? StyleTokens.roles.success.color : root.accent; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
                         Rectangle { height: 1px; background: root.divider; }
                         Text { text: "Advanced customization"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Edit your settings and theme pack files. Valid changes appear here automatically."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
@@ -2990,7 +3029,7 @@ export component AppWindow inherits Window {
                     }
                     if root.live-session && root.native-audio-failed : Text {
                         text: root.native-audio-error;
-                        color: #e58e9b; font-size: 12px * root.text-scale;
+                        color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b; font-size: 12px * root.text-scale;
                         wrap: word-wrap; accessible-live-region: polite;
                     }
                     if root.live-session && root.native-camera-active : Text {
@@ -3005,17 +3044,17 @@ export component AppWindow inherits Window {
                     }
                     if root.live-session && root.native-capture-error != "" : Text {
                         text: root.native-capture-error;
-                        color: #ef9da9; font-size: 11px * root.text-scale;
+                        color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #ef9da9; font-size: 11px * root.text-scale;
                         wrap: word-wrap; accessible-live-region: polite;
                     }
                     if root.live-session && root.native-camera-error != "" : Text {
                         text: "Camera: " + root.native-camera-error;
-                        color: #ef9da9; font-size: 11px * root.text-scale;
+                        color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #ef9da9; font-size: 11px * root.text-scale;
                         wrap: word-wrap; accessible-live-region: polite;
                     }
                     if root.live-session && root.native-screen-error != "" : Text {
                         text: "Screen share: " + root.native-screen-error;
-                        color: #ef9da9; font-size: 11px * root.text-scale;
+                        color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #ef9da9; font-size: 11px * root.text-scale;
                         wrap: word-wrap; accessible-live-region: polite;
                     }
                     if root.live-session && root.native-call-enabled : VerticalLayout {
@@ -3260,8 +3299,8 @@ export component AppWindow inherits Window {
                                 }
                             }
                             ActionRect {
-                                width: 110px; height: 43px; border-radius: 9px; background: root.live-session && !root.native-call-enabled ? root.hover : root.call-connected ? #d65163 : root.accent;
-                                focus-color: root.live-session && !root.native-call-enabled ? root.muted : root.call-connected ? #10131b : root.accent-ink;
+                                width: 110px; height: 43px; border-radius: 9px; background: root.live-session && !root.native-call-enabled ? root.hover : root.call-connected ? (StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : #d65163) : root.accent;
+                                focus-color: root.live-session && !root.native-call-enabled ? root.muted : root.call-connected ? (StyleTokens.roles.destructive-ink.present ? StyleTokens.roles.destructive-ink.color : #10131b) : root.accent-ink;
                                 label: root.live-session ? (root.native-leave-unconfirmed ? "Review incomplete call cleanup" : (root.call-connected ? "Leave native call" : "Join native call")) : (root.call-connected ? "End call preview" : "Start call preview");
                                 enabled: !root.live-session || root.native-call-enabled;
                                 activated => {
@@ -3273,7 +3312,7 @@ export component AppWindow inherits Window {
                                         }
                                     } else { root.call-connected = !root.call-connected; }
                                 }
-                                Text { text: root.live-session ? (root.native-call-enabled ? (root.native-leave-unconfirmed ? "Review leave" : (root.call-connected ? "Leave call" : (root.room-call-mode == 2 ? "Join legacy call" : "Join call"))) : "Unavailable") : (root.call-connected ? "End preview" : "Start preview"); color: root.live-session && !root.native-call-enabled ? root.muted : root.call-connected ? #10131b : root.accent-ink; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                                Text { text: root.live-session ? (root.native-call-enabled ? (root.native-leave-unconfirmed ? "Review leave" : (root.call-connected ? "Leave call" : (root.room-call-mode == 2 ? "Join legacy call" : "Join call"))) : "Unavailable") : (root.call-connected ? "End preview" : "Start preview"); color: root.live-session && !root.native-call-enabled ? root.muted : root.call-connected ? (StyleTokens.roles.destructive-ink.present ? StyleTokens.roles.destructive-ink.color : #10131b) : root.accent-ink; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                             }
                             IconAction { width: 40px; height: 43px; icon: "R"; label: "Return to chat"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.page = 0; } }
                         }
@@ -3283,7 +3322,7 @@ export component AppWindow inherits Window {
         }
 
         if root.show-side-panel && root.page == 0 : Rectangle {
-            width: min(root.details-width * 1px, max(200px, root.width * 0.25));
+            width: root.details-width * 1px;
             background: root.panel;
             border-color: root.divider;
             border-width: 1px;
@@ -3356,7 +3395,7 @@ export component AppWindow inherits Window {
                     }
                     if root.live-session && root.member-error != "" : Text {
                         height: 58px; text: root.member-error;
-                        color: #d65163; font-size: 11px * root.text-scale;
+                        color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #d65163; font-size: 11px * root.text-scale;
                         wrap: word-wrap; horizontal-alignment: center; vertical-alignment: center;
                         accessible-live-region: assertive;
                     }
@@ -3375,7 +3414,7 @@ export component AppWindow inherits Window {
                         Rectangle {
                             horizontal-stretch: 1; background: root.elevated;
                             border-radius: 7px; border-color: root.divider; border-width: 1px;
-                            TextInput {
+                            ThemedTextInput {
                                 x: 7px; width: parent.width - 14px; height: parent.height;
                                 text <=> root.member-invite-user-id;
                                 color: root.ink; font-size: 11px * root.text-scale;
@@ -3399,7 +3438,7 @@ export component AppWindow inherits Window {
                     }
                     if root.member-action-error != "" : Text {
                         height: 44px; text: root.member-action-error;
-                        color: #e47483; font-size: 11px * root.text-scale;
+                        color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483; font-size: 11px * root.text-scale;
                         wrap: word-wrap; accessible-live-region: polite;
                     }
                     if root.member-action-notice != "" : Text {
@@ -3480,7 +3519,7 @@ export component AppWindow inherits Window {
                                 Rectangle {
                                     horizontal-stretch: 1; background: root.panel;
                                     border-radius: 7px; border-color: root.divider; border-width: 1px;
-                                    TextInput {
+                                    ThemedTextInput {
                                         x: 7px; width: parent.width - 14px; height: parent.height;
                                         text <=> root.member-selected-power;
                                         color: root.ink; font-size: 11px * root.text-scale;
@@ -3594,7 +3633,7 @@ export component AppWindow inherits Window {
                                 text: root.thread-root-rich-body;
                                 default-color: root.ink;
                                 default-font-size: 12px * root.text-scale;
-                                link-color: root.accent;
+                                link-color: StyleTokens.roles.link.present ? StyleTokens.roles.link.color : root.accent;
                                 accessible-role: text;
                                 accessible-label: root.thread-root-rich-accessible-body;
                                 link-clicked(url) => { root.open-message-link(url); }
@@ -3608,13 +3647,13 @@ export component AppWindow inherits Window {
                                 border-radius: StyleTokens.radius * 0.8;
                                 VerticalLayout {
                                     padding: min(12px, root.content-inset); spacing: max(2px, root.message-row-gap);
-                                    Text { text: reply.sender + (root.show-message-timestamps || reply.time == "Sending…" || reply.time == "Failed to send" ? " · " + reply.time : ""); color: root.color-message-senders ? reply.accent : root.ink; font-size: 11px * root.text-scale; font-weight: 700; }
+                                    Text { text: reply.sender + (root.show-message-timestamps || reply.time == "Sending…" || reply.time == "Failed to send" ? " · " + reply.time : ""); color: root.color-message-senders ? (root.sender-palette.length > 0 ? root.sender-palette[mod(reply.sender-palette-index, max(1, root.sender-palette.length))] : reply.accent) : root.ink; font-size: 11px * root.text-scale; font-weight: 700; }
                                     StyledText {
                                         text: reply.rich-body;
                                         default-color: root.ink;
                                         default-font-size: root.message-font-px;
                                         default-font-family: root.message-font-family;
-                                        link-color: root.accent;
+                                        link-color: StyleTokens.roles.link.present ? StyleTokens.roles.link.color : root.accent;
                                         accessible-role: text;
                                         accessible-label: reply.rich-accessible-body;
                                         link-clicked(url) => { root.open-message-link(url); }
@@ -3720,7 +3759,7 @@ export component AppWindow inherits Window {
                             Text { text: "Search this room"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 750; }
                             Rectangle {
                                 height: 34px; background: root.elevated; border-radius: 7px;
-                                search-message-input := TextInput {
+                                search-message-input := ThemedTextInput {
                                     x: 8px; y: 2px; width: parent.width - 16px; height: parent.height - 4px;
                                     text <=> root.room-search-query; color: root.ink; font-size: 12px * root.text-scale;
                                     enabled: root.live-session && root.active-room-id != "" && !root.room-search-loading;
@@ -3747,7 +3786,7 @@ export component AppWindow inherits Window {
                         x: 12px; width: parent.width - 24px;
                     }
                     if root.room-search-error != "" : Text {
-                        height: 52px; text: root.room-search-error; color: #e58e9b;
+                        height: 52px; text: root.room-search-error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b;
                         font-size: 11px * root.text-scale; wrap: word-wrap;
                         accessible-live-region: polite;
                     }
@@ -3771,7 +3810,7 @@ export component AppWindow inherits Window {
                                 accessible-live-region: polite;
                             }
                             if root.room-search-context-error != "" : Text {
-                                text: root.room-search-context-error; color: #e58e9b;
+                                text: root.room-search-context-error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b;
                                 font-size: 11px * root.text-scale; wrap: word-wrap;
                                 accessible-live-region: polite;
                             }
@@ -3784,12 +3823,12 @@ export component AppWindow inherits Window {
                                 font-size: 12px * root.text-scale; wrap: word-wrap;
                             }
                             for context in root.room-search-context : Rectangle {
-                                min-height: 55px; background: context.event-id == root.room-search-selected-event-id ? root.hover : root.elevated;
+                                min-height: 55px; background: context.event-id == root.room-search-selected-event-id ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : root.elevated;
                                 border-radius: 7px;
                                 VerticalLayout {
                                     padding: 8px; spacing: 3px;
-                                    Text { text: context.sender + " · " + context.time; color: root.accent; font-size: 10px * root.text-scale; overflow: elide; }
-                                    Text { text: context.body; color: root.ink; font-size: 11px * root.text-scale; wrap: word-wrap; }
+                                    Text { text: context.sender + " · " + context.time; color: context.event-id == root.room-search-selected-event-id && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.accent; font-size: 10px * root.text-scale; overflow: elide; }
+                                    Text { text: context.body; color: context.event-id == root.room-search-selected-event-id && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink; font-size: 11px * root.text-scale; wrap: word-wrap; }
                                 }
                             }
                         }
@@ -3805,8 +3844,8 @@ export component AppWindow inherits Window {
                         vertical-stretch: 1; horizontal-scrollbar-policy: always-off;
                         for result in root.room-search-results : ActionRect {
                             width: search-results-list.visible-width; height: 94px;
-                            border-radius: 8px; focus-color: root.accent;
-                            background: result.event-id == root.room-search-selected-event-id ? root.hover : self.has-hover ? root.elevated : root.panel;
+                            border-radius: 8px; focus-color: result.event-id == root.room-search-selected-event-id && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.accent;
+                            background: result.event-id == root.room-search-selected-event-id ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : self.has-hover ? root.elevated : root.panel;
                             label: "Show message context from " + result.sender + " at " + result.time;
                             activated => {
                                 root.room-search-selected-event-id = result.event-id;
@@ -3817,9 +3856,9 @@ export component AppWindow inherits Window {
                             }
                             VerticalLayout {
                                 padding: 9px; spacing: 4px;
-                                Text { text: result.sender; color: root.accent; font-size: 11px * root.text-scale; font-weight: 700; overflow: elide; }
-                                Text { text: result.time; color: root.muted; font-size: 10px * root.text-scale; overflow: elide; }
-                                Text { text: result.preview; color: root.ink; font-size: 11px * root.text-scale; overflow: elide; }
+                                Text { text: result.sender; color: result.event-id == root.room-search-selected-event-id && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.accent; font-size: 11px * root.text-scale; font-weight: 700; overflow: elide; }
+                                Text { text: result.time; color: result.event-id == root.room-search-selected-event-id && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.muted; font-size: 10px * root.text-scale; overflow: elide; }
+                                Text { text: result.preview; color: result.event-id == root.room-search-selected-event-id && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink; font-size: 11px * root.text-scale; overflow: elide; }
                             }
                         }
                     }
@@ -3902,7 +3941,7 @@ export component AppWindow inherits Window {
                     Rectangle {
                         height: 38px; background: root.elevated; border-radius: 8px;
                         if root.quick-switcher-query == "" : Text { x: 10px; text: "Room name or Matrix room ID"; color: root.muted; font-size: 12px * root.text-scale; vertical-alignment: center; }
-                        quick-room-input := TextInput {
+                        quick-room-input := ThemedTextInput {
                             x: 10px; width: parent.width - 20px; height: parent.height;
                             text <=> root.quick-switcher-query; color: root.ink; font-size: 12px * root.text-scale;
                             single-line: true; accessible-label: "Filter rooms; arrows select, Enter opens, Escape closes";
@@ -3918,14 +3957,14 @@ export component AppWindow inherits Window {
                         spacing: 3px; alignment: start;
                         for room[index] in root.quick-switcher-results : ActionRect {
                             height: 36px; border-radius: 7px;
-                            background: index == root.quick-switcher-index ? root.hover : root.elevated;
+                            background: index == root.quick-switcher-index ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : root.elevated;
                             focus-color: root.accent;
                             label: "Open " + room.name + " · " + room.id;
                             activated => { root.choose-quick-room(index); }
                             HorizontalLayout {
                                 padding-left: 10px; padding-right: 10px; spacing: 8px;
-                                Text { text: room.name; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
-                                Text { text: room.unread > 0 ? room.unread + " unread" : ""; color: root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; }
+                                Text { text: room.name; color: index == root.quick-switcher-index && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; overflow: elide; horizontal-stretch: 1; }
+                                Text { text: room.unread > 0 ? room.unread + " unread" : ""; color: index == root.quick-switcher-index && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; }
                             }
                         }
                     }
@@ -4018,7 +4057,7 @@ export component AppWindow inherits Window {
                         height: 43px;
                         background: root.elevated;
                         border-radius: 8px;
-                        room-action-input := TextInput {
+                        room-action-input := ThemedTextInput {
                             x: 11px; width: parent.width - 22px; height: parent.height;
                             text <=> root.room-action-input;
                             color: root.ink;
@@ -4031,7 +4070,7 @@ export component AppWindow inherits Window {
                     Text {
                         text: root.live-session ? root.room-action-error : "Preview only · sign in to create or join rooms.";
                         accessible-live-region: polite;
-                        color: root.live-session && root.room-action-error != "" ? #ff8d9d : root.muted;
+                        color: root.live-session && root.room-action-error != "" ? (StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #ff8d9d) : root.muted;
                         font-size: 11px * root.text-scale;
                         wrap: word-wrap;
                         height: 40px;
@@ -4118,7 +4157,7 @@ export component AppWindow inherits Window {
                             Text { text: "Room name"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 650; }
                             Rectangle {
                                 min-height: 42px * root.text-scale; background: root.elevated; border-radius: 8px;
-                                TextInput {
+                                ThemedTextInput {
                                     x: 12px; width: parent.width - 24px; height: parent.height;
                                     text <=> root.room-admin-name-input; single-line: true;
                                     enabled: root.room-settings-editable && root.room-settings-name-allowed;
@@ -4138,7 +4177,7 @@ export component AppWindow inherits Window {
                             Text { text: "Topic"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 650; }
                             Rectangle {
                                 min-height: 70px * root.text-scale; background: root.elevated; border-radius: 8px;
-                                TextInput {
+                                ThemedTextInput {
                                     x: 12px; y: 8px; width: parent.width - 24px; height: parent.height - 16px;
                                     text <=> root.room-admin-topic-input; single-line: false; wrap: word-wrap;
                                     enabled: root.room-settings-editable && root.room-settings-topic-allowed;
@@ -4236,7 +4275,7 @@ export component AppWindow inherits Window {
                             if root.room-settings-restricted : Text { text: "Allowed rooms · one Matrix room ID per line (up to 32)"; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; }
                             if root.room-settings-restricted : Rectangle {
                                 min-height: 96px * root.text-scale; background: root.elevated; border-radius: 8px;
-                                TextInput {
+                                ThemedTextInput {
                                     x: 12px; y: 8px; width: parent.width - 24px; height: parent.height - 16px;
                                     text <=> root.room-settings-allow-rooms; single-line: false; wrap: word-wrap;
                                     enabled: root.room-settings-editable && root.room-settings-join-allowed;
@@ -4258,7 +4297,7 @@ export component AppWindow inherits Window {
                         }
                     }
                     if root.room-admin-busy : Text { text: "Working… You can close this form to cancel pending work."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
-                    if root.room-admin-error != "" : Text { text: root.room-admin-error; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+                    if root.room-admin-error != "" : Text { text: root.room-admin-error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
                     if root.room-admin-notice != "" : Text { text: root.room-admin-notice; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
                     settings-close := ActionRect {
                         height: 42px * root.text-scale; border-radius: 8px; border-width: 1px; border-color: root.divider;
@@ -4363,7 +4402,7 @@ export component AppWindow inherits Window {
                     }
                     if root.room-admin-error != "" : Text {
                         text: root.room-admin-error;
-                        color: #ff8d9d;
+                        color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #ff8d9d;
                         font-size: 11px * root.text-scale;
                         wrap: word-wrap;
                         accessible-live-region: polite;
@@ -4539,7 +4578,7 @@ export component AppWindow inherits Window {
                     }
                     if root.native-capture-source-error != "" : Text {
                         text: root.native-capture-source-error;
-                        color: #ef9da9;
+                        color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #ef9da9;
                         font-size: 12px * root.text-scale;
                         wrap: word-wrap;
                         accessible-live-region: polite;
@@ -4728,17 +4767,17 @@ export component AppWindow inherits Window {
                 Text { text: "HOMESERVER"; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
                 Rectangle {
                     height: 42px; background: root.elevated; border-radius: 8px; border-color: root.divider; border-width: 1px; clip: true;
-                    TextInput { x: 11px; width: parent.width - 22px; height: parent.height; text <=> root.login-homeserver; color: root.ink; font-size: 13px * root.text-scale; vertical-alignment: center; accessible-label: "Homeserver URL"; }
+                    ThemedTextInput { x: 11px; width: parent.width - 22px; height: parent.height; text <=> root.login-homeserver; color: root.ink; font-size: 13px * root.text-scale; vertical-alignment: center; accessible-label: "Homeserver URL"; }
                 }
                 Text { text: "MATRIX ID OR USERNAME"; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
                 Rectangle {
                     height: 42px; background: root.elevated; border-radius: 8px; border-color: root.divider; border-width: 1px; clip: true;
-                    TextInput { x: 11px; width: parent.width - 22px; height: parent.height; text <=> root.login-username; color: root.ink; font-size: 13px * root.text-scale; vertical-alignment: center; accessible-label: "Matrix ID or username"; }
+                    ThemedTextInput { x: 11px; width: parent.width - 22px; height: parent.height; text <=> root.login-username; color: root.ink; font-size: 13px * root.text-scale; vertical-alignment: center; accessible-label: "Matrix ID or username"; }
                 }
                 Text { text: "PASSWORD"; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
                 Rectangle {
                     height: 42px; background: root.elevated; border-radius: 8px; border-color: root.divider; border-width: 1px; clip: true;
-                    TextInput {
+                    ThemedTextInput {
                         x: 11px; width: parent.width - 22px; height: parent.height;
                         text <=> root.login-password; input-type: password;
                         color: root.ink; font-size: 13px * root.text-scale; vertical-alignment: center;
@@ -4753,8 +4792,8 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                if root.login-error != "" : Text { text: root.login-error; color: #e47483; font-size: 11px * root.text-scale; wrap: word-wrap; }
-                if root.config-error != "" : Text { text: "Settings file: " + root.config-error; color: #e47483; font-size: 11px * root.text-scale; wrap: word-wrap; }
+                if root.login-error != "" : Text { text: root.login-error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483; font-size: 11px * root.text-scale; wrap: word-wrap; }
+                if root.config-error != "" : Text { text: "Settings file: " + root.config-error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483; font-size: 11px * root.text-scale; wrap: word-wrap; }
                 Rectangle { vertical-stretch: 1; background: transparent; }
                 Rectangle {
                     height: 43px; border-radius: 9px; background: root.accent;
@@ -5006,7 +5045,7 @@ export component AppWindow inherits Window {
                             Rectangle {
                                 visible: root.access-mode == 0 || root.access-mode == 2 || root.access-mode == 3;
                                 height: self.visible ? 42px * root.text-scale : 0px; background: root.elevated; border-radius: 8px;
-                                access-current := TextInput {
+                                access-current := ThemedTextInput {
                                     x: 12px; width: parent.width - 24px; height: parent.height; single-line: true; input-type: password;
                                     enabled: parent.visible && !root.access-busy; text <=> root.access-current-password;
                                     color: root.ink; font-size: 14px * root.text-scale; vertical-alignment: center; accessible-label: "Current local app password";
@@ -5017,7 +5056,7 @@ export component AppWindow inherits Window {
                             Rectangle {
                                 visible: root.access-mode == 1 || root.access-mode == 2;
                                 height: self.visible ? 42px * root.text-scale : 0px; background: root.elevated; border-radius: 8px;
-                                access-new := TextInput {
+                                access-new := ThemedTextInput {
                                     x: 12px; width: parent.width - 24px; height: parent.height; single-line: true; input-type: password;
                                     enabled: parent.visible && !root.access-busy; text <=> root.access-new-password;
                                     color: root.ink; font-size: 14px * root.text-scale; vertical-alignment: center; accessible-label: "New local app password";
@@ -5027,14 +5066,14 @@ export component AppWindow inherits Window {
                             Rectangle {
                                 visible: root.access-mode == 1 || root.access-mode == 2;
                                 height: self.visible ? 42px * root.text-scale : 0px; background: root.elevated; border-radius: 8px;
-                                access-confirm := TextInput {
+                                access-confirm := ThemedTextInput {
                                     x: 12px; width: parent.width - 24px; height: parent.height; single-line: true; input-type: password;
                                     enabled: parent.visible && !root.access-busy; text <=> root.access-confirm-password;
                                     color: root.ink; font-size: 14px * root.text-scale; vertical-alignment: center; accessible-label: "Confirm new local app password";
                                     accepted => { if !root.access-busy { root.submit-account-access(); } }
                                 }
                             }
-                            Text { text: root.access-error; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+                            Text { text: root.access-error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
                         }
                     }
                     HorizontalLayout {
@@ -5047,7 +5086,7 @@ export component AppWindow inherits Window {
                         access-submit := TextAction {
                             text: root.access-busy ? "Working…" : root.access-mode == 0 ? "Unlock" : root.access-mode == 3 ? "Turn off" : root.access-mode == 4 ? "Remove account" : root.access-mode == 5 ? "Reset password" : "Save password";
                             enabled: !root.access-busy;
-                            ink: root.accent-ink; muted: root.muted; surface: root.accent; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                            ink: root.access-mode >= 3 && StyleTokens.roles.destructive-ink.present ? StyleTokens.roles.destructive-ink.color : root.accent-ink; muted: root.muted; surface: root.access-mode >= 3 && StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : root.accent; hover-surface: root.access-mode >= 3 && StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : root.hover; outline: root.divider; text-scale: root.text-scale;
                             activated => { root.submit-account-access(); }
                         }
                     }

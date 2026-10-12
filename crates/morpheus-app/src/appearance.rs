@@ -1,9 +1,69 @@
 //! Declarative appearance bridge shared by live sessions and offline previews.
 
-use morpheus_config::{BuiltInStylePreset, Config, ConfigStore, MessageLayout};
-use slint::ComponentHandle;
+use morpheus_config::{BuiltInStylePreset, Config, ConfigStore, MessageLayout, ThemePack};
+use slint::{ComponentHandle, ModelRc, VecModel};
 
-use super::{AppWindow, StyleTokens, save_config_change};
+use super::{AppWindow, ColorRole, StyleTokens, ThemeRoleSet, color_from_hex, save_config_change};
+
+/// Apply a complete projection every time, including clearing omitted overrides.
+/// Sender colors are a live UI model: existing message rows need no rebuilding.
+pub(super) fn apply_theme(ui: &AppWindow, theme: Option<&ThemePack>) {
+    let (roles, senders) = theme_projection(theme);
+    ui.global::<StyleTokens>().set_roles(roles);
+    ui.set_sender_palette(ModelRc::new(VecModel::from(senders)));
+}
+
+fn color_role(value: Option<&str>) -> ColorRole {
+    value.map_or_else(ColorRole::default, |value| ColorRole {
+        present: true,
+        color: color_from_hex(value),
+    })
+}
+
+fn theme_projection(theme: Option<&ThemePack>) -> (ThemeRoleSet, Vec<slint::Color>) {
+    let Some(theme) = theme else {
+        return (ThemeRoleSet::default(), Vec::new());
+    };
+    let roles = &theme.roles;
+    (
+        ThemeRoleSet {
+            error: color_role(roles.error.as_deref()),
+            error_surface: color_role(roles.error_surface.as_deref()),
+            error_ink: color_role(roles.error_ink.as_deref()),
+            success: color_role(roles.success.as_deref()),
+            success_surface: color_role(roles.success_surface.as_deref()),
+            success_ink: color_role(roles.success_ink.as_deref()),
+            selection: color_role(roles.selection.as_deref()),
+            selection_ink: color_role(roles.selection_ink.as_deref()),
+            focus: color_role(roles.focus.as_deref()),
+            link: color_role(roles.link.as_deref()),
+            unread: color_role(roles.unread.as_deref()),
+            unread_ink: color_role(roles.unread_ink.as_deref()),
+            destructive: color_role(roles.destructive.as_deref()),
+            destructive_ink: color_role(roles.destructive_ink.as_deref()),
+            voice: color_role(roles.voice.as_deref()),
+        },
+        theme
+            .senders
+            .colors
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|value| color_from_hex(value))
+            .collect(),
+    )
+}
+
+/// Stable identity token, independent of message text, palette length and theme.
+/// Use the existing avatar hash's polynomial with an explicit 64-bit width,
+/// then retain 31 bits so Slint's signed model index is always nonnegative.
+/// Avatar colors remain unchanged and are never used as the custom palette.
+pub(super) fn sender_palette_index(sender: &str) -> i32 {
+    let hash = sender.bytes().fold(0u64, |current, byte| {
+        current.wrapping_mul(31).wrapping_add(u64::from(byte))
+    });
+    (hash & 0x7fff_ffff) as i32
+}
 
 pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
     ui.set_message_font_family(config.typography.message_family(&config.appearance).into());
@@ -116,4 +176,80 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
             });
         }
     });
+}
+
+#[cfg(test)]
+mod theme_tests {
+    use super::*;
+
+    #[test]
+    fn omitted_roles_and_sender_palette_restore_legacy_bindings() {
+        let (roles, senders) = theme_projection(None);
+        assert_eq!(roles, ThemeRoleSet::default());
+        assert!(senders.is_empty());
+        assert!(!color_role(None).present);
+        let black = color_role(Some("#000000"));
+        assert!(black.present, "black is an explicit color, not an omission");
+        assert_eq!(black.color, slint::Color::from_rgb_u8(0, 0, 0));
+    }
+
+    #[test]
+    fn sparse_theme_replaces_roles_and_sender_colors_without_retaining_old_values() {
+        let mut theme: ThemePack = serde_json::from_value(serde_json::json!({
+            "schema_version": 1, "name": "projection test",
+            "colors": {
+                "rail": "#010101", "sidebar": "#020202", "canvas": "#030303",
+                "panel": "#040404", "elevated": "#050505", "hover": "#060606",
+                "ink": "#070707", "muted": "#080808", "divider": "#090909",
+                "accent": "#0A0A0A", "accent_ink": "#0B0B0B"
+            },
+            "roles": {"error": "#121314", "focus": "#212223", "selection_ink": "#313233"},
+            "senders": {"colors": ["#414243", "#515253"]}
+        }))
+        .unwrap();
+        let (roles, senders) = theme_projection(Some(&theme));
+        assert_eq!(
+            roles.error.color,
+            slint::Color::from_rgb_u8(0x12, 0x13, 0x14)
+        );
+        assert!(roles.error.present && roles.focus.present && roles.selection_ink.present);
+        assert!(!roles.success.present);
+        assert_eq!(
+            senders,
+            vec![
+                slint::Color::from_rgb_u8(0x41, 0x42, 0x43),
+                slint::Color::from_rgb_u8(0x51, 0x52, 0x53)
+            ]
+        );
+        theme.roles = Default::default();
+        theme.senders = Default::default();
+        let (roles, senders) = theme_projection(Some(&theme));
+        assert_eq!(roles, ThemeRoleSet::default());
+        assert!(senders.is_empty());
+    }
+
+    #[test]
+    fn sender_identity_indices_are_stable_for_full_matrix_ids() {
+        let first = String::from("@casey:one.example.org");
+        let copied = first.clone();
+        assert_eq!(sender_palette_index(&first), sender_palette_index(&copied));
+        assert_ne!(
+            sender_palette_index(&first),
+            sender_palette_index("@casey:two.example.org")
+        );
+        for identity in [
+            "",
+            "Casey",
+            "@casey:one.example.org",
+            "@雪:example.org",
+            &"sender".repeat(4096),
+        ] {
+            let index = sender_palette_index(identity);
+            assert!(index >= 0);
+            for length in 1..=16 {
+                let selected = index % length;
+                assert!((0..length).contains(&selected));
+            }
+        }
+    }
 }

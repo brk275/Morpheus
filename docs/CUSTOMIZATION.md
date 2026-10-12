@@ -83,8 +83,9 @@ avatars. Columns aligns nicknames and timestamps beside the message body;
 long names may elide visually but keep their complete accessibility label.
 When the conversation is narrower than 640 logical pixels, or 640 multiplied by
 a text scale above 100%, columns uses a compact header. Nickname columns also
-stay within 20% of the conversation width. Desired room/details widths shrink
-when necessary to preserve conversation space in a smaller window.
+stay within 20% of the conversation width. Pane sizes contribute to the minimum
+window width, preserving at least 360 logical pixels for the main content.
+Hide the details panel or reduce the pane widths for a smaller workspace.
 
 For example, this creates a compact, square, monospaced workspace:
 
@@ -117,14 +118,33 @@ color_senders = true
 nickname_width = 112
 ```
 
-The first appearance expansion covers the main conversation, navigation,
-composer and reusable controls. Some call and modal surfaces still have fixed
-geometry. Theme packs currently contain eleven color tokens; semantic status
-colors, custom sender palettes, font weights/line-height controls, timestamp
-formatting, background images and arbitrary pane arrangements remain future
-work. Theme packs cannot execute code. The presence of older configuration
-fields such as `reduce_motion`, `show_space_labels` or `group_direct_messages`
-does not imply those controls are implemented.
+The appearance controls cover the main conversation, navigation, composer and
+reusable controls. Some call and modal surfaces still have fixed geometry.
+Theme packs add optional semantic colors and a sender-name palette to the
+original eleven color tokens; see [Theme files](#theme-files). Font weights,
+line-height controls, timestamp formatting, background images and arbitrary
+pane arrangements remain future work. Theme packs cannot execute code.
+
+### Preferences awaiting implementation
+
+The following older fields can be stored in TOML but currently have no runtime
+consumer. Changing them does not enable the described behavior:
+
+| Field | Pending behavior |
+| --- | --- |
+| `appearance.reduce_motion` | Motion preference; current UI has no explicit animations to reduce |
+| `layout.show_space_labels` | Visual Space-name toggle; accessible names already identify Spaces |
+| `layout.group_direct_messages` | Optional combined room/DM navigation |
+| `media.camera_device` | Saved camera selection |
+| `media.noise_suppression` | Configurable noise suppression |
+| `media.autoplay_animated_media` | Animated-media autoplay policy |
+| `experimental.background_account_sync` | Background syncing of inactive accounts |
+| `account_overrides.<id>.theme` | Per-account theme override |
+
+Microphone and speaker selection, notification overrides and the appearance
+controls documented above do have consumers. The monospace font setting covers
+timestamps and security codes; it does not replace every rich-message code
+font.
 
 ## Notifications
 
@@ -166,10 +186,90 @@ errors. The original palettes are available in
 [Nocturne](../themes/nocturne.toml), [Terminal](../themes/terminal.toml) and
 [Paper](../themes/paper.toml).
 
+### Semantic colors and sender names
+
+The original `[colors]` table remains required and unchanged. A theme file may
+also include `[roles]` and `[senders]`. These belong in the theme TOML beside
+`[colors]`, **not** in `config.toml`. Every semantic role is optional:
+
+| Role | Used for |
+| --- | --- |
+| `error` | Inline error text |
+| `error_surface` | Error-banner background |
+| `error_ink` | Text on an error banner |
+| `success` | Inline success text |
+| `success_surface` | Success-banner background |
+| `success_ink` | Text on a success banner |
+| `selection` | Selected navigation, message/search surfaces and input text selections |
+| `selection_ink` | Text and icons on selected surfaces; selected input text |
+| `focus` | Keyboard-focus indicators |
+| `link` | Rich-message links |
+| `unread` | Unread-count badge backgrounds |
+| `unread_ink` | Unread-count badge text |
+| `destructive` | Destructive-action backgrounds and logout text |
+| `destructive_ink` | Their text |
+| `voice` | Voice-room icons and labels |
+
+For example, keep the `[colors]` table from the dark Nocturne theme and set
+these optional sections in that theme file:
+
+```toml
+[roles]
+error = "#F0A9AF"
+error_surface = "#38272D"
+error_ink = "#FFDDE0"
+success = "#9FD5BD"
+success_surface = "#20382E"
+success_ink = "#D5F4E2"
+selection = "#3C4657"
+selection_ink = "#F0F4FA"
+focus = "#C7B4FF"
+link = "#AFCDFF"
+unread = "#B7A4EA"
+unread_ink = "#201733"
+destructive = "#F1A1AC"
+destructive_ink = "#39141F"
+voice = "#9DD8CD"
+
+[senders]
+colors = ["#C2AEFA", "#9DD8CD", "#F0C28F", "#ACCEFF", "#E7AED1", "#C7D59B"]
+```
+
+All colors must be `#RRGGBB`; names, transparency values and malformed strings
+are rejected. `senders.colors` accepts **1–16 colors**. An empty list is invalid;
+omit it to restore the previous sender colors. Repeated colors and a one-color
+palette are allowed. Sender colors apply when **Settings → Appearance → Colored
+sender names** is on (`chat.color_senders = true`). This palette changes name text,
+in timeline messages and thread replies, independently of avatar backgrounds,
+account badges and Space identity colors. Thread-root headings and search
+result authors retain their existing text colors, with selection colors when
+applicable. Users choose their own contrast; syntactically valid low-contrast colors are
+not silently replaced. The three shipped presets include semantic roles and
+sender text palettes with source contrast checks.
+
+Old eleven-token themes keep their previous per-control fallbacks. Omitting a
+role restores that control's existing color; it does not borrow the value from
+the previously selected theme. Editing colors or removing optional fields
+reloads the active palette. Invalid edits retain the last valid appearance and
+show an error. Semantic and sender-palette values are edited in the theme file;
+Settings currently offers preset/base-palette selection and the sender-color
+toggle, not an individual color editor.
+
+To reset custom colors, choose a **Base palette** in Settings; this clears the
+custom theme selection and preserves fonts and geometry. To reset an embedded
+theme override, remove its file from the themes directory; Morpheus then uses
+that embedded theme. Choosing a **Starting point** also resets the documented
+font/layout/geometry fields, so use that when resetting the whole style.
+
+The new roles cover their documented controls. They do not recolor images,
+video, avatar backgrounds, modal scrims or theme-preview swatches. Native
+rendering, live-reload interaction and accessibility checks remain required;
+source contrast checks alone do not establish those results.
+
 Morpheus rejects an unknown schema version instead of silently discarding
-settings. New versions read existing schema 1 files with defaults for the new
-appearance tables; older app versions may reject files containing those new
-tables.
+settings. New versions read existing schema 1 configuration and theme files
+with defaults for the new tables; older app versions may reject files
+containing those tables.
 
 ## Call audio devices
 

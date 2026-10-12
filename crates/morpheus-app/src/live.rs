@@ -2083,6 +2083,7 @@ fn message_item(info: &MessageInfo) -> MessageItem {
         event_id: info.event_id.as_deref().unwrap_or("").into(),
         is_own: info.is_own,
         sender: sender.into(),
+        sender_palette_index: crate::appearance::sender_palette_index(&info.sender),
         initials: sender_initials.into(),
         time: time.into(),
         body: display_body.into(),
@@ -2228,6 +2229,19 @@ mod member_tests {
         };
         let item = message_item(&info);
         assert!(item.edit_markdown);
+        let other_body = message_item(&MessageInfo {
+            body: "Another message".into(),
+            rich_markdown: None,
+            rich_accessible: None,
+            ..info.clone()
+        });
+        assert_eq!(item.sender_palette_index, other_body.sender_palette_index);
+        let other_server = message_item(&MessageInfo {
+            sender: "@alice:other.example.org".into(),
+            ..info.clone()
+        });
+        assert_eq!(item.sender, other_server.sender);
+        assert_ne!(item.sender_palette_index, other_server.sender_palette_index);
         assert_eq!(item.edit_source.as_str(), "Visible **bold** text");
         assert_eq!(item.rich_accessible_body.as_str(), "Visible bold text");
 
@@ -2242,5 +2256,153 @@ mod member_tests {
             plain.rich_accessible_body.as_str(),
             "different plain fallback"
         );
+    }
+}
+
+#[cfg(test)]
+mod account_presentation_tests {
+    use super::*;
+
+    fn empty_profile() -> (tempfile::TempDir, Arc<LiveUi>) {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = Arc::new(AccountManager::open(directory.path().join("profile")).unwrap());
+        let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
+            directory.path().join("config.toml"),
+        )));
+        let live = LiveUi::new(manager, Handle::current(), Weak::default(), voices);
+        (directory, live)
+    }
+
+    struct SignalDrop(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for SignalDrop {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    async fn pending_feed() -> (JoinHandle<()>, tokio::sync::oneshot::Receiver<()>) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _on_drop = SignalDrop(Some(dropped_tx));
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        // Start the real task before revocation so this tests cancellation of
+        // retained work, rather than only dropping an unpolled future.
+        started_rx.await.unwrap();
+        (task, dropped_rx)
+    }
+
+    async fn assert_feed_cancelled(receiver: tokio::sync::oneshot::Receiver<()>) {
+        tokio::time::timeout(Duration::from_secs(2), receiver)
+            .await
+            .expect("revoked feed must be cancelled")
+            .expect("feed cancellation must drop its retained work");
+    }
+
+    async fn close_profile(directory: tempfile::TempDir, live: Arc<LiveUi>) {
+        let manager = live.manager.clone();
+        drop(live);
+        // LiveUi's existing draft worker owns the profile until its channel
+        // closes. Drain that owner before removing the locked file on Windows.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while Arc::strong_count(&manager) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("empty draft worker must release the profile");
+        drop(manager);
+        directory.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn detach_revokes_room_thread_and_navigation_work() {
+        let (directory, live) = empty_profile();
+        live.is_live.store(true, Ordering::Release);
+        *live.selected_room.lock().await = Some("!old-room:example.org".into());
+        *live.selected_space.lock().await = Some("!old-space:example.org".into());
+        *live.feed_key.lock().await = Some(("old-account".into(), "!old-room:example.org".into()));
+        live.space_children.lock().await.insert(
+            "!old-space:example.org".into(),
+            HashSet::from(["!old-room:example.org".into()]),
+        );
+        *live.space_scan_key.lock().await =
+            Some(("old-account".into(), vec!["!old-space:example.org".into()]));
+        *live.space_scan_failed_at.lock().await = Some(Instant::now());
+
+        let navigation = live.current_navigation_epoch();
+        let render = live.render_epoch.load(Ordering::Acquire);
+        let member = live.member_epoch.load(Ordering::Acquire);
+        let scan = live.space_scan_epoch.load(Ordering::Acquire);
+        let room_feed = live.generation.load(Ordering::Acquire);
+        let thread = live.begin_thread_request();
+        assert!(live.navigation_is_current(navigation));
+        assert!(live.thread_request_is_current(thread));
+        let (feed, feed_cancelled) = pending_feed().await;
+        let (thread_feed, thread_cancelled) = pending_feed().await;
+        *live.feed.lock().await = Some(feed);
+        *live.thread_feed.lock().await = Some(thread_feed);
+
+        live.account_detached(Weak::default()).await;
+
+        assert!(!live.is_live.load(Ordering::Acquire));
+        assert!(!live.navigation_is_current(navigation));
+        assert!(!live.thread_request_is_current(thread));
+        assert!(live.render_epoch.load(Ordering::Acquire) > render);
+        assert!(live.member_epoch.load(Ordering::Acquire) > member);
+        assert!(live.space_scan_epoch.load(Ordering::Acquire) > scan);
+        assert!(live.generation.load(Ordering::Acquire) > room_feed);
+        assert!(live.selected_room.lock().await.is_none());
+        assert!(live.selected_space.lock().await.is_none());
+        assert!(live.feed.lock().await.is_none());
+        assert!(live.thread_feed.lock().await.is_none());
+        assert!(live.feed_key.lock().await.is_none());
+        assert!(live.space_scan_key.lock().await.is_none());
+        assert!(live.space_scan_failed_at.lock().await.is_none());
+        assert!(live.space_children.lock().await.is_empty());
+        assert!(matches!(
+            live.require_media_context("old-account", "!old-room:example.org")
+                .await,
+            Err(MatrixCoreError::NoActiveAccount)
+        ));
+        assert_feed_cancelled(feed_cancelled).await;
+        assert_feed_cancelled(thread_cancelled).await;
+        close_profile(directory, live).await;
+    }
+
+    #[tokio::test]
+    async fn failed_activation_presentation_returns_to_detached_state() {
+        let (directory, live) = empty_profile();
+        // Simulate stale presentation state without granting core account
+        // authority. The real activation adapter must fail closed.
+        live.is_live.store(true, Ordering::Release);
+        *live.selected_room.lock().await = Some("!old-room:example.org".into());
+        *live.selected_space.lock().await = Some("!old-space:example.org".into());
+        let navigation = live.current_navigation_epoch();
+        let (feed, feed_cancelled) = pending_feed().await;
+        let (thread_feed, thread_cancelled) = pending_feed().await;
+        *live.feed.lock().await = Some(feed);
+        *live.thread_feed.lock().await = Some(thread_feed);
+
+        assert!(matches!(
+            live.account_activated(Weak::default()).await,
+            Err(MatrixCoreError::NoActiveAccount)
+        ));
+
+        assert!(live.manager.active_account().await.is_none());
+        assert!(!live.is_live.load(Ordering::Acquire));
+        assert!(!live.navigation_is_current(navigation));
+        assert!(live.selected_room.lock().await.is_none());
+        assert!(live.selected_space.lock().await.is_none());
+        assert!(live.feed.lock().await.is_none());
+        assert!(live.thread_feed.lock().await.is_none());
+        assert_feed_cancelled(feed_cancelled).await;
+        assert_feed_cancelled(thread_cancelled).await;
+        close_profile(directory, live).await;
     }
 }

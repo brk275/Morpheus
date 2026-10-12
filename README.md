@@ -82,10 +82,12 @@ Morpheus is growing a TOML-driven style system that changes more than colors.
 The first expansion adds independent interface/message/monospace fonts,
 message size, spacing, corners, rail and pane widths, optional avatars and
 timestamps, and stacked, compact or aligned nickname-column layouts.
+Theme files also expose status, selection, focus, link, unread and voice colors,
+plus a separate palette for sender names.
 **Nocturne, Terminal and Paper** are editable starting points. In-app controls
 and live TOML reload use the same preferences; invalid edits keep the last valid
-style. This expansion awaits native visual verification. More granular theme
-roles and layout controls remain in development; Halloy-level breadth is the
+style. This expansion awaits native visual verification. A theme editor and
+more layout controls remain in development; Halloy-level breadth is the
 target, not a completed claim. See [customization](docs/CUSTOMIZATION.md).
 
 ## Direction

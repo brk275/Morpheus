@@ -4,7 +4,7 @@
 //! queue and all handlers live only for the lifetime of Morpheus.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     sync::{
         Arc, RwLock, Weak,
         atomic::{AtomicBool, Ordering},
@@ -82,8 +82,10 @@ struct QueuedNotification {
 /// The UI supplies the latest valid config. The worker asks Slint whether a
 /// room is on screen at delivery time, so a navigation change cannot leave a
 /// stale room suppression cache.
+/// This is the manager's single process-lifetime notification owner.
 /// `watch_accounts` registers one Matrix notification callback for each loaded
-/// account. Both the callback and the delivery worker re-check the active
+/// SDK client, including a fresh client restored for a previously seen account.
+/// Both the callback and the delivery worker re-check the active
 /// account, so queued work from an earlier selection is discarded.
 pub struct DesktopNotifications {
     manager: Arc<AccountManager>,
@@ -236,37 +238,34 @@ impl DesktopNotifications {
 
 async fn watch_accounts(manager: Arc<AccountManager>, service: Weak<DesktopNotifications>) {
     let mut selected = manager.subscribe_active_account();
-    let mut registered = HashSet::new();
     loop {
         let account = selected.borrow().clone();
-        if let Some(account) = account
-            && !registered.contains(&account.id)
-            && let Ok(client) = manager.active_client().await
-            // The selected account may have changed while active_client ran.
-            && client.user_id().is_some_and(|id| id.as_str() == account.user_id)
-            && client.device_id().is_some_and(|id| id.as_str() == account.device_id)
-        {
+        if let Some(account) = account {
             let weak = service.clone();
             let callback_account = account.clone();
-            client
-                .register_notification_handler(move |notification, room, _client| {
-                    let account = callback_account.clone();
-                    // Capture at callback invocation, before the async body
-                    // can be queued behind an A → B → A transition.
-                    let service = weak.upgrade();
-                    let selection = service
-                        .as_ref()
-                        .and_then(|service| service.manager.account_selection(&account.id));
-                    async move {
-                        if let (Some(service), Some(selection)) = (service, selection) {
-                            service
-                                .enqueue(&account, selection, notification, room)
-                                .await;
+            // The manager rechecks the exact selected target and owns the
+            // once-only registration slot for this SDK client's lifetime.
+            let _ = manager
+                .register_notification_handler_for(
+                    &account.id,
+                    move |notification, room, _client| {
+                        let account = callback_account.clone();
+                        // Capture at callback invocation, before the async body
+                        // can be queued behind an A → B → A transition.
+                        let service = weak.upgrade();
+                        let selection = service
+                            .as_ref()
+                            .and_then(|service| service.manager.account_selection(&account.id));
+                        async move {
+                            if let (Some(service), Some(selection)) = (service, selection) {
+                                service
+                                    .enqueue(&account, selection, notification, room)
+                                    .await;
+                            }
                         }
-                    }
-                })
+                    },
+                )
                 .await;
-            registered.insert(account.id);
         }
         if service.upgrade().is_none() || selected.changed().await.is_err() {
             return;

@@ -145,6 +145,7 @@ fn message(
         event_id: SharedString::default(),
         is_own: false,
         sender: sender.into(),
+        sender_palette_index: appearance::sender_palette_index(sender),
         initials: initials.into(),
         time: time.into(),
         body: body.into(),
@@ -894,6 +895,7 @@ fn apply_notification_settings(ui: &AppWindow, config: &Config) {
 
 fn apply_config(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
     appearance::apply_config(ui, config);
+    appearance::apply_theme(ui, theme);
     shortcuts::apply_config(ui, config);
     audio_devices::apply_config(ui, config);
     image_previews::apply_config(ui, config);

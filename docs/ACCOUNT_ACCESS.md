@@ -54,7 +54,9 @@ unlock existing accounts.
 
 ## Verification status
 
-This implementation is awaiting native compilation and regression execution on
-the four supported runner targets, real credential-vault/restart checks and
-interactive keyboard/screen-reader acceptance. Source tests and review are
-not beta acceptance. See [verification](VERIFICATION.md).
+At `cab6c91`, all 15 core password/removal regressions passed on the four
+supported runner targets. The desktop checks stopped at Slint compilation,
+so the native controls, real credential-vault/restart checks and interactive
+keyboard/screen-reader acceptance remain unverified. The follow-up lifecycle
+repairs also require hosted regression execution. These model tests are not
+beta acceptance. See [verification](VERIFICATION.md).

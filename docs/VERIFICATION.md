@@ -5,17 +5,56 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
 ## Account access and style expansion, 2026-10-12
 
-The next source batch implements the local app password, protected activation
+Candidate `cab6c91` implements the local app password, protected activation
 and startup, direct account removal, durable incomplete-cleanup states and a
 reset allowed only after every account has been removed. It also adds original
 Nocturne/Terminal/Paper presets and explicit typography, geometry and message
 layout preferences. Independent source review resolved cancellation, partial
 logout/removal, profile-lock lifetime, preview-transition and update/recovery
-exclusion findings. Fifteen new core password/removal regression tests and
-real-vault integration checks are prepared. Local source checks passed: 487
-Python helper tests with six platform-only skips, direct Rust formatting,
-workflow validation and four-platform scope selection. No local native build
-or test has run. Native/UI acceptance remains pending.
+exclusion findings. Local source checks passed: 487 Python helper tests with
+six platform-only skips, direct Rust formatting, workflow validation and
+four-platform scope selection. No local native build or test ran.
+
+### Hosted candidate stopped at UI compilation: `cab6c91`
+
+[Run 38236579140](https://github.com/brk275/Morpheus/actions/runs/38236579140)
+tested `cab6c918b3a5f5709eb63df6ad19897268ce9790`. Scope passed 492 helper
+tests with one skip and scanned 54 reachable commits with zero findings.
+Linux formatting passed. Each of the four supported targets passed 151
+configuration, Matrix and RTC protocol unit tests: 24 configuration, 119 Matrix
+(including all 15 new password/removal regressions) and eight RTC protocol tests.
+
+The no-input integration targets separately ran two pure diagnostic tests on
+Linux and one on each Mac and Windows. Their ten Linux and nine other-platform
+early returns are not real Matrix, OS-vault or encrypted-store acceptance.
+The expanded protected-account live fixture has not executed on this candidate.
+
+All four desktop checks stopped at the same Slint source errors: inherited
+`enabled` and `has-hover` properties were referenced without `self`, and one
+message-body element specified both `width` and `min-width`. The compiler also
+reported new layout binding-loop warnings in the configurable side panes.
+Native builds, preview captures, device checks and live Matrix/RTC acceptance
+did not run. This candidate produced no artifacts and establishes no beta or
+installer readiness.
+
+Every job and cache/checkout post step finished. All five complete job logs
+were scanned with zero findings. The next source repair corrects the property
+references and geometry constraints; its native/UI behavior still requires
+hosted verification. Prior-candidate results remain recorded below.
+
+### Follow-up candidate awaiting hosted verification
+
+The source repair also adds 15 optional semantic theme colors and an independent
+sender-name palette, with legacy fallbacks and complete reset on theme changes.
+The three shipped palettes pass source contrast calculations; native rendering
+and hot-reload interaction remain unverified. Six new configuration tests and
+three projection tests await native execution.
+
+Two account-presentation tests exercise feed cancellation and failed activation
+cleanup. Review additionally found and fixed notification registration tied to
+an account UUID instead of its loaded SDK client, and delayed draft access to
+an account whose removal remained pending. Two new core regressions cover those
+lifetime and removal boundaries. These checks are source-reviewed, not yet run.
 
 ### Completed prior candidate: `6abdfb7`
 

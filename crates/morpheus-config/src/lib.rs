@@ -1151,6 +1151,13 @@ pub struct ThemePack {
     pub schema_version: u32,
     pub name: String,
     pub colors: ThemeColors,
+    /// Optional semantic roles. Missing values preserve each control's legacy
+    /// palette choice; they are not synthesized from a different theme.
+    #[serde(default, skip_serializing_if = "ThemeRoles::is_empty")]
+    pub roles: ThemeRoles,
+    /// Sender-name text colors. Avatar backgrounds keep their own palette.
+    #[serde(default, skip_serializing_if = "SenderColors::is_empty")]
+    pub senders: SenderColors,
 }
 
 impl ThemePack {
@@ -1164,18 +1171,119 @@ impl ThemePack {
             ));
         }
         for (label, value) in self.colors.entries() {
-            if value.len() != 7
-                || !value.starts_with('#')
-                || !value[1..]
-                    .chars()
-                    .all(|character| character.is_ascii_hexdigit())
-            {
+            validate_theme_color(&format!("colors.{label}"), value)?;
+        }
+        for (label, value) in self.roles.entries() {
+            if let Some(value) = value {
+                validate_theme_color(&format!("roles.{label}"), value)?;
+            }
+        }
+        if let Some(colors) = &self.senders.colors {
+            if !(1..=MAX_SENDER_COLORS).contains(&colors.len()) {
                 return Err(ConfigError::InvalidTheme(format!(
-                    "colors.{label} must be a #RRGGBB color"
+                    "senders.colors must contain between 1 and {MAX_SENDER_COLORS} colors; omit it to use the legacy sender colors"
                 )));
+            }
+            for (index, value) in colors.iter().enumerate() {
+                validate_theme_color(&format!("senders.colors[{index}]"), value)?;
             }
         }
         Ok(())
+    }
+}
+
+fn validate_theme_color(field: &str, value: &str) -> Result<(), ConfigError> {
+    if value.len() != 7
+        || !value.starts_with('#')
+        || !value[1..]
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err(ConfigError::InvalidTheme(format!(
+            "{field} must be a #RRGGBB color"
+        )));
+    }
+    Ok(())
+}
+
+/// Semantic colors are optional so schema-1 packs containing only `colors`
+/// keep their previous behavior. User colors are syntax-checked; contrast is
+/// a theme author's choice. Built-in themes have separate contrast tests.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ThemeRoles {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_surface: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_ink: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success_surface: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub success_ink: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection_ink: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unread: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unread_ink: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destructive: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destructive_ink: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+}
+
+impl ThemeRoles {
+    pub fn entries(&self) -> [(&'static str, Option<&str>); 15] {
+        [
+            ("error", self.error.as_deref()),
+            ("error_surface", self.error_surface.as_deref()),
+            ("error_ink", self.error_ink.as_deref()),
+            ("success", self.success.as_deref()),
+            ("success_surface", self.success_surface.as_deref()),
+            ("success_ink", self.success_ink.as_deref()),
+            ("selection", self.selection.as_deref()),
+            ("selection_ink", self.selection_ink.as_deref()),
+            ("focus", self.focus.as_deref()),
+            ("link", self.link.as_deref()),
+            ("unread", self.unread.as_deref()),
+            ("unread_ink", self.unread_ink.as_deref()),
+            ("destructive", self.destructive.as_deref()),
+            ("destructive_ink", self.destructive_ink.as_deref()),
+            ("voice", self.voice.as_deref()),
+        ]
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries().iter().all(|(_, value)| value.is_none())
+    }
+}
+
+pub const MAX_SENDER_COLORS: usize = 16;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SenderColors {
+    /// None preserves legacy sender text colors. Some must contain 1..=16
+    /// colors. This palette never changes avatar or account identity colors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub colors: Option<Vec<String>>,
+}
+
+impl SenderColors {
+    pub fn is_empty(&self) -> bool {
+        self.colors.is_none()
     }
 }
 
@@ -1430,6 +1538,8 @@ mod tests {
                 accent: "#A88CFF".into(),
                 accent_ink: "#FFFFFF".into(),
             },
+            roles: ThemeRoles::default(),
+            senders: SenderColors::default(),
         };
         fs::write(
             theme_directory.join("aurora.toml"),
@@ -1917,5 +2027,196 @@ mod tests {
         let restored: Config = toml::from_str(&serialized).unwrap();
         restored.validate().unwrap();
         assert_eq!(restored, config);
+    }
+
+    #[test]
+    fn legacy_theme_has_no_implicit_roles_or_sender_palette() {
+        let theme: ThemePack = toml::from_str(include_str!("../../../themes/aurora.toml")).unwrap();
+        theme.validate().unwrap();
+        assert!(theme.roles.is_empty());
+        assert!(theme.senders.is_empty());
+        let encoded = toml::to_string_pretty(&theme).unwrap();
+        assert!(!encoded.contains("[roles]"));
+        assert!(!encoded.contains("[senders]"));
+        assert_eq!(toml::from_str::<ThemePack>(&encoded).unwrap(), theme);
+
+        let partial = format!("{encoded}\n[roles]\nlink = '#123456'\n");
+        let partial: ThemePack = toml::from_str(&partial).unwrap();
+        partial.validate().unwrap();
+        assert_eq!(partial.roles.link.as_deref(), Some("#123456"));
+        assert_eq!(partial.roles.selection, None);
+        assert_eq!(partial.roles.error, None);
+        assert_eq!(partial.senders.colors, None);
+    }
+
+    #[test]
+    fn optional_theme_roles_reject_malformed_colors_and_unknown_keys() {
+        let legacy: ThemePack =
+            toml::from_str(include_str!("../../../themes/aurora.toml")).unwrap();
+        let encoded = toml::to_string_pretty(&legacy).unwrap();
+        for (role, _) in ThemeRoles::default().entries() {
+            for bad in ["red", "#12345", "#1234567", "#abcdef00", "#gggggg", "#éabc"] {
+                let text = format!("{encoded}\n[roles]\n{role} = '{bad}'\n");
+                let theme: ThemePack = toml::from_str(&text).unwrap();
+                let error = theme.validate().unwrap_err().to_string();
+                assert!(error.contains(&format!("roles.{role}")), "{error}");
+            }
+        }
+        for extension in [
+            "[roles]\nunknwon = '#123456'\n",
+            "[senders]\ncolours = ['#123456']\n",
+        ] {
+            assert!(toml::from_str::<ThemePack>(&format!("{encoded}\n{extension}")).is_err());
+        }
+    }
+
+    #[test]
+    fn sender_text_palette_is_bounded_and_does_not_rewrite_theme_colors() {
+        let mut theme = BuiltInStylePreset::Nocturne.theme().unwrap();
+        let original_colors = theme.colors.clone();
+        for count in [1, MAX_SENDER_COLORS] {
+            theme.senders.colors = Some(vec!["#aBcDeF".into(); count]);
+            theme.validate().unwrap();
+            let encoded = toml::to_string_pretty(&theme).unwrap();
+            assert_eq!(toml::from_str::<ThemePack>(&encoded).unwrap(), theme);
+            assert_eq!(theme.colors, original_colors);
+        }
+        for count in [0, MAX_SENDER_COLORS + 1] {
+            theme.senders.colors = Some(vec!["#abcdef".into(); count]);
+            assert!(
+                theme
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("senders.colors")
+            );
+        }
+        theme.senders.colors = Some(vec!["#abcdef".into(), "secret-color".into()]);
+        assert!(
+            theme
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("senders.colors[1]")
+        );
+        theme.senders.colors = None;
+        theme.validate().unwrap();
+    }
+
+    #[test]
+    fn custom_theme_contrast_is_an_authors_choice() {
+        let mut theme = BuiltInStylePreset::Paper.theme().unwrap();
+        // Validation checks the declarative format, not user aesthetic choices.
+        theme.roles.link = Some(theme.colors.canvas.clone());
+        theme.senders.colors = Some(vec![theme.colors.canvas.clone()]);
+        theme.validate().unwrap();
+    }
+
+    #[test]
+    fn malformed_semantic_override_does_not_load_embedded_theme_instead() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let mut config = Config::default();
+        config.apply_style_preset(BuiltInStylePreset::Terminal);
+        fs::create_dir(store.themes_dir().unwrap()).unwrap();
+        let path = store.themes_dir().unwrap().join("terminal.toml");
+        let mut override_theme = BuiltInStylePreset::Terminal.theme().unwrap();
+        override_theme.roles.error = Some("invalid".into());
+        let override_text = toml::to_string_pretty(&override_theme).unwrap();
+        fs::write(&path, &override_text).unwrap();
+        assert!(matches!(
+            store.load_theme(&config),
+            Err(ConfigError::InvalidTheme(_))
+        ));
+        assert_eq!(fs::read_to_string(&path).unwrap(), override_text);
+    }
+
+    #[test]
+    fn shipped_semantic_roles_and_sender_text_have_readable_contrast() {
+        fn luminance(hex: &str) -> f64 {
+            let mut linear = [0.0; 3];
+            for (index, value) in linear.iter_mut().enumerate() {
+                let offset = 1 + 2 * index;
+                let channel =
+                    u8::from_str_radix(&hex[offset..offset + 2], 16).unwrap() as f64 / 255.0;
+                *value = if channel <= 0.04045 {
+                    channel / 12.92
+                } else {
+                    ((channel + 0.055) / 1.055).powf(2.4)
+                };
+            }
+            0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2]
+        }
+        fn assert_contrast(name: &str, foreground: &str, background: &str, minimum: f64) {
+            let foreground_luminance = luminance(foreground);
+            let background_luminance = luminance(background);
+            let ratio = (foreground_luminance.max(background_luminance) + 0.05)
+                / (foreground_luminance.min(background_luminance) + 0.05);
+            assert!(
+                ratio >= minimum,
+                "{name}: {foreground} on {background} is {ratio:.3}, below {minimum}"
+            );
+        }
+        for preset in BuiltInStylePreset::ALL {
+            let theme = preset.theme().unwrap();
+            let roles = &theme.roles;
+            assert!(roles.entries().iter().all(|(_, value)| value.is_some()));
+            let surfaces = [
+                &theme.colors.rail,
+                &theme.colors.sidebar,
+                &theme.colors.canvas,
+                &theme.colors.panel,
+                &theme.colors.elevated,
+                &theme.colors.hover,
+            ];
+            for foreground in [&roles.error, &roles.success, &roles.link, &roles.voice] {
+                for background in surfaces {
+                    assert_contrast(&theme.name, foreground.as_deref().unwrap(), background, 4.5);
+                }
+            }
+            for (foreground, background) in [
+                (&roles.error_ink, &roles.error_surface),
+                (&roles.success_ink, &roles.success_surface),
+                (&roles.selection_ink, &roles.selection),
+                (&roles.unread_ink, &roles.unread),
+                (&roles.destructive_ink, &roles.destructive),
+            ] {
+                assert_contrast(
+                    &theme.name,
+                    foreground.as_deref().unwrap(),
+                    background.as_deref().unwrap(),
+                    4.5,
+                );
+            }
+            for background in surfaces
+                .into_iter()
+                .map(String::as_str)
+                .chain([roles.selection.as_deref().unwrap()])
+            {
+                assert_contrast(
+                    &theme.name,
+                    roles.focus.as_deref().unwrap(),
+                    background,
+                    3.0,
+                );
+            }
+            assert_contrast(
+                &theme.name,
+                roles.voice.as_deref().unwrap(),
+                roles.selection.as_deref().unwrap(),
+                4.5,
+            );
+            for foreground in theme.senders.colors.as_ref().unwrap() {
+                for background in [
+                    theme.colors.canvas.as_str(),
+                    theme.colors.panel.as_str(),
+                    theme.colors.elevated.as_str(),
+                    theme.colors.hover.as_str(),
+                    roles.selection.as_deref().unwrap(),
+                ] {
+                    assert_contrast(&theme.name, foreground, background, 4.5);
+                }
+            }
+        }
     }
 }

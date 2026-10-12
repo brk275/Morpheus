@@ -13,3 +13,24 @@ muted = "#596B61"
 divider = "#C9CEC2"
 accent = "#366B5A"
 accent_ink = "#FFFFFF"
+
+[roles]
+error = "#9B354C"
+error_surface = "#F1DBDE"
+error_ink = "#6B2437"
+success = "#2E684A"
+success_surface = "#DDEADC"
+success_ink = "#294F36"
+selection = "#D6E2D7"
+selection_ink = "#233C2D"
+focus = "#80552C"
+link = "#335F86"
+unread = "#625684"
+unread_ink = "#FFFFFF"
+destructive = "#9B354C"
+destructive_ink = "#FFFFFF"
+voice = "#296D5F"
+
+[senders]
+# Sender names only; avatar backgrounds retain their separate identity colors.
+colors = ["#5A4C87", "#326755", "#8A482E", "#355F84", "#854B72", "#566327"]

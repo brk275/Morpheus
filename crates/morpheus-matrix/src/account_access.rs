@@ -1015,6 +1015,69 @@ mod tests {
     }
 
     #[test]
+    fn pending_removal_blocks_drafts_even_with_a_retained_loaded_client() {
+        runtime().block_on(async {
+            let directory = TestDirectory::new();
+            let manager = AccountManager::open(&directory.0).unwrap();
+            let saved = account();
+            let client = Client::builder()
+                .homeserver_url("http://127.0.0.1:9")
+                .build()
+                .await
+                .unwrap();
+            {
+                let mut state = manager.state.lock().await;
+                state.registry.accounts.push(saved.clone());
+                state.loaded.insert(
+                    saved.id.clone(),
+                    Arc::new(LoadedAccount::new(
+                        client,
+                        saved.id.clone(),
+                        String::new(),
+                        manager._access_lock.clone(),
+                    )),
+                );
+            }
+            let room_id = "!draft:example.org";
+            // Prove this fixture reaches the loaded client's room lookup first.
+            assert!(matches!(
+                manager
+                    .load_composed_draft_for(&saved.id, room_id, None)
+                    .await,
+                Err(MatrixCoreError::RoomNotFound(_))
+            ));
+            // This is the retained-client state after a refresh worker prevents
+            // removal from completing promptly. Delayed draft work must stop
+            // at the tombstone, before consulting any SDK room or store.
+            manager
+                .state
+                .lock()
+                .await
+                .registry
+                .pending_removals
+                .push(saved.id.clone());
+            assert!(matches!(
+                manager
+                    .load_composed_draft_for(&saved.id, room_id, None)
+                    .await,
+                Err(MatrixCoreError::AccountRemovalPending)
+            ));
+            assert!(matches!(
+                manager
+                    .save_composed_draft_for(
+                        &saved.id,
+                        room_id,
+                        None,
+                        &ComposeText::plain("delayed draft"),
+                    )
+                    .await,
+                Err(MatrixCoreError::AccountRemovalPending)
+            ));
+            manager.stop().await;
+        });
+    }
+
+    #[test]
     fn vault_failure_during_removal_is_not_reported_as_complete() {
         runtime().block_on(async {
             let directory = TestDirectory::new();
@@ -1131,6 +1194,7 @@ mod tests {
                 timelines: Mutex::new(HashMap::new()),
                 composed_edits: Mutex::new(HashMap::new()),
                 incoming_verification_tx,
+                notification_handler_registered: Mutex::new(false),
                 token_task: Mutex::new(Some(SyncTask {
                     shutdown: Some(shutdown),
                     task,
