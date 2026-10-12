@@ -1172,16 +1172,27 @@ mod tests {
     }
 
     #[test]
-    fn stop_drains_token_owner_before_immediate_profile_reopen() {
+    fn selected_pause_retains_token_owner_but_stop_drains_before_profile_reopen() {
         runtime().block_on(async {
             let directory = TestDirectory::new();
             let manager = AccountManager::open(&directory.0).unwrap();
             let saved = account();
             let lock = manager._access_lock.clone();
-            let (shutdown, receiver) = oneshot::channel();
+            let (shutdown, mut receiver) = oneshot::channel();
+            let (probe_tx, mut probes) =
+                tokio::sync::mpsc::unbounded_channel::<oneshot::Sender<()>>();
             let task = tokio::spawn(async move {
                 let _lock = lock;
-                let _ = receiver.await;
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut receiver => break,
+                        probe = probes.recv() => {
+                            let Some(probe) = probe else { break };
+                            let _ = probe.send(());
+                        }
+                    }
+                }
             });
             let client = Client::builder()
                 .homeserver_url("http://127.0.0.1:9")
@@ -1190,7 +1201,7 @@ mod tests {
                 .unwrap();
             let (incoming_verification_tx, _) = watch::channel(Vec::new());
             let loaded = Arc::new(LoadedAccount {
-                client,
+                client: client.clone(),
                 timelines: Mutex::new(HashMap::new()),
                 composed_edits: Mutex::new(HashMap::new()),
                 incoming_verification_tx,
@@ -1200,8 +1211,59 @@ mod tests {
                     task,
                 })),
             });
-            manager.state.lock().await.loaded.insert(saved.id, loaded);
+            let lifetime = Arc::downgrade(&loaded);
+            {
+                let mut state = manager.state.lock().await;
+                state.registry.accounts.push(saved.clone());
+                state.registry.active_account_id = Some(saved.id.clone());
+                state.active_account_id = Some(saved.id.clone());
+                state.loaded.insert(saved.id.clone(), loaded);
+                let (shutdown, stopped) = oneshot::channel();
+                state.sync_task = Some(SyncTask {
+                    shutdown: Some(shutdown),
+                    task: tokio::spawn(async {
+                        let _ = stopped.await;
+                    }),
+                });
+            }
+            manager.publish_active_account(Some(saved.clone()));
+            let stale = manager.account_selection(&saved.id).unwrap();
+            manager.publish_active_account(Some(saved.clone()));
+            let current = manager.account_selection(&saved.id).unwrap();
+            let foreign = crate::account_selection::Selections::default();
+            foreign.replace(Some(&saved.id));
+            let foreign_selection = foreign.for_account(&saved.id).unwrap();
+            for rejected in [&stale, &foreign_selection] {
+                assert!(matches!(
+                    manager.pause_active_sync_for(rejected).await,
+                    Err(MatrixCoreError::SelectedAccountChanged)
+                ));
+                assert!(client.send_queue().is_enabled());
+                assert!(manager.state.lock().await.sync_task.is_some());
+            }
+            manager.pause_active_sync_for(&current).await.unwrap();
+            assert!(!client.send_queue().is_enabled());
+            assert!(current.is_current());
+            assert_eq!(manager.active_account().await, Some(saved.clone()));
+            assert_eq!(
+                *manager.subscribe_sync_status().borrow(),
+                SyncStatus::Stopped
+            );
+            assert!(manager.state.lock().await.sync_task.is_none());
+            assert!(lifetime.upgrade().is_some());
+            // The token owner's task remains able to handle a new event after
+            // pause. Actual rotating-token persistence is covered by OAuth QA.
+            let (probe, observed) = oneshot::channel();
+            probe_tx.send(probe).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), observed)
+                .await
+                .unwrap()
+                .unwrap();
             manager.stop().await;
+            assert!(!current.is_current());
+            assert!(manager.active_account().await.is_none());
+            assert!(probe_tx.is_closed());
+            assert!(lifetime.upgrade().is_none());
             drop(manager);
             assert!(AccountManager::open(&directory.0).is_ok());
         });

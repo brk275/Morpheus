@@ -11,7 +11,7 @@ default = []
 native-calls = ["dep:morpheus-rtc"]
 
 [dependencies]
-slint = "=1.18.1"
+slint = { version = "=1.18.1", features = ["unstable-fontique-011"] }
 morpheus-config = { path = "../morpheus-config" }
 morpheus-matrix = { path = "../morpheus-matrix" }
 morpheus-rtc = { path = "../morpheus-rtc", features = ["native-devices"], optional = true }
@@ -43,3 +43,6 @@ sha2 = "=0.10.9"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+i-slint-backend-testing = { version = "=1.18.1", default-features = false }

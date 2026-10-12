@@ -42,6 +42,36 @@ Their palette files are embedded in the app. Setting only
 `appearance.theme_pack = "terminal"` selects its colors; use the in-app preset
 or set the fields below to select its fonts and layout too.
 
+## Room header
+
+**Settings → Appearance → Room header** controls the header independently of
+message layout:
+
+| Mode | Visible conversation header |
+| --- | --- |
+| `full` (default) | Existing room header, topic and introductory block; the introduction still follows the message layout |
+| `compact` | Room-name header and one topic line, without the second introduction/topic block |
+| `minimal` | Room-name header and room actions, without topic or introductory decoration |
+
+```toml
+[conversation]
+header = "compact"
+```
+
+Omitting this table or field preserves the existing `full` behavior. Unknown
+modes and misspelled fields reject the edit. Settings and file changes use the
+same live-reload path; an invalid edit retains the last valid appearance.
+Appearance starting points preserve this independent choice.
+
+All modes retain the active room name, room settings/search/call/details
+controls, call notices, voice-room controls, status and error messages. The
+complete room topic remains available in Room settings. This setting affects
+the conversation page; Settings, discovery and the call stage keep their
+headers. Composer tools and navigation are outside this change.
+
+The implementation still requires native rendering and keyboard/accessibility
+verification; source checks are not evidence of those results.
+
 ## Typography, geometry and messages
 
 These tables are optional in schema version 1. Older configuration files receive
@@ -66,7 +96,13 @@ edit, so spelling mistakes do not silently become inactive settings.
 
 Font names must be nonblank, at most 128 UTF-8 bytes, and contain no control or
 direction-format characters. The app selects installed font families; it does
-not fetch font files. Missing families use the renderer's fallback. In Settings,
+not fetch font files. `monospace`, `serif` and `sans-serif` resolve to a usable
+installed family from the operating system's generic-font mapping; the portable
+name remains in your configuration. Other names pass through unchanged. If no
+usable generic family is available, the renderer uses its normal fallback,
+which may have different metrics or a proportional design. Missing named families
+also use that fallback. Resolution runs again on each configuration reload.
+In Settings,
 leave the message family blank to inherit the interface font and choose
 **Apply fonts**. In TOML, omit `message_font_family` to inherit; an explicitly
 empty string is invalid.

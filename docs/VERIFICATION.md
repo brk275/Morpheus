@@ -42,19 +42,70 @@ were scanned with zero findings. The next source repair corrects the property
 references and geometry constraints; its native/UI behavior still requires
 hosted verification. Prior-candidate results remain recorded below.
 
-### Follow-up candidate awaiting hosted verification
+### Follow-up native execution: `65b4ceb`
 
-The source repair also adds 15 optional semantic theme colors and an independent
-sender-name palette, with legacy fallbacks and complete reset on theme changes.
-The three shipped palettes pass source contrast calculations; native rendering
-and hot-reload interaction remain unverified. Six new configuration tests and
-three projection tests await native execution.
+[Run 38240049732](https://github.com/brk275/Morpheus/actions/runs/38240049732)
+tested `65b4cebf703c7aa8eae061c803f0bcc135e81772`. All four native checks and
+builds passed, including the Slint repairs. No layout binding-loop warnings
+remained. Linux formatting passed. Scope passed 492 helper tests with one skip
+and scanned 55 reachable commits with zero findings.
 
-Two account-presentation tests exercise feed cancellation and failed activation
-cleanup. Review additionally found and fixed notification registration tied to
-an account UUID instead of its loaded SDK client, and delayed draft access to
-an account whose removal remained pending. Two new core regressions cover those
-lifetime and removal boundaries. These checks are source-reviewed, not yet run.
+| Suite | Each Mac and Windows | Linux |
+| --- | ---: | ---: |
+| Configuration | 30 | 30 |
+| Matrix | 121 | 121 |
+| RTC protocol | 8 | 8 |
+| Desktop/controller | 218 | 233 |
+| Native RTC/device guards | 78 | 89 |
+| Vendor, updater and SDK regressions | 391 | 391 |
+| Total passed | 846 | 872 |
+
+Each target had one ignored live-fixture test. Separately, two input-free
+diagnostic tests ran on Linux and one on each other target. Ten Linux and nine
+other-platform no-input integration early returns are excluded from those
+totals and do not establish live acceptance.
+
+The 16 core account-access regressions passed everywhere, together with the
+notification-client lifetime test and two account-presentation cancellation/
+detach tests. The six added semantic-theme configuration tests and three theme
+projection tests passed, including legacy fallbacks and replacement of omitted
+roles/sender colors. All five full Unicode emoji-catalog regressions and the
+native ringtone guards passed. These are native automated regressions; actual
+account-dialog keyboard/screen-reader behavior, picker performance, hot reload
+interaction and audible output/device routing remain open.
+
+Linux passed Xvfb startup and the strict Wayland capture fixture; Windows passed
+owned synthetic window/display capture. Linux also passed 15 live Rust tests,
+including encrypted drafts, formatting/media, search through both sync paths,
+recovery, three ringing cases and native RTC/late joins. The pre-synced stock
+Element Call `v0.28.0-rc.1` Sticky2025 peer passed all 11 fixture facts.
+
+Four Linux live checks failed:
+
+- `live_local` stopped at `encrypted_restart`. The protected-account live
+  sequence follows that point and was not reached.
+- Room settings failed `concurrent_topic` with the fixed `rate_limited` category.
+- OAuth login/refresh failed at `vault_persist` with `rust_acceptance`; its
+  restore/refresh phase did not run.
+- Current/DM ringing failed `account_fresh_offer` with `timed_out`, before its
+  account-switch/replay sequence. All 13 sender facts and ten earlier actor
+  checks passed; the other three ringing cases passed.
+
+These fixed diagnostics narrow the failures but do not establish a repaired
+candidate. No unchanged rerun was dispatched. All fixture cleanup checks passed.
+
+The only artifact was five actual native PNG captures plus provenance, artifact
+ID `11742924649`. Exact revision/run/attempt, archive digest, image hashes and
+fictional fixture names were verified; all five images received visual review.
+They show Nocturne, Terminal, sign-in, incoming-call and room-settings surfaces;
+they do not establish account-password dialog or Paper-preset visual acceptance.
+No installer was uploaded.
+
+Every job and cache/checkout post finished. All five complete job logs were
+independently scanned with zero findings. Follow-up chrome, focus-harness and
+expanded preview changes require their own candidate verification. Physical
+devices, real provider handoff, interactive accessibility, installation, signing,
+updates and uninstall gates remain open. Prior-candidate history follows.
 
 ### Completed prior candidate: `6abdfb7`
 

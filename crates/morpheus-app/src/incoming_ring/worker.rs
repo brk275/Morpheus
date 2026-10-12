@@ -36,6 +36,19 @@ use tokio::{
     time,
 };
 
+#[cfg(test)]
+mod diagnostics;
+#[cfg(test)]
+use diagnostics::{Counters, Diagnostic, Snapshot};
+
+// Omitted entirely from non-test builds; arguments are never evaluated there.
+macro_rules! diagnostic {
+    ($gate:expr, $value:ident) => {{
+        #[cfg(test)]
+        $gate.diagnostics.record(Diagnostic::$value);
+    }};
+}
+
 const COMMANDS: usize = 16;
 const CANDIDATES: usize = 64;
 const ROOMS: usize = 128;
@@ -53,6 +66,8 @@ struct State {
     interests: BTreeMap<String, BTreeSet<String>>,
 }
 struct Gate {
+    #[cfg(test)]
+    diagnostics: Counters,
     state: Mutex<State>,
     invalidate: InvalidationHandle,
     offers: watch::Sender<Vec<OfferPresentation>>,
@@ -60,6 +75,7 @@ struct Gate {
 }
 impl Gate {
     fn invalidate(&self) {
+        diagnostic!(self, GateInvalidation);
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         self.invalidate.invalidate();
         if let Some(next) = state.epoch.checked_add(1) {
@@ -106,6 +122,7 @@ impl Gate {
             })
     }
     fn shutdown(&self) {
+        diagnostic!(self, GateShutdown);
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.stopped = true;
         self.invalidate.shutdown();
@@ -133,6 +150,7 @@ impl Gate {
             || state.epoch != epoch
             || state.selected.as_ref().is_none_or(|s| !s.is_current())
         {
+            diagnostic!(self, PublicationRejected);
             return;
         }
         if offers.iter().any(|offer| {
@@ -140,6 +158,9 @@ impl Gate {
                 != state.selected.as_ref().map(AccountSelection::account_id)
         }) {
             return;
+        }
+        if !offers.is_empty() {
+            diagnostic!(self, Publication);
         }
         self.offers.send_replace(offers);
     }
@@ -169,6 +190,10 @@ pub(crate) struct IncomingHandle {
     gate: Arc<Gate>,
 }
 impl IncomingHandle {
+    #[cfg(test)]
+    pub(crate) fn diagnostics(&self) -> Snapshot {
+        self.gate.diagnostics.snapshot()
+    }
     pub(crate) fn snapshot(&self) -> Vec<OfferPresentation> {
         self.gate.snapshot()
     }
@@ -218,6 +243,8 @@ impl IncomingWorker {
         let controller = IncomingController::default();
         let (offers, _) = watch::channel(Vec::new());
         let gate = Arc::new(Gate {
+            #[cfg(test)]
+            diagnostics: Counters::default(),
             state: Mutex::new(State {
                 epoch: 1,
                 stopped: false,
@@ -361,6 +388,7 @@ async fn run(
                 let keep = usable && scope.as_ref().is_some_and(|scope| scope.selection.is_current() && scope.healthy.load(Ordering::Acquire) && scope._tasks.0.iter().all(|task| !task.is_finished())
                     && selection.as_ref().is_some_and(|selection| selection.account_id() == scope.selection.account_id()));
                 if !keep {
+                    if !usable { diagnostic!(gate, ScopeUnavailable); }
                     scope = None;
                     controller.select(None);
                     gate.select(None);
@@ -374,7 +402,7 @@ async fn run(
                                 gate.select(Some(selection));
                                 scope = Some(prepared);
                             }
-                        }
+                        } else { diagnostic!(gate, ScopeSetupFailed); }
                     }
                 }
                 if let Some(scope) = scope.as_mut() { discover_rooms(scope, &gate, &candidates); }
@@ -382,16 +410,21 @@ async fn run(
             },
             candidate = incoming.recv() => {
                 let Some(candidate) = candidate else { break; };
-                if gate.current() != Some(candidate.epoch) { continue; }
+                if gate.current() != Some(candidate.epoch) { diagnostic!(gate, CandidateStaleEpoch); continue; }
+                diagnostic!(gate, AdmissionStarted);
                 enum Outcome { Command(Option<Command>), Changed, Finished }
                 let outcome = {
                     let receive = controller.receive(&manager, &preferences, &candidate.room, &candidate.event);
                     tokio::pin!(receive);
                     tokio::select! {
                         biased;
-                        command = commands.recv() => Outcome::Command(command),
-                        _ = gate.wake.notified() => Outcome::Changed,
-                        _ = &mut receive => Outcome::Finished,
+                        command = commands.recv() => { diagnostic!(gate, CandidateInterrupted); Outcome::Command(command) },
+                        _ = gate.wake.notified() => { diagnostic!(gate, CandidateInvalidated); Outcome::Changed },
+                        _result = &mut receive => {
+                            #[cfg(test)]
+                            gate.diagnostics.result(&_result);
+                            Outcome::Finished
+                        },
                     }
                 };
                 match outcome {
@@ -688,12 +721,18 @@ fn reconcile_room(
 ) {
     let retained = room.sticky_events().keyless_live();
     if retained.invalidated || retained.events.len() > RECEIPTS {
+        if retained.invalidated {
+            diagnostic!(gate, CacheInvalidated);
+        } else {
+            diagnostic!(gate, ReceiptCapacity);
+        }
         cached.reject(room.room_id().as_str(), gate);
         return;
     }
     let own_user = room.client().user_id().map(ToString::to_string);
     let own_device = room.client().device_id().map(ToString::to_string);
     let Some((own_user, own_device)) = own_user.zip(own_device) else {
+        diagnostic!(gate, MissingIdentity);
         cached.reject(room.room_id().as_str(), gate);
         return;
     };
@@ -704,29 +743,35 @@ fn reconcile_room(
         let raw = event.raw().json().get();
         bytes = bytes.saturating_add(raw.len());
         if raw.len() > super::MAX_BYTES || bytes > ROOM_BYTES {
+            diagnostic!(gate, ReceiptOversized);
             cached.reject(room.room_id().as_str(), gate);
             return;
         }
         let Some(encryption) = event.encryption_info() else {
+            diagnostic!(gate, ReceiptUnverified);
             continue;
         };
         if encryption.verification_state != VerificationState::Verified
             || encryption.sender != event.sender
         {
+            diagnostic!(gate, ReceiptUnverified);
             continue;
         }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+            diagnostic!(gate, ReceiptMalformed);
             continue;
         };
         let Ok(ring) =
             morpheus_rtc::ringing::RingNotification::parse(&value, room.room_id().as_str())
         else {
+            diagnostic!(gate, ReceiptMalformed);
             continue;
         };
         if ring.sender() == own_user
             || ring.sender() != encryption.sender.as_str()
             || ring.event_id() != event.event_id.as_str()
         {
+            diagnostic!(gate, ReceiptIdentity);
             continue;
         }
         callers.insert(ring.sender().to_owned());
@@ -736,6 +781,7 @@ fn reconcile_room(
         );
     }
     if raw_receipts.is_empty() {
+        diagnostic!(gate, NoVerifiedReceipts);
         if !cached.unavailable
             && (!cached.receipts.is_empty()
                 || cached
@@ -754,6 +800,7 @@ fn reconcile_room(
     let mut members = BTreeSet::new();
     let live = room.sticky_events().live();
     if live.len() > MEMBERS {
+        diagnostic!(gate, MemberCapacity);
         cached.reject(room.room_id().as_str(), gate);
         return;
     }
@@ -766,14 +813,17 @@ fn reconcile_room(
         let raw = member.raw().json().get();
         bytes = bytes.saturating_add(raw.len());
         if bytes > ROOM_BYTES {
+            diagnostic!(gate, MemberOversized);
             cached.reject(room.room_id().as_str(), gate);
             return;
         }
         if raw.len() > super::MAX_BYTES {
+            diagnostic!(gate, MemberOversized);
             cached.reject(room.room_id().as_str(), gate);
             return;
         }
         let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+            diagnostic!(gate, MemberMalformed);
             cached.reject(room.room_id().as_str(), gate);
             return;
         };
@@ -784,16 +834,19 @@ fn reconcile_room(
             continue;
         }
         let Some(encryption) = member.encryption_info() else {
+            diagnostic!(gate, MemberUnverified);
             cached.reject(room.room_id().as_str(), gate);
             return;
         };
         let Some(device) = encryption.sender_device.as_deref() else {
+            diagnostic!(gate, MemberUnverified);
             cached.reject(room.room_id().as_str(), gate);
             return;
         };
         if encryption.verification_state != VerificationState::Verified
             || encryption.sender != member.key.sender
         {
+            diagnostic!(gate, MemberUnverified);
             cached.reject(room.room_id().as_str(), gate);
             return;
         }
@@ -804,10 +857,12 @@ fn reconcile_room(
             encryption.sender.as_str(),
             device.as_str(),
         ) else {
+            diagnostic!(gate, MemberMalformed);
             cached.reject(room.room_id().as_str(), gate);
             return;
         };
         if parsed.logical_id != member.key.sticky_key {
+            diagnostic!(gate, MemberMismatch);
             cached.reject(room.room_id().as_str(), gate);
             return;
         }
@@ -830,22 +885,28 @@ fn reconcile_room(
         .iter()
         .any(|caller| !members.iter().any(|member| &member.sender == caller))
     {
+        diagnostic!(gate, CallerMembershipMissing);
         cached.reject(room.room_id().as_str(), gate);
         return;
     }
     gate.interest(room.room_id().as_str(), callers);
     if cached.changed(retained.generation, raw_receipts, members) {
+        diagnostic!(gate, CacheChanged);
         gate.room_changed(room.room_id().as_str());
     }
     for event in retained.events {
         if !cached.receipts.contains_key(event.event_id.as_str())
             || cached.seen.contains(event.event_id.as_str())
         {
+            if cached.seen.contains(event.event_id.as_str()) {
+                diagnostic!(gate, SeenRetained);
+            }
             continue;
         }
         // The actual admission boundary determines encrypted trust/target/type.
         // Malformed/untrusted receipts cannot be turned into UI actions here.
         let Some(epoch) = gate.current() else {
+            diagnostic!(gate, GateUnavailable);
             return;
         };
         if candidates
@@ -856,9 +917,11 @@ fn reconcile_room(
             })
             .is_err()
         {
+            diagnostic!(gate, CandidateQueueFull);
             cached.reject(room.room_id().as_str(), gate);
             return;
         }
+        diagnostic!(gate, CandidateQueued);
         cached.seen.insert(event.event_id.to_string());
     }
 }
@@ -871,6 +934,8 @@ mod tests {
         let controller = IncomingController::default();
         let (offers, _) = watch::channel(Vec::new());
         let gate = Arc::new(Gate {
+            #[cfg(test)]
+            diagnostics: Counters::default(),
             state: Mutex::new(State {
                 epoch: 1,
                 stopped: false,

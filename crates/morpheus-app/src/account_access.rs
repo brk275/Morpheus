@@ -397,3 +397,7 @@ fn clear_passwords(ui: &AppWindow) {
     ui.set_access_new_password("".into());
     ui.set_access_confirm_password("".into());
 }
+
+#[cfg(test)]
+#[path = "account_access_ui_tests.rs"]
+mod ui_tests;

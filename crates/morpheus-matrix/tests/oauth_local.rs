@@ -322,6 +322,18 @@ fn require_no_plaintext_session(profile: &Path, values: &[&str]) -> Result<()> {
     Ok(())
 }
 
+// Expiry probes need sync paused, while the live SDK client's token observer
+// must still persist refreshes. Whole-manager stop is a terminal drain boundary.
+async fn pause_sync(manager: &AccountManager, account: &AccountInfo) -> Result<()> {
+    let selection = manager
+        .account_selection(&account.id)
+        .ok_or("OAuth selected account unavailable")?;
+    timeout(REQUEST_TIMEOUT, manager.pause_active_sync_for(&selection))
+        .await
+        .map_err(|_| "OAuth sync pause timed out")?
+        .map_err(|_| "OAuth sync pause failed")
+}
+
 async fn login_and_refresh(
     manager: &AccountManager,
     fixture: &Fixture,
@@ -425,7 +437,7 @@ async fn login_and_refresh(
     whoami(&client, &account).await?;
     println!("\nMORPHEUS_OAUTH_CHECK login=true");
     println!("\nMORPHEUS_OAUTH_CHECK callback_replay_rejected=true");
-    manager.stop().await;
+    pause_sync(manager, &account).await?;
     let before = tokens(&client)?;
     stage(Stage::ManualRefresh);
     timeout(REQUEST_TIMEOUT, client.oauth().refresh_access_token())
@@ -482,7 +494,7 @@ async fn restore_and_refresh(
         .map_err(|_| "restored client unavailable")?;
     whoami(&client, &account).await?;
     println!("\nMORPHEUS_OAUTH_CHECK restored=true");
-    manager.stop().await;
+    pause_sync(manager, &account).await?;
     let before = tokens(&client)?;
     // Use real expiry, with the server's supported 60-second fixture TTL.
     // No database edits, mocked 401, forced clocks or manual SDK refresh here.

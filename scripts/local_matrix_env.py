@@ -159,6 +159,14 @@ if not re.search(r'^rc_invites:', config, re.MULTILINE):
   per_user: {per_second: 10, burst_count: 100}
   per_issuer: {per_second: 10, burst_count: 100}
 """
+# Room-settings acceptance deliberately sends a bounded burst of state changes.
+# Keep rate limiting enabled with fixture capacity; production clients must still
+# surface 429 and must never automatically replay a state write.
+if not re.search(r'^rc_message:', config, re.MULTILINE):
+    config += """rc_message:
+  per_second: 10
+  burst_count: 100
+"""
 # This fixture is loopback-only. Synapse otherwise denies all public-room
 # publication, leaving directory discovery impossible to exercise.
 if not re.search(r'^room_list_publication_rules:', config, re.MULTILINE):

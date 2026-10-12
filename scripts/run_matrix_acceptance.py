@@ -51,7 +51,8 @@ LIVE_STAGES = frozenset((
     'encrypted_edit',
     'encrypted_reaction',
     'encrypted_reply',
-    'encrypted_restart',
+    'encrypted_restart_room',
+    'encrypted_restart_message',
     'encrypted_send',
     'encrypted_thread_receive',
     'encrypted_thread_send',
@@ -233,6 +234,65 @@ INCOMING_ERRORS = frozenset((
     "observer_unsupported_server",
 
 ))
+INCOMING_DIAGNOSTICS = frozenset((
+    "worker_scope_unavailable",
+    "worker_scope_setup_failed",
+    "worker_gate_invalidation",
+    "worker_gate_shutdown",
+    "worker_publication",
+    "worker_publication_rejected",
+    "worker_candidate_queued",
+    "worker_candidate_stale_epoch",
+    "worker_candidate_interrupted",
+    "worker_candidate_invalidated",
+    "worker_admission_started",
+    "worker_admission_succeeded",
+    "worker_controller_unavailable",
+    "worker_controller_capacity",
+    "worker_controller_stale",
+    "worker_controller_expired",
+    "worker_controller_busy",
+    "worker_controller_revoked",
+    "worker_controller_wrong_call",
+    "worker_admission_account",
+    "worker_admission_sync",
+    "worker_admission_receipt",
+    "worker_admission_replay",
+    "worker_admission_expired",
+    "worker_admission_membership",
+    "worker_admission_trust",
+    "worker_admission_policy",
+    "worker_admission_quiet",
+    "worker_admission_transport",
+    "worker_admission_unavailable",
+    "worker_admission_timed_out",
+    "worker_admission_revoked",
+    "worker_cache_invalidated",
+    "worker_receipt_capacity",
+    "worker_missing_identity",
+    "worker_receipt_oversized",
+    "worker_receipt_unverified",
+    "worker_receipt_malformed",
+    "worker_receipt_identity",
+    "worker_no_verified_receipts",
+    "worker_member_capacity",
+    "worker_member_oversized",
+    "worker_member_malformed",
+    "worker_member_unverified",
+    "worker_member_mismatch",
+    "worker_caller_membership_missing",
+    "worker_cache_changed",
+    "worker_gate_unavailable",
+    "worker_candidate_queue_full",
+    "worker_seen_retained",
+    "fresh_before_idle",
+    "fresh_before_selected",
+    "fresh_before_sync",
+    "fresh_before_caller_only",
+    "fresh_after_receipt_retained",
+    "fresh_after_receipt_cache_current",
+))
+INCOMING_DIAGNOSTIC = re.compile(r"^MORPHEUS_INCOMING_DIAGNOSTIC ([a-z_]+)=(0|[1-9][0-9]{0,4})$", re.MULTILINE)
 INCOMING_CHECK = re.compile(r"^MORPHEUS_INCOMING_CHECK ([a-z_]+)=(true|false)$", re.MULTILINE)
 INCOMING_STAGE = re.compile(r"^MORPHEUS_INCOMING_STAGE ([a-z_]+)$", re.MULTILINE)
 INCOMING_FAILURE = re.compile(r"^MORPHEUS_INCOMING_FAILURE ([a-z_]+)$", re.MULTILINE)
@@ -288,6 +348,51 @@ def live_diagnostics(output: str) -> dict:
     return result
 
 
+def native_process_diagnostics(output: str, returncode, timed_out: bool) -> dict:
+    """Fixed process facts only; no panic text, paths, commands, or server data."""
+    result = {"result": "deadline" if timed_out else "unknown"}
+    if not timed_out and type(returncode) is int:
+        if 0 <= returncode <= 255:
+            result.update(result="exited", exit_code=returncode)
+        elif -64 <= returncode < 0:
+            result.update(result="signalled", signal=-returncode)
+    panic = re.search(r"^thread '[^'\r\n]{1,256}'(?: \([0-9]{1,10}\))? panicked at ([^\r\n]{1,1024})$",
+                      output, re.MULTILINE)
+    result["panic_observed"] = panic is not None
+    result["assertion_observed"] = re.search(
+        r"^assertion (?:failed:|`left (?:==|!=) right` failed)", output, re.MULTILINE) is not None
+    result["stack_overflow"] = re.search(
+        r"^thread '[^'\r\n]{1,256}'(?: \([0-9]{1,10}\))? has overflowed its stack$",
+        output, re.MULTILINE) is not None
+    if panic:
+        location = panic[1]
+        if re.fullmatch(r"crates/morpheus-[a-z-]+/[A-Za-z0-9_./-]+\.rs:[0-9]+:[0-9]+:?", location):
+            result["panic_family"] = "morpheus"
+        elif re.fullmatch(
+                r"/home/runner/\.cargo/git/checkouts/matrix-rust-sdk-[0-9a-f]+/[0-9a-f]+/"
+                r"crates/matrix-sdk(?:-ui|-base|-crypto|-sqlite)?/src/[A-Za-z0-9_./-]+\.rs:[0-9]+:[0-9]+:?",
+                location):
+            result["panic_family"] = "matrix_sdk"
+        elif re.fullmatch(
+                r"/home/runner/\.cargo/registry/src/index\.crates\.io-[0-9a-f]+/"
+                r"(?:rusqlite|libsqlite3-sys|deadpool-sqlite)-[0-9a-z.+-]+/src/"
+                r"[A-Za-z0-9_./-]+\.rs:[0-9]+:[0-9]+:?", location):
+            result["panic_family"] = "sqlite"
+        else:
+            result["panic_family"] = "other"
+    # Cargo normally exits 101 when its child is killed. Capture only known
+    # signal number/name pairs from its fixed termination record, never args.
+    signals = {4: "SIGILL", 6: "SIGABRT", 7: "SIGBUS", 9: "SIGKILL", 11: "SIGSEGV", 15: "SIGTERM"}
+    for number, name in re.findall(
+            r"^  process didn't exit successfully: [^\r\n]{1,4096} \(signal: ([0-9]{1,2}), (SIG[A-Z]+)(?:: [^\r\n]*)?\)$",
+            output, re.MULTILINE):
+        number = int(number)
+        if signals.get(number) == name:
+            result["test_signal"] = number
+            result["test_signal_name"] = signals[number]
+    return result
+
+
 def rtc_diagnostics(output: str) -> dict:
     """Only fixed call-roster/decryption categories and sampled booleans."""
     result = {}
@@ -331,6 +436,12 @@ def incoming_evidence(output: str) -> dict[str, bool]:
 def incoming_diagnostics(output: str) -> dict:
     """Emit only fixed actor categories; never relay unknown marker contents."""
     diagnostics = {"checks": incoming_evidence(output)}
+    counts = {}
+    for name, value in INCOMING_DIAGNOSTIC.findall(output):
+        if name in INCOMING_DIAGNOSTICS and int(value) <= 65535:
+            counts[name] = max(counts.get(name, 0), int(value))
+    if counts:
+        diagnostics["discovery"] = counts
     for name, pattern, allowed in (
         ("stage", INCOMING_STAGE, INCOMING_STAGES),
         ("failure", INCOMING_FAILURE, INCOMING_STAGES),
@@ -346,6 +457,8 @@ def incoming_diagnostics(output: str) -> dict:
         valid = check is not None and (
             check[1] in INCOMING_CHECKS or check[1] == INCOMING_REPLAY_CHECK
         )
+        counter = INCOMING_DIAGNOSTIC.fullmatch(line)
+        valid |= counter is not None and counter[1] in INCOMING_DIAGNOSTICS and int(counter[2]) <= 65535
         for pattern, allowed in ((INCOMING_STAGE, INCOMING_STAGES),
                                  (INCOMING_FAILURE, INCOMING_STAGES),
                                  (INCOMING_ERROR, INCOMING_ERRORS)):
@@ -563,6 +676,7 @@ class Acceptance:
         started = time.monotonic()
         print(f"Starting {label}", flush=True)
         timed_out = False
+        observed_returncode = None
         if pid_namespace:
             if not self.containment_verified:
                 raise RuntimeError("Acceptance process containment has not been verified")
@@ -582,9 +696,10 @@ class Acceptance:
                 raise RuntimeError("Acceptance command could not be started") from None
             try:
                 if pid_namespace:
-                    wait_owned(process, seconds)
+                    observed_returncode = wait_owned(process, seconds)
                 else:
                     process.communicate(stdin, timeout=seconds)
+                    observed_returncode = process.returncode
             except subprocess.TimeoutExpired:
                 # Cargo and fixture scripts spawn children. Stop the whole
                 # owned group so a timed-out test cannot outlive its services.
@@ -638,6 +753,7 @@ class Acceptance:
             evidence = {"check": label, "failed_tests": failed, "panic_locations": locations}
             if label == "live_local":
                 evidence["live_diagnostics"] = live_diagnostics(output)
+                evidence["native_process"] = native_process_diagnostics(output, observed_returncode, timed_out)
                 if timed_out:
                     evidence["live_diagnostics"]["failure"] = "deadline"
             if fixture_diagnostics := matrix_fixture_diagnostics(output):

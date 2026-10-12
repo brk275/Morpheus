@@ -681,6 +681,7 @@ export component AppWindow inherits Window {
     in-out property <int> content-padding-px: 24;
     in-out property <int> rail-width-px: 70;
     in-out property <int> message-layout: 0;
+    in-out property <int> conversation-header-mode: 0; // full, compact, minimal
     in-out property <bool> show-message-avatars: true;
     in-out property <bool> show-message-timestamps: true;
     in-out property <bool> color-message-senders: false;
@@ -693,6 +694,7 @@ export component AppWindow inherits Window {
     callback set-style-fonts(string, string, string);
     callback change-style-number(int, int);
     callback choose-message-layout(int);
+    callback choose-conversation-header-mode(int);
     callback set-style-flag(int, bool);
 
     in-out property <string> config-error;
@@ -1112,7 +1114,7 @@ export component AppWindow inherits Window {
     in-out property <string> thread-root-rich-accessible-body;
     in-out property <string> thread-composer-text;
     in-out property <bool> thread-send-pending: false;
-    property <string> login-homeserver: "https://matrix.org";
+    in-out property <string> login-homeserver: "https://matrix.org";
     property <string> login-username;
     property <string> login-password;
 
@@ -1133,6 +1135,30 @@ export component AppWindow inherits Window {
         root.cancel-room-settings(); root.close-image-preview(); root.mention-context-changed(); }
     changed thread-root-id => { root.close-image-preview(); root.mention-context-changed(); }
     changed active-space-id => { root.quick-switcher-open = false; }
+    // Conditional dialog subtrees do not retain a usable keyboard focus target
+    // after dismissal. Return to an account control on the visible surface.
+    property <int> account-focus-request: 0;
+    function return-account-focus() {
+        if !root.access-open {
+            // Each conditional subtree resolves its own local focus target.
+            root.account-focus-request += 1;
+            if !root.manage-accounts-open && !root.show-sign-in { account-trigger.focus(); }
+        }
+    }
+    changed access-open => {
+        if !root.access-open { root.return-account-focus(); }
+    }
+    changed manage-accounts-open => {
+        if !root.manage-accounts-open { root.return-account-focus(); }
+    }
+    // A completed final-account removal may refresh the saved rows after its
+    // dialog closes. Do not leave focus on the now-removed sign-in shortcut.
+    property <int> saved-account-count: root.saved-accounts.length;
+    changed saved-account-count => {
+        if root.saved-account-count == 0 && root.show-sign-in && !root.manage-accounts-open && !root.access-open {
+            root.return-account-focus();
+        }
+    }
     changed show-sign-in => {
         if root.show-sign-in { root.cancel-room-settings(); } if root.show-sign-in { root.close-image-preview(); } if !root.show-sign-in { shortcut-scope.focus(); } }
 
@@ -1644,15 +1670,26 @@ export component AppWindow inherits Window {
                             font-size: 20px * root.text-scale;
                             vertical-alignment: center;
                         }
-                        Text {
+                        if root.page != 0 || root.conversation-header-mode != 2 : Text {
                             text: root.page == 1 ? "Settings" : root.page == 2 ? "Voice & video" : root.page == 3 ? "Discover rooms" : root.active-room-name;
                             color: root.ink;
                             font-size: 16px * root.text-scale;
                             font-weight: 750;
                             vertical-alignment: center;
                         }
-                        Rectangle { width: 1px; height: 24px; background: root.divider; }
-                        Text {
+                        if root.page == 0 && root.conversation-header-mode == 2 : Text {
+                            text: root.active-room-name;
+                            color: root.ink;
+                            font-size: 16px * root.text-scale;
+                            font-weight: 750;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            min-width: 0px;
+                            overflow: elide;
+                            accessible-label: "Current room: " + root.active-room-name;
+                        }
+                        if root.page != 0 || root.conversation-header-mode != 2 : Rectangle { width: 1px; height: 24px; background: root.divider; }
+                        if root.page != 0 || root.conversation-header-mode != 2 : Text {
                             text: root.page == 0 ? root.active-room-topic : root.page == 1 ? "Make Morpheus yours" : root.page == 3 ? "Public rooms on your Matrix homeserver" : "The Workshop";
                             color: root.muted;
                             font-size: 12px * root.text-scale;
@@ -1818,7 +1855,7 @@ export component AppWindow inherits Window {
                 if root.page == 0 : VerticalLayout {
                     vertical-stretch: 1;
                     spacing: 0px;
-                    Rectangle {
+                    if root.conversation-header-mode == 0 : Rectangle {
                         height: root.message-layout == 0 ? max(110px, 54px * root.text-scale + 56px) : max(48px, 24px * root.text-scale + 24px);
                         background: root.canvas;
                         VerticalLayout {
@@ -1962,12 +1999,19 @@ export component AppWindow inherits Window {
                                             text: message.sender; color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.color-message-senders ? (root.sender-palette.length > 0 ? root.sender-palette[mod(message.sender-palette-index, max(1, root.sender-palette.length))] : message.accent) : root.ink;
                                             font-family: root.message-font-family;
                                             font-size: root.message-layout == 0 ? root.message-font-px : max(10px, root.message-font-px - 2px);
-                                            font-weight: 650; overflow: elide; horizontal-stretch: 1;
+                                            font-weight: 650; overflow: elide;
+                                            horizontal-stretch: 0; min-width: 0px;
                                             accessible-label: message.sender;
                                         }
                                         if !message-row.tight-header && message-row.show-time : Text {
                                             text: message.time; color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.muted; font-family: root.monospace-font-family;
                                             font-size: 10px * root.text-scale; vertical-alignment: center;
+                                            horizontal-stretch: 0;
+                                        }
+                                        // Keep author and time adjacent; the spare width follows
+                                        // them. Elided names may shrink before the reserved actions.
+                                        if !message-row.tight-header : Rectangle {
+                                            horizontal-stretch: 1; min-width: 0px;
                                         }
                                     }
                                     if message.reply-to != "" : Rectangle {
@@ -2479,6 +2523,29 @@ export component AppWindow inherits Window {
                         StyleNumberSetting { label: "Message font size"; value: root.message-font-size; minimum: 10; maximum: 32;
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
                             changed-value(value) => { root.change-style-number(0, value); } }
+                        Text { text: "Room header"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
+                        for name[index] in ["Full · room header and introduction", "Compact · room header and topic", "Minimal · room name and actions"] : ActionRect {
+                            height: 40px * root.text-scale;
+                            label: "Room header: " + name + (root.conversation-header-mode == index ? ", selected" : "");
+                            background: root.conversation-header-mode == index ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : self.has-hover ? root.hover : root.elevated;
+                            border-radius: StyleTokens.radius * 0.8;
+                            border-width: root.conversation-header-mode == index ? 1px : 0px;
+                            border-color: root.accent;
+                            focus-color: root.accent;
+                            activated => { root.choose-conversation-header-mode(index); }
+                            Text {
+                                x: 12px; width: parent.width - 24px; height: parent.height;
+                                text: name;
+                                color: root.conversation-header-mode == index && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink;
+                                font-size: 11px * root.text-scale;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                        }
+                        Text {
+                            text: "Room identity, room actions, call state and errors stay visible in every mode. The full topic remains in Room settings. Appearance starting points keep this choice.";
+                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                        }
                         Text { text: "Conversation style"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         for name[index] in ["Stacked · names above messages", "Compact · smaller names and avatars", "Columns · aligned timestamps and nicknames"] : ActionRect {
                             height: 40px * root.text-scale;
@@ -4732,6 +4799,13 @@ export component AppWindow inherits Window {
     }
 
     if root.show-sign-in : Rectangle {
+        in property <int> focus-request: root.account-focus-request;
+        init => {
+            if !root.manage-accounts-open && !root.access-open && root.saved-accounts.length == 0 { login-homeserver-input.focus(); }
+        }
+        changed focus-request => {
+            if !root.manage-accounts-open && !root.access-open && root.saved-accounts.length == 0 { login-homeserver-input.focus(); }
+        }
         background: root.rail;
         Rectangle {
             x: (parent.width - 448px) / 2;
@@ -4753,7 +4827,12 @@ export component AppWindow inherits Window {
                 }
                 Text { text: "Welcome to Morpheus"; color: root.ink; font-size: 22px * root.text-scale; font-weight: 770; }
                 Text { text: "Sign in with an existing Matrix account."; color: root.muted; font-size: 12px * root.text-scale; }
-                if root.saved-accounts.length > 0 : TextAction {
+                if root.saved-accounts.length > 0 : saved-account-trigger := TextAction {
+                    in property <int> focus-request: root.account-focus-request;
+                    init => { if !root.manage-accounts-open && !root.access-open { self.focus(); } }
+                    changed focus-request => {
+                        if root.show-sign-in && !root.manage-accounts-open && !root.access-open && root.saved-accounts.length > 0 { self.focus(); }
+                    }
                     text: "Choose a saved account"; ink: root.ink; muted: root.muted;
                     surface: root.panel; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
                     activated => { root.manage-accounts-open = true; root.manage-accounts(); }
@@ -4767,7 +4846,7 @@ export component AppWindow inherits Window {
                 Text { text: "HOMESERVER"; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
                 Rectangle {
                     height: 42px; background: root.elevated; border-radius: 8px; border-color: root.divider; border-width: 1px; clip: true;
-                    ThemedTextInput { x: 11px; width: parent.width - 22px; height: parent.height; text <=> root.login-homeserver; color: root.ink; font-size: 13px * root.text-scale; vertical-alignment: center; accessible-label: "Homeserver URL"; }
+                    login-homeserver-input := ThemedTextInput { x: 11px; width: parent.width - 22px; height: parent.height; text <=> root.login-homeserver; color: root.ink; font-size: 13px * root.text-scale; vertical-alignment: center; accessible-label: "Homeserver URL"; }
                 }
                 Text { text: "MATRIX ID OR USERNAME"; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
                 Rectangle {
@@ -4910,8 +4989,12 @@ export component AppWindow inherits Window {
     }
     } // shortcut-scope
     if root.manage-accounts-open : FocusScope {
+        in property <int> focus-request: root.account-focus-request;
         focus-on-tab-navigation: false;
-        init => { manage-close.focus(); }
+        init => { if !root.access-open { manage-close.focus(); } }
+        changed focus-request => {
+            if root.manage-accounts-open && !root.access-open { manage-close.focus(); }
+        }
         capture-key-pressed(event) => {
             if event.text == Key.Escape { root.manage-accounts-open = false; accept }
             else if event.text == Key.Tab && !event.modifiers.shift && manage-close.has-focus { manage-add.focus(); accept }

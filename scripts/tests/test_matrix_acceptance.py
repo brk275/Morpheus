@@ -338,6 +338,86 @@ class FixtureAbsenceTests(unittest.TestCase):
                 self.assertNotIn("private", visible.getvalue() + str(caught.exception))
 
 
+class NativeProcessDiagnosticTests(unittest.TestCase):
+    def test_exit_facts_are_bounded_and_timeout_is_not_reported_as_a_kill(self):
+        for code, expected in ((0, ("exited", "exit_code", 0)),
+                               (101, ("exited", "exit_code", 101)),
+                               (255, ("exited", "exit_code", 255)),
+                               (-9, ("signalled", "signal", 9)),
+                               (-64, ("signalled", "signal", 64))):
+            result = acceptance_module.native_process_diagnostics("private", code, False)
+            self.assertEqual(result["result"], expected[0])
+            self.assertEqual(result[expected[1]], expected[2])
+            self.assertNotIn("private", json.dumps(result))
+        for code in (None, True, "101", 1.5, 256, -65):
+            result = acceptance_module.native_process_diagnostics("", code, False)
+            self.assertEqual(result["result"], "unknown")
+            self.assertNotIn("signal", result)
+            self.assertNotIn("exit_code", result)
+        result = acceptance_module.native_process_diagnostics("", -9, True)
+        self.assertEqual(result["result"], "deadline")
+        self.assertNotIn("signal", result)
+
+    def test_known_panic_families_never_publish_private_source_or_message(self):
+        for source, family in (
+                ("crates/morpheus-matrix/src/lib.rs:42:7:", "morpheus"),
+                ("/home/runner/.cargo/git/checkouts/matrix-rust-sdk-123abc/c6ad52e/crates/matrix-sdk-ui/src/timeline/mod.rs:42:7:", "matrix_sdk"),
+                ("/home/runner/.cargo/registry/src/index.crates.io-123abc/rusqlite-0.38.0/src/lib.rs:42:7:", "sqlite"),
+                ("/private/opaque-key/src/lib.rs:42:7:", "other"),
+                ("https://private.example/token:42:7:", "other")):
+            output = f"thread 'worker' (123) panicked at {source}\nprivate-server-response\nassertion `left == right` failed\n"
+            result = acceptance_module.native_process_diagnostics(output, 101, False)
+            self.assertTrue(result["panic_observed"])
+            self.assertTrue(result["assertion_observed"])
+            self.assertEqual(result["panic_family"], family)
+            for withheld in (source, "private", "worker"):
+                self.assertNotIn(withheld, json.dumps(result))
+        result = acceptance_module.native_process_diagnostics("server quoted panicked at private\n", 1, False)
+        self.assertFalse(result["panic_observed"])
+        self.assertNotIn("panic_family", result)
+
+    def test_stack_overflow_and_cargo_signals_use_only_fixed_codes(self):
+        output = ("thread 'private-thread' has overflowed its stack\n"
+                  "fatal runtime error: stack overflow, aborting\n"
+                  "  process didn't exit successfully: `/private/command --password private` (signal: 6, SIGABRT: process abort signal)\n")
+        result = acceptance_module.native_process_diagnostics(output, 101, False)
+        self.assertTrue(result["stack_overflow"])
+        self.assertEqual((result["test_signal"], result["test_signal_name"]), (6, "SIGABRT"))
+        self.assertNotIn("private", json.dumps(result))
+        for suffix in ("signal: 9, SIGABRT: contradictory", "signal: 99, SIGPRIVATE", "signal: 6, private"):
+            result = acceptance_module.native_process_diagnostics(
+                "  process didn't exit successfully: private (" + suffix + ")\n", 101, False)
+            self.assertNotIn("test_signal", result)
+            self.assertNotIn("test_signal_name", result)
+
+    def test_contained_diagnostics_retain_observed_status_before_cleanup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            runner.containment_verified = True
+            process = Mock(returncode=None)
+            visible = io.StringIO()
+            output = "running 1 test\nMORPHEUS_LIVE_STAGE fixture\nMORPHEUS_LIVE_STAGE encrypted_restart_message\nprivate-server-response\n"
+            def start(_args, **kwargs):
+                kwargs["stdout"].write(output.encode())
+                return process
+            def cleanup(child):
+                # The observed pre-cleanup status is the diagnostic authority.
+                child.returncode = -9
+            with (patch.object(acceptance_module, "namespace_command", return_value=["owned"]),
+                  patch.object(acceptance_module.subprocess, "Popen", side_effect=start),
+                  patch.object(acceptance_module, "wait_owned", return_value=101),
+                  patch.object(acceptance_module, "stop_owned", side_effect=cleanup),
+                  patch.object(acceptance_module.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)),
+                  contextlib.redirect_stdout(visible),
+                  self.assertRaises(acceptance_module.CheckFailure)):
+                runner.run("live_local", ["mock-test"], test=True, pid_namespace=True)
+            records = [json.loads(line) for line in visible.getvalue().splitlines() if line.startswith("{")]
+            self.assertEqual(records[0]["native_process"]["exit_code"], 101)
+            self.assertNotIn("signal", records[0]["native_process"])
+            self.assertEqual(records[0]["live_diagnostics"]["stage"], "encrypted_restart_message")
+            self.assertNotIn("private-server", visible.getvalue())
+
+
 class LiveStageTests(unittest.TestCase):
     def test_stalls_and_fixed_stages_never_reflect_unknown_values(self):
         self.assertEqual(acceptance_module.live_diagnostics("private compiler diagnostic\n"),
@@ -570,6 +650,28 @@ class LiveEvidenceTests(unittest.TestCase):
         self.assertEqual(oauth_diagnostics(output), {"stage": "login_finish", "failure": "rust_acceptance"})
         self.assertEqual(oauth_diagnostics("MORPHEUS_OAUTH_STAGE password_value\n"
                                            "MORPHEUS_OAUTH_FAILURE https://example.org/private"), {})
+
+    def test_incoming_discovery_counters_are_bounded_and_never_relay_unknown_values(self):
+        for name in acceptance_module.INCOMING_DIAGNOSTICS:
+            output = f"MORPHEUS_INCOMING_DIAGNOSTIC {name}=65535\nMORPHEUS_INCOMING_DIAGNOSTIC {name}=0"
+            self.assertEqual(acceptance_module.incoming_diagnostics(output), {
+                "checks": {}, "discovery": {name: 65535},
+            })
+        for line in ("worker_candidate_queued=-1", "worker_candidate_queued=65536",
+                     "worker_candidate_queued=999999", "worker_candidate_queued=01",
+                     "worker_candidate_queued=1 private-token", "private_account=1",
+                     "worker_candidate_queued=private-token"):
+            result = acceptance_module.incoming_diagnostics("MORPHEUS_INCOMING_DIAGNOSTIC " + line)
+            self.assertEqual(result, {"checks": {}, "malformed": True})
+            self.assertNotIn("private", json.dumps(result))
+
+    def test_incoming_discovery_counter_names_match_fixed_rust_sources(self):
+        repo = Path(__file__).resolve().parents[2]
+        counters = (repo / "crates/morpheus-app/src/incoming_ring/worker/diagnostics.rs").read_text()
+        fixtures = (repo / "crates/morpheus-app/src/outgoing_ring/live_tests/actor_tests.rs").read_text()
+        names = set(re.findall(r'"(worker_[a-z_]+)"', counters))
+        names.update(re.findall(r'"(fresh_(?:before|after)_[a-z_]+)"', fixtures))
+        self.assertEqual(names, acceptance_module.INCOMING_DIAGNOSTICS)
 
     def test_browser_diagnostics_are_preserved_through_all_three_allowlists(self):
         import local_matrix_auth

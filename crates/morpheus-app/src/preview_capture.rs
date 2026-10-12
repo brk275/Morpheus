@@ -14,19 +14,23 @@ use std::{
     time::Duration,
 };
 
-use morpheus_config::BuiltInStylePreset;
+use morpheus_config::{BuiltInStylePreset, ConversationHeaderMode};
 use slint::ComponentHandle;
 
 use super::{AppWindow, Config, apply_config, apply_state, fixtures};
 
 const WIDTH: u32 = 1440;
 const HEIGHT: u32 = 900;
-const FILES: [&str; 5] = [
+const FILES: [&str; 9] = [
     "desktop-preview.ppm",
     "account-switcher.ppm",
     "sign-in.ppm",
     "incoming-call.ppm",
     "room-settings.ppm",
+    "paper-preview.ppm",
+    "manage-accounts.ppm",
+    "account-password.ppm",
+    "account-password-large.ppm",
 ];
 
 pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
@@ -49,7 +53,12 @@ pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
     let nocturne_theme = BuiltInStylePreset::Nocturne.theme()?;
     let mut terminal = Config::default();
     terminal.apply_style_preset(BuiltInStylePreset::Terminal);
+    terminal.conversation.header = ConversationHeaderMode::Minimal;
     let terminal_theme = BuiltInStylePreset::Terminal.theme()?;
+    let mut paper = Config::default();
+    paper.apply_style_preset(BuiltInStylePreset::Paper);
+    paper.conversation.header = ConversationHeaderMode::Compact;
+    let paper_theme = BuiltInStylePreset::Paper.theme()?;
     apply_config(&ui, &nocturne, Some(&nocturne_theme));
     apply_state(&ui, &fixtures());
     ui.set_native_call_enabled(cfg!(feature = "native-calls"));
@@ -142,6 +151,53 @@ pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
                         "Only invited people can join.".into(),
                     );
                     window.set_room_admin_open(true);
+                }
+                4 => {
+                    window.set_room_admin_open(false);
+                    window.set_live_session(false);
+                    apply_config(&window, &paper, Some(&paper_theme));
+                }
+                5 => {
+                    apply_config(&window, &nocturne, Some(&nocturne_theme));
+                    // Presentation only: these IDs never enter AccountManager.
+                    window.set_saved_accounts(slint::ModelRc::new(slint::VecModel::from(vec![
+                        super::SavedAccountItem {
+                            id: "preview-casey".into(),
+                            handle: "@casey:example.org".into(),
+                            active: true,
+                            removal_pending: false,
+                        },
+                        super::SavedAccountItem {
+                            id: "preview-personal".into(),
+                            handle: "@river:example.net".into(),
+                            active: false,
+                            removal_pending: false,
+                        },
+                        super::SavedAccountItem {
+                            id: "preview-community".into(),
+                            handle: "@workshop:example.org".into(),
+                            active: false,
+                            removal_pending: true,
+                        },
+                    ])));
+                    window.set_app_password_enabled(true);
+                    window.set_account_access_notice("".into());
+                    window.set_manage_accounts_open(true);
+                }
+                6 => {
+                    // Real dialog layout, with empty password properties and
+                    // no callbacks capable of touching credentials or policy.
+                    window.set_access_mode(2);
+                    window.set_access_target("".into());
+                    window.set_access_current_password("".into());
+                    window.set_access_new_password("".into());
+                    window.set_access_confirm_password("".into());
+                    window.set_access_error("".into());
+                    window.set_access_busy(false);
+                    window.set_access_open(true);
+                }
+                7 => {
+                    window.set_font_scale_percent(200);
                 }
                 _ => {
                     *captured.borrow_mut() = Some(Ok(()));

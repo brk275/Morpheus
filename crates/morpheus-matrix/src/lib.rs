@@ -2206,6 +2206,25 @@ impl AccountManager {
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
     }
 
+    /// Pause the selected account's sync and send queue while retaining its
+    /// client, cached data, and refresh-token persistence. This does not close
+    /// or lock the account, revoke its selection, or remove credentials.
+    /// Re-select the active account to resume. Use `stop` for manager shutdown.
+    pub async fn pause_active_sync_for(&self, selection: &AccountSelection) -> Result<()> {
+        let mut state = self.state.lock().await;
+        let current = self
+            .account_selection(selection.account_id())
+            .ok_or(MatrixCoreError::SelectedAccountChanged)?;
+        if !selection.same_epoch(&current) {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        account_access::ensure_eligible(&state, selection.account_id())?;
+        selected_loaded_for(&state, selection.account_id())?;
+        stop_sync(&mut state).await;
+        self.sync_tx.send_replace(SyncStatus::Stopped);
+        Ok(())
+    }
+
     pub async fn stop(&self) {
         let mut state = self.state.lock().await;
         self.selections.replace(None);

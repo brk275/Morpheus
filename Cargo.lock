@@ -6133,6 +6133,7 @@ dependencies = [
  "directories",
  "emojis",
  "futures-util",
+ "i-slint-backend-testing",
  "image",
  "libc",
  "matrix-sdk",

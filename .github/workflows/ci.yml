@@ -35,17 +35,19 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          path: candidate
           fetch-depth: 0
           persist-credentials: false
-      - name: Check scope and packaging helpers
-        run: |
-          python3 -m unittest discover -s scripts/tests -v
-          python3 -m unittest discover -s scripts -p 'test_*.py' -v
-          python3 -m compileall -q scripts
-          node --check scripts/element_call_peer.mjs
-          node --check scripts/element_call_stock_peer.mjs
-          python3 scripts/package.py --check
+      - name: Check out reviewed validation inputs
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # PR input is read as data; classification code comes from its base.
+          # Push uses reviewed main; dispatch uses its owner-selected revision.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
+          path: trusted
+          persist-credentials: false
       - name: Scan committed history for credentials
+        working-directory: candidate
         shell: bash
         run: |
           set -euo pipefail
@@ -56,14 +58,43 @@ jobs:
           echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
           mkdir "$RUNNER_TEMP/gitleaks"
           tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
-          "$RUNNER_TEMP/gitleaks/gitleaks" git --redact=100 --ignore-gitleaks-allow --no-banner --log-opts=--all .
-      - name: Select checks from changed inputs
+          # Never honor candidate-provided rules or suppression files. No
+          # candidate code has executed on this runner before scanning.
+          printf '[extend]\nuseDefault = true\n' > "$RUNNER_TEMP/morpheus-gitleaks-default.toml"
+          : > "$RUNNER_TEMP/morpheus-gitleaks-empty.ignore"
+          "$RUNNER_TEMP/gitleaks/gitleaks" git --redact=100 --ignore-gitleaks-allow --no-banner \
+            --config "$RUNNER_TEMP/morpheus-gitleaks-default.toml" \
+            --gitleaks-ignore-path "$RUNNER_TEMP/morpheus-gitleaks-empty.ignore" \
+            --log-opts=--all .
+      - name: Select checks from changed inputs using reviewed classifier
         id: scope
-        run: python3 scripts/ci_scope.py --github-event
+        working-directory: candidate
+        # Isolated mode excludes the candidate working directory and Python
+        # environment hooks from import lookup. The classifier uses stdlib only.
+        run: python3 -I ../trusted/scripts/ci_scope.py --github-event
+
+  helpers:
+    name: Validation helper tests
+    needs: scope
+    if: github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Check scope and packaging helpers
+        run: |
+          python3 -m unittest discover -s scripts/tests -v
+          python3 -m unittest discover -s scripts -p 'test_*.py' -v
+          python3 -m compileall -q scripts
+          node --check scripts/element_call_peer.mjs
+          node --check scripts/element_call_stock_peer.mjs
+          python3 scripts/package.py --check
 
   config:
     name: Theme configuration tests
-    needs: scope
+    needs: [scope, helpers]
     if: github.event.repository.private == false && needs.scope.outputs.config == 'true'
     runs-on: ubuntu-24.04
     concurrency:
@@ -84,7 +115,7 @@ jobs:
 
   compile:
     name: Check and test (${{ matrix.os }})
-    needs: scope
+    needs: [scope, helpers]
     if: github.event.repository.private == false && needs.scope.outputs.native == 'true'
     runs-on: ${{ matrix.os }}
     concurrency:
@@ -186,6 +217,10 @@ jobs:
             ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/sign-in.png
             ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/incoming-call.png
             ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/room-settings.png
+            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/paper-preview.png
+            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/manage-accounts.png
+            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/account-password.png
+            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/account-password-large.png
             ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/provenance.json
           if-no-files-found: error
           retention-days: 1
@@ -269,3 +304,71 @@ jobs:
         run: |
           echo "Protocol model, native preview, desktop controller, native capture, SDK receipt, or vendor regression tests failed; this candidate is not verified."
           exit 1
+
+  acceptance:
+    name: CI acceptance
+    needs: [scope, helpers, config, compile]
+    # Run after failed/skipped dependencies too. A selected check may never
+    # disappear behind a skipped aggregate that branch protection accepts.
+    if: always() && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    permissions: {}
+    timeout-minutes: 2
+    steps:
+      # No checkout, dependency/cache restore, artifacts, or submitted code.
+      # This combines job conclusions; source/workflow review remains required.
+      - name: Require every selected check to succeed
+        env:
+          CHECK_RESULTS: ${{ toJSON(needs) }}
+        shell: bash
+        run: |
+          python3 - <<'PY_ACCEPTANCE'
+          import json
+          import os
+          import sys
+
+          def acceptance_error(needs):
+              if not isinstance(needs, dict) or set(needs) != {"scope", "helpers", "config", "compile"}:
+                  return "Missing dependency conclusions."
+              if any(not isinstance(value, dict) for value in needs.values()):
+                  return "Malformed dependency conclusions."
+              if needs["scope"].get("result") != "success":
+                  return "Security and change scope did not succeed."
+              if needs["helpers"].get("result") != "success":
+                  return "Validation helper tests did not succeed."
+              outputs = needs["scope"].get("outputs")
+              if not isinstance(outputs, dict):
+                  return "Scope outputs are missing."
+              native, config = outputs.get("native"), outputs.get("config")
+              if native not in ("true", "false") or config not in ("true", "false"):
+                  return "Scope flags are missing or malformed."
+              if native == config == "true":
+                  return "Native checks already include configuration tests."
+              try:
+                  matrix = json.loads(outputs.get("native_matrix", ""))
+              except (TypeError, ValueError):
+                  return "Native matrix is missing or malformed."
+              if not isinstance(matrix, dict) or set(matrix) != {"os"}:
+                  return "Native matrix must contain only standard operating systems."
+              platforms = matrix["os"]
+              allowed = {"macos-15", "macos-15-intel", "ubuntu-24.04", "windows-2025"}
+              if (not isinstance(platforms, list)
+                      or any(not isinstance(item, str) or item not in allowed for item in platforms)
+                      or len(platforms) != len(set(platforms))
+                      or bool(platforms) != (native == "true")):
+                  return "Native matrix disagrees with the selected standard checks."
+              for job, selected in (("config", config), ("compile", native)):
+                  expected = "success" if selected == "true" else "skipped"
+                  if needs[job].get("result") != expected:
+                      return "A selected check failed, was cancelled, or did not run."
+              return None
+
+          try:
+              error = acceptance_error(json.loads(os.environ["CHECK_RESULTS"]))
+          except (KeyError, ValueError):
+              error = "Dependency conclusions are missing or malformed."
+          if error:
+              print(error, file=sys.stderr)
+              raise SystemExit(1)
+          print("Security checks and every selected validation job succeeded.")
+          PY_ACCEPTANCE

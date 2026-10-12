@@ -918,7 +918,6 @@ fn apply_config(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
     ui.set_room_list_width(config.layout.room_list_width.into());
     ui.set_details_width(config.layout.details_width.into());
     ui.set_show_side_panel(config.layout.show_member_panel);
-    ui.set_ui_font_family(config.appearance.font_family.as_str().into());
     if let Some(theme) = theme {
         let colors = &theme.colors;
         ui.set_custom_rail(color_from_hex(&colors.rail));

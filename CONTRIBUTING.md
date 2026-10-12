@@ -31,3 +31,17 @@ Report vulnerabilities through the private channel in [SECURITY.md](SECURITY.md)
 Public pull-request workflows require maintainer approval for outside
 contributors and receive no signing credentials. CI results do not authorize
 installer publication or bypass the release checklist.
+
+## Security review of contributions
+
+Every externally submitted change, including dependency-bot updates, receives source
+review before its code is executed. Include the reason for the change, affected trust
+boundaries, dependency/build-hook changes, tests and remaining limitations. Keep each
+pull request focused and retain provenance for generated or vendored material.
+
+Maintainers review the exact revision, workflows and dependency changes before
+approving hosted checks. Submitted scripts, build hooks and binaries are not run on
+the owner's computer. New commits require review of the new diff and affected test
+evidence. Passing tests or a clean scanner result alone does not authorize a merge.
+The detailed maintainer procedure is in [AGENTS.md](AGENTS.md#review-externally-submitted-code-before-execution).
+Do not post exploit details or secrets in a pull request; use [SECURITY.md](SECURITY.md).

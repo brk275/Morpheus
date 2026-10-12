@@ -345,6 +345,25 @@ impl ActorAcceptance {
         bob_room: &Room,
     ) -> Result<OfferPresentation, ()> {
         check(self.receipt.is_none())?;
+        let diagnostics_before = self.worker.handle().diagnostics();
+        let ready_idle = self.calls.status() == CallStatus::Idle;
+        let ready_selected = self
+            .manager
+            .account_selection(&self.account.id)
+            .is_some_and(|s| s.is_current());
+        let ready_sync = matches!(
+            *self.manager.subscribe_sync_status().borrow(),
+            SyncStatus::Running {
+                backend: SyncBackend::SlidingSticky
+            }
+        );
+        let ready_caller_only = rtc.participants(&info.room_id).is_ok_and(|roster| {
+            roster.len() == 1
+                && roster[0].is_local
+                && roster[0].user_id == caller.user_id
+                && roster[0].device_id.as_deref() == Some(caller.device_id.as_str())
+                && roster[0].member_id == info.membership_id
+        });
         let selection = alice.account_selection(&caller.id).ok_or(())?;
         let active = AtomicU64::new(1);
         let stop = CaptureStop::default();
@@ -362,7 +381,36 @@ impl ActorAcceptance {
             }
         };
         self.receipt = Some(receipt);
-        let row = wait_offer(&self.worker.handle(), &self.account, caller, case).await?;
+        let row = match wait_offer(&self.worker.handle(), &self.account, caller, case).await {
+            Ok(row) => row,
+            Err(()) => {
+                self.worker
+                    .handle()
+                    .diagnostics()
+                    .emit_since(&diagnostics_before);
+                let snapshot = bob_room.sticky_events().keyless_live();
+                let retained = self.receipt.as_ref().is_some_and(|receipt| {
+                    snapshot
+                        .events
+                        .iter()
+                        .any(|event| event.event_id == receipt.event_id)
+                });
+                for (name, present) in [
+                    ("fresh_before_idle", ready_idle),
+                    ("fresh_before_selected", ready_selected),
+                    ("fresh_before_sync", ready_sync),
+                    ("fresh_before_caller_only", ready_caller_only),
+                    ("fresh_after_receipt_retained", retained),
+                    ("fresh_after_receipt_cache_current", !snapshot.invalidated),
+                ] {
+                    eprintln!(
+                        "\nMORPHEUS_INCOMING_DIAGNOSTIC {name}={}",
+                        u32::from(present)
+                    );
+                }
+                return Err(());
+            }
+        };
         check(
             self.first_key
                 .as_ref()

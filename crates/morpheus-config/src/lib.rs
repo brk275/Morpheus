@@ -42,6 +42,7 @@ pub struct Config {
     pub typography: Typography,
     pub geometry: Geometry,
     pub chat: ChatStyle,
+    pub conversation: Conversation,
     pub layout: Layout,
     pub notifications: Notifications,
     pub media: Media,
@@ -58,6 +59,7 @@ impl Default for Config {
             typography: Typography::default(),
             geometry: Geometry::default(),
             chat: ChatStyle::default(),
+            conversation: Conversation::default(),
             layout: Layout::default(),
             notifications: Notifications::default(),
             media: Media::default(),
@@ -528,6 +530,25 @@ impl ChatStyle {
     fn validate(&self) -> Result<(), ConfigError> {
         validate_range("chat.nickname_width", self.nickname_width, 64, 240)
     }
+}
+
+/// Room-header presentation; status, calls and room actions remain visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationHeaderMode {
+    /// Preserve the existing room header and introductory welcome/topic block.
+    #[default]
+    Full,
+    /// Keep the room header and its topic, without the introductory block.
+    Compact,
+    /// Keep room identity and actions; omit topic and introductory decoration.
+    Minimal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Conversation {
+    pub header: ConversationHeaderMode,
 }
 
 fn validate_range(name: &str, value: u16, minimum: u16, maximum: u16) -> Result<(), ConfigError> {
@@ -2218,5 +2239,83 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn room_header_defaults_and_modes_are_schema_one_compatible() {
+        for source in ["schema_version = 1", "[conversation]"] {
+            let config: Config = toml::from_str(source).unwrap();
+            assert_eq!(config.conversation.header, ConversationHeaderMode::Full);
+        }
+        for (value, expected) in [
+            ("full", ConversationHeaderMode::Full),
+            ("compact", ConversationHeaderMode::Compact),
+            ("minimal", ConversationHeaderMode::Minimal),
+        ] {
+            let source = format!("[conversation]\nheader = '{value}'\n");
+            let config: Config = toml::from_str(&source).unwrap();
+            config.validate().unwrap();
+            assert_eq!(config.conversation.header, expected);
+            let encoded = toml::to_string_pretty(&config).unwrap();
+            assert_eq!(toml::from_str::<Config>(&encoded).unwrap(), config);
+        }
+        for source in [
+            "[conversation]\nheader = 'hidden'\n",
+            "[conversation]\nheader = 'Compact'\n",
+            "[conversation]\nheader = 1\n",
+            "[conversation]\nheadre = 'compact'\n",
+        ] {
+            assert!(
+                toml::from_str::<Config>(source).is_err(),
+                "accepted {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn appearance_presets_preserve_independent_room_header_choice() {
+        let mut config = Config::default();
+        config.conversation.header = ConversationHeaderMode::Minimal;
+        for preset in BuiltInStylePreset::ALL {
+            config.apply_style_preset(preset);
+            assert_eq!(config.conversation.header, ConversationHeaderMode::Minimal);
+        }
+    }
+
+    #[test]
+    fn room_header_watcher_reports_invalid_edit_and_recovers() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let mut config = Config::default();
+        config.conversation.header = ConversationHeaderMode::Compact;
+        store.save(&config).unwrap();
+        let updates = store.watch_with_theme(Duration::from_millis(10));
+        assert_eq!(
+            updates
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap()
+                .config
+                .conversation
+                .header,
+            ConversationHeaderMode::Compact
+        );
+        fs::write(store.path(), "[conversation]\nheader = 'hidden'\n").unwrap();
+        assert!(matches!(
+            updates.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Err(ConfigError::Decode(_))
+        ));
+        config.conversation.header = ConversationHeaderMode::Minimal;
+        store.save(&config).unwrap();
+        assert_eq!(
+            updates
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap()
+                .config
+                .conversation
+                .header,
+            ConversationHeaderMode::Minimal
+        );
     }
 }

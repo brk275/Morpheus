@@ -15,7 +15,8 @@ customization.
 - **Optional local switch password and direct account removal.** The new
   [account controls](docs/ACCOUNT_ACCESS.md) use one app password for protected
   switches and startup restore. Remove any saved account without opening it;
-  incomplete cleanup stays visible for retry. Native verification is pending.
+  incomplete cleanup stays visible for retry. Core regressions pass on all four
+  targets; real-vault and interactive acceptance remain open.
 
 Each alias remains a normal Matrix account with its own homeserver identity.
 
@@ -49,8 +50,8 @@ The composer includes explicit mention selection, typed Plain/Markdown drafts,
 mention-aware replies, threads and edits, and a searchable emoji picker. The
 new [Unicode catalog](docs/EMOJI_CATALOG.md) expands its 44 starter choices to
 3,944 canonical entries, including skin-tone combinations, with offline name,
-shortcode and glyph search. This expansion is source-reviewed; its native tests,
-performance and platform font behavior are not yet verified. The prior composer
+shortcode and glyph search. Its native regressions passed on all four targets
+at `65b4ceb`; performance and platform font behavior remain unverified. The prior composer
 and starter-picker guards passed on all four platforms at `c02a1b7`. Expanded
 encrypted formatting and typed-draft fixtures also passed in Linux at that
 revision. Keyboard, IME and accessibility acceptance remain open.
@@ -64,12 +65,12 @@ and video previews are not supported. See [image preview limits](docs/IMAGE_PREV
 
 A [room-settings extension](docs/ROOM_SETTINGS.md) adds guarded name/topic,
 avatar and join-rule controls.
-At `6abdfb7`, all four native builds passed; its live room-settings fixture
-failed at a topic update. Incoming Answer/Dismiss passed three of four hosted
-controller cases; the remaining Current DM case timed out during account
-revocation. Narrow diagnostics are added for the next run. Native
-[incoming-call sound](docs/INCOMING_CALLS.md) is source-reviewed and awaits
-native tests and device acceptance; protocol Decline remains unimplemented.
+At `65b4ceb`, all four native builds and unit suites passed. Linux live checks
+still failed on encrypted restart, a rate-limited topic write, OAuth refresh
+persistence, and a fresh incoming-offer timeout before account switching.
+See [the verification record](docs/VERIFICATION.md) for the exact results.
+Native [incoming-call sound](docs/INCOMING_CALLS.md) passed its automated guards;
+audible output and device acceptance remain open. Protocol Decline is unimplemented.
 
 ![Morpheus native desktop preview with fictional accounts](docs/screenshots/desktop.png)
 
@@ -82,11 +83,13 @@ Morpheus is growing a TOML-driven style system that changes more than colors.
 The first expansion adds independent interface/message/monospace fonts,
 message size, spacing, corners, rail and pane widths, optional avatars and
 timestamps, and stacked, compact or aligned nickname-column layouts.
+Full, compact and minimal room headers can be selected independently.
 Theme files also expose status, selection, focus, link, unread and voice colors,
 plus a separate palette for sender names.
 **Nocturne, Terminal and Paper** are editable starting points. In-app controls
 and live TOML reload use the same preferences; invalid edits keep the last valid
-style. This expansion awaits native visual verification. A theme editor and
+style. Native Nocturne and Terminal captures have been reviewed; follow-up
+font and layout refinements still require new capture verification. A theme editor and
 more layout controls remain in development; Halloy-level breadth is the
 target, not a completed claim. See [customization](docs/CUSTOMIZATION.md).
 

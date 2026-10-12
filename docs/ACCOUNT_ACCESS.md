@@ -54,9 +54,16 @@ unlock existing accounts.
 
 ## Verification status
 
-At `cab6c91`, all 15 core password/removal regressions passed on the four
-supported runner targets. The desktop checks stopped at Slint compilation,
-so the native controls, real credential-vault/restart checks and interactive
-keyboard/screen-reader acceptance remain unverified. The follow-up lifecycle
-repairs also require hosted regression execution. These model tests are not
-beta acceptance. See [verification](VERIFICATION.md).
+At `65b4ceb` ([run 38240049732](https://github.com/brk275/Morpheus/actions/runs/38240049732)),
+all four supported runner targets passed native builds, 16 core password/removal
+regressions, the notification-client lifetime regression and two account
+presentation/detach regressions. The unit account tests use an isolated mock
+vault; they do not prove real credential-vault behavior.
+
+Linux live acceptance stopped at `encrypted_restart` before the protected
+account sequence. OAuth login/refresh also failed at `vault_persist`, and its
+restore phase did not run. Real-vault protected switching/removal/restart,
+interactive dialogs, keyboard/screen-reader checks and installed-app acceptance
+remain open. Follow-up focus and real-Slint harness changes are separate,
+unverified inputs. These results are not beta acceptance. See
+[verification](VERIFICATION.md).

@@ -511,8 +511,9 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
             .expect("Cannot restore peer Matrix session")
             .expect("Saved peer account missing");
         assert_eq!(peer_active.id, bob.id);
-        phase!(encrypted_restart);
+        phase!(encrypted_restart_room);
         wait_for_room(&peer_restored, encrypted_room).await;
+        phase!(encrypted_restart_message);
         wait_for_message(&peer_restored, encrypted_room, &edited_body).await;
 
         phase!(logout_bob);

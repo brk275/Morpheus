@@ -1,6 +1,9 @@
 //! Declarative appearance bridge shared by live sessions and offline previews.
 
-use morpheus_config::{BuiltInStylePreset, Config, ConfigStore, MessageLayout, ThemePack};
+use morpheus_config::{
+    BuiltInStylePreset, Config, ConfigStore, ConversationHeaderMode, MessageLayout, ThemePack,
+};
+use slint::fontique_011::fontique;
 use slint::{ComponentHandle, ModelRc, VecModel};
 
 use super::{AppWindow, ColorRole, StyleTokens, ThemeRoleSet, color_from_hex, save_config_change};
@@ -65,9 +68,61 @@ pub(super) fn sender_palette_index(sender: &str) -> i32 {
     (hash & 0x7fff_ffff) as i32
 }
 
+/// Slint 1.18.1 treats font-family strings as named families, including generic
+/// words. Resolve our documented generic names through the renderer's own
+/// system-font collection before assigning them to Text, StyledText and inputs.
+/// This runs on the UI thread after AppWindow creation. No fonts are downloaded
+/// or registered, and the user's portable config string is never rewritten.
+fn display_font_family(requested: &str) -> slint::SharedString {
+    font_family_with_resolver(requested, |generic| {
+        let mut collection = slint::fontique_011::shared_collection();
+        let mut sources = fontique::SourceCache::default();
+        let family_id = {
+            let mut query = collection.query(&mut sources);
+            query.set_families([fontique::QueryFamily::Generic(generic)]);
+            let mut family_id = None;
+            query.matches_with(|font| {
+                family_id = Some(font.family.0);
+                fontique::QueryStatus::Stop
+            });
+            family_id
+        }?;
+        collection.family_name(family_id).map(str::to_owned)
+    })
+    .into()
+}
+
+fn font_family_with_resolver(
+    requested: &str,
+    resolve: impl FnOnce(fontique::GenericFamily) -> Option<String>,
+) -> String {
+    let generic = match requested.trim().to_ascii_lowercase().as_str() {
+        "monospace" => fontique::GenericFamily::Monospace,
+        "serif" => fontique::GenericFamily::Serif,
+        "sans-serif" => fontique::GenericFamily::SansSerif,
+        // Named custom families pass through unchanged, even if not installed.
+        _ => return requested.to_owned(),
+    };
+    // Preserve the existing renderer fallback if the OS has no usable match.
+    // Do not cache misses: a later config/preset projection always resolves anew.
+    resolve(generic)
+        .filter(|family| !family.trim().is_empty())
+        .unwrap_or_else(|| requested.to_owned())
+}
+
 pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
-    ui.set_message_font_family(config.typography.message_family(&config.appearance).into());
-    ui.set_monospace_font_family(config.typography.monospace_font_family.as_str().into());
+    ui.set_conversation_header_mode(match config.conversation.header {
+        ConversationHeaderMode::Full => 0,
+        ConversationHeaderMode::Compact => 1,
+        ConversationHeaderMode::Minimal => 2,
+    });
+    ui.set_ui_font_family(display_font_family(&config.appearance.font_family));
+    ui.set_message_font_family(display_font_family(
+        config.typography.message_family(&config.appearance),
+    ));
+    ui.set_monospace_font_family(display_font_family(
+        &config.typography.monospace_font_family,
+    ));
     ui.set_message_font_size(config.typography.message_size.into());
     ui.set_corner_radius_px(config.geometry.corner_radius.into());
     ui.set_message_gap_px(config.geometry.message_gap.into());
@@ -97,6 +152,22 @@ pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
 }
 
 pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
+    let weak = ui.as_weak();
+    let store_for_header = store.clone();
+    ui.on_choose_conversation_header_mode(move |index| {
+        let header = match index {
+            0 => ConversationHeaderMode::Full,
+            1 => ConversationHeaderMode::Compact,
+            2 => ConversationHeaderMode::Minimal,
+            _ => return,
+        };
+        if let Some(ui) = weak.upgrade() {
+            let _ = save_config_change(&ui, &store_for_header, |config| {
+                config.conversation.header = header;
+            });
+        }
+    });
+
     let weak = ui.as_weak();
     let store_for_preset = store.clone();
     ui.on_choose_style_preset(move |index| {
@@ -251,5 +322,60 @@ mod theme_tests {
                 assert!((0..length).contains(&selected));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod font_tests {
+    use super::*;
+
+    #[test]
+    fn generic_font_projection_uses_system_generic_categories() {
+        for (requested, expected) in [
+            ("monospace", fontique::GenericFamily::Monospace),
+            ("SERIF", fontique::GenericFamily::Serif),
+            (" sans-serif ", fontique::GenericFamily::SansSerif),
+        ] {
+            assert_eq!(
+                font_family_with_resolver(requested, |generic| {
+                    assert_eq!(generic, expected);
+                    Some("Installed font family".to_owned())
+                }),
+                "Installed font family"
+            );
+        }
+    }
+
+    #[test]
+    fn named_fonts_bypass_generic_lookup_and_empty_matches_keep_fallback() {
+        for requested in ["Inter", "Monospace Custom", "Noto Sans 日本語", "system-ui"] {
+            assert_eq!(
+                font_family_with_resolver(requested, |_| panic!("named font must pass through")),
+                requested
+            );
+        }
+        for unavailable in [None, Some(String::new()), Some("  ".to_owned())] {
+            assert_eq!(
+                font_family_with_resolver("monospace", |_| unavailable),
+                "monospace"
+            );
+        }
+    }
+
+    #[test]
+    fn live_font_projection_does_not_retain_previous_generic_or_custom_choice() {
+        assert_eq!(
+            font_family_with_resolver("monospace", |_| Some("Fixed font".to_owned())),
+            "Fixed font"
+        );
+        assert_eq!(font_family_with_resolver("serif", |_| None), "serif");
+        assert_eq!(
+            font_family_with_resolver("Custom Font", |_| panic!("custom family")),
+            "Custom Font"
+        );
+        assert_eq!(
+            font_family_with_resolver("monospace", |_| Some("New fixed font".to_owned())),
+            "New fixed font"
+        );
     }
 }
