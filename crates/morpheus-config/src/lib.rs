@@ -433,6 +433,8 @@ pub struct Typography {
     pub message_font_family: Option<String>,
     pub monospace_font_family: String,
     pub message_size: u16,
+    /// Omission preserves each sender surface's existing weight.
+    pub sender_weight: Option<u16>,
 }
 
 impl Default for Typography {
@@ -441,6 +443,7 @@ impl Default for Typography {
             message_font_family: None,
             monospace_font_family: "monospace".into(),
             message_size: 14,
+            sender_weight: None,
         }
     }
 }
@@ -454,7 +457,11 @@ impl Typography {
             "typography.monospace_font_family",
             &self.monospace_font_family,
         )?;
-        validate_range("typography.message_size", self.message_size, 10, 32)
+        validate_range("typography.message_size", self.message_size, 10, 32)?;
+        if let Some(weight) = self.sender_weight {
+            validate_range("typography.sender_weight", weight, 100, 900)?;
+        }
+        Ok(())
     }
 
     pub fn message_family<'a>(&'a self, appearance: &'a Appearance) -> &'a str {
@@ -504,12 +511,25 @@ pub enum MessageLayout {
     Columns,
 }
 
+/// Fixed local-clock formats, independent of locale and arbitrary format strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimestampFormat {
+    #[default]
+    TwelveHour,
+    TwentyFourHour,
+    TwentyFourHourSeconds,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChatStyle {
     pub layout: MessageLayout,
     pub show_avatars: bool,
     pub show_timestamps: bool,
+    pub timestamp_format: TimestampFormat,
+    pub timestamp_brackets: bool,
+    pub timestamp_width: u16,
     pub color_senders: bool,
     pub nickname_width: u16,
 }
@@ -520,6 +540,9 @@ impl Default for ChatStyle {
             layout: MessageLayout::Stacked,
             show_avatars: true,
             show_timestamps: true,
+            timestamp_format: TimestampFormat::TwelveHour,
+            timestamp_brackets: false,
+            timestamp_width: 72,
             color_senders: false,
             nickname_width: 128,
         }
@@ -528,7 +551,8 @@ impl Default for ChatStyle {
 
 impl ChatStyle {
     fn validate(&self) -> Result<(), ConfigError> {
-        validate_range("chat.nickname_width", self.nickname_width, 64, 240)
+        validate_range("chat.nickname_width", self.nickname_width, 64, 240)?;
+        validate_range("chat.timestamp_width", self.timestamp_width, 48, 160)
     }
 }
 
@@ -2317,5 +2341,104 @@ mod tests {
                 .header,
             ConversationHeaderMode::Minimal
         );
+    }
+
+    #[test]
+    fn conversation_metadata_defaults_formats_and_bounds_round_trip() {
+        let original: Config = toml::from_str("schema_version=1").unwrap();
+        assert_eq!(original.typography.sender_weight, None);
+        assert_eq!(original.chat.timestamp_format, TimestampFormat::TwelveHour);
+        assert!(!original.chat.timestamp_brackets);
+        assert_eq!(original.chat.timestamp_width, 72);
+        for (format, expected) in [
+            ("twelve_hour", TimestampFormat::TwelveHour),
+            ("twenty_four_hour", TimestampFormat::TwentyFourHour),
+            (
+                "twenty_four_hour_seconds",
+                TimestampFormat::TwentyFourHourSeconds,
+            ),
+        ] {
+            for (weight, width) in [(100, 48), (650, 72), (900, 160)] {
+                let text = format!(
+                    "[typography]\nsender_weight={weight}\n[chat]\ntimestamp_format='{format}'\ntimestamp_brackets=true\ntimestamp_width={width}"
+                );
+                let config: Config = toml::from_str(&text).unwrap();
+                config.validate().unwrap();
+                assert_eq!(config.typography.sender_weight, Some(weight));
+                assert_eq!(config.chat.timestamp_format, expected);
+                assert!(config.chat.timestamp_brackets);
+                assert_eq!(config.chat.timestamp_width, width);
+                let encoded = toml::to_string_pretty(&config).unwrap();
+                assert_eq!(toml::from_str::<Config>(&encoded).unwrap(), config);
+            }
+        }
+        for text in [
+            "[typography]\nsender_weight=0",
+            "[typography]\nsender_weight=99",
+            "[typography]\nsender_weight=901",
+            "[chat]\ntimestamp_width=47",
+            "[chat]\ntimestamp_width=161",
+        ] {
+            assert!(toml::from_str::<Config>(text).unwrap().validate().is_err());
+        }
+        for text in [
+            "[chat]\ntimestamp_format='%H:%M'",
+            "[chat]\ntimestamp_format='TwentyFourHour'",
+            "[chat]\ntimestamp_brackets='yes'",
+            "[typography]\nsender_weight=-1",
+        ] {
+            assert!(toml::from_str::<Config>(text).is_err());
+        }
+    }
+
+    #[test]
+    fn metadata_reload_preserves_valid_file_then_removes_every_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let mut custom = Config::default();
+        custom.typography.sender_weight = Some(500);
+        custom.chat.timestamp_format = TimestampFormat::TwentyFourHourSeconds;
+        custom.chat.timestamp_brackets = true;
+        custom.chat.timestamp_width = 112;
+        store.save(&custom).unwrap();
+        let last_valid = fs::read(store.path()).unwrap();
+        let updates = store.watch_with_theme(Duration::from_millis(10));
+        assert_eq!(
+            updates
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap()
+                .config,
+            custom
+        );
+        let mut invalid = custom.clone();
+        invalid.typography.sender_weight = Some(901);
+        assert!(store.save(&invalid).is_err());
+        assert_eq!(fs::read(store.path()).unwrap(), last_valid);
+        fs::write(store.path(), "[chat]\ntimestamp_format='unsupported'\n").unwrap();
+        assert!(
+            updates
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .is_err()
+        );
+        // Omitting all new fields restores their defaults, not the old custom
+        // values retained in a previous watcher result.
+        fs::write(store.path(), "schema_version=1\n").unwrap();
+        let restored = updates
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap()
+            .config;
+        assert_eq!(restored.typography.sender_weight, None);
+        assert_eq!(restored.chat, ChatStyle::default());
+        for preset in BuiltInStylePreset::ALL {
+            let mut reset = custom.clone();
+            reset.apply_style_preset(preset);
+            assert_eq!(reset.typography.sender_weight, None);
+            assert_eq!(reset.chat.timestamp_format, TimestampFormat::TwelveHour);
+            assert!(!reset.chat.timestamp_brackets);
+            assert_eq!(reset.chat.timestamp_width, 72);
+        }
     }
 }

@@ -65,9 +65,10 @@ and video previews are not supported. See [image preview limits](docs/IMAGE_PREV
 
 A [room-settings extension](docs/ROOM_SETTINGS.md) adds guarded name/topic,
 avatar and join-rule controls.
-At `65b4ceb`, all four native builds and unit suites passed. Linux live checks
-still failed on encrypted restart, a rate-limited topic write, OAuth refresh
-persistence, and a fresh incoming-offer timeout before account switching.
+At `93d1358`, all four native builds and unit suites passed. Linux OAuth refresh
+persistence and room-settings checks passed. Live checks still failed on an
+encrypted-restart test stack overflow and a fresh incoming-offer timeout before
+account switching; repairs require fresh hosted verification.
 See [the verification record](docs/VERIFICATION.md) for the exact results.
 Native [incoming-call sound](docs/INCOMING_CALLS.md) passed its automated guards;
 audible output and device acceptance remain open. Protocol Decline is unimplemented.

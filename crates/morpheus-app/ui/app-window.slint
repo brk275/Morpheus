@@ -115,6 +115,8 @@ export struct MessageItem {
     sender-palette-index: int,
     initials: string,
     time: string,
+    time-24h: string,
+    time-24h-seconds: string,
     body: string,
     rich-body: styled-text,
     rich-accessible-body: string,
@@ -290,6 +292,9 @@ component ActionRect inherits Rectangle {
     in property <color> focus-color: #a88cff;
     in property <bool> trap-tab: false;
     in property <bool> cancel-on-escape: false;
+    // Account controls opt in so Slint reveals their entire rectangle on Tab.
+    // Existing actions keep their original zero-sized focus target.
+    in property <bool> reveal-full-control: false;
     out property <bool> has-hover: hit.has-hover;
     out property <bool> has-focus: keyboard-focus.has-focus;
     callback activated();
@@ -309,8 +314,10 @@ component ActionRect inherits Rectangle {
     }
     keyboard-focus := FocusScope {
         x: 0px;
-        width: 0px;
-        height: 0px;
+        width: root.reveal-full-control ? root.width : 0px;
+        height: root.reveal-full-control ? root.height : 0px;
+        // A full-size scope must not consume the press before the TouchArea.
+        focus-on-click: !root.reveal-full-control;
         enabled: root.enabled;
         key-pressed(event) => {
             if event.text == Key.Space || event.text == Key.Return {
@@ -676,6 +683,10 @@ export component AppWindow inherits Window {
     in-out property <string> message-font-family: "Inter";
     in-out property <string> monospace-font-family: "monospace";
     in-out property <int> message-font-size: 14;
+    in-out property <int> sender-font-weight: 0; // zero preserves each surface's legacy weight
+    in-out property <int> timestamp-format: 0; // 12-hour, 24-hour, 24-hour with seconds
+    in-out property <bool> timestamp-brackets: false;
+    in-out property <int> timestamp-width-px: 72;
     in-out property <int> corner-radius-px: 10;
     in-out property <int> message-gap-px: 12;
     in-out property <int> content-padding-px: 24;
@@ -696,6 +707,17 @@ export component AppWindow inherits Window {
     callback choose-message-layout(int);
     callback choose-conversation-header-mode(int);
     callback set-style-flag(int, bool);
+    callback set-sender-weight(int);
+    callback choose-timestamp-format(int);
+
+    // Empty alternate clocks identify delivery status or a row with no clock.
+    // Keep those labels unchanged even when clocks are hidden or decorated.
+    pure function message-time-label(message: MessageItem) -> string {
+        if message.time-24h == "" { return message.time; }
+        let clock = root.timestamp-format == 1 ? message.time-24h
+            : root.timestamp-format == 2 ? message.time-24h-seconds : message.time;
+        return clock == "" ? "" : root.timestamp-brackets ? "[" + clock + "]" : clock;
+    }
 
     in-out property <string> config-error;
     in-out property <string> session-error;
@@ -1945,7 +1967,11 @@ export component AppWindow inherits Window {
                             // The timeline uses time for local delivery status too. Hiding
                             // optional timestamps must keep pending and failed sends visible.
                             property <bool> show-time: root.show-message-timestamps || message.time == "Sending…" || message.time == "Failed to send";
-                            property <bool> columns: root.message-layout == 2 && self.width >= max(640px, 640px * root.text-scale);
+                            property <string> time-label: root.message-time-label(message);
+                            // A wider clock gutter requires the same additional room before
+                            // choosing columns; keep the existing message/action space intact.
+                            property <bool> columns: root.message-layout == 2 && self.width >= max(640px, 640px * root.text-scale)
+                                + (self.show-time ? max(0px, (root.timestamp-width-px - 72) * 1px * root.text-scale) : 0px);
                             property <bool> selected-message: root.room-search-selected-event-id != "" && message.event-id == root.room-search-selected-event-id;
                             property <length> avatar-size: root.message-layout == 0 ? 38px : 26px;
                             property <length> action-width: message.event-id == "" ? 0px : (message.is-own && message.attachment == "" ? 172px : 136px);
@@ -1953,7 +1979,7 @@ export component AppWindow inherits Window {
                             property <bool> tight-header: !self.columns && self.body-width < self.action-width + 180px * root.text-scale;
                             property <length> body-width: max(0px, self.width - 2 * root.content-inset
                                 - (root.show-message-avatars ? self.avatar-size + (root.message-layout == 0 ? 10px : 7px) : 0px)
-                                - (self.columns ? self.column-width + 7px + (message-row.show-time ? 72px * root.text-scale + 7px : 0px) : 0px));
+                                - (self.columns ? self.column-width + 7px + (message-row.show-time ? root.timestamp-width-px * 1px * root.text-scale + 7px : 0px) : 0px));
                             min-height: max(28px + 2 * root.message-row-gap, root.show-message-avatars ? self.avatar-size + 2 * root.message-row-gap : 0px);
                             background: message-row.selected-message ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : message-hover.has-hover ? root.elevated : transparent;
                             message-hover := TouchArea { mouse-cursor: default; }
@@ -1968,16 +1994,16 @@ export component AppWindow inherits Window {
                                     initials: message.initials; accent: message.accent;
                                 }
                                 if message-row.columns && message-row.show-time : Text {
-                                    width: 72px * root.text-scale; text: message.time;
+                                    width: root.timestamp-width-px * 1px * root.text-scale; text: message-row.time-label;
                                     color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.muted; font-family: root.monospace-font-family;
                                     font-size: 10px * root.text-scale; overflow: elide;
-                                    accessible-label: message.time;
+                                    accessible-label: message-row.time-label;
                                 }
                                 if message-row.columns : Text {
                                     width: message-row.column-width; text: message.sender;
                                     color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.color-message-senders ? (root.sender-palette.length > 0 ? root.sender-palette[mod(message.sender-palette-index, max(1, root.sender-palette.length))] : message.accent) : root.ink;
                                     font-family: root.message-font-family; font-size: root.message-font-px;
-                                    font-weight: 650; horizontal-alignment: right; overflow: elide;
+                                    font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 650; horizontal-alignment: right; overflow: elide;
                                     accessible-label: message.sender;
                                 }
                                 message-content := VerticalLayout {
@@ -1989,22 +2015,22 @@ export component AppWindow inherits Window {
                                         padding-right: message-row.tight-header ? 0px : message-row.action-width + 8px;
                                         spacing: 8px;
                                         if message-row.tight-header : Text {
-                                            text: message.sender + (message-row.show-time ? " · " + message.time : "");
+                                            text: message.sender + (message-row.show-time && message-row.time-label != "" ? " · " + message-row.time-label : "");
                                             color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.color-message-senders ? (root.sender-palette.length > 0 ? root.sender-palette[mod(message.sender-palette-index, max(1, root.sender-palette.length))] : message.accent) : root.ink;
                                             font-family: root.message-font-family; font-size: root.message-font-px;
-                                            font-weight: 650; overflow: elide; vertical-alignment: top;
-                                            accessible-label: message.sender + (message-row.show-time ? ", " + message.time : "");
+                                            font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 650; overflow: elide; vertical-alignment: top;
+                                            accessible-label: message.sender + (message-row.show-time && message-row.time-label != "" ? ", " + message-row.time-label : "");
                                         }
                                         if !message-row.tight-header : Text {
                                             text: message.sender; color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.color-message-senders ? (root.sender-palette.length > 0 ? root.sender-palette[mod(message.sender-palette-index, max(1, root.sender-palette.length))] : message.accent) : root.ink;
                                             font-family: root.message-font-family;
                                             font-size: root.message-layout == 0 ? root.message-font-px : max(10px, root.message-font-px - 2px);
-                                            font-weight: 650; overflow: elide;
+                                            font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 650; overflow: elide;
                                             horizontal-stretch: 0; min-width: 0px;
                                             accessible-label: message.sender;
                                         }
                                         if !message-row.tight-header && message-row.show-time : Text {
-                                            text: message.time; color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.muted; font-family: root.monospace-font-family;
+                                            text: message-row.time-label; color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.muted; font-family: root.monospace-font-family;
                                             font-size: 10px * root.text-scale; vertical-alignment: center;
                                             horizontal-stretch: 0;
                                         }
@@ -2523,6 +2549,17 @@ export component AppWindow inherits Window {
                         StyleNumberSetting { label: "Message font size"; value: root.message-font-size; minimum: 10; maximum: 32;
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
                             changed-value(value) => { root.change-style-number(0, value); } }
+                        StyleNumberSetting { label: "Sender font weight"; value: root.sender-font-weight > 0 ? root.sender-font-weight : 650; minimum: 100; maximum: 900; step: 50;
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
+                            changed-value(value) => { root.set-sender-weight(value); } }
+                        TextAction {
+                            text: root.sender-font-weight == 0 ? "Sender weight: surface defaults" : "Restore sender weight defaults";
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                            outline: root.divider; text-scale: root.text-scale;
+                            activated => { root.set-sender-weight(0); }
+                        }
+                        Text { text: "Available weights depend on your font. Message-body weight and line spacing are not configurable yet.";
+                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
                         Text { text: "Room header"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         for name[index] in ["Full · room header and introduction", "Compact · room header and topic", "Minimal · room name and actions"] : ActionRect {
                             height: 40px * root.text-scale;
@@ -2569,6 +2606,32 @@ export component AppWindow inherits Window {
                                 Text { text: style-toggle.selected ? "On" : "Off"; color: root.accent; font-size: 12px * root.text-scale; }
                             }
                         }
+                        Text { text: "Timestamp style"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
+                        for name[index] in ["12-hour · 3:04 PM", "24-hour · 15:04", "24-hour with seconds · 15:04:05"] : ActionRect {
+                            height: 40px * root.text-scale;
+                            label: "Timestamp format: " + name + (root.timestamp-format == index ? ", selected" : "");
+                            background: root.timestamp-format == index ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : self.has-hover ? root.hover : root.elevated;
+                            border-radius: StyleTokens.radius * 0.8; border-width: root.timestamp-format == index ? 1px : 0px; border-color: root.accent;
+                            focus-color: root.accent; activated => { root.choose-timestamp-format(index); }
+                            Text { x: 12px; width: parent.width - 24px; height: parent.height;
+                                text: name; color: root.timestamp-format == index && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink;
+                                font-size: 11px * root.text-scale; vertical-alignment: center; overflow: elide; }
+                        }
+                        ActionRect {
+                            height: 42px * root.text-scale;
+                            label: "Timestamp square brackets" + (root.timestamp-brackets ? ", on" : ", off");
+                            background: self.has-hover ? root.hover : root.elevated; border-radius: StyleTokens.radius * 0.8; focus-color: root.accent;
+                            activated => { root.set-style-flag(3, !root.timestamp-brackets); }
+                            HorizontalLayout { padding: 12px; spacing: 8px;
+                                Text { text: "Timestamp square brackets"; color: root.ink; font-size: 12px * root.text-scale; horizontal-stretch: 1; }
+                                Text { text: root.timestamp-brackets ? "On" : "Off"; color: root.accent; font-size: 12px * root.text-scale; }
+                            }
+                        }
+                        StyleNumberSetting { label: "Timestamp column width"; value: root.timestamp-width-px; minimum: 48; maximum: 160; step: 4;
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
+                            changed-value(value) => { root.change-style-number(6, value); } }
+                        Text { text: "Clock style updates messages and thread replies. Column width applies in Columns layout. Narrow columns shorten displayed times; screen readers can read the full time. Sending and failed messages always keep their status.";
+                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
                         Text { text: "Geometry"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         StyleNumberSetting { label: "Corner radius"; value: root.corner-radius-px; minimum: 0; maximum: 24;
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
@@ -3695,7 +3758,7 @@ export component AppWindow inherits Window {
                             spacing: 10px;
                             alignment: start;
                             vertical-stretch: 0;
-                            Text { text: root.thread-root-sender; color: root.ink; font-size: 12px * root.text-scale; font-weight: 750; vertical-stretch: 0; }
+                            Text { text: root.thread-root-sender; color: root.ink; font-size: 12px * root.text-scale; font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 750; vertical-stretch: 0; }
                             StyledText {
                                 text: root.thread-root-rich-body;
                                 default-color: root.ink;
@@ -3707,14 +3770,15 @@ export component AppWindow inherits Window {
                             }
                             Rectangle { height: 1px; background: root.divider; }
                             Text { text: "REPLIES · " + root.thread-messages.length; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; vertical-stretch: 0; }
-                            for reply in root.thread-messages : Rectangle {
+                            for reply in root.thread-messages : thread-reply := Rectangle {
+                                property <string> time-label: root.message-time-label(reply);
                                 min-height: 43px;
                                 vertical-stretch: 0;
                                 background: root.elevated;
                                 border-radius: StyleTokens.radius * 0.8;
                                 VerticalLayout {
                                     padding: min(12px, root.content-inset); spacing: max(2px, root.message-row-gap);
-                                    Text { text: reply.sender + (root.show-message-timestamps || reply.time == "Sending…" || reply.time == "Failed to send" ? " · " + reply.time : ""); color: root.color-message-senders ? (root.sender-palette.length > 0 ? root.sender-palette[mod(reply.sender-palette-index, max(1, root.sender-palette.length))] : reply.accent) : root.ink; font-size: 11px * root.text-scale; font-weight: 700; }
+                                    Text { text: reply.sender + ((root.show-message-timestamps || reply.time == "Sending…" || reply.time == "Failed to send") && thread-reply.time-label != "" ? " · " + thread-reply.time-label : ""); color: root.color-message-senders ? (root.sender-palette.length > 0 ? root.sender-palette[mod(reply.sender-palette-index, max(1, root.sender-palette.length))] : reply.accent) : root.ink; font-size: 11px * root.text-scale; font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 700; wrap: word-wrap; }
                                     StyledText {
                                         text: reply.rich-body;
                                         default-color: root.ink;
@@ -5012,64 +5076,83 @@ export component AppWindow inherits Window {
                 accessible-role: region; accessible-label: "Manage saved Matrix accounts";
                 VerticalLayout {
                     padding: 20px; spacing: 12px;
-                    Text { text: "Your accounts"; color: root.ink; font-size: 22px * root.text-scale; font-weight: 750; }
-                    Text { text: "Separate aliases, one app. Open an account or remove it directly from this device."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
-                    manage-add := TextAction {
-                        text: "Add account"; ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
-                        activated => { root.manage-accounts-open = false; root.add-account(); }
-                    }
-                    ScrollView {
+                    Text { text: "Your accounts"; color: root.ink; font-size: 22px * root.text-scale; font-weight: 750; vertical-stretch: 0; }
+                    // Only the body grows. At short heights or large text, both
+                    // the account list and protection controls remain scrollable.
+                    manage-body-scroll := ScrollView {
                         vertical-stretch: 1; horizontal-scrollbar-policy: always-off;
                         VerticalLayout {
-                            spacing: 8px;
-                            for account in root.saved-accounts : Rectangle {
-                                min-height: 88px * root.text-scale; background: root.elevated; border-radius: 9px;
-                                VerticalLayout {
-                                    padding: 10px; spacing: 7px;
-                                    Text { text: account.handle; color: root.ink; font-size: 13px * root.text-scale; overflow: elide; accessible-label: account.handle; }
-                                    HorizontalLayout {
-                                        spacing: 8px;
-                                        Text { text: account.removal-pending ? "Removal pending" : account.active ? "Current account" : "Paused"; color: root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; }
-                                        TextAction {
-                                            text: root.app-password-enabled ? "Unlock" : "Open"; enabled: !account.removal-pending;
-                                            label: "Open " + account.handle;
-                                            ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
-                                            activated => { root.activate-saved-account(account.id); }
-                                        }
-                                        TextAction {
-                                            text: account.removal-pending ? "Retry removal" : "Remove"; label: "Remove " + account.handle + " from this app";
-                                            ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
-                                            activated => { root.remove-saved-account(account.id); }
+                            width: manage-body-scroll.visible-width; spacing: 12px; alignment: start; vertical-stretch: 0;
+                            Text { text: "Separate aliases, one app. Open an account or remove it directly from this device."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; vertical-stretch: 0; }
+                            manage-add := TextAction {
+                                reveal-full-control: true;
+                                height: 40px * root.text-scale; vertical-stretch: 0;
+                                text: "Add account"; ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                                activated => { root.manage-accounts-open = false; root.add-account(); }
+                            }
+                            VerticalLayout {
+                                spacing: 8px; alignment: start; vertical-stretch: 0;
+                                for account in root.saved-accounts : Rectangle {
+                                    min-height: 88px * root.text-scale; vertical-stretch: 0; background: root.elevated; border-radius: 9px;
+                                    VerticalLayout {
+                                        padding: 10px; spacing: 7px; alignment: start;
+                                        Text { text: account.handle; color: root.ink; font-size: 13px * root.text-scale; overflow: elide; accessible-label: account.handle; vertical-stretch: 0; }
+                                        HorizontalLayout {
+                                            height: 36px * root.text-scale; vertical-stretch: 0; spacing: 8px;
+                                            Text { text: account.removal-pending ? "Removal pending" : account.active ? "Current account" : "Paused"; color: root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; }
+                                            TextAction {
+                                reveal-full-control: true;
+                                                height: 36px * root.text-scale; vertical-stretch: 0;
+                                                text: root.app-password-enabled ? "Unlock" : "Open"; enabled: !account.removal-pending;
+                                                label: "Open " + account.handle;
+                                                ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                                                activated => { root.activate-saved-account(account.id); }
+                                            }
+                                            TextAction {
+                                reveal-full-control: true;
+                                                height: 36px * root.text-scale; vertical-stretch: 0;
+                                                text: account.removal-pending ? "Retry removal" : "Remove"; label: "Remove " + account.handle + " from this app";
+                                                ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                                                activated => { root.remove-saved-account(account.id); }
+                                            }
                                         }
                                     }
                                 }
+                                if root.saved-accounts.length == 0 : Text { text: "No saved accounts. Add a Matrix account to get started."; color: root.muted; wrap: word-wrap; font-size: 12px * root.text-scale; vertical-stretch: 0; }
                             }
-                            if root.saved-accounts.length == 0 : Text { text: "No saved accounts. Add a Matrix account to get started."; color: root.muted; wrap: word-wrap; font-size: 12px * root.text-scale; }
+                            Rectangle { height: 1px; vertical-stretch: 0; background: root.divider; }
+                            Text { text: root.app-password-enabled ? "Switch protection is on" : "Switch protection is off"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; vertical-stretch: 0; }
+                            Text { text: "One local app password for every account switch and startup restore. Works with SSO accounts too."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; vertical-stretch: 0; }
+                            HorizontalLayout {
+                                height: 40px * root.text-scale; vertical-stretch: 0; spacing: 8px;
+                                TextAction {
+                                reveal-full-control: true;
+                                    height: 40px * root.text-scale; vertical-stretch: 0;
+                                    text: root.app-password-enabled ? "Change password" : "Set app password";
+                                    ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                                    activated => { root.open-app-password(root.app-password-enabled ? 2 : 1); }
+                                }
+                                if root.app-password-enabled : TextAction {
+                                reveal-full-control: true;
+                                    height: 40px * root.text-scale; vertical-stretch: 0;
+                                    text: "Turn off"; label: "Turn off account switch protection";
+                                    ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                                    activated => { root.open-app-password(3); }
+                                }
+                            }
+                            if root.saved-accounts.length == 0 && root.app-password-enabled : TextAction {
+                                reveal-full-control: true;
+                                height: 40px * root.text-scale; vertical-stretch: 0;
+                                text: "Reset password after removing all accounts";
+                                ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                                activated => { root.open-app-password(5); }
+                            }
+                            Text { text: root.account-access-notice; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; vertical-stretch: 0; }
                         }
                     }
-                    Rectangle { height: 1px; background: root.divider; }
-                    Text { text: root.app-password-enabled ? "Switch protection is on" : "Switch protection is off"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
-                    Text { text: "One local app password for every account switch and startup restore. Works with SSO accounts too."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        TextAction {
-                            text: root.app-password-enabled ? "Change password" : "Set app password";
-                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
-                            activated => { root.open-app-password(root.app-password-enabled ? 2 : 1); }
-                        }
-                        if root.app-password-enabled : TextAction {
-                            text: "Turn off"; label: "Turn off account switch protection";
-                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
-                            activated => { root.open-app-password(3); }
-                        }
-                    }
-                    if root.saved-accounts.length == 0 && root.app-password-enabled : TextAction {
-                        text: "Reset password after removing all accounts";
-                        ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
-                        activated => { root.open-app-password(5); }
-                    }
-                    Text { text: root.account-access-notice; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
                     manage-close := TextAction {
+                                reveal-full-control: true;
+                        height: 40px * root.text-scale; vertical-stretch: 0;
                         text: "Done"; ink: root.accent-ink; muted: root.muted; surface: root.accent; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
                         activated => { root.manage-accounts-open = false; }
                     }
@@ -5109,25 +5192,25 @@ export component AppWindow inherits Window {
                     padding: 22px; spacing: 12px;
                     Text {
                         text: root.access-mode == 0 ? "Unlock account" : root.access-mode == 1 ? "Set app password" : root.access-mode == 2 ? "Change app password" : root.access-mode == 3 ? "Turn off protection?" : root.access-mode == 5 ? "Reset app password?" : "Remove from this app?";
-                        color: root.ink; font-size: 21px * root.text-scale; font-weight: 750; wrap: word-wrap;
+                        color: root.ink; font-size: 21px * root.text-scale; font-weight: 750; wrap: word-wrap; vertical-stretch: 0;
                     }
-                    ScrollView {
+                    access-body-scroll := ScrollView {
                         vertical-stretch: 1; horizontal-scrollbar-policy: always-off;
                         VerticalLayout {
-                            spacing: 12px;
+                            width: access-body-scroll.visible-width; spacing: 12px; alignment: start; vertical-stretch: 0;
                             Text {
                                 text: root.access-mode == 5 ? "Reset is available only after every saved account and its local credentials and history have been removed. You can then set a new password and sign in again. This cannot unlock an existing account."
                                     : root.access-mode == 4 ? "This removes the saved session and local history for this account. It works offline. It does not log out the homeserver device; revoke that device from another client if needed. Keep your recovery key before removing your last verified device."
                                     : root.access-mode == 0 ? "Enter your local app password to open this account."
                                     : root.access-mode == 3 ? "Your current app password is required. Saved accounts will then open without this prompt."
                                     : "Choose one password for protected switches on this device. Use at least 12 characters. Keep it in your password manager; Morpheus cannot recover it. This protects access through Morpheus, not access by someone who controls your operating system.";
-                                color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap;
+                                color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; vertical-stretch: 0;
                             }
-                            if root.access-target != "" : Text { text: root.access-target; color: root.ink; font-size: 13px * root.text-scale; wrap: word-wrap; }
-                            if root.access-mode == 0 || root.access-mode == 2 || root.access-mode == 3 : Text { text: "Current app password"; color: root.ink; font-size: 12px * root.text-scale; }
+                            if root.access-target != "" : Text { text: root.access-target; color: root.ink; font-size: 13px * root.text-scale; wrap: word-wrap; vertical-stretch: 0; }
+                            if root.access-mode == 0 || root.access-mode == 2 || root.access-mode == 3 : Text { text: "Current app password"; color: root.ink; font-size: 12px * root.text-scale; vertical-stretch: 0; }
                             Rectangle {
                                 visible: root.access-mode == 0 || root.access-mode == 2 || root.access-mode == 3;
-                                height: self.visible ? 42px * root.text-scale : 0px; background: root.elevated; border-radius: 8px;
+                                height: self.visible ? 42px * root.text-scale : 0px; vertical-stretch: 0; background: root.elevated; border-radius: 8px;
                                 access-current := ThemedTextInput {
                                     x: 12px; width: parent.width - 24px; height: parent.height; single-line: true; input-type: password;
                                     enabled: parent.visible && !root.access-busy; text <=> root.access-current-password;
@@ -5135,20 +5218,20 @@ export component AppWindow inherits Window {
                                     accepted => { if !root.access-busy && root.access-mode != 2 { root.submit-account-access(); } }
                                 }
                             }
-                            if root.access-mode == 1 || root.access-mode == 2 : Text { text: "New app password"; color: root.ink; font-size: 12px * root.text-scale; }
+                            if root.access-mode == 1 || root.access-mode == 2 : Text { text: "New app password"; color: root.ink; font-size: 12px * root.text-scale; vertical-stretch: 0; }
                             Rectangle {
                                 visible: root.access-mode == 1 || root.access-mode == 2;
-                                height: self.visible ? 42px * root.text-scale : 0px; background: root.elevated; border-radius: 8px;
+                                height: self.visible ? 42px * root.text-scale : 0px; vertical-stretch: 0; background: root.elevated; border-radius: 8px;
                                 access-new := ThemedTextInput {
                                     x: 12px; width: parent.width - 24px; height: parent.height; single-line: true; input-type: password;
                                     enabled: parent.visible && !root.access-busy; text <=> root.access-new-password;
                                     color: root.ink; font-size: 14px * root.text-scale; vertical-alignment: center; accessible-label: "New local app password";
                                 }
                             }
-                            if root.access-mode == 1 || root.access-mode == 2 : Text { text: "Confirm new password"; color: root.ink; font-size: 12px * root.text-scale; }
+                            if root.access-mode == 1 || root.access-mode == 2 : Text { text: "Confirm new password"; color: root.ink; font-size: 12px * root.text-scale; vertical-stretch: 0; }
                             Rectangle {
                                 visible: root.access-mode == 1 || root.access-mode == 2;
-                                height: self.visible ? 42px * root.text-scale : 0px; background: root.elevated; border-radius: 8px;
+                                height: self.visible ? 42px * root.text-scale : 0px; vertical-stretch: 0; background: root.elevated; border-radius: 8px;
                                 access-confirm := ThemedTextInput {
                                     x: 12px; width: parent.width - 24px; height: parent.height; single-line: true; input-type: password;
                                     enabled: parent.visible && !root.access-busy; text <=> root.access-confirm-password;
@@ -5156,17 +5239,23 @@ export component AppWindow inherits Window {
                                     accepted => { if !root.access-busy { root.submit-account-access(); } }
                                 }
                             }
-                            Text { text: root.access-error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
+                            Text { text: root.access-error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; vertical-stretch: 0; }
                         }
                     }
+                    // The fixed footer must not compete with the scrollable form.
                     HorizontalLayout {
+                        height: 40px * root.text-scale; vertical-stretch: 0;
                         spacing: 10px; alignment: end;
                         access-cancel := TextAction {
+                                reveal-full-control: true;
+                            height: 40px * root.text-scale; vertical-stretch: 0;
                             text: "Cancel"; enabled: !root.access-busy || root.access-mode == 0;
                             ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
                             activated => { root.cancel-account-access(); }
                         }
                         access-submit := TextAction {
+                                reveal-full-control: true;
+                            height: 40px * root.text-scale; vertical-stretch: 0;
                             text: root.access-busy ? "Working…" : root.access-mode == 0 ? "Unlock" : root.access-mode == 3 ? "Turn off" : root.access-mode == 4 ? "Remove account" : root.access-mode == 5 ? "Reset password" : "Save password";
                             enabled: !root.access-busy;
                             ink: root.access-mode >= 3 && StyleTokens.roles.destructive-ink.present ? StyleTokens.roles.destructive-ink.color : root.accent-ink; muted: root.muted; surface: root.access-mode >= 3 && StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : root.accent; hover-surface: root.access-mode >= 3 && StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : root.hover; outline: root.divider; text-scale: root.text-scale;

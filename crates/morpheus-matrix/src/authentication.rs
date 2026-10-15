@@ -79,16 +79,17 @@ struct PendingOAuth {
 }
 
 /// An unsuccessful or cancelled login must not leave an unusable account store.
-struct PendingStore {
-    id: String,
-    path: PathBuf,
+pub(super) struct PendingStore {
+    pub(super) id: String,
+    pub(super) path: PathBuf,
     account_dir: PathBuf,
+    data_dir: PathBuf,
     marker: Option<fs::File>,
     keep: bool,
 }
 
 impl PendingStore {
-    fn new(manager: &AccountManager) -> Result<Self> {
+    pub(super) fn new(manager: &AccountManager) -> Result<Self> {
         let id = Uuid::new_v4().to_string();
         let path = manager.store_path(&id);
         let account_dir = path
@@ -98,6 +99,7 @@ impl PendingStore {
         let mut store = Self {
             path,
             account_dir,
+            data_dir: manager.data_dir.clone(),
             marker: None,
             id,
             keep: false,
@@ -118,21 +120,41 @@ impl PendingStore {
             use std::os::unix::fs::OpenOptionsExt;
             marker.mode(0o600);
         }
-        let mut file = marker.open(store.account_dir.join(PENDING_STORE_MARKER))?;
+        let file = marker.open(store.account_dir.join(PENDING_STORE_MARKER))?;
         file.try_lock().map_err(std::io::Error::other)?;
-        // Only a complete, locked marker is eligible for stale-store cleanup.
-        use std::io::Write as _;
-        file.write_all(b"morpheus-pending-v1")?;
+        // Retain ownership even if writing this newly created marker fails.
+        // Only a complete marker is eligible for cleanup by a later process.
         store.marker = Some(file);
+        use std::io::Write as _;
+        let file = store
+            .marker
+            .as_mut()
+            .expect("owned marker was just installed");
+        file.write_all(b"morpheus-pending-v1")?;
+        file.sync_all()?;
+        sync_registry_directory(&store.account_dir)?;
+        sync_registry_directory(&manager.data_dir.join("accounts"))?;
         Ok(store)
     }
 
-    fn commit(&mut self) {
-        self.keep = true;
-        // The registry is already saved while this lock is held. Cleanup must
-        // re-read it after acquiring the lock, even if this unlink fails.
+    pub(super) fn commit(&mut self) -> std::io::Result<()> {
+        self.commit_with(|marker| fs::remove_file(marker))
+    }
+
+    fn commit_with(
+        &mut self,
+        remove_marker: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        // Final registry durability precedes this unlink. A leftover marker
+        // must remain a blocked cleanup operation, never a successful login.
         self.marker.take();
-        let _ = fs::remove_file(self.account_dir.join(PENDING_STORE_MARKER));
+        match remove_marker(&self.account_dir.join(PENDING_STORE_MARKER)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        self.keep = true;
+        Ok(())
     }
 }
 
@@ -140,7 +162,14 @@ impl Drop for PendingStore {
     fn drop(&mut self) {
         if !self.keep {
             if let Some(marker) = self.marker.take() {
-                let _ = remove_pending_store(&self.account_dir, marker);
+                // Cancellation after a registry rename must preserve a saved
+                // account. An ambiguous registry is never deletion consent.
+                if matches!(
+                    registered_account_on_disk(&self.data_dir, &self.id),
+                    Ok(false)
+                ) {
+                    let _ = remove_pending_store(&self.account_dir, marker);
+                }
             }
         }
     }
@@ -191,6 +220,57 @@ fn remove_pending_store_with(
     fs::remove_file(marker_path)?;
     // Nonrecursive removal cannot erase an unrelated file added meanwhile.
     fs::remove_dir(account_dir)
+}
+
+/// A valid owned marker on a registered account means its login commit or
+/// marker cleanup was interrupted. Block it before any startup activation.
+/// This recovery reads only files; explicit removal owns all vault cleanup.
+pub(super) fn recover_pending_login_rows(data_dir: &Path, registry: &mut Registry) -> Result<()> {
+    let mut recovered = registry.clone();
+    let mut markers = Vec::new();
+    for account in &registry.accounts {
+        let account_dir = data_dir.join("accounts").join(&account.id);
+        let marker_path = account_dir.join(PENDING_STORE_MARKER);
+        match fs::symlink_metadata(&marker_path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+            _ => return Err(MatrixCoreError::AppPasswordUnavailable),
+        }
+        let directory = fs::symlink_metadata(&account_dir)?;
+        if !directory.is_dir() || directory.file_type().is_symlink() {
+            return Err(MatrixCoreError::AppPasswordUnavailable);
+        }
+        let mut marker = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&marker_path)?;
+        marker
+            .try_lock()
+            .map_err(|_| MatrixCoreError::AccountAccessBusy)?;
+        use std::io::Read as _;
+        let mut version = [0; 19];
+        if marker.metadata()?.len() != 19
+            || marker.read_exact(&mut version).is_err()
+            || &version != b"morpheus-pending-v1"
+        {
+            return Err(MatrixCoreError::AppPasswordUnavailable);
+        }
+        markers.push(marker);
+        if !recovered.pending_removals.contains(&account.id) {
+            recovered.pending_removals.push(account.id.clone());
+        }
+        if recovered.active_account_id.as_deref() == Some(account.id.as_str()) {
+            recovered.active_account_id = None;
+        }
+    }
+    if !markers.is_empty() {
+        save_registry(data_dir, &recovered)?;
+        // Even if directory sync fails, the caller must retain the blocked
+        // in-memory row and refuse startup instead of assuming no rename.
+        *registry = recovered;
+        sync_registry_directory(data_dir)?;
+    }
+    Ok(())
 }
 
 /// SQLite's worker may release its last Windows file handle after the Client
@@ -520,7 +600,7 @@ impl AccountManager {
         };
         let client = &login.client;
         let passphrase = &login.passphrase;
-        let store = &login.store;
+        let store = &mut login.store;
         let session = StoredSession::from_client(client).ok_or(MatrixCoreError::InvalidSession)?;
         let account = AccountInfo {
             id: store.id.clone(),
@@ -537,30 +617,22 @@ impl AccountManager {
             {
                 return Err(MatrixCoreError::DuplicateAccount);
             }
-            let _permit = self.access_permit()?;
+            let permit = self.access_permit()?;
             state.access = account_access::AccessFence::read(&self.data_dir)?;
             start_event_cache(client)?;
-            save_secret(
-                &store.id,
+            self.persist_new_account(
+                &mut state,
+                &account,
+                store,
                 StoredSecret {
                     version: SECRET_VERSION,
                     store_passphrase: passphrase.to_string(),
                     session,
                 },
-                self._access_lock.clone(),
+                permit.clone(),
             )
             .await?;
-            let mut next = state.registry.clone();
-            next.accounts.push(account.clone());
-            if !state.access.enabled {
-                next.active_account_id = Some(store.id.clone());
-            }
-            if let Err(error) = save_registry(&self.data_dir, &next) {
-                let _ = delete_secret(&store.id, self._access_lock.clone()).await;
-                return Err(error);
-            }
             if state.access.enabled {
-                state.registry = next;
                 return Ok(());
             }
             self.selections.replace(None);
@@ -572,7 +644,6 @@ impl AccountManager {
                 self._access_lock.clone(),
             ));
             state.loaded.insert(store.id.clone(), loaded.clone());
-            state.registry = next;
             state.active_account_id = Some(account.id.clone());
             self.publish_active_account(Some(account.clone()));
             self.start_sync(&mut state, loaded.client.clone()).await;
@@ -583,7 +654,6 @@ impl AccountManager {
             let _ = tokio::time::timeout(Duration::from_secs(15), client.logout()).await;
             return Err(error);
         }
-        login.store.commit();
         Ok(account)
     }
 }
@@ -604,6 +674,7 @@ mod tests {
         url: String,
         stopped: Arc<AtomicBool>,
         redirects_followed: Arc<AtomicUsize>,
+        password_logins: Arc<AtomicUsize>,
         worker: Option<thread::JoinHandle<()>>,
     }
 
@@ -623,6 +694,8 @@ mod tests {
             let stop = stopped.clone();
             let redirects_followed = Arc::new(AtomicUsize::new(0));
             let redirects = redirects_followed.clone();
+            let password_logins = Arc::new(AtomicUsize::new(0));
+            let observed_password_logins = password_logins.clone();
             let worker = thread::spawn(move || {
                 while !stop.load(Ordering::SeqCst) {
                     let (mut stream, _) = match listener.accept() {
@@ -706,6 +779,13 @@ mod tests {
                                 String::new(),
                             )
                         }
+                    } else if path.ends_with("/login") && request.starts_with("POST ") {
+                        observed_password_logins.fetch_add(1, Ordering::SeqCst);
+                        (
+                            403,
+                            serde_json::json!({"errcode":"M_FORBIDDEN", "error":"private-reflected-authentication-detail"}),
+                            String::new(),
+                        )
                     } else if path == "/register" {
                         (
                             201,
@@ -740,6 +820,7 @@ mod tests {
                 url,
                 stopped,
                 redirects_followed,
+                password_logins,
                 worker: Some(worker),
             }
         }
@@ -814,6 +895,173 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         panic!("unfinished browser store was not cleaned");
+    }
+
+    #[test]
+    fn failed_password_login_sanitizes_response_and_leaves_no_reset_blocking_parent() {
+        let directory = PrivateTestDir::new();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let manager = AccountManager::open(&directory.0).unwrap();
+                manager
+                    .set_app_password(None, Zeroizing::new("synthetic local password".into()))
+                    .await
+                    .unwrap();
+                let server = AuthServer::start(404);
+                let error = manager
+                    .add_password_account(
+                        &server.url,
+                        "synthetic-user",
+                        "incorrect fixture password",
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(server.password_logins.load(Ordering::SeqCst), 1);
+                assert!(
+                    !error
+                        .to_string()
+                        .contains("private-reflected-authentication-detail")
+                );
+                assert!(
+                    error
+                        .to_string()
+                        .contains("Check your homeserver and credentials")
+                );
+                assert!(manager.accounts().await.is_empty());
+                for attempt in 0..50 {
+                    cleanup_pending_stores(&directory.0, &Registry::default()).unwrap();
+                    if fs::read_dir(directory.0.join("accounts"))
+                        .unwrap()
+                        .next()
+                        .is_none()
+                    {
+                        break;
+                    }
+                    assert!(
+                        attempt < 49,
+                        "failed password login left an account directory"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                manager.reset_app_password_after_removal().await.unwrap();
+                assert!(!manager.app_password_status().await.enabled);
+            });
+    }
+
+    #[test]
+    fn failed_marker_commit_preserves_the_registered_store_and_recovery_record() {
+        let directory = PrivateTestDir::new();
+        let manager = AccountManager::open(&directory.0).unwrap();
+        let mut pending = PendingStore::new(&manager).unwrap();
+        let account_dir = pending.account_dir.clone();
+        save_registry(
+            &directory.0,
+            &Registry {
+                accounts: vec![AccountInfo {
+                    id: pending.id.clone(),
+                    user_id: "@fixture:example.org".into(),
+                    device_id: "FIXTURE".into(),
+                    homeserver: "https://example.org".into(),
+                }],
+                ..Registry::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            pending
+                .commit_with(|_| Err(std::io::Error::other("injected marker unlink failure")))
+                .is_err()
+        );
+        drop(pending);
+        assert!(account_dir.join("store").is_dir());
+        assert!(account_dir.join(PENDING_STORE_MARKER).is_file());
+    }
+
+    #[test]
+    fn pending_guard_drop_preserves_registered_or_unreadable_registry_data() {
+        for invalid_registry in [false, true] {
+            let directory = PrivateTestDir::new();
+            let manager = AccountManager::open(&directory.0).unwrap();
+            let pending = PendingStore::new(&manager).unwrap();
+            let account_dir = pending.account_dir.clone();
+            fs::write(pending.path.join("keep"), b"registered account payload").unwrap();
+            if invalid_registry {
+                fs::write(directory.0.join("accounts.json"), b"unreadable registry").unwrap();
+            } else {
+                save_registry(
+                    &directory.0,
+                    &Registry {
+                        accounts: vec![AccountInfo {
+                            id: pending.id.clone(),
+                            user_id: "@fixture:example.org".into(),
+                            device_id: "FIXTURE".into(),
+                            homeserver: "https://example.org".into(),
+                        }],
+                        ..Registry::default()
+                    },
+                )
+                .unwrap();
+            }
+            drop(pending);
+            assert_eq!(
+                fs::read(account_dir.join("store").join("keep")).unwrap(),
+                b"registered account payload"
+            );
+            assert!(account_dir.join(PENDING_STORE_MARKER).is_file());
+        }
+    }
+
+    #[test]
+    fn startup_recovers_registered_marker_but_refuses_locked_or_malformed_marker() {
+        let directory = PrivateTestDir::new();
+        let manager = AccountManager::open(&directory.0).unwrap();
+        let pending = PendingStore::new(&manager).unwrap();
+        let account_dir = pending.account_dir.clone();
+        let id = pending.id.clone();
+        let registry = Registry {
+            accounts: vec![AccountInfo {
+                id: id.clone(),
+                user_id: "@fixture:example.org".into(),
+                device_id: "FIXTURE".into(),
+                homeserver: "https://example.org".into(),
+            }],
+            active_account_id: Some(id.clone()),
+            ..Registry::default()
+        };
+        save_registry(&directory.0, &registry).unwrap();
+        let unknown = directory.0.join("accounts").join("unrelated");
+        fs::create_dir(&unknown).unwrap();
+        fs::write(unknown.join("keep"), b"unrelated payload").unwrap();
+        drop(manager);
+        assert!(matches!(
+            AccountManager::open(&directory.0),
+            Err(MatrixCoreError::AccountAccessBusy)
+        ));
+        drop(pending);
+        let manager = AccountManager::open(&directory.0).unwrap();
+        let recovered: Registry =
+            serde_json::from_slice(&fs::read(directory.0.join("accounts.json")).unwrap()).unwrap();
+        assert_eq!(recovered.pending_removals, [id.clone()]);
+        assert!(recovered.active_account_id.is_none());
+        assert!(account_dir.join("store").is_dir());
+        assert_eq!(
+            fs::read(unknown.join("keep")).unwrap(),
+            b"unrelated payload"
+        );
+        drop(manager);
+        fs::write(account_dir.join(PENDING_STORE_MARKER), b"malformed marker").unwrap();
+        assert!(matches!(
+            AccountManager::open(&directory.0),
+            Err(MatrixCoreError::AppPasswordUnavailable)
+        ));
+        assert!(account_dir.join("store").is_dir());
+        assert_eq!(
+            fs::read(unknown.join("keep")).unwrap(),
+            b"unrelated payload"
+        );
     }
 
     #[test]

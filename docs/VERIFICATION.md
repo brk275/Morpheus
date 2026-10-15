@@ -5,29 +5,76 @@ the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
 ## Live acceptance stack overflow diagnosis, 2026-10-15
 
-The `live_local` acceptance test aborted with a stack overflow (SIGABRT) at
-`encrypted_restart_message` in Linux CI for `65b4ceb` and `93d1358`
-([run 38246027915](https://github.com/brk275/Morpheus/actions/runs/38246027915)).
-A local reproduction against two loopback Synapse 1.162.0 homeservers and a
-disposable keyring measured the test thread's stack with a paint-and-scan probe
-at every phase marker. libtest runs the test on a 2,097,152-byte thread with
-`RUST_MIN_STACK` unset; the single async block holding every stage used
-1,143,881 bytes of poll frame before any SDK call at the unoptimized test
-profile, while the test future itself was only 19,376 bytes. The restored
-encrypted timeline build then peaked at 2,127,120 bytes and the following
-protected-account restart at 2,123,336 bytes. The SDK call chains themselves
-stayed under about 0.98 MiB at every stage, so this was an oversized test
-frame, not runtime recursion.
+At `65b4ceb`, the `live_local` acceptance test stopped during `encrypted_restart`
+without a classified cause. At `93d1358`, the added diagnostics confirmed a
+stack overflow (SIGABRT) at `encrypted_restart_message` in Linux
+[run 38246027915](https://github.com/brk275/Morpheus/actions/runs/38246027915).
+
+Claude's contribution reports a local reproduction against two loopback
+Synapse 1.162.0 homeservers and a disposable keyring. Its reported stack probe
+at the unoptimized test profile measured about 1.1 MiB in the monolithic test's
+poll frame before an SDK call, with the restored encrypted timeline exceeding
+the default 2 MiB test-thread stack. Those local measurements have not been
+independently reproduced in this review.
 
 The test now runs each stage as its own `async fn` behind a slim coordinator,
-with every phase marker, assertion and call in the original order. On the
-default 2 MiB stack the complete test passed locally with a peak of 1,470,264
-bytes (`encrypted_send`); `encrypted_restart_message` peaked at 1,423,240 and
-`password_restart` at 1,352,680. No stack size was raised and the acceptance
-script's `complete` gate and stack-overflow detection are unchanged. This is
-local evidence on one Linux host; the hosted Linux run on the next candidate
-still has to pass, and the protected-account live sequence that follows this
-stage has now executed only locally.
+with the original runtime phase order, assertions, timeouts and account
+operations retained. Claude reports the complete test passing locally after
+this change with a peak below 1.5 MiB. No stack size is raised. The source guard
+checks entry/completion within the coordinator and still requires the exact
+global phase allowlist with no duplicates; the runtime `complete` gate and
+stack-overflow detection are unchanged. Hosted execution of the merged
+candidate remains required, including the protected-account sequence.
+
+## Completed native run: `93d1358`
+
+[Run 38246027915](https://github.com/brk275/Morpheus/actions/runs/38246027915)
+tested `93d135844847b262679b3d5996fe7863b93ba2f1` on the four standard
+supported runners. Every native build, model/controller/device suite, vendor
+regression and SDK receipt check passed. Each Mac and Windows passed 855 tests;
+Linux passed 881. These totals exclude input-free diagnostic tests and skipped
+no-fixture integration paths. Each target retained one ignored live test.
+The helper jobs passed 501 tests with one skip. The history scan found no
+secrets in 56 commits; complete collected job logs also scanned clean.
+
+The real Slint keyboard/account harness and system generic-font projections
+passed on all four targets. Linux Xvfb startup, strict Wayland capture and
+Windows synthetic-window/display capture passed. Nine native Linux screenshots
+were reviewed: Nocturne, Terminal, Paper, sign-in, incoming call and room settings
+passed the inspected visual scope. Manage accounts and both password-dialog
+captures failed: stretched buttons squeezed the scrollable content. A subsequent
+source fix bounds those buttons and gives the body its own scroll area; it still
+needs fresh captures and keyboard/pointer checks. These images are not proof of
+VoiceOver, Narrator or Orca acceptance.
+
+Linux passed 18 substantive live Rust checks, plus three repeated diagnostic
+checks. OAuth login/refresh and restore/refresh now passed, including vault
+persistence and logout. Room settings passed all 13 facts after the disposable
+fixture's rate-limit adjustment. The pre-synced stock Element Call peer again
+passed all 11 facts. Two live checks still failed:
+
+- `live_local`: confirmed stack overflow/SIGABRT at `encrypted_restart_message`;
+  the protected-account sequence was not reached.
+- Current/DM incoming calls: `account_fresh_offer` timed out before account
+  switching. Discovery observed 20 passes with no verified receipts and 22
+  malformed membership results; no admission or queue event occurred during
+  that wait. The other three ringing cases passed.
+
+Source review traced that discovery failure to a valid Current leave event
+retained in the SDK sticky cache after the previous call. Discovery was passing
+it to the join-only admission parser and rejecting the entire reconciliation.
+The follow-up ignores only validated departures after the existing sender/device
+trust and size checks. Departures remain invalid join evidence, and caller
+presence, receipt expiry, replay and membership invalidation checks stay in
+place. This explanation matches the observed counters; the repair and its
+negative regressions still require the next native/live run.
+
+The final CI acceptance job correctly failed. All job/cache posts and fixture
+cleanup completed. Only fictional preview PNGs and provenance were uploaded;
+no installer was published. The next candidate combines the reviewed staged
+test repair with account durability, modal layout and metadata styling changes;
+these new inputs do not inherit this run's passing evidence. Physical devices,
+provider handoff, screen readers, installation, signing and updates remain open.
 
 ## Account access and style expansion, 2026-10-12
 

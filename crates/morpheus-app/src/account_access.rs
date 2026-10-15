@@ -35,6 +35,7 @@ pub(crate) struct AccountAccessUi {
     can_change: Arc<dyn Fn() -> bool + Send + Sync>,
     pending: Mutex<Option<Pending>>,
     generation: Arc<AtomicU64>,
+    accounts_refresh_generation: Arc<AtomicU64>,
     busy: AtomicBool,
 }
 
@@ -52,6 +53,7 @@ impl AccountAccessUi {
             can_change: Arc::new(can_change),
             pending: Mutex::new(None),
             generation: Arc::new(AtomicU64::new(0)),
+            accounts_refresh_generation: Arc::new(AtomicU64::new(0)),
             busy: AtomicBool::new(false),
         });
         let access = this.clone();
@@ -250,6 +252,10 @@ impl AccountAccessUi {
     }
 
     pub(crate) async fn refresh_accounts(&self) {
+        let generation = self
+            .accounts_refresh_generation
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
         let accounts = self.live.manager.accounts().await;
         let status = self.live.manager.app_password_status().await;
         let active = self.live.manager.active_account().await;
@@ -262,7 +268,12 @@ impl AccountAccessUi {
                 removal_pending: status.pending_removals.contains(&account.id),
             })
             .collect::<Vec<_>>();
+        let current_generation = self.accounts_refresh_generation.clone();
         let _ = self.ui.upgrade_in_event_loop(move |ui| {
+            // An earlier Manage refresh must not reinsert a row after removal.
+            if current_generation.load(Ordering::Acquire) != generation {
+                return;
+            }
             ui.set_saved_accounts(ModelRc::new(VecModel::from(rows)));
             ui.set_app_password_enabled(status.enabled);
         });
@@ -339,6 +350,8 @@ impl AccountAccessUi {
                         // A partial removal may already have revoked the active account.
                         if access.live.manager.active_account().await.is_none() {
                             access.live.account_detached(access.ui.clone()).await;
+                        } else {
+                            access.live.refresh_account_menu(access.ui.clone()).await;
                         }
                         if result.is_err() && access.live.manager.active_account().await.is_some() {
                             // Tombstone persistence may fail before any revocation.

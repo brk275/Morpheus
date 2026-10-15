@@ -430,7 +430,14 @@ class LiveStageTests(unittest.TestCase):
     def test_source_emits_exact_allowlisted_stage_identifiers(self):
         source = (Path(__file__).resolve().parents[2]
                   / "crates/morpheus-matrix/tests/live_local.rs").read_text()
-        outer = re.findall(r"phase!\(([a-z_]+)\)", source)
+        # Stage helpers can follow the test in the file. Check entry/completion
+        # in the actual coordinator, not the lexical order of helper bodies.
+        coordinator = re.search(
+            r"(?ms)^fn two_homeservers_switch_restore_and_encrypted_restart\(\) \{\n(.*?)^\}",
+            source,
+        )
+        self.assertIsNotNone(coordinator, "the live acceptance coordinator must exist")
+        outer = re.findall(r"phase!\(([a-z_]+)\)", coordinator.group(1))
         self.assertEqual(outer[0], "fixture")
         self.assertEqual(outer[-1], "complete")
         source += (Path(__file__).resolve().parents[2]

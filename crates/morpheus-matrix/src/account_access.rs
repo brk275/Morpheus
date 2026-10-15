@@ -96,6 +96,19 @@ impl AccessFence {
                 Ok(fence)
             }
             Err(error) if create && error.kind() == std::io::ErrorKind::NotFound => {
+                // Losing the policy file must not turn an existing profile off.
+                // This also refuses implicit migration of pre-policy profiles.
+                let registry_absent = matches!(
+                    fs::symlink_metadata(data_dir.join("accounts.json")),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                );
+                let accounts_empty = fs::read_dir(data_dir.join("accounts"))
+                    .map_err(|_| MatrixCoreError::AppPasswordUnavailable)?
+                    .next()
+                    .is_none();
+                if !registry_absent || !accounts_empty {
+                    return Err(MatrixCoreError::AppPasswordUnavailable);
+                }
                 let fence = Self {
                     version: 1,
                     profile: Uuid::new_v4().to_string(),
@@ -429,16 +442,16 @@ impl AccountManager {
         Ok(())
     }
 
-    pub(super) fn access_permit(&self) -> Result<AccessPermit> {
+    pub(super) fn access_permit(&self) -> Result<Arc<AccessPermit>> {
         let worker = self
             .access_worker
             .clone()
             .try_acquire_owned()
             .map_err(|_| MatrixCoreError::AccountAccessBusy)?;
-        Ok(AccessPermit {
+        Ok(Arc::new(AccessPermit {
             _worker: worker,
             _profile_lock: self._access_lock.clone(),
-        })
+        }))
     }
 
     pub(super) fn validate_challenge(
@@ -607,7 +620,12 @@ mod tests {
         static ENTRIES: OnceLock<StdMutex<MockEntries>> = OnceLock::new();
         ENTRIES.get_or_init(|| StdMutex::new(HashMap::new()))
     }
-    struct SharedMock(Arc<keyring::mock::MockCredential>);
+    type CredentialOverrides = HashMap<(String, String), Arc<keyring::credential::Credential>>;
+    fn overrides() -> &'static StdMutex<CredentialOverrides> {
+        static OVERRIDES: OnceLock<StdMutex<CredentialOverrides>> = OnceLock::new();
+        OVERRIDES.get_or_init(|| StdMutex::new(HashMap::new()))
+    }
+    struct SharedMock(Arc<keyring::credential::Credential>);
     impl CredentialApi for SharedMock {
         fn set_secret(&self, secret: &[u8]) -> std::result::Result<(), keyring::Error> {
             self.0.set_secret(secret)
@@ -623,6 +641,14 @@ mod tests {
         }
     }
     pub(super) fn vault_entry(service: &str, id: &str) -> keyring::Entry {
+        if let Some(credential) = overrides()
+            .lock()
+            .unwrap()
+            .get(&(service.into(), id.into()))
+            .cloned()
+        {
+            return keyring::Entry::new_with_credential(Box::new(SharedMock(credential)));
+        }
         let credential = entries()
             .lock()
             .unwrap()
@@ -676,6 +702,365 @@ mod tests {
             .unwrap();
     }
 
+    struct ControlledCredential {
+        backing: Arc<keyring::mock::MockCredential>,
+        before_write: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+    impl CredentialApi for ControlledCredential {
+        fn set_secret(&self, value: &[u8]) -> std::result::Result<(), keyring::Error> {
+            if let Some(before_write) = self.before_write.lock().unwrap().take() {
+                before_write();
+            }
+            self.backing.set_secret(value)
+        }
+        fn get_secret(&self) -> std::result::Result<Vec<u8>, keyring::Error> {
+            self.backing.get_secret()
+        }
+        fn delete_credential(&self) -> std::result::Result<(), keyring::Error> {
+            self.backing.delete_credential()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+    fn controlled_credential(
+        id: &str,
+        before_write: impl FnOnce() + Send + 'static,
+    ) -> Arc<keyring::mock::MockCredential> {
+        let backing = Arc::new(keyring::mock::MockCredential::default());
+        overrides().lock().unwrap().insert(
+            (KEYRING_SERVICE.into(), id.into()),
+            Arc::new(ControlledCredential {
+                backing: backing.clone(),
+                before_write: StdMutex::new(Some(Box::new(before_write))),
+            }),
+        );
+        backing
+    }
+    fn login_secret(account: &AccountInfo) -> StoredSecret {
+        StoredSecret {
+            version: SECRET_VERSION,
+            store_passphrase: "synthetic store passphrase".into(),
+            session: StoredSession::Matrix(MatrixSession {
+                meta: matrix_sdk::SessionMeta {
+                    user_id: UserId::parse(&account.user_id).unwrap(),
+                    device_id: account.device_id.as_str().into(),
+                },
+                tokens: matrix_sdk::SessionTokens {
+                    access_token: "synthetic access token".into(),
+                    refresh_token: None,
+                },
+            }),
+        }
+    }
+    fn pending_login(manager: &AccountManager) -> (authentication::PendingStore, AccountInfo) {
+        let store = authentication::PendingStore::new(manager).unwrap();
+        let mut saved = account();
+        saved.id = store.id.clone();
+        (store, saved)
+    }
+    async fn assert_blocked_login(manager: &AccountManager, saved: &AccountInfo) {
+        assert!(manager.accounts().await.contains(saved));
+        assert!(
+            manager
+                .app_password_status()
+                .await
+                .pending_removals
+                .contains(&saved.id)
+        );
+        assert!(matches!(
+            manager.switch_to(&saved.id).await,
+            Err(MatrixCoreError::AccountRemovalPending)
+        ));
+    }
+
+    #[test]
+    fn cancelled_login_write_retains_cleanup_owner_and_cannot_resurrect_after_removal() {
+        runtime().block_on(async {
+            let directory = TestDirectory::new();
+            let manager = Arc::new(AccountManager::open(&directory.0).unwrap());
+            let (mut store, saved) = pending_login(&manager);
+            let (entered, waiting) = oneshot::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let credential = controlled_credential(&saved.id, move || {
+                let _ = entered.send(());
+                blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+            let task_manager = manager.clone();
+            let task_account = saved.clone();
+            let writer = tokio::spawn(async move {
+                let permit = task_manager.access_permit().unwrap();
+                let mut state = task_manager.state.lock().await;
+                task_manager
+                    .persist_new_account(
+                        &mut state,
+                        &task_account,
+                        &mut store,
+                        login_secret(&task_account),
+                        permit,
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(2), waiting)
+                .await
+                .unwrap()
+                .unwrap();
+            writer.abort();
+            assert!(writer.await.unwrap_err().is_cancelled());
+            assert!(manager.account_access_busy());
+            assert!(
+                manager
+                    .app_password_status()
+                    .await
+                    .pending_removals
+                    .contains(&saved.id)
+            );
+            assert!(matches!(
+                manager.remove_account(&saved.id).await,
+                Err(MatrixCoreError::AccountAccessBusy)
+            ));
+            assert!(
+                directory
+                    .0
+                    .join("accounts")
+                    .join(&saved.id)
+                    .join(".pending-browser-login")
+                    .is_file()
+            );
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while manager.account_access_busy() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(credential.get_secret().is_ok());
+            assert_blocked_login(&manager, &saved).await;
+            assert!(manager.remove_account(&saved.id).await.unwrap().complete);
+            assert!(matches!(
+                credential.get_secret(),
+                Err(keyring::Error::NoEntry)
+            ));
+            assert!(!directory.0.join("accounts").join(&saved.id).exists());
+            assert!(manager.accounts().await.is_empty());
+        });
+    }
+
+    #[test]
+    fn pending_registry_sync_failure_never_starts_a_vault_write() {
+        runtime().block_on(async {
+            let directory = TestDirectory::new();
+            let manager = AccountManager::open(&directory.0).unwrap();
+            let (mut store, saved) = pending_login(&manager);
+            let result = {
+                let permit = manager.access_permit().unwrap();
+                let mut state = manager.state.lock().await;
+                manager
+                    .persist_new_account_with_sync(
+                        &mut state,
+                        &saved,
+                        &mut store,
+                        login_secret(&saved),
+                        permit,
+                        |_| {
+                            Err(
+                                std::io::Error::other("injected pending directory sync failure")
+                                    .into(),
+                            )
+                        },
+                    )
+                    .await
+            };
+            assert!(result.is_err());
+            drop(store);
+            assert_blocked_login(&manager, &saved).await;
+            assert!(matches!(
+                vault_entry(KEYRING_SERVICE, &saved.id).get_password(),
+                Err(keyring::Error::NoEntry)
+            ));
+            assert!(manager.remove_account(&saved.id).await.unwrap().complete);
+        });
+    }
+
+    #[test]
+    fn final_registry_sync_failure_recovers_blocked_row_after_restart() {
+        runtime().block_on(async {
+            let directory = TestDirectory::new();
+            let manager = AccountManager::open(&directory.0).unwrap();
+            let (mut store, saved) = pending_login(&manager);
+            let result = {
+                let permit = manager.access_permit().unwrap();
+                let mut state = manager.state.lock().await;
+                let mut syncs = 0;
+                manager
+                    .persist_new_account_with_sync(
+                        &mut state,
+                        &saved,
+                        &mut store,
+                        login_secret(&saved),
+                        permit,
+                        |path| {
+                            syncs += 1;
+                            if syncs == 2 {
+                                Err(
+                                    std::io::Error::other("injected final directory sync failure")
+                                        .into(),
+                                )
+                            } else {
+                                sync_registry_directory(path)
+                            }
+                        },
+                    )
+                    .await
+            };
+            assert!(result.is_err());
+            assert_blocked_login(&manager, &saved).await;
+            let disk: Registry =
+                serde_json::from_slice(&fs::read(directory.0.join("accounts.json")).unwrap())
+                    .unwrap();
+            assert!(
+                !disk.pending_removals.contains(&saved.id),
+                "test must cross the successful final rename"
+            );
+            drop(store);
+            manager.stop().await;
+            drop(manager);
+            let manager = AccountManager::open(&directory.0).unwrap();
+            assert!(manager.active_account().await.is_none());
+            assert!(manager.last_active_account_id().await.is_none());
+            assert_blocked_login(&manager, &saved).await;
+            assert!(manager.remove_account(&saved.id).await.unwrap().complete);
+        });
+    }
+
+    #[test]
+    fn final_registry_save_failure_and_vault_delete_failure_remain_retryable() {
+        runtime().block_on(async {
+            let directory = TestDirectory::new();
+            let manager = AccountManager::open(&directory.0).unwrap();
+            let (mut store, saved) = pending_login(&manager);
+            let registry_path = directory.0.join("accounts.json");
+            let pending_bytes = Arc::new(StdMutex::new(Vec::new()));
+            let captured = pending_bytes.clone();
+            let broken_path = registry_path.clone();
+            let credential = controlled_credential(&saved.id, move || {
+                *captured.lock().unwrap() = fs::read(&broken_path).unwrap();
+                fs::remove_file(&broken_path).unwrap();
+                fs::create_dir(&broken_path).unwrap();
+            });
+            let result = {
+                let permit = manager.access_permit().unwrap();
+                let mut state = manager.state.lock().await;
+                manager
+                    .persist_new_account(
+                        &mut state,
+                        &saved,
+                        &mut store,
+                        login_secret(&saved),
+                        permit,
+                    )
+                    .await
+            };
+            assert!(result.is_err());
+            drop(store);
+            assert!(
+                directory
+                    .0
+                    .join("accounts")
+                    .join(&saved.id)
+                    .join("store")
+                    .is_dir()
+            );
+            assert_blocked_login(&manager, &saved).await;
+            fs::remove_dir(&registry_path).unwrap();
+            fs::write(&registry_path, &*pending_bytes.lock().unwrap()).unwrap();
+            credential.inner.lock().unwrap().get_mut().error =
+                Some(keyring::Error::PlatformFailure(Box::new(
+                    std::io::Error::other("fixture vault unavailable"),
+                )));
+            let removal = manager.remove_account(&saved.id).await.unwrap();
+            assert!(!removal.complete && !removal.credentials_removed);
+            assert_blocked_login(&manager, &saved).await;
+            assert!(manager.remove_account(&saved.id).await.unwrap().complete);
+            assert!(matches!(
+                credential.get_secret(),
+                Err(keyring::Error::NoEntry)
+            ));
+        });
+    }
+
+    #[test]
+    fn successful_login_commit_disarms_journal_without_changing_active_authority() {
+        runtime().block_on(async {
+            let directory = TestDirectory::new();
+            let manager = AccountManager::open(&directory.0).unwrap();
+            let previous = account();
+            {
+                let mut state = manager.state.lock().await;
+                state.registry.accounts.push(previous.clone());
+                state.registry.active_account_id = Some(previous.id.clone());
+                state.active_account_id = Some(previous.id.clone());
+                save_registry(&directory.0, &state.registry).unwrap();
+            }
+            manager.publish_active_account(Some(previous.clone()));
+            let selection = manager.account_selection(&previous.id).unwrap();
+            let (mut store, saved) = pending_login(&manager);
+            {
+                let permit = manager.access_permit().unwrap();
+                let mut state = manager.state.lock().await;
+                manager
+                    .persist_new_account(
+                        &mut state,
+                        &saved,
+                        &mut store,
+                        login_secret(&saved),
+                        permit,
+                    )
+                    .await
+                    .unwrap();
+            }
+            drop(store);
+            assert_eq!(manager.active_account().await, Some(previous));
+            assert!(selection.is_current());
+            assert!(
+                manager
+                    .app_password_status()
+                    .await
+                    .pending_removals
+                    .is_empty()
+            );
+            assert!(
+                directory
+                    .0
+                    .join("accounts")
+                    .join(&saved.id)
+                    .join("store")
+                    .is_dir()
+            );
+            assert!(
+                !directory
+                    .0
+                    .join("accounts")
+                    .join(&saved.id)
+                    .join(".pending-browser-login")
+                    .exists()
+            );
+            manager.stop().await;
+            drop(manager);
+            let manager = AccountManager::open(&directory.0).unwrap();
+            assert!(
+                manager
+                    .app_password_status()
+                    .await
+                    .pending_removals
+                    .is_empty()
+            );
+            assert!(manager.accounts().await.contains(&saved));
+            assert!(manager.remove_account(&saved.id).await.unwrap().complete);
+        });
+    }
+
     #[test]
     fn password_verification_rejects_wrong_password_and_missing_vault_entry() {
         let entry = mock_entry();
@@ -713,8 +1098,9 @@ mod tests {
             let mut registry = Registry::default();
             registry.accounts.push(saved.clone());
             registry.active_account_id = Some(saved.id.clone());
-            save_registry(&directory.0, &registry).unwrap();
+            fs::create_dir(directory.0.join("accounts")).unwrap();
             let mut fence = AccessFence::open(&directory.0).unwrap();
+            save_registry(&directory.0, &registry).unwrap();
             fence.enabled = true;
             fence.save(&directory.0).unwrap();
             let manager = AccountManager::open(&directory.0).unwrap();
@@ -827,6 +1213,8 @@ mod tests {
                 active_account_id: Some(saved.id.clone()),
                 ..Registry::default()
             };
+            let initial = AccountManager::open(&directory.0).unwrap();
+            drop(initial);
             save_registry(&directory.0, &registry).unwrap();
             let manager = AccountManager::open(&directory.0).unwrap();
             assert!(manager.last_active_account_id().await.is_none());
@@ -890,6 +1278,76 @@ mod tests {
                 Err(MatrixCoreError::AppPasswordUnavailable)
             ));
         });
+    }
+
+    #[test]
+    fn missing_fence_refuses_existing_profiles_without_replacing_data() {
+        runtime().block_on(async {
+            let directory = TestDirectory::new();
+            let manager = AccountManager::open(&directory.0).unwrap();
+            let saved = account();
+            {
+                let mut state = manager.state.lock().await;
+                state.registry.accounts.push(saved.clone());
+                state.registry.active_account_id = Some(saved.id.clone());
+                save_registry(&directory.0, &state.registry).unwrap();
+            }
+            manager
+                .set_app_password(None, Zeroizing::new("fixture profile password".into()))
+                .await
+                .unwrap();
+            let registry_before = fs::read(directory.0.join("accounts.json")).unwrap();
+            let store = directory.0.join("accounts").join(&saved.id);
+            fs::create_dir(&store).unwrap();
+            fs::write(store.join("preserved"), b"account fixture").unwrap();
+            manager.stop().await;
+            drop(manager);
+            fs::remove_file(directory.0.join(ACCESS_FILE)).unwrap();
+            assert!(matches!(
+                AccountManager::open(&directory.0),
+                Err(MatrixCoreError::AppPasswordUnavailable)
+            ));
+            assert!(!directory.0.join(ACCESS_FILE).exists());
+            assert_eq!(
+                fs::read(directory.0.join("accounts.json")).unwrap(),
+                registry_before
+            );
+            assert_eq!(
+                fs::read(store.join("preserved")).unwrap(),
+                b"account fixture"
+            );
+        });
+    }
+
+    #[test]
+    fn missing_fence_creation_requires_no_registry_and_an_empty_account_directory() {
+        for case in [
+            "empty_registry",
+            "invalid_registry",
+            "unreadable_registry",
+            "unknown_directory",
+        ] {
+            let directory = TestDirectory::new();
+            fs::create_dir(directory.0.join("accounts")).unwrap();
+            match case {
+                "empty_registry" => save_registry(&directory.0, &Registry::default()).unwrap(),
+                "invalid_registry" => {
+                    fs::write(directory.0.join("accounts.json"), b"invalid").unwrap()
+                }
+                "unreadable_registry" => fs::create_dir(directory.0.join("accounts.json")).unwrap(),
+                "unknown_directory" => {
+                    fs::create_dir(directory.0.join("accounts").join("unknown")).unwrap()
+                }
+                _ => unreachable!(),
+            }
+            assert!(AccountManager::open(&directory.0).is_err(), "{case}");
+            assert!(!directory.0.join(ACCESS_FILE).exists(), "{case}");
+        }
+        let directory = TestDirectory::new();
+        let manager = AccountManager::open(&directory.0).unwrap();
+        assert!(!AccessFence::read(&directory.0).unwrap().enabled);
+        drop(manager);
+        assert!(AccountManager::open(&directory.0).is_ok());
     }
 
     #[test]

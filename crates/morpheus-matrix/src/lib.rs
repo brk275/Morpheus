@@ -671,14 +671,15 @@ impl AccountManager {
         let data_dir = data_dir.into();
         fs::create_dir_all(data_dir.join("accounts"))?;
         let access_lock = account_access::lock_profile(&data_dir)?;
-        let access = account_access::AccessFence::open(&data_dir)?;
         let registry_path = data_dir.join("accounts.json");
-        let registry: Registry = match fs::read(registry_path) {
+        let mut registry: Registry = match fs::read(registry_path) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Registry::default(),
             Err(e) => return Err(e.into()),
         };
         registry.validate()?;
+        let access = account_access::AccessFence::open(&data_dir)?;
+        authentication::recover_pending_login_rows(&data_dir, &mut registry)?;
         authentication::cleanup_pending_stores(&data_dir, &registry)?;
         let (active_tx, _) = watch::channel(None);
         let (sync_tx, _) = watch::channel(SyncStatus::Stopped);
@@ -753,6 +754,76 @@ impl AccountManager {
         }
     }
 
+    // A pending registry row owns the UUID before any credential can be written.
+    // A cancelled future leaves that row blocked and the worker's permit alive.
+    async fn persist_new_account(
+        &self,
+        state: &mut State,
+        account: &AccountInfo,
+        store: &mut authentication::PendingStore,
+        secret: StoredSecret,
+        permit: Arc<account_access::AccessPermit>,
+    ) -> Result<()> {
+        self.persist_new_account_with_sync(
+            state,
+            account,
+            store,
+            secret,
+            permit,
+            sync_registry_directory,
+        )
+        .await
+    }
+
+    async fn persist_new_account_with_sync(
+        &self,
+        state: &mut State,
+        account: &AccountInfo,
+        store: &mut authentication::PendingStore,
+        secret: StoredSecret,
+        permit: Arc<account_access::AccessPermit>,
+        mut sync_directory: impl FnMut(&Path) -> Result<()>,
+    ) -> Result<()> {
+        if account.id != store.id
+            || state
+                .registry
+                .accounts
+                .iter()
+                .any(|saved| saved.id == account.id)
+        {
+            return Err(MatrixCoreError::InvalidSession);
+        }
+        let mut pending = state.registry.clone();
+        pending.accounts.push(account.clone());
+        pending.pending_removals.push(account.id.clone());
+        let pending_save = save_registry(&self.data_dir, &pending);
+        // Any ambiguous initial save is represented as blocked in memory. No
+        // vault write occurs until both replacement and directory sync succeed.
+        state.registry = pending;
+        pending_save?;
+        sync_directory(&self.data_dir)?;
+        save_secret(&account.id, secret, self._access_lock.clone(), Some(permit)).await?;
+        let mut committed = state.registry.clone();
+        committed.pending_removals.retain(|id| id != &account.id);
+        if !state.access.enabled {
+            committed.active_account_id = Some(account.id.clone());
+        }
+        save_registry(&self.data_dir, &committed)?;
+        // Keep the in-memory tombstone and owned marker on ambiguous failure.
+        // Startup restores a blocked row from that marker before activation.
+        sync_directory(&self.data_dir)?;
+        if store.commit().is_err() {
+            // The journal still owns the interrupted commit. Keep the old
+            // blocked row visible and best-effort persist that state; startup
+            // also recognizes the retained marker if this write cannot finish.
+            let _ = save_registry(&self.data_dir, &state.registry);
+            let _ = sync_directory(&self.data_dir);
+            return Err(MatrixCoreError::AccountRemovalPending);
+        }
+        state.registry = committed;
+        Ok(())
+    }
+
     /// Password login creates a new Matrix device and its own encrypted local
     /// store. The password itself is never persisted.
     pub async fn add_password_account(
@@ -762,20 +833,15 @@ impl AccountManager {
         password: &str,
     ) -> Result<AccountInfo> {
         let homeserver = validate_homeserver(homeserver)?;
-        let _permit = self.access_permit()?;
+        let permit = self.access_permit()?;
         let mut state = self.state.lock().await;
         state.access = account_access::AccessFence::read(&self.data_dir)?;
-        let id = Uuid::new_v4().to_string();
-        let store_path = self.store_path(&id);
-        fs::create_dir_all(&store_path)?;
+        // Declared before Client so cancellation drops the client first. If
+        // SQLite releases Windows handles later, the owned marker permits retry.
+        let mut store = authentication::PendingStore::new(self)?;
+        let id = store.id.clone();
         let passphrase = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-        let client = match build_client(&homeserver, &store_path, &passphrase).await {
-            Ok(client) => client,
-            Err(e) => {
-                let _ = fs::remove_dir_all(&store_path);
-                return Err(e);
-            }
-        };
+        let client = build_client(&homeserver, &store.path, &passphrase).await?;
         let response = match client
             .matrix_auth()
             .login_username(username, password)
@@ -784,9 +850,10 @@ impl AccountManager {
             .await
         {
             Ok(response) => response,
-            Err(e) => {
-                let _ = fs::remove_dir_all(&store_path);
-                return Err(MatrixCoreError::Sdk(e.to_string()));
+            Err(_) => {
+                return Err(MatrixCoreError::Sdk(
+                    "Matrix password sign-in failed. Check your homeserver and credentials, then try again.".into(),
+                ));
             }
         };
         let session: MatrixSession = (&response).into();
@@ -803,44 +870,34 @@ impl AccountManager {
             .any(|a| a.user_id == account.user_id && a.device_id == account.device_id)
         {
             let _ = client.logout().await;
-            let _ = fs::remove_dir_all(&store_path);
             return Err(MatrixCoreError::DuplicateAccount);
         }
         if let Err(error) = start_event_cache(&client) {
             let _ = client.logout().await;
-            let _ = fs::remove_dir_all(&store_path);
             return Err(error);
         }
-        if let Err(e) = save_secret(
-            &id,
-            StoredSecret {
-                version: SECRET_VERSION,
-                store_passphrase: passphrase.clone(),
-                session: StoredSession::Matrix(session),
-            },
-            self._access_lock.clone(),
-        )
-        .await
+        if let Err(error) = self
+            .persist_new_account(
+                &mut state,
+                &account,
+                &mut store,
+                StoredSecret {
+                    version: SECRET_VERSION,
+                    store_passphrase: passphrase.clone(),
+                    session: StoredSession::Matrix(session),
+                },
+                permit.clone(),
+            )
+            .await
         {
+            // The pending row owns any partial vault write until explicit
+            // local removal. A failed remote logout cannot erase that owner.
             let _ = client.logout().await;
-            let _ = fs::remove_dir_all(&store_path);
-            return Err(e);
-        }
-        let mut next = state.registry.clone();
-        next.accounts.push(account.clone());
-        if !state.access.enabled {
-            next.active_account_id = Some(id.clone());
-        }
-        if let Err(e) = save_registry(&self.data_dir, &next) {
-            let _ = delete_secret(&id, self._access_lock.clone()).await;
-            let _ = client.logout().await;
-            let _ = fs::remove_dir_all(&store_path);
-            return Err(e);
+            return Err(error);
         }
         if state.access.enabled {
             // The Matrix password authenticates this new device, not the app
             // access policy. Save it paused and let the caller request a grant.
-            state.registry = next;
             return Ok(account);
         }
         self.selections.replace(None);
@@ -852,7 +909,6 @@ impl AccountManager {
             self._access_lock.clone(),
         ));
         state.loaded.insert(id, loaded.clone());
-        state.registry = next;
         state.active_account_id = Some(account.id.clone());
         self.publish_active_account(Some(account.clone()));
         self.start_sync(&mut state, loaded.client.clone()).await;
@@ -2405,6 +2461,7 @@ impl LoadedAccount {
                                     session,
                                 },
                                 profile_lock.clone(),
+                                None,
                             )
                             .await
                             {
@@ -3090,6 +3147,61 @@ fn validate_loopback_redirect(raw: &str) -> Result<Url> {
     Ok(url)
 }
 
+#[cfg(not(windows))]
+fn replace_registry_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_registry_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let invalid = || std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid registry path");
+    if source.as_os_str().encode_wide().any(|unit| unit == 0)
+        || destination.as_os_str().encode_wide().any(|unit| unit == 0)
+    {
+        return Err(invalid());
+    }
+    // canonicalize supplies extended Windows paths, preserving long and
+    // non-ASCII names. The destination may not exist, so resolve its parent.
+    let source = fs::canonicalize(source)?;
+    let destination = fs::canonicalize(destination.parent().ok_or_else(invalid)?)?
+        .join(destination.file_name().ok_or_else(invalid)?);
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
+    }
+    const REPLACE_EXISTING: u32 = 1;
+    const WRITE_THROUGH: u32 = 8;
+    // SAFETY: both pointers refer to live, NUL-terminated UTF-16 buffers.
+    // Kernel32 does not retain them; the signature matches the Windows ABI.
+    let replaced = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            REPLACE_EXISTING | WRITE_THROUGH,
+        )
+    };
+    if replaced == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn sync_registry_directory(data_dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    fs::File::open(data_dir)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = data_dir;
+    Ok(())
+}
+
 fn save_registry(data_dir: &Path, registry: &Registry) -> Result<()> {
     registry.validate()?;
     let path = data_dir.join("accounts.json");
@@ -3107,7 +3219,7 @@ fn save_registry(data_dir: &Path, registry: &Registry) -> Result<()> {
         use std::io::Write;
         file.write_all(&bytes)?;
         file.sync_all()?;
-        fs::rename(&temp, &path)?;
+        replace_registry_file(&temp, &path)?;
         Ok(())
     })();
     if write_result.is_err() {
@@ -3116,11 +3228,17 @@ fn save_registry(data_dir: &Path, registry: &Registry) -> Result<()> {
     write_result
 }
 
-async fn save_secret(id: &str, secret: StoredSecret, profile_lock: Arc<fs::File>) -> Result<()> {
+async fn save_secret(
+    id: &str,
+    secret: StoredSecret,
+    profile_lock: Arc<fs::File>,
+    access_permit: Option<Arc<account_access::AccessPermit>>,
+) -> Result<()> {
     let id = id.to_owned();
     let payload = Zeroizing::new(serde_json::to_string(&secret)?);
     tokio::task::spawn_blocking(move || {
         let _profile_lock = profile_lock;
+        let _access_permit = access_permit;
         let entry = account_access::vault_entry(KEYRING_SERVICE, &id)
             .map_err(|e| MatrixCoreError::Keyring(e.to_string()))?;
         entry
@@ -3155,24 +3273,54 @@ async fn load_secret(id: &str, profile_lock: Arc<fs::File>) -> Result<StoredSecr
     serde_json::from_str(&payload).map_err(Into::into)
 }
 
-async fn delete_secret(id: &str, profile_lock: Arc<fs::File>) -> Result<()> {
-    let id = id.to_owned();
-    tokio::task::spawn_blocking(move || {
-        let _profile_lock = profile_lock;
-        let entry = account_access::vault_entry(KEYRING_SERVICE, &id)
-            .map_err(|e| MatrixCoreError::Keyring(e.to_string()))?;
-        match entry.delete_credential() {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(MatrixCoreError::Keyring(e.to_string())),
-        }
-    })
-    .await
-    .map_err(|e| MatrixCoreError::Keyring(e.to_string()))?
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn registry_replacement_preserves_long_unicode_paths_and_overwrites_atomically() {
+        let root = std::env::temp_dir().join(format!("morpheus-registry-{}", Uuid::new_v4()));
+        let directory = root
+            .join("界".repeat(24))
+            .join("long-segment".repeat(10))
+            .join("another-segment".repeat(10));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("temporary-界.json");
+        let destination = directory.join("accounts-界.json");
+        fs::write(&source, b"new registry").unwrap();
+        fs::write(&destination, b"old registry").unwrap();
+        replace_registry_file(&source, &destination).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"new registry");
+        assert!(!source.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn registry_replacement_failure_and_nul_rejection_preserve_existing_data() {
+        use std::os::windows::ffi::OsStringExt;
+        let root = std::env::temp_dir().join(format!("morpheus-registry-{}", Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("temporary.json");
+        let destination = root.join("occupied");
+        fs::write(&source, b"pending registry").unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("keep"), b"existing account").unwrap();
+        assert!(replace_registry_file(&source, &destination).is_err());
+        assert_eq!(fs::read(&source).unwrap(), b"pending registry");
+        assert_eq!(
+            fs::read(destination.join("keep")).unwrap(),
+            b"existing account"
+        );
+        let invalid = PathBuf::from(std::ffi::OsString::from_wide(&[65, 0, 66]));
+        assert_eq!(
+            replace_registry_file(&source, &invalid).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert!(source.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn only_the_selected_account_has_an_active_send_queue() {

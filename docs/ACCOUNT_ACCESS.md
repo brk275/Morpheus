@@ -28,6 +28,17 @@ or invalid verifier refuses protected activation. Password fields clear on
 submission and cancellation; Rust-owned password buffers are zeroized when
 dropped. Toolkit and operating-system memory cannot be guaranteed erased.
 
+### Missing policy files in pre-alpha profiles
+
+Startup refuses an existing profile whose `account-access.json` is missing or
+invalid. It preserves the account registry and stores; it does not silently
+turn protection off or read the vault to guess the old policy. A disabled
+policy is created only for a new profile with no account registry and an empty
+account directory. This deliberately does not migrate older pre-alpha
+profiles that lack the policy file. Restore that profile's original policy
+file from your own backup, or keep the old profile intact and use a separate
+new profile to sign in again. Do not fabricate a replacement policy file.
+
 ## Quick removal
 
 Choose **Remove** beside any saved account, then confirm the account shown.
@@ -47,6 +58,21 @@ cannot be opened. Choose **Retry removal**, restarting Morpheus first if files
 remain open. Success is reported only after both local credential and store
 cleanup are confirmed.
 
+An interrupted or failed sign-in can also leave an account marked **Removal
+pending**. Its registry row owns any partial vault write, so it cannot be
+opened and remains available for explicit cleanup. Startup reads the local
+commit marker and registry without querying the vault; an incomplete commit
+is blocked before restore. A locked or malformed marker refuses startup and
+preserves the files. It is never treated as permission to delete account data.
+
+Morpheus synchronizes the registry file before replacement and the parent
+directory on Unix; Windows registry replacement requests write-through. These
+are the filesystem's durability mechanisms, not a guarantee against faulty
+storage or every power-loss scenario. If marker cleanup is interrupted after
+sign-in, restart conservatively lists that account for cleanup even when its
+credential was saved. Removing it deletes its local keys and history, so keep
+the recovery key or another verified device as described above.
+
 If you forget the app password, remove every saved account first. Only after
 all account credentials and stores have been removed does **Reset password
 after removing all accounts** become available. This explicit reset cannot
@@ -54,16 +80,18 @@ unlock existing accounts.
 
 ## Verification status
 
-At `65b4ceb` ([run 38240049732](https://github.com/brk275/Morpheus/actions/runs/38240049732)),
+At `93d1358` ([run 38246027915](https://github.com/brk275/Morpheus/actions/runs/38246027915)),
 all four supported runner targets passed native builds, 16 core password/removal
 regressions, the notification-client lifetime regression and two account
 presentation/detach regressions. The unit account tests use an isolated mock
 vault; they do not prove real credential-vault behavior.
 
-Linux live acceptance stopped at `encrypted_restart` before the protected
-account sequence. OAuth login/refresh also failed at `vault_persist`, and its
-restore phase did not run. Real-vault protected switching/removal/restart,
-interactive dialogs, keyboard/screen-reader checks and installed-app acceptance
-remain open. Follow-up focus and real-Slint harness changes are separate,
-unverified inputs. These results are not beta acceptance. See
+Linux live acceptance stopped with a stack overflow at
+`encrypted_restart_message` before the protected-account sequence. OAuth
+login/refresh and restore/refresh both passed. The real Slint account keyboard
+harness passed on all four targets, but the Linux password/management screenshots
+revealed stretched action buttons. The subsequent layout and login-durability
+fixes require fresh native checks. Real-vault protected switching/removal/restart,
+screen readers and installed-app acceptance remain open. These results are not
+beta acceptance. See
 [verification](VERIFICATION.md).

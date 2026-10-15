@@ -84,6 +84,7 @@ edit, so spelling mistakes do not silently become inactive settings.
 | `typography.message_font_family` | Omitted | Message and composer family; omission follows the interface font |
 | `typography.monospace_font_family` | `"monospace"` | Timestamp and security-code family |
 | `typography.message_size` | `14` | 10–32 logical pixels before text scaling |
+| `typography.sender_weight` | Omitted | 100–900; sender-name weight in the timeline and thread headings/replies; omission preserves each surface's existing weight |
 | `geometry.corner_radius` | `10` | 0–24; base radius for core controls and conversation surfaces |
 | `geometry.message_gap` | `12` | 0–32; base vertical message padding, adjusted by density |
 | `geometry.content_padding` | `24` | 0–48; conversation inset and composer margin |
@@ -91,6 +92,9 @@ edit, so spelling mistakes do not silently become inactive settings.
 | `chat.layout` | `"stacked"` | `"stacked"`, `"compact"` or `"columns"` |
 | `chat.show_avatars` | `true` | Show message avatars; hiding them also removes their gutter |
 | `chat.show_timestamps` | `true` | Show optional message timestamps; pending/failed delivery labels remain visible |
+| `chat.timestamp_format` | `"twelve_hour"` | `"twelve_hour"`, `"twenty_four_hour"` or `"twenty_four_hour_seconds"`; local-clock format in the timeline and thread replies |
+| `chat.timestamp_brackets` | `false` | Put square brackets around actual timestamps; delivery labels and missing clocks stay unchanged |
+| `chat.timestamp_width` | `72` | 48–160 logical pixels before text scaling; timestamp gutter in Columns layout |
 | `chat.color_senders` | `false` | Use the current sender palette for name text |
 | `chat.nickname_width` | `128` | 64–240; desired nickname column width |
 
@@ -107,6 +111,21 @@ leave the message family blank to inherit the interface font and choose
 **Apply fonts**. In TOML, omit `message_font_family` to inherit; an explicitly
 empty string is invalid.
 
+Sender weight is independent of message-body formatting. Choose a number in
+Settings or **Restore sender weight defaults** to remove the override. Omission
+keeps the existing 650 timeline weight, 700 thread-reply weight and 750 thread-root
+heading weight. Combined compact headers apply the same weight to their time
+label. Installed fonts may approximate weights they do not provide.
+
+Timestamp formats use the operating system's local timezone: `3:04 PM`, `15:04`
+or `15:04:05`. Square brackets are optional. These fixed formats do not accept
+an arbitrary formatting language. Changes update existing timeline rows and
+thread replies immediately, including after config reload; search results keep
+their existing date-and-time labels. Missing timestamps remain blank and the
+`Sending…` / `Failed to send` labels remain visible even when timestamps are
+hidden. Narrow timestamp columns elide visually and retain the full accessible
+label. Increase the column width for larger fonts, seconds or brackets.
+
 Geometry values are logical pixels, independent of desktop DPI. Global text
 scale still multiplies message size. Compact density uses half the configured
 message padding; comfortable uses it unchanged; spacious uses about 1.33 times
@@ -118,7 +137,9 @@ Stacked places names above messages. Compact uses smaller name headers and
 avatars. Columns aligns nicknames and timestamps beside the message body;
 long names may elide visually but keep their complete accessibility label.
 When the conversation is narrower than 640 logical pixels, or 640 multiplied by
-a text scale above 100%, columns uses a compact header. Nickname columns also
+a text scale above 100%, columns uses a compact header. A timestamp width above
+72 adds the extra scaled width to that threshold, preserving message/action
+space. Nickname columns also
 stay within 20% of the conversation width. Pane sizes contribute to the minimum
 window width, preserving at least 360 logical pixels for the main content.
 Hide the details panel or reduce the pane widths for a smaller workspace.
@@ -139,6 +160,7 @@ scale_percent = 100
 message_font_family = "monospace"
 monospace_font_family = "monospace"
 message_size = 13
+sender_weight = 500
 
 [geometry]
 corner_radius = 0
@@ -150,6 +172,9 @@ rail_width = 52
 layout = "columns"
 show_avatars = false
 show_timestamps = true
+timestamp_format = "twenty_four_hour_seconds"
+timestamp_brackets = true
+timestamp_width = 88
 color_senders = true
 nickname_width = 112
 ```
@@ -157,9 +182,10 @@ nickname_width = 112
 The appearance controls cover the main conversation, navigation, composer and
 reusable controls. Some call and modal surfaces still have fixed geometry.
 Theme packs add optional semantic colors and a sender-name palette to the
-original eleven color tokens; see [Theme files](#theme-files). Font weights,
-line-height controls, timestamp formatting, background images and arbitrary
-pane arrangements remain future work. Theme packs cannot execute code.
+original eleven color tokens; see [Theme files](#theme-files). Message-body font
+weights, line-height controls, background images and arbitrary pane arrangements
+remain future work. The pinned rich-text component does not expose body-weight
+or line-height controls. Theme packs cannot execute code.
 
 ### Preferences awaiting implementation
 

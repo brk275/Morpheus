@@ -18,6 +18,7 @@ mod incoming_ring;
 mod live;
 #[cfg(feature = "native-calls")]
 mod local_video;
+mod message_metadata;
 mod notifications;
 #[cfg(feature = "native-calls")]
 mod outgoing_ring;
@@ -141,6 +142,7 @@ fn message(
     reaction: &str,
     accent: Color,
 ) -> MessageItem {
+    let clocks = message_metadata::ClockLabels::from_preview(time);
     MessageItem {
         event_id: SharedString::default(),
         is_own: false,
@@ -148,6 +150,8 @@ fn message(
         sender_palette_index: appearance::sender_palette_index(sender),
         initials: initials.into(),
         time: time.into(),
+        time_24h: clocks.twenty_four_hour.into(),
+        time_24h_seconds: clocks.twenty_four_hour_seconds.into(),
         body: body.into(),
         rich_body: StyledText::from_plain_text(body),
         rich_accessible_body: body.into(),
@@ -4071,7 +4075,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         });
                     }
                 }
-                Err(error) => show_login_error(&ui, error.to_string()),
+                Err(error) => {
+                    access.refresh_accounts().await;
+                    let mut message = error.to_string();
+                    if !live.manager.app_password_status().await.pending_removals.is_empty() {
+                        message.push_str(" Some saved accounts need cleanup. Open Manage accounts and choose Retry removal.");
+                    }
+                    show_login_error(&ui, message);
+                }
             }
         });
     });
@@ -4157,7 +4168,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         });
                     }
                 }
-                Err(error) => show_login_error(&ui, error),
+                Err(error) => {
+                    access.refresh_accounts().await;
+                    let mut message = error;
+                    if !live.manager.app_password_status().await.pending_removals.is_empty() {
+                        message.push_str(" Some saved accounts need cleanup. Open Manage accounts and choose Retry removal.");
+                    }
+                    show_login_error(&ui, message);
+                }
             }
         });
     });

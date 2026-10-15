@@ -9,7 +9,6 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use chrono::{Local, TimeZone};
 use morpheus_matrix::{
     AccountInfo, AccountManager, AccountSelection, ComposeSendTarget, ComposeText,
     DownloadedAttachment, EditBaseline, MatrixCoreError, MatrixLinkTarget, MessageInfo,
@@ -747,6 +746,26 @@ impl LiveUi {
     pub(crate) fn navigation_is_current(&self, navigation_epoch: u64) -> bool {
         self.is_live.load(Ordering::Acquire)
             && self.navigation_epoch.load(Ordering::Acquire) == navigation_epoch
+    }
+
+    /// Refresh saved identities after removal without reopening the room or
+    /// querying its members. A queued pre-removal snapshot must not reinsert it.
+    pub(crate) async fn refresh_account_menu(&self, ui: Weak<AppWindow>) {
+        let render_epoch = self.render_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let accounts = self.manager.accounts().await;
+        let Some(active) = self.manager.active_account().await else {
+            return;
+        };
+        let current_epoch = self.render_epoch.clone();
+        let is_live = self.is_live.clone();
+        let _ = ui.upgrade_in_event_loop(move |ui| {
+            if is_live.load(Ordering::Acquire)
+                && current_epoch.load(Ordering::Acquire) == render_epoch
+                && ui.get_active_account_local_id().as_str() == active.id
+            {
+                apply_account_menu(&ui, &accounts, &active);
+            }
+        });
     }
 
     pub async fn refresh(self: &Arc<Self>, ui: Weak<AppWindow>) -> Result<(), MatrixCoreError> {
@@ -1702,41 +1721,7 @@ fn apply_snapshot(
         ui.set_thread_markdown(false);
         ui.set_thread_send_pending(false);
     }
-    let active_index = view
-        .accounts
-        .iter()
-        .position(|account| account.id == view.active.id)
-        .unwrap_or(0);
-    let items = view
-        .accounts
-        .iter()
-        .enumerate()
-        .map(|(index, account)| account_item(account, index == active_index))
-        .collect::<Vec<_>>();
-    let options = std::iter::once(active_index)
-        .chain((0..view.accounts.len()).filter(|index| *index != active_index))
-        .map(|index| {
-            let item = &items[index];
-            AccountOption {
-                local_id: view.accounts[index].id.as_str().into(),
-                index: index as i32,
-                name: item.name.clone(),
-                handle: item.handle.clone(),
-                initials: item.initials.clone(),
-                accent: item.accent,
-            }
-        })
-        .collect::<Vec<_>>();
-    let account = &items[active_index];
-    ui.set_accounts(ModelRc::new(VecModel::from(items.clone())));
-    ui.set_account_options(ModelRc::new(VecModel::from(options)));
-    ui.set_active_account_index(active_index as i32);
-    ui.set_active_account_local_id(view.active.id.as_str().into());
-    ui.set_active_account_name(account.name.clone());
-    ui.set_active_account_handle(account.handle.clone());
-    ui.set_active_account_initials(account.initials.clone());
-    ui.set_active_account_status(account.status.clone());
-    ui.set_active_account_accent(account.accent);
+    apply_account_menu(ui, &view.accounts, &view.active);
     let active_space_name = view
         .selected_space
         .as_deref()
@@ -1948,6 +1933,41 @@ fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::Securi
     ui.set_transfer_notice("".into());
 }
 
+pub(crate) fn apply_account_menu(ui: &AppWindow, accounts: &[AccountInfo], active: &AccountInfo) {
+    let Some(active_index) = accounts.iter().position(|account| account.id == active.id) else {
+        return;
+    };
+    let items = accounts
+        .iter()
+        .enumerate()
+        .map(|(index, account)| account_item(account, index == active_index))
+        .collect::<Vec<_>>();
+    let options = std::iter::once(active_index)
+        .chain((0..accounts.len()).filter(|index| *index != active_index))
+        .map(|index| {
+            let item = &items[index];
+            AccountOption {
+                local_id: accounts[index].id.as_str().into(),
+                index: index as i32,
+                name: item.name.clone(),
+                handle: item.handle.clone(),
+                initials: item.initials.clone(),
+                accent: item.accent,
+            }
+        })
+        .collect::<Vec<_>>();
+    let account = &items[active_index];
+    ui.set_accounts(ModelRc::new(VecModel::from(items.clone())));
+    ui.set_account_options(ModelRc::new(VecModel::from(options)));
+    ui.set_active_account_index(active_index as i32);
+    ui.set_active_account_local_id(active.id.as_str().into());
+    ui.set_active_account_name(account.name.clone());
+    ui.set_active_account_handle(account.handle.clone());
+    ui.set_active_account_initials(account.initials.clone());
+    ui.set_active_account_status(account.status.clone());
+    ui.set_active_account_accent(account.accent);
+}
+
 fn account_item(account: &AccountInfo, selected: bool) -> AccountItem {
     let name = display_user(&account.user_id);
     let account_initials = initials(&name);
@@ -2040,15 +2060,8 @@ fn member_item(info: &RoomMemberInfo) -> MemberItem {
 fn message_item(info: &MessageInfo) -> MessageItem {
     let sender = display_user(&info.sender);
     let sender_initials = initials(&sender);
-    let time = match info.send_state {
-        MessageSendState::Pending => "Sending…".to_owned(),
-        MessageSendState::Failed => "Failed to send".to_owned(),
-        MessageSendState::Sent => Local
-            .timestamp_millis_opt(info.timestamp_ms as i64)
-            .single()
-            .map(|time| time.format("%-I:%M %p").to_string())
-            .unwrap_or_default(),
-    };
+    let clocks =
+        crate::message_metadata::ClockLabels::for_message(info.timestamp_ms, info.send_state);
     let display_body = if info.attachment_name.as_deref() == Some(info.body.as_str()) {
         ""
     } else {
@@ -2085,7 +2098,9 @@ fn message_item(info: &MessageInfo) -> MessageItem {
         sender: sender.into(),
         sender_palette_index: crate::appearance::sender_palette_index(&info.sender),
         initials: sender_initials.into(),
-        time: time.into(),
+        time: clocks.twelve_hour.into(),
+        time_24h: clocks.twenty_four_hour.into(),
+        time_24h_seconds: clocks.twenty_four_hour_seconds.into(),
         body: display_body.into(),
         rich_body,
         rich_accessible_body: rich_accessible_body.into(),

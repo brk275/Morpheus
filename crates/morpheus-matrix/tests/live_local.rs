@@ -252,12 +252,11 @@ fn two_homeservers_switch_restore_and_encrypted_restart() {
         .enable_all()
         .build()
         .expect("Cannot start local test runtime");
-    // Each stage is its own `async fn`. libtest runs this test on a 2 MiB
-    // thread, and at the unoptimized test profile an async block's poll frame
-    // holds every temporary of the whole block. One block for all stages
-    // needed 1.1 MiB before any SDK call; building the restored encrypted
-    // timeline then overflowed the stack. Add new stages as separate
-    // functions rather than extending one of these blocks.
+    // Separate stages limit the temporaries retained in a single poll frame.
+    // The previous monolithic test overflowed the hosted Linux test stack at
+    // encrypted restart; see docs/VERIFICATION.md for the diagnosis and limits
+    // of the local measurements. Add new stages as separate functions instead
+    // of growing one async block. The runner's stack limits stay unchanged.
     runtime.block_on(async {
         let (manager, alice, a_body) = login_alice_and_send(&live).await;
         let carol = login_carol_and_switch(&live, manager, &alice, &a_body).await;

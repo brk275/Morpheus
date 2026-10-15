@@ -850,6 +850,20 @@ fn reconcile_room(
             cached.reject(room.room_id().as_str(), gate);
             return;
         }
+        // A valid leave remains in the sticky cache until its TTL expires.
+        // It is absence from the joined roster, not malformed join evidence.
+        // Preserve all trust/bounds checks above; malformed pseudo-leaves still
+        // reach the strict parser and reject this reconciliation below.
+        if super::departed_membership_envelope(
+            &value,
+            room.room_id().as_str(),
+            member.event_id.as_str(),
+            encryption.sender.as_str(),
+            device.as_str(),
+            &member.key.sticky_key,
+        ) {
+            continue;
+        }
         let Ok(parsed) = membership_envelope(
             &value,
             room.room_id().as_str(),

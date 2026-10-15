@@ -116,6 +116,44 @@ fn assert_passwords_empty(ui: &AppWindow) {
     assert!(ui.get_access_confirm_password().is_empty());
 }
 
+fn assert_removed_account_menu_projection(ui: &AppWindow) {
+    let account = |id: &str, name: &str| morpheus_matrix::AccountInfo {
+        id: id.into(),
+        user_id: format!("@{name}:example.org"),
+        device_id: "PRESENTATION".into(),
+        homeserver: "https://example.org".into(),
+    };
+    let removed = account("removed", "jules");
+    let active = account("active", "casey");
+    let remaining = account("remaining", "sam");
+    crate::live::apply_account_menu(ui, &[removed, active.clone(), remaining.clone()], &active);
+    assert_eq!(ui.get_active_account_index(), 1);
+    assert_eq!(
+        ui.get_account_options().row_data(0).unwrap().local_id,
+        "active"
+    );
+
+    // Removing a row before the active one changes numeric indices. Preserve
+    // each remaining option's identity and the selected alias, without a room
+    // snapshot or a new sign-in being needed to refresh the menu.
+    crate::live::apply_account_menu(ui, &[active.clone(), remaining], &active);
+    assert_eq!(ui.get_active_account_index(), 0);
+    assert_eq!(ui.get_active_account_local_id(), "active");
+    assert_eq!(ui.get_active_account_handle(), "@casey:example.org");
+    assert_eq!(ui.get_accounts().row_count(), 2);
+    let options = ui.get_account_options().iter().collect::<Vec<_>>();
+    assert_eq!(options.len(), 2);
+    assert_eq!(options[0].local_id, "active");
+    assert_eq!(options[0].index, 0);
+    assert_eq!(options[1].local_id, "remaining");
+    assert_eq!(options[1].index, 1);
+    assert!(
+        ui.get_accounts()
+            .iter()
+            .all(|item| item.handle != "@jules:example.org")
+    );
+}
+
 #[test]
 fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
     // Slint's event-loop proxy is process-global. Keep all real-window account
@@ -194,6 +232,39 @@ async fn exercise_account_ui(runtime: Handle) {
     key(&ui, Key::Return); // restored account trigger
     assert!(ui.get_account_menu_open());
     ui.set_account_menu_open(false);
+
+    // Click an unfocused real action once. Account controls use a full-size
+    // forwarded focus rectangle so ScrollView can reveal the whole button;
+    // that rectangle must not consume the press before the existing TouchArea.
+    ui.set_manage_accounts_open(true);
+    settle(&ui).await;
+    key(&ui, Key::Tab); // Done -> Add, so Done is not already focused
+    let logical_size = ui.window().size().to_logical(ui.window().scale_factor());
+    let text_scale = ui.get_font_scale_percent() as f32 / 100.0;
+    let dialog_height = (680.0 * text_scale).min(logical_size.height - 32.0);
+    // Center of the fixed Done footer: centered dialog, 20px outer padding,
+    // 40px scaled action height. No font metrics or caption width assumptions.
+    let position = slint::LogicalPosition::new(
+        logical_size.width / 2.0,
+        (logical_size.height + dialog_height) / 2.0 - 20.0 - 20.0 * text_scale,
+    );
+    ui.window()
+        .dispatch_event(WindowEvent::PointerMoved { position });
+    ui.window().dispatch_event(WindowEvent::PointerPressed {
+        position,
+        button: slint::platform::PointerEventButton::Left,
+    });
+    ui.window().dispatch_event(WindowEvent::PointerReleased {
+        position,
+        button: slint::platform::PointerEventButton::Left,
+    });
+    settle(&ui).await;
+    assert!(
+        !ui.get_manage_accounts_open(),
+        "one click must activate Done"
+    );
+    assert!(!ui.get_account_menu_open());
+    assert!(!ui.get_access_open());
 
     // The real registered submit callback clears every password property even
     // when confirmation is invalid, before it can start any asynchronous work.
@@ -393,6 +464,7 @@ async fn exercise_account_ui(runtime: Handle) {
     assert!(ui.get_security_recovery_key().is_empty());
     assert!(manager.active_account().await.is_none());
 
+    assert_removed_account_menu_projection(&ui);
     ui.hide().unwrap();
     drop(ui); // Drops the registered controller callbacks.
     drop(access);

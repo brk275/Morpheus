@@ -589,13 +589,12 @@ fn membership<T>(
     membership_envelope(&envelope, room, event, encryption.sender.as_str(), device)
 }
 
-fn membership_envelope(
-    envelope: &Value,
+fn membership_fields<'a>(
+    envelope: &'a Value,
     room: &str,
     event: &str,
     user: &str,
-    device: &str,
-) -> Result<Membership, AdmissionFailure> {
+) -> Result<(&'a Value, &'a str, InteropMode), AdmissionFailure> {
     if !matches!(
         envelope.get("type").and_then(Value::as_str),
         Some("m.rtc.member" | "org.matrix.msc4143.rtc.member")
@@ -627,6 +626,61 @@ fn membership_envelope(
         Some("m.call#ROOM") => InteropMode::Sticky2025,
         _ => return Err(AdmissionFailure::Membership),
     };
+    Ok((content, logical_id, mode))
+}
+
+/// Discovery can ignore a verified departure retained by the sticky cache.
+/// This never creates a joined membership or relaxes the admission parser.
+/// The caller has already checked byte limits and SDK sender/device trust.
+fn departed_membership_envelope(
+    envelope: &Value,
+    room: &str,
+    event: &str,
+    user: &str,
+    device: &str,
+    sticky_key: &str,
+) -> bool {
+    let Ok((content, logical_id, _)) = membership_fields(envelope, room, event, user) else {
+        return false;
+    };
+    if logical_id != sticky_key
+        || content
+            .pointer("/member/membership")
+            .and_then(Value::as_str)
+            != Some("leave")
+        || content.get("application").is_some_and(|application| {
+            application.get("type").and_then(Value::as_str) != Some("m.call")
+        })
+    {
+        return false;
+    }
+    let key = content.get("sticky_key");
+    let unstable = content.get("msc4354_sticky_key");
+    if (key.is_none() && unstable.is_none())
+        || [key, unstable]
+            .into_iter()
+            .flatten()
+            .any(|value| value.as_str() != Some(logical_id))
+    {
+        return false;
+    }
+    [("/member/user_id", user), ("/member/device_id", device)]
+        .into_iter()
+        .all(|(path, expected)| {
+            content
+                .pointer(path)
+                .is_none_or(|value| value.as_str() == Some(expected))
+        })
+}
+
+fn membership_envelope(
+    envelope: &Value,
+    room: &str,
+    event: &str,
+    user: &str,
+    device: &str,
+) -> Result<Membership, AdmissionFailure> {
+    let (content, logical_id, mode) = membership_fields(envelope, room, event, user)?;
     if !matches_membership(
         MembershipEvidence {
             sender: user,
@@ -735,5 +789,106 @@ mod tests {
             candidate["content"]["member"]["membership"] = json!("leave");
             assert!(parse(&candidate).is_err());
         }
+    }
+
+    fn departed(value: &Value) -> bool {
+        departed_membership_envelope(
+            value,
+            "!room:example.org",
+            "$member",
+            "@caller:example.org",
+            "CALLER",
+            "logical",
+        )
+    }
+
+    #[test]
+    fn retained_departures_are_discovery_only_and_never_join_evidence() {
+        for (slot, event_type) in [
+            ("m.call#room", "m.rtc.member"),
+            ("m.call#ROOM", "org.matrix.msc4143.rtc.member"),
+        ] {
+            for unstable in [false, true] {
+                let field = if unstable {
+                    "msc4354_sticky_key"
+                } else {
+                    "sticky_key"
+                };
+                let mut leave = event();
+                leave["type"] = json!(event_type);
+                leave["content"]["slot_id"] = json!(slot);
+                leave["content"]["member"]["membership"] = json!("leave");
+                leave["content"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("sticky_key");
+                leave["content"][field] = json!("logical");
+                // This is the pinned RTC for_leave wire shape: application is
+                // a join-only field and is absent on an ordinary departure.
+                leave["content"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("application");
+                assert!(departed(&leave));
+                assert!(parse(&leave).is_err());
+            }
+        }
+        assert!(!departed(&event()));
+        assert!(parse(&event()).is_ok());
+    }
+
+    #[test]
+    fn departure_classification_preserves_envelope_and_content_identity_checks() {
+        let mut leave = event();
+        leave["content"]["member"]["membership"] = json!("leave");
+        assert!(departed(&leave));
+        for (pointer, replacement) in [
+            ("/type", json!("m.room.message")),
+            ("/event_id", json!("$other")),
+            ("/sender", json!("@other:example.org")),
+            ("/room_id", json!("!other:example.org")),
+            ("/unsigned", json!({"redacted_because": {}})),
+            ("/unsigned", json!("malformed")),
+            ("/content/slot_id", json!("m.call#Room")),
+            ("/content/sticky_key", json!("other")),
+            ("/content/msc4354_sticky_key", json!("other")),
+            ("/content/member/id", json!("other")),
+            ("/content/member/id", json!("bad id")),
+            ("/content/member/id", json!("")),
+            ("/content/member/id", json!("x".repeat(256))),
+            ("/content/member/id", json!("bad\u{0000}id")),
+            ("/content/member/device_id", json!("OTHER")),
+            ("/content/member/user_id", json!("@other:example.org")),
+            ("/content/member/membership", json!("unknown")),
+            ("/content/application", json!(null)),
+            ("/content/application/type", json!("other")),
+        ] {
+            let mut changed = leave.clone();
+            let (parent, key) = pointer.rsplit_once('/').unwrap();
+            let object = if parent.is_empty() {
+                &mut changed
+            } else {
+                changed.pointer_mut(parent).unwrap()
+            };
+            object
+                .as_object_mut()
+                .unwrap()
+                .insert(key.into(), replacement);
+            assert!(!departed(&changed), "{pointer}");
+            assert!(parse(&changed).is_err());
+        }
+        assert!(!departed_membership_envelope(
+            &leave,
+            "!room:example.org",
+            "$member",
+            "@caller:example.org",
+            "CALLER",
+            "other"
+        ));
+        leave["content"]
+            .as_object_mut()
+            .unwrap()
+            .remove("sticky_key");
+        assert!(!departed(&leave));
     }
 }

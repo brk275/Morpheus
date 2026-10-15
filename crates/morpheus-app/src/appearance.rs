@@ -2,6 +2,7 @@
 
 use morpheus_config::{
     BuiltInStylePreset, Config, ConfigStore, ConversationHeaderMode, MessageLayout, ThemePack,
+    TimestampFormat,
 };
 use slint::fontique_011::fontique;
 use slint::{ComponentHandle, ModelRc, VecModel};
@@ -124,6 +125,14 @@ pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
         &config.typography.monospace_font_family,
     ));
     ui.set_message_font_size(config.typography.message_size.into());
+    ui.set_sender_font_weight(config.typography.sender_weight.unwrap_or(0).into());
+    ui.set_timestamp_format(match config.chat.timestamp_format {
+        TimestampFormat::TwelveHour => 0,
+        TimestampFormat::TwentyFourHour => 1,
+        TimestampFormat::TwentyFourHourSeconds => 2,
+    });
+    ui.set_timestamp_brackets(config.chat.timestamp_brackets);
+    ui.set_timestamp_width_px(config.chat.timestamp_width.into());
     ui.set_corner_radius_px(config.geometry.corner_radius.into());
     ui.set_message_gap_px(config.geometry.message_gap.into());
     ui.set_content_padding_px(config.geometry.content_padding.into());
@@ -152,6 +161,35 @@ pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
 }
 
 pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
+    let weak = ui.as_weak();
+    let store_for_weight = store.clone();
+    ui.on_set_sender_weight(move |value| {
+        let weight = match value {
+            0 => None,
+            100..=900 => Some(value as u16),
+            _ => return,
+        };
+        if let Some(ui) = weak.upgrade() {
+            let _ = save_config_change(&ui, &store_for_weight, |config| {
+                config.typography.sender_weight = weight;
+            });
+        }
+    });
+    let weak = ui.as_weak();
+    let store_for_clock = store.clone();
+    ui.on_choose_timestamp_format(move |index| {
+        let format = match index {
+            0 => TimestampFormat::TwelveHour,
+            1 => TimestampFormat::TwentyFourHour,
+            2 => TimestampFormat::TwentyFourHourSeconds,
+            _ => return,
+        };
+        if let Some(ui) = weak.upgrade() {
+            let _ = save_config_change(&ui, &store_for_clock, |config| {
+                config.chat.timestamp_format = format;
+            });
+        }
+    });
     let weak = ui.as_weak();
     let store_for_header = store.clone();
     ui.on_choose_conversation_header_mode(move |index| {
@@ -201,7 +239,7 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
     let weak = ui.as_weak();
     let store_for_number = store.clone();
     ui.on_change_style_number(move |field, value| {
-        if !(0..=5).contains(&field) {
+        if !(0..=6).contains(&field) {
             return;
         }
         if let Some(ui) = weak.upgrade() {
@@ -212,6 +250,7 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
                 3 => config.geometry.content_padding = value.clamp(0, 48) as u16,
                 4 => config.geometry.rail_width = value.clamp(44, 100) as u16,
                 5 => config.chat.nickname_width = value.clamp(64, 240) as u16,
+                6 => config.chat.timestamp_width = value.clamp(48, 160) as u16,
                 _ => unreachable!("validated appearance field"),
             });
         }
@@ -235,7 +274,7 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
     let weak = ui.as_weak();
     let store_for_flag = store.clone();
     ui.on_set_style_flag(move |field, value| {
-        if !(0..=2).contains(&field) {
+        if !(0..=3).contains(&field) {
             return;
         }
         if let Some(ui) = weak.upgrade() {
@@ -243,6 +282,7 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
                 0 => config.chat.show_avatars = value,
                 1 => config.chat.show_timestamps = value,
                 2 => config.chat.color_senders = value,
+                3 => config.chat.timestamp_brackets = value,
                 _ => unreachable!("validated appearance flag"),
             });
         }
