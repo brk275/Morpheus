@@ -3,6 +3,32 @@
 Morpheus is pre-alpha software with no approved installer release. This log records checks actually completed;
 the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
+## Live acceptance stack overflow diagnosis, 2026-10-15
+
+The `live_local` acceptance test aborted with a stack overflow (SIGABRT) at
+`encrypted_restart_message` in Linux CI for `65b4ceb` and `93d1358`
+([run 38246027915](https://github.com/brk275/Morpheus/actions/runs/38246027915)).
+A local reproduction against two loopback Synapse 1.162.0 homeservers and a
+disposable keyring measured the test thread's stack with a paint-and-scan probe
+at every phase marker. libtest runs the test on a 2,097,152-byte thread with
+`RUST_MIN_STACK` unset; the single async block holding every stage used
+1,143,881 bytes of poll frame before any SDK call at the unoptimized test
+profile, while the test future itself was only 19,376 bytes. The restored
+encrypted timeline build then peaked at 2,127,120 bytes and the following
+protected-account restart at 2,123,336 bytes. The SDK call chains themselves
+stayed under about 0.98 MiB at every stage, so this was an oversized test
+frame, not runtime recursion.
+
+The test now runs each stage as its own `async fn` behind a slim coordinator,
+with every phase marker, assertion and call in the original order. On the
+default 2 MiB stack the complete test passed locally with a peak of 1,470,264
+bytes (`encrypted_send`); `encrypted_restart_message` peaked at 1,423,240 and
+`password_restart` at 1,352,680. No stack size was raised and the acceptance
+script's `complete` gate and stack-overflow detection are unchanged. This is
+local evidence on one Linux host; the hosted Linux run on the next candidate
+still has to pass, and the protected-account live sequence that follows this
+stage has now executed only locally.
+
 ## Account access and style expansion, 2026-10-12
 
 Candidate `cab6c91` implements the local app password, protected activation
