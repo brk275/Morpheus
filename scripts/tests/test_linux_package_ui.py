@@ -67,14 +67,20 @@ class PackageKeyboardMockTests(unittest.TestCase):
             return process
 
         captured = io.StringIO()
-        with patch.object(smoke.subprocess, "Popen", side_effect=launch), \
+        with patch.object(smoke.sys, "platform", "linux"), \
+                patch.object(smoke.subprocess, "Popen", side_effect=launch), \
                 patch.object(smoke, "process_status", return_value=7), \
                 patch.object(smoke, "require_nonreaping_wait"), patch.object(smoke, "stop_process"), \
                 contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
             with self.assertRaises(RuntimeError):
                 smoke.launch_smoke(Path("/synthetic/app"))
         self.assertNotIn("PRIVATE_APPLICATION_DIAGNOSTIC", captured.getvalue())
-        self.assertIn('"app_log_public":false', captured.getvalue())
+        record = json.loads(captured.getvalue())
+        self.assertIs(record["app_log_public"], False)
+        self.assertEqual(record, {
+            "check": "installed_startup", "status": "failed", "app_log_public": False,
+            "diagnostic": {"category": "unclassified", "exit_status": 7, "missing_library": None},
+        })
 
     def test_minimal_launch_failure_never_installs_accessibility_dependencies(self):
         with patch.object(smoke, "linux_display_launch", side_effect=RuntimeError("failed")), \
