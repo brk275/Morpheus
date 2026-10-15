@@ -281,7 +281,10 @@ class WindowsCaptureTests(unittest.TestCase):
         with patch.object(capture, "guard"), patch.object(capture, "execute", side_effect=fail), contextlib.redirect_stdout(output):
             self.assertEqual(capture.main(), 1)
         facts = json.loads(output.getvalue().split(": ", 1)[1])
-        self.assertEqual(facts, {"passed": False, "stage": "window_frames", "failure": "capture", "status": 0xC0000005})
+        self.assertEqual(facts, {"passed": False, "stage": "window_frames", "failure": "capture", "status": 0xC0000005,
+                                 "diagnostics": {"test_log": "complete", "named_test_failed": False,
+                                                 "panic_reason": "none", "fixture_stage": "unavailable",
+                                                 "fixture_exit_code": None}})
         self.assertNotIn("PRIVATE", output.getvalue())
 
     def test_unexpected_errors_are_static_and_not_passed(self):
@@ -327,8 +330,94 @@ class WindowsCaptureTests(unittest.TestCase):
                     patch.object(capture.tempfile, "TemporaryDirectory", return_value=UnsuccessfulCleanup()), contextlib.redirect_stdout(output):
                 self.assertEqual(capture.main(), 1)
             facts = json.loads(output.getvalue().split(": ", 1)[1])
-            self.assertEqual(facts, {"passed": False, "stage": "complete", "failure": "internal"})
+            self.assertEqual(facts, {"passed": False, "stage": "complete", "failure": "internal",
+                                     "diagnostics": {"test_log": "missing", "named_test_failed": False,
+                                                     "panic_reason": "none", "fixture_stage": "unavailable",
+                                                     "fixture_exit_code": None}})
             self.assertNotIn("PRIVATE", output.getvalue())
+
+    def test_panic_diagnostics_accept_only_reviewed_prefixes_and_named_test(self):
+        for thread_suffix in ("", " (1234)"):
+            header = (f"thread '{capture.TARGET}'{thread_suffix} panicked at "
+                      "PRIVATE\\tests\\windows_capture.rs:42:9:\n")
+            for message, reason in capture.PANIC_REASONS.items():
+                with self.subTest(message=message, suffix=thread_suffix):
+                    self.assertEqual(capture.panic_reason(header + message), reason)
+                    self.assertEqual(capture.panic_reason(header + message + ": PRIVATE-OS-ERROR"), reason)
+            self.assertEqual(capture.panic_reason(header + "PRIVATE-UNKNOWN-PANIC"), "unknown")
+            self.assertEqual(capture.panic_reason(header + "fixture window exited early-extra"), "unknown")
+            self.assertEqual(capture.panic_reason(header + "x" * 2049), "unknown")
+            self.assertEqual(capture.panic_reason(header + "fixture window exited early\n" + header), "ambiguous")
+            self.assertEqual(capture.panic_reason(header.replace(capture.TARGET, "another_test") +
+                                                  "fixture window exited early"), "none")
+            self.assertEqual(capture.panic_reason(header.replace("windows_capture.rs", "other.rs") +
+                                                  "fixture window exited early"), "none")
+
+    def test_bounded_test_log_never_accepts_partial_oversized_or_missing_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "test.log"
+            self.assertEqual(capture.bounded_test_output(path), ("missing", ""))
+            path.write_bytes(b"a\r\nb\xff")
+            self.assertEqual(capture.bounded_test_output(path), ("complete", "a\nb\ufffd"))
+            path.write_bytes(b"x" * capture.MAX_TEST_LOG_BYTES)
+            self.assertEqual(capture.bounded_test_output(path)[0], "complete")
+            path.write_bytes(b"x" * (capture.MAX_TEST_LOG_BYTES + 1))
+            self.assertEqual(capture.bounded_test_output(path), ("oversized", ""))
+            self.assertFalse(capture.passed(capture.bounded_test_output(path)[1]))
+            with patch.object(Path, "open", side_effect=PermissionError("PRIVATE-PATH")):
+                self.assertEqual(capture.bounded_test_output(path), ("read_failed", ""))
+
+    def test_fixture_diagnostics_reject_unknown_stages_and_non_u32_exit_codes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for stage in capture.FIXTURE_STAGES:
+                (root / "fixture-stage").write_text(stage)
+                self.assertEqual(capture.diagnostic_facts(root)["fixture_stage"], stage)
+            for invalid in ("PRIVATE", "ready\nPRIVATE", "x" * 200):
+                (root / "fixture-stage").write_text(invalid)
+                self.assertEqual(capture.diagnostic_facts(root)["fixture_stage"], "unknown")
+            (root / "fixture-stage").write_bytes(b"\xff")
+            self.assertEqual(capture.diagnostic_facts(root)["fixture_stage"], "unavailable")
+            for code in (0, 3, 0xC0000005, 0xFFFFFFFF):
+                (root / "fixture-exit-code").write_text(str(code))
+                self.assertEqual(capture.diagnostic_facts(root)["fixture_exit_code"], code)
+            for invalid in ("-1", "true", "4294967296", "3\nPRIVATE", "x" * 200, "0" * 11):
+                (root / "fixture-exit-code").write_text(invalid)
+                self.assertIsNone(capture.diagnostic_facts(root)["fixture_exit_code"])
+
+    def test_named_failure_diagnostics_survive_cleanup_without_private_payload(self):
+        paths = []
+        def fail(root, environment):
+            paths.append(root)
+            (root / "stage").write_text("window_ready")
+            (root / "fixture-stage").write_text("interactive_check")
+            (root / "fixture-exit-code").write_text("3")
+            (root / "test.log").write_bytes(
+                (f"test {capture.TARGET} ... FAILED\r\n"
+                 f"thread '{capture.TARGET}' (42) panicked at PRIVATE\\windows_capture.rs:31:9:\r\n"
+                 "fixture window exited early: PRIVATE-ERROR\r\n").encode())
+            raise capture.Failure("capture", 101)
+        output = io.StringIO()
+        with patch.object(capture, "guard"), patch.object(capture, "execute", side_effect=fail), contextlib.redirect_stdout(output):
+            self.assertEqual(capture.main(), 1)
+        facts = json.loads(output.getvalue().split(": ", 1)[1])
+        self.assertEqual(facts["diagnostics"], {"test_log": "complete", "named_test_failed": True,
+                         "panic_reason": "fixture_exited", "fixture_stage": "interactive_check", "fixture_exit_code": 3})
+        self.assertFalse(paths[0].exists())
+        self.assertNotIn("PRIVATE", output.getvalue())
+
+    def test_fixture_phases_and_panic_prefixes_match_reviewed_source(self):
+        rust = (capture.REPO / "crates/morpheus-rtc/tests/windows_capture.rs").read_text()
+        powershell = (capture.REPO / "scripts/windows_capture_window.ps1").read_text()
+        import re
+        self.assertEqual(set(re.findall(r'fixture.stage\("([a-z_]+)"\)', rust)), capture.STAGES - {"before_test"})
+        self.assertEqual(set(re.findall(r"Write-FixtureStage '([a-z_]+)'", powershell)), capture.FIXTURE_STAGES)
+        for prefix in capture.PANIC_REASONS:
+            self.assertIn('"' + prefix + '"', rust)
+        self.assertIn("Duration::from_secs(15)", rust)
+        self.assertIn("Duration::from_secs(10)", rust)
+        self.assertIn(".stdout(Stdio::null())", rust)
+        self.assertIn(".stderr(Stdio::null())", rust)
 
     def test_fixture_uses_only_fixed_commands_and_guarded_child_identity(self):
         rust = (capture.REPO / "crates/morpheus-rtc/tests/windows_capture.rs").read_text()

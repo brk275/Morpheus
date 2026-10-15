@@ -34,13 +34,50 @@ supported desktops remain required; see [verification](VERIFICATION.md).
 Choosing a preset fills in ordinary appearance, typography, geometry and chat
 settings, including pane sizes and details-panel visibility. Subsequent edits
 remain yours: there is no separate preset layer overriding them. Presets keep
-text scale, unread sorting, notifications, shortcuts, media preferences and
+text scale, navigation mode, Space labels, DM grouping, unread sorting, notifications, shortcuts, media preferences and
 account settings intact. **Base palette** changes the palette alone.
 
 The corresponding built-in theme names are `nocturne`, `terminal` and `paper`.
 Their palette files are embedded in the app. Setting only
 `appearance.theme_pack = "terminal"` selects its colors; use the in-app preset
 or set the fields below to select its fonts and layout too.
+
+## Navigation
+
+**Settings → Layout → Navigation** edits the same schema-version-1 fields as
+this optional table:
+
+```toml
+[layout]
+navigation = "sidebar"       # "rail" (default) or "sidebar"
+show_space_labels = true      # default false; labels under icon-rail Spaces
+group_direct_messages = false # default true; separate rooms and DMs
+sort_unread_first = true      # default false
+```
+
+`rail` preserves the existing icon column. `sidebar` places text routes for Home,
+Discover, Calls and Settings, followed by the same Spaces, into the scrollable
+room list. The active Matrix account control stays at the bottom left. Space
+names are always visible in sidebar mode; `show_space_labels` affects only the
+icon rail, where long names are shortened visually and retain their complete
+accessible label. Rail width remains saved while the rail is hidden.
+
+With grouping off, rooms and DMs share one list ordered by case-folded name and
+room ID. Unread-first sorting moves unread conversations above read ones and
+preserves that ordering within each section. DM and voice-room identities,
+unread badges and normal open/join actions remain distinct. The quick switcher
+and next/previous unread shortcuts follow the displayed order. Invitations keep
+their separate controls. Space membership and account selection do not change.
+
+Settings and file edits update the current view without restarting sync. If a
+mode change removes the focused navigation control, focus moves to the account
+control before removal; typing in a composer or modal keeps its existing focus.
+Omitting the table restores rail mode, hidden rail labels and separate DMs.
+Unknown modes or misspelled fields reject the edit; the app keeps its last valid
+configuration. Appearance presets preserve these three navigation preferences.
+
+Native rendering, keyboard focus and screen-reader checks remain required on
+all supported platforms, including long names, many Spaces and 200% text scale.
 
 ## Room header
 
@@ -195,8 +232,6 @@ consumer. Changing them does not enable the described behavior:
 | Field | Pending behavior |
 | --- | --- |
 | `appearance.reduce_motion` | Motion preference; current UI has no explicit animations to reduce |
-| `layout.show_space_labels` | Visual Space-name toggle; accessible names already identify Spaces |
-| `layout.group_direct_messages` | Optional combined room/DM navigation |
 | `media.camera_device` | Saved camera selection |
 | `media.noise_suppression` | Configurable noise suppression |
 | `media.autoplay_animated_media` | Animated-media autoplay policy |

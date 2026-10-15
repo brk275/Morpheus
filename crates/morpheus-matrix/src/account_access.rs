@@ -1601,6 +1601,133 @@ mod tests {
     }
 
     #[test]
+    fn selected_logout_rejects_retargeted_aba_foreign_and_stopped_intents_without_effects() {
+        runtime().block_on(async {
+            let directory = TestDirectory::new();
+            let manager = AccountManager::open(&directory.0).unwrap();
+            let first = account();
+            let second = account();
+            for saved in [&first, &second] {
+                let store = directory.0.join("accounts").join(&saved.id);
+                fs::create_dir_all(&store).unwrap();
+                fs::write(store.join("keep"), b"owned history fixture").unwrap();
+                vault_entry(KEYRING_SERVICE, &saved.id)
+                    .set_password("owned credential fixture")
+                    .unwrap();
+            }
+            {
+                let mut state = manager.state.lock().await;
+                state.registry.accounts = vec![first.clone(), second.clone()];
+                state.registry.active_account_id = Some(first.id.clone());
+                state.active_account_id = Some(first.id.clone());
+                save_registry(&directory.0, &state.registry).unwrap();
+            }
+            manager.publish_active_account(Some(first.clone()));
+            // This is the synchronous token captured by the initial UI click.
+            let queued = manager.account_selection(&first.id).unwrap();
+            let foreign_owner = crate::account_selection::Selections::default();
+            foreign_owner.replace(Some(&first.id));
+            let foreign = foreign_owner.for_account(&first.id).unwrap();
+            // A queued switch can win the transition lock; returning to the
+            // same ID, or a token from another manager, must not revive intent.
+            for (active, token) in [
+                (Some(second.clone()), queued.clone()),
+                (Some(first.clone()), queued.clone()),
+                (Some(first.clone()), foreign),
+                (None, queued),
+            ] {
+                {
+                    let mut state = manager.state.lock().await;
+                    state.active_account_id = active.as_ref().map(|a| a.id.clone());
+                    state.registry.active_account_id = state.active_account_id.clone();
+                    save_registry(&directory.0, &state.registry).unwrap();
+                }
+                manager.publish_active_account(active.clone());
+                let before = fs::read(directory.0.join("accounts.json")).unwrap();
+                let published = manager.subscribe_active_account().borrow().clone();
+                assert!(matches!(
+                    manager.logout_selected_account(&token).await,
+                    Err(MatrixCoreError::SelectedAccountChanged)
+                ));
+                assert_eq!(fs::read(directory.0.join("accounts.json")).unwrap(), before);
+                assert_eq!(manager.active_account().await, active);
+                assert_eq!(*manager.subscribe_active_account().borrow(), published);
+                assert!(
+                    manager
+                        .app_password_status()
+                        .await
+                        .pending_removals
+                        .is_empty()
+                );
+                assert_eq!(manager.accounts().await, [first.clone(), second.clone()]);
+                for saved in [&first, &second] {
+                    assert_eq!(
+                        fs::read(directory.0.join("accounts").join(&saved.id).join("keep"))
+                            .unwrap(),
+                        b"owned history fixture"
+                    );
+                    assert_eq!(
+                        vault_entry(KEYRING_SERVICE, &saved.id)
+                            .get_password()
+                            .unwrap(),
+                        "owned credential fixture"
+                    );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn selected_logout_removes_only_current_target_and_reports_unconfirmed_remote_logout() {
+        runtime().block_on(async {
+            let directory = TestDirectory::new();
+            let manager = AccountManager::open(&directory.0).unwrap();
+            let first = account();
+            let second = account();
+            for saved in [&first, &second] {
+                let store = directory.0.join("accounts").join(&saved.id);
+                fs::create_dir_all(&store).unwrap();
+                fs::write(store.join("keep"), b"owned history fixture").unwrap();
+            }
+            // No first-account credential exists in this isolated mock vault:
+            // remote logout is unavailable, but explicit local removal works.
+            vault_entry(KEYRING_SERVICE, &second.id)
+                .set_password("other account credential fixture")
+                .unwrap();
+            {
+                let mut state = manager.state.lock().await;
+                state.registry.accounts = vec![first.clone(), second.clone()];
+                state.registry.active_account_id = Some(first.id.clone());
+                state.active_account_id = Some(first.id.clone());
+                save_registry(&directory.0, &state.registry).unwrap();
+            }
+            manager.publish_active_account(Some(first.clone()));
+            let selected = manager.account_selection(&first.id).unwrap();
+            let result = manager.logout_selected_account(&selected).await.unwrap();
+            assert!(!result.remote_logout_succeeded);
+            assert!(!selected.is_current());
+            assert!(manager.active_account().await.is_none());
+            assert!(manager.account_selection(&first.id).is_none());
+            assert_eq!(manager.accounts().await, [second.clone()]);
+            assert!(!directory.0.join("accounts").join(&first.id).exists());
+            assert!(
+                directory
+                    .0
+                    .join("accounts")
+                    .join(&second.id)
+                    .join("keep")
+                    .is_file()
+            );
+            assert_eq!(
+                vault_entry(KEYRING_SERVICE, &second.id)
+                    .get_password()
+                    .unwrap(),
+                "other account credential fixture"
+            );
+        });
+    }
+
+    #[test]
     fn failed_legacy_logout_never_retains_live_authority_or_same_id_bypass() {
         runtime().block_on(async {
             let directory = TestDirectory::new();

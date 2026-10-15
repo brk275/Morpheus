@@ -16,7 +16,9 @@ import uuid
 
 REPO = Path(__file__).resolve().parents[1]
 TARGET = "windows_selected_sources_change_and_stop"
-STAGES = {"before_test", "window_ready", "window_frames", "display_frames", "changed_pixels",
+STAGES = {"before_test", "window_ready", "window_enumeration", "window_identity",
+          "window_application", "source_enumeration", "source_identity", "display_enumeration",
+          "display_identity", "display_geometry", "window_frames", "display_frames", "changed_pixels",
           "reopen", "retitle_rejection", "closed_rejection", "complete"}
 FAILURES = {"guard", "job_setup", "job_assignment", "process_start", "process_wait",
             "deadline", "cleanup", "containment", "build", "discovery", "capture", "internal"}
@@ -24,6 +26,37 @@ OPERATIONS = {"job_create", "job_configure", "handle_duplicate", "process_create
               "job_assign", "thread_resume", "process_observe", "process_terminate",
               "process_completion", "process_wait", "process_exit_code", "job_query",
               "job_terminate", "job_drain"}
+
+FIXTURE_STAGES = {"load_forms", "load_drawing", "interactive_check", "display_check",
+                  "create_window", "show_window", "shown", "painted", "ready"}
+MAX_TEST_LOG_BYTES = 1024 * 1024
+# Only reviewed static panic prefixes become public codes. Appended OS errors,
+# paths, titles, identifiers and panic bodies are never emitted.
+PANIC_REASONS = {
+    "inspect fixture process": "fixture_process_observation",
+    "fixture window exited early": "fixture_exited",
+    "fixture acknowledgement timed out": "fixture_ack_timeout",
+    "launch synthetic fixture window": "fixture_launch",
+    "enumerate synthetic window": "window_enumeration",
+    "owned nonce window is missing or ambiguous": "window_identity",
+    "identify fixture application": "window_application",
+    "enumerate capture sources": "source_enumeration",
+    "fixture source key is missing or ambiguous": "source_identity",
+    "enumerate fixture monitors": "display_enumeration",
+    "fixture requires one isolated display": "display_count",
+    "resolve owned window monitor": "display_identity",
+    "fixture horizontal position": "window_geometry",
+    "fixture vertical position": "window_geometry",
+    "fixture width": "window_geometry",
+    "fixture height": "window_geometry",
+    "display horizontal position": "display_geometry",
+    "display vertical position": "display_geometry",
+    "display width": "display_geometry",
+    "display height": "display_geometry",
+    "owned fixture does not cover the full selected display": "display_coverage",
+    "capture owned synthetic source": "capture_source",
+    "synthetic source pixels did not match": "pixel_mismatch",
+}
 
 
 class Failure(Exception):
@@ -73,13 +106,66 @@ def guard(environment=None, platform=None):
         raise Failure("guard")
 
 
-def stage_fact(path):
+def fixed_file_fact(path, allowed):
     try:
         with path.open("rb") as stream:
             value = stream.read(65).decode("ascii")
     except (OSError, UnicodeError):
         return "unavailable"
-    return value if value in STAGES else "unknown"
+    return value if value in allowed else "unknown"
+
+
+def stage_fact(path):
+    return fixed_file_fact(path, STAGES)
+
+
+def bounded_test_output(path):
+    try:
+        with path.open("rb") as stream:
+            value = stream.read(MAX_TEST_LOG_BYTES + 1)
+    except FileNotFoundError:
+        return "missing", ""
+    except OSError:
+        return "read_failed", ""
+    if len(value) > MAX_TEST_LOG_BYTES:
+        return "oversized", ""
+    return "complete", value.decode("utf-8", errors="replace").replace("\r\n", "\n")
+
+
+def panic_reason(output):
+    header = re.compile(rf"^thread '{TARGET}'(?: \([0-9]+\))? panicked at "
+                        r"[^\n]{0,1024}windows_capture\.rs:[0-9]+:[0-9]+:$", re.M)
+    matches = list(header.finditer(output))
+    if not matches:
+        return "none"
+    if len(matches) != 1:
+        return "ambiguous"
+    message = output[matches[0].end() + 1:].split("\n", 1)[0]
+    if len(message) > 2048:
+        return "unknown"
+    for prefix, reason in PANIC_REASONS.items():
+        if message == prefix or message.startswith(prefix + ": "):
+            return reason
+    return "unknown"
+
+
+def diagnostic_facts(root):
+    log_state, output = bounded_test_output(root / "test.log")
+    exit_code = None
+    try:
+        with (root / "fixture-exit-code").open("rb") as stream:
+            raw = stream.read(11)
+        if re.fullmatch(rb"[0-9]{1,10}", raw) and int(raw) <= 0xFFFFFFFF:
+            exit_code = int(raw)
+    except OSError:
+        pass
+    return {
+        "test_log": log_state,
+        "named_test_failed": re.search(rf"^test {TARGET} \.\.\. FAILED$", output, re.M) is not None,
+        "panic_reason": panic_reason(output),
+        "fixture_stage": fixed_file_fact(root / "fixture-stage", FIXTURE_STAGES),
+        "fixture_exit_code": exit_code,
+    }
 
 
 def passed(output):
@@ -330,7 +416,8 @@ def execute(root, environment):
         executable = executable_from_output(build_log.read_text(errors="replace"))
         test_log = root / "test.log"
         code = owned_run(job, [str(executable), "--ignored", "--exact", TARGET, "--test-threads=1"], environment, test_log, 120)
-        if code or not passed(test_log.read_text(errors="replace")) or stage_fact(root / "stage") != "complete":
+        log_state, output = bounded_test_output(test_log)
+        if code or log_state != "complete" or not passed(output) or stage_fact(root / "stage") != "complete":
             raise Failure("capture", code)
     finally:
         job.close()
@@ -354,6 +441,7 @@ def main():
                 facts["passed"] = True
             finally:
                 facts["stage"] = stage_fact(root / "stage")
+                facts["diagnostics"] = diagnostic_facts(root)
     except BaseException as error:
         facts["passed"] = False
         details = failure_chain(error)

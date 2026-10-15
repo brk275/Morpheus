@@ -11,6 +11,12 @@ The package output goes to `dist/`. This command does not make a public release.
 
 ## Unsigned package validation
 
+The Windows job prepares [verified NSIS tools](../packaging/windows/NSIS_TOOLS.md)
+before running Cargo Packager. All three downloads have exact size and SHA-256
+pins; preparation refuses an existing tool cache. Its pure/mocked checks and
+in-memory validation of the pinned inputs pass. Actual Windows preparation and
+installer execution still require the next package run.
+
 The manual [`package-qa.yml`](../.github/workflows/package-qa.yml) workflow runs
 only on public `main` using standard hosted runners. It requires an explicit
 platform choice (`linux`, `windows`, `macos`, or `all`), defaulting to Linux.

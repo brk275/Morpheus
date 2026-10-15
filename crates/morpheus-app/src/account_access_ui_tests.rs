@@ -7,7 +7,7 @@ use crate::{
     AccountItem, MemberItem, MessageItem, MessageSearchItem, RoomItem, apply_config,
     voice_spaces::VoiceSpaces,
 };
-use morpheus_config::{BuiltInStylePreset, Config};
+use morpheus_config::{BuiltInStylePreset, Config, NavigationMode};
 use slint::fontique_011::fontique;
 use slint::platform::{Key, WindowEvent};
 use std::time::Duration;
@@ -110,10 +110,225 @@ fn assert_live_font_projections(ui: &AppWindow) {
     assert_installed_generic_family(ui.get_monospace_font_family().as_str(), Monospace);
 }
 
+async fn assert_navigation_projection_and_focus(ui: &AppWindow) {
+    let default = Config::default();
+    let mut sidebar = default.clone();
+    sidebar.layout.navigation = NavigationMode::Sidebar;
+    sidebar.layout.show_space_labels = true;
+    sidebar.layout.group_direct_messages = false;
+    let room = |id: &str, name: &str, unread| RoomItem {
+        id: id.into(),
+        name: name.into(),
+        unread,
+        ..Default::default()
+    };
+    ui.set_unsorted_channels(ModelRc::new(VecModel::from(vec![room("!z", "Zebra", 0)])));
+    ui.set_unsorted_direct_messages(ModelRc::new(VecModel::from(vec![room("!a", "Aster", 1)])));
+    ui.set_spaces(ModelRc::new(VecModel::from(vec![crate::SpaceItem {
+        id: "!workshop:example.org".into(),
+        name: "Workshop".into(),
+        initials: "W".into(),
+        ..Default::default()
+    }])));
+    apply_config(ui, &default, None);
+    // Use the existing production focus return, rather than a test-only focus API.
+    ui.set_show_sign_in(true);
+    settle(ui).await;
+    ui.set_show_sign_in(false);
+    settle(ui).await;
+    assert_eq!(
+        crate::navigation::visible_rooms(ui)
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>(),
+        ["!z", "!a"]
+    );
+
+    // From the initial root focus, Tab reaches the existing rail Home action.
+    // A live mode switch must move that disappearing focus to the account
+    // trigger; Return then opens the real account menu.
+    key(ui, Key::Tab);
+    settle(ui).await;
+    apply_config(ui, &sidebar, None);
+    settle(ui).await;
+    assert_eq!(ui.get_navigation_mode(), 1);
+    assert!(ui.get_show_space_labels());
+    assert!(!ui.get_group_direct_messages());
+    assert_eq!(
+        crate::navigation::visible_rooms(ui)
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect::<Vec<_>>(),
+        ["!a", "!z"]
+    );
+    assert!(ui.get_combined_rooms().row_data(0).unwrap().direct);
+    key(ui, Key::Return);
+    assert!(ui.get_account_menu_open());
+    ui.set_account_menu_open(false);
+
+    // The existing sign-in transition returns focus to shortcut-scope. The
+    // sidebar begins with Create/join, quick switcher, four app routes, then
+    // the first Space. This checks a dynamically repeated focus target too.
+    ui.set_show_sign_in(true);
+    settle(ui).await;
+    ui.set_show_sign_in(false);
+    settle(ui).await;
+    for _ in 0..7 {
+        key(ui, Key::Tab);
+    }
+    settle(ui).await;
+    apply_config(ui, &default, None);
+    settle(ui).await;
+    key(ui, Key::Return);
+    assert!(ui.get_account_menu_open());
+    ui.set_account_menu_open(false);
+    assert_eq!(ui.get_navigation_mode(), 0);
+    assert!(!ui.get_show_space_labels());
+    assert!(ui.get_group_direct_messages());
+
+    // An external config change must not move focus out of an active composer.
+    ui.set_composer_text("".into());
+    ui.invoke_focus_composer(false);
+    settle(ui).await;
+    type_text(ui, "first");
+    apply_config(ui, &sidebar, None);
+    settle(ui).await;
+    type_text(ui, "second");
+    assert_eq!(ui.get_composer_text(), "firstsecond");
+    apply_config(ui, &default, None);
+    settle(ui).await;
+    type_text(ui, "third");
+    assert_eq!(ui.get_composer_text(), "firstsecondthird");
+
+    ui.set_composer_text("".into());
+    ui.set_spaces(ModelRc::new(VecModel::<crate::SpaceItem>::default()));
+    ui.set_unsorted_channels(ModelRc::new(VecModel::<RoomItem>::default()));
+    ui.set_unsorted_direct_messages(ModelRc::new(VecModel::<RoomItem>::default()));
+    crate::apply_room_sort(ui);
+}
+
 fn assert_passwords_empty(ui: &AppWindow) {
     assert!(ui.get_access_current_password().is_empty());
     assert!(ui.get_access_new_password().is_empty());
     assert!(ui.get_access_confirm_password().is_empty());
+}
+
+async fn assert_sign_in_keyboard(ui: &AppWindow) {
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    // Observe the real UI callbacks without installing any authentication,
+    // network, preview-controller or credential-vault behavior.
+    let passwords = Rc::new(RefCell::new(Vec::<String>::new()));
+    let browser = Rc::new(Cell::new(0));
+    let previews = Rc::new(Cell::new(0));
+    let calls = passwords.clone();
+    ui.on_submit_login(move |server, user, secret| {
+        assert_eq!(server.as_str(), "https://keyboard.example.org");
+        assert_eq!(user.as_str(), "fixture");
+        calls.borrow_mut().push(secret.to_string());
+    });
+    let calls = browser.clone();
+    ui.on_submit_sso(move |server| {
+        assert_eq!(server.as_str(), "https://keyboard.example.org");
+        calls.set(calls.get() + 1);
+    });
+    let calls = previews.clone();
+    ui.on_preview_demo(move || calls.set(calls.get() + 1));
+
+    for scale in [100, 200] {
+        ui.set_show_sign_in(false);
+        settle(ui).await;
+        ui.set_saved_accounts(ModelRc::new(VecModel::<SavedAccountItem>::default()));
+        ui.set_font_scale_percent(scale);
+        ui.set_login_loading(false);
+        ui.set_login_homeserver("".into());
+        ui.set_show_sign_in(true);
+        settle(ui).await;
+        type_text(ui, "https://keyboard.example.org");
+        key(ui, Key::Tab);
+        if scale == 100 {
+            type_text(ui, "fixture");
+        }
+        key(ui, Key::Tab);
+        type_text(ui, "input fixture");
+        key(ui, Key::Tab); // password -> Sign in button
+        let before = passwords.borrow().len();
+        key(ui, Key::Return);
+        assert_eq!(passwords.borrow().len(), before + 1);
+        assert_eq!(passwords.borrow().last().unwrap(), "input fixture");
+        assert!(ui.get_login_loading());
+        key(ui, Key::Return); // a disabled action cannot submit twice
+        assert_eq!(passwords.borrow().len(), before + 1);
+
+        ui.set_login_loading(false);
+        ui.set_show_sign_in(false);
+        settle(ui).await;
+        ui.set_show_sign_in(true);
+        settle(ui).await;
+        key(ui, Key::Tab);
+        key(ui, Key::Tab); // return to password without typing again
+        key(ui, Key::Return);
+        assert_eq!(passwords.borrow().len(), before + 2);
+        assert!(passwords.borrow().last().unwrap().is_empty());
+        // The second callback proves the private password field was cleared;
+        // no production password getter is exposed for testing.
+
+        ui.set_login_loading(false);
+        ui.set_show_sign_in(false);
+        settle(ui).await;
+        ui.set_show_sign_in(true);
+        settle(ui).await;
+        for _ in 0..4 {
+            key(ui, Key::Tab); // homeserver -> username -> password -> submit -> browser
+        }
+        let before = browser.get();
+        key(ui, Key::Space);
+        assert_eq!(browser.get(), before + 1);
+        assert!(ui.get_login_loading());
+
+        ui.set_login_loading(false);
+        ui.set_show_sign_in(false);
+        settle(ui).await;
+        ui.set_show_sign_in(true);
+        settle(ui).await;
+        key(ui, Key::Backtab); // first field wraps to the preview action
+        let before = previews.get();
+        key(ui, Key::Return);
+        assert_eq!(previews.get(), before + 1);
+        key(ui, Key::Tab); // preview wraps to the visible first field
+        ui.set_login_homeserver("".into());
+        type_text(ui, "wrap");
+        assert_eq!(ui.get_login_homeserver().as_str(), "wrap");
+        assert!(!ui.get_account_menu_open());
+    }
+
+    // When saved accounts are present the first visible control changes. The
+    // wrap must reach that control, not the covered sidebar account trigger.
+    ui.set_saved_accounts(ModelRc::new(VecModel::from(vec![SavedAccountItem {
+        id: "sign-in-presentation".into(),
+        handle: "@river:example.net".into(),
+        ..Default::default()
+    }])));
+    settle(ui).await;
+    key(ui, Key::Backtab);
+    let before = previews.get();
+    key(ui, Key::Return);
+    assert_eq!(previews.get(), before + 1);
+    key(ui, Key::Tab);
+    key(ui, Key::Return);
+    assert!(ui.get_manage_accounts_open());
+    assert!(!ui.get_account_menu_open());
+
+    ui.set_manage_accounts_open(false);
+    ui.set_saved_accounts(ModelRc::new(VecModel::<SavedAccountItem>::default()));
+    ui.set_show_sign_in(false);
+    ui.set_font_scale_percent(100);
+    ui.set_login_loading(false);
+    ui.set_login_homeserver("https://matrix.org".into());
+    settle(ui).await;
 }
 
 fn assert_removed_account_menu_projection(ui: &AppWindow) {
@@ -187,6 +402,9 @@ async fn exercise_account_ui(runtime: Handle) {
     ui.show().unwrap();
     ui.window()
         .dispatch_event(WindowEvent::WindowActiveChanged(true));
+    assert_sign_in_keyboard(&ui).await;
+    settle(&ui).await;
+    assert_navigation_projection_and_focus(&ui).await;
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),
     )));
@@ -213,6 +431,19 @@ async fn exercise_account_ui(runtime: Handle) {
     key(&ui, Key::Tab); // Unlock -> current password (modal wrap)
     type_text(&ui, "cedar");
     assert_eq!(ui.get_access_current_password().as_str(), "cedar");
+    // Reloading navigation must also leave a focused password field in place.
+    let mut sidebar = Config::default();
+    sidebar.layout.navigation = NavigationMode::Sidebar;
+    apply_config(&ui, &sidebar, None);
+    settle(&ui).await;
+    type_text(&ui, "x");
+    assert_eq!(ui.get_access_current_password().as_str(), "cedarx");
+    key(&ui, Key::Backspace);
+    apply_config(&ui, &Config::default(), None);
+    settle(&ui).await;
+    type_text(&ui, "y");
+    assert_eq!(ui.get_access_current_password().as_str(), "cedary");
+    key(&ui, Key::Backspace);
     assert!(ui.get_access_new_password().is_empty());
     key(&ui, Key::Backtab); // first input -> Unlock
     key(&ui, Key::Tab); // Unlock -> first input again
@@ -306,6 +537,69 @@ async fn exercise_account_ui(runtime: Handle) {
     key(&ui, Key::Return); // closing Manage accounts restores account trigger
     assert!(ui.get_account_menu_open());
     ui.set_account_menu_open(false);
+
+    // Logout must enter the Rust callback even with a connected call. Rust
+    // owns the captured selection and can preserve it through confirmation;
+    // Slint must not bypass capture by opening the numeric -3 dialog directly.
+    let logout_clicks = std::rc::Rc::new(std::cell::Cell::new(0));
+    let clicks = logout_clicks.clone();
+    ui.on_log_out(move || clicks.set(clicks.get() + 1));
+    ui.set_account_options(ModelRc::new(VecModel::default()));
+    ui.set_call_connected(true);
+    ui.set_account_menu_open(true);
+    settle(&ui).await;
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(2));
+    key(&ui, Key::Tab); // Add account -> Manage accounts
+    key(&ui, Key::Tab); // Manage accounts -> Log out
+    key(&ui, Key::Return);
+    assert_eq!(logout_clicks.get(), 1);
+    assert!(!ui.get_leave_call_dialog()); // the Rust stub intentionally does not open it
+    assert!(!ui.get_account_menu_open());
+    ui.set_call_connected(false);
+
+    // Every dismissal path drops the captured logout continuation. Exercise
+    // the actual Escape route and the focused Cancel button.
+    let dismissed = std::rc::Rc::new(std::cell::Cell::new(0));
+    let count = dismissed.clone();
+    ui.on_cancel_pending_log_out(move || count.set(count.get() + 1));
+    for escape in [true, false] {
+        ui.set_pending_account_index(-3);
+        ui.set_leave_call_busy(false);
+        ui.set_leave_call_dialog(true);
+        settle(&ui).await;
+        key(&ui, if escape { Key::Escape } else { Key::Return });
+        assert!(!ui.get_leave_call_dialog());
+        assert_eq!(ui.get_pending_account_index(), -1);
+    }
+    assert_eq!(dismissed.get(), 2);
+
+    // Slint can retain focus when a custom action becomes disabled. Enter,
+    // Space and Escape must not activate or cancel the in-flight operation.
+    let confirmations = std::rc::Rc::new(std::cell::Cell::new(0));
+    let count = confirmations.clone();
+    ui.on_confirm_leave_call(move |_| count.set(count.get() + 1));
+    for confirm_focus in [false, true] {
+        ui.set_pending_account_index(-3);
+        ui.set_leave_call_busy(false);
+        ui.set_leave_call_dialog(true);
+        settle(&ui).await;
+        if confirm_focus {
+            key(&ui, Key::Tab);
+        }
+        ui.set_leave_call_busy(true);
+        let before = dismissed.get();
+        key(&ui, Key::Return);
+        key(&ui, Key::Space);
+        key(&ui, Key::Escape);
+        assert!(ui.get_leave_call_dialog());
+        assert_eq!(ui.get_pending_account_index(), -3);
+        assert_eq!(dismissed.get(), before);
+        assert_eq!(confirmations.get(), 0);
+        ui.set_leave_call_busy(false);
+        key(&ui, Key::Escape);
+        assert!(!ui.get_leave_call_dialog());
+        assert_eq!(dismissed.get(), before + 1);
+    }
 
     // Direct removal uses the saved row's identity in the confirmation. Tab
     // wraps between its two actions; Enter on Cancel never submits deletion.
@@ -413,6 +707,15 @@ async fn exercise_account_ui(runtime: Handle) {
         id: "!private:example.org".into(),
         ..Default::default()
     }])));
+    ui.set_combined_rooms(ModelRc::new(VecModel::from(vec![
+        crate::NavigationRoomItem {
+            room: RoomItem {
+                id: "!private:example.org".into(),
+                ..Default::default()
+            },
+            direct: true,
+        },
+    ])));
     ui.set_messages(ModelRc::new(VecModel::from(vec![MessageItem {
         body: "private message".into(),
         ..Default::default()
@@ -448,6 +751,7 @@ async fn exercise_account_ui(runtime: Handle) {
     assert!(ui.get_active_room_name().is_empty());
     assert_eq!(ui.get_accounts().row_count(), 0);
     assert_eq!(ui.get_channels().row_count(), 0);
+    assert_eq!(ui.get_combined_rooms().row_count(), 0);
     assert_eq!(ui.get_messages().row_count(), 0);
     assert_eq!(ui.get_thread_messages().row_count(), 0);
     assert_eq!(ui.get_members().row_count(), 0);

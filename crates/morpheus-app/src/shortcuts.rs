@@ -2,7 +2,7 @@
 //! The Slint focus scope bubbles keys here only after the focused control declines
 //! them; text movement, editing, and modal focus management keep precedence.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 use morpheus_config::{
     Config, ConfigStore, Shortcut, ShortcutAction, ShortcutKey, ShortcutModifiers,
@@ -148,12 +148,7 @@ fn blocked(ui: &AppWindow) -> bool {
 }
 
 fn visible_rooms(ui: &AppWindow) -> Vec<RoomItem> {
-    let mut seen = HashSet::new();
-    ui.get_channels()
-        .iter()
-        .chain(ui.get_direct_messages().iter())
-        .filter(|room| seen.insert(room.id.clone()))
-        .collect()
+    crate::navigation::visible_rooms(ui)
 }
 
 fn unread_room(rooms: &[RoomItem], current: &str, backwards: bool) -> Option<SharedString> {

@@ -1,0 +1,40 @@
+{
+  "schema": 1,
+  "packager_version": "0.11.8",
+  "assets": {
+    "nsis": {
+      "url": "https://github.com/tauri-apps/binary-releases/releases/download/nsis-3.9/nsis-3.09.zip",
+      "bytes": 2354828,
+      "sha256": "f5dc52eef1f3884230520199bac6f36b82d643d86b003ce51bd24b05c6ba7c91"
+    },
+    "application_id": {
+      "url": "https://github.com/tauri-apps/binary-releases/releases/download/nsis-plugins-v0/NSIS-ApplicationID.zip",
+      "bytes": 2802408,
+      "sha256": "1c2772b0edfb0f96a7524734d6c8fac1fc011f26221faf88f3ed2c950f0c06c0"
+    },
+    "tauri_utils": {
+      "url": "https://github.com/tauri-apps/nsis-tauri-utils/releases/download/nsis_tauri_utils-v0.2.1/nsis_tauri_utils.dll",
+      "bytes": 1188352,
+      "sha256": "0eed48313a7f904d7cc1977b70000ab3f11f18cadc8e6a69b807d288ca71f9db"
+    }
+  },
+  "required_files": {
+    "makensis.exe": "f142bb94774975da5f6099f55de19616b2412499811496698b10c3abc7655e00",
+    "Bin/makensis.exe": "b07836cef6d70edb4e58a06a9504eb70847ac99cb7b3b23d84a410fbfd501ab1",
+    "Include/FileFunc.nsh": "476f33722ff773cfec60876c5f270f2aadb9529e9b73730fa8c41e9490f4b0d6",
+    "Include/MUI2.nsh": "2c847d2009b55ff46f8bc1591ffda00f0194fb08ffebc0876cda669b7957b396",
+    "Include/nsDialogs.nsh": "e390fc3472bebe77b1cbc18f42704e31b8e01913d546ad384e3ca7ec43911cb2",
+    "Include/WinMessages.nsh": "97c154539b1761df7ce9b9df922be266697bbb28234d381dfa611529ccb50aec",
+    "Include/x64.nsh": "aea6ab8bae28e987d4ceac5385b29d781aab5c3a1879f66a4639be1ee7a5d269",
+    "Stubs/lzma-x86-unicode": "b0b55539e26eb79aec77adb2b1c4e3ffa4a7841666e0ab80c8832d4704aac603",
+    "Stubs/lzma_solid-x86-unicode": "62677d44c9721779c2219571a5d3afdf4fcf4668b5dc475f5f5668d31d3e8ae9",
+    "Plugins/x86-unicode/ApplicationID.dll": "f6851dcbf0a39edecd8a46564bc455e5273736c3dbcb02b954c201c79ccdf117",
+    "Plugins/x86-unicode/nsis_tauri_utils.dll": "0eed48313a7f904d7cc1977b70000ab3f11f18cadc8e6a69b807d288ca71f9db"
+  },
+  "packager_source": {
+    "crate_sha256": "9aa0f5056c4191007702931dce47054c98fe78cbbebbaff8c7c39d5ebeed123d",
+    "nsis_mod_sha256": "ab1d840b525ef2f84cb06a70f7a2cd5c6d01ff58af8a0d64db466465cca35422",
+    "context_sha256": "6cfeccaef5a4e1de14936d3a16f125dfff8a0432379bb6b6678be98c8b154f8c",
+    "cached_path_contract_sha256": "f96ee28fa9a93bb66a6ec826f9853682722b6d9734fac9946bbad8200f9c30ab"
+  }
+}

@@ -80,18 +80,18 @@ unlock existing accounts.
 
 ## Verification status
 
-At `93d1358` ([run 38246027915](https://github.com/brk275/Morpheus/actions/runs/38246027915)),
-all four supported runner targets passed native builds, 16 core password/removal
-regressions, the notification-client lifetime regression and two account
-presentation/detach regressions. The unit account tests use an isolated mock
-vault; they do not prove real credential-vault behavior.
+At `51c04ce` ([run 38725671739](https://github.com/brk275/Morpheus/actions/runs/38725671739)),
+the Linux live fixture passed protected A→B→A switching, rejection of direct,
+wrong-password and cancelled activation, locked restart and unlock, inactive
+and active removal, credential/store deletion, and reset after complete removal.
+It uses two disposable homeservers and an isolated real OS credential vault.
+Protected classic login stayed paused until authorization; both OAuth refresh
+phases also passed.
 
-Linux live acceptance stopped with a stack overflow at
-`encrypted_restart_message` before the protected-account sequence. OAuth
-login/refresh and restore/refresh both passed. The real Slint account keyboard
-harness passed on all four targets, but the Linux password/management screenshots
-revealed stretched action buttons. The subsequent layout and login-durability
-fixes require fresh native checks. Real-vault protected switching/removal/restart,
-screen readers and installed-app acceptance remain open. These results are not
-beta acceptance. See
+Fresh native Linux captures passed visual review of Manage accounts and the
+password dialog at 100% and 200% text sizes. These complement the mock-vault
+regressions and real Slint keyboard/pointer harness; they do not establish
+VoiceOver, Narrator or Orca acceptance. Mac/Windows real-vault and installed-app
+checks remain open. New exact-intent logout and sign-in keyboard changes require
+their own hosted verification. These results are not beta acceptance. See
 [verification](VERIFICATION.md).

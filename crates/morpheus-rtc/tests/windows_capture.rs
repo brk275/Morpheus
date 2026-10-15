@@ -23,13 +23,16 @@ impl Fixture {
     fn wait_ack(&mut self, expected: &str) {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            assert!(
-                self.child
-                    .try_wait()
-                    .expect("inspect fixture process")
-                    .is_none(),
-                "fixture window exited early"
-            );
+            let status = self.child.try_wait().expect("inspect fixture process");
+            if let Some(code) = status.and_then(|status| status.code()) {
+                // Diagnostic only: retain the unsigned Windows exit status, not
+                // exception text. Failure to record it cannot replace the panic.
+                let _ = fs::write(
+                    self.root.join("fixture-exit-code"),
+                    (code as u32).to_string(),
+                );
+            }
+            assert!(status.is_none(), "fixture window exited early");
             if fs::read_to_string(self.root.join("ack")).ok().as_deref() == Some(expected) {
                 return;
             }
@@ -152,6 +155,7 @@ fn windows_selected_sources_change_and_stop() {
     fixture.stage("window_ready");
     fixture.wait_ack("ready");
     let title = format!("Morpheus capture QA {nonce}");
+    fixture.stage("window_enumeration");
     let windows: Vec<_> = xcap::Window::all()
         .expect("enumerate synthetic window")
         .into_iter()
@@ -160,28 +164,33 @@ fn windows_selected_sources_change_and_stop() {
                 && window.title().ok().as_deref() == Some(title.as_str())
         })
         .collect();
+    fixture.stage("window_identity");
     assert!(
         windows.len() == 1,
         "owned nonce window is missing or ambiguous"
     );
     let native_window = &windows[0];
+    fixture.stage("window_application");
     let label = format!(
         "{} — {title}",
         native_window
             .app_name()
             .expect("identify fixture application")
     );
+    fixture.stage("source_enumeration");
     let keys: Vec<_> = ScreenCapture::window_sources()
         .expect("enumerate capture sources")
         .into_iter()
         .filter(|(_, candidate)| candidate == &label)
         .map(|(key, _)| key)
         .collect();
+    fixture.stage("source_identity");
     assert!(
         keys.len() == 1,
         "fixture source key is missing or ambiguous"
     );
     let key = &keys[0];
+    fixture.stage("display_enumeration");
     assert!(
         xcap::Monitor::all()
             .expect("enumerate fixture monitors")
@@ -189,9 +198,11 @@ fn windows_selected_sources_change_and_stop() {
             == 1,
         "fixture requires one isolated display"
     );
+    fixture.stage("display_identity");
     let monitor = native_window
         .current_monitor()
         .expect("resolve owned window monitor");
+    fixture.stage("display_geometry");
     assert!(
         native_window.x().expect("fixture horizontal position")
             == monitor.x().expect("display horizontal position")

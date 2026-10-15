@@ -177,14 +177,14 @@ def menu_keyboard(ui):
     else:
         raise RuntimeError("Account menu target was not keyboard reachable")
     ui.key("Return")
-    ui.wait("Manage Matrix accounts")
-    ui.expect_focus("Close account manager")
+    ui.wait("Manage saved Matrix accounts")
+    ui.expect_focus("Done")
     ui.key("Tab")
-    ui.expect_focus("Add Matrix account")
+    ui.expect_focus("Add account")
     ui.key("shift+Tab")
-    ui.expect_focus("Close account manager")
+    ui.expect_focus("Done")
     ui.key("Escape")
-    ui.wait_for(lambda: ui.find("Manage Matrix accounts") is None)
+    ui.wait_for(lambda: ui.find("Manage saved Matrix accounts") is None)
     ui.expect_focus(trigger, prefix=True)
 
 
@@ -265,9 +265,9 @@ def acceptance(executable, report):
             password = ui.wait("Password")
             smoke.require(password.getRole() == ui.api.ROLE_PASSWORD_TEXT, "Password field lacks protected text semantics")
             report["sign_in_semantics"] = True
-            # Preview entry is an accessible action; do not claim keyboard-only
-            # startup or silently submit a login. Its native button lacks a
-            # FocusScope today, so that separate source gap remains documented.
+            # Enter the account-free preview through its accessible action.
+            # This flow starts keyboard checks in the account menu; it does not
+            # claim keyboard-only startup or submit a login.
             ui.action("Open interactive preview without signing in")
             report["phase"] = "account_menu_keyboard"
             menu_keyboard(ui)

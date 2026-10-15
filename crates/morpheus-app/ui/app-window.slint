@@ -129,6 +129,12 @@ export struct MessageItem {
     accent: color,
 }
 
+// Type comes from the originating list, independently of a room's display name.
+export struct NavigationRoomItem {
+    room: RoomItem,
+    direct: bool,
+}
+
 export struct MemberItem {
     user-id: string,
     name: string,
@@ -236,6 +242,7 @@ component IconAction inherits Rectangle {
     property <bool> vector-icon: icon == "S" || icon == "C" || icon == "P" || icon == "⌂" || icon == "+" || icon == "↓" || icon == "F" || icon == "↩" || icon == "♥" || icon == "⌫" || icon == "✎" || icon == "☷";
     opacity: !quiet || context-hover || area.has-hover || keyboard-focus.has-focus ? 1 : 0;
     callback activated();
+    callback focus-state-changed(bool);
     width: 34px;
     height: 34px;
     border-radius: StyleTokens.radius * 0.9;
@@ -270,9 +277,11 @@ component IconAction inherits Rectangle {
         width: 0px;
         height: 0px;
         enabled: root.enabled;
+        focus-gained(reason) => { root.focus-state-changed(true); }
+        focus-lost(reason) => { root.focus-state-changed(false); }
         key-pressed(event) => {
             if event.text == Key.Space || event.text == Key.Return {
-                root.activated();
+                if root.enabled { root.activated(); }
                 accept
             } else { reject }
         }
@@ -292,12 +301,13 @@ component ActionRect inherits Rectangle {
     in property <color> focus-color: #a88cff;
     in property <bool> trap-tab: false;
     in property <bool> cancel-on-escape: false;
-    // Account controls opt in so Slint reveals their entire rectangle on Tab.
+    // Scrollable controls opt in so Slint reveals their entire rectangle on Tab.
     // Existing actions keep their original zero-sized focus target.
     in property <bool> reveal-full-control: false;
     out property <bool> has-hover: hit.has-hover;
     out property <bool> has-focus: keyboard-focus.has-focus;
     callback activated();
+    callback focus-state-changed(bool);
     callback next-focus();
     callback previous-focus();
     callback cancelled();
@@ -319,9 +329,11 @@ component ActionRect inherits Rectangle {
         // A full-size scope must not consume the press before the TouchArea.
         focus-on-click: !root.reveal-full-control;
         enabled: root.enabled;
+        focus-gained(reason) => { root.focus-state-changed(true); }
+        focus-lost(reason) => { root.focus-state-changed(false); }
         key-pressed(event) => {
             if event.text == Key.Space || event.text == Key.Return {
-                root.activated();
+                if root.enabled { root.activated(); }
                 accept
             } else if root.trap-tab && event.text == Key.Tab && !event.modifiers.shift {
                 root.next-focus();
@@ -330,7 +342,7 @@ component ActionRect inherits Rectangle {
                 root.previous-focus();
                 accept
             } else if root.cancel-on-escape && event.text == Key.Escape {
-                root.cancelled();
+                if root.enabled { root.cancelled(); }
                 accept
             } else { reject }
         }
@@ -340,6 +352,80 @@ component ActionRect inherits Rectangle {
         border-width: 2px;
         border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.focus-color;
         background: transparent;
+    }
+}
+
+// The same row renders grouped and combined navigation. `direct` is carried
+// from the originating model, never guessed from the display name or icon.
+component NavigationRoomRow inherits ActionRect {
+    in property <RoomItem> room;
+    in property <bool> direct;
+    in property <bool> selected;
+    in property <int> density-mode;
+    in property <float> text-scale;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> elevated;
+    in property <color> hover;
+    in property <color> accent;
+    in property <color> accent-ink;
+    callback open(string, bool);
+    height: max(root.direct ? (root.density-mode == 0 ? 32px : root.density-mode == 2 ? 47px : 39px)
+        : (root.density-mode == 0 ? 30px : root.density-mode == 2 ? 44px : 36px), 22px * root.text-scale);
+    border-radius: StyleTokens.radius * 0.8;
+    background: root.selected ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : self.has-hover ? root.elevated : transparent;
+    focus-color: root.accent;
+    label: root.room.voice-space ? (root.direct ? "Enter voice space with " : "Enter voice space ") + root.room.name
+        : (root.direct ? "Open direct message with " : "Open room ") + root.room.name;
+    activated => { root.open(root.room.id, root.room.voice-space); }
+    HorizontalLayout {
+        padding-left: root.direct ? 9px : 10px; padding-right: 9px; spacing: root.direct ? 9px : 8px;
+        if root.direct : Rectangle {
+            width: 25px; height: 25px; border-radius: StyleTokens.radius * 0.9; background: root.accent;
+            Text { text: root.room.voice-space ? "◖" : "@"; color: root.accent-ink; font-size: 13px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+        }
+        if !root.direct : Text {
+            text: root.room.voice-space ? "◖" : (root.room.private-room ? "⌑" : "#");
+            color: root.selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.room.voice-space ? (StyleTokens.roles.voice.present ? StyleTokens.roles.voice.color : #78c8b1) : root.muted;
+            font-size: 18px * root.text-scale; vertical-alignment: center;
+        }
+        Text {
+            text: root.room.name;
+            color: root.selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : (root.room.unread > 0 ? root.ink : root.muted);
+            font-size: 13px * root.text-scale; font-weight: root.direct ? 0 : root.room.unread > 0 ? 700 : 500;
+            vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
+        }
+        if root.room.voice-space : Text {
+            text: "VOICE"; color: root.selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : StyleTokens.roles.voice.present ? StyleTokens.roles.voice.color : #78c8b1;
+            font-size: 9px * root.text-scale; font-weight: 750; vertical-alignment: center;
+        }
+        if root.room.unread > 0 : Rectangle {
+            width: 20px; height: 20px; border-radius: 10px;
+            background: StyleTokens.roles.unread.present ? StyleTokens.roles.unread.color : root.accent;
+            Text { text: root.room.unread; color: StyleTokens.roles.unread-ink.present ? StyleTokens.roles.unread-ink.color : root.accent-ink; font-size: 10px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+        }
+    }
+}
+
+component NavigationTextAction inherits ActionRect {
+    in property <string> text;
+    in property <bool> selected;
+    in property <float> text-scale;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> hover;
+    in property <color> accent;
+    height: max(32px, 22px * root.text-scale + 8px); vertical-stretch: 0;
+    reveal-full-control: true;
+    border-radius: StyleTokens.radius * 0.8;
+    background: root.selected ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : self.has-hover ? root.hover : transparent;
+    focus-color: root.accent;
+    label: root.text;
+    Text {
+        x: 8px; width: parent.width - 16px; height: parent.height;
+        text: root.text; color: root.selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.selected ? root.ink : root.muted;
+        font-size: 13px * root.text-scale; font-weight: root.selected ? 650 : 500;
+        overflow: elide; vertical-alignment: center;
     }
 }
 
@@ -579,7 +665,7 @@ export component AppWindow inherits Window {
     preferred-height: 820px;
     // Derive the minimum from saved pane sizes, not the window width. A
     // width-dependent pane constraint creates a layout-info binding cycle.
-    min-width: max(940px, root.rail-width-px * 1px + root.room-list-width * 1px
+    min-width: max(940px, (root.navigation-mode == 0 ? root.rail-width-px * 1px : 0px) + root.room-list-width * 1px
         + (root.show-side-panel && root.page == 0 ? root.details-width * 1px : 0px) + 360px);
     min-height: 620px;
 
@@ -590,6 +676,34 @@ export component AppWindow inherits Window {
     in-out property <string> active-space-name: "Home";
     in-out property <[RoomItem]> channels;
     in-out property <[RoomItem]> direct-messages;
+    in-out property <[NavigationRoomItem]> combined-rooms;
+    out property <int> navigation-mode: 0; // rail or text-first sidebar
+    in-out property <bool> show-space-labels: false;
+    in-out property <bool> group-direct-messages: true;
+    callback choose-navigation-mode(int);
+    callback set-show-space-labels(bool);
+    callback set-group-direct-messages(bool);
+    property <int> navigation-focus-owner: -1;
+    property <string> navigation-focus-token;
+    function navigation-focus-changed(owner: int, token: string, focused: bool) {
+        if focused {
+            root.navigation-focus-owner = owner;
+            root.navigation-focus-token = token;
+        } else if root.navigation-focus-owner == owner && root.navigation-focus-token == token {
+            root.navigation-focus-owner = -1;
+            root.navigation-focus-token = "";
+        }
+    }
+    public function apply-navigation-mode(mode: int) {
+        if mode != root.navigation-mode && root.navigation-focus-owner == root.navigation-mode
+            && !root.show-sign-in && !root.manage-accounts-open && !root.access-open
+            && !root.account-menu-open && !root.room-actions-open && !root.room-admin-open
+            && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog
+            && !root.quick-switcher-open && !root.image-preview-open && root.security-recovery-key == "" {
+            account-trigger.focus();
+        }
+        root.navigation-mode = mode;
+    }
     in-out property <[RoomItem]> invitations;
     in-out property <[RoomItem]> unsorted-channels;
     in-out property <[RoomItem]> unsorted-direct-messages;
@@ -925,6 +1039,8 @@ export component AppWindow inherits Window {
     callback add-account();
     callback manage-accounts();
     callback log-out();
+    callback continue-log-out();
+    callback cancel-pending-log-out();
     callback choose-theme(int);
     callback change-font-scale(int);
     callback choose-density(int);
@@ -1218,8 +1334,8 @@ export component AppWindow inherits Window {
     HorizontalLayout {
         spacing: 0px;
 
-        // Space and navigation rail.
-        Rectangle {
+        // Space and navigation rail (the default presentation).
+        if root.navigation-mode == 0 : Rectangle {
             width: root.rail-width-px * 1px;
             background: root.rail;
             VerticalLayout {
@@ -1243,6 +1359,7 @@ export component AppWindow inherits Window {
                     width: root.rail-width-px * 1px - 12px;
                     height: 48px;
                     icon: "⌂";
+                    focus-state-changed(focused) => { root.navigation-focus-changed(0, "route:home", focused); }
                     label: "Home and all rooms";
                     ink: root.page == 0 && root.active-space-id == "" ? root.accent : root.muted;
                     surface: root.rail;
@@ -1258,7 +1375,8 @@ export component AppWindow inherits Window {
                         spacing: 8px;
                         for space in root.spaces : ActionRect {
                             width: root.rail-width-px * 1px - 12px;
-                            height: 48px;
+                            height: root.show-space-labels ? 52px + 14px * root.text-scale : 48px;
+                            focus-state-changed(focused) => { root.navigation-focus-changed(0, "space:" + space.id, focused); }
                             border-radius: StyleTokens.radius * 1.2;
                             background: root.active-space-id == space.id && root.page == 0 ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : self.has-hover ? root.hover : transparent;
                             focus-color: root.accent;
@@ -1275,6 +1393,12 @@ export component AppWindow inherits Window {
                                 initials: space.initials;
                                 accent: space.accent;
                             }
+                            if root.show-space-labels : Text {
+                                x: 2px; y: 48px; width: parent.width - 4px; height: 14px * root.text-scale;
+                                text: space.name; font-size: 10px * root.text-scale; overflow: elide;
+                                color: root.active-space-id == space.id && root.page == 0 && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.muted;
+                                horizontal-alignment: center; accessible-label: space.name;
+                            }
                         }
                     }
                 }
@@ -1283,6 +1407,7 @@ export component AppWindow inherits Window {
                     width: root.rail-width-px * 1px - 12px;
                     height: 48px;
                     icon: "S";
+                    focus-state-changed(focused) => { root.navigation-focus-changed(0, "route:discover", focused); }
                     label: "Explore public Matrix rooms";
                     ink: root.page == 3 ? root.accent : root.muted;
                     surface: root.rail;
@@ -1294,6 +1419,7 @@ export component AppWindow inherits Window {
                     width: root.rail-width-px * 1px - 12px;
                     height: 48px;
                     icon: "C";
+                    focus-state-changed(focused) => { root.navigation-focus-changed(0, "route:calls", focused); }
                     label: "Open call stage";
                     ink: root.page == 2 ? root.accent : root.muted;
                     surface: root.rail;
@@ -1305,6 +1431,7 @@ export component AppWindow inherits Window {
                     width: root.rail-width-px * 1px - 12px;
                     height: 48px;
                     icon: "⚙";
+                    focus-state-changed(focused) => { root.navigation-focus-changed(0, "route:settings", focused); }
                     label: "Open settings";
                     ink: root.page == 1 ? root.accent : root.muted;
                     surface: root.rail;
@@ -1386,8 +1513,40 @@ export component AppWindow inherits Window {
                         padding-right: 10px;
                         padding-bottom: 18px;
                         spacing: 3px;
+                        if root.navigation-mode == 1 : VerticalLayout {
+                            spacing: 3px; alignment: start; vertical-stretch: 0;
+                            for route[index] in ["Home", "Discover", "Calls", "Settings"] : NavigationTextAction {
+                                text: route; text-scale: root.text-scale;
+                                ink: root.ink; muted: root.muted; hover: root.hover; accent: root.accent;
+                                selected: index == 0 ? root.page == 0 && root.active-space-id == "" : root.page == (index == 1 ? 3 : index == 2 ? 2 : 1);
+                                label: index == 0 ? "Home and all rooms" : index == 1 ? "Explore public Matrix rooms" : index == 2 ? "Open call stage" : "Open settings";
+                                focus-state-changed(focused) => { root.navigation-focus-changed(1, "route:" + index, focused); }
+                                activated => {
+                                    if index == 0 { root.active-space-id = ""; root.active-space-name = "Home"; root.select-space(""); root.page = 0; }
+                                    else if index == 1 { root.page = 3; root.open-discovery(); }
+                                    else if index == 2 { root.page = 2; }
+                                    else { root.page = 1; root.open-security(); }
+                                }
+                            }
+                            if root.spaces.length > 0 : Text {
+                                text: "SPACES"; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750;
+                                height: max(29px, 18px * root.text-scale); vertical-alignment: bottom;
+                            }
+                            for space in root.spaces : NavigationTextAction {
+                                text: space.name; text-scale: root.text-scale;
+                                ink: root.ink; muted: root.muted; hover: root.hover; accent: root.accent;
+                                selected: root.page == 0 && root.active-space-id == space.id;
+                                label: "Select space " + space.name;
+                                focus-state-changed(focused) => { root.navigation-focus-changed(1, "space:" + space.id, focused); }
+                                activated => {
+                                    root.active-space-id = space.id; root.active-space-name = space.name;
+                                    root.select-space(space.id); root.page = 0;
+                                }
+                            }
+                            Rectangle { height: 1px; vertical-stretch: 0; background: root.divider; }
+                        }
                         Text {
-                            text: root.active-space-id == "" ? "YOUR ROOMS" : "SPACE ROOMS";
+                            text: root.group-direct-messages ? (root.active-space-id == "" ? "YOUR ROOMS" : "SPACE ROOMS") : "CONVERSATIONS";
                             color: root.muted;
                             font-size: 10px * root.text-scale;
                             font-weight: 750;
@@ -1454,61 +1613,43 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
-                        for room in root.channels : ActionRect {
-                            height: max(root.density-mode == 0 ? 30px : root.density-mode == 2 ? 44px : 36px, 22px * root.text-scale);
-                            border-radius: StyleTokens.radius * 0.8;
-                            background: room.id == root.active-room-id && root.page == 0 ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : self.has-hover ? root.elevated : transparent;
-                            focus-color: root.accent;
-                            label: room.voice-space ? "Enter voice space " + room.name : "Open room " + room.name;
-                            activated => {
-                                if room.voice-space && root.live-session { root.open-voice-space(room.id); }
-                                else { root.page = 0; root.open-room(room.id); }
+                        if root.group-direct-messages : VerticalLayout {
+                            spacing: 3px; alignment: start; vertical-stretch: 0;
+                            for channel in root.channels : NavigationRoomRow {
+                                room: channel; direct: false;
+                                selected: channel.id == root.active-room-id && root.page == 0;
+                                density-mode: root.density-mode; text-scale: root.text-scale;
+                                ink: root.ink; muted: root.muted; elevated: root.elevated; hover: root.hover; accent: root.accent; accent-ink: root.accent-ink;
+                                open(id, voice) => {
+                                    if voice && root.live-session { root.open-voice-space(id); }
+                                    else { root.page = 0; root.open-room(id); }
+                                }
                             }
-                            HorizontalLayout {
-                                padding-left: 10px;
-                                padding-right: 9px;
-                                spacing: 8px;
-                                Text { text: room.voice-space ? "◖" : (room.private-room ? "⌑" : "#"); color: room.id == root.active-room-id && root.page == 0 && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : room.voice-space ? (StyleTokens.roles.voice.present ? StyleTokens.roles.voice.color : #78c8b1) : root.muted; font-size: 18px * root.text-scale; vertical-alignment: center; }
-                                Text { text: room.name; color: room.id == root.active-room-id && root.page == 0 && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : (room.unread > 0 ? root.ink : root.muted); font-size: 13px * root.text-scale; font-weight: room.unread > 0 ? 700 : 500; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
-                                if room.voice-space : Text { text: "VOICE"; color: room.id == root.active-room-id && root.page == 0 && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : StyleTokens.roles.voice.present ? StyleTokens.roles.voice.color : #78c8b1; font-size: 9px * root.text-scale; font-weight: 750; vertical-alignment: center; }
-                                if room.unread > 0 : Rectangle {
-                                    width: 20px; height: 20px; border-radius: 10px; background: StyleTokens.roles.unread.present ? StyleTokens.roles.unread.color : root.accent;
-                                    Text { text: room.unread; color: StyleTokens.roles.unread-ink.present ? StyleTokens.roles.unread-ink.color : root.accent-ink; font-size: 10px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                            Text {
+                                text: "DIRECT MESSAGES"; color: root.muted; font-size: 10px * root.text-scale;
+                                font-weight: 750; letter-spacing: 1px; height: 40px; vertical-alignment: bottom;
+                            }
+                            for dm in root.direct-messages : NavigationRoomRow {
+                                room: dm; direct: true;
+                                selected: dm.id == root.active-room-id && root.page == 0;
+                                density-mode: root.density-mode; text-scale: root.text-scale;
+                                ink: root.ink; muted: root.muted; elevated: root.elevated; hover: root.hover; accent: root.accent; accent-ink: root.accent-ink;
+                                open(id, voice) => {
+                                    if voice && root.live-session { root.open-voice-space(id); }
+                                    else { root.page = 0; root.open-room(id); }
                                 }
                             }
                         }
-                        Text {
-                            text: "DIRECT MESSAGES";
-                            color: root.muted;
-                            font-size: 10px * root.text-scale;
-                            font-weight: 750;
-                            letter-spacing: 1px;
-                            height: 40px;
-                            vertical-alignment: bottom;
-                        }
-                        for room in root.direct-messages : ActionRect {
-                            height: max(root.density-mode == 0 ? 32px : root.density-mode == 2 ? 47px : 39px, 22px * root.text-scale);
-                            border-radius: StyleTokens.radius * 0.8;
-                            background: room.id == root.active-room-id && root.page == 0 ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : self.has-hover ? root.elevated : transparent;
-                            focus-color: root.accent;
-                            label: room.voice-space ? "Enter voice space with " + room.name : "Open direct message with " + room.name;
-                            activated => {
-                                if room.voice-space && root.live-session { root.open-voice-space(room.id); }
-                                else { root.page = 0; root.open-room(room.id); }
-                            }
-                            HorizontalLayout {
-                                padding-left: 9px;
-                                padding-right: 9px;
-                                spacing: 9px;
-                                Rectangle {
-                                    width: 25px; height: 25px; border-radius: StyleTokens.radius * 0.9; background: root.accent;
-                                    Text { text: room.voice-space ? "◖" : "@"; color: root.accent-ink; font-size: 13px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
-                                }
-                                Text { text: room.name; color: room.id == root.active-room-id && root.page == 0 && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : (room.unread > 0 ? root.ink : root.muted); font-size: 13px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
-                                if room.voice-space : Text { text: "VOICE"; color: room.id == root.active-room-id && root.page == 0 && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : StyleTokens.roles.voice.present ? StyleTokens.roles.voice.color : #78c8b1; font-size: 9px * root.text-scale; font-weight: 750; vertical-alignment: center; }
-                                if room.unread > 0 : Rectangle {
-                                    width: 20px; height: 20px; border-radius: 10px; background: StyleTokens.roles.unread.present ? StyleTokens.roles.unread.color : root.accent;
-                                    Text { text: room.unread; color: StyleTokens.roles.unread-ink.present ? StyleTokens.roles.unread-ink.color : root.accent-ink; font-size: 10px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                        if !root.group-direct-messages : VerticalLayout {
+                            spacing: 3px; alignment: start; vertical-stretch: 0;
+                            for entry in root.combined-rooms : NavigationRoomRow {
+                                room: entry.room; direct: entry.direct;
+                                selected: entry.room.id == root.active-room-id && root.page == 0;
+                                density-mode: root.density-mode; text-scale: root.text-scale;
+                                ink: root.ink; muted: root.muted; elevated: root.elevated; hover: root.hover; accent: root.accent; accent-ink: root.accent-ink;
+                                open(id, voice) => {
+                                    if voice && root.live-session { root.open-voice-space(id); }
+                                    else { root.page = 0; root.open-room(id); }
                                 }
                             }
                         }
@@ -1550,7 +1691,7 @@ export component AppWindow inherits Window {
                 background: root.elevated;
                 border-color: root.divider;
                 border-width: 1px;
-                border-radius: 12px;
+                border-radius: StyleTokens.radius * 1.2;
                 drop-shadow-color: #00000044;
                 drop-shadow-blur: 18px;
                 drop-shadow-offset-y: 7px;
@@ -1574,7 +1715,7 @@ export component AppWindow inherits Window {
                             spacing: 2px;
                     for account[index] in root.account-options : account-choice := ActionRect {
                         height: max(42px, 30px * root.text-scale + 12px);
-                        border-radius: 8px;
+                        border-radius: StyleTokens.radius * 0.8;
                         background: account.index == root.active-account-index ? root.hover : self.has-hover ? root.hover : transparent;
                         focus-color: root.accent;
                         cancel-on-escape: true;
@@ -1603,7 +1744,7 @@ export component AppWindow inherits Window {
                             padding-top: 6px;
                             padding-bottom: 6px;
                             spacing: 9px;
-                            VerticalLayout { width: 30px; alignment: center; AvatarBadge { width: 30px; height: 30px; border-radius: 10px; initials: account.initials; accent: account.accent; } }
+                            VerticalLayout { width: 30px; alignment: center; AvatarBadge { width: 30px; height: 30px; border-radius: StyleTokens.radius * 1.0; initials: account.initials; accent: account.accent; } }
                             VerticalLayout {
                                 alignment: center;
                                 spacing: 1px;
@@ -1619,7 +1760,7 @@ export component AppWindow inherits Window {
                     Rectangle { height: 1px; background: root.divider; }
                     add-account-choice := ActionRect {
                         height: 35px;
-                        border-radius: 8px;
+                        border-radius: StyleTokens.radius * 0.8;
                         background: self.has-hover ? root.hover : transparent;
                         focus-color: root.accent;
                         cancel-on-escape: true;
@@ -1644,7 +1785,7 @@ export component AppWindow inherits Window {
                     }
                     ActionRect {
                         height: 35px;
-                        border-radius: 8px;
+                        border-radius: StyleTokens.radius * 0.8;
                         background: self.has-hover ? root.hover : transparent;
                         focus-color: root.accent;
                         cancel-on-escape: true;
@@ -1655,15 +1796,16 @@ export component AppWindow inherits Window {
                     }
                     ActionRect {
                         height: 35px;
-                        border-radius: 8px;
+                        border-radius: StyleTokens.radius * 0.8;
                         background: self.has-hover ? root.hover : transparent;
                         focus-color: root.accent;
                         cancel-on-escape: true;
                         label: "Log out of current Matrix account";
                         cancelled => { root.account-menu-open = false; account-trigger.focus(); }
                         activated => {
-                            if root.call-connected { root.pending-account-index = -3; root.leave-call-dialog = true; root.account-menu-open = false; }
-                            else { root.log-out(); root.account-menu-open = false; }
+                            // Rust captures the exact selection before it opens
+                            // a leave-call confirmation or starts async logout.
+                            root.log-out(); root.account-menu-open = false;
                         }
                         Text { x: 9px; text: "↪   Log out"; color: StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : #e47483; font-size: 12px * root.text-scale; vertical-alignment: center; }
                     }
@@ -2708,6 +2850,35 @@ export component AppWindow inherits Window {
                         }
                         Rectangle { height: 1px; background: root.divider; }
                         Text { text: "Layout"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
+                        Text { text: "Navigation"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
+                        VerticalLayout {
+                            spacing: 6px; alignment: start; vertical-stretch: 0;
+                            for choice[index] in ["Icon rail", "Text sidebar"] : TextAction {
+                                height: 36px * root.text-scale; vertical-stretch: 0;
+                                text: choice; label: "Use " + choice + " navigation";
+                                ink: root.ink; muted: root.muted; surface: root.navigation-mode == index ? root.hover : root.elevated;
+                                hover-surface: root.hover; outline: root.navigation-mode == index ? root.accent : root.divider; text-scale: root.text-scale;
+                                activated => { root.choose-navigation-mode(index); }
+                            }
+                        }
+                        TextAction {
+                            height: 36px * root.text-scale; vertical-stretch: 0;
+                            text: root.show-space-labels ? "Space labels: on" : "Space labels: off";
+                            label: root.show-space-labels ? "Hide Space labels in the icon rail" : "Show Space labels in the icon rail";
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                            activated => { root.set-show-space-labels(!root.show-space-labels); }
+                        }
+                        TextAction {
+                            height: 36px * root.text-scale; vertical-stretch: 0;
+                            text: root.group-direct-messages ? "Separate DMs: on" : "Separate DMs: off";
+                            label: root.group-direct-messages ? "Combine rooms and direct messages" : "Group direct messages separately";
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                            activated => { root.set-group-direct-messages(!root.group-direct-messages); }
+                        }
+                        Text {
+                            text: "Text sidebar moves Home, Spaces and app routes into the room list. Combined conversations use name order, with unread conversations first when enabled. Space labels affect only the icon rail.";
+                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                        }
                         Rectangle {
                             height: 70px; border-radius: StyleTokens.radius * 1; background: root.elevated;
                             HorizontalLayout {
@@ -2756,7 +2927,7 @@ export component AppWindow inherits Window {
                                 VerticalLayout {
                                     alignment: center; horizontal-stretch: 1; spacing: 3px;
                                     Text { text: "Unread rooms first"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
-                                    Text { text: "Move unread rooms and DMs to the top of each list"; color: root.muted; font-size: 11px * root.text-scale; }
+                                    Text { text: root.group-direct-messages ? "Move unread rooms and DMs to the top of each list" : "Move unread conversations to the top of the combined list"; color: root.muted; font-size: 11px * root.text-scale; }
                                 }
                                 IconAction {
                                     icon: root.sort-unread-first ? "✓" : "+";
@@ -4801,6 +4972,7 @@ export component AppWindow inherits Window {
         init => { cancel-leave.focus(); }
         key-pressed(event) => {
             if event.text == Key.Escape && !root.leave-call-busy {
+                root.cancel-pending-log-out();
                 root.leave-call-dialog = false;
                 root.pending-account-index = -1;
                 account-trigger.focus();
@@ -4839,8 +5011,8 @@ export component AppWindow inherits Window {
                         cancel-on-escape: true;
                         next-focus => { confirm-leave.focus(); }
                         previous-focus => { confirm-leave.focus(); }
-                        cancelled => { root.leave-call-dialog = false; root.pending-account-index = -1; account-trigger.focus(); }
-                        activated => { root.leave-call-dialog = false; root.pending-account-index = -1; account-trigger.focus(); }
+                        cancelled => { root.cancel-pending-log-out(); root.leave-call-dialog = false; root.pending-account-index = -1; account-trigger.focus(); }
+                        activated => { root.cancel-pending-log-out(); root.leave-call-dialog = false; root.pending-account-index = -1; account-trigger.focus(); }
                         Text { text: "Cancel"; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                     }
                     confirm-leave := ActionRect {
@@ -4852,7 +5024,7 @@ export component AppWindow inherits Window {
                         cancel-on-escape: true;
                         next-focus => { cancel-leave.focus(); }
                         previous-focus => { cancel-leave.focus(); }
-                        cancelled => { root.leave-call-dialog = false; root.pending-account-index = -1; account-trigger.focus(); }
+                        cancelled => { root.cancel-pending-log-out(); root.leave-call-dialog = false; root.pending-account-index = -1; account-trigger.focus(); }
                         activated => { root.confirm-leave-call(root.pending-account-index); }
                         Text { text: root.leave-call-busy ? "Checking…" : root.native-leave-unconfirmed ? "Continue if safe" : "Leave call"; color: root.accent-ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                     }
@@ -4862,7 +5034,8 @@ export component AppWindow inherits Window {
         }
     }
 
-    if root.show-sign-in : Rectangle {
+    if root.show-sign-in : FocusScope {
+        focus-on-tab-navigation: false;
         in property <int> focus-request: root.account-focus-request;
         init => {
             if !root.manage-accounts-open && !root.access-open && root.saved-accounts.length == 0 { login-homeserver-input.focus(); }
@@ -4870,33 +5043,65 @@ export component AppWindow inherits Window {
         changed focus-request => {
             if !root.manage-accounts-open && !root.access-open && root.saved-accounts.length == 0 { login-homeserver-input.focus(); }
         }
-        background: root.rail;
+        capture-key-pressed(event) => {
+            if event.text == Key.Tab && !event.modifiers.shift && login-preview.has-focus {
+                if root.saved-accounts.length > 0 { saved-account-trigger.focus(); }
+                else { login-homeserver-input.focus(); }
+                accept
+            } else if (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) &&
+                ((root.saved-accounts.length > 0 && saved-account-trigger.has-focus) ||
+                 (root.saved-accounts.length == 0 && login-homeserver-input.has-focus)) {
+                if root.login-loading { login-password-input.focus(); }
+                else { login-preview.focus(); }
+                accept
+            } else if root.login-loading && (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) &&
+                (login-submit.has-focus || login-browser.has-focus || login-preview.has-focus) {
+                login-password-input.focus(); accept
+            } else if root.login-loading && event.text == Key.Tab && !event.modifiers.shift &&
+                (login-password-input.has-focus || login-submit.has-focus || login-browser.has-focus) {
+                if root.saved-accounts.length > 0 { saved-account-trigger.focus(); }
+                else { login-homeserver-input.focus(); }
+                accept
+            } else { reject }
+        }
         Rectangle {
-            x: (parent.width - 448px) / 2;
-            y: (parent.height - 528px) / 2;
-            width: 448px;
-            height: 576px;
-            border-radius: 18px;
+        background: root.rail;
+        // The sign-in surface stays inside the window at every text scale.
+        // Its fields and actions scroll together; focused actions reveal their
+        // complete bounds without allowing Tab into the covered conversation.
+        Rectangle {
+            width: min(448px * root.text-scale, parent.width - 32px);
+            height: min(640px * root.text-scale, parent.height - 32px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: StyleTokens.radius * 1.8;
             border-color: root.divider;
             border-width: 1px;
             background: root.canvas;
             accessible-role: form;
             accessible-label: "Sign in to Matrix";
-            VerticalLayout {
-                padding: 28px;
+            login-body-scroll := ScrollView {
+                x: 24px; y: 24px;
+                width: parent.width - 48px; height: parent.height - 48px;
+                horizontal-scrollbar-policy: always-off;
+                VerticalLayout {
+                width: login-body-scroll.visible-width;
+                alignment: start; vertical-stretch: 0;
                 spacing: 11px;
                 Rectangle {
-                    width: 48px; height: 48px; border-radius: 15px; background: root.accent;
+                    width: 48px * root.text-scale; height: 48px * root.text-scale; vertical-stretch: 0; border-radius: StyleTokens.radius * 1.5; background: root.accent;
                     Text { text: "M"; color: root.accent-ink; font-size: 22px * root.text-scale; font-weight: 800; horizontal-alignment: center; vertical-alignment: center; }
                 }
-                Text { text: "Welcome to Morpheus"; color: root.ink; font-size: 22px * root.text-scale; font-weight: 770; }
-                Text { text: "Sign in with an existing Matrix account."; color: root.muted; font-size: 12px * root.text-scale; }
+                Text { text: "Welcome to Morpheus"; color: root.ink; font-size: 22px * root.text-scale; font-weight: 770; wrap: word-wrap; vertical-stretch: 0; }
+                Text { text: "Sign in with an existing Matrix account."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; vertical-stretch: 0; }
                 if root.saved-accounts.length > 0 : saved-account-trigger := TextAction {
                     in property <int> focus-request: root.account-focus-request;
                     init => { if !root.manage-accounts-open && !root.access-open { self.focus(); } }
                     changed focus-request => {
                         if root.show-sign-in && !root.manage-accounts-open && !root.access-open && root.saved-accounts.length > 0 { self.focus(); }
                     }
+                    reveal-full-control: true;
+                    height: 38px * root.text-scale; vertical-stretch: 0;
                     text: "Choose a saved account"; ink: root.ink; muted: root.muted;
                     surface: root.panel; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
                     activated => { root.manage-accounts-open = true; root.manage-accounts(); }
@@ -4906,23 +5111,23 @@ export component AppWindow inherits Window {
                     wrap: word-wrap; accessible-live-region: polite;
                 }
 
-                Rectangle { height: 6px; background: transparent; }
-                Text { text: "HOMESERVER"; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
+                Rectangle { height: 6px; vertical-stretch: 0; background: transparent; }
+                Text { text: "HOMESERVER"; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; letter-spacing: 1px; vertical-stretch: 0; }
                 Rectangle {
-                    height: 42px; background: root.elevated; border-radius: 8px; border-color: root.divider; border-width: 1px; clip: true;
-                    login-homeserver-input := ThemedTextInput { x: 11px; width: parent.width - 22px; height: parent.height; text <=> root.login-homeserver; color: root.ink; font-size: 13px * root.text-scale; vertical-alignment: center; accessible-label: "Homeserver URL"; }
+                    height: 42px * root.text-scale; vertical-stretch: 0; background: root.elevated; border-radius: StyleTokens.radius * 0.8; border-color: root.divider; border-width: 1px; clip: true;
+                    login-homeserver-input := ThemedTextInput { x: 11px; width: parent.width - 22px; height: parent.height; single-line: true; text <=> root.login-homeserver; color: root.ink; font-size: 13px * root.text-scale; vertical-alignment: center; accessible-label: "Homeserver URL"; }
                 }
-                Text { text: "MATRIX ID OR USERNAME"; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
+                Text { text: "MATRIX ID OR USERNAME"; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; letter-spacing: 1px; vertical-stretch: 0; }
                 Rectangle {
-                    height: 42px; background: root.elevated; border-radius: 8px; border-color: root.divider; border-width: 1px; clip: true;
-                    ThemedTextInput { x: 11px; width: parent.width - 22px; height: parent.height; text <=> root.login-username; color: root.ink; font-size: 13px * root.text-scale; vertical-alignment: center; accessible-label: "Matrix ID or username"; }
+                    height: 42px * root.text-scale; vertical-stretch: 0; background: root.elevated; border-radius: StyleTokens.radius * 0.8; border-color: root.divider; border-width: 1px; clip: true;
+                    ThemedTextInput { x: 11px; width: parent.width - 22px; height: parent.height; single-line: true; text <=> root.login-username; color: root.ink; font-size: 13px * root.text-scale; vertical-alignment: center; accessible-label: "Matrix ID or username"; }
                 }
-                Text { text: "PASSWORD"; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
+                Text { text: "PASSWORD"; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; letter-spacing: 1px; vertical-stretch: 0; }
                 Rectangle {
-                    height: 42px; background: root.elevated; border-radius: 8px; border-color: root.divider; border-width: 1px; clip: true;
-                    ThemedTextInput {
+                    height: 42px * root.text-scale; vertical-stretch: 0; background: root.elevated; border-radius: StyleTokens.radius * 0.8; border-color: root.divider; border-width: 1px; clip: true;
+                    login-password-input := ThemedTextInput {
                         x: 11px; width: parent.width - 22px; height: parent.height;
-                        text <=> root.login-password; input-type: password;
+                        text <=> root.login-password; single-line: true; input-type: password;
                         color: root.ink; font-size: 13px * root.text-scale; vertical-alignment: center;
                         accessible-label: "Password";
                         accepted => {
@@ -4937,13 +5142,13 @@ export component AppWindow inherits Window {
                 }
                 if root.login-error != "" : Text { text: root.login-error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483; font-size: 11px * root.text-scale; wrap: word-wrap; }
                 if root.config-error != "" : Text { text: "Settings file: " + root.config-error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483; font-size: 11px * root.text-scale; wrap: word-wrap; }
-                Rectangle { vertical-stretch: 1; background: transparent; }
-                Rectangle {
-                    height: 43px; border-radius: 9px; background: root.accent;
-                    accessible-role: button;
-                    accessible-label: root.login-loading ? "Signing in" : "Sign in to Matrix";
-                    accessible-enabled: !root.login-loading;
-                    accessible-action-default => {
+                login-submit := ActionRect {
+                    height: 43px * root.text-scale; vertical-stretch: 0;
+                    border-radius: StyleTokens.radius * 0.9; background: root.accent;
+                    reveal-full-control: true; focus-color: root.accent-ink;
+                    label: root.login-loading ? "Signing in" : "Sign in to Matrix";
+                    enabled: !root.login-loading;
+                    activated => {
                         if !root.login-loading {
                             let password = root.login-password;
                             root.login-password = "";
@@ -4952,47 +5157,34 @@ export component AppWindow inherits Window {
                         }
                     }
                     Text { text: root.login-loading ? "Signing in…" : "Sign in"; color: root.accent-ink; font-size: 13px * root.text-scale; font-weight: 750; horizontal-alignment: center; vertical-alignment: center; }
-                    TouchArea {
-                        enabled: !root.login-loading;
-                        mouse-cursor: pointer;
-                        clicked => {
-                            let password = root.login-password;
-                            root.login-password = "";
-                            root.login-loading = true;
-                            root.submit-login(root.login-homeserver, root.login-username, password);
-                        }
-                    }
                 }
-                Rectangle {
-                    height: 40px; border-radius: 9px; background: root.elevated;
+                login-browser := ActionRect {
+                    height: 40px * root.text-scale; vertical-stretch: 0;
+                    border-radius: StyleTokens.radius * 0.9; background: root.elevated;
                     border-color: root.divider; border-width: 1px;
-                    accessible-role: button;
-                    accessible-label: "Sign in with browser using Matrix SSO";
-                    accessible-enabled: !root.login-loading;
-                    accessible-action-default => {
+                    reveal-full-control: true; focus-color: root.accent;
+                    label: "Sign in with browser using Matrix SSO";
+                    enabled: !root.login-loading;
+                    activated => {
                         if !root.login-loading {
                             root.login-loading = true;
                             root.submit-sso(root.login-homeserver);
                         }
                     }
                     Text { text: "Sign in with browser · Matrix SSO"; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
-                    TouchArea {
-                        enabled: !root.login-loading; mouse-cursor: pointer;
-                        clicked => {
-                            root.login-loading = true;
-                            root.submit-sso(root.login-homeserver);
-                        }
-                    }
                 }
-                Rectangle {
-                    height: 38px; border-radius: 8px; background: preview-hit.has-hover ? root.hover : transparent;
-                    accessible-role: button; accessible-label: "Open interactive preview without signing in";
-                    accessible-enabled: !root.login-loading;
-                    accessible-action-default => { if !root.login-loading { root.preview-demo(); } }
+                login-preview := ActionRect {
+                    height: 38px * root.text-scale; vertical-stretch: 0;
+                    border-radius: StyleTokens.radius * 0.8; background: self.has-hover ? root.hover : transparent;
+                    reveal-full-control: true; focus-color: root.accent;
+                    label: "Open interactive preview without signing in";
+                    enabled: !root.login-loading;
+                    activated => { if !root.login-loading { root.preview-demo(); } }
                     Text { text: "Explore the interactive preview"; color: root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
-                    preview-hit := TouchArea { enabled: !root.login-loading; mouse-cursor: pointer; clicked => { root.preview-demo(); } }
+                }
                 }
             }
+        }
         }
     }
 
@@ -5072,7 +5264,7 @@ export component AppWindow inherits Window {
                 width: min(620px * root.text-scale, parent.width - 32px);
                 height: min(680px * root.text-scale, parent.height - 32px);
                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-                background: root.canvas; border-radius: 14px; border-width: 1px; border-color: root.divider;
+                background: root.canvas; border-radius: StyleTokens.radius * 1.4; border-width: 1px; border-color: root.divider;
                 accessible-role: region; accessible-label: "Manage saved Matrix accounts";
                 VerticalLayout {
                     padding: 20px; spacing: 12px;
@@ -5093,7 +5285,7 @@ export component AppWindow inherits Window {
                             VerticalLayout {
                                 spacing: 8px; alignment: start; vertical-stretch: 0;
                                 for account in root.saved-accounts : Rectangle {
-                                    min-height: 88px * root.text-scale; vertical-stretch: 0; background: root.elevated; border-radius: 9px;
+                                    min-height: 88px * root.text-scale; vertical-stretch: 0; background: root.elevated; border-radius: StyleTokens.radius * 0.9;
                                     VerticalLayout {
                                         padding: 10px; spacing: 7px; alignment: start;
                                         Text { text: account.handle; color: root.ink; font-size: 13px * root.text-scale; overflow: elide; accessible-label: account.handle; vertical-stretch: 0; }
@@ -5186,7 +5378,7 @@ export component AppWindow inherits Window {
                 width: min(540px * root.text-scale, parent.width - 32px);
                 height: min(610px * root.text-scale, parent.height - 32px);
                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-                background: root.canvas; border-radius: 14px; border-width: 1px; border-color: root.divider;
+                background: root.canvas; border-radius: StyleTokens.radius * 1.4; border-width: 1px; border-color: root.divider;
                 accessible-role: form; accessible-label: root.access-mode == 4 ? "Remove saved account" : "Local app password";
                 VerticalLayout {
                     padding: 22px; spacing: 12px;
@@ -5210,7 +5402,7 @@ export component AppWindow inherits Window {
                             if root.access-mode == 0 || root.access-mode == 2 || root.access-mode == 3 : Text { text: "Current app password"; color: root.ink; font-size: 12px * root.text-scale; vertical-stretch: 0; }
                             Rectangle {
                                 visible: root.access-mode == 0 || root.access-mode == 2 || root.access-mode == 3;
-                                height: self.visible ? 42px * root.text-scale : 0px; vertical-stretch: 0; background: root.elevated; border-radius: 8px;
+                                height: self.visible ? 42px * root.text-scale : 0px; vertical-stretch: 0; background: root.elevated; border-radius: StyleTokens.radius * 0.8;
                                 access-current := ThemedTextInput {
                                     x: 12px; width: parent.width - 24px; height: parent.height; single-line: true; input-type: password;
                                     enabled: parent.visible && !root.access-busy; text <=> root.access-current-password;
@@ -5221,7 +5413,7 @@ export component AppWindow inherits Window {
                             if root.access-mode == 1 || root.access-mode == 2 : Text { text: "New app password"; color: root.ink; font-size: 12px * root.text-scale; vertical-stretch: 0; }
                             Rectangle {
                                 visible: root.access-mode == 1 || root.access-mode == 2;
-                                height: self.visible ? 42px * root.text-scale : 0px; vertical-stretch: 0; background: root.elevated; border-radius: 8px;
+                                height: self.visible ? 42px * root.text-scale : 0px; vertical-stretch: 0; background: root.elevated; border-radius: StyleTokens.radius * 0.8;
                                 access-new := ThemedTextInput {
                                     x: 12px; width: parent.width - 24px; height: parent.height; single-line: true; input-type: password;
                                     enabled: parent.visible && !root.access-busy; text <=> root.access-new-password;
@@ -5231,7 +5423,7 @@ export component AppWindow inherits Window {
                             if root.access-mode == 1 || root.access-mode == 2 : Text { text: "Confirm new password"; color: root.ink; font-size: 12px * root.text-scale; vertical-stretch: 0; }
                             Rectangle {
                                 visible: root.access-mode == 1 || root.access-mode == 2;
-                                height: self.visible ? 42px * root.text-scale : 0px; vertical-stretch: 0; background: root.elevated; border-radius: 8px;
+                                height: self.visible ? 42px * root.text-scale : 0px; vertical-stretch: 0; background: root.elevated; border-radius: StyleTokens.radius * 0.8;
                                 access-confirm := ThemedTextInput {
                                     x: 12px; width: parent.width - 24px; height: parent.height; single-line: true; input-type: password;
                                     enabled: parent.visible && !root.access-busy; text <=> root.access-confirm-password;

@@ -3,9 +3,21 @@ $ErrorActionPreference = 'Stop'
 if ($env:MORPHEUS_WINDOWS_CAPTURE_ACCEPTANCE -ne '1' -or $env:GITHUB_ACTIONS -ne 'true' -or
     $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows' -or
     $Nonce -notmatch '^[a-f0-9]{32}$') { exit 2 }
+# Diagnostic phases contain literals only. Recording them is best effort and
+# cannot replace an original fixture failure or change the acceptance guards.
+function Write-FixtureStage([string]$Stage) {
+    try { [System.IO.File]::WriteAllText((Join-Path $FixtureRoot 'fixture-stage'), $Stage) }
+    catch { }
+}
+Write-FixtureStage 'load_forms'
 Add-Type -AssemblyName System.Windows.Forms
+Write-FixtureStage 'load_drawing'
 Add-Type -AssemblyName System.Drawing
-if (-not [Environment]::UserInteractive -or [System.Windows.Forms.Screen]::AllScreens.Count -ne 1) { exit 3 }
+Write-FixtureStage 'interactive_check'
+if (-not [Environment]::UserInteractive) { exit 3 }
+Write-FixtureStage 'display_check'
+if ([System.Windows.Forms.Screen]::AllScreens.Count -ne 1) { exit 3 }
+Write-FixtureStage 'create_window'
 [System.Windows.Forms.Application]::EnableVisualStyles()
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Morpheus capture QA $Nonce"
@@ -41,10 +53,14 @@ $timer.Add_Tick({
     [System.IO.File]::WriteAllText((Join-Path $FixtureRoot 'ack'), $command)
 })
 $form.Add_Shown({
+    Write-FixtureStage 'shown'
     $form.Activate()
     $form.Refresh()
+    Write-FixtureStage 'painted'
     [System.IO.File]::WriteAllText((Join-Path $FixtureRoot 'ack'), 'ready')
+    Write-FixtureStage 'ready'
     $timer.Start()
 })
+Write-FixtureStage 'show_window'
 try { [System.Windows.Forms.Application]::Run($form) }
 finally { $timer.Stop(); $timer.Dispose(); $form.Dispose(); $red.Dispose(); $blue.Dispose() }

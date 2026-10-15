@@ -19,6 +19,7 @@ mod live;
 #[cfg(feature = "native-calls")]
 mod local_video;
 mod message_metadata;
+mod navigation;
 mod notifications;
 #[cfg(feature = "native-calls")]
 mod outgoing_ring;
@@ -872,15 +873,7 @@ fn color_from_hex(value: &str) -> Color {
 }
 
 fn apply_room_sort(ui: &AppWindow) {
-    let sort_unread_first = ui.get_sort_unread_first();
-    let mut channels = ui.get_unsorted_channels().iter().collect::<Vec<_>>();
-    let mut direct_messages = ui.get_unsorted_direct_messages().iter().collect::<Vec<_>>();
-    if sort_unread_first {
-        channels.sort_by_key(|room| room.unread == 0);
-        direct_messages.sort_by_key(|room| room.unread == 0);
-    }
-    ui.set_channels(ModelRc::new(VecModel::from(channels)));
-    ui.set_direct_messages(ModelRc::new(VecModel::from(direct_messages)));
+    navigation::apply_room_order(ui);
 }
 
 fn apply_notification_settings(ui: &AppWindow, config: &Config) {
@@ -1474,7 +1467,7 @@ fn continue_account_action(ui: &AppWindow, action: i32) {
     ui.set_account_menu_open(false);
     match action {
         -2 => ui.invoke_add_account(),
-        -3 => ui.invoke_log_out(),
+        -3 => ui.invoke_continue_log_out(),
         index if index >= 0 => ui.invoke_switch_account(index),
         _ => {}
     }
@@ -4210,32 +4203,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Bind logout at the first click, including while a leave-call dialog is
+    // open. A resumed intent never captures whichever account is current later.
+    let pending_logout = Rc::new(RefCell::new(None::<morpheus_matrix::AccountSelection>));
     let weak = ui.as_weak();
     let logout_live = live.clone();
     let logout_handle = runtime.handle().clone();
     let logout_access = account_access.clone();
     #[cfg(feature = "native-calls")]
     let logout_calls = calls.clone();
-    ui.on_log_out(move || {
-        if let Some(ui) = weak.upgrade() {
-            ui.invoke_cancel_room_settings();
-            ui.invoke_close_image_preview();
-        }
-        if !logout_live.is_live.load(Ordering::Acquire) {
-            if let Some(ui) = weak.upgrade() {
-                ui.set_show_sign_in(true);
-            }
-            return;
-        }
-        if let Some(window) = weak.upgrade()
-            && security::block_account_change(&window, &logout_live.security_gate)
-        {
-            return;
-        }
-        #[cfg(feature = "native-calls")]
-        if ask_to_leave_call(&weak, &logout_calls, -3) {
-            return;
-        }
+    let perform_logout = Rc::new(move |selection: morpheus_matrix::AccountSelection| {
         logout_live.invalidate_navigation();
         let live = logout_live.clone();
         let security_gate = logout_live.security_gate.clone();
@@ -4253,20 +4230,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             #[cfg(feature = "native-calls")]
             if calls.status().blocks_account_switch() {
-                let _ = ui.upgrade_in_event_loop(|window| {
-                    window.set_pending_account_index(-3);
-                    window.set_leave_call_dialog(true);
-                });
+                // A new call began after the click or confirmation. Do not
+                // reopen a dialog and accidentally replace its captured intent.
+                show_error(&ui, "Leave the active call before logging out.".into());
                 return;
             }
             let Some(_security) = security_gate.try_account_access() else { return; };
-            let Some(active) = live.manager.active_account().await else {
+            let account_id = selection.account_id().to_owned();
+            // The core checks selection identity atomically before any logout
+            // effect. A queued A -> B (including A -> B -> A) cannot retarget it.
+            let result = live.manager.logout_selected_account(&selection).await;
+            if matches!(&result, Err(morpheus_matrix::MatrixCoreError::SelectedAccountChanged)) {
+                show_error(&ui, "The account changed. Open its menu and request logout again.".into());
                 return;
-            };
-            // Logout deletes this account's encrypted store. Flush is not
-            // needed: in-flight draft writes share the manager's state lock,
-            // and writes after deletion reject the missing account ID.
-            let result = live.manager.logout_account(&active.id).await;
+            }
             if live.manager.active_account().await.is_none() {
                 live.account_detached(ui.clone()).await;
             }
@@ -4274,11 +4251,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             drop(transition);
             match result {
                 Ok(result) => {
-                    if let Err(error) = live.voice_spaces.clear_logged_out_account(&active.id) {
+                    if let Err(error) = live.voice_spaces.clear_logged_out_account(&account_id) {
                         show_error(&ui, format!("Could not remove local voice labels: {error}"));
                     }
-                    live.voice_spaces.forget_account(&active.id).await;
-                    live.forget_account_drafts(&active.id);
+                    live.voice_spaces.forget_account(&account_id).await;
+                    live.forget_account_drafts(&account_id);
                     live.clear_feed().await;
                     live.account_detached(ui.clone()).await;
                     let _ = ui.upgrade_in_event_loop(move |ui| {
@@ -4292,6 +4269,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(error) => show_error(&ui, error.to_string()),
             }
         });
+    });
+    let weak = ui.as_weak();
+    let logout_live = live.clone();
+    let logout_pending = pending_logout.clone();
+    let logout_perform = perform_logout.clone();
+    #[cfg(feature = "native-calls")]
+    let logout_calls = calls.clone();
+    ui.on_log_out(move || {
+        // A fresh click supersedes any dismissed/old confirmation.
+        logout_pending.borrow_mut().take();
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        window.invoke_cancel_room_settings();
+        window.invoke_close_image_preview();
+        if !logout_live.is_live.load(Ordering::Acquire) {
+            if window.get_call_connected() {
+                window.set_pending_account_index(-3);
+                window.set_leave_call_dialog(true);
+            } else {
+                window.set_show_sign_in(true);
+            }
+            return;
+        }
+        if security::block_account_change(&window, &logout_live.security_gate) {
+            return;
+        }
+        let visible_id = window.get_active_account_local_id();
+        let Some(selection) = logout_live.manager.account_selection(visible_id.as_str()) else {
+            show_error(
+                &weak,
+                "The account changed. Open its menu and request logout again.".into(),
+            );
+            return;
+        };
+        #[cfg(feature = "native-calls")]
+        if ask_to_leave_call(&weak, &logout_calls, -3) {
+            *logout_pending.borrow_mut() = Some(selection);
+            return;
+        }
+        logout_perform(selection);
+    });
+    let weak = ui.as_weak();
+    let resume_live = live.clone();
+    let resume_pending = pending_logout.clone();
+    ui.on_continue_log_out(move || {
+        let selection = resume_pending.borrow_mut().take();
+        if !resume_live.is_live.load(Ordering::Acquire) {
+            // The offline call preview has no Matrix account or destructive work.
+            if let Some(window) = weak.upgrade() {
+                window.set_show_sign_in(true);
+            }
+            return;
+        }
+        let Some(selection) = selection else {
+            show_error(
+                &weak,
+                "The account changed. Open its menu and request logout again.".into(),
+            );
+            return;
+        };
+        perform_logout(selection);
+    });
+    ui.on_cancel_pending_log_out(move || {
+        pending_logout.borrow_mut().take();
     });
 
     let weak = ui.as_weak();

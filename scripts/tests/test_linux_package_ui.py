@@ -155,7 +155,7 @@ class KeyboardFlowMockTests(unittest.TestCase):
                     raise RuntimeError("focus mismatch")
 
             def find(self, name):
-                present = self.modal if name == "Manage Matrix accounts" else self.menu
+                present = self.modal if name == "Manage saved Matrix accounts" else self.menu
                 return True if present else None
 
             def wait(self, name):
@@ -172,10 +172,10 @@ class KeyboardFlowMockTests(unittest.TestCase):
                     self.menu = self.modal = False
                     self.focus_name = "Account menu for fixture" if escape_returns else "unrelated"
                 elif self.modal:
-                    self.focus_name = "Add Matrix account" if key == "Tab" else "Close account manager"
+                    self.focus_name = "Add account" if key == "Tab" else "Done"
                 elif key in {"Return", "space"}:
                     if self.focus_name == "Manage accounts":
-                        self.menu, self.modal, self.focus_name = False, True, "Close account manager"
+                        self.menu, self.modal, self.focus_name = False, True, "Done"
                     else:
                         self.menu, self.focus_name = True, "Switch to fixture"
                 elif key == "Tab":

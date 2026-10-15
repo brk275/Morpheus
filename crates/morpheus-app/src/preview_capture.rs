@@ -14,14 +14,14 @@ use std::{
     time::Duration,
 };
 
-use morpheus_config::{BuiltInStylePreset, ConversationHeaderMode};
+use morpheus_config::{BuiltInStylePreset, ConversationHeaderMode, NavigationMode};
 use slint::ComponentHandle;
 
 use super::{AppWindow, Config, apply_config, apply_state, fixtures};
 
 const WIDTH: u32 = 1440;
 const HEIGHT: u32 = 900;
-const FILES: [&str; 9] = [
+const FILES: [&str; 12] = [
     "desktop-preview.ppm",
     "account-switcher.ppm",
     "sign-in.ppm",
@@ -31,6 +31,9 @@ const FILES: [&str; 9] = [
     "manage-accounts.ppm",
     "account-password.ppm",
     "account-password-large.ppm",
+    "sign-in-large.ppm",
+    "terminal-sidebar.ppm",
+    "terminal-space-labels.ppm",
 ];
 
 pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
@@ -55,6 +58,15 @@ pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
     terminal.apply_style_preset(BuiltInStylePreset::Terminal);
     terminal.conversation.header = ConversationHeaderMode::Minimal;
     let terminal_theme = BuiltInStylePreset::Terminal.theme()?;
+    let mut terminal_sidebar = terminal.clone();
+    terminal_sidebar.layout.navigation = NavigationMode::Sidebar;
+    terminal_sidebar.layout.group_direct_messages = false;
+    terminal_sidebar.layout.sort_unread_first = true;
+    let mut terminal_labels = terminal_sidebar.clone();
+    terminal_labels.layout.navigation = NavigationMode::Rail;
+    terminal_labels.layout.show_space_labels = true;
+    let mut large_sign_in = nocturne.clone();
+    large_sign_in.appearance.scale_percent = 200;
     let mut paper = Config::default();
     paper.apply_style_preset(BuiltInStylePreset::Paper);
     paper.conversation.header = ConversationHeaderMode::Compact;
@@ -199,6 +211,56 @@ pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
                 7 => {
                     window.set_font_scale_percent(200);
                 }
+                8 => {
+                    // The next frame is the actual large-text sign-in form,
+                    // without a saved-account shortcut or another modal over it.
+                    reset_capture_overlays(&window);
+                    window.set_saved_accounts(slint::ModelRc::new(slint::VecModel::from(Vec::<
+                        super::SavedAccountItem,
+                    >::new(
+                    ))));
+                    window.set_app_password_enabled(false);
+                    window.set_live_session(false);
+                    window.set_preview_session(false);
+                    window.set_active_account_local_id("".into());
+                    window.set_login_loading(false);
+                    window.set_login_error("".into());
+                    window.set_login_homeserver("https://matrix.org".into());
+                    apply_config(&window, &large_sign_in, Some(&nocturne_theme));
+                    window.set_show_sign_in(true);
+                }
+                9 => {
+                    // Rebuild only the same in-memory Home fixtures. The Space
+                    // names below are presentation rows, not live membership.
+                    reset_capture_overlays(&window);
+                    window.set_show_sign_in(false);
+                    apply_state(&window, &fixtures());
+                    window.set_active_space_id("".into());
+                    window.set_active_space_name("Home".into());
+                    window.set_spaces(slint::ModelRc::new(slint::VecModel::from(vec![
+                        super::SpaceItem {
+                            id: "!preview-workshop:example.org".into(),
+                            name: "Workshop".into(),
+                            initials: "W".into(),
+                            accent: super::rgb(109, 180, 156),
+                        },
+                        super::SpaceItem {
+                            id: "!preview-study:example.org".into(),
+                            name: "Quiet Study and Shared Notes".into(),
+                            initials: "QS".into(),
+                            accent: super::rgb(135, 157, 208),
+                        },
+                    ])));
+                    apply_config(&window, &terminal_sidebar, Some(&terminal_theme));
+                    window
+                        .set_native_call_status("Select a room to check call availability".into());
+                }
+                10 => {
+                    // Same window, Home rooms and fictional Spaces; just change
+                    // navigation to the labeled rail through real configuration.
+                    reset_capture_overlays(&window);
+                    apply_config(&window, &terminal_labels, Some(&terminal_theme));
+                }
                 _ => {
                     *captured.borrow_mut() = Some(Ok(()));
                     let _ = slint::quit_event_loop();
@@ -216,6 +278,35 @@ pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
         .ok_or("The preview window closed before screenshot capture completed")?;
     result.map_err(|error: String| -> Box<dyn std::error::Error> { error.into() })?;
     Ok(true)
+}
+
+// These are UI properties only. early_dispatch never registers callbacks that
+// can sign in, start a call, change accounts, or read/write saved credentials.
+fn reset_capture_overlays(ui: &AppWindow) {
+    ui.set_access_open(false);
+    ui.set_manage_accounts_open(false);
+    ui.set_account_menu_open(false);
+    ui.set_room_admin_open(false);
+    ui.set_room_actions_open(false);
+    ui.set_member_confirm_open(false);
+    ui.set_native_capture_picker_open(false);
+    ui.set_leave_call_dialog(false);
+    ui.set_quick_switcher_open(false);
+    ui.set_image_preview_open(false);
+    ui.set_access_current_password("".into());
+    ui.set_access_new_password("".into());
+    ui.set_access_confirm_password("".into());
+    ui.set_access_target("".into());
+    ui.set_access_error("".into());
+    ui.set_access_busy(false);
+    ui.set_account_access_notice("".into());
+    ui.set_session_error("".into());
+    ui.set_incoming_call_notice("".into());
+    ui.set_incoming_call_account_id("".into());
+    ui.set_incoming_call_offers(slint::ModelRc::new(slint::VecModel::from(Vec::<
+        super::IncomingCallItem,
+    >::new())));
+    ui.set_page(0);
 }
 
 fn save_snapshot(ui: &AppWindow, path: &Path) -> Result<(), Box<dyn std::error::Error>> {

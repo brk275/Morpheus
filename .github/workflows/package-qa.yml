@@ -115,6 +115,9 @@ jobs:
             gnome-keyring libsecret-tools libglib2.0-bin libdrm-dev libinih-dev \
             libsystemd-dev meson ninja-build wayland-protocols sway swaybg \
             pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-wlr
+      - name: Prepare verified Windows NSIS tools
+        if: runner.os == 'Windows'
+        run: python3 scripts/windows_package_tools.py
       - name: Build unsigned QA package
         if: runner.os != 'Linux' || (!inputs.appimage_updates && !inputs.appimage_capture)
         run: python3 scripts/package.py --formats ${{ matrix.formats }}

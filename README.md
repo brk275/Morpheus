@@ -15,8 +15,9 @@ customization.
 - **Optional local switch password and direct account removal.** The new
   [account controls](docs/ACCOUNT_ACCESS.md) use one app password for protected
   switches and startup restore. Remove any saved account without opening it;
-  incomplete cleanup stays visible for retry. Core regressions pass on all four
-  targets; real-vault and interactive acceptance remain open.
+  incomplete cleanup stays visible for retry. Linux disposable-vault tests now
+  pass protected switching, restart/unlock and removal. Installed-app and
+  screen-reader acceptance remain open.
 
 Each alias remains a normal Matrix account with its own homeserver identity.
 
@@ -65,18 +66,19 @@ and video previews are not supported. See [image preview limits](docs/IMAGE_PREV
 
 A [room-settings extension](docs/ROOM_SETTINGS.md) adds guarded name/topic,
 avatar and join-rule controls.
-At `93d1358`, all four native builds and unit suites passed. Linux OAuth refresh
-persistence and room-settings checks passed. Live checks still failed on an
-encrypted-restart test stack overflow and a fresh incoming-offer timeout before
-account switching; repairs require fresh hosted verification.
+At `51c04ce`, Linux passed the encrypted-restart and incoming-call replay checks
+that previously failed, together with protected-account, OAuth refresh,
+room-settings and stock Element Call fixtures. The native account dialogs also
+passed fresh visual review at normal and 200% text sizes.
 See [the verification record](docs/VERIFICATION.md) for the exact results.
 Native [incoming-call sound](docs/INCOMING_CALLS.md) passed its automated guards;
 audible output and device acceptance remain open. Protocol Decline is unimplemented.
 
-![Morpheus native desktop preview with fictional accounts](docs/screenshots/desktop.png)
+![Morpheus in its Terminal preset with aligned messages and an upward account switcher](docs/screenshots/account-switcher.png)
 
-Actual native application capture with fictional preview accounts.
-[Account switcher, sign-in, and capture details](docs/screenshots/README.md).
+Actual native capture: monospaced messages, nickname columns, square controls,
+a minimal header and the bottom-left account switcher. All people and accounts
+are fictional. [Nocturne, Paper, account controls and capture details](docs/screenshots/README.md).
 
 ## Make it yours
 
@@ -85,12 +87,16 @@ The first expansion adds independent interface/message/monospace fonts,
 message size, spacing, corners, rail and pane widths, optional avatars and
 timestamps, and stacked, compact or aligned nickname-column layouts.
 Full, compact and minimal room headers can be selected independently.
+Choose a Space rail or text sidebar, show Space labels, and group direct messages
+separately or combine them with rooms. Keyboard room navigation follows the
+displayed order.
 Theme files also expose status, selection, focus, link, unread and voice colors,
 plus a separate palette for sender names.
 **Nocturne, Terminal and Paper** are editable starting points. In-app controls
 and live TOML reload use the same preferences; invalid edits keep the last valid
-style. Native Nocturne and Terminal captures have been reviewed; follow-up
-font and layout refinements still require new capture verification. A theme editor and
+style. Native Nocturne, Terminal and Paper captures at `51c04ce` have been
+reviewed, including the monospaced and serif font choices. The newer navigation
+and keyboard changes still require their own hosted checks. A theme editor and
 more layout controls remain in development; Halloy-level breadth is the
 target, not a completed claim. See [customization](docs/CUSTOMIZATION.md).
 

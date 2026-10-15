@@ -640,9 +640,19 @@ impl BuiltInStylePreset {
     }
 }
 
+/// Location and presentation of the same Home, Space and application routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NavigationMode {
+    #[default]
+    Rail,
+    Sidebar,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Layout {
+    pub navigation: NavigationMode,
     pub room_list_width: u16,
     pub details_width: u16,
     pub show_member_panel: bool,
@@ -654,6 +664,7 @@ pub struct Layout {
 impl Default for Layout {
     fn default() -> Self {
         Self {
+            navigation: NavigationMode::Rail,
             room_list_width: 260,
             details_width: 300,
             show_member_panel: true,
@@ -1547,6 +1558,71 @@ mod tests {
             fs::read_to_string(store.path()).unwrap(),
             "schema_version = 99\n"
         );
+    }
+
+    #[test]
+    fn navigation_defaults_round_trip_and_reject_unknown_modes() {
+        let old: Config =
+            toml::from_str("schema_version = 1\n[layout]\nroom_list_width = 260\n").unwrap();
+        assert_eq!(old.layout.navigation, NavigationMode::Rail);
+        assert!(!old.layout.show_space_labels);
+        assert!(old.layout.group_direct_messages);
+        let mut config: Config = toml::from_str("schema_version = 1\n[layout]\nnavigation = \"sidebar\"\nshow_space_labels = true\ngroup_direct_messages = false\n").unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.layout.navigation, NavigationMode::Sidebar);
+        assert_eq!(
+            toml::from_str::<Config>(&toml::to_string(&config).unwrap()).unwrap(),
+            config
+        );
+        for preset in BuiltInStylePreset::ALL {
+            config.apply_style_preset(preset);
+            assert_eq!(config.layout.navigation, NavigationMode::Sidebar);
+            assert!(config.layout.show_space_labels);
+            assert!(!config.layout.group_direct_messages);
+        }
+        for bad in ["\"floating\"", "true", "1"] {
+            assert!(toml::from_str::<Config>(&format!("[layout]\nnavigation = {bad}\n")).is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_navigation_file_is_rejected_and_omission_restores_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let mut valid = Config::default();
+        valid.layout.navigation = NavigationMode::Sidebar;
+        valid.layout.group_direct_messages = false;
+        store.save(&valid).unwrap();
+        let updates = store.watch_with_theme(Duration::from_millis(10));
+        assert_eq!(
+            updates
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap()
+                .config
+                .layout
+                .navigation,
+            NavigationMode::Sidebar
+        );
+        fs::write(store.path(), "[layout]\nnavigation = \"unknown\"\n").unwrap();
+        assert!(matches!(
+            updates.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Err(ConfigError::Decode(_))
+        ));
+        assert!(store.load().is_err());
+        // A failed reload leaves the user's invalid edit intact for correction.
+        assert_eq!(
+            fs::read_to_string(store.path()).unwrap(),
+            "[layout]\nnavigation = \"unknown\"\n"
+        );
+        // Removing the table restores all three defaults.
+        fs::write(store.path(), "schema_version = 1\n").unwrap();
+        let restored = updates
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap()
+            .config;
+        assert_eq!(restored.layout, Layout::default());
     }
 
     #[test]

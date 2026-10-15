@@ -3,6 +3,67 @@
 Morpheus is pre-alpha software with no approved installer release. This log records checks actually completed;
 the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
+## Native and live acceptance: `51c04ce`
+
+[Run 38725671739](https://github.com/brk275/Morpheus/actions/runs/38725671739)
+tested `51c04ceec75538ff0bff3ef43cbfd3531870b3cb`. Linux and both Macs
+completed successfully. Windows passed its native builds and unit suites but
+failed the synthetic capture fixture. All jobs and cache/checkout post steps
+finished; the final CI acceptance job correctly failed. Complete collected
+platform logs scanned with zero findings. This candidate has not passed the
+complete native matrix.
+
+Each Mac passed 874 substantive unit/vendor/SDK tests; Windows passed 876 and
+Linux passed 900. Windows has two additional platform-specific Matrix tests.
+These counts exclude no-fixture integration early returns and pure diagnostic
+checks. Each target retains one ignored live test. Helpers passed 501 tests
+with one skip; the history scan found no secrets in 58 reachable commits.
+
+Linux passed 20 substantive live Rust tests plus three repeated diagnostics,
+with no failed or unrun checks. The staged `live_local` test reached `complete`.
+Against two disposable homeservers and an isolated real OS credential vault,
+it enabled account protection; rejected direct, wrong-password and cancelled
+activation; switched A→B→A with cached isolation; reopened locked and unlocked;
+removed inactive and active accounts with credential/store deletion; and
+allowed password reset only after complete removal. Protected classic login
+remained paused until authorization. This verifies the Linux fixture scope,
+not Mac/Windows credential-vault or installed-app behavior.
+
+All four Current/Sticky2025 DM/room ringing cases passed. Current/DM reached the
+fresh-offer phase and exercised account A→B→A with the old offer rejected.
+OAuth login/refresh and restore/refresh, all 13 room-settings facts, recovery,
+native late joins and the stock Element Call peer's 11 browser/native facts
+also passed. Real provider/browser handoff and physical audio/video devices
+remain separate gates.
+
+All nine native Linux preview captures passed visual inspection, including
+Manage accounts and password dialogs at 100% and 200%. The real Slint keyboard
+and pointer harness passed in these completed jobs, without binding-loop
+warnings. Six unchanged PNGs are recorded in the
+[screenshot gallery](screenshots/README.md), with exact source, run, artifact
+and image identities. This is neither screen-reader nor interactive installed
+acceptance. No installer was uploaded.
+
+The next source batch adds exact-intent logout, disabled-keyboard guards,
+scrollable sign-in, navigation choices and three more capture views. Those
+changed inputs need their own native evidence; they do not inherit this run's
+passing results. Signing, real devices, installation, updates, rollback and
+VoiceOver/Narrator/Orca remain release gates.
+
+### Windows capture failure
+
+The fixed result was `failure=capture`, `stage=window_ready`, `status=101`.
+That stage covers the fixture acknowledgement, owned PID/nonce window lookup,
+source-key lookup, single-display check and full-cover geometry assertion.
+`window_frames` was never reached, so no successful frame capture is established.
+The private native test log was deleted during fixture cleanup; the exact
+failed assertion cannot be recovered from the public result. Containment and
+cleanup reported no failure. The next candidate adds fixed stage/reason
+identifiers, bounded child exit codes and PowerShell preflight phases without
+exposing raw logs, window titles, paths or pixels. Its 24 mocked helper tests
+pass; hosted execution is pending. Geometry checks, process containment and
+deadlines remain unchanged.
+
 ## Live acceptance stack overflow diagnosis, 2026-10-15
 
 At `65b4ceb`, the `live_local` acceptance test stopped during `encrypted_restart`
@@ -23,8 +84,9 @@ operations retained. Claude reports the complete test passing locally after
 this change with a peak below 1.5 MiB. No stack size is raised. The source guard
 checks entry/completion within the coordinator and still requires the exact
 global phase allowlist with no duplicates; the runtime `complete` gate and
-stack-overflow detection are unchanged. Hosted execution of the merged
-candidate remains required, including the protected-account sequence.
+stack-overflow detection are unchanged. The merged test subsequently reached
+`complete` in Linux run 38725671739, including the protected-account sequence
+described above.
 
 ## Completed native run: `93d1358`
 

@@ -1,8 +1,8 @@
 //! Declarative appearance bridge shared by live sessions and offline previews.
 
 use morpheus_config::{
-    BuiltInStylePreset, Config, ConfigStore, ConversationHeaderMode, MessageLayout, ThemePack,
-    TimestampFormat,
+    BuiltInStylePreset, Config, ConfigStore, ConversationHeaderMode, MessageLayout, NavigationMode,
+    ThemePack, TimestampFormat,
 };
 use slint::fontique_011::fontique;
 use slint::{ComponentHandle, ModelRc, VecModel};
@@ -112,6 +112,14 @@ fn font_family_with_resolver(
 }
 
 pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
+    // Move only a focused, disappearing navigation control before changing its
+    // conditional subtree. Other input and modal focus remains untouched.
+    ui.invoke_apply_navigation_mode(match config.layout.navigation {
+        NavigationMode::Rail => 0,
+        NavigationMode::Sidebar => 1,
+    });
+    ui.set_show_space_labels(config.layout.show_space_labels);
+    ui.set_group_direct_messages(config.layout.group_direct_messages);
     ui.set_conversation_header_mode(match config.conversation.header {
         ConversationHeaderMode::Full => 0,
         ConversationHeaderMode::Compact => 1,
@@ -161,6 +169,38 @@ pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
 }
 
 pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
+    let weak = ui.as_weak();
+    let store_for_navigation = store.clone();
+    ui.on_choose_navigation_mode(move |index| {
+        let mode = match index {
+            0 => NavigationMode::Rail,
+            1 => NavigationMode::Sidebar,
+            _ => return,
+        };
+        if let Some(ui) = weak.upgrade() {
+            let _ = save_config_change(&ui, &store_for_navigation, |config| {
+                config.layout.navigation = mode;
+            });
+        }
+    });
+    let weak = ui.as_weak();
+    let store_for_labels = store.clone();
+    ui.on_set_show_space_labels(move |show| {
+        if let Some(ui) = weak.upgrade() {
+            let _ = save_config_change(&ui, &store_for_labels, |config| {
+                config.layout.show_space_labels = show;
+            });
+        }
+    });
+    let weak = ui.as_weak();
+    let store_for_grouping = store.clone();
+    ui.on_set_group_direct_messages(move |group| {
+        if let Some(ui) = weak.upgrade() {
+            let _ = save_config_change(&ui, &store_for_grouping, |config| {
+                config.layout.group_direct_messages = group;
+            });
+        }
+    });
     let weak = ui.as_weak();
     let store_for_weight = store.clone();
     ui.on_set_sender_weight(move |value| {

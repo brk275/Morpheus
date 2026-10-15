@@ -1015,8 +1015,39 @@ impl AccountManager {
     /// but a network failure cannot prevent removal of local credentials.
     /// The result reports whether the server accepted the logout.
     pub async fn logout_account(&self, id: &str) -> Result<LogoutResult> {
+        self.logout_account_inner(id, None).await
+    }
+
+    /// Log out only the selection captured when the user requested logout.
+    /// The same account selected again has a new epoch; queued work must not
+    /// delete its session. Validation happens before any persistent mutation,
+    /// credential access, or network request while holding the state lock.
+    pub async fn logout_selected_account(
+        &self,
+        selection: &AccountSelection,
+    ) -> Result<LogoutResult> {
+        self.logout_account_inner(selection.account_id(), Some(selection))
+            .await
+    }
+
+    async fn logout_account_inner(
+        &self,
+        id: &str,
+        selection: Option<&AccountSelection>,
+    ) -> Result<LogoutResult> {
         let _permit = self.access_permit()?;
         let mut state = self.state.lock().await;
+        if let Some(selection) = selection {
+            let current = self
+                .account_selection(id)
+                .ok_or(MatrixCoreError::SelectedAccountChanged)?;
+            if !selection.is_current()
+                || !selection.same_epoch(&current)
+                || state.active_account_id.as_deref() != Some(id)
+            {
+                return Err(MatrixCoreError::SelectedAccountChanged);
+            }
+        }
         let account = state
             .registry
             .accounts
@@ -1057,23 +1088,26 @@ impl AccountManager {
                     .await
                     {
                         Ok(client) => {
-                            if let Err(e) = client.restore_session(secret.session.into_auth()).await
+                            if client
+                                .restore_session(secret.session.into_auth())
+                                .await
+                                .is_err()
                             {
-                                warn!(account_id = id, error = %e, "could not restore session for remote logout");
+                                warn!("could not restore session for remote logout");
                                 None
                             } else {
                                 Some(client)
                             }
                         }
-                        Err(e) => {
-                            warn!(account_id = id, error = %e, "could not open client for remote logout");
+                        Err(_) => {
+                            warn!("could not open client for remote logout");
                             None
                         }
                     }
                 }
                 Ok(_) => None,
-                Err(e) => {
-                    warn!(account_id = id, error = %e, "could not read session for remote logout");
+                Err(_) => {
+                    warn!("could not read session for remote logout");
                     None
                 }
             }
@@ -1081,12 +1115,14 @@ impl AccountManager {
         let remote_logout_succeeded = if let Some(client) = client {
             match tokio::time::timeout(Duration::from_secs(15), client.logout()).await {
                 Ok(Ok(())) => true,
-                Ok(Err(e)) => {
-                    warn!(account_id = id, error = %e, "remote Matrix logout failed");
+                Ok(Err(_)) => {
+                    // Authenticated server errors may reflect request secrets.
+                    // Keep diagnostic text fixed, including on local restore.
+                    warn!("remote Matrix logout failed");
                     false
                 }
                 Err(_) => {
-                    warn!(account_id = id, "remote Matrix logout timed out");
+                    warn!("remote Matrix logout timed out");
                     false
                 }
             }

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import struct
 import tempfile
 import unittest
@@ -10,6 +11,23 @@ from scripts import encode_preview_pngs as preview
 
 
 class PreviewEncodingTests(unittest.TestCase):
+    def test_capture_encoder_and_workflow_share_the_exact_twelve_frame_allowlist(self):
+        expected = ("desktop-preview", "account-switcher", "sign-in", "incoming-call", "room-settings",
+                    "paper-preview", "manage-accounts", "account-password", "account-password-large",
+                    "sign-in-large", "terminal-sidebar", "terminal-space-labels")
+        self.assertEqual(preview.NAMES, expected)
+        root = Path(__file__).resolve().parents[2]
+        capture = (root / "crates/morpheus-app/src/preview_capture.rs").read_text()
+        names = re.search(r"const FILES: \[&str; 12\] = \[(.*?)\];", capture, re.S)
+        self.assertIsNotNone(names)
+        self.assertEqual(tuple(re.findall(r'"([a-z-]+)\.ppm"', names.group(1))), expected)
+        workflow = (root / ".github/workflows/ci.yml").read_text()
+        upload = workflow.split("      - name: Upload native preview PNGs and provenance only\n", 1)[1].split("      - name:", 1)[0]
+        path_block = upload.split("          path: |\n", 1)[1].split("          if-no-files-found:", 1)[0]
+        prefix = "${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/"
+        self.assertEqual([line.strip() for line in path_block.splitlines()],
+                         [prefix + name + ".png" for name in expected] + [prefix + "provenance.json"])
+
     def pixels(self):
         # Includes whitespace, '#', zero, and full-intensity channel values.
         sample = b"\x00\x20\xff\x0a\x23\x0d"
@@ -71,7 +89,7 @@ class PreviewEncodingTests(unittest.TestCase):
             self.assertTrue(all(path.stat().st_mode & 0o777 == 0o600 for path in out.iterdir()))
 
     def test_existing_output_extra_raw_file_and_symlink_are_rejected(self):
-        for issue in ("existing", "extra", "symlink", "directory"):
+        for issue in ("existing", "extra", "missing", "symlink", "directory"):
             with self.subTest(issue=issue), tempfile.TemporaryDirectory() as folder:
                 root = Path(folder).resolve()
                 raw, binary = self.fixture(root)
@@ -80,6 +98,8 @@ class PreviewEncodingTests(unittest.TestCase):
                     out.mkdir()
                 elif issue == "extra":
                     (raw / "private.log").write_text("not an upload input")
+                elif issue == "missing":
+                    (raw / "terminal-sidebar.ppm").unlink()
                 else:
                     target = raw / "sign-in.ppm"
                     target.unlink()

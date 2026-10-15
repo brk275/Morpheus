@@ -428,6 +428,9 @@ impl LiveUi {
             ui.set_spaces(ModelRc::new(VecModel::<SpaceItem>::default()));
             ui.set_channels(ModelRc::new(VecModel::<RoomItem>::default()));
             ui.set_direct_messages(ModelRc::new(VecModel::<RoomItem>::default()));
+            ui.set_combined_rooms(ModelRc::new(
+                VecModel::<crate::NavigationRoomItem>::default(),
+            ));
             ui.set_unsorted_channels(ModelRc::new(VecModel::<RoomItem>::default()));
             ui.set_unsorted_direct_messages(ModelRc::new(VecModel::<RoomItem>::default()));
             ui.set_messages(ModelRc::new(VecModel::<MessageItem>::default()));
