@@ -25,6 +25,57 @@ else:
     import package_smoke as smoke
 
 
+class DiagnosticFailure(RuntimeError):
+    def __init__(self, code):
+        self.code = code
+        super().__init__("Installed UI assertion failed")
+
+
+def require_ui(condition, code):
+    if not condition:
+        raise DiagnosticFailure(code)
+
+
+class Diagnostics:
+    """Only fixed tokens/booleans; never record names, values, PIDs or errors."""
+    def __init__(self, report):
+        self.value = report["diagnostic"] = {
+            "step": "setup", "operation": "none", "failure": "none",
+            "desktop_app_seen": False, "owned_app_seen": False,
+            "owned_node_seen": False, "homeserver_seen": False,
+            "username_seen": False, "password_seen": False,
+            "selector_matches": 0, "password_role": "unchecked",
+            "cleanup": "not_started",
+        }
+
+    def step(self, step):
+        self.value["step"] = step
+        self.value["operation"] = "none"
+
+    def operation(self, operation):
+        self.value["operation"] = operation
+
+    def failed(self, error):
+        if self.value["failure"] != "none":
+            return
+        if isinstance(error, DiagnosticFailure):
+            code = error.code
+        elif isinstance(error, AttributeError):
+            code = "attribute_error"
+        elif isinstance(error, TypeError):
+            code = "type_error"
+        elif isinstance(error, NotImplementedError):
+            code = "not_implemented"
+        elif isinstance(error, LookupError):
+            code = "lookup_error"
+        elif isinstance(error, OSError):
+            code = "os_error"
+        else:
+            code = "unclassified"
+        # Defensive fixed fallback if a future assertion supplies a bad token.
+        self.value["failure"] = code if code in smoke.KEYBOARD_FAILURES else "unclassified"
+
+
 def command(arguments):
     result = subprocess.run(arguments, stdin=subprocess.DEVNULL, capture_output=True, timeout=5)
     smoke.require(result.returncode == 0, "Installed UI helper command failed")
@@ -48,7 +99,9 @@ def seed_profile(root):
 
 
 class AccessibleUI:
-    def __init__(self, process, nonce):
+    def __init__(self, process, nonce, diagnostics=None):
+        self.diagnostics = diagnostics or Diagnostics({})
+        self.diagnostics.step("atspi_setup")
         import pyatspi
         from gi.repository import GLib
         self.api, self.transient_error = pyatspi, GLib.Error
@@ -60,20 +113,29 @@ class AccessibleUI:
 
     def nodes(self):
         count = 0
+        self.diagnostics.operation("desktop")
         for application in self.api.Registry.getDesktop(0):
+            self.diagnostics.value["desktop_app_seen"] = True
             try:
+                self.diagnostics.operation("application_pid")
                 pid = application.get_process_id()
+                self.diagnostics.operation("ownership")
                 if not self.owned(pid):
                     continue
+                self.diagnostics.value["owned_app_seen"] = True
                 pending = [application]
                 while pending:
                     node = pending.pop()
                     count += 1
-                    smoke.require(count <= 5000, "Installed accessibility tree exceeds bound")
+                    require_ui(count <= 5000, "tree_bound")
                     try:
+                        self.diagnostics.operation("node_cache")
                         node.clearCache()
+                        self.diagnostics.operation("ownership")
                         if self.owned(pid):
+                            self.diagnostics.value["owned_node_seen"] = True
                             yield node
+                            self.diagnostics.operation("node_children")
                             pending.extend(list(node))
                     except (LookupError, self.transient_error):
                         continue
@@ -82,20 +144,24 @@ class AccessibleUI:
 
     def find(self, label, *, prefix=False):
         matches = []
+        self.diagnostics.value["selector_matches"] = 0
         for node in self.nodes():
             try:
+                self.diagnostics.operation("node_name")
                 value = node.name or ""
                 if value.startswith(label) if prefix else value == label:
                     matches.append(node)
+                    self.diagnostics.value["selector_matches"] = min(len(matches), 2)
             except self.transient_error:
                 continue
-        smoke.require(len(matches) <= 1, "Installed accessibility selector is ambiguous")
+        require_ui(len(matches) <= 1, "selector_ambiguous")
         return matches[0] if matches else None
 
     def wait_for(self, predicate, seconds=12):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
-            smoke.require(smoke.process_status(self.process) is None, "Installed UI exited early")
+            self.diagnostics.operation("process_status")
+            require_ui(smoke.process_status(self.process) is None, "app_exited")
             try:
                 value = predicate()
                 if value:
@@ -103,7 +169,7 @@ class AccessibleUI:
             except (LookupError, self.transient_error):
                 pass
             time.sleep(0.1)
-        raise RuntimeError("Installed accessibility state did not arrive")
+        raise DiagnosticFailure("wait_timeout")
 
     def wait(self, label, *, prefix=False):
         return self.wait_for(lambda: self.find(label, prefix=prefix))
@@ -151,6 +217,28 @@ class AccessibleUI:
         smoke.require(node.getState().contains(self.api.STATE_ENABLED), "Installed control is disabled")
         action = node.queryAction()
         smoke.require(action.nActions > 0 and action.doAction(0), "Installed accessible action failed")
+
+
+def inspect_sign_in(ui, report, diagnostics):
+    report["phase"] = "sign_in_semantics"
+    diagnostics.step("homeserver")
+    ui.wait("Homeserver URL")
+    diagnostics.value["homeserver_seen"] = True
+    diagnostics.step("username")
+    ui.wait("Matrix ID or username")
+    diagnostics.value["username_seen"] = True
+    diagnostics.step("password")
+    password = ui.wait("Password")
+    diagnostics.value["password_seen"] = True
+    diagnostics.step("password_role")
+    diagnostics.operation("node_role")
+    role = password.getRole()
+    diagnostics.value["password_role"] = (
+        "password_text" if role == ui.api.ROLE_PASSWORD_TEXT else
+        "entry" if role == ui.api.ROLE_ENTRY else
+        "text" if role == ui.api.ROLE_TEXT else "other")
+    require_ui(role == ui.api.ROLE_PASSWORD_TEXT, "password_role")
+    report["sign_in_semantics"] = True
 
 
 def menu_keyboard(ui):
@@ -243,7 +331,8 @@ def request_close(window):
         xlib.XCloseDisplay(display)
 
 
-def acceptance(executable, report):
+def acceptance(executable, report, diagnostics=None):
+    diagnostics = diagnostics or Diagnostics(report)
     smoke.require(os.environ.get("GITHUB_ACTIONS") == "true" and sys.platform == "linux"
                   and Path("/.dockerenv").exists() and os.geteuid() != 0,
                   "Installed keyboard acceptance requires the unprivileged CI container")
@@ -258,24 +347,23 @@ def acceptance(executable, report):
         process = subprocess.Popen([str(executable)], env=env, stdin=subprocess.DEVNULL,
                                    stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         try:
-            ui = AccessibleUI(process, nonce)
-            report["phase"] = "sign_in_semantics"
-            ui.wait("Homeserver URL")
-            ui.wait("Matrix ID or username")
-            password = ui.wait("Password")
-            smoke.require(password.getRole() == ui.api.ROLE_PASSWORD_TEXT, "Password field lacks protected text semantics")
-            report["sign_in_semantics"] = True
+            ui = AccessibleUI(process, nonce, diagnostics)
+            inspect_sign_in(ui, report, diagnostics)
             # Enter the account-free preview through its accessible action.
             # This flow starts keyboard checks in the account menu; it does not
             # claim keyboard-only startup or submit a login.
+            diagnostics.step("preview")
             ui.action("Open interactive preview without signing in")
             report["phase"] = "account_menu_keyboard"
+            diagnostics.step("account_menu")
             menu_keyboard(ui)
             report["account_menu_keyboard"] = True
             report["phase"] = "appearance_config"
+            diagnostics.step("appearance")
             appearance_keyboard(ui, config)
             report["appearance_config"] = True
             report["phase"] = "normal_window_close"
+            diagnostics.step("normal_close")
             request_close(ui.window())
             deadline = time.monotonic() + 15
             while smoke.process_status(process) is None and time.monotonic() < deadline:
@@ -290,10 +378,22 @@ def acceptance(executable, report):
                     data = (candidate / "environ").read_bytes()
                     smoke.require(marker not in data.split(b"\0"), "Installed app left a running process")
             report["normal_window_close"] = True
+        except Exception as error:
+            diagnostics.failed(error)
+            raise
         finally:
-            # Cancel the acceptance alarm before bounded TERM/KILL/reap cleanup.
+            # Preserve the first failure position if bounded cleanup also fails.
             signal.alarm(0)
-            smoke.stop_process(process)
+            try:
+                smoke.stop_process(process)
+                diagnostics.value["cleanup"] = "passed"
+            except Exception as error:
+                diagnostics.value["cleanup"] = "failed"
+                if diagnostics.value["failure"] == "none":
+                    diagnostics.step("cleanup")
+                    diagnostics.operation("cleanup")
+                    diagnostics.failed(error)
+                raise
 
 
 def main():
@@ -301,16 +401,20 @@ def main():
               "sign_in_semantics": False, "account_menu_keyboard": False, "appearance_config": False,
               "normal_window_close": False, "app_log_public": False, "screen_reader_acceptance": False}
 
+    diagnostics = Diagnostics(report)
+
     def deadline(_signal, _frame):
-        raise RuntimeError("Installed UI acceptance deadline")
+        raise DiagnosticFailure("deadline")
 
     try:
         smoke.require(len(sys.argv) == 2, "Expected installed package path")
         signal.signal(signal.SIGALRM, deadline)
         signal.alarm(180)
-        acceptance(Path(sys.argv[1]).resolve(), report)
+        acceptance(Path(sys.argv[1]).resolve(), report, diagnostics)
         report.update(status="passed", phase="complete")
-    except Exception:
+        diagnostics.step("complete")
+    except Exception as error:
+        diagnostics.failed(error)
         # Library errors, tree contents, config diagnostics and application logs
         # are never printed. Fixed phases/booleans are enough to target a rerun.
         pass

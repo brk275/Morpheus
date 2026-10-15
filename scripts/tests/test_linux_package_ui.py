@@ -10,11 +10,19 @@ from unittest.mock import Mock, patch
 from scripts import ci_scope, linux_package_ui as ui, package_smoke as smoke
 
 
+def diagnostic(**overrides):
+    return {"step": "complete", "operation": "none", "failure": "none",
+            "desktop_app_seen": True, "owned_app_seen": True, "owned_node_seen": True,
+            "homeserver_seen": True, "username_seen": True, "password_seen": True,
+            "selector_matches": 1, "password_role": "password_text", "cleanup": "passed",
+            **overrides}
+
+
 def report(**overrides):
     return {"check": "installed_linux_keyboard_atspi", "status": "passed", "phase": "complete",
             "sign_in_semantics": True, "account_menu_keyboard": True, "appearance_config": True,
             "normal_window_close": True, "app_log_public": False, "screen_reader_acceptance": False,
-            **overrides}
+            "diagnostic": diagnostic(), **overrides}
 
 
 class PackageKeyboardMockTests(unittest.TestCase):
@@ -223,6 +231,163 @@ class KeyboardFlowMockTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 ui.appearance_keyboard(driver, config)
             self.assertEqual(config.read_bytes(), valid)
+
+
+
+class BoundedDiagnosticTests(unittest.TestCase):
+    def driver(self, applications=()):
+        driver = object.__new__(ui.AccessibleUI)
+        driver.diagnostics = ui.Diagnostics({})
+        driver.api = Mock()
+        driver.api.Registry.getDesktop.return_value = applications
+        driver.transient_error = type("Transient", (Exception,), {})
+        driver.process = Mock()
+        driver.owned = lambda _: True
+        return driver
+
+    def test_duplicate_exact_labels_remain_failure_with_bounded_match_count(self):
+        driver = self.driver()
+        nodes = [Mock(), Mock(), Mock()]
+        for node in nodes:
+            node.name = "Homeserver URL"
+        driver.nodes = lambda: iter(nodes)
+        with self.assertRaises(ui.DiagnosticFailure) as error:
+            driver.find("Homeserver URL")
+        driver.diagnostics.failed(error.exception)
+        self.assertEqual(driver.diagnostics.value["failure"], "selector_ambiguous")
+        self.assertEqual(driver.diagnostics.value["selector_matches"], 2)
+
+    def test_pid_api_error_is_distinguished_from_missing_owned_tree(self):
+        class MissingPid:
+            pass
+        driver = self.driver([MissingPid()])
+        with self.assertRaises(AttributeError) as error:
+            list(driver.nodes())
+        driver.diagnostics.failed(error.exception)
+        value = driver.diagnostics.value
+        self.assertTrue(value["desktop_app_seen"])
+        self.assertFalse(value["owned_app_seen"])
+        self.assertEqual(value["operation"], "application_pid")
+        self.assertEqual(value["failure"], "attribute_error")
+
+    def test_unowned_application_is_never_traversed(self):
+        app = Mock()
+        app.get_process_id.return_value = 123
+        driver = self.driver([app])
+        driver.owned = lambda _: False
+        self.assertEqual(list(driver.nodes()), [])
+        self.assertTrue(driver.diagnostics.value["desktop_app_seen"])
+        self.assertFalse(driver.diagnostics.value["owned_app_seen"])
+        self.assertFalse(driver.diagnostics.value["owned_node_seen"])
+        app.clearCache.assert_not_called()
+
+    def test_owned_tree_and_name_api_failure_are_separate_facts(self):
+        class Node:
+            @property
+            def name(self):
+                raise TypeError("PRIVATE_VALUE")
+        driver = self.driver()
+        driver.nodes = lambda: iter([Node()])
+        with self.assertRaises(TypeError) as error:
+            driver.find("Password")
+        driver.diagnostics.failed(error.exception)
+        self.assertEqual(driver.diagnostics.value["operation"], "node_name")
+        self.assertEqual(driver.diagnostics.value["failure"], "type_error")
+        self.assertNotIn("PRIVATE_VALUE", json.dumps(driver.diagnostics.value))
+
+    def test_sign_in_fields_and_wrong_password_role_cannot_pass(self):
+        fake = Mock()
+        fake.api.ROLE_PASSWORD_TEXT, fake.api.ROLE_ENTRY, fake.api.ROLE_TEXT = 1, 2, 3
+        fake.wait.return_value.getRole.return_value = 2
+        record = {"sign_in_semantics": False}
+        trace = ui.Diagnostics(record)
+        with self.assertRaises(ui.DiagnosticFailure) as error:
+            ui.inspect_sign_in(fake, record, trace)
+        trace.failed(error.exception)
+        self.assertFalse(record["sign_in_semantics"])
+        self.assertEqual(trace.value["step"], "password_role")
+        self.assertEqual(trace.value["operation"], "node_role")
+        self.assertEqual(trace.value["password_role"], "entry")
+        self.assertTrue(all(trace.value[key] for key in ("homeserver_seen", "username_seen", "password_seen")))
+        self.assertEqual([call.args[0] for call in fake.wait.call_args_list],
+                         ["Homeserver URL", "Matrix ID or username", "Password"])
+
+    def test_missing_second_label_retains_first_observation(self):
+        fake = Mock()
+        fake.wait.side_effect = [True, ui.DiagnosticFailure("wait_timeout")]
+        record = {"sign_in_semantics": False}
+        trace = ui.Diagnostics(record)
+        with self.assertRaises(ui.DiagnosticFailure) as error:
+            ui.inspect_sign_in(fake, record, trace)
+        trace.failed(error.exception)
+        self.assertEqual(trace.value["step"], "username")
+        self.assertTrue(trace.value["homeserver_seen"])
+        self.assertFalse(trace.value["username_seen"])
+        self.assertFalse(record["sign_in_semantics"])
+
+    def test_early_process_exit_is_not_a_label_timeout(self):
+        driver = self.driver()
+        with patch.object(smoke, "process_status", return_value=7):
+            with self.assertRaises(ui.DiagnosticFailure) as error:
+                driver.wait_for(lambda: False)
+        driver.diagnostics.failed(error.exception)
+        self.assertEqual(driver.diagnostics.value["failure"], "app_exited")
+        self.assertEqual(driver.diagnostics.value["operation"], "process_status")
+
+    def test_first_failure_survives_cleanup_error(self):
+        trace = ui.Diagnostics({})
+        trace.step("password_role")
+        trace.failed(ui.DiagnosticFailure("password_role"))
+        trace.value["cleanup"] = "failed"
+        trace.failed(OSError("PRIVATE_PATH"))
+        self.assertEqual(trace.value["failure"], "password_role")
+        self.assertEqual(trace.value["step"], "password_role")
+        self.assertEqual(trace.value["cleanup"], "failed")
+
+    def test_real_acceptance_finally_preserves_failure_and_reports_cleanup_failure(self):
+        record = {"sign_in_semantics": False}
+        trace = ui.Diagnostics(record)
+        original_path = Path
+
+        def fail_signin(_ui, _report, diagnostics):
+            diagnostics.step("password_role")
+            raise ui.DiagnosticFailure("password_role")
+
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), \
+                patch.object(ui.sys, "platform", "linux"), patch.object(ui.os, "geteuid", return_value=1000), \
+                patch.object(ui, "Path", side_effect=lambda value: Mock(exists=lambda: True)
+                             if value == "/.dockerenv" else original_path(value)), \
+                patch.object(smoke, "require_nonreaping_wait"), patch.object(ui, "command"), \
+                patch.object(ui.subprocess, "Popen", return_value=Mock()), \
+                patch.object(ui, "AccessibleUI"), patch.object(ui, "inspect_sign_in", side_effect=fail_signin), \
+                patch.object(ui.signal, "alarm"), \
+                patch.object(smoke, "stop_process", side_effect=OSError("PRIVATE_CLEANUP_PATH")):
+            with self.assertRaises(OSError):
+                ui.acceptance(Path("/synthetic/app"), record, trace)
+        self.assertEqual(trace.value["failure"], "password_role")
+        self.assertEqual(trace.value["step"], "password_role")
+        self.assertEqual(trace.value["cleanup"], "failed")
+        self.assertNotIn("PRIVATE", json.dumps(trace.value))
+
+    def test_parser_rejects_arbitrary_diagnostic_values_and_incomplete_success(self):
+        bad = [diagnostic(step="PRIVATE_PATH"), diagnostic(step=[]), diagnostic(operation="PRIVATE_LABEL"),
+               diagnostic(failure="PRIVATE_ERROR"), diagnostic(password_role="PRIVATE_ROLE"),
+               diagnostic(selector_matches=3), diagnostic(selector_matches=True),
+               diagnostic(owned_app_seen=1), diagnostic(cleanup="failed"),
+               diagnostic(homeserver_seen=False), diagnostic(private_text="SECRET")]
+        for value in bad:
+            with self.subTest(value=value), self.assertRaises(RuntimeError):
+                smoke.keyboard_report(json.dumps(report(diagnostic=value)).encode())
+
+    def test_exception_text_never_reaches_final_record(self):
+        for error in (AttributeError("PRIVATE_PATH"), TypeError("PRIVATE_SECRET"),
+                      NotImplementedError("PRIVATE_ROLE"), OSError("PRIVATE_TOKEN")):
+            with self.subTest(error=type(error).__name__):
+                trace = ui.Diagnostics({})
+                trace.failed(error)
+                raw = json.dumps(report(status="failed", phase="sign_in_semantics", diagnostic=trace.value))
+                self.assertNotIn("PRIVATE_", raw)
+                self.assertEqual(smoke.keyboard_report(raw.encode())["status"], "failed")
 
 
 if __name__ == "__main__":

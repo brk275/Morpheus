@@ -3,6 +3,42 @@
 Morpheus is pre-alpha software with no approved installer release. This log records checks actually completed;
 the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
+## Windows native acceptance: `74bcac2`
+
+[Run 38760078956](https://github.com/brk275/Morpheus/actions/runs/38760078956)
+tested `74bcac2af845dc145d1f05d1d15f86d9c23c14b1`. Impact selection ran
+Windows native checks for the changed Windows process helper; it did not
+repeat the other three native targets. Windows passed 882 substantive
+unit/vendor/SDK tests, five additional native-vault parser/path/cleanup
+contracts, native compilation, the generated-Slint keyboard/pointer harness
+and owned synthetic window/display capture. The three actual native-vault
+phases remained ignored in ordinary CI and still require the dedicated manual
+workflow. Successful contract tests are not credential-vault acceptance.
+
+Helpers passed 622 tests with one skip. The 64-commit history scan and complete
+collected job logs had zero findings. Every job and cache post completed,
+including the aggregate acceptance job. Linux's installed accessibility and
+system Wayland failures remain separate open gates.
+
+## Linux installed startup and accessibility: `74bcac2`
+
+[Run 38760502829](https://github.com/brk275/Morpheus/actions/runs/38760502829)
+tested only the ordinary Linux AppImage at
+`74bcac2af845dc145d1f05d1d15f86d9c23c14b1`, with update and fixed-client
+capture modes disabled. With the explicit host ALSA runtime installed,
+resources, desktop entry, ELF baseline and the 12-second owned X11 window
+startup/stop check passed before accessibility tools were installed.
+The AppImage SHA-256 was
+`4953605eab1adcfb38df3be9e14b8fa2621e58b41dcd82af52d2837ef20ece6f`.
+
+The later installed AT-SPI check failed at `sign_in_semantics`. That phase
+combined three input-label lookups and the password-role assertion; its fixed
+record cannot identify which failed. Account-menu keyboard behavior, appearance
+editing, normal window close and final package removal were not established.
+All jobs and cache posts completed, both complete logs scanned with zero
+findings, and no artifact was uploaded. This startup pass does not establish
+Orca, audio-device or system Wayland acceptance.
+
 ## Linux package startup diagnostic: `0f4f170`
 
 [Run 38755259166](https://github.com/brk275/Morpheus/actions/runs/38755259166)
@@ -19,7 +55,7 @@ findings, and no artifact was uploaded.
 The clean Ubuntu 24.04 AppImage fixture now explicitly installs the host ALSA
 runtime, `libasound2t64`, before its first launch. The first minimal-runtime
 launch must still pass before accessibility tools may be installed. This
-correction requires a new Linux-only package check; it does not establish
+correction passed the later Linux-only startup check above; it does not establish
 keyboard, audio-device or system Wayland acceptance. Mac and Windows package
 results below remain scoped to their unchanged package inputs.
 

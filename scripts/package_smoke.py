@@ -490,9 +490,46 @@ def linux_display_launch(executable, keyboard=False):
     require(result.returncode == 0 and report["status"] == "passed", "Installed keyboard acceptance failed")
 
 
+KEYBOARD_FAILURES = frozenset({
+    "none", "selector_ambiguous", "tree_bound", "app_exited", "wait_timeout",
+    "password_role", "deadline", "attribute_error", "type_error",
+    "not_implemented", "lookup_error", "os_error", "unclassified",
+})
+KEYBOARD_STEPS = frozenset({
+    "setup", "atspi_setup", "homeserver", "username", "password", "password_role",
+    "preview", "account_menu", "appearance", "normal_close", "cleanup", "complete",
+})
+KEYBOARD_OPERATIONS = frozenset({
+    "none", "desktop", "application_pid", "ownership", "node_cache", "node_children",
+    "node_name", "node_role", "process_status", "cleanup",
+})
+KEYBOARD_OBSERVATIONS = frozenset({
+    "desktop_app_seen", "owned_app_seen", "owned_node_seen", "homeserver_seen",
+    "username_seen", "password_seen",
+})
+
+
+def validate_keyboard_diagnostic(value, passed):
+    expected = KEYBOARD_OBSERVATIONS | {"step", "operation", "failure", "selector_matches",
+                                        "password_role", "cleanup"}
+    require(type(value) is dict and value.keys() == expected, "Invalid installed keyboard diagnostic shape")
+    require(all(type(value[key]) is str for key in ("step", "operation", "failure", "password_role", "cleanup"))
+            and value["step"] in KEYBOARD_STEPS and value["operation"] in KEYBOARD_OPERATIONS
+            and value["failure"] in KEYBOARD_FAILURES
+            and value["password_role"] in {"unchecked", "password_text", "entry", "text", "other"}
+            and value["cleanup"] in {"not_started", "passed", "failed"}
+            and type(value["selector_matches"]) is int and 0 <= value["selector_matches"] <= 2
+            and all(type(value[key]) is bool for key in KEYBOARD_OBSERVATIONS),
+            "Invalid installed keyboard diagnostic value")
+    require(not passed or (value["step"] == "complete" and value["failure"] == "none"
+            and value["cleanup"] == "passed" and value["password_role"] == "password_text"
+            and all(value[key] for key in KEYBOARD_OBSERVATIONS)),
+            "Incomplete installed keyboard diagnostics")
+
+
 def keyboard_report(raw):
     expected = {"check", "status", "phase", "sign_in_semantics", "account_menu_keyboard",
-                "appearance_config", "normal_window_close", "app_log_public", "screen_reader_acceptance"}
+                "appearance_config", "normal_window_close", "app_log_public", "screen_reader_acceptance", "diagnostic"}
     phases = {"setup", "sign_in_semantics", "account_menu_keyboard", "appearance_config",
               "normal_window_close", "complete"}
     require(len(raw) <= 65536, "Installed keyboard diagnostics exceeded bound")
@@ -506,9 +543,10 @@ def keyboard_report(raw):
             continue
         require(value.keys() == expected and value["status"] in {"passed", "failed"}
                 and value["phase"] in phases
-                and all(type(value[key]) is bool for key in expected - {"check", "status", "phase"})
+                and all(type(value[key]) is bool for key in expected - {"check", "status", "phase", "diagnostic"})
                 and not value["app_log_public"] and not value["screen_reader_acceptance"],
                 "Invalid installed keyboard diagnostic shape")
+        validate_keyboard_diagnostic(value["diagnostic"], value["status"] == "passed")
         require(value["status"] != "passed" or (value["phase"] == "complete"
                 and all(value[key] for key in ("sign_in_semantics", "account_menu_keyboard",
                                              "appearance_config", "normal_window_close"))),
