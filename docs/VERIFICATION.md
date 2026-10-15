@@ -3,6 +3,31 @@
 Morpheus is pre-alpha software with no approved installer release. This log records checks actually completed;
 the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
+## Sign-in compilation repair: `f4170ba`
+
+[Run 38735248636](https://github.com/brk275/Morpheus/actions/runs/38735248636)
+tested `f4170ba270cc25b4d1f4c4c7824aa3641341042c`. Both Macs and Linux
+passed 179 configuration/Matrix/RTC protocol tests; Windows passed 181,
+including two platform-specific Matrix tests. Helpers passed 520 tests with
+one skip. The 60-commit history scan and complete collected platform logs had
+zero findings.
+
+All four desktop checks then stopped at the same three Slint errors: the
+outer sign-in keyboard handler referenced `saved-account-trigger` inside a
+conditional subtree. App/controller tests, native device checks, live Matrix
+fixtures and preview captures did not run. Every job and cache post finished;
+the final CI acceptance job failed. No installer or preview artifact was
+published by this run.
+
+The repair requests saved-account focus through the existing account-focus
+mechanism and keeps that conditional control's Tab/Backtab handling local.
+The same-window keyboard regression now also exercises forward Tab into the
+homeserver field and the loading-state password/shortcut routes. Base palette
+and density selectors use the existing keyboard-enabled action component,
+with real-key harness coverage at 100% and 200% text size. Direct Rust formatting
+and source reviews passed; native compilation and execution of these repairs
+remain pending. The earlier `51c04ce` evidence below does not verify them.
+
 ## Native and live acceptance: `51c04ce`
 
 [Run 38725671739](https://github.com/brk275/Morpheus/actions/runs/38725671739)

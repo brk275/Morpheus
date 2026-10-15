@@ -2794,16 +2794,16 @@ export component AppWindow inherits Window {
                         Text { text: "Base palette"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         HorizontalLayout {
                             spacing: 12px;
-                            for choice[index] in ["Dark", "Light", "High contrast", "System"] : Rectangle {
+                            for choice[index] in ["Dark", "Light", "High contrast", "System"] : ActionRect {
                                 width: 128px;
                                 height: 100px;
                                 background: index == root.theme-mode ? root.hover : root.elevated;
                                 border-color: index == root.theme-mode ? root.accent : root.divider;
                                 border-width: index == root.theme-mode ? 2px : 1px;
                                 border-radius: StyleTokens.radius * 1.1;
-                                accessible-role: button;
-                                accessible-label: "Use " + choice + " theme";
-                                accessible-action-default => { root.choose-theme(index); }
+                                label: "Use " + choice + " theme";
+                                reveal-full-control: true; focus-color: root.accent;
+                                activated => { root.choose-theme(index); }
                                 VerticalLayout {
                                     padding: 14px;
                                     spacing: 9px;
@@ -2818,7 +2818,6 @@ export component AppWindow inherits Window {
                                     }
                                     Text { text: choice; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; overflow: elide; }
                                 }
-                                TouchArea { mouse-cursor: pointer; clicked => { root.choose-theme(index); } }
                             }
                         }
                         Rectangle {
@@ -2836,16 +2835,15 @@ export component AppWindow inherits Window {
                         Text { text: "Density"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
                         HorizontalLayout {
                             spacing: 10px;
-                            for choice[index] in ["Compact", "Comfortable", "Spacious"] : Rectangle {
+                            for choice[index] in ["Compact", "Comfortable", "Spacious"] : ActionRect {
                                 width: 142px; height: 40px; border-radius: StyleTokens.radius * 0.9;
                                 background: index == root.density-mode ? root.hover : root.elevated;
                                 border-color: index == root.density-mode ? root.accent : root.divider;
                                 border-width: index == root.density-mode ? 2px : 1px;
-                                accessible-role: button;
-                                accessible-label: "Use " + choice + " room and message density";
-                                accessible-action-default => { root.choose-density(index); }
+                                label: "Use " + choice + " room and message density";
+                                reveal-full-control: true; focus-color: root.accent;
+                                activated => { root.choose-density(index); }
                                 Text { text: choice; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
-                                TouchArea { mouse-cursor: pointer; clicked => { root.choose-density(index); } }
                             }
                         }
                         Rectangle { height: 1px; background: root.divider; }
@@ -5045,12 +5043,11 @@ export component AppWindow inherits Window {
         }
         capture-key-pressed(event) => {
             if event.text == Key.Tab && !event.modifiers.shift && login-preview.has-focus {
-                if root.saved-accounts.length > 0 { saved-account-trigger.focus(); }
+                if root.saved-accounts.length > 0 { root.return-account-focus(); }
                 else { login-homeserver-input.focus(); }
                 accept
             } else if (event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift)) &&
-                ((root.saved-accounts.length > 0 && saved-account-trigger.has-focus) ||
-                 (root.saved-accounts.length == 0 && login-homeserver-input.has-focus)) {
+                root.saved-accounts.length == 0 && login-homeserver-input.has-focus {
                 if root.login-loading { login-password-input.focus(); }
                 else { login-preview.focus(); }
                 accept
@@ -5059,7 +5056,7 @@ export component AppWindow inherits Window {
                 login-password-input.focus(); accept
             } else if root.login-loading && event.text == Key.Tab && !event.modifiers.shift &&
                 (login-password-input.has-focus || login-submit.has-focus || login-browser.has-focus) {
-                if root.saved-accounts.length > 0 { saved-account-trigger.focus(); }
+                if root.saved-accounts.length > 0 { root.return-account-focus(); }
                 else { login-homeserver-input.focus(); }
                 accept
             } else { reject }
@@ -5094,11 +5091,20 @@ export component AppWindow inherits Window {
                 }
                 Text { text: "Welcome to Morpheus"; color: root.ink; font-size: 22px * root.text-scale; font-weight: 770; wrap: word-wrap; vertical-stretch: 0; }
                 Text { text: "Sign in with an existing Matrix account."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; vertical-stretch: 0; }
-                if root.saved-accounts.length > 0 : saved-account-trigger := TextAction {
+                if root.saved-accounts.length > 0 : TextAction {
                     in property <int> focus-request: root.account-focus-request;
                     init => { if !root.manage-accounts-open && !root.access-open { self.focus(); } }
                     changed focus-request => {
                         if root.show-sign-in && !root.manage-accounts-open && !root.access-open && root.saved-accounts.length > 0 { self.focus(); }
+                    }
+                    // Resolve this conditional item's focus locally. Outer
+                    // handlers request it through account-focus-request;
+                    // Slint cannot address an ID across this conditional.
+                    trap-tab: true;
+                    next-focus => { login-homeserver-input.focus(); }
+                    previous-focus => {
+                        if root.login-loading { login-password-input.focus(); }
+                        else { login-preview.focus(); }
                     }
                     reveal-full-control: true;
                     height: 38px * root.text-scale; vertical-stretch: 0;

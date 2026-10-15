@@ -313,11 +313,27 @@ async fn assert_sign_in_keyboard(ui: &AppWindow) {
         ..Default::default()
     }])));
     settle(ui).await;
+    key(ui, Key::Tab); // saved-account shortcut -> first sign-in field
+    ui.set_login_homeserver("".into());
+    type_text(ui, "saved-focus");
+    assert_eq!(ui.get_login_homeserver().as_str(), "saved-focus");
+    key(ui, Key::Backtab); // first field -> saved-account shortcut
     key(ui, Key::Backtab);
     let before = previews.get();
     key(ui, Key::Return);
     assert_eq!(previews.get(), before + 1);
     key(ui, Key::Tab);
+    ui.set_login_loading(true);
+    key(ui, Key::Backtab); // saved shortcut -> password while actions are disabled
+    type_text(ui, "loading focus fixture");
+    ui.set_login_homeserver("https://keyboard.example.org".into());
+    ui.set_login_loading(false);
+    let before = passwords.borrow().len();
+    key(ui, Key::Return); // the normal field callback proves the focus target
+    assert_eq!(passwords.borrow().len(), before + 1);
+    assert_eq!(passwords.borrow().last().unwrap(), "loading focus fixture");
+    assert!(ui.get_login_loading());
+    key(ui, Key::Tab); // password wraps to the saved shortcut during login
     key(ui, Key::Return);
     assert!(ui.get_manage_accounts_open());
     assert!(!ui.get_account_menu_open());
@@ -328,6 +344,123 @@ async fn assert_sign_in_keyboard(ui: &AppWindow) {
     ui.set_font_scale_percent(100);
     ui.set_login_loading(false);
     ui.set_login_homeserver("https://matrix.org".into());
+    settle(ui).await;
+}
+
+// This observer uses only the already pinned Slint generated-code API. It
+// neither forces focus nor activates an accessible action. The public testing
+// element search needs debug-info code generation; this direct item-tree read
+// keeps the normal build and production properties unchanged.
+fn focused_control_has_label(ui: &AppWindow, expected: &str) -> bool {
+    use slint::private_unstable_api::re_exports::{AccessibleStringProperty, ItemRc, WindowInner};
+    use std::ops::ControlFlow;
+
+    let window = WindowInner::from_pub(ui.window());
+    let Some(focused) = window.focus_item.borrow().upgrade() else {
+        return false;
+    };
+    let root = ItemRc::new_root(window.component());
+    root.visit_descendants(|item| {
+        if item
+            .accessible_string_property(AccessibleStringProperty::Label)
+            .as_deref()
+            != Some(expected)
+        {
+            return ControlFlow::Continue(());
+        }
+        let contains_focus = item == &focused
+            || item
+                .visit_descendants(|child| {
+                    if child == &focused {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                })
+                .is_some();
+        if contains_focus {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_some()
+}
+
+fn tab_to_control(ui: &AppWindow, label: &str) {
+    // Walk the real current tab order without activating intervening controls.
+    // A missing FocusScope must fail instead of silently invoking the callback.
+    for _ in 0..160 {
+        if focused_control_has_label(ui, label) {
+            return;
+        }
+        key(ui, Key::Tab);
+    }
+    panic!("Appearance control is not keyboard reachable: {label}");
+}
+
+async fn assert_palette_and_density_keyboard(ui: &AppWindow) {
+    use std::{cell::RefCell, rc::Rc};
+
+    let themes = Rc::new(RefCell::new(Vec::new()));
+    let observed = themes.clone();
+    let weak = ui.as_weak();
+    ui.on_choose_theme(move |index| {
+        observed.borrow_mut().push(index);
+        weak.upgrade().unwrap().set_theme_mode(index);
+    });
+    let densities = Rc::new(RefCell::new(Vec::new()));
+    let observed = densities.clone();
+    let weak = ui.as_weak();
+    ui.on_choose_density(move |index| {
+        observed.borrow_mut().push(index);
+        weak.upgrade().unwrap().set_density_mode(index);
+    });
+
+    for scale in [100, 200] {
+        ui.set_page(1);
+        ui.set_font_scale_percent(scale);
+        // Existing production focus return resets the route to shortcut-scope.
+        ui.set_show_sign_in(true);
+        settle(ui).await;
+        ui.set_show_sign_in(false);
+        settle(ui).await;
+        for (index, label, activation) in [
+            (0, "Use Dark theme", Key::Return),
+            (1, "Use Light theme", Key::Space),
+            (2, "Use High contrast theme", Key::Return),
+            (3, "Use System theme", Key::Space),
+        ] {
+            tab_to_control(ui, label);
+            let previous = themes.borrow().len();
+            key(ui, activation);
+            assert_eq!(themes.borrow().len(), previous + 1);
+            assert_eq!(themes.borrow().last(), Some(&index));
+            assert_eq!(ui.get_theme_mode(), index);
+            assert!(focused_control_has_label(ui, label));
+        }
+        for (index, label, activation) in [
+            (0, "Use Compact room and message density", Key::Space),
+            (1, "Use Comfortable room and message density", Key::Return),
+            (2, "Use Spacious room and message density", Key::Space),
+        ] {
+            tab_to_control(ui, label);
+            let previous = densities.borrow().len();
+            key(ui, activation);
+            assert_eq!(densities.borrow().len(), previous + 1);
+            assert_eq!(densities.borrow().last(), Some(&index));
+            assert_eq!(ui.get_density_mode(), index);
+            assert!(focused_control_has_label(ui, label));
+        }
+    }
+
+    // These choices are always enabled in the product. Existing sign-in tests
+    // cover the shared ActionRect's disabled-retained-focus activation guard.
+    // Keep later account scenarios on the same window with their prior state.
+    ui.on_choose_theme(|_| {});
+    ui.on_choose_density(|_| {});
+    apply_config(ui, &Config::default(), None);
+    ui.set_page(0);
     settle(ui).await;
 }
 
@@ -405,6 +538,7 @@ async fn exercise_account_ui(runtime: Handle) {
     assert_sign_in_keyboard(&ui).await;
     settle(&ui).await;
     assert_navigation_projection_and_focus(&ui).await;
+    assert_palette_and_density_keyboard(&ui).await;
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),
     )));
