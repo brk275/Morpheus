@@ -45,9 +45,12 @@ class OwnedRunner:
         self.progress = progress
         self.last_stage = "none"
 
+    def assert_containment(self):
+        containment.assert_contained()
+
     def run(self, stage, argv, *, cwd, env, timeout, output_limit,
             binary_output=False, expected_status=(0,)):
-        containment.assert_contained()
+        self.assert_containment()
         if (not re.fullmatch(r"[a-z][a-z0-9-]{0,47}", stage)
                 or not argv or not all(isinstance(value, str) and "\0" not in value for value in argv)
                 or not argv[0].startswith("/")

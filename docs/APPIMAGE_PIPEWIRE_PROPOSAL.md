@@ -110,6 +110,16 @@ fresh account/profile cases: ordinary loading, then per-child
 `LD_DEBUG=bindings` plus `LD_BIND_NOW=1`. The latter supplies binding evidence;
 it cannot substitute for the first ordinary scheduling/capture case.
 
+Each case executes in a fresh Python worker before importing AT-SPI, so its
+process-wide accessibility client cannot retain the previous case's bus. The
+worker enables `IsEnabled` and `ScreenReaderEnabled` on its owned private bus
+before discovering the app. Private input/result files bind the case to exact
+artifact, executable, client, peer, backend and fixture hashes. The worker must
+be a direct child of the validated namespace PID1 with the same unprivileged
+identity, private PID namespace, zero capabilities and `NoNewPrivs`; the normal
+command runner retains its PID1 requirement. Fixed progress and cleanup facts
+are validated only after the worker has stopped.
+
 Each case starts an owned private DBus, SecretService, headless Sway, system
 PipeWire/WirePlumber and the existing pinned SHM portal fixture. The normal
 installed AppImage is launched normally. AT-SPI enters its disposable account,
@@ -177,7 +187,8 @@ run on failure. Fixture data volumes are intentionally retained, not claimed
 wiped. Temporary profiles, packages and logs are removed with the private root.
 
 Build limits are 60 minutes for the app, 30 minutes for the receiving test ELF,
-15 minutes for packaging, and 10 minutes across the client recipe. Each peer has
+15 minutes for packaging, and 10 minutes across the client recipe. Each fresh
+case worker has a 15-minute deadline. Each peer has
 a 420-second main phase plus bounded cleanup; the outer namespace has a hard
 120-minute deadline and separate bounded teardown. The manual job remains
 150 minutes, including tool setup. These are caps, not runtime estimates.
@@ -192,13 +203,21 @@ enter this schema. No raw log or installer artifact is uploaded.
 
 ## Source verification and remaining gates
 
-87 focused Python checks passed using mocks/pure filesystem fixtures. Actionlint,
-Python syntax and direct rustfmt checks pass. There has been no native build,
-Rust test, service, executable download, actual GUI/capture or package run for
-this draft. Source enablement is not evidence of installed compatibility.
+The worker, containment, cleanup and diagnostic suite passed 53 focused Python
+checks using mocks/pure filesystem fixtures; CI selection passed 21 checks.
+Source review caught and corrected the descendant PID guard and supervisor
+cleanup-reporting issues before hosted execution. Actionlint and Python syntax
+checks pass. This manual fixed-client package/capture path has not run; source
+enablement is not evidence of installed compatibility.
 
-Required next evidence: compile the receiving test on a standard free Linux
-runner, then run this manual installed case only after the candidate's native
+At `a38fe43`, native CI compiled the Linux `wayland_capture` target containing
+the receiving peer. Its separate system-library capture failed. That compiled
+target does not establish execution of the installed-AppImage peer or either
+fresh worker case.
+
+Required next evidence: build the release receiving test and fixed-client
+AppImage on a standard free Linux runner, then run this manual installed case
+only after the candidate's native
 jobs and cache posts finish. Record exact source, tool/client/package hashes and
 both ordinary/binding outcomes. Real desktop portals, hardware/device behavior,
 signed packages, installation/update/rollback and the full release requirements

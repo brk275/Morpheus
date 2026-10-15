@@ -15,7 +15,7 @@ import tempfile
 COMMANDS = frozenset((
     "none", "unknown", "cargo-version", "packager-version", "download", "native-build", "package", "extract", "update-metadata",
     "tool-version", "distro-patch", "configure", "client-build", "inventory-elf", "inventory-owner", "inventory-package",
-    "capture-peer-build", "capture-peer-list", "capture-dbus-env", "capture-portal-owner", "capture-focus", "capture-window",
+    "capture-case", "capture-accessibility", "capture-peer-build", "capture-peer-list", "capture-dbus-env", "capture-portal-owner", "capture-focus", "capture-window",
     "capture-yellow", "capture-green", "capture-magenta", "capture-remove-source", "capture-close-window", "capture-imports",
     "capture-inventory", "capture-env-up", "capture-env-down", "capture-rtc-up", "capture-rtc-probe", "capture-rtc-rtc-fixture",
     "capture-rtc-down", "capture-backend-configure", "capture-backend-compile", "cleanup-rtc", "cleanup-env", "cleanup-inventory"))

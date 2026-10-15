@@ -46,9 +46,35 @@ class ScopeTests(unittest.TestCase):
                      "scripts/tests/test_windows_capture_acceptance.py", "crates/morpheus-rtc/tests/windows_capture.rs"):
             with self.subTest(path=path):
                 self.assertEqual(classify([path])["native_matrix"]["os"], ["windows-2025"])
-        # Workflow and scope implementation changes remain shared inputs.
+        # Native workflow changes remain shared inputs.
         self.assertEqual(classify([".github/workflows/ci.yml"])["native_matrix"]["os"], list(PLATFORMS))
-        self.assertEqual(classify(["scripts/ci_scope.py"])["native_matrix"]["os"], list(PLATFORMS))
+
+    def test_manual_capture_driver_changes_do_not_rerun_system_native_acceptance(self):
+        for path in ("packaging/linux/appimage_capture.py",
+                     "packaging/linux/appimage_capture_worker.py",
+                     "packaging/linux/appimage_diagnostics.py",
+                     "packaging/linux/appimage_process.py"):
+            with self.subTest(path=path):
+                self.assertFalse(classify([path])["native"])
+                self.assertEqual(classify([path, "crates/morpheus-rtc/src/linux_portal.rs"])
+                                 ["native_matrix"]["os"], ["ubuntu-24.04"])
+                self.assertEqual(classify([path, "Cargo.lock"])["native_matrix"]["os"], list(PLATFORMS))
+                self.assertEqual(classify([path], force_all=True)["native_matrix"]["os"], list(PLATFORMS))
+        # The peer is compiled by native CI; unknown package inputs fail closed.
+        for path in ("packaging/linux/appimage_peer.rs", "packaging/linux/new-helper.py",
+                     "packaging/linux/AppRun", "packaging/linux/appimage-tools.json"):
+            with self.subTest(path=path):
+                self.assertEqual(classify([path])["native_matrix"]["os"], ["ubuntu-24.04"])
+
+    def test_classifier_validation_does_not_suppress_other_affected_checks(self):
+        classifier = "scripts/ci_scope.py"
+        self.assertFalse(classify([classifier, "scripts/tests/test_ci_scope.py"])["native"])
+        self.assertTrue(classify([classifier, "themes/aurora.toml"])["config"])
+        for path in ("crates/morpheus-app/src/main.rs", ".github/workflows/ci.yml",
+                     "Cargo.lock", "new-build-input.conf"):
+            with self.subTest(path=path):
+                self.assertEqual(classify([classifier, path])["native_matrix"]["os"], list(PLATFORMS))
+        self.assertEqual(classify([classifier], force_all=True)["native_matrix"]["os"], list(PLATFORMS))
 
     def test_pipewire_isolation_inputs_only_select_linux(self):
         for path in ("vendor/webrtc-sys/pipewire_isolation.rs", "vendor/webrtc-sys/pipewire-symbols.txt"):

@@ -1,9 +1,9 @@
 # Native screenshots
 
 These are real Slint window captures of Morpheus at
-[`51c04ce`](https://github.com/brk275/Morpheus/commit/51c04ceec75538ff0bff3ef43cbfd3531870b3cb),
+[`a38fe43`](https://github.com/brk275/Morpheus/commit/a38fe43ba149cd5f1384dfcb736a26ec4f652001),
 using fictional offline preview accounts. They were captured on the standard
-Ubuntu runner in [CI run 38725671739](https://github.com/brk275/Morpheus/actions/runs/38725671739),
+Ubuntu runner in [CI run 38737708120](https://github.com/brk275/Morpheus/actions/runs/38737708120),
 attempt 1, on October 15, 2026.
 
 The images are 1440 × 900 lossless PNGs with unchanged pixels and no embedded
@@ -18,6 +18,17 @@ avatars and a minimal room header. The upward account menu keeps separate
 aliases close at hand.
 
 ![Terminal preset with the account switcher open](account-switcher.png)
+
+## Sidebar and labeled rail
+
+Optional text navigation, a combined room/DM list and unread-first ordering:
+
+![Terminal preset with text navigation and combined conversations](terminal-sidebar.png)
+
+The narrow icon rail can also show Space labels. Long names shorten visually;
+controls retain the complete accessible name.
+
+![Terminal preset with a labeled Space rail](terminal-space-labels.png)
 
 ## Nocturne
 
@@ -49,19 +60,21 @@ retry control. See [account access](../ACCOUNT_ACCESS.md) for behavior and limit
 
 The native capture command is `--morpheus-capture-preview`; CI converts its RGB
 snapshots to PNG with `scripts/encode_preview_pngs.py`. The source artifact was
-`native-preview-51c04ceec75538ff0bff3ef43cbfd3531870b3cb-1`,
-ID `11967634194`. Its archive SHA-256 is
-`73f845089059c77ba899127b89d9d553ba59125fca61f43ee919aad84c1e2e87`.
+`native-preview-a38fe43ba149cd5f1384dfcb736a26ec4f652001-1`,
+ID `11974809132`. Its archive SHA-256 is
+`794d015daf2aa08e06d7f35ef2477039d2f654eff24d4766229fc31fc2692e99`.
 `desktop-preview.png` was copied here as `desktop.png`, and `paper-preview.png`
 as `paper.png`. Every image was copied byte for byte after privacy and visual
-review. All six images below came from the same native executable, SHA-256
-`b38d72688e565e9f725eb20383bb7351c07c4ac0225b08814830c404e6438a43`.
+review. All eight images below came from the same native executable, SHA-256
+`ddc66c3c73379f0b0a5e3581eb53548b3beedba56882c9eadc6a45eb2d404b17`.
 
 | File | SHA-256 |
 | --- | --- |
 | `desktop.png` | `83e665a72322f850ed43fe97994ad1037a4f32d0b39cd6ede06f1753f40d016d` |
-| `account-switcher.png` | `da0e3a939f41d58c240b4faabe7e7c4f83814646b0faccc47d164c238d2be959` |
+| `account-switcher.png` | `41e564379d0d30b7c5eef2e13047c3d0e9933b063ef438ad6ae777124605d459` |
 | `paper.png` | `e457518119ad00235a9a426704a4d293db72f32a25bf59dd399e8045b2a5c6a6` |
-| `manage-accounts.png` | `3d957064e50094c781b3bb5feeda10eec83f8d1fcafcf0a214744fe0188f0796` |
-| `account-password.png` | `2d7c5b6deaf529594910a08b8f961b4d1a09a6a9e188848a5c188b8b73adc035` |
-| `sign-in.png` | `ad7c4ce4af8d49c746694db24eedb0120122cdf1bde39f175dc1c2bd1522cd64` |
+| `manage-accounts.png` | `730375e5c7105414022e9a5069cbd525c522db67f21ae0c1c23f47e0d6e479a3` |
+| `account-password.png` | `2ff2503a6d165e9b5617ef92ab66fcfad72eb607a193939c5f112f08ca49a21a` |
+| `sign-in.png` | `efcf41e65b1ca636511c612f2fbb56a024ba9b1f32c1ef906766e10a9d6ef367` |
+| `terminal-sidebar.png` | `49bc38a632967106e2e068348dda67412f3d7957392cc82e79e485c0295494f4` |
+| `terminal-space-labels.png` | `6a889b7599c7ca89cb92875bd643027b127359dab8aa0a3eaea4f4087cdcf112` |

@@ -96,7 +96,7 @@ class ProgressTests(unittest.TestCase):
         self.assertEqual(D.PEER_FACTS, set(capture.FACTS))
         import ast
         names = set()
-        for name in ("appimage_capture.py", "package_appimage.py", "appimage_notices.py"):
+        for name in ("appimage_capture.py", "appimage_capture_worker.py", "package_appimage.py", "appimage_notices.py"):
             tree = ast.parse((ROOT / "packaging/linux" / name).read_text())
             for node in ast.walk(tree):
                 if isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.Constant):

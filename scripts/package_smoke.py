@@ -281,6 +281,65 @@ def owned_x11_windows(group, nonce):
     return found
 
 
+# Emit only reviewed literal names. An arbitrary SONAME could contain private
+# text, so a recognized loader failure with any other name withholds that name.
+STARTUP_LIBRARY_NAMES = frozenset((
+    "libasound.so.2", "libatomic.so.1", "libc.so.6", "libcap.so.2",
+    "libcrypto.so.3", "libdbus-1.so.3", "libEGL.so.1", "libexpat.so.1", "libfontconfig.so.1",
+    "libfreetype.so.6", "libfuse.so.2", "libgcc_s.so.1", "libGL.so.1",
+    "libglib-2.0.so.0", "libgobject-2.0.so.0", "libICE.so.6", "libm.so.6",
+    "libpipewire-0.3.so.0", "libSM.so.6", "libsqlite3.so.0", "libssl.so.3", "libstdc++.so.6",
+    "libudev.so.1", "libwayland-client.so.0", "libX11.so.6", "libX11-xcb.so.1",
+    "libxcb.so.1", "libxcb-render.so.0", "libxcb-shape.so.0", "libxcb-shm.so.0",
+    "libxcb-xfixes.so.0", "libxcb-xkb.so.1", "libXcursor.so.1", "libXext.so.6",
+    "libXfixes.so.3", "libXi.so.6", "libxkbcommon.so.0", "libxkbcommon-x11.so.0",
+    "libXrandr.so.2", "libXrender.so.1", "libz.so.1",
+))
+STARTUP_LOG_BOUND = 65536
+
+
+def startup_failure_diagnostics(log, status):
+    """Reduce private Linux stderr to fixed facts; never return foreign text.
+
+    Exit 127 alone does not identify a loader defect. Match complete standard
+    ELF loader diagnostic lines only, and keep unknown or ambiguous input
+    unclassified. No command, file path, symbol, version or arbitrary library
+    name can reach public output through this reducer.
+    """
+    status = status if type(status) is int and -128 <= status <= 255 else None
+    facts = {"category": "unclassified", "exit_status": status, "missing_library": None}
+    if status != 127:
+        return facts
+    try:
+        log.seek(0)
+        raw = log.read(STARTUP_LOG_BOUND + 1)
+    except (OSError, ValueError):
+        return {**facts, "category": "private_log_unavailable"}
+    if type(raw) is not bytes or len(raw) > STARTUP_LOG_BOUND:
+        return {**facts, "category": "private_log_exceeded_bound"}
+    missing = re.findall(
+        rb"(?m)^[^\r\n]{1,4096}: error while loading shared libraries: "
+        rb"([A-Za-z0-9_.+-]{1,128}): cannot open shared object file: No such file or directory\r?$", raw)
+    symbols = re.findall(
+        rb"(?m)^[^\r\n]{1,4096}: symbol lookup error: [^\r\n]{1,4096}: "
+        rb"undefined symbol: [A-Za-z0-9_@.]{1,256}\r?$", raw)
+    versions = re.findall(
+        rb"(?m)^[^\r\n]{1,4096}: [^\r\n]{1,4096}: version [`'][^'\r\n]{1,256}' "
+        rb"not found \(required by [^\r\n]{1,4096}\)\r?$", raw)
+    matches = len(missing) + len(symbols) + len(versions)
+    if matches > 1:
+        return {**facts, "category": "ambiguous_loader_diagnostics"}
+    if missing:
+        name = missing[0].decode("ascii")
+        return {**facts, "category": "missing_shared_library",
+                "missing_library": name if name in STARTUP_LIBRARY_NAMES else None}
+    if symbols:
+        return {**facts, "category": "undefined_loader_symbol"}
+    if versions:
+        return {**facts, "category": "missing_library_version"}
+    return facts
+
+
 def launch_smoke(executable, window_check=None, seconds=12):
     if os.name != "nt":
         require_nonreaping_wait()
@@ -296,6 +355,7 @@ def launch_smoke(executable, window_check=None, seconds=12):
         process = subprocess.Popen([str(executable)], env=env, stdout=log, stderr=subprocess.STDOUT,
                                    start_new_session=os.name != "nt")
         saw_window = False
+        status = None
         try:
             deadline = time.monotonic() + seconds
             while time.monotonic() < deadline:
@@ -309,8 +369,11 @@ def launch_smoke(executable, window_check=None, seconds=12):
             require(window_check is None or saw_window, "Installed app did not create the expected native window")
         except Exception:
             # Never publish app logs: even startup errors can contain private
-            # paths, URLs or account details. Only this literal fact is public.
-            print('{"check":"installed_startup","status":"failed","app_log_public":false}', flush=True)
+            # paths, URLs or account details. Only fixed reduced facts are public.
+            failure = {"check": "installed_startup", "status": "failed", "app_log_public": False}
+            if sys.platform.startswith("linux"):
+                failure["diagnostic"] = startup_failure_diagnostics(log, status)
+            print(json.dumps(failure, sort_keys=True), flush=True)
             raise
         finally:
             stop_process(process)

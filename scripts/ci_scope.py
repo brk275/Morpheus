@@ -11,6 +11,15 @@ from pathlib import PurePosixPath
 
 PLATFORMS = ("macos-15", "macos-15-intel", "ubuntu-24.04", "windows-2025")
 MACOS = PLATFORMS[:2]
+# These Python drivers run only in explicitly selected installed-AppImage QA.
+# Ordinary native CI cannot exercise them; its always-on helper suite covers
+# their pure/mocked contracts. Unknown package inputs still select Linux.
+MANUAL_LINUX_PACKAGE_INPUTS = {
+    "packaging/linux/appimage_capture.py",
+    "packaging/linux/appimage_capture_worker.py",
+    "packaging/linux/appimage_diagnostics.py",
+    "packaging/linux/appimage_process.py",
+}
 WINDOWS_ACCEPTANCE_INPUTS = {
     "scripts/run_windows_capture_acceptance.py",
     "scripts/windows_capture_window.ps1",
@@ -58,6 +67,11 @@ def classify(paths, force_all=False):
             continue
         if path == "Cargo.lock" or path.endswith("Cargo.toml"):
             native.update(PLATFORMS)
+        elif path in MANUAL_LINUX_PACKAGE_INPUTS or path == "scripts/ci_scope.py":
+            # The classifier itself is exercised by the always-on helper
+            # tests. Mixed changes still select their affected native inputs;
+            # manual full verification remains an unconditional full matrix.
+            continue
         elif path in LINUX_ACCEPTANCE_INPUTS or path.startswith("packaging/linux/") or path == "packaging/linux.toml":
             native.add("ubuntu-24.04")
         elif path in WINDOWS_ACCEPTANCE_INPUTS:
@@ -68,8 +82,8 @@ def classify(paths, force_all=False):
             native.add("windows-2025")
         elif path.startswith("themes/"):
             config = True
-        elif path in {"scripts/ci_scope.py", "scripts/package.py"}:
-            # These scripts control native scope or shared package inputs.
+        elif path == "scripts/package.py":
+            # This wrapper controls shared native package inputs.
             native.update(PLATFORMS)
         elif path.startswith(("scripts/", "tests/")):
             # Scope job checks Python and JavaScript without external accounts.

@@ -14,8 +14,11 @@ The package output goes to `dist/`. This command does not make a public release.
 The Windows job prepares [verified NSIS tools](../packaging/windows/NSIS_TOOLS.md)
 before running Cargo Packager. All three downloads have exact size and SHA-256
 pins; preparation refuses an existing tool cache. Its pure/mocked checks and
-in-memory validation of the pinned inputs pass. Actual Windows preparation and
-installer execution still require the next package run.
+in-memory validation of the pinned inputs pass. At `a38fe43`, actual Windows
+preparation, silent installation, owned-window startup and uninstallation
+passed in [run 38743493394](https://github.com/brk275/Morpheus/actions/runs/38743493394).
+This unsigned smoke does not establish signing, Narrator, account or update
+acceptance.
 
 The manual [`package-qa.yml`](../.github/workflows/package-qa.yml) workflow runs
 only on public `main` using standard hosted runners. It requires an explicit
@@ -28,8 +31,12 @@ complete Linux release gate. It pins Rust 1.99.0 and Cargo Packager 0.11.8. To d
 appropriate check after confirming no equivalent run is active:
 
 ```sh
-gh workflow run package-qa.yml --ref main -f platform=linux -f linux_formats=both
+gh workflow run package-qa.yml --ref main -f platform=linux -f linux_formats=appimage
 ```
+
+Debian validation is currently deferred by the owner pending a working project
+maintainer email. Use AppImage for current Linux checks; this leaves the Debian
+release gate open.
 
 The workflow builds DMGs on both native Mac architectures, NSIS on Windows,
 and DEB/AppImage on Ubuntu 24.04. It installs, inspects, briefly launches, and
@@ -77,6 +84,13 @@ failure; the keyboard driver's entire output is private except for validated
 fixed phases and boolean results. No accessibility trees or screenshots are
 published.
 
+On Linux startup failure, a bounded private-log reducer may report a fixed
+loader-error category and a reviewed literal library name. It requires exit
+127 plus a complete recognized loader diagnostic; exit 127 alone stays
+unclassified. Unknown library names, paths, symbols, version strings and raw
+log text are withheld. Oversized or ambiguous diagnostics cannot select a
+specific missing library. The original failure and cleanup remain mandatory.
+
 #### Installed Linux keyboard and accessibility API check
 
 `scripts/linux_package_ui.py` runs only as the disposable container's unprivileged
@@ -105,13 +119,17 @@ enters the synthetic preview through its accessible action, then:
 
 This is focused API/keyboard coverage, **not Orca acceptance**, whole-app keyboard
 reachability, contrast validation, notification delivery after quit, or real
-account switching. Preview entry currently has an accessible action but no
-explicit keyboard FocusScope; the driver does not claim keyboard-only entry.
+account switching. Preview entry now uses the shared keyboard action component,
+but this installed driver still enters through its accessible action and does
+not claim keyboard-only entry.
 The check does not cover the DEB's UI, Wayland, VoiceOver or Narrator. No native
 media device or permission prompt is exercised.
 
-After applicable native CI is healthy, run only the affected ordinary package
-check with `platform=linux`, `linux_formats=appimage`, `appimage_updates=false`.
+After applicable native jobs and cache posts finish, review their results and
+run only the affected ordinary package check with `platform=linux`,
+`linux_formats=appimage`, `appimage_updates=false`, `appimage_capture=false`.
+An independent package check may diagnose installation while a separate native
+gate remains failed; it cannot replace or clear that failure.
 The helper and its Python tests do not trigger an automatic native matrix;
 installed acceptance requires that explicit Linux package run. Debian `both`
 remains blocked until its working public maintainer contact is configured.

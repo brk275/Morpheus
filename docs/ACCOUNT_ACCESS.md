@@ -80,7 +80,7 @@ unlock existing accounts.
 
 ## Verification status
 
-At `51c04ce` ([run 38725671739](https://github.com/brk275/Morpheus/actions/runs/38725671739)),
+At `a38fe43` ([run 38737708120](https://github.com/brk275/Morpheus/actions/runs/38737708120)),
 the Linux live fixture passed protected A→B→A switching, rejection of direct,
 wrong-password and cancelled activation, locked restart and unlock, inactive
 and active removal, credential/store deletion, and reset after complete removal.
@@ -88,10 +88,11 @@ It uses two disposable homeservers and an isolated real OS credential vault.
 Protected classic login stayed paused until authorization; both OAuth refresh
 phases also passed.
 
-Fresh native Linux captures passed visual review of Manage accounts and the
-password dialog at 100% and 200% text sizes. These complement the mock-vault
+Fresh native Linux captures passed visual review of Manage accounts at 100%
+and the password dialog at 100% and 200% text sizes. These complement the mock-vault
 regressions and real Slint keyboard/pointer harness; they do not establish
 VoiceOver, Narrator or Orca acceptance. Mac/Windows real-vault and installed-app
-checks remain open. New exact-intent logout and sign-in keyboard changes require
-their own hosted verification. These results are not beta acceptance. See
+checks remain open. Exact-intent logout and the generated-Slint sign-in keyboard
+regressions passed on all four targets. Linux's separate system Wayland capture
+test failed, so aggregate CI remains failed. These results are not beta acceptance. See
 [verification](VERIFICATION.md).

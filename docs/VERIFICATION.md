@@ -3,6 +3,114 @@
 Morpheus is pre-alpha software with no approved installer release. This log records checks actually completed;
 the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
+## Ordinary unsigned package validation: `a38fe43`
+
+[Run 38743493394](https://github.com/brk275/Morpheus/actions/runs/38743493394)
+tested `a38fe43ba149cd5f1384dfcb736a26ec4f652001` on the four standard hosted
+runners, with `platform=all`, `linux_formats=appimage`, and both update/capture
+modes disabled. Every job and cache post finished. Debian remains owner-deferred;
+the run uploaded zero artifacts. All five complete job logs scanned with zero
+findings.
+
+- **Apple Silicon: passed.** The DMG mounted without interaction; the copied
+  app had the expected native architecture, bundle identity/version, permission
+  purpose strings, license and theme. Its installed executable survived the
+  12-second smoke and was stopped and removed. The cache post completed.
+  This is process-liveness evidence, not native-window, VoiceOver, Gatekeeper,
+  signing or update acceptance.
+- **Linux AppImage: failed.** Package creation, resources, desktop entry/icon
+  and `GLIBC_2.39`/`GLIBCXX_3.4.30` baseline checks passed. The actual AppImage
+  then exited with code 127 during the first minimal-runtime X11 launch.
+  Accessibility tooling had not been installed, and keyboard acceptance was
+  not reached. The old smoke discarded its private startup log, so this run
+  cannot identify a missing library or other exact loader cause. Its cache
+  save was skipped after failure.
+- **Windows: passed.** Verified NSIS tool preparation and package creation
+  succeeded. The installer ran silently into a path containing spaces; the
+  installed app had the x64 GUI subsystem, matching resources and correct
+  Add/Remove Programs identity. It survived 12 seconds with an owned visible
+  Win32 window, then the real uninstaller removed the app and registration.
+  The cache post completed. Account login, Narrator, physical media devices,
+  signing and updates were not exercised.
+- **Intel Mac: passed.** The same DMG mount, copied-app metadata/resources,
+  12-second process-liveness, stop and removal checks passed for x64. The
+  cache post completed. Its acceptance scope has the same limits as Apple
+  Silicon above.
+
+| Package | SHA-256 |
+| --- | --- |
+| Apple Silicon DMG | `c4860e3475710d44e98c95eaff37487de4b78ff87a8b46465145ac2012177f9d` |
+| Intel Mac DMG | `bfd52178903e9e9cd435c52a6fd7aafd8a34be462b313172457db2366e3b450d` |
+| Linux AppImage | `b3e897b3ba3929bc7110e0c32e6de192ee2b0724299523a33051567b842fc35c` |
+| Windows NSIS | `f0b5ff328afd55d5f7a5dccd2b3596739c928871433bd36c13528be3fc7b39ce` |
+
+The next Linux ordinary-package check uses bounded, fixed startup diagnostics;
+this improves evidence without changing the startup assertion or guessing a
+runtime dependency fix. Trusted package builds now retain their dependency
+cache if a later install check fails. The separate installed fixed-client
+capture path also has reviewed fresh-process accessibility isolation and
+cleanup regressions; its actual GUI/peer checks have not run. None of these
+changes clears the failed system Wayland gate below.
+
+## Native and live acceptance: `a38fe43`
+
+[Run 38737708120](https://github.com/brk275/Morpheus/actions/runs/38737708120)
+tested `a38fe43ba149cd5f1384dfcb736a26ec4f652001`. Both Macs and Windows
+completed successfully. Linux passed its builds, unit suites and live Matrix
+fixtures, but failed the required system-library Wayland capture test. Every
+job and cache post finished; aggregate CI acceptance correctly failed.
+
+Each Mac passed 880 substantive unit/vendor/SDK tests, Windows 882 and Linux
+906. These counts exclude no-fixture early returns and pure diagnostics; the
+app suite still has one ignored live test. Helpers passed 520 tests with one
+skip. The 61-commit history scan and complete collected job logs had zero
+findings.
+
+The generated-Slint keyboard/pointer harness passed on all four targets,
+including the repaired sign-in focus routes, loading guards, and palette and
+density keyboard controls at 100% and 200% text size. The exact-intent logout,
+navigation ordering and focus guards also passed. No binding-loop warnings
+were observed. All twelve actual Linux captures passed visual/privacy review;
+eight unchanged PNGs and their immutable provenance are in the
+[gallery](screenshots/README.md). This does not establish installed-app or
+screen-reader acceptance.
+
+Linux passed 20 substantive live Rust tests plus three repeated diagnostics,
+with no failed or unrun live checks. `live_local` reached `complete`, including
+protected account switching, locked restart/unlock, inactive and active local
+removal and exact credential/store cleanup against two disposable homeservers
+and an isolated OS vault. All four Current/Sticky2025 DM/room ringing cases,
+the Current/DM account-ABA replay check, both OAuth refresh phases, all 13
+moderation/settings facts and all 11 stock Element Call browser/native facts passed.
+Physical devices and real provider/browser handoff remain separate gates.
+
+Windows completed its owned synthetic window/display capture test. This records
+a passing current run; it does not identify the exact cause of the earlier
+`51c04ce` failure.
+
+### Remaining system Wayland failure
+
+Linux stopped at `first_frame_1`: the producer queued a valid frame, but the
+consumer never processed a buffer before its unchanged deadline. All 33
+PipeWire bindings resolved to the system library. Portal negotiation, buffer
+allocation and Streaming completed; service processes stayed alive and all
+private diagnostic drains completed without truncation.
+
+The first producer queue preceded the consumer's local Running observation,
+consistent with the previously investigated PipeWire startup ordering issue.
+`graph_incomplete` also occurs in a passing historical run, so that message
+alone is not a diagnosis. Relevant capture sources and dependency locks match
+`51c04ce`; the runner images differ. The retained facts do not uniquely prove
+a lost wake-up or a new application defect.
+
+The earlier [controlled comparison](#linux-pipewire-startup-comparison) supports
+the narrow upstream backport already implemented in the separate
+[AppImage client path](APPIMAGE_PIPEWIRE_PROPOSAL.md). No unchanged native rerun
+was dispatched. Ordinary package installation and installed fixed-client
+capture are separate next checks; neither can replace this failed system-library
+result. Signing, real devices, installation, updates, rollback and
+VoiceOver/Narrator/Orca remain release gates.
+
 ## Sign-in compilation repair: `f4170ba`
 
 [Run 38735248636](https://github.com/brk275/Morpheus/actions/runs/38735248636)
@@ -25,8 +133,9 @@ The same-window keyboard regression now also exercises forward Tab into the
 homeserver field and the loading-state password/shortcut routes. Base palette
 and density selectors use the existing keyboard-enabled action component,
 with real-key harness coverage at 100% and 200% text size. Direct Rust formatting
-and source reviews passed; native compilation and execution of these repairs
-remain pending. The earlier `51c04ce` evidence below does not verify them.
+and source reviews passed before the repair was pushed. Its subsequent native
+compilation and execution passed at `a38fe43`, recorded above; the earlier
+`51c04ce` evidence below does not verify these changes.
 
 ## Native and live acceptance: `51c04ce`
 
@@ -56,16 +165,16 @@ not Mac/Windows credential-vault or installed-app behavior.
 
 All four Current/Sticky2025 DM/room ringing cases passed. Current/DM reached the
 fresh-offer phase and exercised account A→B→A with the old offer rejected.
-OAuth login/refresh and restore/refresh, all 13 room-settings facts, recovery,
+OAuth login/refresh and restore/refresh, all 13 moderation/settings facts, recovery,
 native late joins and the stock Element Call peer's 11 browser/native facts
 also passed. Real provider/browser handoff and physical audio/video devices
 remain separate gates.
 
 All nine native Linux preview captures passed visual inspection, including
-Manage accounts and password dialogs at 100% and 200%. The real Slint keyboard
+Manage accounts at 100% and the password dialog at 100% and 200%. The real Slint keyboard
 and pointer harness passed in these completed jobs, without binding-loop
 warnings. Six unchanged PNGs are recorded in the
-[screenshot gallery](screenshots/README.md), with exact source, run, artifact
+[gallery recording that run](https://github.com/brk275/Morpheus/blob/f4170ba270cc25b4d1f4c4c7824aa3641341042c/docs/screenshots/README.md), with exact source, run, artifact
 and image identities. This is neither screen-reader nor interactive installed
 acceptance. No installer was uploaded.
 
@@ -136,7 +245,7 @@ VoiceOver, Narrator or Orca acceptance.
 
 Linux passed 18 substantive live Rust checks, plus three repeated diagnostic
 checks. OAuth login/refresh and restore/refresh now passed, including vault
-persistence and logout. Room settings passed all 13 facts after the disposable
+persistence and logout. Moderation/settings passed all 13 facts after the disposable
 fixture's rate-limit adjustment. The pre-synced stock Element Call peer again
 passed all 11 facts. Two live checks still failed:
 

@@ -375,9 +375,13 @@ The manual [`wayland-startup-probe.yml`](../.github/workflows/wayland-startup-pr
 workflow is an opt-in experiment on the standard free Ubuntu 24.04 runner. It
 is restricted to the public repository's `main` branch; the helper also requires
 the explicit probe flag, GitHub-hosted Linux x64, Ubuntu 24.04 and matching
-installed package/source identities. **This implementation has not been
-executed; free hosted verification is pending.** Ordinary CI keeps its separate,
-mandatory system-library gate.
+installed package/source identities. In
+[run 38147202698](https://github.com/brk275/Morpheus/actions/runs/38147202698)
+at `4352c88`, system and control captures failed while the patched client passed
+the complete named test. See the [recorded comparison](VERIFICATION.md#linux-pipewire-startup-comparison)
+for exact scope and limitations. Ordinary CI keeps its separate, mandatory
+system-library gate; installed acceptance of the
+[AppImage-local client](APPIMAGE_PIPEWIRE_PROPOSAL.md) remains open.
 
 The diagnostic collects three conditions, each in a fresh owned PID namespace
 and disposable Wayland fixture:

@@ -66,10 +66,12 @@ and video previews are not supported. See [image preview limits](docs/IMAGE_PREV
 
 A [room-settings extension](docs/ROOM_SETTINGS.md) adds guarded name/topic,
 avatar and join-rule controls.
-At `51c04ce`, Linux passed the encrypted-restart and incoming-call replay checks
+At `a38fe43`, Linux passed the encrypted-restart and incoming-call replay checks
 that previously failed, together with protected-account, OAuth refresh,
-room-settings and stock Element Call fixtures. The native account dialogs also
-passed fresh visual review at normal and 200% text sizes.
+room-settings and stock Element Call fixtures. Native captures passed fresh
+visual review of Manage accounts at 100% and the password dialog at 100% and
+200% text sizes. Both Macs and Windows
+passed native CI; Linux's separate system Wayland capture check still fails.
 See [the verification record](docs/VERIFICATION.md) for the exact results.
 Native [incoming-call sound](docs/INCOMING_CALLS.md) passed its automated guards;
 audible output and device acceptance remain open. Protocol Decline is unimplemented.
@@ -78,7 +80,7 @@ audible output and device acceptance remain open. Protocol Decline is unimplemen
 
 Actual native capture: monospaced messages, nickname columns, square controls,
 a minimal header and the bottom-left account switcher. All people and accounts
-are fictional. [Nocturne, Paper, account controls and capture details](docs/screenshots/README.md).
+are fictional. [Nocturne, Paper, sidebar navigation, account controls and capture details](docs/screenshots/README.md).
 
 ## Make it yours
 
@@ -94,9 +96,10 @@ Theme files also expose status, selection, focus, link, unread and voice colors,
 plus a separate palette for sender names.
 **Nocturne, Terminal and Paper** are editable starting points. In-app controls
 and live TOML reload use the same preferences; invalid edits keep the last valid
-style. Native Nocturne, Terminal and Paper captures at `51c04ce` have been
-reviewed, including the monospaced and serif font choices. The newer navigation
-and keyboard changes still require their own hosted checks. A theme editor and
+style. Native captures at `a38fe43` have been reviewed, including Nocturne,
+Terminal, Paper, text navigation, labeled Spaces and the monospaced and serif
+font choices. Keyboard and platform acceptance are tracked separately in
+[verification](docs/VERIFICATION.md). A theme editor and
 more layout controls remain in development; Halloy-level breadth is the
 target, not a completed claim. See [customization](docs/CUSTOMIZATION.md).
 

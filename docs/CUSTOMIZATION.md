@@ -17,9 +17,12 @@ width. Existing controls cover font scale (75–200%), room/message density,
 unread-first sorting, pane widths and the details panel. These preferences use
 the same configuration path in live sessions and the offline preview.
 
-The appearance expansion is implemented in source. Native compilation,
-rendered layout, font fallback and keyboard/screen-reader acceptance on all
-supported desktops remain required; see [verification](VERIFICATION.md).
+At `a38fe43`, native builds and the configuration, navigation and generated-Slint
+keyboard guards passed on all four targets. Twelve Linux captures passed visual
+review, including sidebar navigation and labeled Spaces. Full platform font
+coverage, installed interaction and screen-reader acceptance remain open; see
+[verification](VERIFICATION.md), including the separate failed system Wayland
+capture check.
 
 ## Appearance starting points
 
@@ -76,8 +79,10 @@ Omitting the table restores rail mode, hidden rail labels and separate DMs.
 Unknown modes or misspelled fields reject the edit; the app keeps its last valid
 configuration. Appearance presets preserve these three navigation preferences.
 
-Native rendering, keyboard focus and screen-reader checks remain required on
-all supported platforms, including long names, many Spaces and 200% text scale.
+The native projection/focus guards passed on all four targets at `a38fe43`;
+the sidebar and labeled rail passed Linux visual review. Broader installed
+keyboard and screen-reader checks remain required, including long names, many
+Spaces and 200% text scale.
 
 ## Room header
 
@@ -106,8 +111,8 @@ complete room topic remains available in Room settings. This setting affects
 the conversation page; Settings, discovery and the call stage keep their
 headers. Composer tools and navigation are outside this change.
 
-The implementation still requires native rendering and keyboard/accessibility
-verification; source checks are not evidence of those results.
+The three modes appear in the reviewed native Nocturne, Terminal and Paper
+captures. Full installed keyboard/accessibility verification remains open.
 
 ## Typography, geometry and messages
 
@@ -400,9 +405,10 @@ backend), not every optional CPAL backend. Audio still requires the existing
 48 kHz mono/stereo PCM support. Operating-system default and virtual endpoints
 can themselves reroute audio. Automatic device hotplug recovery, live
 reconfiguration, camera selection, and extra noise-processing controls are
-outside this change. Native compilation, selector interaction, permissions,
-duplicate-name hardware, unplug/rejoin, and actual routing acceptance on all
-supported desktops remain pending for this batch.
+outside this change. Native compilation and automated guards passed on all four
+targets at `a38fe43`. Selector interaction, permissions, duplicate-name hardware,
+unplug/rejoin and actual routing acceptance on all supported desktops remain
+pending.
 
 ## Call membership mode
 
@@ -431,6 +437,8 @@ These formats do not negotiate or automatically fall back to each other.
 The mode chosen when starting is fixed until the call ends. Mode controls are
 disabled while opening, connecting, joined, or cleaning up a call. External
 TOML edits apply to the next call, never an existing one. The voice-space marker
-does not select a protocol. Native compilation, UI interaction, and production
-Element Call acceptance for the new Matrix 2.0 choice remain pending; see
+does not select a protocol. Native compilation passed on all four targets at
+`a38fe43`; live UI interaction and production Element Call acceptance for the
+Matrix 2.0 choice remain pending. The controlled peer fixture has a narrower
+scope; see
 [the exact peer assertions and limits](ELEMENT_CALL_ACCEPTANCE.md).

@@ -210,6 +210,25 @@ class InstalledUI(AccessibleUI):
         return next(iter(found)) if found else None
 
 
+def enable_private_accessibility(run, environment):
+    # This function runs once in a fresh case worker, before pyatspi/Atspi is
+    # imported. Its process-global client must use the same owned session bus
+    # as the installed app; child-only env overrides cannot configure it.
+    require("pyatspi" not in sys.modules and "gi.repository.Atspi" not in sys.modules)
+    require(environment.get("DBUS_SESSION_BUS_ADDRESS", "").startswith("unix:"))
+    os.environ.clear()
+    os.environ.update(environment)
+    for name in ("AT_SPI_BUS_ADDRESS", "DBUS_STARTER_ADDRESS", "DBUS_STARTER_BUS_TYPE"):
+        os.environ.pop(name, None)
+        environment.pop(name, None)
+    # AccessKit 0.22.1 observes IsEnabled; obtaining the accessibility bus
+    # address alone does not enable its tree. Set only this private session.
+    for setting in ("IsEnabled", "ScreenReaderEnabled"):
+        run("capture-accessibility", ["gdbus", "call", "--session", "--dest", "org.a11y.Bus",
+            "--object-path", "/org/a11y/bus", "--method", "org.freedesktop.DBus.Properties.Set",
+            "org.a11y.Status", setting, "<true>"], seconds=5, limit=4096)
+
+
 def owned_window_on_first_output(tree, pid):
     matches = []
     count = 0
@@ -285,6 +304,7 @@ def run_case(runner, root, artifact, appdir, peer_binary, backend, fixture, envi
         def run(stage, argv, seconds=15, limit=65536):
             return runner.run(stage, [executable(argv[0]), *argv[1:]], cwd=ROOT, env=env, timeout=seconds, output_limit=limit)
         run("capture-dbus-env", ["dbus-update-activation-environment", "WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "PIPEWIRE_RUNTIME_DIR"])
+        enable_private_accessibility(run, env)
         phase("portal")
         pipewire = owner.start("pipewire", [executable("pipewire")], env)
         owner.wait_for(lambda: (runtime / "pipewire-0").is_socket(), watch=[pipewire])
@@ -407,6 +427,7 @@ def run_case(runner, root, artifact, appdir, peer_binary, backend, fixture, envi
 
 
 def run(runner, root, artifact, appdir, build_record, environment, diagnostics=None):
+    from appimage_capture_worker import run_isolated
     containment.assert_contained()
     require(build_record["appimage_sha256"] == hashlib.sha256(client.read_regular(artifact, 512 * 1024 * 1024)).hexdigest())
     environment = {**environment, "MORPHEUS_MATRIX_TEST_HOME": str(root / "matrix-fixture")}
@@ -445,7 +466,7 @@ def run(runner, root, artifact, appdir, build_record, environment, diagnostics=N
             fixture_hash = hashlib.sha256(client.read_regular(fixture, 65536)).hexdigest()
             require(fixture_hash not in fixture_hashes)
             fixture_hashes.add(fixture_hash)
-            outcomes.append(run_case(runner, root / name, artifact, appdir, peer, backend, fixture, environment, bindings=bindings, diagnostics=diagnostics))
+            outcomes.append(run_isolated(root / name, artifact, appdir, peer, backend, fixture, environment, bindings=bindings, diagnostics=diagnostics))
     except BaseException as error:
         body_failed = True
         if diagnostics is not None:

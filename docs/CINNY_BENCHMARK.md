@@ -8,12 +8,13 @@ is the pinned comparison point; its [release history](https://github.com/cinnyap
 documents earlier voice/video rooms, DM and room video starts, code-block
 formatting, media, and device-management changes.
 
-The completed `51c04ce` verification in
-[run 38725671739](https://github.com/brk275/Morpheus/actions/runs/38725671739)
+The completed `a38fe43` verification in
+[run 38737708120](https://github.com/brk275/Morpheus/actions/runs/38737708120)
 passed the Linux live fixtures, including protected accounts, all four
-Current/Sticky2025 DM/room ringing cases and all 13 room-settings facts. Native
-builds and unit suites passed on all four targets; Windows failed its synthetic
-capture fixture, so the complete native matrix has not passed. No beta gate is
+Current/Sticky2025 DM/room ringing cases and all 13 moderation/settings facts. Native
+builds and unit suites passed on all four targets; Windows also passed synthetic
+capture. Linux failed its separate system Wayland capture fixture, so the
+complete native matrix has not passed. No beta gate is
 complete. These results apply to that revision; later source changes require
 fresh evidence. See [the verification log](VERIFICATION.md).
 

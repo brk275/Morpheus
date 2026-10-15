@@ -100,6 +100,14 @@ class ProcessTests(unittest.TestCase):
                 self.invoke(Path(directory), status=status, cleanup_error=cleanup)
             self.assertEqual(error.exception.reason, reason)
 
+    def test_supervisor_records_cleanup_failure_even_when_command_exit_is_preserved(self):
+        from appimage_capture_worker import WorkerSupervision
+        progress = WorkerSupervision()
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(M.CommandFailure) as caught:
+            self.invoke(Path(directory), status=1, cleanup_error=RuntimeError("private cleanup"), progress=progress)
+        self.assertEqual(caught.exception.reason, "exit")
+        self.assertTrue(progress.cleanup_failed)
+
     def test_full_write_handles_partial_and_zero_writes(self):
         class Partial(io.BytesIO):
             def write(self, data):

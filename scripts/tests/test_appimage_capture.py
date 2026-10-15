@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "packaging/linux"))
 sys.path.insert(0, str(ROOT / "scripts"))
 import appimage_capture as M
+import appimage_capture_worker as W
 
 
 class ProofTests(unittest.TestCase):
@@ -125,7 +126,7 @@ class TeardownTests(unittest.TestCase):
                 mock.patch.object(M.shutil, "which", return_value="/usr/bin/cargo"), \
                 mock.patch.object(M, "compile_peer", return_value=Path("/private/peer")), \
                 mock.patch.object(M, "prepare_backend", return_value=Path("/private/backend")), \
-                mock.patch.object(M, "run_case", side_effect=case_error or [{"mode": "ordinary"}, {"mode": "eager_bindings"}]) as case:
+                mock.patch.object(W, "run_isolated", side_effect=case_error or [{"mode": "ordinary"}, {"mode": "eager_bindings"}]) as case:
             try:
                 result = M.run(runner, root, artifact, root / "appdir", {
                     "appimage_sha256": hashlib.sha256(artifact.read_bytes()).hexdigest()}, {})

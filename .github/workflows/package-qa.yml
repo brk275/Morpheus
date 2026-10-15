@@ -98,6 +98,8 @@ jobs:
           toolchain: 1.99.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          # Preserve trusted build dependencies when a later install check fails.
+          cache-on-failure: true
           save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
       - name: Install pinned Cargo Packager
         run: cargo install cargo-packager --version 0.11.8 --locked
