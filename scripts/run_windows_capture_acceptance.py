@@ -2,6 +2,7 @@
 """Explicit hosted Windows capture QA. No pixels or raw child logs are emitted."""
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import json
 import os
@@ -254,7 +255,7 @@ class WindowsJob:
             code = ctypes.get_last_error(); kernel.CloseHandle(self.job); self.job = None
             raise Failure("job_setup", code, "job_configure")
 
-    def spawn(self, command, environment, log):
+    def spawn(self, command, environment, log, *, stdin_stream=None):
         import msvcrt
         from ctypes import wintypes as w
         executable = str(Path(command[0]).resolve())
@@ -265,9 +266,10 @@ class WindowsJob:
         duplicates = []
         created = False
         try:
-            with open(os.devnull, "rb") as null:
+            with (open(os.devnull, "rb") if stdin_stream is None
+                  else contextlib.nullcontext(stdin_stream)) as input_stream:
                 current = self.kernel.GetCurrentProcess()
-                for stream in (null, log):
+                for stream in (input_stream, log):
                     duplicate = w.HANDLE()
                     if not self.kernel.DuplicateHandle(current, msvcrt.get_osfhandle(stream.fileno()),
                             current, ctypes.byref(duplicate), 0, True, 2):  # DUPLICATE_SAME_ACCESS

@@ -3,6 +3,26 @@
 Morpheus is pre-alpha software with no approved installer release. This log records checks actually completed;
 the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
+## Linux package startup diagnostic: `0f4f170`
+
+[Run 38755259166](https://github.com/brk275/Morpheus/actions/runs/38755259166)
+tested only the ordinary Linux AppImage at
+`0f4f17035f943640688eee2292ff208ae10827ad`, with update and fixed-client
+capture modes disabled. Package creation, resources, desktop entry and ELF
+baseline checks passed. Its bounded startup diagnostic identified missing
+`libasound.so.2`, exit 127, before accessibility tooling or keyboard checks.
+The AppImage SHA-256 was
+`9e2aea4060b87b7ce081eb7f8b94d01eaa5ef8c0d99fc8d8cf5500357fed5c91`.
+All jobs and cache posts completed, both complete logs scanned with zero
+findings, and no artifact was uploaded.
+
+The clean Ubuntu 24.04 AppImage fixture now explicitly installs the host ALSA
+runtime, `libasound2t64`, before its first launch. The first minimal-runtime
+launch must still pass before accessibility tools may be installed. This
+correction requires a new Linux-only package check; it does not establish
+keyboard, audio-device or system Wayland acceptance. Mac and Windows package
+results below remain scoped to their unchanged package inputs.
+
 ## Ordinary unsigned package validation: `a38fe43`
 
 [Run 38743493394](https://github.com/brk275/Morpheus/actions/runs/38743493394)
@@ -44,10 +64,8 @@ findings.
 | Linux AppImage | `b3e897b3ba3929bc7110e0c32e6de192ee2b0724299523a33051567b842fc35c` |
 | Windows NSIS | `f0b5ff328afd55d5f7a5dccd2b3596739c928871433bd36c13528be3fc7b39ce` |
 
-The next Linux ordinary-package check uses bounded, fixed startup diagnostics;
-this improves evidence without changing the startup assertion or guessing a
-runtime dependency fix. Trusted package builds now retain their dependency
-cache if a later install check fails. The separate installed fixed-client
+The subsequent Linux diagnostic run is recorded above. Trusted package builds
+now retain their dependency cache if a later install check fails. The separate installed fixed-client
 capture path also has reviewed fresh-process accessibility isolation and
 cleanup regressions; its actual GUI/peer checks have not run. None of these
 changes clears the failed system Wayland gate below.

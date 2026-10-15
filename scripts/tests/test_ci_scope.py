@@ -66,6 +66,20 @@ class ScopeTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(classify([path])["native_matrix"]["os"], ["ubuntu-24.04"])
 
+    def test_native_vault_manual_fixture_does_not_duplicate_desktop_ci(self):
+        for path in ("crates/morpheus-matrix/tests/native_vault.rs",
+                     ".github/workflows/native-vault-qa.yml"):
+            with self.subTest(path=path):
+                self.assertFalse(classify([path])["native"])
+                self.assertEqual(classify([path, "scripts/run_windows_capture_acceptance.py"])
+                                 ["native_matrix"]["os"], ["windows-2025"])
+                self.assertEqual(classify([path, "scripts/tests/test_windows_capture_acceptance.py"])
+                                 ["native_matrix"]["os"], ["windows-2025"])
+                for shared in ("crates/morpheus-matrix/src/lib.rs", "Cargo.lock",
+                               ".github/workflows/ci.yml", "crates/morpheus-matrix/tests/unknown.rs"):
+                    self.assertEqual(classify([path, shared])["native_matrix"]["os"], list(PLATFORMS))
+                self.assertEqual(classify([path], force_all=True)["native_matrix"]["os"], list(PLATFORMS))
+
     def test_classifier_validation_does_not_suppress_other_affected_checks(self):
         classifier = "scripts/ci_scope.py"
         self.assertFalse(classify([classifier, "scripts/tests/test_ci_scope.py"])["native"])

@@ -32,12 +32,14 @@ class Kernel:
         self.duplicate_failure = duplicate_failure
         self.calls, self.terminated = [], set()
         self.duplicates = 0
+        self.sources = []
 
     def GetCurrentProcess(self):
         return -1
 
     def DuplicateHandle(self, current, source, destination, result, access, inherit, options):
         self.duplicates += 1
+        self.sources.append(source)
         self.calls.append(("duplicate", inherit, options))
         if self.duplicate_failure == self.duplicates:
             return False
@@ -165,6 +167,44 @@ class WindowsCaptureTests(unittest.TestCase):
         self.assertIn(("close", 101), kernel.calls)
         self.assertIn(("close", 102), kernel.calls)
         self.assertNotIn(("close", 20), kernel.calls)
+
+    def test_private_stdin_is_duplicated_without_closing_the_callers_stream(self):
+        kernel = Kernel()
+        job = job_with(kernel)
+        with tempfile.TemporaryFile() as source, tempfile.TemporaryFile() as log, \
+                patch.dict(sys.modules, {"msvcrt": types.SimpleNamespace(get_osfhandle=lambda fd: fd)}), \
+                patch.object(ctypes, "get_last_error", return_value=5, create=True), \
+                patch("builtins.open", side_effect=AssertionError("provided stdin must not open devnull")):
+            result = job.spawn([str(Path("fixture.exe").resolve())], {}, log, stdin_stream=source)
+            self.assertEqual(result, 20)
+            self.assertEqual(kernel.sources, [source.fileno(), log.fileno()])
+            self.assertFalse(source.closed)
+            self.assertFalse(log.closed)
+        events = [call[0] for call in kernel.calls]
+        self.assertLess(events.index("assign"), events.index("resume"))
+        self.assertEqual([call for call in kernel.calls if call[0] == "close"],
+                         [("close", 21), ("close", 101), ("close", 102)])
+
+    def test_private_stdin_failure_paths_close_only_owned_duplicates(self):
+        for options in ({"duplicate_failure": 1}, {"duplicate_failure": 2},
+                        {"create": False}, {"assign": False}, {"resume": 0}):
+            with self.subTest(options=options):
+                kernel = Kernel(**options)
+                job = job_with(kernel)
+                with tempfile.TemporaryFile() as source, tempfile.TemporaryFile() as log, \
+                        patch.dict(sys.modules, {"msvcrt": types.SimpleNamespace(get_osfhandle=lambda fd: fd)}), \
+                        patch.object(ctypes, "get_last_error", return_value=5, create=True):
+                    with self.assertRaises(capture.Failure):
+                        job.spawn([str(Path("fixture.exe").resolve())], {}, log, stdin_stream=source)
+                    self.assertFalse(source.closed)
+                    self.assertFalse(log.closed)
+                    expected = [] if options.get("duplicate_failure") == 1 else [101]
+                    if options.get("duplicate_failure") is None:
+                        expected.append(102)
+                    closed = [call[1] for call in kernel.calls if call[0] == "close" and call[1] in (101, 102)]
+                    self.assertEqual(closed, expected)
+                if options.get("assign") is False or "resume" in options:
+                    self.assertIn(("terminate", 20), kernel.calls)
 
     def test_assignment_failure_kills_suspended_child_and_never_resumes(self):
         kernel = Kernel(assign=False)

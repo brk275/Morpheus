@@ -562,10 +562,11 @@ def linux_container_smoke(dist, kind):
                 and not Path(f"/usr/share/applications/{BINARY}.desktop").exists(), "DEB purge left application files behind")
         record("deb_purge")
     else:
-        # Minimal X11 desktop runtime, with no Rust/compiler/library development packages
-        # or libraries introduced by installing the DEB in this container.
+        # Minimal X11 desktop/audio runtime, with no Rust/compiler/library development
+        # packages or DEB side effects. AppImage excludes ALSA's device-facing
+        # library, so Ubuntu 24.04 must supply it before the first launch.
         apt_install("xvfb", "xauth", "x11-utils", "dbus-x11", "fonts-dejavu-core", "libegl1", "libxkbcommon0",
-                    "libxkbcommon-x11-0", "libxcursor1", "libxi6", "libxrandr2")
+                    "libxkbcommon-x11-0", "libxcursor1", "libxi6", "libxrandr2", "libasound2t64")
         with tempfile.TemporaryDirectory(prefix="morpheus-appimage-") as temp:
             work = Path(temp)
             work.chmod(0o755)

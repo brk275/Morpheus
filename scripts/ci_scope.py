@@ -20,6 +20,13 @@ MANUAL_LINUX_PACKAGE_INPUTS = {
     "packaging/linux/appimage_diagnostics.py",
     "packaging/linux/appimage_process.py",
 }
+# The isolated OS-vault fixture is ignored by ordinary CI. Its exact manual
+# workflow runs all contracts and native phases on selected Mac/Windows runners.
+# Production core changes, unknown fixtures and shared inputs still fail closed.
+MANUAL_NATIVE_VAULT_INPUTS = {
+    "crates/morpheus-matrix/tests/native_vault.rs",
+    ".github/workflows/native-vault-qa.yml",
+}
 WINDOWS_ACCEPTANCE_INPUTS = {
     "scripts/run_windows_capture_acceptance.py",
     "scripts/windows_capture_window.ps1",
@@ -67,7 +74,7 @@ def classify(paths, force_all=False):
             continue
         if path == "Cargo.lock" or path.endswith("Cargo.toml"):
             native.update(PLATFORMS)
-        elif path in MANUAL_LINUX_PACKAGE_INPUTS or path == "scripts/ci_scope.py":
+        elif path in MANUAL_LINUX_PACKAGE_INPUTS or path in MANUAL_NATIVE_VAULT_INPUTS or path == "scripts/ci_scope.py":
             # The classifier itself is exercised by the always-on helper
             # tests. Mixed changes still select their affected native inputs;
             # manual full verification remains an unconditional full matrix.

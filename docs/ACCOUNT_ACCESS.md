@@ -96,3 +96,27 @@ checks remain open. Exact-intent logout and the generated-Slint sign-in keyboard
 regressions passed on all four targets. Linux's separate system Wayland capture
 test failed, so aggregate CI remains failed. These results are not beta acceptance. See
 [verification](VERIFICATION.md).
+
+### Isolated native vault checks
+
+The manual [native-vault workflow](../.github/workflows/native-vault-qa.yml)
+checks both Mac architectures and Windows x64 on fresh standard hosted runners.
+After selecting and hashing the exact compiled core test, it runs parser and
+cleanup contracts, then exercises two separate processes using a temporary
+profile and isolated generated OS-vault entries. It covers password changes and
+restart persistence, wrong/cancelled/stale authorization, exact inactive account
+removal, and reset only after all accounts have been removed.
+
+On macOS it creates a dedicated keychain and restores the original keychain
+preference metadata after every owned process has stopped. On Windows it uses
+exact generated credential targets and a private directory restricted to the
+runner and SYSTEM. Unknown cleanup remains a failed check. Credentials and raw
+OS output are not published or uploaded. This fixture performs no Matrix login
+or successful account activation; Linux's two-homeserver test and installed UI
+checks cover different requirements.
+
+The fixture and wrapper have source reviews and pure/mocked regression coverage;
+actual hosted native-vault results are still pending. Select `platform=all` for
+initial acceptance, or only the affected platform when diagnosing a failure.
+Check active runs and completed cache posts before dispatching. This workflow
+does not distribute a package or complete the beta gate.

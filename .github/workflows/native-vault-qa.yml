@@ -1,0 +1,101 @@
+name: Native vault validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Native credential-vault targets (all for initial acceptance)
+        type: choice
+        required: true
+        default: all
+        options: [macos, windows, all]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-vault-qa-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_BUILD_JOBS: "2"
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  scope:
+    name: Select native vault platforms
+    if: github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event.repository.private == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.scope.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Select standard hosted targets
+        id: scope
+        env:
+          NATIVE_VAULT_PLATFORM: ${{ inputs.platform }}
+        run: python3 scripts/native_vault_scope.py
+
+  vault:
+    name: Native vault validation (${{ matrix.label }})
+    needs: scope
+    if: github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event.repository.private == false
+    runs-on: ${{ matrix.os }}
+    concurrency:
+      group: native-${{ github.sha }}-${{ matrix.os }}
+      cancel-in-progress: false
+    # Pre-vault steps are capped at 50 minutes total; reserve the full
+    # 30-minute wrapper budget plus 10 minutes for runner/cache completion.
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.scope.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        timeout-minutes: 5
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action
+        with:
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        timeout-minutes: 10
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
+      - name: Build and identify the exact core integration test
+        timeout-minutes: 25
+        id: fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target
+          cargo test --locked -p morpheus-matrix --test native_vault --no-run --message-format=json,json-render-diagnostics > target/native-vault-build.json
+          cargo metadata --locked --offline --no-deps --format-version 1 > target/native-vault-metadata.json
+          python3 scripts/native_vault_artifact.py
+      - name: Check parser and cleanup contracts before vault mutation
+        timeout-minutes: 5
+        shell: bash
+        env:
+          NATIVE_VAULT_BINARY: ${{ steps.fixture.outputs.binary }}
+        run: '"$NATIVE_VAULT_BINARY" contract_tests:: --test-threads=1'
+      - name: Check password persistence and exact account removal
+        timeout-minutes: 30
+        shell: bash
+        env:
+          NATIVE_VAULT_BINARY: ${{ steps.fixture.outputs.binary }}
+          NATIVE_VAULT_BINARY_SHA256: ${{ steps.fixture.outputs.binary_sha256 }}
+        run: |
+          set -euo pipefail
+          python3 scripts/run_native_vault_acceptance.py \
+            --binary "$NATIVE_VAULT_BINARY" \
+            --binary-sha256 "$NATIVE_VAULT_BINARY_SHA256"
+      # Synthetic credentials, OS output and profiles remain private on the
+      # fresh runner. This workflow uploads no artifact and publishes no release.

@@ -69,6 +69,14 @@ override is deliberately not used for release packages.
 | Linux x64 DEB | Resolve/install the DEB in a fresh Ubuntu 24.04 container with no compiler or library development packages; verify declared ABI floors and `libxi6`, direct shared libraries and dynamic loading of `libXi.so.6` **before** adding Xvfb; check ELF architecture/symbol floors, desktop entry/icon and license/theme; launch as an unprivileged user under X11/Xvfb for 12 seconds and require a visible window owned by that launch; stop the process and purge the package. |
 | Linux x64 AppImage | In a separate fresh Ubuntu 24.04 container with a minimal X11 desktop runtime, inspect the extracted metadata/resources/ELF, then launch the **AppImage itself** as an unprivileged user using its extract-and-run runtime (no FUSE mount); require a visible window owned by that launch and 12-second survival. Only then install accessibility test tools and relaunch the same package for the bounded keyboard/AT-SPI checks below. Remove the portable file. No DEB is installed in this container. |
 
+The AppImage's Ubuntu 24.04 runtime baseline includes the host ALSA library
+(`libasound2t64`, providing `libasound.so.2`) as well as the X11/desktop libraries
+listed in the smoke helper. ALSA remains host-provided for audio-device access,
+following the [AppImage exclusion policy](https://github.com/AppImageCommunity/pkg2appimage/blob/master/excludelist#L118-L121).
+The first launch runs before adding accessibility tools; those tools must not
+supply a missing application runtime dependency implicitly. A passing launch
+does not verify a microphone, speaker or other physical device.
+
 The Linux runtime image is resolved once per job and used by immutable image ID
 for both containers. Logs record that image ID and each installer's filename,
 size and SHA-256, followed by machine-readable results. Multiple matching
