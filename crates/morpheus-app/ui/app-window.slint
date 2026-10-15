@@ -781,6 +781,10 @@ export component AppWindow inherits Window {
     in-out property <string> voice-designation-notice;
     in-out property <int> voice-designation-operation: 0;
     in-out property <int> theme-mode: 0;
+    // The global appearance.theme the picker edits; theme-mode is the
+    // effective palette, which the active account's override can replace.
+    in-out property <int> global-theme-mode: 0;
+    in-out property <string> account-theme-notice: "";
     in-out property <int> font-scale-percent: 100;
     in-out property <int> density-mode: 1;
     in-out property <bool> sort-unread-first: false;
@@ -2791,15 +2795,15 @@ export component AppWindow inherits Window {
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
                             changed-value(value) => { root.change-style-number(5, value); } }
                         Rectangle { height: 1px; background: root.divider; }
-                        Text { text: "Base palette"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
+                        Text { text: "Base palette for all accounts"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         HorizontalLayout {
                             spacing: 12px;
                             for choice[index] in ["Dark", "Light", "High contrast", "System"] : ActionRect {
                                 width: 128px;
                                 height: 100px;
-                                background: index == root.theme-mode ? root.hover : root.elevated;
-                                border-color: index == root.theme-mode ? root.accent : root.divider;
-                                border-width: index == root.theme-mode ? 2px : 1px;
+                                background: index == root.global-theme-mode ? root.hover : root.elevated;
+                                border-color: index == root.global-theme-mode ? root.accent : root.divider;
+                                border-width: index == root.global-theme-mode ? 2px : 1px;
                                 border-radius: StyleTokens.radius * 1.1;
                                 label: "Use " + choice + " theme";
                                 reveal-full-control: true; focus-color: root.accent;
@@ -2819,6 +2823,10 @@ export component AppWindow inherits Window {
                                     Text { text: choice; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; overflow: elide; }
                                 }
                             }
+                        }
+                        if root.account-theme-notice != "" : Text {
+                            text: root.account-theme-notice; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                            accessible-role: text; accessible-label: root.account-theme-notice;
                         }
                         Rectangle {
                             height: 70px; border-radius: StyleTokens.radius * 1; background: root.elevated;

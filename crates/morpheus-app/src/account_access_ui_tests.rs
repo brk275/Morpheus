@@ -464,6 +464,73 @@ async fn assert_palette_and_density_keyboard(ui: &AppWindow) {
     settle(ui).await;
 }
 
+/// The window palette follows the account that the accepted account-menu
+/// snapshot publishes; the Settings picker shows the global choice with a
+/// notice while that account overrides it. No activation is simulated: a
+/// wrong password, cancel or stale switch never reaches the snapshot adapter.
+fn assert_account_theme_follows_accepted_snapshot(ui: &AppWindow) {
+    use morpheus_config::ThemeMode;
+    let account = |id: &str, name: &str| morpheus_matrix::AccountInfo {
+        id: id.into(),
+        user_id: format!("@{name}:example.org"),
+        device_id: "DEVICE".into(),
+        homeserver: "https://example.org".into(),
+    };
+    let plain = account("plain-account", "plain");
+    let themed = account("old-account", "casey");
+    let mut config = Config::default();
+    config.appearance.theme = ThemeMode::System;
+    config
+        .account_overrides
+        .entry("old-account".into())
+        .or_default()
+        .theme = Some(ThemeMode::Light);
+    // Sign-in screen, no active account: the global mode everywhere.
+    ui.set_active_account_local_id("".into());
+    apply_config(ui, &config, None);
+    assert_eq!(ui.get_theme_mode(), 3);
+    assert_eq!(ui.get_global_theme_mode(), 3);
+    assert!(ui.get_account_theme_notice().is_empty());
+    // An activation hook that runs before the accepted snapshot sees the
+    // still-visible account and changes nothing.
+    crate::appearance::apply_theme_mode(ui);
+    assert_eq!(ui.get_theme_mode(), 3);
+    // The winning snapshot publishes the themed account: its override wins,
+    // while the picker keeps showing the global choice plus a notice.
+    crate::live::apply_account_menu(ui, &[plain.clone(), themed.clone()], &themed);
+    assert_eq!(ui.get_active_account_local_id().as_str(), "old-account");
+    assert_eq!(ui.get_theme_mode(), 1);
+    assert_eq!(ui.get_global_theme_mode(), 3);
+    assert_eq!(
+        ui.get_account_theme_notice().as_str(),
+        "This account overrides it with Light in config.toml."
+    );
+    // A later snapshot for an account without an override returns to the
+    // global palette, even though the earlier hook ran before it.
+    crate::live::apply_account_menu(ui, &[plain.clone(), themed.clone()], &plain);
+    assert_eq!(ui.get_active_account_local_id().as_str(), "plain-account");
+    assert_eq!(ui.get_theme_mode(), 3);
+    assert!(ui.get_account_theme_notice().is_empty());
+    // Editing the global theme through Settings changes the picker and the
+    // palette of accounts without an override; the override stays untouched.
+    config.appearance.theme = ThemeMode::HighContrast;
+    apply_config(ui, &config, None);
+    assert_eq!(ui.get_global_theme_mode(), 2);
+    assert_eq!(ui.get_theme_mode(), 2);
+    crate::live::apply_account_menu(ui, &[plain, themed.clone()], &themed);
+    assert_eq!(ui.get_theme_mode(), 1);
+    assert_eq!(ui.get_global_theme_mode(), 2);
+    assert_eq!(
+        ui.get_account_theme_notice().as_str(),
+        "This account overrides it with Light in config.toml."
+    );
+    // A snapshot that is not accepted (unknown active account) publishes
+    // nothing, so the current palette stays.
+    crate::live::apply_account_menu(ui, &[themed], &account("stale-account", "stale"));
+    assert_eq!(ui.get_active_account_local_id().as_str(), "old-account");
+    assert_eq!(ui.get_theme_mode(), 1);
+}
+
 fn assert_removed_account_menu_projection(ui: &AppWindow) {
     let account = |id: &str, name: &str| morpheus_matrix::AccountInfo {
         id: id.into(),
@@ -826,10 +893,13 @@ async fn exercise_account_ui(runtime: Handle) {
     );
     assert!(!ui.get_account_menu_open());
 
+    assert_account_theme_follows_accepted_snapshot(&ui);
+
     // Seed private information in distinct user-visible surfaces, then use the
     // production detach adapter with a real Weak<AppWindow>, not Weak::default.
     ui.set_live_session(true);
     ui.set_active_account_local_id("old-account".into());
+    assert_eq!(ui.get_theme_mode(), 1, "the themed account is still shown");
     ui.set_active_account_handle("@casey:example.org".into());
     ui.set_accounts(ModelRc::new(VecModel::from(vec![AccountItem {
         handle: "@casey:example.org".into(),
@@ -881,6 +951,16 @@ async fn exercise_account_ui(runtime: Handle) {
     assert!(ui.get_active_account_local_id().is_empty());
     assert!(ui.get_active_account_handle().is_empty());
     assert_eq!(ui.get_active_account_index(), -1);
+    assert_eq!(
+        ui.get_theme_mode(),
+        2,
+        "detaching returns to the global theme, not the departed account's override"
+    );
+    assert_eq!(ui.get_global_theme_mode(), 2);
+    assert!(ui.get_account_theme_notice().is_empty());
+    apply_config(&ui, &Config::default(), None);
+    assert_eq!(ui.get_theme_mode(), 0);
+    assert_eq!(ui.get_global_theme_mode(), 0);
     assert!(ui.get_active_room_id().is_empty());
     assert!(ui.get_active_room_name().is_empty());
     assert_eq!(ui.get_accounts().row_count(), 0);

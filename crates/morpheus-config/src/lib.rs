@@ -378,6 +378,17 @@ impl Config {
                 .and_then(|overrides| overrides.notifications_enabled)
                 .unwrap_or(true)
     }
+
+    /// The theme mode to show while `account_id` is the active account. An
+    /// account without a `theme` override, an unknown ID and no active account
+    /// all use the global `appearance.theme`. Theme packs stay global.
+    pub fn theme_for(&self, account_id: Option<&str>) -> ThemeMode {
+        account_id
+            .filter(|id| !id.is_empty())
+            .and_then(|id| self.account_overrides.get(id))
+            .and_then(|overrides| overrides.theme)
+            .unwrap_or(self.appearance.theme)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -1760,6 +1771,63 @@ mod tests {
         assert!(config.notifications_enabled_for("bob"));
         config.notifications.enabled = false;
         assert!(!config.notifications_enabled_for("bob"));
+    }
+
+    #[test]
+    fn account_theme_override_applies_only_to_that_account() {
+        let mut config = Config::default();
+        assert_eq!(config.theme_for(None), ThemeMode::Dark);
+        assert_eq!(config.theme_for(Some("alice")), ThemeMode::Dark);
+        config
+            .account_overrides
+            .entry("alice".into())
+            .or_default()
+            .theme = Some(ThemeMode::Light);
+        assert_eq!(config.theme_for(Some("alice")), ThemeMode::Light);
+        assert_eq!(config.theme_for(Some("bob")), ThemeMode::Dark);
+        assert_eq!(config.theme_for(Some("")), ThemeMode::Dark);
+        assert_eq!(config.theme_for(None), ThemeMode::Dark);
+        config.appearance.theme = ThemeMode::HighContrast;
+        assert_eq!(config.theme_for(Some("alice")), ThemeMode::Light);
+        assert_eq!(config.theme_for(Some("bob")), ThemeMode::HighContrast);
+        assert_eq!(config.theme_for(None), ThemeMode::HighContrast);
+        // An override entry whose theme is unset is not an override.
+        config.account_overrides.get_mut("alice").unwrap().theme = None;
+        assert_eq!(config.theme_for(Some("alice")), ThemeMode::HighContrast);
+    }
+
+    #[test]
+    fn account_theme_override_round_trips_toml_and_rejects_unknown_modes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        std::fs::write(
+            store.path(),
+            "[appearance]\ntheme = \"dark\"\n\n[account_overrides.alice]\ntheme = \"light\"\n",
+        )
+        .unwrap();
+        let config = store.load().unwrap();
+        assert_eq!(config.theme_for(Some("alice")), ThemeMode::Light);
+        assert_eq!(config.theme_for(Some("bob")), ThemeMode::Dark);
+        store.save(&config).unwrap();
+        assert_eq!(store.load().unwrap(), config);
+        std::fs::write(
+            store.path(),
+            "[account_overrides.alice]\ntheme = \"neon\"\n",
+        )
+        .unwrap();
+        assert!(
+            store.load().is_err(),
+            "an unknown theme mode is an invalid edit"
+        );
+        std::fs::write(
+            store.path(),
+            "[account_overrides.alice]\ntheme_pack = \"terminal\"\n",
+        )
+        .unwrap();
+        assert!(
+            store.load().is_err(),
+            "theme packs are not an account override"
+        );
     }
 
     #[test]

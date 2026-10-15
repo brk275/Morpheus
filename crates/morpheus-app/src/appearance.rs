@@ -1,13 +1,100 @@
 //! Declarative appearance bridge shared by live sessions and offline previews.
 
+use std::sync::{Mutex, PoisonError};
+
 use morpheus_config::{
     BuiltInStylePreset, Config, ConfigStore, ConversationHeaderMode, MessageLayout, NavigationMode,
-    ThemePack, TimestampFormat,
+    ThemeMode, ThemePack, TimestampFormat,
 };
 use slint::fontique_011::fontique;
 use slint::{ComponentHandle, ModelRc, VecModel};
 
 use super::{AppWindow, ColorRole, StyleTokens, ThemeRoleSet, color_from_hex, save_config_change};
+
+/// Theme-mode preferences of the last configuration this window accepted.
+/// Only a successfully loaded configuration replaces them, so a rejected
+/// external edit keeps the last valid choice. The account they apply to is
+/// the window's active account ID, which the live controller publishes only
+/// after a successful activation and clears whenever no account is active;
+/// a wrong password, a cancelled or stale switch never changes it.
+static THEME_SOURCE: Mutex<Option<Config>> = Mutex::new(None);
+
+/// Record the last valid configuration's theme preferences.
+pub(crate) fn remember_theme_preferences(config: &Config) {
+    *THEME_SOURCE.lock().unwrap_or_else(PoisonError::into_inner) = Some(config.clone());
+}
+
+/// Show the theme mode configured for the window's active account, or the
+/// global mode when that account has no override or no account is active.
+/// The Settings picker shows the global choice separately, with a notice
+/// while the active account overrides it.
+pub(crate) fn apply_theme_mode(ui: &AppWindow) {
+    let account = ui.get_active_account_local_id();
+    let projection = {
+        let source = THEME_SOURCE.lock().unwrap_or_else(PoisonError::into_inner);
+        theme_projection_for(source.as_ref(), account.as_str())
+    };
+    ui.set_theme_mode(theme_mode_index(projection.effective));
+    ui.set_global_theme_mode(theme_mode_index(projection.global));
+    ui.set_account_theme_notice(projection.notice.into());
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ThemeModeProjection {
+    /// The palette the window shows.
+    effective: ThemeMode,
+    /// The global `appearance.theme`, which the Settings picker edits.
+    global: ThemeMode,
+    /// Empty unless the active account overrides the global choice.
+    notice: String,
+}
+
+fn theme_projection_for(source: Option<&Config>, account_id: &str) -> ThemeModeProjection {
+    let default = Config::default();
+    let config = source.unwrap_or(&default);
+    let global = config.theme_for(None);
+    let effective = config.theme_for(Some(account_id));
+    let overridden = !account_id.is_empty()
+        && config
+            .account_overrides
+            .get(account_id)
+            .is_some_and(|overrides| overrides.theme.is_some());
+    ThemeModeProjection {
+        effective,
+        global,
+        notice: if overridden {
+            format!(
+                "This account overrides it with {} in config.toml.",
+                theme_mode_name(effective)
+            )
+        } else {
+            String::new()
+        },
+    }
+}
+
+fn resolve_theme_mode(source: Option<&Config>, account_id: &str) -> ThemeMode {
+    theme_projection_for(source, account_id).effective
+}
+
+fn theme_mode_name(mode: ThemeMode) -> &'static str {
+    match mode {
+        ThemeMode::Dark => "Dark",
+        ThemeMode::Light => "Light",
+        ThemeMode::HighContrast => "High contrast",
+        ThemeMode::System => "System",
+    }
+}
+
+/// The `theme-mode` index the window palette switches on.
+pub(crate) fn theme_mode_index(mode: ThemeMode) -> i32 {
+    match mode {
+        ThemeMode::Dark => 0,
+        ThemeMode::Light => 1,
+        ThemeMode::HighContrast => 2,
+        ThemeMode::System => 3,
+    }
+}
 
 /// Apply a complete projection every time, including clearing omitted overrides.
 /// Sender colors are a live UI model: existing message rows need no rebuilding.
@@ -332,6 +419,44 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
 #[cfg(test)]
 mod theme_tests {
     use super::*;
+
+    #[test]
+    fn account_theme_mode_resolves_from_the_active_account_only() {
+        let mut config = Config::default();
+        config.appearance.theme = ThemeMode::System;
+        config
+            .account_overrides
+            .entry("alice".into())
+            .or_default()
+            .theme = Some(ThemeMode::Light);
+        // No accepted configuration yet: the built-in default, never a guess.
+        assert_eq!(resolve_theme_mode(None, "alice"), ThemeMode::Dark);
+        assert_eq!(resolve_theme_mode(Some(&config), "alice"), ThemeMode::Light);
+        assert_eq!(resolve_theme_mode(Some(&config), "bob"), ThemeMode::System);
+        assert_eq!(resolve_theme_mode(Some(&config), ""), ThemeMode::System);
+        // The picker state is the global choice; the notice names the
+        // override only while the active account has one.
+        let alice = theme_projection_for(Some(&config), "alice");
+        assert_eq!(alice.global, ThemeMode::System);
+        assert_eq!(alice.effective, ThemeMode::Light);
+        assert_eq!(
+            alice.notice,
+            "This account overrides it with Light in config.toml."
+        );
+        let bob = theme_projection_for(Some(&config), "bob");
+        assert_eq!(bob.global, ThemeMode::System);
+        assert_eq!(bob.effective, ThemeMode::System);
+        assert!(bob.notice.is_empty());
+        assert!(theme_projection_for(Some(&config), "").notice.is_empty());
+        config.account_overrides.get_mut("alice").unwrap().theme = None;
+        let alice = theme_projection_for(Some(&config), "alice");
+        assert_eq!(alice.effective, ThemeMode::System);
+        assert!(alice.notice.is_empty());
+        assert_eq!(theme_mode_index(ThemeMode::Dark), 0);
+        assert_eq!(theme_mode_index(ThemeMode::Light), 1);
+        assert_eq!(theme_mode_index(ThemeMode::HighContrast), 2);
+        assert_eq!(theme_mode_index(ThemeMode::System), 3);
+    }
 
     #[test]
     fn omitted_roles_and_sender_palette_restore_legacy_bindings() {
