@@ -11,6 +11,18 @@ from pathlib import PurePosixPath
 
 PLATFORMS = ("macos-15", "macos-15-intel", "ubuntu-24.04", "windows-2025")
 MACOS = PLATFORMS[:2]
+# The standalone morpheus-rtc Wayland target does not compile the app or
+# configuration crate. These reviewed presentation inputs still select all
+# four native targets; only the unrelated system Wayland fixture is omitted.
+# Keep this list exact: mixed dependency/build/unknown changes select Wayland.
+WAYLAND_UNRELATED_NATIVE_INPUTS = {
+    "crates/morpheus-app/src/account_access_ui_tests.rs",
+    "crates/morpheus-app/src/appearance.rs",
+    "crates/morpheus-app/src/live.rs",
+    "crates/morpheus-app/src/main.rs",
+    "crates/morpheus-app/ui/app-window.slint",
+    "crates/morpheus-config/src/lib.rs",
+}
 # These Python drivers run only in explicitly selected installed-AppImage QA.
 # Ordinary native CI cannot exercise them; its always-on helper suite covers
 # their pure/mocked contracts. Unknown package inputs still select Linux.
@@ -66,12 +78,15 @@ LINUX_ACCEPTANCE_INPUTS = {
 def classify(paths, force_all=False):
     native = set(PLATFORMS if force_all else ())
     config = False
+    wayland_affected = force_all
     for raw in paths:
         path = str(PurePosixPath(raw))
         if (path.endswith(".md")
                 or (path.startswith("docs/screenshots/") and path.endswith(".png"))
                 or path in {"LICENSE", ".gitignore", ".gitleaksignore"}):
             continue
+        if path not in WAYLAND_UNRELATED_NATIVE_INPUTS:
+            wayland_affected = True
         if path == "Cargo.lock" or path.endswith("Cargo.toml"):
             native.update(PLATFORMS)
         elif path in MANUAL_LINUX_PACKAGE_INPUTS or path in MANUAL_NATIVE_VAULT_INPUTS or path == "scripts/ci_scope.py":
@@ -110,6 +125,7 @@ def classify(paths, force_all=False):
         "native": bool(native),
         "native_matrix": {"os": [p for p in PLATFORMS if p in native]},
         "config": config and not native,
+        "wayland": "ubuntu-24.04" in native and wayland_affected,
     }
 
 

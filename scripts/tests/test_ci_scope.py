@@ -2,10 +2,48 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from scripts.ci_scope import MACOS, PLATFORMS, changed_paths, classify
+from scripts.ci_scope import MACOS, PLATFORMS, WAYLAND_UNRELATED_NATIVE_INPUTS, changed_paths, classify
 
 
 class ScopeTests(unittest.TestCase):
+    def test_reviewed_presentation_inputs_keep_full_native_without_system_wayland(self):
+        reviewed = {"crates/morpheus-app/src/account_access_ui_tests.rs", "crates/morpheus-app/src/appearance.rs",
+                    "crates/morpheus-app/src/live.rs", "crates/morpheus-app/src/main.rs",
+                    "crates/morpheus-app/ui/app-window.slint", "crates/morpheus-config/src/lib.rs"}
+        self.assertEqual(WAYLAND_UNRELATED_NATIVE_INPUTS, reviewed)
+        paths = sorted(reviewed) + ["docs/CUSTOMIZATION.md"]
+        for selected in ([path] for path in paths[:-1]):
+            result = classify(selected)
+            self.assertEqual(result["native_matrix"]["os"], list(PLATFORMS))
+            self.assertFalse(result["wayland"])
+        result = classify(paths)
+        self.assertEqual(result["native_matrix"]["os"], list(PLATFORMS))
+        self.assertFalse(result["config"] or result["wayland"])
+
+    def test_wayland_dependencies_mixed_or_unknown_inputs_fail_closed(self):
+        theme = "crates/morpheus-app/src/appearance.rs"
+        for changed in ("Cargo.lock", "Cargo.toml", "rust-toolchain.toml", ".cargo/config.toml",
+                        ".github/workflows/ci.yml", "crates/morpheus-app/build.rs",
+                        "crates/morpheus-rtc/src/linux_portal.rs", "crates/morpheus-rtc/Cargo.toml",
+                        "crates/morpheus-matrix/src/lib.rs", "crates/morpheus-matrix/Cargo.toml",
+                        "vendor/webrtc-sys/pipewire_isolation.rs", "vendor/webrtc-sys/build.rs",
+                        "packaging/linux/appimage_peer.rs", "scripts/run_wayland_acceptance.py",
+                        "scripts/wayland_fixture_backend.py", "scripts/element_process_namespace.py",
+                        "crates/morpheus-rtc/tests/support/pipewire_probe.rs", "new-build-input.conf",
+                        "crates/morpheus-app/src/new-input.rs", "scripts/new-input.py"):
+            with self.subTest(path=changed):
+                result = classify([theme, changed])
+                self.assertEqual(result["native_matrix"]["os"], list(PLATFORMS))
+                self.assertTrue(result["wayland"])
+
+    def test_wayland_requires_linux_and_forced_full_always_selects_it(self):
+        for paths in ([], ["README.md"], ["themes/aurora.toml"], ["scripts/ci_scope.py"],
+                      ["scripts/run_windows_capture_acceptance.py"], ["packaging/macos/Info.plist"]):
+            self.assertFalse(classify(paths)["wayland"])
+            self.assertTrue(classify(paths, force_all=True)["wayland"])
+        self.assertTrue(classify(sorted(WAYLAND_UNRELATED_NATIVE_INPUTS), force_all=True)["wayland"])
+        self.assertTrue(classify(["scripts/run_wayland_acceptance.py"])["wayland"])
+
     def test_docs_do_not_build_native_code(self):
         self.assertFalse(classify(["README.md", "docs/PACKAGING.md", "AGENTS.md"])["native"])
 

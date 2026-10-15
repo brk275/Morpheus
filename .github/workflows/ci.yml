@@ -32,6 +32,7 @@ jobs:
       native: ${{ steps.scope.outputs.native }}
       native_matrix: ${{ steps.scope.outputs.native_matrix }}
       config: ${{ steps.scope.outputs.config }}
+      wayland: ${{ steps.scope.outputs.wayland }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -178,7 +179,7 @@ jobs:
         run: cargo build --locked -p morpheus-app --features native-calls
       - name: Capture actual native preview screens
         id: preview-capture
-        if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name == 'push'
+        if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && (github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push'))
         continue-on-error: true
         timeout-minutes: 2
         env:
@@ -193,6 +194,8 @@ jobs:
           # This debug-only early CLI renders fictional fixtures before any
           # account/config store or network service initialization. Native
           # logs and raw frames stay private and are never uploaded.
+          # Reviewed PRs capture their tested merge tree before integration;
+          # their PNGs remain untrusted until visual/privacy review.
           if ! timeout --kill-after=5s 30s xvfb-run -a -s '-screen 0 1440x900x24' \
             sh -c 'xdotool mousemove 1 1 && exec "$@"' sh \
             target/debug/morpheus-app --morpheus-capture-preview "$preview_root/raw" \
@@ -206,7 +209,7 @@ jobs:
             --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
       - name: Upload native preview PNGs and provenance only
         id: preview-upload
-        if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.preview-capture.outcome == 'success'
+        if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && (github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push')) && steps.preview-capture.outcome == 'success'
         continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -259,7 +262,9 @@ jobs:
         run: python scripts/run_windows_capture_acceptance.py
       - name: Test real Wayland portal streaming, source loss, and cancellation
         id: wayland-tests
-        if: runner.os == 'Linux'
+        # Missing/malformed selection is fail-closed; the result gate below
+        # rejects it even if the fixture happens to pass.
+        if: runner.os == 'Linux' && needs.scope.outputs.wayland != 'false'
         # Collect independent Matrix/OAuth/RTC evidence even if this desktop
         # fixture fails. The final outcome gate still rejects the candidate.
         continue-on-error: true
@@ -301,6 +306,32 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
           dbus-run-session -- python3 scripts/run_matrix_acceptance.py \
             --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks"
+      - name: Require the selected Wayland result
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        env:
+          WAYLAND_SELECTED: ${{ needs.scope.outputs.wayland }}
+          WAYLAND_OUTCOME: ${{ steps.wayland-tests.outcome }}
+        shell: bash
+        run: |
+          python3 - <<'PY_WAYLAND_ACCEPTANCE'
+          import os
+          import sys
+
+          def wayland_error(selected, outcome):
+              if selected not in ("true", "false"):
+                  return "Wayland selection is missing or malformed."
+              expected = "success" if selected == "true" else "skipped"
+              if outcome != expected:
+                  return "The selected Wayland check failed, was cancelled, or did not run."
+              return None
+
+          error = wayland_error(os.environ.get("WAYLAND_SELECTED"), os.environ.get("WAYLAND_OUTCOME"))
+          if error:
+              print(error, file=sys.stderr)
+              raise SystemExit(1)
+          if os.environ["WAYLAND_SELECTED"] == "false":
+              print("System Wayland was outside this change's inputs; its existing release gate remains open.")
+          PY_WAYLAND_ACCEPTANCE
       - name: Enforce collected acceptance results
         if: ${{ !cancelled() && (steps.model-tests.outcome == 'failure' || steps.preview-capture.outcome == 'failure' || steps.preview-upload.outcome == 'failure' || steps.desktop-tests.outcome == 'failure' || steps.wayland-tests.outcome == 'failure' || steps.windows-capture-tests.outcome == 'failure' || steps.sdk-receipt-tests.outcome == 'failure' || steps.vendor-tests.outcome == 'failure') }}
         shell: bash
@@ -342,8 +373,8 @@ jobs:
               outputs = needs["scope"].get("outputs")
               if not isinstance(outputs, dict):
                   return "Scope outputs are missing."
-              native, config = outputs.get("native"), outputs.get("config")
-              if native not in ("true", "false") or config not in ("true", "false"):
+              native, config, wayland = outputs.get("native"), outputs.get("config"), outputs.get("wayland")
+              if any(flag not in ("true", "false") for flag in (native, config, wayland)):
                   return "Scope flags are missing or malformed."
               if native == config == "true":
                   return "Native checks already include configuration tests."
@@ -360,6 +391,8 @@ jobs:
                       or len(platforms) != len(set(platforms))
                       or bool(platforms) != (native == "true")):
                   return "Native matrix disagrees with the selected standard checks."
+              if wayland == "true" and "ubuntu-24.04" not in platforms:
+                  return "Selected Wayland acceptance requires the Linux native job."
               for job, selected in (("config", config), ("compile", native)):
                   expected = "success" if selected == "true" else "skipped"
                   if needs[job].get("result") != expected:
