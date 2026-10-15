@@ -16,7 +16,10 @@ import sys
 DWORD = ctypes.c_uint32
 BOOL = ctypes.c_int32
 PTR = ctypes.c_void_p
-CODES = {"guard", "root", "token", "descriptor", "create", "verify", "internal"}
+CODES = {"guard", "root", "token", "descriptor", "create", "verify", "internal",
+         "root_metadata", "root_identity", "root_not_empty", "descriptor_query",
+         "descriptor_convert", "descriptor_bounds", "descriptor_termination",
+         "acl_shape", "acl_owner", "acl_flags", "acl_aces", "acl_principals"}
 SID = re.compile(r"S-1-5-21-(?:[0-9]{1,10}-){3}[0-9]{1,10}\Z")
 
 
@@ -56,21 +59,32 @@ def expected_descriptor(sid):
     return f"O:{sid}D:P(A;OICI;FA;;;{sid})(A;OICI;FA;;;SY)"
 
 
-def descriptor_is_private(value, sid):
-    """Closed SDDL subset: owner plus two explicit inheritable full-access ACEs."""
+def descriptor_failure(value, sid):
+    """Closed failure tokens for the unchanged protected two-ACE policy."""
     if not valid_sid(sid) or type(value) is not str or len(value) > 4096:
-        return False
+        return "acl_shape"
     prefix = f"O:{sid}D:"
     if not value.startswith(prefix):
-        return False
+        return "acl_owner"
     remainder = value[len(prefix):]
     index = remainder.find("(")
-    if index < 0 or remainder[:index] not in {"P", "PAI", "AIP"}:
-        return False
+    if index < 0:
+        return "acl_shape"
+    if remainder[:index] not in {"P", "PAI", "AIP"}:
+        return "acl_flags"
     aces = re.findall(r"\(A;(?:OICI|CIOI);(?:FA|0x1[fF]01[fF][fF]);;;([^;()]+)\)", remainder[index:])
     exact = re.fullmatch(r"(?:\(A;(?:OICI|CIOI);(?:FA|0x1[fF]01[fF][fF]);;;[^;()]+\)){2}", remainder[index:])
     normalized = ["S-1-5-18" if value == "SY" else value for value in aces]
-    return exact is not None and len(normalized) == 2 and set(normalized) == {sid, "S-1-5-18"}
+    if exact is None or len(normalized) != 2:
+        return "acl_aces"
+    if set(normalized) != {sid, "S-1-5-18"}:
+        return "acl_principals"
+    return None
+
+
+def descriptor_is_private(value, sid):
+    """Closed SDDL subset: owner plus two explicit inheritable full-access ACEs."""
+    return descriptor_failure(value, sid) is None
 
 
 def guard_root(root):
@@ -93,7 +107,7 @@ def guard_root(root):
 def root_metadata(root):
     value = root.lstat()
     require(stat.S_ISDIR(value.st_mode) and not stat.S_ISLNK(value.st_mode)
-            and not value.st_file_attributes & 0x400, "root")
+            and not value.st_file_attributes & 0x400, "root_metadata")
     return value
 
 
@@ -160,15 +174,15 @@ class _Api:
         descriptor, output, length = PTR(), PTR(), DWORD()
         status = self.advapi.GetNamedSecurityInfoW(str(root), 1, 0x5, None, None, None, None, ctypes.byref(descriptor))
         if status != 0:
-            raise NativeVaultWindowsError("verify", status)
+            raise NativeVaultWindowsError("descriptor_query", status)
         try:
-            require(descriptor.value is not None, "verify")
+            require(descriptor.value is not None, "descriptor_bounds")
             if not self.advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW(descriptor, 1, 0x5, ctypes.byref(output), ctypes.byref(length)):
-                raise NativeVaultWindowsError("verify", ctypes.get_last_error())
-            require(output.value is not None and 1 <= length.value <= 4096, "verify")
+                raise NativeVaultWindowsError("descriptor_convert", ctypes.get_last_error())
+            require(output.value is not None and 1 <= length.value <= 4096, "descriptor_bounds")
             raw = ctypes.wstring_at(output, length.value)
             text, separator, padding = raw.partition("\0")
-            require(separator and not padding.strip("\0"), "verify")
+            require(separator and not padding.strip("\0"), "descriptor_termination")
             return text
         finally:
             if output.value:
@@ -178,9 +192,11 @@ class _Api:
 
 def _verify(root, api, sid):
     before = root_metadata(root)
-    require(descriptor_is_private(api.descriptor(root), sid), "verify")
+    failure = descriptor_failure(api.descriptor(root), sid)
+    if failure is not None:
+        raise NativeVaultWindowsError(failure)
     after = root_metadata(root)
-    require((before.st_dev, before.st_ino) == (after.st_dev, after.st_ino), "root")
+    require((before.st_dev, before.st_ino) == (after.st_dev, after.st_ino), "root_identity")
 
 
 def prepare_private_root(root):
@@ -199,7 +215,7 @@ def prepare_private_root(root):
         api.create(root, sid)
         created = True
         _verify(root, api, sid)
-        require(not any(root.iterdir()), "root")
+        require(not any(root.iterdir()), "root_not_empty")
     except NativeVaultWindowsError as error:
         error.created = created
         raise

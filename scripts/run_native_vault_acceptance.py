@@ -71,6 +71,33 @@ def require(condition, code):
         raise Failure(code)
 
 
+def windows_isolation_code(error):
+    """Map reviewed helper tokens only; never publish OS status or descriptor data."""
+    code = getattr(error, "code", None)
+    codes = {
+        "guard": "windows_isolation_guard",
+        "root": "windows_isolation_root",
+        "token": "windows_isolation_token",
+        "descriptor": "windows_isolation_descriptor",
+        "create": "windows_isolation_create",
+        "verify": "windows_isolation_verify",
+        "internal": "windows_isolation_internal",
+        "root_metadata": "windows_isolation_root_metadata",
+        "root_identity": "windows_isolation_root_identity",
+        "root_not_empty": "windows_isolation_root_not_empty",
+        "descriptor_query": "windows_isolation_descriptor_query",
+        "descriptor_convert": "windows_isolation_descriptor_convert",
+        "descriptor_bounds": "windows_isolation_descriptor_bounds",
+        "descriptor_termination": "windows_isolation_descriptor_termination",
+        "acl_shape": "windows_isolation_acl_shape",
+        "acl_owner": "windows_isolation_acl_owner",
+        "acl_flags": "windows_isolation_acl_flags",
+        "acl_aces": "windows_isolation_acl_aces",
+        "acl_principals": "windows_isolation_acl_principals",
+    }
+    return codes.get(code, "windows_isolation_internal") if type(code) is str else "windows_isolation_internal"
+
+
 class Evidence:
     def __init__(self):
         self.first = None
@@ -519,6 +546,7 @@ class MacKeychain:
         self.snapshotted = False
         self.may_have_changed = False
         self.owned_create_attempted = False
+        self.root_identity = None
         self.ready = False
 
     def command(self, arguments):
@@ -539,15 +567,68 @@ class MacKeychain:
         self.original_default, self.original_list = current_default, current_list
         self.snapshotted = True
 
+    def secure_created_file(self):
+        # security may choose a broader creation mode. Normalize only the exact
+        # new file inside this invocation's already-private, unchanged root.
+        # An old vault, wrong owner, link or substituted inode is never repaired.
+        require(self.owned_create_attempted and self.root_identity is not None
+            and self.runner.quiescent, "private_path")
+        root_info = private_object(self.root, directory=True)
+        require((root_info.st_dev, root_info.st_ino) == self.root_identity
+            and stat.S_IMODE(root_info.st_mode) == 0o700, "root_permissions")
+        require(self.path == self.root / "native-vault.keychain-db", "private_path")
+        root_fd = os.open(self.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            opened_root = os.fstat(root_fd)
+            require(stat.S_ISDIR(opened_root.st_mode) and opened_root.st_uid == os.geteuid()
+                and stat.S_IMODE(opened_root.st_mode) == 0o700
+                and (opened_root.st_dev, opened_root.st_ino) == self.root_identity, "root_permissions")
+            name = self.path.name
+            before = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            require(stat.S_ISREG(before.st_mode), "private_path")
+            require(before.st_uid == os.geteuid(), "private_permissions")
+            require(before.st_nlink == 1, "private_links")
+            # NONBLOCK prevents a substituted FIFO from hanging before fstat.
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=root_fd)
+            try:
+                opened = os.fstat(fd)
+                require(stat.S_ISREG(opened.st_mode)
+                    and (opened.st_dev, opened.st_ino) == (before.st_dev, before.st_ino), "private_path")
+                require(opened.st_uid == os.geteuid(), "private_permissions")
+                require(opened.st_nlink == 1, "private_links")
+                os.fchmod(fd, 0o600)
+                secured = os.fstat(fd)
+                require(stat.S_ISREG(secured.st_mode)
+                    and (secured.st_dev, secured.st_ino) == (before.st_dev, before.st_ino), "private_path")
+                require(secured.st_uid == os.geteuid() and stat.S_IMODE(secured.st_mode) == 0o600, "private_permissions")
+                require(secured.st_nlink == 1, "private_links")
+                current = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+                require(stat.S_ISREG(current.st_mode)
+                    and (current.st_dev, current.st_ino) == (secured.st_dev, secured.st_ino), "private_path")
+                final_root = private_object(self.root, directory=True)
+                require((final_root.st_dev, final_root.st_ino) == self.root_identity
+                    and stat.S_IMODE(final_root.st_mode) == 0o700, "root_permissions")
+                private_object(self.path)
+            finally:
+                os.close(fd)
+        finally:
+            os.close(root_fd)
+
     def setup(self):
         # Validate interactive path spelling before any global preference change.
         password = secrets.token_hex(32)
         security_secret_payload("create-keychain", password, self.path)
         self.snapshot()
+        # Acceptance created this absent root with make_mac_root immediately
+        # before setup. Bind its identity before issuing the create command.
+        root_info = private_object(self.root, directory=True)
+        require(stat.S_IMODE(root_info.st_mode) == 0o700, "root_permissions")
+        self.root_identity = (root_info.st_dev, root_info.st_ino)
         require(not self.path.exists() and not self.path.is_symlink(), "keychain_exists")
         self.may_have_changed = True
         self.owned_create_attempted = True
         self.secret_command("create-keychain", password)
+        self.secure_created_file()
         private_object(self.path)
         self.secret_command("unlock-keychain", password)
         self.command(["list-keychains", "-d", "user", "-s", self.path])
@@ -661,7 +742,14 @@ class Acceptance:
 
     def phase(self, phase, expected_cleanup=None):
         if sys.platform == "win32":
-            self.windows_root.verify_private_root(self.root)
+            try:
+                self.windows_root.verify_private_root(self.root)
+            except self.windows_root.NativeVaultWindowsError as error:
+                context = {"prepare": "windows_root_verify_prepare",
+                    "verify_remove": "windows_root_verify_remove",
+                    "cleanup": "windows_root_verify_cleanup"}.get(phase, "setup_or_fixture")
+                self.evidence.fail(context, windows_isolation_code(error))
+                raise
         private_object(self.root, directory=True)
         executable_identity(self.binary, self.digest)
         for suffix in ("-progress.json", "-result.json"):
@@ -733,8 +821,13 @@ class Acceptance:
         except (Failure, OSError, *windows_error) as error:
             if getattr(error, "created", False):
                 self.created = True
-            code = error.code if isinstance(error, Failure) else "windows_isolation" if isinstance(error, windows_error) else "private_io"
-            self.evidence.fail("setup_or_fixture", code)
+            if isinstance(error, windows_error):
+                # A pre-phase verification has already recorded its precise
+                # context. Evidence.fail preserves that first failure.
+                self.evidence.fail("windows_root_prepare", windows_isolation_code(error))
+            else:
+                code = error.code if isinstance(error, Failure) else "private_io"
+                self.evidence.fail("setup_or_fixture", code)
             if isinstance(error, Failure) and error.cleanup:
                 self.evidence.cleanup_failed("children_unconfirmed")
             if self.root_verified and (windows or keychain.ready) and self.runner.quiescent and (self.root / "owned-items.json").exists():

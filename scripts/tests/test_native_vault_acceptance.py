@@ -220,6 +220,156 @@ class KeychainTransactionTests(unittest.TestCase):
         self.assertEqual(evidence.cleanup_failures, [])
 
 
+class CreatedKeychainModeTests(unittest.TestCase):
+    def info(self, *, directory=False, inode=None, mode=None, uid=None, links=1):
+        return SimpleNamespace(st_dev=10, st_ino=(20 if directory else 30) if inode is None else inode,
+            st_mode=(M.stat.S_IFDIR if directory else M.stat.S_IFREG) | (0o700 if directory else 0o644) if mode is None else mode,
+            st_uid=os.geteuid() if uid is None else uid, st_nlink=links)
+
+    def instance(self):
+        keychain = M.MacKeychain(Path("/owned"), Mock(quiescent=True), M.Evidence())
+        keychain.owned_create_attempted = True
+        keychain.root_identity = (10, 20)
+        return keychain
+
+    def exercise(self, *, before=None, opened=None, secured=None, current=None, root=None, opened_root=None, final_root=None, chmod_error=None):
+        keychain = self.instance()
+        valid_root = self.info(directory=True)
+        valid_file = self.info()
+        private_file = self.info(mode=M.stat.S_IFREG | 0o600)
+        with patch.object(M, "private_object", side_effect=[root or valid_root, final_root or valid_root, private_file]), \
+                patch.object(M.os, "open", side_effect=[100, 101]) as opened_fds, \
+                patch.object(M.os, "fstat", side_effect=[opened_root or valid_root, opened or valid_file, secured or private_file]), \
+                patch.object(M.os, "stat", side_effect=[before or valid_file, current or private_file]) as checked, \
+                patch.object(M.os, "fchmod", side_effect=chmod_error) as chmod, \
+                patch.object(M.os, "close") as close:
+            try:
+                keychain.secure_created_file()
+                failure = None
+            except (M.Failure, OSError) as error:
+                failure = error
+        return failure, opened_fds, checked, chmod, close
+
+    def test_owned_creation_mode_is_narrowed_via_exact_no_follow_descriptor(self):
+        failure, opened, checked, chmod, close = self.exercise()
+        self.assertIsNone(failure)
+        self.assertEqual(opened.call_args_list[0].args[0], Path("/owned"))
+        self.assertTrue(opened.call_args_list[0].args[1] & os.O_DIRECTORY)
+        self.assertTrue(opened.call_args_list[0].args[1] & os.O_NOFOLLOW)
+        self.assertEqual(opened.call_args_list[1].args[0], "native-vault.keychain-db")
+        self.assertEqual(opened.call_args_list[1].kwargs, {"dir_fd": 100})
+        self.assertTrue(opened.call_args_list[1].args[1] & os.O_NOFOLLOW)
+        self.assertTrue(opened.call_args_list[1].args[1] & os.O_NONBLOCK)
+        self.assertEqual(checked.call_args_list[0].kwargs, {"dir_fd": 100, "follow_symlinks": False})
+        chmod.assert_called_once_with(101, 0o600)
+        self.assertEqual([call.args for call in close.call_args_list], [(101,), (100,)])
+
+    def test_old_or_unbound_root_cannot_be_repaired(self):
+        for changes in ({"owned_create_attempted": False}, {"root_identity": None}, {"path": Path("/other")}, {"runner": Mock(quiescent=False)}):
+            keychain = self.instance()
+            for name, value in changes.items():
+                setattr(keychain, name, value)
+            with patch.object(M, "private_object", return_value=self.info(directory=True)), \
+                    patch.object(M.os, "open") as opened, patch.object(M.os, "fchmod") as chmod:
+                with self.assertRaises(M.Failure):
+                    keychain.secure_created_file()
+            opened.assert_not_called(); chmod.assert_not_called()
+
+    def test_wrong_owner_links_and_nonregular_created_file_are_never_chmodded(self):
+        invalid = [self.info(uid=os.geteuid() + 1), self.info(links=2),
+            self.info(mode=M.stat.S_IFLNK | 0o777), self.info(mode=M.stat.S_IFIFO | 0o600), self.info(directory=True)]
+        for before in invalid:
+            with self.subTest(mode=before.st_mode, uid=before.st_uid, links=before.st_nlink):
+                failure, opened, _, chmod, close = self.exercise(before=before)
+                self.assertIsInstance(failure, M.Failure)
+                self.assertEqual(opened.call_count, 1)
+                chmod.assert_not_called(); close.assert_called_once_with(100)
+
+    def test_opened_file_substitution_owner_or_links_reject_before_chmod(self):
+        for opened in (self.info(inode=31), self.info(uid=os.geteuid() + 1), self.info(links=2), self.info(mode=M.stat.S_IFIFO | 0o600)):
+            failure, _, _, chmod, close = self.exercise(opened=opened)
+            self.assertIsInstance(failure, M.Failure)
+            chmod.assert_not_called()
+            self.assertEqual([call.args for call in close.call_args_list], [(101,), (100,)])
+
+    def test_root_identity_or_permissions_change_reject_before_file_open(self):
+        for root in (SimpleNamespace(**{**vars(self.info(directory=True)), "st_ino": 21}), self.info(mode=M.stat.S_IFDIR | 0o755)):
+            failure, opened, _, chmod, _ = self.exercise(root=root)
+            self.assertIsInstance(failure, M.Failure); opened.assert_not_called(); chmod.assert_not_called()
+        failure, opened, _, chmod, close = self.exercise(opened_root=self.info(mode=M.stat.S_IFDIR | 0o755))
+        self.assertIsInstance(failure, M.Failure); self.assertEqual(opened.call_count, 1)
+        chmod.assert_not_called(); close.assert_called_once_with(100)
+
+    def test_chmod_failure_or_post_chmod_identity_change_cannot_pass(self):
+        for changes in ({"chmod_error": OSError("private")}, {"secured": self.info()}, {"current": self.info(inode=31)},
+                        {"final_root": SimpleNamespace(**{**vars(self.info(directory=True)), "st_ino": 21})}):
+            failure, _, _, _, close = self.exercise(**changes)
+            self.assertIsInstance(failure, (M.Failure, OSError))
+            self.assertEqual([call.args for call in close.call_args_list], [(101,), (100,)])
+
+    def test_setup_secures_created_dummy_file_before_unlock_and_selection(self):
+        # Plain empty fixture files only; every security command is mocked.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); root.chmod(0o700)
+            keychain = M.MacKeychain(root, Mock(quiescent=True), M.Evidence())
+            selected = False
+            def command(arguments):
+                nonlocal selected
+                name = arguments[0]
+                if name == "create-keychain":
+                    keychain.path.touch(); keychain.path.chmod(0o644); return b""
+                if name == "unlock-keychain":
+                    self.assertEqual(M.stat.S_IMODE(keychain.path.stat().st_mode), 0o600)
+                    return b""
+                if "-s" in arguments:
+                    selected = True; return b""
+                path = keychain.path if selected else Path("/original/default")
+                return ('"' + str(path) + '"\n').encode()
+            with patch.object(keychain, "command", side_effect=command), \
+                    patch.object(keychain, "secret_command", side_effect=lambda name, password: command([name])):
+                keychain.setup()
+            self.assertTrue(keychain.ready)
+            self.assertEqual(keychain.root_identity, (root.stat().st_dev, root.stat().st_ino))
+            self.assertEqual(M.stat.S_IMODE(keychain.path.stat().st_mode), 0o600)
+
+    def test_failed_permission_normalization_retains_strict_cleanup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); root.chmod(0o700)
+            evidence = M.Evidence()
+            keychain = M.MacKeychain(root, Mock(quiescent=True), evidence)
+            calls = []
+            def command(arguments):
+                calls.append(arguments)
+                if arguments[0] == "create-keychain":
+                    keychain.path.touch(); keychain.path.chmod(0o644); return b""
+                if "-s" in arguments:
+                    return b""
+                return b'"/original/default"\n'
+            with patch.object(keychain, "command", side_effect=command), \
+                    patch.object(keychain, "secret_command", side_effect=lambda name, password: command([name])), \
+                    patch.object(M.os, "fchmod", side_effect=OSError("private")):
+                with self.assertRaises(OSError):
+                    keychain.setup()
+                self.assertFalse(keychain.restore())
+            self.assertFalse(keychain.ready)
+            self.assertFalse(any(call[0] in ("unlock-keychain", "delete-keychain") for call in calls))
+            self.assertTrue(keychain.path.exists())
+            self.assertEqual(evidence.cleanup_failures, ["keychain_delete"])
+
+    def test_preexisting_keychain_is_not_modified_or_owned(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); root.chmod(0o700)
+            keychain = M.MacKeychain(root, Mock(quiescent=True), M.Evidence())
+            keychain.path.touch(mode=0o600)
+            with patch.object(keychain, "command", return_value=b'"/original/default"\n'), \
+                    patch.object(keychain, "secret_command") as secret, patch.object(M.os, "fchmod") as chmod:
+                with self.assertRaises(M.Failure) as error:
+                    keychain.setup()
+            self.assertEqual(error.exception.code, "keychain_exists")
+            self.assertFalse(keychain.owned_create_attempted or keychain.may_have_changed)
+            secret.assert_not_called(); chmod.assert_not_called()
+
+
 class GuardTests(unittest.TestCase):
     def test_windows_arm_is_rejected_before_any_root_or_process(self):
         environment = {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted",
@@ -577,6 +727,72 @@ class WindowsRootLifecycleTests(unittest.TestCase):
             self.assertTrue(root.exists())
             self.assertFalse(instance.platform_restored)
             self.assertIn("owned_items_unconfirmed",instance.evidence.cleanup_failures)
+
+
+class WindowsDiagnosticTests(unittest.TestCase):
+    instance = WindowsRootLifecycleTests.instance
+    def test_mapping_is_closed_and_never_includes_foreign_code_or_status(self):
+        from scripts import native_vault_windows as helper
+        for code in helper.CODES:
+            error = helper.NativeVaultWindowsError(code, 0xDEADBEEF)
+            public = M.windows_isolation_code(error)
+            self.assertEqual(public, "windows_isolation_" + code)
+            self.assertNotIn("3735928559", public)
+        for foreign in (None, [], {"PRIVATE": True}, "PRIVATE_SDDL", "acl_owner PRIVATE"):
+            self.assertEqual(M.windows_isolation_code(SimpleNamespace(code=foreign, status="PRIVATE")),
+                             "windows_isolation_internal")
+
+    def test_initial_root_failure_keeps_exact_context_and_empty_only_cleanup(self):
+        from scripts import native_vault_windows as helper
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "fresh"
+            instance = self.instance(root)
+            def create(path):
+                path.mkdir()
+                raise helper.NativeVaultWindowsError("acl_flags", created=True)
+            with patch.object(M.sys, "platform", "win32"), patch.object(helper, "prepare_private_root", side_effect=create), \
+                    patch.object(instance, "phase") as phase, patch.object(M.shutil, "rmtree") as remove:
+                with self.assertRaises(M.Failure):
+                    instance.run()
+            self.assertEqual(instance.evidence.first, {"stage": "windows_root_prepare", "code": "windows_isolation_acl_flags"})
+            self.assertTrue(instance.profile_removed and instance.platform_restored)
+            self.assertEqual(instance.evidence.cleanup_failures, [])
+            phase.assert_not_called()
+            remove.assert_not_called()
+            instance.runner.run.assert_not_called()
+
+    def test_each_prephase_revalidation_failure_precedes_any_private_or_native_access(self):
+        from scripts import native_vault_windows as helper
+        for phase, context in (("prepare", "windows_root_verify_prepare"),
+                               ("verify_remove", "windows_root_verify_remove"),
+                               ("cleanup", "windows_root_verify_cleanup")):
+            instance = self.instance(Path("PRIVATE_PATH"))
+            instance.windows_root = helper
+            with patch.object(M.sys, "platform", "win32"), \
+                    patch.object(helper, "verify_private_root", side_effect=helper.NativeVaultWindowsError("descriptor_query", 5)), \
+                    patch.object(M, "private_object") as private, patch.object(M, "executable_identity") as identity:
+                with self.assertRaises(helper.NativeVaultWindowsError):
+                    instance.phase(phase)
+            self.assertEqual(instance.evidence.first, {"stage": context, "code": "windows_isolation_descriptor_query"})
+            self.assertFalse(instance.phase_started)
+            private.assert_not_called(); identity.assert_not_called(); instance.runner.run.assert_not_called()
+
+    def test_prephase_failure_survives_outer_catch_and_cleanup_failure(self):
+        from scripts import native_vault_windows as helper
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "fresh"
+            instance = self.instance(root)
+            with patch.object(M.sys, "platform", "win32"), \
+                    patch.object(helper, "prepare_private_root", side_effect=lambda path: path.mkdir()), \
+                    patch.object(helper, "verify_private_root", side_effect=[helper.NativeVaultWindowsError("acl_principals"), helper.NativeVaultWindowsError("root_identity")]), \
+                    patch.object(M.shutil, "rmtree") as remove:
+                with self.assertRaises(M.Failure):
+                    instance.run()
+            self.assertEqual(instance.evidence.first, {"stage": "windows_root_verify_prepare", "code": "windows_isolation_acl_principals"})
+            self.assertEqual(instance.evidence.cleanup_failures, ["root_cleanup"])
+            self.assertFalse(instance.profile_removed)
+            self.assertTrue(root.exists())
+            remove.assert_not_called(); instance.runner.run.assert_not_called()
 
 
 if __name__ == "__main__":

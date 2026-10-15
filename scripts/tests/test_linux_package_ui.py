@@ -15,6 +15,7 @@ def diagnostic(**overrides):
             "desktop_app_seen": True, "owned_app_seen": True, "owned_node_seen": True,
             "homeserver_seen": True, "username_seen": True, "password_seen": True,
             "selector_matches": 1, "password_role": "password_text", "cleanup": "passed",
+            "traversed_node_matched": False,
             **overrides}
 
 
@@ -388,6 +389,86 @@ class BoundedDiagnosticTests(unittest.TestCase):
                 raw = json.dumps(report(status="failed", phase="sign_in_semantics", diagnostic=trace.value))
                 self.assertNotIn("PRIVATE_", raw)
                 self.assertEqual(smoke.keyboard_report(raw.encode())["status"], "failed")
+
+
+class SequenceDiagnosticTests(unittest.TestCase):
+    class Sequence:
+        def __init__(self, values, error_at=None, error=None, count=None):
+            self.values, self.error_at, self.error, self.count = values, error_at, error, count
+            self.calls = []
+
+        def __len__(self):
+            self.calls.append("count")
+            return len(self.values) if self.count is None else self.count
+
+        def __getitem__(self, index):
+            self.calls.append(index)
+            if index == self.error_at:
+                raise self.error
+            return self.values[index]
+
+    def test_list_preserves_exact_length_and_index_operations(self):
+        original, observed = self.Sequence([1, 2, 3]), self.Sequence([1, 2, 3])
+        diagnostics = ui.Diagnostics({})
+        self.assertEqual(list(original), list(ui.ObservedSequence(observed, diagnostics, "node")))
+        self.assertEqual(original.calls, observed.calls)
+        self.assertEqual(diagnostics.value["operation"], "node_child_index")
+
+    def test_desktop_for_loop_preserves_index_only_protocol(self):
+        original, observed = self.Sequence([1, 2]), self.Sequence([1, 2])
+        self.assertEqual([x for x in original],
+                         [x for x in ui.ObservedSequence(observed, ui.Diagnostics({}), "desktop")])
+        self.assertEqual(original.calls, observed.calls)
+        self.assertNotIn("count", observed.calls)
+
+    def test_negative_child_count_reports_value_error_at_count_without_skipping(self):
+        sequence = self.Sequence([], count=-1)
+        diagnostics = ui.Diagnostics({})
+        with self.assertRaises(ValueError) as error:
+            list(ui.ObservedSequence(sequence, diagnostics, "node"))
+        diagnostics.failed(error.exception)
+        self.assertEqual(sequence.calls, ["count"])
+        self.assertEqual(diagnostics.value["operation"], "node_child_count")
+        self.assertEqual(diagnostics.value["failure"], "value_error")
+
+    def test_child_index_runtime_failure_is_not_an_empty_subtree(self):
+        sequence = self.Sequence([1, 2], error_at=1, error=RuntimeError("PRIVATE_NODE_DATA"))
+        diagnostics = ui.Diagnostics({})
+        with self.assertRaises(RuntimeError) as error:
+            list(ui.ObservedSequence(sequence, diagnostics, "node"))
+        diagnostics.failed(error.exception)
+        self.assertEqual(sequence.calls, ["count", 0, 1])
+        self.assertEqual(diagnostics.value["operation"], "node_child_index")
+        self.assertEqual(diagnostics.value["failure"], "runtime_error")
+        self.assertNotIn("PRIVATE", json.dumps(diagnostics.value))
+
+    def test_sequence_overflow_is_closed_and_failure_remains_sticky(self):
+        diagnostics = ui.Diagnostics({})
+        diagnostics.failed(OverflowError("PRIVATE_COUNT"))
+        diagnostics.failed(RuntimeError("PRIVATE_OTHER"))
+        self.assertEqual(diagnostics.value["failure"], "overflow_error")
+        self.assertNotIn("PRIVATE", json.dumps(diagnostics.value))
+
+    def test_exact_match_boolean_does_not_publish_the_label(self):
+        driver = object.__new__(ui.AccessibleUI)
+        driver.diagnostics = ui.Diagnostics({})
+        driver.transient_error = type("Transient", (Exception,), {})
+        node = Mock()
+        node.name = "PRIVATE_MATCHED_NAME"
+        driver.nodes = lambda: iter([node])
+        self.assertIs(driver.find("PRIVATE_MATCHED_NAME"), node)
+        self.assertTrue(driver.diagnostics.value["traversed_node_matched"])
+        self.assertNotIn("PRIVATE", json.dumps(driver.diagnostics.value))
+        node.name = "PRIVATE_OTHER_NAME"
+        self.assertIsNone(driver.find("PRIVATE_MATCHED_NAME"))
+        self.assertFalse(driver.diagnostics.value["traversed_node_matched"])
+
+    def test_traversal_match_is_boolean_but_not_required_true_for_pass(self):
+        for value in (True, False):
+            smoke.keyboard_report(json.dumps(report(diagnostic=diagnostic(traversed_node_matched=value))).encode())
+        for value in (1, None, "PRIVATE_NAME"):
+            with self.assertRaises(RuntimeError):
+                smoke.keyboard_report(json.dumps(report(diagnostic=diagnostic(traversed_node_matched=value))).encode())
 
 
 if __name__ == "__main__":

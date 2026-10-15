@@ -45,6 +45,7 @@ class Diagnostics:
             "owned_node_seen": False, "homeserver_seen": False,
             "username_seen": False, "password_seen": False,
             "selector_matches": 0, "password_role": "unchecked",
+            "traversed_node_matched": False,
             "cleanup": "not_started",
         }
 
@@ -68,12 +69,37 @@ class Diagnostics:
             code = "not_implemented"
         elif isinstance(error, LookupError):
             code = "lookup_error"
+        elif isinstance(error, ValueError):
+            code = "value_error"
+        elif isinstance(error, OverflowError):
+            code = "overflow_error"
+        elif isinstance(error, RuntimeError):
+            code = "runtime_error"
         elif isinstance(error, OSError):
             code = "os_error"
         else:
             code = "unclassified"
         # Defensive fixed fallback if a future assertion supplies a bad token.
         self.value["failure"] = code if code in smoke.KEYBOARD_FAILURES else "unclassified"
+
+
+class ObservedSequence:
+    """Observe pyatspi's sequence protocol without changing its API calls.
+
+    pyatspi 2.46.1 assigns Accessible.__len__ and __getitem__ (no __iter__).
+    Forward those exact operations so list() still checks its length hint and
+    traverses to the same IndexError terminator. No node/exception text is read.
+    """
+    def __init__(self, accessible, diagnostics, kind):
+        self.accessible, self.diagnostics, self.kind = accessible, diagnostics, kind
+
+    def __len__(self):
+        self.diagnostics.operation(self.kind + "_child_count")
+        return len(self.accessible)
+
+    def __getitem__(self, index):
+        self.diagnostics.operation(self.kind + "_child_index")
+        return self.accessible[index]
 
 
 def command(arguments):
@@ -114,7 +140,8 @@ class AccessibleUI:
     def nodes(self):
         count = 0
         self.diagnostics.operation("desktop")
-        for application in self.api.Registry.getDesktop(0):
+        desktop = self.api.Registry.getDesktop(0)
+        for application in ObservedSequence(desktop, self.diagnostics, "desktop"):
             self.diagnostics.value["desktop_app_seen"] = True
             try:
                 self.diagnostics.operation("application_pid")
@@ -134,9 +161,10 @@ class AccessibleUI:
                         self.diagnostics.operation("ownership")
                         if self.owned(pid):
                             self.diagnostics.value["owned_node_seen"] = True
+                            self.diagnostics.value["traversed_node_matched"] = False
                             yield node
                             self.diagnostics.operation("node_children")
-                            pending.extend(list(node))
+                            pending.extend(list(ObservedSequence(node, self.diagnostics, "node")))
                     except (LookupError, self.transient_error):
                         continue
             except (LookupError, self.transient_error):
@@ -149,7 +177,9 @@ class AccessibleUI:
             try:
                 self.diagnostics.operation("node_name")
                 value = node.name or ""
-                if value.startswith(label) if prefix else value == label:
+                matched = value.startswith(label) if prefix else value == label
+                self.diagnostics.value["traversed_node_matched"] = matched
+                if matched:
                     matches.append(node)
                     self.diagnostics.value["selector_matches"] = min(len(matches), 2)
             except self.transient_error:

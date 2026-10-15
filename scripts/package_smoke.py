@@ -494,6 +494,7 @@ KEYBOARD_FAILURES = frozenset({
     "none", "selector_ambiguous", "tree_bound", "app_exited", "wait_timeout",
     "password_role", "deadline", "attribute_error", "type_error",
     "not_implemented", "lookup_error", "os_error", "unclassified",
+    "value_error", "overflow_error", "runtime_error",
 })
 KEYBOARD_STEPS = frozenset({
     "setup", "atspi_setup", "homeserver", "username", "password", "password_role",
@@ -502,6 +503,7 @@ KEYBOARD_STEPS = frozenset({
 KEYBOARD_OPERATIONS = frozenset({
     "none", "desktop", "application_pid", "ownership", "node_cache", "node_children",
     "node_name", "node_role", "process_status", "cleanup",
+    "desktop_child_count", "desktop_child_index", "node_child_count", "node_child_index",
 })
 KEYBOARD_OBSERVATIONS = frozenset({
     "desktop_app_seen", "owned_app_seen", "owned_node_seen", "homeserver_seen",
@@ -511,7 +513,7 @@ KEYBOARD_OBSERVATIONS = frozenset({
 
 def validate_keyboard_diagnostic(value, passed):
     expected = KEYBOARD_OBSERVATIONS | {"step", "operation", "failure", "selector_matches",
-                                        "password_role", "cleanup"}
+                                        "password_role", "cleanup", "traversed_node_matched"}
     require(type(value) is dict and value.keys() == expected, "Invalid installed keyboard diagnostic shape")
     require(all(type(value[key]) is str for key in ("step", "operation", "failure", "password_role", "cleanup"))
             and value["step"] in KEYBOARD_STEPS and value["operation"] in KEYBOARD_OPERATIONS
@@ -519,7 +521,8 @@ def validate_keyboard_diagnostic(value, passed):
             and value["password_role"] in {"unchecked", "password_text", "entry", "text", "other"}
             and value["cleanup"] in {"not_started", "passed", "failed"}
             and type(value["selector_matches"]) is int and 0 <= value["selector_matches"] <= 2
-            and all(type(value[key]) is bool for key in KEYBOARD_OBSERVATIONS),
+            and all(type(value[key]) is bool for key in KEYBOARD_OBSERVATIONS)
+            and type(value["traversed_node_matched"]) is bool,
             "Invalid installed keyboard diagnostic value")
     require(not passed or (value["step"] == "complete" and value["failure"] == "none"
             and value["cleanup"] == "passed" and value["password_role"] == "password_text"

@@ -3,6 +3,51 @@
 Morpheus is pre-alpha software with no approved installer release. This log records checks actually completed;
 the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
+## Development check selection
+
+The reviewed appearance files still select all four native targets and Linux
+Matrix acceptance. They do not select the standalone system Wayland fixture,
+which does not compile the app or configuration crate. Mixed dependency,
+runtime, workflow or unknown inputs select that fixture conservatively; manual
+full verification always includes it. An omitted development check does not
+clear its existing failed release gate.
+
+Pull requests now produce the same fictional native preview captures as main
+pushes. Their images and provenance require review before publication in the
+gallery. Installers remain excluded from workflow uploads.
+
+## Native vault and installed accessibility diagnostics: `ff2c353`
+
+[Native-vault run 38765972179](https://github.com/brk275/Morpheus/actions/runs/38765972179)
+tested `ff2c35353bd7e83f6db1395eb9dae4e11d975558` on both standard Mac
+runners and Windows. All three built the exact fixture and passed its five
+parser/path/cleanup contracts, then failed during setup before either native
+acceptance phase ran. Both Macs reported `private_permissions`; Windows
+reported `windows_isolation`. These failures do not establish password
+persistence, protected switching or account-removal acceptance.
+
+All children stopped. The Mac fixtures could not confirm keychain deletion
+or root cleanup; Windows confirmed cleanup. Every job and cache post finished,
+all four complete logs scanned with zero findings, and no artifact was uploaded.
+Private evidence retains the original parser rejections and a separately
+reviewed interpretation of GitHub's initial log BOM and Windows' exact CRLF
+checkout bytes. Neither adjustment changes a failing fixture result to a pass.
+
+[Linux package run 38766014423](https://github.com/brk275/Morpheus/actions/runs/38766014423)
+tested the ordinary AppImage at the same revision with update and fixed-client
+capture modes disabled. Resources, desktop entry, ELF baseline and the owned
+12-second X11 startup/stop check passed. Installed AT-SPI exposed the owned
+application and the homeserver and username fields. Traversal then failed
+during the password lookup, before uniqueness completion or password-role
+inspection. The record cannot identify the exception or establish a product
+accessibility defect. Account-menu, appearance editing and normal close remain
+unverified. Fixture cleanup passed, all jobs/posts completed, both complete logs
+scanned with zero findings, and no artifact was uploaded. AppImage SHA-256:
+`df91fe378a209c2428bae0ce2018e37b69cf7b4efec9fb5d45169aafe1cf6255`.
+
+System Wayland capture, screen readers, physical devices, signing and updates
+remain separate open release gates.
+
 ## Windows native acceptance: `74bcac2`
 
 [Run 38760078956](https://github.com/brk275/Morpheus/actions/runs/38760078956)

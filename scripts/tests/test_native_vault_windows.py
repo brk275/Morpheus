@@ -245,5 +245,122 @@ class ApiTests(unittest.TestCase):
                     api.descriptor(Path("owned-root"))
             self.assertEqual([call.args[0].value for call in api.kernel.LocalFree.call_args_list], [567] if fault == "failure" else [789, 567])
 
+class ClosedDiagnosticTests(unittest.TestCase):
+    api = ApiTests.api
+    def test_policy_categories_do_not_admit_any_new_descriptor(self):
+        valid = W.expected_descriptor(USER)
+        cases = [
+            (None, "acl_shape"), ("x" * 4097, "acl_shape"),
+            (valid.replace("O:" + USER, "O:SY"), "acl_owner"),
+            ("O:" + USER + "D:P", "acl_shape"),
+            (valid.replace("D:P", "D:"), "acl_flags"),
+            (valid.replace("(A;", "(D;", 1), "acl_aces"),
+            (valid.replace(";OICI;", ";OICIID;"), "acl_aces"),
+            (valid.replace(";FA;", ";FR;"), "acl_aces"),
+            (valid + "(A;OICI;FA;;;WD)", "acl_aces"),
+            (valid.replace(";;;SY", ";;;BA"), "acl_principals"),
+            (valid.replace(";;;SY", ";;;" + USER), "acl_principals"),
+        ]
+        for value, code in cases:
+            with self.subTest(code=code):
+                self.assertEqual(W.descriptor_failure(value, USER), code)
+                self.assertFalse(W.descriptor_is_private(value, USER))
+        self.assertIsNone(W.descriptor_failure(valid, USER))
+        self.assertTrue(W.descriptor_is_private(valid, USER))
+
+    def test_query_and_conversion_failures_have_distinct_fixed_codes(self):
+        for fault, expected in (("query", "descriptor_query"), ("convert", "descriptor_convert")):
+            api = self.api()
+            def query(*args):
+                if fault == "query":
+                    return 5
+                args[-1]._obj.value = 567
+                return 0
+            api.advapi.GetNamedSecurityInfoW = query
+            api.advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW = Mock(return_value=0)
+            with patch.object(ctypes, "get_last_error", return_value=87, create=True):
+                with self.assertRaises(W.NativeVaultWindowsError) as caught:
+                    api.descriptor(Path("PRIVATE_PATH"))
+            self.assertEqual(caught.exception.code, expected)
+            self.assertNotIn("PRIVATE", str(caught.exception))
+            self.assertEqual(api.kernel.LocalFree.call_count, 0 if fault == "query" else 1)
+            if fault == "query":
+                api.advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW.assert_not_called()
+
+    def test_descriptor_bounds_fail_before_reading_memory(self):
+        for fault in ("descriptor", "output", "zero", "large"):
+            api = self.api()
+            def query(*args):
+                args[-1]._obj.value = None if fault == "descriptor" else 567
+                return 0
+            def convert(descriptor, revision, information, output, length):
+                output._obj.value = None if fault == "output" else 789
+                length._obj.value = {"zero": 0, "large": 4097}.get(fault, 100)
+                return 1
+            api.advapi.GetNamedSecurityInfoW = query
+            api.advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW = Mock(side_effect=convert)
+            with patch.object(ctypes, "wstring_at", side_effect=AssertionError("must not read")):
+                with self.assertRaises(W.NativeVaultWindowsError) as caught:
+                    api.descriptor(Path("PRIVATE_PATH"))
+            self.assertEqual(caught.exception.code, "descriptor_bounds")
+            if fault == "descriptor":
+                api.advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW.assert_not_called()
+            self.assertEqual(api.kernel.LocalFree.call_count, 2 if fault in {"zero", "large"} else 1)
+
+    def test_descriptor_termination_failure_frees_allocations(self):
+        for value in ("PRIVATE_NO_TERMINATOR", "PRIVATE_PREFIX\0PRIVATE_PADDING"):
+            api = self.api()
+            memory = ctypes.create_unicode_buffer(value)
+            def query(*args):
+                args[-1]._obj.value = 567
+                return 0
+            def convert(descriptor, revision, information, output, length):
+                output._obj.value = ctypes.addressof(memory)
+                length._obj.value = len(value)  # Exclude the automatically appended NUL.
+                return 1
+            api.advapi.GetNamedSecurityInfoW = query
+            api.advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW = convert
+            with self.assertRaises(W.NativeVaultWindowsError) as caught:
+                api.descriptor(Path("PRIVATE_PATH"))
+            self.assertEqual(caught.exception.code, "descriptor_termination")
+            self.assertNotIn("PRIVATE", str(caught.exception))
+            self.assertEqual([x.args[0].value for x in api.kernel.LocalFree.call_args_list], [ctypes.addressof(memory), 567])
+
+    def test_metadata_acl_and_identity_failures_remain_distinct_and_fail_closed(self):
+        root = Mock()
+        root.lstat.return_value = SimpleNamespace(st_mode=0o040700, st_file_attributes=0x400)
+        with self.assertRaises(W.NativeVaultWindowsError) as caught:
+            W.root_metadata(root)
+        self.assertEqual(caught.exception.code, "root_metadata")
+        first = SimpleNamespace(st_dev=1, st_ino=2)
+        second = SimpleNamespace(st_dev=1, st_ino=3)
+        api = SimpleNamespace(descriptor=lambda path: W.expected_descriptor(USER))
+        with patch.object(W, "root_metadata", side_effect=[first, second]):
+            with self.assertRaises(W.NativeVaultWindowsError) as caught:
+                W._verify(Path("PRIVATE_PATH"), api, USER)
+        self.assertEqual(caught.exception.code, "root_identity")
+        api.descriptor = lambda path: W.expected_descriptor(USER).replace(";;;SY", ";;;WD")
+        with patch.object(W, "root_metadata", return_value=first) as metadata:
+            with self.assertRaises(W.NativeVaultWindowsError) as caught:
+                W._verify(Path("PRIVATE_PATH"), api, USER)
+        self.assertEqual(caught.exception.code, "acl_principals")
+        self.assertEqual(metadata.call_count, 1)
+
+    def test_nonempty_new_root_retains_only_partial_cleanup_ownership(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "new"
+            def create(path, sid):
+                path.mkdir()
+                (path / "PRIVATE_FILE").touch()
+            api = SimpleNamespace(user_sid=lambda: USER, create=create)
+            with patch.object(W, "guard_root", return_value=root), patch.object(W, "_Api", return_value=api), \
+                    patch.object(W, "_verify"):
+                with self.assertRaises(W.NativeVaultWindowsError) as caught:
+                    W.prepare_private_root(root)
+            self.assertEqual(caught.exception.code, "root_not_empty")
+            self.assertTrue(caught.exception.created)
+            self.assertTrue((root / "PRIVATE_FILE").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
