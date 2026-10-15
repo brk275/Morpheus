@@ -75,7 +75,11 @@ join does not terminate that call.
 
 Discovery currently watches up to 128 joined rooms, with bounded commands,
 candidates, cached receipts and membership scans. A relevant uncertainty can
-withdraw every pending offer. Accounts beyond the room bound have incomplete
+withdraw every pending offer. A verified departed membership (MSC4143
+`member.membership: "leave"`) stays in the sticky cache until its lifetime
+ends; discovery treats it as an absent participant rather than uncertainty, so
+a device's own recent departure does not suppress later offers in that room.
+Admission still refuses a departed membership as the referenced join. Accounts beyond the room bound have incomplete
 incoming discovery. Audible ringing, incoming OS notifications, protocol decline,
 real-device Answer behavior and accessibility acceptance remain release gates.
 Source review and unit guards alone do not establish those behaviors.

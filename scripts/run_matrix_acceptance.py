@@ -285,6 +285,7 @@ INCOMING_DIAGNOSTICS = frozenset((
     "worker_gate_unavailable",
     "worker_candidate_queue_full",
     "worker_seen_retained",
+    "worker_member_departed",
     "fresh_before_idle",
     "fresh_before_selected",
     "fresh_before_sync",

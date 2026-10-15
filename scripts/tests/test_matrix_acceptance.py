@@ -430,7 +430,12 @@ class LiveStageTests(unittest.TestCase):
     def test_source_emits_exact_allowlisted_stage_identifiers(self):
         source = (Path(__file__).resolve().parents[2]
                   / "crates/morpheus-matrix/tests/live_local.rs").read_text()
-        outer = re.findall(r"phase!\(([a-z_]+)\)", source)
+        # The stages run as separate async functions; the #[test] coordinator
+        # itself must still enter at `fixture` and finish at `complete`.
+        test_body = re.search(
+            r"#\[test\]\nfn two_homeservers_switch_restore_and_encrypted_restart\(\) \{\n.*?\n\}\n",
+            source, re.S).group(0)
+        outer = re.findall(r"phase!\(([a-z_]+)\)", test_body)
         self.assertEqual(outer[0], "fixture")
         self.assertEqual(outer[-1], "complete")
         source += (Path(__file__).resolve().parents[2]

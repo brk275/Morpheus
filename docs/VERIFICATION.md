@@ -3,6 +3,38 @@
 Morpheus is pre-alpha software with no approved installer release. This log records checks actually completed;
 the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
+## Current/DM second-offer timeout diagnosis, 2026-10-15
+
+The Current/DM ringing case failed `account_fresh_offer` with `timed_out` at
+`65b4ceb` and `93d1358`. Its worker counters in
+[run 38246027915](https://github.com/brk275/Morpheus/actions/runs/38246027915)
+showed the second receipt retained in the SDK cache but no candidate ever
+queued: 20 `worker_no_verified_receipts` and 22 `worker_member_malformed`
+ticks, with every admission counter at zero. The cause is in discovery, not in
+the replay ledger or admission. The pinned RTC core leaves a call by sending a
+sticky `m.rtc.member` event whose content carries `member.membership: "leave"`
+and no `application` block, and that entry stays live until its lifetime ends.
+The worker parsed it with the join-only envelope check, classified our own
+device's departure as malformed and rejected the whole room on every tick, so
+the caller's second invitation never produced an offer. The other three cases
+pass only because they never request a second offer after a completed call;
+a user called again in a room they just left would hit the same path.
+
+Discovery now treats a verified departed membership as an absent participant
+(new `worker_member_departed` counter) and still refuses it as the referenced
+join at admission, with a unit regression on both sides. A local
+reproduction against loopback Synapse 1.162.0, a source-built LiveKit 1.13.9
+and lk-jwt-service 0.9.0 reproduced the hosted failure exactly on the
+unchanged worker (same 20/22 counters, `account_fresh_offer` `timed_out`),
+then passed all ten actor checks and the full account A-B-A replay sequence
+with the change. The other three ring cases also passed locally with fresh
+account pairs. Each ran once on one Linux host; hosted Linux verification is
+still pending, and this does not establish audible, UI or device behavior.
+
+The same batch repairs the helper test that located the `live_local` stage
+markers by file position; after the staged restructure it checks the test
+function's own first and last markers instead.
+
 ## Live acceptance stack overflow diagnosis, 2026-10-15
 
 The `live_local` acceptance test aborted with a stack overflow (SIGABRT) at

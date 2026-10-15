@@ -59,6 +59,7 @@ pub(super) enum Diagnostic {
     GateUnavailable,
     CandidateQueueFull,
     SeenRetained,
+    MemberDeparted,
 }
 
 const NAMES: &[&str] = &[
@@ -112,6 +113,7 @@ const NAMES: &[&str] = &[
     "worker_gate_unavailable",
     "worker_candidate_queue_full",
     "worker_seen_retained",
+    "worker_member_departed",
 ];
 
 pub(super) struct Counters([AtomicU32; NAMES.len()]);

@@ -850,6 +850,14 @@ fn reconcile_room(
             cached.reject(room.room_id().as_str(), gate);
             return;
         }
+        // A verified leave stays in the sticky cache until its lifetime ends.
+        // It is the absence of a participant, not a malformed membership: our
+        // own device's recent departure must not reject every later offer in
+        // this room, and a departed caller simply has no live membership below.
+        if departed_membership(&value) {
+            diagnostic!(gate, MemberDeparted);
+            continue;
+        }
         let Ok(parsed) = membership_envelope(
             &value,
             room.room_id().as_str(),
@@ -926,9 +934,20 @@ fn reconcile_room(
     }
 }
 
+/// MSC4143 marks a departed participant with `member.membership: "leave"`;
+/// the entry carries no application or transports. Admission never accepts
+/// one as a referenced membership; discovery treats it as absent.
+fn departed_membership(envelope: &serde_json::Value) -> bool {
+    envelope
+        .pointer("/content/member/membership")
+        .and_then(serde_json::Value::as_str)
+        == Some("leave")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn gate() -> (IncomingController, Arc<Gate>) {
         let controller = IncomingController::default();
@@ -963,6 +982,72 @@ mod tests {
         BTreeSet::from([member()])
     }
 
+    fn sticky_member(content: serde_json::Value) -> serde_json::Value {
+        json!({
+            "type": "m.rtc.member",
+            "event_id": "$member",
+            "sender": "@own:example.org",
+            "room_id": "!room:example.org",
+            "content": content,
+        })
+    }
+
+    #[test]
+    fn departed_memberships_are_absent_participants_not_malformed_rooms() {
+        // The pinned RTC core's leave: slot, sticky key, member id/leave and a
+        // reason, with no application block.
+        let leave = sticky_member(json!({
+            "slot_id": "m.call#room",
+            "msc4354_sticky_key": "join-one",
+            "member": {"id": "join-one", "membership": "leave"},
+            "leave_reason": {"code": "m.leave"},
+        }));
+        assert!(departed_membership(&leave));
+        assert!(
+            membership_envelope(
+                &leave,
+                "!room:example.org",
+                "$member",
+                "@own:example.org",
+                "DEVICE",
+            )
+            .is_err(),
+            "admission must still refuse a departed referenced membership"
+        );
+        let join = sticky_member(json!({
+            "slot_id": "m.call#room",
+            "msc4354_sticky_key": "join-one",
+            "member": {"id": "join-one", "membership": "join"},
+            "application": {"type": "m.call"},
+        }));
+        assert!(!departed_membership(&join));
+        assert!(
+            membership_envelope(
+                &join,
+                "!room:example.org",
+                "$member",
+                "@own:example.org",
+                "DEVICE",
+            )
+            .is_ok()
+        );
+        for other in [
+            sticky_member(json!({"slot_id": "m.call#room", "msc4354_sticky_key": "join-one"})),
+            sticky_member(json!({
+                "slot_id": "m.call#room",
+                "msc4354_sticky_key": "join-one",
+                "member": {"id": "join-one", "membership": ["leave"]},
+            })),
+            sticky_member(json!({
+                "slot_id": "m.call#room",
+                "msc4354_sticky_key": "join-one",
+                "member": {"id": "join-one", "membership": "Leave"},
+            })),
+            json!({"member": {"membership": "leave"}}),
+        ] {
+            assert!(!departed_membership(&other));
+        }
+    }
     #[test]
     fn text_keys_are_exact_unique_and_cannot_be_interpreted_as_rows() {
         let keys = ["incoming-10", "incoming-20"];
