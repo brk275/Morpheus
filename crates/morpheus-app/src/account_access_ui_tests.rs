@@ -389,15 +389,70 @@ fn focused_control_has_label(ui: &AppWindow, expected: &str) -> bool {
 }
 
 fn tab_to_control(ui: &AppWindow, label: &str) {
+    use slint::private_unstable_api::re_exports::{
+        AccessibleStringProperty, ItemRc, TextInput, WindowInner,
+    };
+    use std::ops::ControlFlow;
+
     // Walk the real current tab order without activating intervening controls.
-    // A missing FocusScope must fail instead of silently invoking the callback.
+    // Keep only weak identities for diagnostics; never retain a removed tree,
+    // print other controls' names, set focus, or invoke an action directly.
+    let window = WindowInner::from_pub(ui.window());
+    let mut seen = Vec::new();
+    let mut previous = None;
+    let mut unchanged = 0usize;
+    let mut missing = 0usize;
     for _ in 0..160 {
         if focused_control_has_label(ui, label) {
             return;
         }
+        let current = window.focus_item.borrow().clone();
+        if current.upgrade().is_some() {
+            if previous.as_ref() == Some(&current) {
+                unchanged += 1;
+            }
+            if !seen.contains(&current) {
+                seen.push(current.clone());
+            }
+        } else {
+            missing += 1;
+        }
+        previous = Some(current);
         key(ui, Key::Tab);
     }
-    panic!("Appearance control is not keyboard reachable: {label}");
+    let mut targets = 0usize;
+    let mut visible = 0usize;
+    let mut nonzero = 0usize;
+    ItemRc::new_root(window.component()).visit_descendants(|item| {
+        if item
+            .accessible_string_property(AccessibleStringProperty::Label)
+            .as_deref()
+            == Some(label)
+        {
+            targets += 1;
+            visible += usize::from(item.is_visible());
+            let size = item.geometry().size;
+            nonzero += usize::from(size.width > 0.0 && size.height > 0.0);
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    let focused_text_input = window
+        .focus_item
+        .borrow()
+        .upgrade()
+        .is_some_and(|item| item.downcast::<TextInput>().is_some());
+    panic!(
+        "Appearance control is not keyboard reachable: {label}; page={}, scale={}, distinct_focus={}, unchanged_focus={}, missing_focus={}, target_nodes={}, visible_targets={}, nonzero_targets={}, focused_text_input={}",
+        ui.get_page(),
+        ui.get_font_scale_percent(),
+        seen.len(),
+        unchanged,
+        missing,
+        targets,
+        visible,
+        nonzero,
+        focused_text_input
+    );
 }
 
 async fn assert_palette_and_density_keyboard(ui: &AppWindow) {
