@@ -294,9 +294,7 @@ component IconAction inherits Rectangle {
             } else { reject }
         }
     }
-    // Keep the tab-order tree stable while the focus decoration changes.
-    Rectangle {
-        opacity: keyboard-focus.has-focus ? 1 : 0;
+    if keyboard-focus.has-focus : Rectangle {
         border-radius: parent.border-radius;
         border-width: 2px;
         border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.ink;
@@ -357,9 +355,7 @@ component ActionRect inherits Rectangle {
             } else { reject }
         }
     }
-    // Keep the tab-order tree stable while the focus decoration changes.
-    Rectangle {
-        opacity: keyboard-focus.has-focus ? 1 : 0;
+    if keyboard-focus.has-focus : Rectangle {
         border-radius: parent.border-radius;
         border-width: 2px;
         border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.focus-color;

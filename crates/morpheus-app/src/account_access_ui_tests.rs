@@ -541,6 +541,37 @@ fn focus_item_kind(item: &slint::private_unstable_api::re_exports::ItemWeak) -> 
     }
 }
 
+// Plain values only: default-empty identity, item kind, initial ordinal,
+// visibility and native-window geometry. Upgrades drop before the next event.
+type FocusStage = (bool, u8, i64, bool, f32, f32, f32, f32);
+
+fn focus_stage(ui: &AppWindow, graph: &FocusGraph) -> FocusStage {
+    use slint::private_unstable_api::re_exports::{ItemWeak, WindowInner};
+
+    let window = WindowInner::from_pub(ui.window());
+    let identity = window.focus_item.borrow().clone();
+    let empty = identity == ItemWeak::default();
+    let kind = focus_item_kind(&identity);
+    let ordinal = graph_ordinal(graph, &identity);
+    match identity.upgrade() {
+        Some(item) => {
+            let geometry = item.geometry();
+            let point = item.map_to_native_window(geometry.origin);
+            (
+                empty,
+                kind,
+                ordinal,
+                item.is_visible(),
+                point.x,
+                point.y,
+                geometry.size.width,
+                geometry.size.height,
+            )
+        }
+        None => (empty, kind, ordinal, false, 0.0, 0.0, 0.0, 0.0),
+    }
+}
+
 fn tab_to_control(ui: &AppWindow, label: &str) {
     use slint::private_unstable_api::re_exports::{
         AccessibleStringProperty, Clip, Flickable, FocusScope, ItemRc, TextInput, WindowInner,
@@ -559,6 +590,7 @@ fn tab_to_control(ui: &AppWindow, label: &str) {
     // (previous ordinal in the initial graph, after-item kind, after-item
     // ordinal, ordinals of the raw steps computed before the key)
     let mut losses: Vec<(i64, u8, i64, Vec<i64>)> = Vec::new();
+    let mut loss_stages: Vec<[FocusStage; 4]> = Vec::new();
     let mut seen = Vec::new();
     let mut previous = None;
     let mut unchanged = 0usize;
@@ -584,13 +616,30 @@ fn tab_to_control(ui: &AppWindow, label: &str) {
         let recording = initial.is_some() && losses.len() < FOCUS_LOSS_BOUND;
         let steps = if recording { raw_steps(&current) } else { Vec::new() };
         previous = Some(current.clone());
-        key(ui, Key::Tab);
+        // Preserve key()'s exact press/release/mock sequence. Read only plain
+        // facts between events to locate the first focus clear; never keep
+        // a strong item reference across the following dispatch.
+        let stages = if let Some(graph) = initial.as_ref().filter(|_| recording) {
+            let before = focus_stage(ui, graph);
+            let text: slint::SharedString = Key::Tab.into();
+            ui.window()
+                .dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
+            let pressed = focus_stage(ui, graph);
+            ui.window().dispatch_event(WindowEvent::KeyReleased { text });
+            let released = focus_stage(ui, graph);
+            i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+            Some([before, pressed, released, focus_stage(ui, graph)])
+        } else {
+            key(ui, Key::Tab);
+            None
+        };
         if let Some(graph) = initial.as_ref().filter(|_| recording) {
             let after = window.focus_item.borrow().clone();
             let kind = focus_item_kind(&after);
             // A press that ends without an item, or on an item that is neither
             // a FocusScope nor a TextInput, lost keyboard focus.
             if kind == 0 || kind == 3 {
+                loss_stages.push(stages.expect("recorded key stages"));
                 losses.push((
                     graph_ordinal(graph, &current),
                     kind,
@@ -704,6 +753,13 @@ fn tab_to_control(ui: &AppWindow, label: &str) {
             eprintln!(
                 "appearance_focus_loss: index={index}, pre_ordinal={pre_ordinal}, after_kind={after_kind}, after_ordinal={after_ordinal}, step_ordinals={steps:?}"
             );
+            for (phase, facts) in ["before", "pressed", "released", "mock"]
+                .into_iter()
+                .zip(loss_stages[index].iter())
+            {
+                let (empty, kind, ordinal, visible, x, y, width, height) = facts;
+                eprintln!("appearance_focus_stage: loss={index}, phase={phase}, empty={empty}, kind={kind}, ordinal={ordinal}, visible={visible}, x={x}, y={y}, width={width}, height={height}");
+            }
         }
         eprintln!(
             "appearance_focus_loss_bound: losses={}, bounded={}",
