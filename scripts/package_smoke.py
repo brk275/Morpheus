@@ -340,7 +340,14 @@ def startup_failure_diagnostics(log, status):
     return facts
 
 
-def launch_smoke(executable, window_check=None, seconds=12):
+def launch_smoke(executable, window_check=None, seconds=12, stop=None):
+    """Launch the installed executable for `seconds`, require it to keep running, then stop it.
+
+    `stop` receives the Popen object in the finally block and defaults to the
+    shared stop_process. The macOS smoke passes its driver's stop_group so the
+    plain launch's whole group is proven empty before its leader is reaped;
+    Linux and Windows keep the default.
+    """
     if os.name != "nt":
         require_nonreaping_wait()
     env = os.environ.copy()
@@ -376,7 +383,7 @@ def launch_smoke(executable, window_check=None, seconds=12):
             print(json.dumps(failure, sort_keys=True), flush=True)
             raise
         finally:
-            stop_process(process)
+            (stop_process if stop is None else stop)(process)
     record("installed_startup_and_stop", seconds=seconds, window_check=window_check or "process_liveness_only")
 
 
@@ -406,12 +413,84 @@ def macos_smoke(dist, expected_arch):
             require(output(["lipo", "-archs", str(executable)]).split() == [expected_arch], "Wrong installed Mach-O architecture")
             check_resources(contents / "Resources")
             record("dmg_installed_bundle_metadata", architecture=expected_arch, identifier=IDENTIFIER)
-            launch_smoke(executable)
+            macos_installed_launches(executable, work)
             shutil.rmtree(installed)
             require(not installed.exists(), "Temporary installed app was not removed")
             record("macos_app_removal")
         finally:
             run(["hdiutil", "detach", str(mount)], stdout=subprocess.DEVNULL)
+
+
+def macos_module():
+    if __package__:
+        from . import macos_package_ui
+    else:
+        import macos_package_ui
+    return macos_package_ui
+
+
+def macos_bridge_build(work):
+    """Compile the Swift accessibility bridge with the runner's system toolchain, before any launch."""
+    source = Path(__file__).with_name("macos_package_ui.swift")
+    binary = Path(work) / "morpheus-ax-bridge"
+    # Compiler output can quote source paths; keep it private like every other stream.
+    with tempfile.TemporaryFile() as log:
+        result = subprocess.run(["xcrun", "swiftc", "-O", "-module-name", "MorpheusAxBridge", "-o", str(binary),
+                                 str(source)], stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                timeout=600)
+    require(result.returncode == 0 and binary.is_file(), "Accessibility bridge did not compile")
+    record("macos_accessibility_bridge_compiled")
+    return binary
+
+
+def macos_keyboard_launch(executable, nonce, bridge):
+    """Second launch of the same installed bundle executable for the bounded AX/keyboard driver.
+
+    Returns (passed, stopped): whether the whole check passed, and whether the
+    driver verified that the app's group and the bridge stopped.
+    """
+    script = Path(__file__).with_name("macos_package_ui.py")
+    with tempfile.TemporaryFile() as log:
+        result = subprocess.run([sys.executable, str(script), str(executable), nonce, str(bridge)],
+                                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, timeout=360)
+        log.seek(0)
+        report = keyboard_report(log.read(65537), check="installed_macos_keyboard_ax",
+                                 validate=validate_macos_keyboard_diagnostic)
+    print(json.dumps(report, sort_keys=True), flush=True)
+    return (result.returncode == 0 and report["status"] == "passed", report["diagnostic"]["cleanup"] == "passed")
+
+
+def macos_installed_launches(executable, work):
+    """One owned profile around the plain launch and the keyboard relaunch.
+
+    The bridge is compiled and its read-only permission state proven before
+    any profile or application work. The release executable creates its
+    account store inside the Application Support profile on first start, so
+    the smoke establishes that profile before the plain launch and the driver
+    only proves the markers. The profile is removed only after both launches
+    verifiably stopped; otherwise it is retained on the disposable runner and
+    the smoke fails.
+    """
+    module = macos_module()
+    bridge = macos_bridge_build(work)
+    module.probe_permissions(bridge)
+    record("macos_accessibility_permission_present")
+    profile = module.PackageProfile.create()
+    stopped = False
+    try:
+        # The plain launch stops through the driver's group proof: its leader is
+        # reaped only once no live group member remains, otherwise this raises
+        # and the profile is retained before any second launch. The keyboard
+        # driver then relaunches the identical installed bundle executable.
+        launch_smoke(executable, stop=module.stop_group)
+        passed, stopped = macos_keyboard_launch(executable, profile.nonce, bridge)
+        require(passed, "Installed macOS keyboard acceptance failed")
+    finally:
+        if stopped:
+            require(profile.remove(), "Synthetic macOS profile was not removed")
+            record("macos_profile_removed")
+        else:
+            print(json.dumps({"check": "macos_profile_retained", "status": "failed"}, sort_keys=True), flush=True)
 
 
 def nsis_command(executable, destination, uninstall=False):
@@ -597,6 +676,63 @@ WINDOWS_BRIDGE_ERRORS = frozenset({
     "invalid_key", "window_gone", "foreground_unowned", "input_rejected", "invalid_command",
     "bridge_error",
 })
+
+
+# Installed macOS accessibility/keyboard driver: fixed tokens only.
+MACOS_KEYBOARD_FAILURES = frozenset({
+    "none", "guard", "permission_unavailable", "install_state", "profile_invalid", "ownership_lost",
+    "window_count", "app_exited", "selector_ambiguous", "tree_bound", "wait_timeout",
+    "password_semantics", "focus_unowned", "foreground_unowned", "input_rejected", "scale_unreachable",
+    "bridge_invalid", "bridge_timeout", "bridge_exited", "bridge_overflow",
+    "config_mismatch", "exit_status", "process_remaining", "deadline", "cleanup",
+    "attribute_error", "type_error", "lookup_error", "value_error", "os_error",
+    "runtime_error", "unclassified",
+})
+MACOS_KEYBOARD_STEPS = frozenset({
+    "setup", "profile", "bridge", "permission", "launch", "window", "homeserver", "username", "password",
+    "password_semantics", "preview", "account_menu", "appearance", "config_persisted",
+    "normal_close", "cleanup", "complete",
+})
+MACOS_KEYBOARD_OPERATIONS = frozenset({
+    "none", "bundle", "profile_open", "bridge_start", "permissions", "process_create", "ownership", "attach",
+    "window_enumeration", "snapshot", "node_owner", "node_name", "node_role", "focus", "focused_element",
+    "key_input", "process_status", "config_read", "close_request", "process_wait", "group_query", "cleanup",
+})
+MACOS_KEYBOARD_OBSERVATIONS = frozenset({
+    "permission_checked", "owned_window_seen", "ax_root_seen", "homeserver_seen", "username_seen",
+    "password_seen",
+})
+MACOS_PASSWORD_SEMANTICS = frozenset({"unchecked", "protected", "unprotected", "not_text_field"})
+MACOS_BRIDGE_ERRORS = frozenset({
+    "bridge_error", "invalid_command", "attach_mismatch", "not_attached", "window_list_unavailable",
+    "unowned_root", "invalid_id", "unowned", "element_unavailable", "invalid_key", "window_gone",
+    "foreground_unowned", "input_rejected", "close_unavailable", "window_count",
+})
+
+
+def validate_macos_keyboard_diagnostic(value, passed):
+    counts = ("selector_matches", "incomplete_passes", "activation_recoveries", "bounded_snapshots")
+    expected = MACOS_KEYBOARD_OBSERVATIONS | set(counts) | {
+        "step", "operation", "failure", "password_semantics", "cleanup", "profile_owned",
+        "traversed_node_matched", "bridge_error",
+    }
+    require(type(value) is dict and value.keys() == expected, "Invalid installed macOS keyboard diagnostic shape")
+    require(all(type(value[key]) is str for key in ("step", "operation", "failure", "password_semantics",
+                                                     "cleanup", "bridge_error"))
+            and value["step"] in MACOS_KEYBOARD_STEPS and value["operation"] in MACOS_KEYBOARD_OPERATIONS
+            and value["failure"] in MACOS_KEYBOARD_FAILURES
+            and value["password_semantics"] in MACOS_PASSWORD_SEMANTICS
+            and value["cleanup"] in {"not_started", "passed", "failed"}
+            and value["bridge_error"] in MACOS_BRIDGE_ERRORS | {"none"}
+            and all(type(value[key]) is int and 0 <= value[key] <= 2 for key in counts)
+            and all(type(value[key]) is bool for key in MACOS_KEYBOARD_OBSERVATIONS)
+            and type(value["traversed_node_matched"]) is bool and type(value["profile_owned"]) is bool,
+            "Invalid installed macOS keyboard diagnostic value")
+    require(not passed or (value["step"] == "complete" and value["failure"] == "none"
+            and value["cleanup"] == "passed" and value["profile_owned"]
+            and value["password_semantics"] == "protected" and value["bridge_error"] == "none"
+            and all(value[key] for key in MACOS_KEYBOARD_OBSERVATIONS)),
+            "Incomplete installed macOS keyboard diagnostics")
 
 
 def validate_windows_keyboard_diagnostic(value, passed):
