@@ -551,7 +551,9 @@ async fn assert_nickname_controls_keyboard(ui: &AppWindow) {
 // than a helper called with assumed inputs. Items inside `for` and `if` are
 // instantiated by settle(); a missing text yields an empty list.
 fn text_colors_of(ui: &AppWindow, text: &str) -> Vec<Color> {
-    use slint::private_unstable_api::re_exports::{ComplexText, ItemRc, SimpleText, WindowInner};
+    use slint::private_unstable_api::re_exports::{
+        ComplexText, ItemRc, SimpleText, StyledTextItem, WindowInner,
+    };
     use std::ops::ControlFlow;
 
     let window = WindowInner::from_pub(ui.window());
@@ -567,6 +569,11 @@ fn text_colors_of(ui: &AppWindow, text: &str) -> Vec<Color> {
             let complex = complex.as_pin_ref();
             if complex.text().as_str() == text {
                 colors.push(complex.color().color());
+            }
+        } else if let Some(styled) = item.downcast::<StyledTextItem>() {
+            let styled = styled.as_pin_ref();
+            if styled.text() == StyledText::from_plain_text(text) {
+                colors.push(styled.default_color().color());
             }
         }
         ControlFlow::<()>::Continue(())
@@ -617,7 +624,17 @@ async fn assert_message_role_precedence_and_thread_metadata(ui: &AppWindow) {
 
     let own_accent = Color::from_rgb_u8(0x11, 0x22, 0x33);
     let other_accent = Color::from_rgb_u8(0x44, 0x55, 0x66);
-    let full = BuiltInStylePreset::Nocturne.theme().unwrap();
+    let mut full = BuiltInStylePreset::Nocturne.theme().unwrap();
+    // Use distinct synthetic colors: shipped timestamps can equal muted and
+    // own-message ink can equal selection ink, masking a broken precedence
+    // or omission binding. Shipped contrast is tested separately.
+    full.roles.timestamp = Some("#123456".into());
+    full.roles.sender = Some("#234567".into());
+    full.roles.message = Some("#345678".into());
+    full.roles.own_message = Some("#456789".into());
+    full.roles.own_surface = Some("#56789A".into());
+    full.roles.selection = Some("#6789AB".into());
+    full.roles.selection_ink = Some("#789ABC".into());
     let role = |value: &Option<String>| color_from_hex(value.as_deref().unwrap());
     let timestamp = role(&full.roles.timestamp);
     let sender = role(&full.roles.sender);
@@ -659,6 +676,9 @@ async fn assert_message_role_precedence_and_thread_metadata(ui: &AppWindow) {
     assert_text_color(ui, "Selected Author", selection_ink, 1);
     assert_text_color(ui, "10:15 AM", timestamp, 1);
     assert_text_color(ui, "Sending…", timestamp, 1);
+    assert_text_color(ui, "Own Author body", own_message, 1);
+    assert_text_color(ui, "Other Author body", role(&full.roles.message), 1);
+    assert_text_color(ui, "Selected Author body", selection_ink, 1);
     assert_eq!(ui.invoke_body_ink(false, true), own_message);
     assert_eq!(ui.invoke_body_ink(false, false), role(&full.roles.message));
     assert_eq!(ui.invoke_body_ink(true, true), selection_ink);
@@ -706,6 +726,7 @@ async fn assert_message_role_precedence_and_thread_metadata(ui: &AppWindow) {
     assert_text_color(ui, "Selected Author", selection_ink, 1);
     assert_text_color(ui, "10:15 AM", timestamp, 1);
     assert_eq!(ui.invoke_body_ink(false, true), own_message);
+    assert_text_color(ui, "Own Author body", own_message, 1);
 
     // Without a palette the colored-name setting falls back to the message
     // accent, still ahead of own_message and sender.
@@ -730,6 +751,9 @@ async fn assert_message_role_precedence_and_thread_metadata(ui: &AppWindow) {
     assert_text_color(ui, "Selected Author", ink, 1);
     assert_text_color(ui, "10:15 AM", muted, 1);
     assert_text_color(ui, "Sending…", muted, 1);
+    assert_text_color(ui, "Own Author body", ink, 1);
+    assert_text_color(ui, "Other Author body", ink, 1);
+    assert_text_color(ui, "Selected Author body", ink, 1);
     assert_eq!(ui.invoke_body_ink(false, true), ink);
     assert_eq!(ui.invoke_body_ink(true, false), ink);
     assert_eq!(
@@ -780,8 +804,11 @@ async fn assert_message_role_precedence_and_thread_metadata(ui: &AppWindow) {
     settle(ui).await;
     // Timeline row and thread-root heading both show the own author's name.
     assert_text_color(ui, "Own Author", own_message, 2);
+    assert_text_color(ui, "Own Author body", own_message, 2);
     assert_text_color(ui, "Reply Author", sender, 1);
     assert_text_color(ui, "Own Reply Author", own_message, 1);
+    assert_text_color(ui, "Reply Author body", role(&full.roles.message), 1);
+    assert_text_color(ui, "Own Reply Author body", own_message, 1);
     assert_text_color(ui, "· Failed to send", timestamp, 1);
     assert_text_color(ui, "· 9:00 AM", timestamp, 1);
     assert_eq!(
@@ -838,6 +865,7 @@ async fn assert_message_role_precedence_and_thread_metadata(ui: &AppWindow) {
     assert_eq!(ui.get_thread_root_palette_index(), 2);
     assert_eq!(ui.get_thread_root_accent(), other_accent);
     assert_text_color(ui, "Other Author", sender, 2);
+    assert_text_color(ui, "Other Author body", role(&full.roles.message), 2);
     assert_eq!(
         ui.invoke_body_ink(false, ui.get_thread_root_is_own()),
         role(&full.roles.message)

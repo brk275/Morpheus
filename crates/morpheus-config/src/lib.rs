@@ -1327,7 +1327,7 @@ pub struct ThemeRoles {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub own_message: Option<String>,
     /// Row background of the account's own messages when neither selected
-    /// nor hovered; omitted keeps rows transparent.
+    /// nor hovered; omitted keeps the previous row background.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub own_surface: Option<String>,
 }
