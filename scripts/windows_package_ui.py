@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Bounded, account-free installed Windows keyboard/UI Automation check on CI only.
 
-package_smoke proves the plain installed launch first. This second launch of the
-same installed release executable runs inside a kernel job object, drives the
-real window through Windows UI Automation and real keyboard input, and then
-asks for a normal close. It is accessibility API/keyboard evidence on a fresh
-hosted runner profile, not Narrator, live-account or visual acceptance.
+package_smoke creates one synthetic release profile, proves the plain installed
+launch, then runs this driver as a second launch of the same installed release
+executable. The app and the UI Automation bridge run inside one kernel job
+object; the driver checks the real window through Windows UI Automation and
+real keyboard input, then asks for a normal close. It is accessibility
+API/keyboard evidence on a fresh hosted runner profile, not Narrator,
+live-account or visual acceptance.
 """
 
 import contextlib
@@ -13,15 +15,15 @@ import ctypes
 import json
 import os
 import queue
+import re
 import secrets
 import shutil
-import subprocess
 import sys
 import tempfile
 import threading
 import time
 import tomllib
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 if __package__:
     from . import package_smoke as smoke
@@ -32,22 +34,29 @@ else:
 
 CHECK = "installed_windows_keyboard_uia"
 PROFILE_RELATIVE = Path("brk275") / "Morpheus"
-# directories 6 resolves io.github/brk275/Morpheus to <RoamingAppData>\brk275\Morpheus
-# (config, data) and <LocalAppData>\brk275\Morpheus (local data, cache).
+# directories 6 / dirs-sys resolve io.github/brk275/Morpheus through the shell
+# known folders (never APPDATA or LOCALAPPDATA): <RoamingAppData>\brk275\Morpheus
+# holds config and the account store, <LocalAppData>\brk275\Morpheus local data
+# and cache. The release build has no profile override.
 KNOWN_FOLDERS = {
     "roaming": "{3EB685DB-65F9-4CF6-A03A-E3EF65729F3D}",
     "local": "{F1B32785-6FBA-4FCF-9D55-7B8E7F157091}",
 }
+KNOWN_FOLDER_CHARS = 32768
+MARKER = ".morpheus-package-qa"
 SEED_CONFIG = "schema_version = 1\n[appearance]\nscale_percent = 110\n"
 ACCEPTANCE_SECONDS = 180
 BRIDGE_REPLY_SECONDS = 20
 WAIT_SECONDS = 12
 BRIDGE_LINE_BOUND = 4 * 1024 * 1024
+BRIDGE_QUEUE_BOUND = 4
 TREE_BOUND = 5000
+NAME_BOUND = 256
 KEYS = frozenset({"Return", "Space", "Tab", "ShiftTab", "Escape"})
 SETTINGS_TAB_BOUND = 160
 WM_CLOSE = 0x0010
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+OVERLONG = object()
 
 
 class DiagnosticFailure(RuntimeError):
@@ -70,7 +79,7 @@ class Diagnostics:
             "username_seen": False, "password_seen": False,
             "selector_matches": 0, "incomplete_passes": 0, "foreground_recoveries": 0,
             "bounded_snapshots": 0, "password_semantics": "unchecked",
-            "traversed_node_matched": False, "cleanup": "not_started", "profile_removed": False,
+            "traversed_node_matched": False, "cleanup": "not_started", "profile_owned": False,
         }
         self.deadline = time.monotonic() + ACCEPTANCE_SECONDS
 
@@ -148,27 +157,48 @@ def bridge_command(script, pid, window):
             "-File", str(script), "-ProcessId", str(pid), "-WindowHandle", str(window)]
 
 
-def known_folder(name):
+def declare_shell_abi(shell32, ole32):
+    """Documented signatures: HRESULT CLSIDFromString(LPCOLESTR, LPCLSID);
+    HRESULT SHGetKnownFolderPath(REFKNOWNFOLDERID, DWORD, HANDLE, PWSTR*); void CoTaskMemFree(LPVOID)."""
+    ole32.CLSIDFromString.argtypes = [ctypes.c_wchar_p, ctypes.c_void_p]
+    ole32.CLSIDFromString.restype = ctypes.c_long
+    shell32.SHGetKnownFolderPath.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p,
+                                             ctypes.POINTER(ctypes.c_void_p)]
+    shell32.SHGetKnownFolderPath.restype = ctypes.c_long
+    ole32.CoTaskMemFree.argtypes = [ctypes.c_void_p]
+    ole32.CoTaskMemFree.restype = None
+
+
+def shell_libraries():
     shell32 = ctypes.WinDLL("shell32", use_last_error=True)
     ole32 = ctypes.WinDLL("ole32", use_last_error=True)
+    declare_shell_abi(shell32, ole32)
+    return shell32, ole32
+
+
+def known_folder(name, libraries=None, read_wide=None):
+    shell32, ole32 = shell_libraries() if libraries is None else libraries
+    read_wide = ctypes.wstring_at if read_wide is None else read_wide
     guid = ctypes.create_string_buffer(16)
     smoke.require(ole32.CLSIDFromString(KNOWN_FOLDERS[name], guid) == 0, "Invalid known folder identifier")
-    result = ctypes.c_wchar_p()
-    status = shell32.SHGetKnownFolderPath(guid, 0, None, ctypes.byref(result))
-    smoke.require(status == 0 and result.value, "Could not resolve the application profile folder")
+    pointer = ctypes.c_void_p()
+    status = shell32.SHGetKnownFolderPath(guid, 0, None, ctypes.byref(pointer))
     try:
-        return Path(result.value)
+        smoke.require(status == 0 and pointer.value, "Could not resolve the application profile folder")
+        # Bounded wide read of the returned buffer, up to its terminator.
+        text = read_wide(pointer.value, KNOWN_FOLDER_CHARS)
+        end = text.find("\0")
+        smoke.require(end > 0, "Application profile folder path is not terminated")
+        # Judged as a Windows path (drive plus root) wherever this runs.
+        smoke.require(PureWindowsPath(text[:end]).is_absolute(), "Application profile folder path is not absolute")
+        return Path(text[:end])
     finally:
-        ole32.CoTaskMemFree(result)
+        # The shell allocates the string on success only; free every allocation.
+        if pointer.value:
+            ole32.CoTaskMemFree(pointer)
 
 
 def profile_roots():
-    # The release executable (directories 6 / dirs-sys) resolves its profile
-    # through the shell known folders, never APPDATA or LOCALAPPDATA, so no
-    # environment variable can redirect it. The driver resolves the same
-    # folders and treats the fresh hosted runner account as the isolation
-    # boundary: it refuses any existing Morpheus material there, creates only
-    # the synthetic profile, and removes only what it created.
     return [known_folder(name) / PROFILE_RELATIVE for name in ("roaming", "local")]
 
 
@@ -181,36 +211,90 @@ def reparse_point(path):
     return path.is_symlink() or bool(getattr(status, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT)
 
 
-def seed_profile(roots):
-    for root in roots:
-        # A fresh runner has no brk275 organization folder at all. An existing
-        # folder, file or reparse point at either level may hold or redirect to
-        # real profile or vault material, so it is refused, not inspected.
-        require_ui(not reparse_point(root.parent) and not root.parent.exists()
-                   and not reparse_point(root) and not root.exists(), "profile_exists")
-    config = roots[0] / "config" / "config.toml"
-    try:
-        config.parent.mkdir(parents=True)
-        for created in (roots[0].parent, roots[0], config.parent):
-            require_ui(created.is_dir() and not reparse_point(created), "profile_exists")
-        config.write_text(SEED_CONFIG, encoding="utf-8")
-    except Exception:
-        remove_profile(roots)
-        raise
-    return config
+def plain_directory(path):
+    return path.is_dir() and not reparse_point(path)
 
 
-def remove_profile(roots):
-    for root in roots:
-        # Only the directories this run created are removed; a reparse point
-        # here would mean the tree is not ours and is never followed.
-        smoke.require(not reparse_point(root) and not reparse_point(root.parent),
-                      "Refusing to remove a redirected profile root")
-        if root.exists():
-            shutil.rmtree(root)
-        with contextlib.suppress(OSError):
-            root.parent.rmdir()  # Only when the organization folder is empty.
-    return all(not root.exists() and not reparse_point(root) for root in roots)
+class PackageProfile:
+    """The one synthetic release profile of a package smoke run.
+
+    The smoke creates it before the first installed launch, both launches share
+    it, and the smoke removes it only after both launches verifiably stopped. A
+    marker file carrying the run nonce in each root proves the roots are this
+    run's; any other existing profile material is refused and never read,
+    inspected or deleted.
+    """
+    def __init__(self, roots, nonce):
+        self.roots, self.nonce = list(roots), nonce
+        self.config = self.roots[0] / "config" / "config.toml"
+
+    @staticmethod
+    def valid_nonce(nonce):
+        return type(nonce) is str and re.fullmatch(r"[0-9a-f]{32}", nonce) is not None
+
+    @classmethod
+    def create(cls, nonce=None, roots=None):
+        nonce = secrets.token_hex(16) if nonce is None else nonce
+        smoke.require(cls.valid_nonce(nonce), "Invalid package smoke profile nonce")
+        roots = profile_roots() if roots is None else list(roots)
+        for root in roots:
+            # A fresh runner has no brk275 organization folder at all. Anything
+            # at either level, including a reparse point, may hold or redirect to
+            # real profile or vault material, so it is refused, not inspected.
+            smoke.require(not reparse_point(root.parent) and not root.parent.exists()
+                          and not reparse_point(root) and not root.exists(),
+                          "Refusing an existing application profile on this runner")
+        profile = cls(roots, nonce)
+        created = []
+        try:
+            for root in roots:
+                root.parent.mkdir()
+                created.append(root.parent)
+                root.mkdir()
+                created.append(root)
+                smoke.require(plain_directory(root.parent) and plain_directory(root), "Profile root was redirected")
+                (root / MARKER).write_text(nonce, encoding="ascii")
+            profile.config.parent.mkdir()
+            smoke.require(plain_directory(profile.config.parent), "Profile root was redirected")
+            profile.config.write_text(SEED_CONFIG, encoding="utf-8")
+        except BaseException:
+            # Only what this call created, verified absent moments ago.
+            for path in reversed(created):
+                if path.exists() and not reparse_point(path):
+                    shutil.rmtree(path, ignore_errors=True)
+            raise
+        return profile
+
+    @classmethod
+    def open(cls, nonce, roots=None):
+        require_ui(cls.valid_nonce(nonce), "profile_invalid")
+        roots = profile_roots() if roots is None else list(roots)
+        profile = cls(roots, nonce)
+        for root in roots:
+            require_ui(plain_directory(root.parent) and plain_directory(root), "profile_invalid")
+            try:
+                marker = (root / MARKER).read_text(encoding="ascii")
+            except (OSError, UnicodeError):
+                raise DiagnosticFailure("profile_invalid") from None
+            require_ui(marker == nonce, "profile_invalid")
+        require_ui(profile.config.is_file() and not reparse_point(profile.config), "profile_invalid")
+        return profile
+
+    def remove(self):
+        for root in self.roots:
+            # A reparse point here means the tree is not ours; never follow it.
+            smoke.require(not reparse_point(root) and not reparse_point(root.parent),
+                          "Refusing to remove a redirected profile root")
+            if root.exists():
+                try:
+                    marker = (root / MARKER).read_text(encoding="ascii")
+                except (OSError, UnicodeError):
+                    marker = None
+                smoke.require(marker == self.nonce, "Refusing to remove a profile this run did not create")
+                shutil.rmtree(root)
+            with contextlib.suppress(OSError):
+                root.parent.rmdir()  # Only when the organization folder is empty.
+        return all(not root.exists() and not reparse_point(root) for root in self.roots)
 
 
 def environment_for(nonce):
@@ -228,24 +312,50 @@ def installed_executable(executable):
 
 
 class Bridge:
-    """One PowerShell UI Automation bridge; its whole stream is private."""
-    def __init__(self, command, log, diagnostics):
-        self.diagnostics = diagnostics
-        self.replies = queue.Queue()
-        self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
-                                        encoding="utf-8", errors="replace", bufsize=1)
-        self.reader = threading.Thread(target=self.pump, daemon=True)
-        self.reader.start()
-        ready = self.reply()
-        require_ui(ready.get("ready") is True, "bridge_invalid")
+    """One PowerShell UI Automation bridge inside the acceptance job.
+
+    The bridge, its Add-Type compiler and any other descendant are assigned to
+    the same kernel job as the app before their first instruction, so a failed
+    start, handshake or stop can never leave an unowned process. Its whole
+    stream stays private; the driver reads bounded lines through a bounded
+    queue and accepts only JSON objects.
+    """
+    def __init__(self, command, job, diagnostics, environment=None):
+        self.job, self.diagnostics = job, diagnostics
+        self.handle = None
+        self.reader = None
+        self.replies = queue.Queue(maxsize=BRIDGE_QUEUE_BOUND)
+        in_read, in_write = os.pipe()
+        out_read, out_write = os.pipe()
+        self.stdin = os.fdopen(in_write, "w", encoding="utf-8", newline="\n")
+        self.stdout = os.fdopen(out_read, "rb")
+        try:
+            with os.fdopen(in_read, "rb") as child_in, os.fdopen(out_write, "wb") as child_out:
+                self.handle = job.spawn(command, os.environ.copy() if environment is None else environment,
+                                        child_out, stdin_stream=child_in)
+            self.reader = threading.Thread(target=self.pump, daemon=True)
+            self.reader.start()
+            ready = self.reply()
+            require_ui(ready.get("ready") is True, "bridge_invalid")
+        except BaseException:
+            self.close()
+            raise
+
+    def alive(self):
+        return self.handle is not None and self.job.kernel.WaitForSingleObject(self.handle, 0) == 258
 
     def pump(self):
         try:
             while True:
-                line = self.process.stdout.readline()
+                # Bounded before allocation: at most one byte past the bound is
+                # read, and an unterminated or overlong line ends the stream.
+                line = self.stdout.readline(BRIDGE_LINE_BOUND + 1)
                 if not line:
                     break
-                self.replies.put(line if len(line) <= BRIDGE_LINE_BOUND else "")
+                if len(line) > BRIDGE_LINE_BOUND or not line.endswith(b"\n"):
+                    self.replies.put(OVERLONG)
+                    break
+                self.replies.put(line)
         except (OSError, ValueError):
             pass
         finally:
@@ -259,21 +369,25 @@ class Bridge:
             self.diagnostics.check_deadline()
             raise DiagnosticFailure("bridge_timeout") from None
         require_ui(line is not None, "bridge_exited")
+        require_ui(line is not OVERLONG, "bridge_overflow")
         try:
-            value = json.loads(line)
-        except ValueError:
+            value = json.loads(line.decode("utf-8"))
+        except (ValueError, UnicodeError):
             raise DiagnosticFailure("bridge_invalid") from None
         require_ui(type(value) is dict and type(value.get("ok")) is bool, "bridge_invalid")
         return value
 
-    def call(self, command, allow_error=False):
-        self.diagnostics.check_deadline()
-        require_ui(self.process.poll() is None, "bridge_exited")
+    def transmit(self, command):
+        require_ui(self.alive(), "bridge_exited")
         try:
-            self.process.stdin.write(json.dumps(command, separators=(",", ":")) + "\n")
-            self.process.stdin.flush()
+            self.stdin.write(json.dumps(command, separators=(",", ":")) + "\n")
+            self.stdin.flush()
         except (OSError, ValueError):
             raise DiagnosticFailure("bridge_exited") from None
+
+    def call(self, command, allow_error=False):
+        self.diagnostics.check_deadline()
+        self.transmit(command)
         value = self.reply()
         if not value["ok"]:
             code = value.get("error")
@@ -285,31 +399,37 @@ class Bridge:
         return value
 
     def close(self):
+        """Ask the bridge to exit, otherwise terminate it; a stop that cannot be verified raises."""
         try:
-            if self.process.poll() is None:
+            if self.alive():
                 with contextlib.suppress(OSError, ValueError):
-                    self.process.stdin.write('{"op":"exit"}\n')
-                    self.process.stdin.flush()
-                try:
-                    self.process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self.process.kill()
-                    self.process.wait(timeout=5)
+                    self.stdin.write('{"op":"exit"}\n')
+                    self.stdin.flush()
+                if self.job.kernel.WaitForSingleObject(self.handle, 5000) != 0:
+                    self.job.terminate_handle(self.handle)
         finally:
             with contextlib.suppress(OSError, ValueError):
-                self.process.stdin.close()
-            with contextlib.suppress(OSError, ValueError):
-                self.process.stdout.close()
+                self.stdin.close()
+            # The reader owns the read pipe while it blocks in readline; closing
+            # it from here would wait on that read. The child's exit ends the
+            # read, and a still-running reader only leaks one descriptor until
+            # this process exits.
+            if self.reader is not None:
+                self.reader.join(timeout=1)
+            if self.reader is None or not self.reader.is_alive():
+                with contextlib.suppress(OSError, ValueError):
+                    self.stdout.close()
 
 
 class Node:
-    __slots__ = ("id", "parent", "pid", "name", "type", "password", "focused", "error")
+    __slots__ = ("id", "parent", "pid", "name", "type", "password", "focused", "error", "truncated")
 
     def __init__(self, raw):
         require_ui(type(raw) is dict and type(raw.get("id")) is int and type(raw.get("parent")) is int
                    and type(raw.get("pid")) is int and type(raw.get("name")) is str
+                   and len(raw["name"]) <= NAME_BOUND
                    and type(raw.get("type")) is str and all(type(raw.get(key)) is bool
-                                                            for key in ("password", "focused", "error")),
+                                                            for key in ("password", "focused", "error", "truncated")),
                    "bridge_invalid")
         for key in self.__slots__:
             setattr(self, key, raw[key])
@@ -333,6 +453,7 @@ class WindowsUI:
         require_ui(type(raw) is list and type(value.get("bounded")) is bool, "bridge_invalid")
         if value["bounded"]:
             self.diagnostics.count("bounded_snapshots")
+        # A bounded walk saw an unknown remainder: it is not a tree.
         require_ui(len(raw) <= TREE_BOUND and not value["bounded"], "tree_bound")
         nodes = [Node(item) for item in raw]
         require_ui(all(node.id == index for index, node in enumerate(nodes)), "bridge_invalid")
@@ -356,6 +477,8 @@ class WindowsUI:
         self.diagnostics.value["selector_matches"] = 0
         for node in self.nodes():
             self.diagnostics.operation("node_name")
+            # A cut name can still carry a short exact label or prefix; it can
+            # never hide a second match because the cut keeps the first 256 chars.
             matched = node.name.startswith(label) if prefix else node.name == label
             self.diagnostics.value["traversed_node_matched"] = matched
             if matched:
@@ -388,7 +511,7 @@ class WindowsUI:
         self.diagnostics.operation("focused_element")
         value = self.bridge.call({"op": "focused"})
         require_ui(all(type(value.get(key)) is bool for key in ("present", "owned"))
-                   and type(value.get("name")) is str, "bridge_invalid")
+                   and type(value.get("name")) is str and len(value["name"]) <= NAME_BOUND, "bridge_invalid")
         if not value["present"]:
             return None
         # Focus elsewhere on the desktop is never treated as our focus state
@@ -410,15 +533,19 @@ class WindowsUI:
     def key(self, key):
         smoke.require(key in KEYS, "Unsupported acceptance key")
         # Only an owned focused element may receive input, and the bridge
-        # requires the exact owned foreground window before SendInput.
+        # requires the exact owned foreground window immediately before its
+        # single native SendInput call for the whole chord.
         self.diagnostics.operation("focused_element")
         require_ui(self.focused_name() is not None, "focus_unowned")
         self.diagnostics.operation("key_input")
         try:
             value = self.bridge.call({"op": "key", "key": key}, allow_error=True)
         except BridgeFailure as error:
-            raise DiagnosticFailure("foreground_unowned" if error.code in {"foreground_unowned", "window_gone"}
-                                    else "bridge_invalid") from None
+            if error.code in {"foreground_unowned", "window_gone"}:
+                raise DiagnosticFailure("foreground_unowned") from None
+            if error.code == "input_rejected":
+                raise DiagnosticFailure("input_rejected") from None
+            raise DiagnosticFailure("bridge_invalid") from None
         if value.get("recovered") is True:
             self.diagnostics.count("foreground_recoveries")
 
@@ -544,8 +671,11 @@ def request_close(pid, window):
     from ctypes import wintypes
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     user32.IsWindow.argtypes = [wintypes.HWND]
+    user32.IsWindow.restype = wintypes.BOOL
     user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
     user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.PostMessageW.restype = wintypes.BOOL
     owner = wintypes.DWORD()
     user32.GetWindowThreadProcessId(window, ctypes.byref(owner))
     smoke.require(user32.IsWindow(window) and owner.value == pid, "Installed window is no longer owned")
@@ -575,25 +705,26 @@ def process_id(job, handle):
     return int(pid)
 
 
-def acceptance(executable, report, diagnostics=None):
+def acceptance(executable, nonce, report, diagnostics=None):
     diagnostics = diagnostics or Diagnostics(report)
     guard()
     diagnostics.operation("registry")
     installed_executable(executable)
     diagnostics.step("profile")
-    diagnostics.operation("known_folder")
-    roots = profile_roots()
-    diagnostics.operation("profile_seed")
-    config = seed_profile(roots)
+    diagnostics.operation("profile_open")
+    # The smoke created this profile before the plain launch and removes it
+    # after both launches verifiably stopped; the driver only proves ownership.
+    profile = PackageProfile.open(nonce)
+    diagnostics.value["profile_owned"] = True
     diagnostics.step("launch")
     diagnostics.operation("job")
     job = None
     bridge = None
     try:
         job = capture.WindowsJob()
-        with tempfile.TemporaryFile() as app_log, tempfile.TemporaryFile() as bridge_log:
+        with tempfile.TemporaryFile() as app_log:
             diagnostics.operation("process_create")
-            handle = job.spawn([str(executable)], environment_for(secrets.token_hex(16)), app_log)
+            handle = job.spawn([str(executable)], environment_for(nonce), app_log)
             diagnostics.operation("process_id")
             pid = process_id(job, handle)
             diagnostics.step("window")
@@ -601,7 +732,7 @@ def acceptance(executable, report, diagnostics=None):
             diagnostics.step("bridge")
             diagnostics.operation("bridge_start")
             bridge = Bridge(bridge_command(Path(__file__).with_name("windows_package_ui.ps1"), pid, window),
-                            bridge_log, diagnostics)
+                            job, diagnostics)
             ui = WindowsUI(bridge, pid, job, handle, diagnostics)
             inspect_sign_in(ui, report, diagnostics)
             diagnostics.step("preview")
@@ -614,7 +745,7 @@ def acceptance(executable, report, diagnostics=None):
             diagnostics.step("appearance")
             appearance_keyboard(ui)
             diagnostics.step("config_persisted")
-            config_persisted(config, diagnostics)
+            config_persisted(profile.config, diagnostics)
             report["appearance_config"] = True
             report["phase"] = "normal_window_close"
             diagnostics.step("normal_close")
@@ -627,22 +758,21 @@ def acceptance(executable, report, diagnostics=None):
         raise
     finally:
         # Preserve the first failure position if bounded cleanup also fails.
+        # The profile is never touched here: the smoke removes it only after
+        # this process reported a verified stop (cleanup passed).
         failure = None
         try:
             if bridge is not None:
                 bridge.close()
         except Exception as error:  # noqa: BLE001 - every cleanup step must run
-            failure = failure or error
+            failure = error
         try:
             if job is not None:
                 job.close()
         except Exception as error:  # noqa: BLE001
             failure = failure or error
-        try:
-            diagnostics.value["profile_removed"] = remove_profile(roots)
-        except Exception as error:  # noqa: BLE001
-            failure = failure or error
-        if failure is None and diagnostics.value["profile_removed"]:
+        # With no job created nothing was launched, so nothing can remain.
+        if failure is None:
             diagnostics.value["cleanup"] = "passed"
         else:
             diagnostics.value["cleanup"] = "failed"
@@ -660,8 +790,8 @@ def main():
               "normal_window_close": False, "app_log_public": False, "screen_reader_acceptance": False}
     diagnostics = Diagnostics(report)
     try:
-        smoke.require(len(sys.argv) == 2, "Expected installed executable path")
-        acceptance(Path(sys.argv[1]).resolve(), report, diagnostics)
+        smoke.require(len(sys.argv) == 3, "Expected installed executable path and profile nonce")
+        acceptance(Path(sys.argv[1]).resolve(), sys.argv[2], report, diagnostics)
         report.update(status="passed", phase="complete")
         diagnostics.step("complete")
     except Exception as error:  # noqa: BLE001 - only fixed tokens leave this process

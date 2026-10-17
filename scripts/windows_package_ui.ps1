@@ -34,12 +34,28 @@ public static class MorpheusInput {
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr window);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr window);
     [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
-    // One real keyboard transition through the normal input path (no window messages).
-    public static uint Key(ushort virtualKey, bool release) {
+    static void Transition(INPUT[] inputs, int index, ushort virtualKey, bool release) {
+        inputs[index].type = 1;
+        inputs[index].u.ki.wVk = virtualKey;
+        inputs[index].u.ki.dwFlags = release ? 2u : 0u;
+    }
+    // The complete key chord in ONE native SendInput call. Windows inserts the
+    // array serially, without interleaving other input, so the proof of the
+    // owned foreground window taken immediately before this call covers every
+    // transition. Returns the number of transitions the system accepted.
+    public static uint Chord(ushort virtualKey, bool shift) {
+        int count = shift ? 4 : 2;
+        INPUT[] inputs = new INPUT[count];
+        int index = 0;
+        if (shift) { Transition(inputs, index++, 0x10, false); }
+        Transition(inputs, index++, virtualKey, false);
+        Transition(inputs, index++, virtualKey, true);
+        if (shift) { Transition(inputs, index++, 0x10, true); }
+        return SendInput((uint)count, inputs, Marshal.SizeOf(typeof(INPUT)));
+    }
+    public static uint Release(ushort virtualKey) {
         INPUT[] inputs = new INPUT[1];
-        inputs[0].type = 1;
-        inputs[0].u.ki.wVk = virtualKey;
-        inputs[0].u.ki.dwFlags = release ? 2u : 0u;
+        Transition(inputs, 0, virtualKey, true);
         return SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
     }
     public static uint WindowProcess(IntPtr window) { uint owner = 0; GetWindowThreadProcessId(window, out owner); return owner; }
@@ -51,6 +67,7 @@ $utf8 = New-Object System.Text.UTF8Encoding($false)
 [Console]::InputEncoding = $utf8
 $script:elements = New-Object 'System.Collections.Generic.List[System.Windows.Automation.AutomationElement]'
 $MaxNodes = 5000
+$MaxName = 256
 $Keys = @{ Return = [uint16]0x0D; Space = [uint16]0x20; Tab = [uint16]0x09; Escape = [uint16]0x1B }
 $Shift = [uint16]0x10
 
@@ -76,6 +93,12 @@ function TypeName($element) {
 # children, so the driver treats that pass as incomplete instead of as a tree
 # that happens to lack the node. Unowned nodes are reported without a name and
 # never expanded. Element indexes stay valid until the next snapshot.
+#
+# Every bound is enforced before the growth it limits: the total of recorded
+# and queued elements never exceeds $MaxNodes, so sibling enumeration stops
+# before a wide or endless sibling chain can grow the queue; a name longer than
+# $MaxName is cut before it is kept; a bounded or incomplete walk is reported
+# and the driver treats it as not-a-tree.
 function Snapshot {
     $script:elements.Clear()
     try {
@@ -87,23 +110,25 @@ function Snapshot {
     $queue = New-Object 'System.Collections.Generic.Queue[object]'
     $queue.Enqueue(@($root, -1))
     $bounded = $false
-    while ($queue.Count -gt 0) {
+    while ($queue.Count -gt 0 -and -not $bounded) {
         $pair = $queue.Dequeue()
         $element = $pair[0]
-        if ($script:elements.Count -ge $MaxNodes) { $bounded = $true; break }
         $id = $script:elements.Count
         $script:elements.Add($element)
         $node = [ordered]@{ id = $id; parent = [int]$pair[1]; pid = -1; name = ''; type = 'other'
-                            password = $false; focused = $false; error = $false }
+                            password = $false; focused = $false; error = $false; truncated = $false }
         try {
             $node.pid = [int]$element.Current.ProcessId
             if ($node.pid -eq $ProcessId) {
-                $node.name = [string]$element.Current.Name
+                $name = [string]$element.Current.Name
+                if ($name.Length -gt $MaxName) { $name = $name.Substring(0, $MaxName); $node.truncated = $true }
+                $node.name = $name
                 $node.type = TypeName $element
                 $node.password = [bool]$element.Current.IsPassword
                 $node.focused = [bool]$element.Current.HasKeyboardFocus
                 $child = $walker.GetFirstChild($element)
                 while ($child -ne $null) {
+                    if ($script:elements.Count + $queue.Count -ge $MaxNodes) { $bounded = $true; break }
                     $queue.Enqueue(@($child, $id))
                     $child = $walker.GetNextSibling($child)
                 }
@@ -142,8 +167,10 @@ function ForegroundOwned {
     return ([MorpheusInput]::WindowProcess($handle) -eq [uint32]$ProcessId)
 }
 
-# Keyboard input is desktop-wide by nature, so the exact owned window handle
-# and process must be the foreground window immediately before every SendInput.
+# Keyboard input is desktop-wide by nature. The exact owned window handle and
+# process must be the foreground window immediately before the single native
+# SendInput call that inserts the whole chord; there is no second call whose
+# target could have changed in between.
 function SendKey([string]$name) {
     $shift = $false
     if ($name -eq 'ShiftTab') { $name = 'Tab'; $shift = $true }
@@ -156,13 +183,20 @@ function SendKey([string]$name) {
         if (-not (ForegroundOwned)) { Fail 'foreground_unowned'; return }
         $recovered = $true
     }
-    $sent = [uint32]0
     $expected = [uint32]2
-    if ($shift) { $expected = 4; $sent += [MorpheusInput]::Key($Shift, $false) }
-    $sent += [MorpheusInput]::Key($Keys[$name], $false)
-    $sent += [MorpheusInput]::Key($Keys[$name], $true)
-    if ($shift) { $sent += [MorpheusInput]::Key($Shift, $true) }
-    if ($sent -ne $expected) { Fail 'input_rejected'; return }
+    if ($shift) { $expected = [uint32]4 }
+    $sent = [MorpheusInput]::Chord($Keys[$name], $shift)
+    if ($sent -ne $expected) {
+        # The system accepted only a prefix of the chord. Release whatever that
+        # prefix left pressed, but only toward the still-owned foreground window;
+        # a changed foreground gets nothing, and the run fails either way.
+        if ($sent -gt 0 -and (ForegroundOwned)) {
+            if ($shift -and $sent -ge 1) { [void][MorpheusInput]::Release($Shift) }
+            if (($shift -and $sent -eq 2) -or (-not $shift -and $sent -eq 1)) { [void][MorpheusInput]::Release($Keys[$name]) }
+        }
+        Fail 'input_rejected'
+        return
+    }
     Reply @{ ok = $true; recovered = $recovered }
 }
 

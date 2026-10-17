@@ -65,7 +65,7 @@ override is deliberately not used for release packages.
 | Target | Automated checks |
 | --- | --- |
 | macOS Apple Silicon and Intel | Verify and mount the DMG read-only without interaction; copy the app into a temporary Applications directory; check native Mach-O architecture, bundle identifier/version, microphone/camera/screen purpose strings, exact license and theme contents; launch the installed executable for 12 seconds, stop it, remove the app, detach the DMG. |
-| Windows x64 | Silently install NSIS into a temporary path containing spaces; check x64 PE32+ GUI subsystem, license/theme and Add/Remove Programs registration/version; require the installed process to survive 12 seconds and create a Win32 window with its visible flag set; close/stop the process. Then relaunch the same installed executable for the bounded keyboard/UI Automation check below, and afterwards run the real silent uninstaller and verify application directory and registration removal. |
+| Windows x64 | Silently install NSIS into a temporary path containing spaces; check x64 PE32+ GUI subsystem, license/theme and Add/Remove Programs registration/version; create the one synthetic release profile described below; require the installed process to survive 12 seconds and create a Win32 window with its visible flag set; close/stop the process. Then relaunch the same installed executable for the bounded keyboard/UI Automation check, remove the profile only after both launches verifiably stopped, and run the real silent uninstaller and verify application directory and registration removal. |
 | Linux x64 DEB | Resolve/install the DEB in a fresh Ubuntu 24.04 container with no compiler or library development packages; verify declared ABI floors and `libxi6`, direct shared libraries and dynamic loading of `libXi.so.6` **before** adding Xvfb; check ELF architecture/symbol floors, desktop entry/icon and license/theme; launch as an unprivileged user under X11/Xvfb for 12 seconds and require a visible window owned by that launch; stop the process and purge the package. |
 | Linux x64 AppImage | In a separate fresh Ubuntu 24.04 container with a minimal X11 desktop runtime, inspect the extracted metadata/resources/ELF, then launch the **AppImage itself** as an unprivileged user using its extract-and-run runtime (no FUSE mount); require a visible window owned by that launch and 12-second survival. Only then install accessibility test tools and relaunch the same package for the bounded keyboard/AT-SPI checks below. Remove the portable file. No DEB is installed in this container. |
 
@@ -156,20 +156,33 @@ The release executable resolves its profile through the shell known folders
 (`RoamingAppData\brk275\Morpheus` for configuration and the account store,
 `LocalAppData\brk275\Morpheus` for local data and cache), never through
 `APPDATA`-style environment variables, and its debug-only profile override is
-compiled out. The driver resolves the same known folders, refuses to start if
-either `brk275` organization folder, Morpheus root, or a reparse point at those
-paths already exists, seeds only `config\config.toml` with a 110% font scale,
-and removes exactly the directories it created. It never reads, redirects or
-deletes existing profile or vault material and never changes registry or shell
-settings. No account is used and no credential is entered.
+compiled out. Its first start creates the account store inside that profile, so
+the smoke establishes one synthetic profile **before** the plain launch: it
+resolves the same known folders with declared native signatures and bounded
+string reads, refuses to continue if either `brk275` organization folder,
+Morpheus root, or a reparse point at those paths already exists, creates both
+roots with a marker file carrying the run nonce, and seeds only
+`config\config.toml` with a 110% font scale. The plain launch and the keyboard
+relaunch share that profile; the driver only proves the markers and refuses
+anything else. The smoke removes the roots only after the plain launch stopped
+and the driver reported that its job is empty; otherwise the synthetic profile
+is retained on the disposable runner and the smoke fails. Nothing ever reads,
+redirects or deletes existing profile or vault material, and no registry or
+shell setting changes. No account is used and no credential is entered.
 
-The app starts inside a kernel job object (assigned before its first
-instruction, kill-on-close) so every descendant is accounted for. After one
-owned visible window appears, the bridge takes bounded raw-view snapshots of
-that window's UI Automation tree only (5000 nodes maximum). A snapshot in which
-any node could not be read or stopped belonging to the owned process is
-incomplete and is retried within the existing wait; a partial pass can still
-reject two matches as ambiguous but can never establish a label or focus. Then:
+The app and the PowerShell bridge run inside one kernel job object (each
+assigned before its first instruction, kill-on-close) so the bridge's
+compiler and every other descendant are accounted for, including after a
+failed start or handshake. After one owned visible window appears, the bridge
+takes bounded raw-view snapshots of that window's UI Automation tree only: the
+recorded-plus-queued element total is capped at 5000 before any sibling is
+enqueued, names are cut at 256 characters before they are kept, the driver
+reads reply lines through a 4 MiB bound before allocation and a bounded queue,
+and a capped or overlong result fails instead of standing for a tree. A
+snapshot in which any node could not be read or stopped belonging to the owned
+process is incomplete and is retried within the existing wait; a partial pass
+can still reject two matches as ambiguous but can never establish a label or
+focus. Then:
 
 - Checks that `Homeserver URL` and `Matrix ID or username` are edit controls
   and that `Password` is an edit control with the UI Automation password flag.
@@ -181,9 +194,13 @@ reject two matches as ambiguous but can never establish a label or focus. Then:
   reachability of Manage accounts through menu choices only, modal Tab order
   and Escape back to the trigger. Before every key the focused element must
   belong to the owned process and the bridge must observe the exact owned
-  window handle and process as the foreground window; one
+  window handle and process as the foreground window immediately before its
+  single native `SendInput` call, which inserts the complete chord (Shift,
+  key down, key up, Shift) serially so no other target can intervene. One
   `SetForegroundWindow` recovery is attempted and counted, otherwise the run
-  fails rather than typing toward another window.
+  fails rather than typing toward another window. A chord the system accepted
+  only partly fails the run; its held keys are released only toward the
+  still-owned window.
 - Opens Settings and reaches `Increase font scale` with bounded real Tab
   presses (160 maximum), checking the owned focused name after each one.
   Settings rows below the fold are clipped out of the accessibility tree until
@@ -192,8 +209,8 @@ reject two matches as ambiguous but can never establish a label or focus. Then:
   `120%`, and reads the saved TOML for `scale_percent = 120`.
 - Posts a normal `WM_CLOSE` to the owned window after reverifying its owner,
   requires exit status zero within 15 seconds and zero active processes in the
-  job, then releases the job and removes the synthetic profile. Forced job
-  termination on failure never counts as a normal close.
+  job, then releases the job. Forced job termination on failure never counts
+  as a normal close, and the profile is removed by the smoke, not the driver.
 
 The whole driver and bridge stream stays private; only the fixed JSON record
 with reviewed phase tokens, booleans and bounded counts (`selector_matches`,

@@ -434,19 +434,57 @@ def uninstall_registry():
     return entries
 
 
-def windows_keyboard_launch(executable):
-    """Second launch of the same installed executable for the bounded UIA/keyboard driver."""
+def windows_profile():
+    """The one synthetic release profile shared by both installed launches."""
+    if __package__:
+        from . import windows_package_ui
+    else:
+        import windows_package_ui
+    return windows_package_ui.PackageProfile.create()
+
+
+def windows_keyboard_launch(executable, nonce):
+    """Second launch of the same installed executable for the bounded UIA/keyboard driver.
+
+    Returns (passed, stopped): whether the whole check passed, and whether the
+    driver verified that its job, holding the app and the bridge, is empty.
+    """
     script = Path(__file__).with_name("windows_package_ui.py")
     # The driver's own stream stays private: PowerShell and UI Automation can
     # print diagnostics with element names or paths outside its JSON report.
     with tempfile.TemporaryFile() as log:
-        result = subprocess.run([sys.executable, str(script), str(executable)], stdin=subprocess.DEVNULL,
+        result = subprocess.run([sys.executable, str(script), str(executable), nonce], stdin=subprocess.DEVNULL,
                                 stdout=log, stderr=subprocess.STDOUT, timeout=360)
         log.seek(0)
         report = keyboard_report(log.read(65537), check="installed_windows_keyboard_uia",
                                  validate=validate_windows_keyboard_diagnostic)
     print(json.dumps(report, sort_keys=True), flush=True)
-    require(result.returncode == 0 and report["status"] == "passed", "Installed Windows keyboard acceptance failed")
+    return (result.returncode == 0 and report["status"] == "passed", report["diagnostic"]["cleanup"] == "passed")
+
+
+def windows_installed_launches(executable):
+    """One owned profile around the plain launch and the keyboard relaunch.
+
+    The release executable creates its account store inside the known-folder
+    profile on first start, so the smoke establishes that profile before any
+    launch and the driver only proves the markers. The profile is removed only
+    after both launches verifiably stopped; otherwise it is retained on the
+    disposable runner and the smoke fails.
+    """
+    profile = windows_profile()
+    stopped = False
+    try:
+        launch_smoke(executable, "win32")
+        # launch_smoke's stop_process raised unless the process stopped. The
+        # keyboard driver relaunches the identical installed executable.
+        passed, stopped = windows_keyboard_launch(executable, profile.nonce)
+        require(passed, "Installed Windows keyboard acceptance failed")
+    finally:
+        if stopped:
+            require(profile.remove(), "Synthetic Windows profile was not removed")
+            record("windows_profile_removed")
+        else:
+            print(json.dumps({"check": "windows_profile_retained", "status": "failed"}, sort_keys=True), flush=True)
 
 
 def windows_smoke(dist):
@@ -467,10 +505,7 @@ def windows_smoke(dist):
                     and Path(entries[0]["InstallLocation"].strip('"')).resolve() == installed.resolve(),
                     "Installed Add/Remove Programs registration does not match")
             record("nsis_install_and_registration")
-            launch_smoke(executable, "win32")
-            # The visible-window smoke proves the plain launch first; the
-            # keyboard driver relaunches the identical installed executable.
-            windows_keyboard_launch(executable)
+            windows_installed_launches(executable)
         finally:
             if uninstaller.exists():
                 # Running a copy with _?= makes the process waitable while the
@@ -531,10 +566,10 @@ KEYBOARD_OBSERVATIONS = frozenset({
 
 # Installed Windows UI Automation/keyboard driver: fixed tokens only.
 WINDOWS_KEYBOARD_FAILURES = frozenset({
-    "none", "guard", "install_state", "profile_exists", "window_count", "app_exited",
+    "none", "guard", "install_state", "profile_invalid", "window_count", "app_exited",
     "selector_ambiguous", "tree_bound", "wait_timeout", "password_semantics",
-    "focus_unowned", "foreground_unowned", "scale_unreachable",
-    "bridge_invalid", "bridge_timeout", "bridge_exited",
+    "focus_unowned", "foreground_unowned", "input_rejected", "scale_unreachable",
+    "bridge_invalid", "bridge_timeout", "bridge_exited", "bridge_overflow",
     "config_mismatch", "exit_status", "process_remaining", "deadline",
     "job_setup", "job_assignment", "process_start", "process_wait", "cleanup", "internal",
     "attribute_error", "type_error", "lookup_error", "value_error", "os_error",
@@ -546,7 +581,7 @@ WINDOWS_KEYBOARD_STEPS = frozenset({
     "normal_close", "cleanup", "complete",
 })
 WINDOWS_KEYBOARD_OPERATIONS = frozenset({
-    "none", "registry", "known_folder", "profile_seed", "job", "process_create", "process_id",
+    "none", "registry", "known_folder", "profile_open", "job", "process_create", "process_id",
     "window_enumeration", "bridge_start", "snapshot", "node_owner", "node_name", "node_role",
     "focus", "focused_element", "key_input", "process_status", "config_read", "close_request",
     "process_wait", "job_query", "cleanup",
@@ -565,7 +600,7 @@ WINDOWS_BRIDGE_ERRORS = frozenset({
 def validate_windows_keyboard_diagnostic(value, passed):
     counts = ("selector_matches", "incomplete_passes", "foreground_recoveries", "bounded_snapshots")
     expected = WINDOWS_KEYBOARD_OBSERVATIONS | set(counts) | {
-        "step", "operation", "failure", "password_semantics", "cleanup", "profile_removed",
+        "step", "operation", "failure", "password_semantics", "cleanup", "profile_owned",
         "traversed_node_matched", "bridge_error",
     }
     require(type(value) is dict and value.keys() == expected, "Invalid installed Windows keyboard diagnostic shape")
@@ -578,10 +613,10 @@ def validate_windows_keyboard_diagnostic(value, passed):
             and value["bridge_error"] in WINDOWS_BRIDGE_ERRORS | {"none"}
             and all(type(value[key]) is int and 0 <= value[key] <= 2 for key in counts)
             and all(type(value[key]) is bool for key in WINDOWS_KEYBOARD_OBSERVATIONS)
-            and type(value["traversed_node_matched"]) is bool and type(value["profile_removed"]) is bool,
+            and type(value["traversed_node_matched"]) is bool and type(value["profile_owned"]) is bool,
             "Invalid installed Windows keyboard diagnostic value")
     require(not passed or (value["step"] == "complete" and value["failure"] == "none"
-            and value["cleanup"] == "passed" and value["profile_removed"]
+            and value["cleanup"] == "passed" and value["profile_owned"]
             and value["password_semantics"] == "protected" and value["bridge_error"] == "none"
             and all(value[key] for key in WINDOWS_KEYBOARD_OBSERVATIONS)),
             "Incomplete installed Windows keyboard diagnostics")
