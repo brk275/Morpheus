@@ -244,8 +244,8 @@ component IconAction inherits Rectangle {
     in property <bool> enabled: true;
     in property <bool> quiet: false;
     in property <bool> context-hover: false;
-    // Scrollable settings opt in so keyboard focus reveals the whole button.
-    in property <bool> reveal-full-control: false;
+    // Match the visible button so keyboard reveal keeps a nonzero focus target.
+    in property <bool> reveal-full-control: true;
     property <bool> vector-icon: icon == "S" || icon == "C" || icon == "P" || icon == "⌂" || icon == "+" || icon == "↓" || icon == "F" || icon == "↩" || icon == "♥" || icon == "⌫" || icon == "✎" || icon == "☷";
     opacity: !quiet || context-hover || area.has-hover || keyboard-focus.has-focus ? 1 : 0;
     callback activated();
@@ -309,9 +309,8 @@ component ActionRect inherits Rectangle {
     in property <color> focus-color: #a88cff;
     in property <bool> trap-tab: false;
     in property <bool> cancel-on-escape: false;
-    // Scrollable controls opt in so Slint reveals their entire rectangle on Tab.
-    // Existing actions keep their original zero-sized focus target.
-    in property <bool> reveal-full-control: false;
+    // Zero-sized targets can round outside a scroll clip and lose focus on release.
+    in property <bool> reveal-full-control: true;
     out property <bool> has-hover: hit.has-hover;
     out property <bool> has-focus: keyboard-focus.has-focus;
     callback activated();
