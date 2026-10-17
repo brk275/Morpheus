@@ -329,6 +329,30 @@ class AccessibleUI:
         action = node.queryAction()
         smoke.require(action.nActions > 0 and action.doAction(0), "Installed accessible action failed")
 
+    def tab_to(self, label, limit=160):
+        """Reveal an offscreen action through the actual bounded Tab order.
+
+        AccessKit excludes clipped nodes from AT-SPI. Waiting for a distant
+        Settings label before focusing/scrolling its row cannot establish that
+        it is absent. No intervening control is activated; every key still
+        goes through the owned-window and foreground checks in key().
+        """
+        require_ui(type(limit) is int and 1 <= limit <= 160, "tree_bound")
+        for attempts in range(limit + 1):
+            previous = self.focused_name()
+            if previous == label:
+                # Preserve unique-selector proof, including the complete-pass
+                # guard, before the caller can activate this focused action.
+                self.wait(label)
+                return
+            if attempts == limit:
+                break
+            require_ui(previous is not None, "lookup_error")
+            self.key("Tab")
+            self.wait_for(lambda: (current := self.focused_name()) is not None
+                          and current != previous)
+        raise DiagnosticFailure("wait_timeout")
+
 
 def inspect_sign_in(ui, report, diagnostics):
     report["phase"] = "sign_in_semantics"
@@ -387,23 +411,36 @@ def menu_keyboard(ui):
     ui.expect_focus(trigger, prefix=True)
 
 
-def appearance_keyboard(ui, config):
+def appearance_keyboard(ui, config, diagnostics=None):
+    def checkpoint(step):
+        if diagnostics is not None:
+            diagnostics.step(step)
+
+    checkpoint("appearance")
     ui.focus("Open settings")
     ui.key("Return")
+    checkpoint("appearance_reach_scale")
+    ui.wait("Appearance")
+    ui.tab_to("Increase font scale")
+    checkpoint("appearance_initial_scale")
     ui.wait("110% · text throughout the app")
-    ui.focus("Increase font scale")
+    ui.expect_focus("Increase font scale")
     ui.key("space")
+    checkpoint("appearance_saved_scale")
     ui.wait("120% · text throughout the app")
     ui.wait_for(lambda: tomllib.loads(config.read_text())["appearance"]["scale_percent"] == 120)
     valid = config.read_bytes()
     try:
         # A real external TOML edit, picked up by the installed app's watcher.
         config.write_text("schema_version = 1\n[appearance]\nscale_percent = 9999\n")
+        checkpoint("appearance_invalid_notice")
         ui.wait("Settings file: ", prefix=True)
+        checkpoint("appearance_invalid_retained")
         ui.wait("120% · text throughout the app")
         smoke.require(config.read_text().endswith("scale_percent = 9999\n"), "Invalid edit was overwritten")
     finally:
         config.write_bytes(valid)
+    checkpoint("appearance_restored")
     ui.wait_for(lambda: ui.find("Settings file: ", prefix=True) is None)
     ui.wait("120% · text throughout the app")
 
@@ -471,7 +508,7 @@ def acceptance(executable, report, diagnostics=None):
             report["account_menu_keyboard"] = True
             report["phase"] = "appearance_config"
             diagnostics.step("appearance")
-            appearance_keyboard(ui, config)
+            appearance_keyboard(ui, config, diagnostics)
             report["appearance_config"] = True
             report["phase"] = "normal_window_close"
             diagnostics.step("normal_close")

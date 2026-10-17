@@ -91,8 +91,10 @@ phases also passed.
 Fresh native Linux captures passed visual review of Manage accounts at 100%
 and the password dialog at 100% and 200% text sizes. These complement the mock-vault
 regressions and real Slint keyboard/pointer harness; they do not establish
-VoiceOver, Narrator or Orca acceptance. Mac/Windows real-vault and installed-app
-checks remain open. Exact-intent logout and the generated-Slint sign-in keyboard
+VoiceOver, Narrator or Orca acceptance. Both Mac architectures passed isolated
+native-vault core checks at `3fe1285`; Windows passed them at `cad1abc`
+([run 39057684016](https://github.com/brk275/Morpheus/actions/runs/39057684016)).
+Installed-app and real Matrix sign-in checks on those platforms remain open. Exact-intent logout and the generated-Slint sign-in keyboard
 regressions passed on all four targets. Linux's separate system Wayland capture
 test failed, so aggregate CI remains failed. These results are not beta acceptance. See
 [verification](VERIFICATION.md).
@@ -115,8 +117,11 @@ OS output are not published or uploaded. This fixture performs no Matrix login
 or successful account activation; Linux's two-homeserver test and installed UI
 checks cover different requirements.
 
-The fixture and wrapper have source reviews and pure/mocked regression coverage;
-actual hosted native-vault results are still pending. Select `platform=all` for
+The fixture and wrapper have source reviews and pure/mocked regression coverage.
+Both Macs passed all five contracts, 13 preparation and 11 restart/removal checks
+at `3fe1285`; Windows passed the same checks at `cad1abc`. Every owned child and
+private profile was cleaned up. These synthetic core checks do not authenticate
+a real Matrix account or verify installed UI. Select `platform=all` for
 initial acceptance, or only the affected platform when diagnosing a failure.
 Check active runs and completed cache posts before dispatching. This workflow
 does not distribute a package or complete the beta gate.
