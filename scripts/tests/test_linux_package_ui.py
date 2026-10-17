@@ -5,7 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from scripts import ci_scope, linux_package_ui as ui, package_smoke as smoke
 
@@ -120,6 +120,17 @@ class PackageKeyboardMockTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 smoke.keyboard_report(raw)
 
+    def test_appearance_checkpoints_are_closed_failure_facts_not_success(self):
+        for step in ("appearance_reach_scale", "appearance_initial_scale", "appearance_saved_scale",
+                     "appearance_invalid_notice", "appearance_invalid_retained", "appearance_restored"):
+            value = report(status="failed", phase="appearance_config", appearance_config=False,
+                           normal_window_close=False, diagnostic=diagnostic(step=step, failure="wait_timeout"))
+            self.assertEqual(smoke.keyboard_report(json.dumps(value).encode()), value)
+            with self.assertRaises(RuntimeError):
+                smoke.keyboard_report(json.dumps(report(diagnostic=diagnostic(step=step))).encode())
+        with self.assertRaises(RuntimeError):
+            smoke.keyboard_report(json.dumps(report(diagnostic=diagnostic(step="private arbitrary label"))).encode())
+
     def test_profile_is_private_and_uses_release_xdg_paths(self):
         with tempfile.TemporaryDirectory() as folder, \
                 patch.dict(os.environ, {"MORPHEUS_QA_PROFILE_DIR": "/should/not/be/used"}):
@@ -229,10 +240,88 @@ class KeyboardFlowMockTests(unittest.TestCase):
             config.write_bytes(valid)
             driver = Mock()
             driver.wait_for.side_effect = lambda predicate, **_: predicate()
-            driver.wait.side_effect = [True, True, RuntimeError("error not accessible")]
+            driver.wait.side_effect = [True, True, True, RuntimeError("error not accessible")]
             with self.assertRaises(RuntimeError):
                 ui.appearance_keyboard(driver, config)
             self.assertEqual(config.read_bytes(), valid)
+
+    def navigation_driver(self, names):
+        class Navigation:
+            index = 0
+            keys = []
+            def focused_name(self):
+                return names[min(self.index, len(names) - 1)]
+            def key(self, key):
+                self.keys.append(key)
+                self.index += 1
+            def wait_for(self, predicate):
+                if not predicate():
+                    raise ui.DiagnosticFailure("wait_timeout")
+            def wait(self, label):
+                if self.focused_name() != label:
+                    raise RuntimeError("offscreen selector queried before focus")
+        return Navigation()
+
+    def test_tab_reveals_target_before_querying_offscreen_selector(self):
+        driver = self.navigation_driver(["Open settings", "Apply Nocturne appearance preset", "Increase font scale"])
+        ui.AccessibleUI.tab_to(driver, "Increase font scale", limit=2)
+        self.assertEqual(driver.keys, ["Tab", "Tab"])
+
+    def test_tab_budget_never_activates_an_unrelated_control(self):
+        driver = self.navigation_driver(["Open settings", "first", "second", "third"])
+        with self.assertRaises(ui.DiagnosticFailure):
+            ui.AccessibleUI.tab_to(driver, "Increase font scale", limit=2)
+        self.assertEqual(driver.keys, ["Tab", "Tab"])
+
+    def test_tab_target_still_requires_unambiguous_complete_selector(self):
+        driver = self.navigation_driver(["Increase font scale"])
+        driver.wait = Mock(side_effect=ui.DiagnosticFailure("selector_ambiguous"))
+        with self.assertRaises(ui.DiagnosticFailure):
+            ui.AccessibleUI.tab_to(driver, "Increase font scale")
+        self.assertEqual(driver.keys, [])
+
+    def test_tab_loss_of_window_ownership_stops_before_more_keys(self):
+        driver = self.navigation_driver(["Open settings", "Increase font scale"])
+        driver.key = Mock(side_effect=RuntimeError("owned window lost"))
+        with self.assertRaises(RuntimeError):
+            ui.AccessibleUI.tab_to(driver, "Increase font scale")
+        driver.key.assert_called_once_with("Tab")
+
+    def test_tab_never_sends_keys_without_an_observed_focused_control(self):
+        driver = self.navigation_driver([None])
+        with self.assertRaises(ui.DiagnosticFailure):
+            ui.AccessibleUI.tab_to(driver, "Increase font scale")
+        self.assertEqual(driver.keys, [])
+
+    def test_tab_rejects_unbounded_or_noninteger_budget(self):
+        for limit in (0, -1, 161, True, 2.0):
+            driver = self.navigation_driver(["Increase font scale"])
+            with self.assertRaises(ui.DiagnosticFailure):
+                ui.AccessibleUI.tab_to(driver, "Increase font scale", limit=limit)
+            self.assertEqual(driver.keys, [])
+
+    def test_appearance_reports_fixed_checkpoints_without_direct_offscreen_focus(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config = Path(folder) / "config.toml"
+            config.write_text("[appearance]\nscale_percent = 110\n")
+            driver = Mock()
+            def key(value):
+                if value == "space":
+                    config.write_text("[appearance]\nscale_percent = 120\n")
+            driver.key.side_effect = key
+            driver.wait_for.side_effect = lambda predicate, **_: predicate()
+            driver.find.return_value = None
+            diagnostics = Mock()
+            ui.appearance_keyboard(driver, config, diagnostics)
+            driver.focus.assert_called_once_with("Open settings")
+            driver.tab_to.assert_called_once_with("Increase font scale")
+            driver.expect_focus.assert_called_once_with("Increase font scale")
+            self.assertEqual(driver.key.call_args_list, [call("Return"), call("space")])
+            self.assertEqual([c.args[0] for c in diagnostics.step.call_args_list], [
+                "appearance", "appearance_reach_scale", "appearance_initial_scale", "appearance_saved_scale",
+                "appearance_invalid_notice", "appearance_invalid_retained", "appearance_restored",
+            ])
+            self.assertEqual(config.read_text(), "[appearance]\nscale_percent = 120\n")
 
 
 
