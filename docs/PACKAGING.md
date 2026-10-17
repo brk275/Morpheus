@@ -95,8 +95,9 @@ reports an unanswered `ChildCount` call as `-1` without an error, and pyatspi
 repeats that call for every index, where a `-1` would otherwise end the list
 early), that received no object for a child index, or that skipped a node for a
 transient IPC error is not evidence: the driver counts it and runs another pass
-within the existing wait, so only a complete traversal of the owned tree can
-match a label, report ambiguity or establish keyboard focus. Only libatspi's
+within the existing wait. A partial traversal can still reject two matches as
+ambiguous; only a complete traversal can establish a unique label or keyboard
+focus. Only libatspi's
 exact `-1` sentinel is treated this way; any other invalid length still fails
 the run.
 
