@@ -633,6 +633,14 @@ KEYBOARD_STEPS = frozenset({
     "preview", "account_menu", "appearance", "normal_close", "cleanup", "complete",
     "appearance_reach_scale", "appearance_initial_scale", "appearance_saved_scale",
     "appearance_invalid_notice", "appearance_invalid_retained", "appearance_restored",
+    "menu_trigger_focus", "menu_open_return", "menu_return_focus", "menu_return_visible",
+    "menu_escape", "menu_escape_hidden", "menu_escape_focus", "menu_open_space",
+    "menu_space_focus", "menu_tab_manage", "menu_manage_activate", "menu_manage_visible",
+    "menu_done_focus", "menu_add_tab", "menu_done_backtab", "menu_manage_escape", "menu_final_focus",
+})
+KEYBOARD_FOCUS_KINDS = frozenset({
+    "unavailable", "none", "account_trigger", "account_choice", "manage_choice",
+    "add_choice", "done", "add_account", "other", "ambiguous",
 })
 KEYBOARD_OPERATIONS = frozenset({
     "none", "desktop", "application_pid", "ownership", "node_cache", "node_children",
@@ -764,21 +772,27 @@ def validate_keyboard_diagnostic(value, passed):
     expected = KEYBOARD_OBSERVATIONS | {"step", "operation", "failure", "selector_matches",
                                         "password_role", "cleanup", "traversed_node_matched",
                                         "child_count_unavailable", "child_unavailable",
-                                        "incomplete_passes"}
+                                        "incomplete_passes", "focus_kind", "focused_nodes"}
     require(type(value) is dict and value.keys() == expected, "Invalid installed keyboard diagnostic shape")
     require(all(type(value[key]) is str for key in ("step", "operation", "failure", "password_role", "cleanup"))
             and value["step"] in KEYBOARD_STEPS and value["operation"] in KEYBOARD_OPERATIONS
             and value["failure"] in KEYBOARD_FAILURES
             and value["password_role"] in {"unchecked", "password_text", "entry", "text", "other"}
             and value["cleanup"] in {"not_started", "passed", "failed"}
+            and type(value["focus_kind"]) is str and value["focus_kind"] in KEYBOARD_FOCUS_KINDS
             and all(type(value[key]) is int and 0 <= value[key] <= 2
                     for key in ("selector_matches", "child_count_unavailable", "child_unavailable",
-                                "incomplete_passes"))
+                                "incomplete_passes", "focused_nodes"))
             and all(type(value[key]) is bool for key in KEYBOARD_OBSERVATIONS)
             and type(value["traversed_node_matched"]) is bool,
             "Invalid installed keyboard diagnostic value")
+    require((value["focus_kind"] in {"unavailable", "none"} and value["focused_nodes"] == 0)
+            or (value["focus_kind"] == "ambiguous" and value["focused_nodes"] == 2)
+            or (value["focus_kind"] not in {"unavailable", "none", "ambiguous"}
+                and value["focused_nodes"] == 1), "Inconsistent installed keyboard focus diagnostic")
     require(not passed or (value["step"] == "complete" and value["failure"] == "none"
             and value["cleanup"] == "passed" and value["password_role"] == "password_text"
+            and value["focus_kind"] not in {"unavailable", "ambiguous"}
             and all(value[key] for key in KEYBOARD_OBSERVATIONS)),
             "Incomplete installed keyboard diagnostics")
 

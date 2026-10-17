@@ -47,6 +47,7 @@ class Diagnostics:
             "selector_matches": 0, "password_role": "unchecked",
             "traversed_node_matched": False,
             "child_count_unavailable": 0, "child_unavailable": 0, "incomplete_passes": 0,
+            "focus_kind": "unavailable", "focused_nodes": 0,
             "cleanup": "not_started",
         }
 
@@ -280,6 +281,8 @@ class AccessibleUI:
         return self.wait_for(lambda: self.find(label, prefix=prefix))
 
     def focused_name(self):
+        self.diagnostics.value["focus_kind"] = "unavailable"
+        self.diagnostics.value["focused_nodes"] = 0
         found = []
         for node in self.nodes():
             try:
@@ -290,10 +293,15 @@ class AccessibleUI:
                 continue
         # Two focused nodes are ambiguous whatever else the pass missed; a pass
         # that skipped any node could hide a second one, so it is not evidence.
+        if len(found) > 1:
+            self.diagnostics.value["focus_kind"] = "ambiguous"
+            self.diagnostics.value["focused_nodes"] = 2
         smoke.require(len(found) <= 1, "Installed accessibility focus is ambiguous")
         if getattr(self, "pass_incomplete", False):
             self.diagnostics.count("incomplete_passes")
             raise IncompleteTraversal()
+        self.diagnostics.value["focused_nodes"] = len(found)
+        self.diagnostics.value["focus_kind"] = focus_kind(found[0] if found else None)
         return found[0] if found else None
 
     def expect_focus(self, name, *, prefix=False):
@@ -376,20 +384,46 @@ def inspect_sign_in(ui, report, diagnostics):
     report["sign_in_semantics"] = True
 
 
-def menu_keyboard(ui):
+def focus_kind(name):
+    """A fixed category only; never expose an account label or input value."""
+    if name is None:
+        return "none"
+    if name.startswith("Account menu for "):
+        return "account_trigger"
+    if name.startswith("Switch to "):
+        return "account_choice"
+    return {"Manage accounts": "manage_choice", "Add another Matrix account": "add_choice",
+            "Done": "done", "Add account": "add_account"}.get(name, "other")
+
+
+def menu_keyboard(ui, diagnostics=None):
+    def checkpoint(step):
+        if diagnostics is not None:
+            diagnostics.step(step)
+
     trigger = "Account menu for "
+    checkpoint("menu_trigger_focus")
     ui.focus(trigger, prefix=True)
+    checkpoint("menu_open_return")
     ui.key("Return")
+    checkpoint("menu_return_focus")
     ui.expect_focus("Switch to ", prefix=True)
+    checkpoint("menu_return_visible")
     ui.wait("Manage accounts")
+    checkpoint("menu_escape")
     ui.key("Escape")
+    checkpoint("menu_escape_hidden")
     ui.wait_for(lambda: ui.find("Manage accounts") is None)
+    checkpoint("menu_escape_focus")
     ui.expect_focus(trigger, prefix=True)
+    checkpoint("menu_open_space")
     ui.key("space")
+    checkpoint("menu_space_focus")
     ui.expect_focus("Switch to ", prefix=True)
     # All transitions to Manage accounts must stay among menu choices. Avoid
     # clicking/focusing that target directly, which would hide broken tab order.
     for _ in range(16):
+        checkpoint("menu_tab_manage")
         focused = ui.focused_name()
         if focused == "Manage accounts":
             break
@@ -399,15 +433,22 @@ def menu_keyboard(ui):
         ui.wait_for(lambda: ui.focused_name() != focused)
     else:
         raise RuntimeError("Account menu target was not keyboard reachable")
+    checkpoint("menu_manage_activate")
     ui.key("Return")
+    checkpoint("menu_manage_visible")
     ui.wait("Manage saved Matrix accounts")
+    checkpoint("menu_done_focus")
     ui.expect_focus("Done")
+    checkpoint("menu_add_tab")
     ui.key("Tab")
     ui.expect_focus("Add account")
+    checkpoint("menu_done_backtab")
     ui.key("shift+Tab")
     ui.expect_focus("Done")
+    checkpoint("menu_manage_escape")
     ui.key("Escape")
     ui.wait_for(lambda: ui.find("Manage saved Matrix accounts") is None)
+    checkpoint("menu_final_focus")
     ui.expect_focus(trigger, prefix=True)
 
 
@@ -504,7 +545,7 @@ def acceptance(executable, report, diagnostics=None):
             ui.action("Open interactive preview without signing in")
             report["phase"] = "account_menu_keyboard"
             diagnostics.step("account_menu")
-            menu_keyboard(ui)
+            menu_keyboard(ui, diagnostics)
             report["account_menu_keyboard"] = True
             report["phase"] = "appearance_config"
             diagnostics.step("appearance")
