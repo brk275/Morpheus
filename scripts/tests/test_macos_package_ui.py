@@ -843,7 +843,11 @@ class FakeChild:
         if self.held is not None:
             self.held.close()
             self.held = None
+        # A constructor timeout can leave the reader alive until held closes.
+        # Release every fake pipe end even when Bridge.close could not join it.
+        self.stdin.close()
         self.sink.close()
+        self.stdout.close()
 
 
 class BridgeProtocolTests(unittest.TestCase):
