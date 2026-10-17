@@ -848,22 +848,22 @@ export component AppWindow inherits Window {
     // Message text and surface precedence: selection first, then the sender
     // palette for names, then own-message roles from real is-own metadata,
     // then the plain roles, then the legacy ink/muted/transparent colors.
-    pure function clock-ink(selected: bool) -> color {
+    public pure function clock-ink(selected: bool) -> color {
         return selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color
             : StyleTokens.roles.timestamp.present ? StyleTokens.roles.timestamp.color : root.muted;
     }
-    pure function sender-ink(selected: bool, own: bool, palette-index: int, accent: color) -> color {
+    public pure function sender-ink(selected: bool, own: bool, palette-index: int, accent: color) -> color {
         return selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color
             : root.color-message-senders ? (root.sender-palette.length > 0 ? root.sender-palette[mod(palette-index, max(1, root.sender-palette.length))] : accent)
             : own && StyleTokens.roles.own-message.present ? StyleTokens.roles.own-message.color
             : StyleTokens.roles.sender.present ? StyleTokens.roles.sender.color : root.ink;
     }
-    pure function body-ink(selected: bool, own: bool) -> color {
+    public pure function body-ink(selected: bool, own: bool) -> color {
         return selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color
             : own && StyleTokens.roles.own-message.present ? StyleTokens.roles.own-message.color
             : StyleTokens.roles.message.present ? StyleTokens.roles.message.color : root.ink;
     }
-    pure function row-surface(selected: bool, hovered: bool, own: bool, idle: color) -> color {
+    public pure function row-surface(selected: bool, hovered: bool, own: bool, idle: color) -> color {
         return selected ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover)
             : hovered ? root.elevated
             : own && StyleTokens.roles.own-surface.present ? StyleTokens.roles.own-surface.color : idle;
@@ -1283,6 +1283,11 @@ export component AppWindow inherits Window {
     in-out property <string> composer-saved-draft;
     in-out property <string> thread-root-id;
     in-out property <string> thread-root-sender;
+    // Presentation metadata of the opened root message. Ownership comes from
+    // the event's is-own flag, never from the display name.
+    in-out property <bool> thread-root-is-own: false;
+    in-out property <int> thread-root-palette-index: 0;
+    in-out property <color> thread-root-accent: transparent;
     in-out property <string> thread-root-body;
     in-out property <styled-text> thread-root-rich-body;
     in-out property <string> thread-root-rich-accessible-body;
@@ -2194,11 +2199,19 @@ export component AppWindow inherits Window {
                                         padding-right: message-row.tight-header ? 0px : message-row.action-width + 8px;
                                         spacing: 8px;
                                         if message-row.tight-header : Text {
-                                            text: message.sender + (message-row.show-time && message-row.time-label != "" ? " · " + message-row.time-label : "");
+                                            text: message.sender;
                                             color: root.sender-ink(message-row.selected-message, message.is-own, message.sender-palette-index, message.accent);
                                             font-family: root.message-font-family; font-size: root.message-font-px;
                                             font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 650; overflow: elide; vertical-alignment: top;
-                                            accessible-label: message.sender + (message-row.show-time && message-row.time-label != "" ? ", " + message-row.time-label : "");
+                                            horizontal-stretch: 0; min-width: 0px;
+                                            accessible-label: message.sender;
+                                        }
+                                        // The compact clock keeps the timestamp role and the pending or
+                                        // failed delivery status beside the name on narrow rows.
+                                        if message-row.tight-header && message-row.show-time && message-row.time-label != "" : Text {
+                                            text: "· " + message-row.time-label; color: root.clock-ink(message-row.selected-message);
+                                            font-family: root.monospace-font-family; font-size: 10px * root.text-scale; vertical-alignment: top;
+                                            horizontal-stretch: 0; accessible-label: message-row.time-label;
                                         }
                                         if !message-row.tight-header : Text {
                                             text: message.sender; color: root.sender-ink(message-row.selected-message, message.is-own, message.sender-palette-index, message.accent);
@@ -2215,7 +2228,7 @@ export component AppWindow inherits Window {
                                         }
                                         // Keep author and time adjacent; the spare width follows
                                         // them. Elided names may shrink before the reserved actions.
-                                        if !message-row.tight-header : Rectangle {
+                                        Rectangle {
                                             horizontal-stretch: 1; min-width: 0px;
                                         }
                                     }
@@ -2329,6 +2342,9 @@ export component AppWindow inherits Window {
                                     activated => {
                                         root.thread-root-id = message.event-id;
                                         root.thread-root-sender = message.sender;
+                                        root.thread-root-is-own = message.is-own;
+                                        root.thread-root-palette-index = message.sender-palette-index;
+                                        root.thread-root-accent = message.accent;
                                         root.thread-root-body = message.body;
                                         root.thread-root-rich-body = message.rich-body;
                                         root.thread-root-rich-accessible-body = message.rich-accessible-body;
@@ -3966,6 +3982,9 @@ export component AppWindow inherits Window {
                             ink: root.muted; surface: root.panel; hover-surface: root.hover;
                             activated => {
                                 root.thread-root-id = "";
+                                root.thread-root-is-own = false;
+                                root.thread-root-palette-index = 0;
+                                root.thread-root-accent = transparent;
                                 root.thread-messages = [];
                                 root.thread-composer-text = "";
                                 root.thread-send-pending = false;
@@ -3989,15 +4008,24 @@ export component AppWindow inherits Window {
                             spacing: 10px;
                             alignment: start;
                             vertical-stretch: 0;
-                            Text { text: root.thread-root-sender; color: StyleTokens.roles.sender.present ? StyleTokens.roles.sender.color : root.ink; font-size: 12px * root.text-scale; font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 750; vertical-stretch: 0; }
-                            StyledText {
-                                text: root.thread-root-rich-body;
-                                default-color: StyleTokens.roles.message.present ? StyleTokens.roles.message.color : root.ink;
-                                default-font-size: 12px * root.text-scale;
-                                link-color: StyleTokens.roles.link.present ? StyleTokens.roles.link.color : root.accent;
-                                accessible-role: text;
-                                accessible-label: root.thread-root-rich-accessible-body;
-                                link-clicked(url) => { root.open-message-link(url); }
+                            Rectangle {
+                                vertical-stretch: 0;
+                                background: root.row-surface(false, false, root.thread-root-is-own, transparent);
+                                border-radius: StyleTokens.radius * 0.8;
+                                VerticalLayout {
+                                    padding: root.thread-root-is-own && StyleTokens.roles.own-surface.present ? min(8px, root.content-inset) : 0px;
+                                    spacing: 10px;
+                                    Text { text: root.thread-root-sender; color: root.sender-ink(false, root.thread-root-is-own, root.thread-root-palette-index, root.thread-root-accent); font-size: 12px * root.text-scale; font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 750; vertical-stretch: 0; }
+                                    StyledText {
+                                        text: root.thread-root-rich-body;
+                                        default-color: root.body-ink(false, root.thread-root-is-own);
+                                        default-font-size: 12px * root.text-scale;
+                                        link-color: StyleTokens.roles.link.present ? StyleTokens.roles.link.color : root.accent;
+                                        accessible-role: text;
+                                        accessible-label: root.thread-root-rich-accessible-body;
+                                        link-clicked(url) => { root.open-message-link(url); }
+                                    }
+                                }
                             }
                             Rectangle { height: 1px; background: root.divider; }
                             Text { text: "REPLIES · " + root.thread-messages.length; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; vertical-stretch: 0; }
@@ -4009,7 +4037,17 @@ export component AppWindow inherits Window {
                                 border-radius: StyleTokens.radius * 0.8;
                                 VerticalLayout {
                                     padding: min(12px, root.content-inset); spacing: max(2px, root.message-row-gap);
-                                    Text { text: reply.sender + ((root.show-message-timestamps || reply.time == "Sending…" || reply.time == "Failed to send") && thread-reply.time-label != "" ? " · " + thread-reply.time-label : ""); color: root.sender-ink(false, reply.is-own, reply.sender-palette-index, reply.accent); font-size: 11px * root.text-scale; font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 700; wrap: word-wrap; }
+                                    HorizontalLayout {
+                                        spacing: 6px;
+                                        Text { text: reply.sender; color: root.sender-ink(false, reply.is-own, reply.sender-palette-index, reply.accent); font-size: 11px * root.text-scale; font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 700; wrap: word-wrap; horizontal-stretch: 0; min-width: 0px; accessible-label: reply.sender; }
+                                        // Reply clocks keep the timestamp role and the delivery status
+                                        // text even when optional timestamps are hidden.
+                                        if (root.show-message-timestamps || reply.time == "Sending…" || reply.time == "Failed to send") && thread-reply.time-label != "" : Text {
+                                            text: "· " + thread-reply.time-label; color: root.clock-ink(false); font-family: root.monospace-font-family;
+                                            font-size: 10px * root.text-scale; vertical-alignment: top; horizontal-stretch: 0; accessible-label: thread-reply.time-label;
+                                        }
+                                        Rectangle { horizontal-stretch: 1; min-width: 0px; }
+                                    }
                                     StyledText {
                                         text: reply.rich-body;
                                         default-color: root.body-ink(false, reply.is-own);

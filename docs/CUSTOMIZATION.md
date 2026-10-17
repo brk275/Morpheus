@@ -318,11 +318,11 @@ also include `[roles]` and `[senders]`. These belong in the theme TOML beside
 | `destructive` | Destructive-action backgrounds and logout text |
 | `destructive_ink` | Their text |
 | `voice` | Voice-room icons and labels |
-| `timestamp` | Timeline and thread clock text; omitted keeps the muted color |
+| `timestamp` | Clock and delivery-status text in every timeline header, including the compact narrow header, and in thread replies; omitted keeps the muted color |
 | `sender` | Sender names while colored sender names are off; omitted keeps ink |
 | `message` | Message body text; omitted keeps ink |
-| `own_message` | Name and body text of your own messages in the timeline and thread replies; omitted falls back to `sender`, `message`, then ink. Thread-root headings carry no ownership data and use `sender` and `message` |
-| `own_surface` | Row background of your own messages when the row is neither selected nor hovered; omitted keeps rows transparent |
+| `own_message` | Name and body text of your own messages in the timeline, the thread root and thread replies; omitted falls back to `sender`, `message`, then ink |
+| `own_surface` | Background of your own messages (timeline rows, the thread root and thread replies) when the row is neither selected nor hovered; omitted keeps the previous row background |
 
 For example, keep the `[colors]` table from the dark Nocturne theme and set
 these optional sections in that theme file:
@@ -362,7 +362,7 @@ sender names** is on (`chat.color_senders = true`). It takes precedence over the
 `sender` and `own_message` roles for name text. Selection colors take precedence
 over every message role on a selected row, and hover keeps its surface over
 `own_surface`. Own-message styling follows the account that sent the event, not
-a display name. Loading a theme replaces the whole role set, so a role the new
+a display name; an opened thread carries that ownership from the root message. Loading a theme replaces the whole role set, so a role the new
 file omits falls back to ink, muted or a transparent row as if it were never
 set. This palette changes name text,
 in timeline messages and thread replies, independently of avatar backgrounds,

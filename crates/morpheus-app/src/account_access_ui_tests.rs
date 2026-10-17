@@ -546,6 +546,326 @@ async fn assert_nickname_controls_keyboard(ui: &AppWindow) {
     settle(ui).await;
 }
 
+// Colors of every native text item currently showing `text`, read from the
+// generated item tree so the assertions trace the real color bindings rather
+// than a helper called with assumed inputs. Items inside `for` and `if` are
+// instantiated by settle(); a missing text yields an empty list.
+fn text_colors_of(ui: &AppWindow, text: &str) -> Vec<Color> {
+    use slint::private_unstable_api::re_exports::{ComplexText, ItemRc, SimpleText, WindowInner};
+    use std::ops::ControlFlow;
+
+    let window = WindowInner::from_pub(ui.window());
+    let root = ItemRc::new_root(window.component());
+    let mut colors = Vec::new();
+    root.visit_descendants(|item| {
+        if let Some(simple) = item.downcast::<SimpleText>() {
+            let simple = simple.as_pin_ref();
+            if simple.text().as_str() == text {
+                colors.push(simple.color().color());
+            }
+        } else if let Some(complex) = item.downcast::<ComplexText>() {
+            let complex = complex.as_pin_ref();
+            if complex.text().as_str() == text {
+                colors.push(complex.color().color());
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    colors
+}
+
+fn assert_text_color(ui: &AppWindow, text: &str, expected: Color, minimum_items: usize) {
+    let colors = text_colors_of(ui, text);
+    assert!(
+        colors.len() >= minimum_items,
+        "expected at least {minimum_items} text item(s) showing {text:?}, found {}",
+        colors.len()
+    );
+    for color in colors {
+        assert_eq!(color, expected, "color of {text:?}");
+    }
+}
+
+fn role_message(
+    event_id: &str,
+    own: bool,
+    sender: &str,
+    palette: i32,
+    time: &str,
+    accent: Color,
+) -> MessageItem {
+    MessageItem {
+        event_id: event_id.into(),
+        is_own: own,
+        sender: sender.into(),
+        sender_palette_index: palette,
+        time: time.into(),
+        body: format!("{sender} body").into(),
+        rich_body: StyledText::from_plain_text(&format!("{sender} body")),
+        rich_accessible_body: format!("{sender} body").into(),
+        accent,
+        ..Default::default()
+    }
+}
+
+/// The message roles reach the real timeline, compact header, thread root and
+/// thread reply bindings with the documented precedence, omitted roles fall
+/// back to the legacy colors, and the opened thread root carries the actual
+/// message ownership, palette index and accent until the thread is closed.
+async fn assert_message_role_precedence_and_thread_metadata(ui: &AppWindow) {
+    use morpheus_config::ThemeRoles;
+
+    let own_accent = Color::from_rgb_u8(0x11, 0x22, 0x33);
+    let other_accent = Color::from_rgb_u8(0x44, 0x55, 0x66);
+    let full = BuiltInStylePreset::Nocturne.theme().unwrap();
+    let role = |value: &Option<String>| color_from_hex(value.as_deref().unwrap());
+    let timestamp = role(&full.roles.timestamp);
+    let sender = role(&full.roles.sender);
+    let own_message = role(&full.roles.own_message);
+    let own_surface = role(&full.roles.own_surface);
+    let selection = role(&full.roles.selection);
+    let selection_ink = role(&full.roles.selection_ink);
+    let ink = color_from_hex(&full.colors.ink);
+    let muted = color_from_hex(&full.colors.muted);
+    let elevated = color_from_hex(&full.colors.elevated);
+    let hover = color_from_hex(&full.colors.hover);
+    let transparent = Color::default();
+
+    let mut config = Config::default();
+    config.apply_style_preset(BuiltInStylePreset::Nocturne);
+    assert!(!config.chat.color_senders);
+    ui.set_page(0);
+    ui.set_room_search_selected_event_id("$selected".into());
+    ui.set_messages(ModelRc::new(VecModel::from(vec![
+        role_message("$own", true, "Own Author", 1, "10:15 AM", own_accent),
+        role_message("$other", false, "Other Author", 2, "Sending…", other_accent),
+        role_message(
+            "$selected",
+            false,
+            "Selected Author",
+            3,
+            "10:17 AM",
+            other_accent,
+        ),
+    ])));
+    apply_config(ui, &config, Some(&full));
+    settle(ui).await;
+
+    // Plain roles: own messages use own_message, others the sender role, the
+    // selected row its selection ink, and clocks (including delivery status)
+    // the timestamp role.
+    assert_text_color(ui, "Own Author", own_message, 1);
+    assert_text_color(ui, "Other Author", sender, 1);
+    assert_text_color(ui, "Selected Author", selection_ink, 1);
+    assert_text_color(ui, "10:15 AM", timestamp, 1);
+    assert_text_color(ui, "Sending…", timestamp, 1);
+    assert_eq!(ui.invoke_body_ink(false, true), own_message);
+    assert_eq!(ui.invoke_body_ink(false, false), role(&full.roles.message));
+    assert_eq!(ui.invoke_body_ink(true, true), selection_ink);
+    assert_eq!(
+        ui.invoke_row_surface(false, false, true, transparent),
+        own_surface
+    );
+    assert_eq!(
+        ui.invoke_row_surface(false, true, true, transparent),
+        elevated
+    );
+    assert_eq!(
+        ui.invoke_row_surface(true, false, true, transparent),
+        selection
+    );
+    assert_eq!(
+        ui.invoke_row_surface(false, false, false, transparent),
+        transparent
+    );
+    assert_eq!(
+        ui.invoke_row_surface(false, false, false, elevated),
+        elevated
+    );
+
+    // The colored sender palette wins over own_message and sender, but never
+    // over the selection ink; clocks are unaffected.
+    config.chat.color_senders = true;
+    apply_config(ui, &config, Some(&full));
+    settle(ui).await;
+    let palette = ui.get_sender_palette();
+    let palette_len = palette.row_count();
+    assert!(palette_len > 0);
+    assert_text_color(
+        ui,
+        "Own Author",
+        palette.row_data(1 % palette_len).unwrap(),
+        1,
+    );
+    assert_text_color(
+        ui,
+        "Other Author",
+        palette.row_data(2 % palette_len).unwrap(),
+        1,
+    );
+    assert_text_color(ui, "Selected Author", selection_ink, 1);
+    assert_text_color(ui, "10:15 AM", timestamp, 1);
+    assert_eq!(ui.invoke_body_ink(false, true), own_message);
+
+    // Without a palette the colored-name setting falls back to the message
+    // accent, still ahead of own_message and sender.
+    let mut without_palette = full.clone();
+    without_palette.senders.colors = None;
+    apply_config(ui, &config, Some(&without_palette));
+    settle(ui).await;
+    assert_eq!(ui.get_sender_palette().row_count(), 0);
+    assert_text_color(ui, "Own Author", own_accent, 1);
+    assert_text_color(ui, "Other Author", other_accent, 1);
+    assert_text_color(ui, "Selected Author", selection_ink, 1);
+
+    // Replacing the theme with one that omits every role clears them: text
+    // returns to ink and muted, own rows to transparent, selection to hover.
+    let mut bare = full.clone();
+    bare.roles = ThemeRoles::default();
+    config.chat.color_senders = false;
+    apply_config(ui, &config, Some(&bare));
+    settle(ui).await;
+    assert_text_color(ui, "Own Author", ink, 1);
+    assert_text_color(ui, "Other Author", ink, 1);
+    assert_text_color(ui, "Selected Author", ink, 1);
+    assert_text_color(ui, "10:15 AM", muted, 1);
+    assert_text_color(ui, "Sending…", muted, 1);
+    assert_eq!(ui.invoke_body_ink(false, true), ink);
+    assert_eq!(ui.invoke_body_ink(true, false), ink);
+    assert_eq!(
+        ui.invoke_row_surface(false, false, true, transparent),
+        transparent
+    );
+    assert_eq!(ui.invoke_row_surface(true, false, true, transparent), hover);
+
+    // Opening a thread from the real timeline action forwards the root
+    // message's ownership, palette index and accent; the thread root heading
+    // and replies then follow the same precedence as the timeline.
+    apply_config(ui, &config, Some(&full));
+    ui.set_thread_messages(ModelRc::new(VecModel::from(vec![
+        role_message(
+            "$reply-other",
+            false,
+            "Reply Author",
+            2,
+            "Failed to send",
+            other_accent,
+        ),
+        role_message(
+            "$reply-own",
+            true,
+            "Own Reply Author",
+            1,
+            "9:00 AM",
+            own_accent,
+        ),
+    ])));
+    settle(ui).await;
+    assert!(!ui.get_thread_root_is_own());
+    tab_to_control(ui, "Open thread for Own Author");
+    key(ui, Key::Return);
+    settle(ui).await;
+    assert_eq!(ui.get_thread_root_id().as_str(), "$own");
+    assert_eq!(ui.get_thread_root_sender().as_str(), "Own Author");
+    assert!(ui.get_thread_root_is_own());
+    assert_eq!(ui.get_thread_root_palette_index(), 1);
+    assert_eq!(ui.get_thread_root_accent(), own_accent);
+    assert_eq!(ui.get_side_panel_tab(), 1);
+    assert!(ui.get_show_side_panel());
+    // Timeline row and thread-root heading both show the own author's name.
+    assert_text_color(ui, "Own Author", own_message, 2);
+    assert_text_color(ui, "Reply Author", sender, 1);
+    assert_text_color(ui, "Own Reply Author", own_message, 1);
+    assert_text_color(ui, "· Failed to send", timestamp, 1);
+    assert_text_color(ui, "· 9:00 AM", timestamp, 1);
+    assert_eq!(
+        ui.invoke_row_surface(false, false, ui.get_thread_root_is_own(), transparent),
+        own_surface
+    );
+    assert_eq!(
+        ui.invoke_body_ink(false, ui.get_thread_root_is_own()),
+        own_message
+    );
+    assert_eq!(
+        ui.invoke_row_surface(false, false, true, elevated),
+        own_surface
+    );
+    assert_eq!(
+        ui.invoke_row_surface(false, false, false, elevated),
+        elevated
+    );
+
+    // Hidden optional timestamps keep the failed-delivery clock in replies.
+    config.chat.show_timestamps = false;
+    apply_config(ui, &config, Some(&full));
+    settle(ui).await;
+    assert!(text_colors_of(ui, "· 9:00 AM").is_empty());
+    assert_text_color(ui, "· Failed to send", timestamp, 1);
+    config.chat.show_timestamps = true;
+
+    // The palette applies to the forwarded thread root as well.
+    config.chat.color_senders = true;
+    apply_config(ui, &config, Some(&full));
+    settle(ui).await;
+    assert_text_color(
+        ui,
+        "Own Author",
+        palette.row_data(1 % palette_len).unwrap(),
+        2,
+    );
+    assert_text_color(
+        ui,
+        "Own Reply Author",
+        palette.row_data(1 % palette_len).unwrap(),
+        1,
+    );
+    config.chat.color_senders = false;
+
+    // Opening another author's thread replaces the metadata with that message.
+    tab_to_control(ui, "Open thread for Other Author");
+    key(ui, Key::Space);
+    settle(ui).await;
+    assert_eq!(ui.get_thread_root_id().as_str(), "$other");
+    assert!(!ui.get_thread_root_is_own());
+    assert_eq!(ui.get_thread_root_palette_index(), 2);
+    assert_eq!(ui.get_thread_root_accent(), other_accent);
+
+    // Closing the thread resets the forwarded metadata.
+    ui.set_thread_root_is_own(true);
+    tab_to_control(ui, "Close thread");
+    key(ui, Key::Return);
+    settle(ui).await;
+    assert!(ui.get_thread_root_id().is_empty());
+    assert!(!ui.get_thread_root_is_own());
+    assert_eq!(ui.get_thread_root_palette_index(), 0);
+    assert_eq!(ui.get_thread_root_accent(), transparent);
+
+    // Narrow rows at 200% use the compact header: the name keeps its role and
+    // the clock, including delivery status, is a separate timestamp-role text.
+    ui.window().set_size(slint::PhysicalSize::new(400, 760));
+    apply_config(ui, &config, Some(&full));
+    ui.set_font_scale_percent(200);
+    settle(ui).await;
+    assert_text_color(ui, "Own Author", own_message, 1);
+    assert_text_color(ui, "· 10:15 AM", timestamp, 1);
+    assert_text_color(ui, "· Sending…", timestamp, 1);
+    assert_text_color(ui, "Selected Author", selection_ink, 1);
+    assert_text_color(ui, "· 10:17 AM", selection_ink, 1);
+    assert!(text_colors_of(ui, "10:15 AM").is_empty());
+    apply_config(ui, &config, Some(&bare));
+    settle(ui).await;
+    assert_text_color(ui, "· 10:15 AM", muted, 1);
+    assert_text_color(ui, "Own Author", ink, 1);
+
+    // Restore the window for the remaining account scenarios.
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    ui.set_messages(ModelRc::new(VecModel::<MessageItem>::default()));
+    ui.set_thread_messages(ModelRc::new(VecModel::<MessageItem>::default()));
+    ui.set_room_search_selected_event_id("".into());
+    apply_config(ui, &Config::default(), None);
+    settle(ui).await;
+}
+
 fn assert_removed_account_menu_projection(ui: &AppWindow) {
     let account = |id: &str, name: &str| morpheus_matrix::AccountInfo {
         id: id.into(),
@@ -621,6 +941,7 @@ async fn exercise_account_ui(runtime: Handle) {
     settle(&ui).await;
     assert_navigation_projection_and_focus(&ui).await;
     assert_palette_and_density_keyboard(&ui).await;
+    assert_message_role_precedence_and_thread_metadata(&ui).await;
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),
     )));
@@ -945,6 +1266,9 @@ async fn exercise_account_ui(runtime: Handle) {
         ..Default::default()
     }])));
     ui.set_thread_root_body("private thread root".into());
+    ui.set_thread_root_is_own(true);
+    ui.set_thread_root_palette_index(3);
+    ui.set_thread_root_accent(Color::from_rgb_u8(0x09, 0x09, 0x09));
     ui.set_thread_composer_text("private reply draft".into());
     ui.set_room_search_query("private search".into());
     ui.set_room_search_results(ModelRc::new(VecModel::from(vec![
@@ -973,6 +1297,9 @@ async fn exercise_account_ui(runtime: Handle) {
     assert_eq!(ui.get_members().row_count(), 0);
     assert!(ui.get_composer_text().is_empty());
     assert!(ui.get_thread_root_body().is_empty());
+    assert!(!ui.get_thread_root_is_own());
+    assert_eq!(ui.get_thread_root_palette_index(), 0);
+    assert_eq!(ui.get_thread_root_accent(), Color::default());
     assert!(ui.get_thread_composer_text().is_empty());
     assert!(ui.get_room_search_query().is_empty());
     assert_eq!(ui.get_room_search_results().row_count(), 0);

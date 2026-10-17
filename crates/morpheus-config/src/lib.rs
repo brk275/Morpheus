@@ -2413,6 +2413,7 @@ mod tests {
                     theme.colors.elevated.as_str(),
                     theme.colors.hover.as_str(),
                     roles.selection.as_deref().unwrap(),
+                    roles.own_surface.as_deref().unwrap(),
                 ] {
                     assert_contrast(&theme.name, foreground, background, 4.5);
                 }
