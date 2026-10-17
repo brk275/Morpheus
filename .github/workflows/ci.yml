@@ -5,16 +5,8 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # Manual dispatch defaults to the complete supported native matrix.
-  # The narrow mode checks desktop tests and their Linux live integration;
-  # separate model/device/vendor checks can retain unchanged passing evidence.
+  # Manual dispatch always checks the complete supported native matrix.
   workflow_dispatch:
-    inputs:
-      desktop_tests_only:
-        description: Desktop tests on four targets plus Linux Matrix/RTC integration; not full native or release acceptance
-        type: boolean
-        required: true
-        default: false
 
 permissions:
   contents: read
@@ -24,7 +16,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  MORPHEUS_DESKTOP_TESTS_ONLY: ${{ github.event_name == 'workflow_dispatch' && inputs.desktop_tests_only == true }}
   CARGO_BUILD_JOBS: "2"
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
@@ -81,13 +72,7 @@ jobs:
         working-directory: candidate
         # Isolated mode excludes the candidate working directory and Python
         # environment hooks from import lookup. The classifier uses stdlib only.
-        shell: bash
-        run: |
-          if [ "$MORPHEUS_DESKTOP_TESTS_ONLY" = "true" ]; then
-            python3 -I ../trusted/scripts/ci_scope.py --github-event --desktop-tests-only
-          else
-            python3 -I ../trusted/scripts/ci_scope.py --github-event
-          fi
+        run: python3 -I ../trusted/scripts/ci_scope.py --github-event
 
   helpers:
     name: Validation helper tests
@@ -130,7 +115,7 @@ jobs:
       - run: cargo test --locked -p morpheus-config
 
   compile:
-    name: ${{ github.event_name == 'workflow_dispatch' && inputs.desktop_tests_only == true && 'Desktop regressions' || 'Check and test' }} (${{ matrix.os }})
+    name: Check and test (${{ matrix.os }})
     needs: [scope, helpers]
     if: github.event.repository.private == false && needs.scope.outputs.native == 'true'
     runs-on: ${{ matrix.os }}
@@ -178,30 +163,10 @@ jobs:
           # The save guard still makes untrusted/PR executions restore-only.
           cache-on-failure: true
           save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
-      - name: Report validation mode
-        shell: bash
-        run: |
-          python3 - <<'PY_MODE'
-          import json
-          import os
-          import sys
-
-          def validation_mode(raw):
-              if raw not in ("true", "false"):
-                  return None
-              return {"check": "ci_validation_mode", "desktop_tests_only": raw == "true",
-                      "release_acceptance": False}
-
-          mode = validation_mode(os.environ.get("MORPHEUS_DESKTOP_TESTS_ONLY"))
-          if mode is None:
-              raise SystemExit("Validation mode is missing or malformed.")
-          print(json.dumps(mode, sort_keys=True))
-          PY_MODE
       - name: Check formatting
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
       - name: Test configuration, Matrix, and RTC protocol models
-        if: env.MORPHEUS_DESKTOP_TESTS_ONLY != 'true'
         id: model-tests
         # Still fail the job below, but collect independent desktop/device
         # results on this candidate instead of paying the compilation cost
@@ -209,14 +174,12 @@ jobs:
         continue-on-error: true
         run: cargo test --locked --no-fail-fast -p morpheus-config -p morpheus-matrix -p morpheus-rtc
       - name: Check desktop and Matrix crates
-        if: env.MORPHEUS_DESKTOP_TESTS_ONLY != 'true'
         run: cargo check --locked -p morpheus-app -p morpheus-matrix
       - name: Build desktop with native call and device adapters
-        if: env.MORPHEUS_DESKTOP_TESTS_ONLY != 'true'
         run: cargo build --locked -p morpheus-app --features native-calls
       - name: Capture actual native preview screens
         id: preview-capture
-        if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && (github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push')) && env.MORPHEUS_DESKTOP_TESTS_ONLY != 'true'
+        if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && (github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push'))
         continue-on-error: true
         timeout-minutes: 2
         env:
@@ -246,7 +209,7 @@ jobs:
             --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
       - name: Upload native preview PNGs and provenance only
         id: preview-upload
-        if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && (github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push')) && steps.preview-capture.outcome == 'success' && env.MORPHEUS_DESKTOP_TESTS_ONLY != 'true'
+        if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && (github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push')) && steps.preview-capture.outcome == 'success'
         continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -270,7 +233,7 @@ jobs:
           compression-level: 0
           include-hidden-files: false
       - name: Smoke test Linux desktop startup under Xvfb
-        if: runner.os == 'Linux' && env.MORPHEUS_DESKTOP_TESTS_ONLY != 'true'
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set +e
@@ -288,11 +251,10 @@ jobs:
         continue-on-error: true
         run: cargo test --locked -p morpheus-app --features native-calls --bin morpheus-app
       - name: Test native device and call guards
-        if: env.MORPHEUS_DESKTOP_TESTS_ONLY != 'true'
         run: cargo test --locked -p morpheus-rtc --features native-devices --lib
       - name: Test Windows capture of an owned synthetic window and display
         id: windows-capture-tests
-        if: runner.os == 'Windows' && env.MORPHEUS_DESKTOP_TESTS_ONLY != 'true'
+        if: runner.os == 'Windows'
         continue-on-error: true
         timeout-minutes: 15
         env:
@@ -302,14 +264,13 @@ jobs:
         id: wayland-tests
         # Missing/malformed selection is fail-closed; the result gate below
         # rejects it even if the fixture happens to pass.
-        if: runner.os == 'Linux' && needs.scope.outputs.wayland != 'false' && env.MORPHEUS_DESKTOP_TESTS_ONLY != 'true'
+        if: runner.os == 'Linux' && needs.scope.outputs.wayland != 'false'
         # Collect independent Matrix/OAuth/RTC evidence even if this desktop
         # fixture fails. The final outcome gate still rejects the candidate.
         continue-on-error: true
         timeout-minutes: 15
         run: python3 scripts/run_wayland_acceptance.py
       - name: Test vendored security fixes
-        if: env.MORPHEUS_DESKTOP_TESTS_ONLY != 'true'
         id: vendor-tests
         # Keep independent SDK and live checks on the already-built app.
         # The final gate still rejects any failed vendor regression command.
@@ -322,7 +283,6 @@ jobs:
           cargo test --locked -p matrix-rtc-core --features testing --lib --test key_rotation
           cargo test --locked -p cargo-packager-updater --lib
       - name: Test pinned SDK sticky receipt and redaction regressions
-        if: env.MORPHEUS_DESKTOP_TESTS_ONLY != 'true'
         id: sdk-receipt-tests
         # Keep collecting the independently built app's live acceptance. The
         # final outcome gate still rejects failed SDK unit regressions.
@@ -330,9 +290,6 @@ jobs:
         shell: bash
         run: cargo test --locked -p matrix-sdk-base --no-default-features --features e2e-encryption,unstable-msc4354 --lib sticky
       - name: Test real Matrix accounts, recovery, moderation, and encrypted RTC
-        # The outgoing-call fixture uses the app test crate too. A repair to
-        # that crate must exercise these ignored integration tests, even when
-        # separate native model/device/vendor checks are outside this run.
         if: runner.os == 'Linux'
         # Four fresh invitation cases each have a bounded 300-second command.
         # Preserve room for the existing checks and their service cleanup.

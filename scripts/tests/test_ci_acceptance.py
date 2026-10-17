@@ -161,8 +161,8 @@ class WaylandWorkflowTests(unittest.TestCase):
         route = "runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && (github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push'))"
         capture = source.split("      - name: Capture actual native preview screens\n", 1)[1].split("      - name:", 1)[0]
         upload = source.split("      - name: Upload native preview PNGs and provenance only\n", 1)[1].split("      - name:", 1)[0]
-        self.assertIn("if: " + route + " && env.MORPHEUS_DESKTOP_TESTS_ONLY != 'true'\n", capture)
-        self.assertIn("if: " + route + " && steps.preview-capture.outcome == 'success' && env.MORPHEUS_DESKTOP_TESTS_ONLY != 'true'\n", upload)
+        self.assertIn("if: " + route + "\n", capture)
+        self.assertIn("if: " + route + " && steps.preview-capture.outcome == 'success'\n", upload)
         self.assertIn("--morpheus-capture-preview", capture)
         self.assertIn('>"$preview_root/native.log" 2>&1', capture)
         allowed = [line.strip().rsplit("/", 1)[-1] for line in upload.splitlines() if "${{ runner.temp }}" in line]
