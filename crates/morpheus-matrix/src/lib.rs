@@ -25,6 +25,11 @@ mod formatting;
 pub use formatting::TextFormat;
 mod compose;
 pub use compose::{ComposeError, ComposeText, MentionSpan, MentionTarget, RestoredCompose};
+mod draft_recovery;
+pub use draft_recovery::{
+    DraftEnvelope, Generation, MAX_PENDING_RECORDS, MAX_THREAD_INDEX, PendingLimitError,
+    PendingRecord, RecoveryCodecError, valid_transaction_id,
+};
 mod account_access;
 mod account_selection;
 pub use account_access::{
@@ -85,7 +90,7 @@ use matrix_sdk::{
         serde::Raw,
     },
     search_index::SearchIndexStoreKind,
-    send_queue::RoomSendQueueUpdate,
+    send_queue::{LocalEchoContent, RoomSendQueueUpdate},
 };
 use matrix_sdk_ui::sync_service::{Error as ServiceError, State as ServiceState, SyncService};
 use matrix_sdk_ui::timeline::{
@@ -150,6 +155,12 @@ pub enum MatrixCoreError {
         "The message may already be queued. Keep the draft and check the send queue before retrying."
     )]
     ComposedSendUncertain,
+    #[error(transparent)]
+    PendingLimit(#[from] PendingLimitError),
+    #[error("This message's saved send record was not found. Check the conversation before sending again.")]
+    PendingSendUnknown,
+    #[error("This message is no longer waiting to send. Check the conversation.")]
+    PendingSendUnavailable,
     #[error("room not found: {0}")]
     RoomNotFound(String),
     #[error("invalid room ID: {0}")]
@@ -424,6 +435,29 @@ pub struct QueuedMessage {
     finished: bool,
 }
 
+/// One pending send record found in a draft row at account selection.
+///
+/// `queued` is present only when the SDK still holds a request with exactly
+/// this record's transaction id; it observes that request. A record without
+/// one is unconfirmed: the SDK may have sent it before the previous process
+/// could record the acknowledgement, or the process stopped between the SDK
+/// store write and the record update. Nothing is adopted or resent from it.
+pub struct RecoveredSend {
+    pub nonce: Generation,
+    pub transaction_id: Option<String>,
+    pub queued: Option<QueuedMessage>,
+}
+
+/// A draft scope whose row carried recovery metadata at account selection.
+pub struct RecoveredDraft {
+    pub room_id: String,
+    pub thread_root: Option<String>,
+    pub restored: RestoredCompose,
+    pub sends: Vec<RecoveredSend>,
+}
+
+type PendingScope = (String, Option<String>);
+
 impl QueuedMessage {
     pub fn transaction_id(&self) -> &str {
         &self.transaction_id
@@ -613,6 +647,13 @@ struct LoadedAccount {
     client: Client,
     timelines: Mutex<HashMap<String, Arc<Timeline>>>,
     composed_edits: Mutex<HashMap<(String, String), composed_adapter::PendingEdit>>,
+    /// Pending send records per draft scope, mirrored from the last encrypted
+    /// row written or read. Enqueue, cancel and retry are authorized against
+    /// this map, never against UI state.
+    pending_sends: Mutex<HashMap<PendingScope, Vec<PendingRecord>>>,
+    /// Draft scopes with recovery metadata discovered before this account's
+    /// send queue was enabled, taken once by the controller after selection.
+    recovered: Mutex<Vec<RecoveredDraft>>,
     incoming_verification_tx: watch::Sender<Vec<VerificationInfo>>,
     token_task: Mutex<Option<SyncTask>>,
     notification_handler_registered: Mutex<bool>,
@@ -911,7 +952,7 @@ impl AccountManager {
         state.loaded.insert(id, loaded.clone());
         state.active_account_id = Some(account.id.clone());
         self.publish_active_account(Some(account.clone()));
-        self.start_sync(&mut state, loaded.client.clone()).await;
+        self.start_sync(&mut state, &loaded).await;
         Ok(account)
     }
 
@@ -1007,7 +1048,7 @@ impl AccountManager {
         state.registry = next;
         state.active_account_id = Some(account.id.clone());
         self.publish_active_account(Some(account.clone()));
-        self.start_sync(state, loaded.client.clone()).await;
+        self.start_sync(state, &loaded).await;
         Ok(account)
     }
 
@@ -1390,6 +1431,9 @@ impl AccountManager {
         let state = self.state.lock().await;
         let loaded = selected_loaded_for(&state, expected_account_id)?;
         let room = account_room(&state, expected_account_id, room_id)?;
+        // One reply per thread may wait at a time; a saved record from an
+        // earlier session blocks this untracked path too.
+        require_pending_owner(loaded, room_id, Some(root_event_id), None).await?;
         let (_, updates) = room
             .send_queue()
             .subscribe()
@@ -1567,22 +1611,33 @@ impl AccountManager {
         room_id: &str,
         thread_root: Option<&str>,
     ) -> Result<RestoredCompose> {
-        let thread_root = thread_root.map(parse_event_id).transpose()?;
+        let parsed_root = thread_root.map(parse_event_id).transpose()?;
         let state = self.state.lock().await;
         let room = account_room(&state, account_id, room_id)?;
         let draft = room
-            .load_composer_draft(thread_root.as_deref())
+            .load_composer_draft(parsed_root.as_deref())
             .await
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
-        Ok(draft.map_or_else(
+        let restored = draft.map_or_else(
             || ComposeText::restore_draft(String::new(), None),
             |draft| ComposeText::restore_draft(draft.plain_text, draft.html_text.as_deref()),
-        ))
+        );
+        if let Some(loaded) = state.loaded.get(account_id) {
+            let scope = (room_id.to_owned(), thread_root.map(str::to_owned));
+            let mut registry = loaded.pending_sends.lock().await;
+            if restored.envelope.pending().is_empty() {
+                registry.remove(&scope);
+            } else {
+                registry.insert(scope, restored.envelope.pending().to_vec());
+            }
+        }
+        Ok(restored)
     }
 
-    /// Save or clear a room draft in that account's encrypted Matrix SQLite
-    /// store. Holding the account lock excludes logout while the write runs;
-    /// a delayed write cannot recreate data after an account is removed.
+    /// Save or clear a plain room draft, keeping whatever recovery metadata the
+    /// row already holds. This read-then-write pair is for callers without a
+    /// cached envelope; the controller's cache path writes text and metadata
+    /// from one snapshot through `save_composed_draft_for`.
     pub async fn save_composer_draft_for(
         &self,
         account_id: &str,
@@ -1600,38 +1655,148 @@ impl AccountManager {
         thread_root: Option<&str>,
         body: &str,
     ) -> Result<()> {
-        self.save_composed_draft_for(account_id, room_id, thread_root, &ComposeText::plain(body))
-            .await
+        let mut envelope = self
+            .load_composed_draft_for(account_id, room_id, thread_root)
+            .await?
+            .envelope;
+        // A plain save is a user edit: fresh generation, metadata retained.
+        envelope.set_generation(Generation::fresh());
+        self.save_composed_draft_for(
+            account_id,
+            room_id,
+            thread_root,
+            &ComposeText::plain(body),
+            &envelope,
+        )
+        .await
     }
 
+    /// Save text and recovery metadata as one encrypted row write, or delete
+    /// the row when neither text nor metadata remains. Holding the account
+    /// lock excludes logout while the write runs; a delayed write cannot
+    /// recreate data after an account is removed. The pending registry used to
+    /// authorize enqueue, cancel and retry mirrors the row just written.
     pub async fn save_composed_draft_for(
         &self,
         account_id: &str,
         room_id: &str,
         thread_root: Option<&str>,
         text: &ComposeText,
+        envelope: &DraftEnvelope,
     ) -> Result<()> {
-        let html = text.draft_html()?;
-        let thread_root = thread_root.map(parse_event_id).transpose()?;
+        let parsed_root = thread_root.map(parse_event_id).transpose()?;
         let state = self.state.lock().await;
         let room = account_room(&state, account_id, room_id)?;
-        if text.body.is_empty() {
-            room.clear_composer_draft(thread_root.as_deref())
+        let loaded = state
+            .loaded
+            .get(account_id)
+            .ok_or_else(|| MatrixCoreError::AccountNotFound(account_id.into()))?;
+        let scope = (room_id.to_owned(), thread_root.map(str::to_owned));
+        if text.body.is_empty() && envelope.is_empty() {
+            room.clear_composer_draft(parsed_root.as_deref())
                 .await
-                .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
+                .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
+            loaded.pending_sends.lock().await.remove(&scope);
+            return Ok(());
+        }
+        let html = text.encode_draft(envelope)?;
+        room.save_composer_draft(
+            ComposerDraft {
+                plain_text: text.body.clone(),
+                html_text: Some(html),
+                draft_type: ComposerDraftType::NewMessage,
+                attachments: Vec::new(),
+            },
+            parsed_root.as_deref(),
+        )
+        .await
+        .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
+        let mut registry = loaded.pending_sends.lock().await;
+        if envelope.pending().is_empty() {
+            registry.remove(&scope);
         } else {
-            room.save_composer_draft(
-                ComposerDraft {
-                    plain_text: text.body.clone(),
-                    html_text: Some(html),
-                    draft_type: ComposerDraftType::NewMessage,
-                    attachments: Vec::new(),
-                },
-                thread_root.as_deref(),
-            )
+            registry.insert(scope, envelope.pending().to_vec());
+        }
+        Ok(())
+    }
+
+    /// Draft scopes with recovery metadata found when this account was
+    /// selected, with exact observers for requests the SDK still holds. Each
+    /// discovery is handed out once; the selection must still be current.
+    pub async fn take_recovered_drafts(
+        &self,
+        selection: &AccountSelection,
+    ) -> Result<Vec<RecoveredDraft>> {
+        let state = self.state.lock().await;
+        let loaded = selected_loaded_for(&state, selection.account_id())?;
+        if !selection.is_current() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        Ok(std::mem::take(&mut *loaded.recovered.lock().await))
+    }
+
+    /// Abort one queued request this account owns. Ownership is the exact
+    /// saved record (nonce and transaction id) for the scope; a request the
+    /// SDK no longer holds is reported as unavailable, which is not evidence
+    /// of delivery. Aborting cannot recall a message the server already took.
+    pub async fn cancel_pending_send_for(
+        &self,
+        selection: &AccountSelection,
+        room_id: &str,
+        thread_root: Option<&str>,
+        nonce: &Generation,
+        transaction_id: &str,
+    ) -> Result<bool> {
+        let state = self.state.lock().await;
+        let loaded = selected_loaded_for(&state, selection.account_id())?;
+        if !selection.is_current() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        let room = account_room(&state, selection.account_id(), room_id)?;
+        require_pending_owner(loaded, room_id, thread_root, Some((nonce, Some(transaction_id))))
+            .await?;
+        let (echoes, _) = room
+            .send_queue()
+            .subscribe()
+            .await
+            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
+        let handle = echo_handle(&echoes, transaction_id).ok_or(MatrixCoreError::PendingSendUnavailable)?;
+        handle
+            .abort()
             .await
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
+    }
+
+    /// Resume one owned request after a paused or wedged send. No new request
+    /// is created, so this cannot duplicate a transaction.
+    pub async fn retry_pending_send_for(
+        &self,
+        selection: &AccountSelection,
+        room_id: &str,
+        thread_root: Option<&str>,
+        nonce: &Generation,
+        transaction_id: &str,
+    ) -> Result<()> {
+        let state = self.state.lock().await;
+        let loaded = selected_loaded_for(&state, selection.account_id())?;
+        if !selection.is_current() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
         }
+        let room = account_room(&state, selection.account_id(), room_id)?;
+        require_pending_owner(loaded, room_id, thread_root, Some((nonce, Some(transaction_id))))
+            .await?;
+        let (echoes, _) = room
+            .send_queue()
+            .subscribe()
+            .await
+            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
+        let handle = echo_handle(&echoes, transaction_id).ok_or(MatrixCoreError::PendingSendUnavailable)?;
+        handle
+            .unwedge()
+            .await
+            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
+        room.send_queue().set_enabled(true);
+        Ok(())
     }
 
     pub async fn send_reply(
@@ -2334,7 +2499,8 @@ impl AccountManager {
         state.loaded.clear();
     }
 
-    async fn start_sync(&self, state: &mut State, client: Client) {
+    async fn start_sync(&self, state: &mut State, loaded: &Arc<LoadedAccount>) {
+        let client = loaded.client.clone();
         // Send queues run independently of /sync. Resume only the selected
         // account, including persisted messages waiting from a prior session.
         // Subscribe before resuming so a fast persisted send cannot lose its
@@ -2343,6 +2509,11 @@ impl AccountManager {
         let queue = client.send_queue();
         let errors = queue.subscribe_errors();
         let updates = queue.subscribe();
+        // Discover saved pending-send records and attach exact observers while
+        // the queue is still disabled, so no acknowledgement can be emitted
+        // before an observer exists. The controller takes the result after
+        // selection; an absent SDK request is reported as unknown, never as sent.
+        recover_pending_sends(loaded).await;
         queue.set_enabled(true).await;
         state.queue_recovery_task = Some(tokio::spawn(recover_room_queues(
             client.clone(),
@@ -2513,6 +2684,8 @@ impl LoadedAccount {
             client,
             timelines: Mutex::new(HashMap::new()),
             composed_edits: Mutex::new(HashMap::new()),
+            pending_sends: Mutex::new(HashMap::new()),
+            recovered: Mutex::new(Vec::new()),
             incoming_verification_tx,
             notification_handler_registered: Mutex::new(false),
             token_task: Mutex::new(Some(SyncTask {
@@ -2666,6 +2839,162 @@ fn account_room(state: &State, account_id: &str, room_id: &str) -> Result<Room> 
 
 fn parse_event_id(raw: &str) -> Result<matrix_sdk::ruma::OwnedEventId> {
     EventId::parse(raw).map_err(|e| MatrixCoreError::InvalidEventId(e.to_string()))
+}
+
+/// Authorize a send-queue action against the saved pending records of a scope.
+///
+/// With `owner` absent, the scope must hold no record at all for a thread
+/// (one waiting reply per thread) and anything for a room. With an owner, the
+/// record must exist with that nonce; an enqueue (`None` transaction) needs
+/// the record still enqueuing and, for a thread, alone in its scope; a
+/// cancel or retry needs the exact queued transaction id.
+async fn require_pending_owner(
+    loaded: &LoadedAccount,
+    room_id: &str,
+    thread_root: Option<&str>,
+    owner: Option<(&Generation, Option<&str>)>,
+) -> Result<()> {
+    let registry = loaded.pending_sends.lock().await;
+    let records = registry
+        .get(&(room_id.to_owned(), thread_root.map(str::to_owned)))
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    let Some((nonce, transaction_id)) = owner else {
+        if thread_root.is_some() && !records.is_empty() {
+            return Err(PendingLimitError::ThreadBusy.into());
+        }
+        return Ok(());
+    };
+    let record = records
+        .iter()
+        .find(|record| record.nonce() == nonce)
+        .ok_or(MatrixCoreError::PendingSendUnknown)?;
+    match transaction_id {
+        None => {
+            if record.is_queued() {
+                return Err(MatrixCoreError::PendingSendUnknown);
+            }
+            if thread_root.is_some() && records.len() != 1 {
+                return Err(PendingLimitError::ThreadBusy.into());
+            }
+            if records.len() > MAX_PENDING_RECORDS {
+                return Err(PendingLimitError::TooManyPending.into());
+            }
+        }
+        Some(transaction_id) => {
+            if record.transaction_id() != Some(transaction_id) {
+                return Err(MatrixCoreError::PendingSendUnknown);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn echo_handle(
+    echoes: &[matrix_sdk::send_queue::LocalEcho],
+    transaction_id: &str,
+) -> Option<matrix_sdk::send_queue::SendHandle> {
+    echoes.iter().find_map(|echo| match &echo.content {
+        LocalEchoContent::Event { send_handle, .. }
+            if echo.transaction_id.as_str() == transaction_id =>
+        {
+            Some(send_handle.clone())
+        }
+        _ => None,
+    })
+}
+
+/// Rooms scanned for saved recovery metadata at account selection.
+const MAX_RECOVERY_ROOMS: usize = 4096;
+
+/// Read every known room's draft row, follow each room's thread index, and
+/// attach an observer to each saved queued transaction the SDK still holds.
+/// Runs while the account's send queue is disabled. Text is never changed,
+/// nothing is resent, and a record without an exact SDK request stays unknown.
+async fn recover_pending_sends(loaded: &Arc<LoadedAccount>) {
+    let mut recovered = Vec::new();
+    let mut registry: HashMap<PendingScope, Vec<PendingRecord>> = HashMap::new();
+    for room in loaded.client.rooms().into_iter().take(MAX_RECOVERY_ROOMS) {
+        if matches!(room.state(), RoomState::Left | RoomState::Banned) {
+            continue;
+        }
+        let room_draft = match room.load_composer_draft(None).await {
+            Ok(Some(draft)) => draft,
+            Ok(None) => continue,
+            Err(error) => {
+                warn!(error = %error, "could not read a room draft during send recovery");
+                continue;
+            }
+        };
+        let room_restored =
+            ComposeText::restore_draft(room_draft.plain_text, room_draft.html_text.as_deref());
+        if room_restored.envelope.is_empty() && !room_restored.metadata_unreadable {
+            continue;
+        }
+        let room_id = room.room_id().to_string();
+        let mut scopes = Vec::with_capacity(1 + room_restored.envelope.threads().len());
+        for root in room_restored.envelope.threads() {
+            let Ok(root_id) = EventId::parse(root) else { continue };
+            match room.load_composer_draft(Some(&root_id)).await {
+                Ok(Some(draft)) => scopes.push((
+                    Some(root.clone()),
+                    ComposeText::restore_draft(draft.plain_text, draft.html_text.as_deref()),
+                )),
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(error = %error, "could not read a thread draft during send recovery");
+                }
+            }
+        }
+        scopes.push((None, room_restored));
+        let mut subscription = None;
+        for (thread_root, restored) in scopes {
+            let mut sends = Vec::new();
+            for record in restored.envelope.pending() {
+                let queued = match record.transaction_id() {
+                    Some(transaction_id) => {
+                        if subscription.is_none() {
+                            subscription = match room.send_queue().subscribe().await {
+                                Ok(value) => Some(value),
+                                Err(error) => {
+                                    warn!(error = %error, "could not read a room send queue during send recovery");
+                                    None
+                                }
+                            };
+                        }
+                        subscription.as_ref().and_then(|(echoes, updates)| {
+                            echo_handle(echoes, transaction_id).map(|handle| QueuedMessage {
+                                transaction_id: transaction_id.to_owned(),
+                                handle,
+                                updates: updates.resubscribe(),
+                                finished: false,
+                            })
+                        })
+                    }
+                    None => None,
+                };
+                sends.push(RecoveredSend {
+                    nonce: record.nonce().clone(),
+                    transaction_id: record.transaction_id().map(str::to_owned),
+                    queued,
+                });
+            }
+            if !restored.envelope.pending().is_empty() {
+                registry.insert(
+                    (room_id.clone(), thread_root.clone()),
+                    restored.envelope.pending().to_vec(),
+                );
+            }
+            recovered.push(RecoveredDraft {
+                room_id: room_id.clone(),
+                thread_root,
+                restored,
+                sends,
+            });
+        }
+    }
+    *loaded.pending_sends.lock().await = registry;
+    *loaded.recovered.lock().await = recovered;
 }
 
 fn parse_user_id(raw: &str) -> Result<matrix_sdk::ruma::OwnedUserId> {
@@ -4083,6 +4412,9 @@ mod composed_adapter {
         /// from redirecting the send; the revocable token also rejects A→B→A.
         /// Once SDK enqueue has begun it is not an atomic server compare-and-set:
         /// an external edit arriving afterwards cannot be recalled.
+        /// Untracked composed send: no saved recovery record owns it. Room sends
+        /// stay allowed for callers without drafts; a thread send is refused
+        /// while a saved reply record exists for that thread.
         pub async fn send_composed_tracked_for(
             &self,
             selection: &AccountSelection,
@@ -4090,6 +4422,24 @@ mod composed_adapter {
             target: ComposeSendTarget,
             text: &ComposeText,
             baseline: Option<&EditBaseline>,
+        ) -> Result<QueuedMessage> {
+            self.send_composed_owned_for(selection, room_id, target, text, baseline, None)
+                .await
+        }
+
+        /// Composed send authorized by a saved pending record. The record must
+        /// already be persisted as enqueuing (text, generation and index
+        /// written before this call); the SDK assigns the transaction id, and
+        /// the caller records it afterwards. A crash between the two leaves an
+        /// unconfirmed record, never a duplicate.
+        pub async fn send_composed_owned_for(
+            &self,
+            selection: &AccountSelection,
+            room_id: &str,
+            target: ComposeSendTarget,
+            text: &ComposeText,
+            baseline: Option<&EditBaseline>,
+            owner: Option<&Generation>,
         ) -> Result<QueuedMessage> {
             let text = text.trimmed_for_send()?;
             if text.body.is_empty() {
@@ -4177,6 +4527,8 @@ mod composed_adapter {
                         let content = formatting::compose_room(&text, room.own_user_id())?;
                         bounded_event(&AnyMessageLikeEventContent::RoomMessage(content.clone()))?;
                         context(selection, &room)?;
+                        require_pending_owner(loaded, room_id, None, owner.map(|nonce| (nonce, None)))
+                            .await?;
                         enqueue_entered.store(true, std::sync::atomic::Ordering::Release);
                         queue
                             .send(content.into())
@@ -4218,6 +4570,13 @@ mod composed_adapter {
                         validate_mentions(selection, &room, &text).await?;
                         let content = formatting::compose_room(&text, room.own_user_id())?;
                         bounded_event(&AnyMessageLikeEventContent::RoomMessage(content.clone()))?;
+                        require_pending_owner(
+                            loaded,
+                            room_id,
+                            Some(root.as_str()),
+                            owner.map(|nonce| (nonce, None)),
+                        )
+                        .await?;
                         // SDK adds the correct current-thread fallback and applies
                         // its own reply-author policy; do not forge relations.
                         enqueue_entered.store(true, std::sync::atomic::Ordering::Release);

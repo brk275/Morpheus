@@ -1039,6 +1039,12 @@ export component AppWindow inherits Window {
     callback open-thread(string, string, string);
     callback close-thread();
     callback thread-composer-edited(string);
+    // Second argument: threaded composer. Review: true marks the unconfirmed
+    // message as sent, false keeps the text; nothing is ever resent.
+    callback cancel-pending-send(bool);
+    callback retry-pending-send(bool);
+    callback review-unconfirmed-send(bool, bool);
+    callback restore-retained-text(bool);
     callback toggle-message-reaction(string, string);
     callback add-account();
     callback manage-accounts();
@@ -1256,6 +1262,17 @@ export component AppWindow inherits Window {
     in-out property <string> thread-root-rich-accessible-body;
     in-out property <string> thread-composer-text;
     in-out property <bool> thread-send-pending: false;
+    // Queued-send status for the visible room and thread composers: counts,
+    // paused/unconfirmed flags and whether unsent text can be restored.
+    in-out property <int> composer-pending-count: 0;
+    in-out property <bool> composer-pending-blocked: false;
+    in-out property <bool> composer-unconfirmed: false;
+    in-out property <bool> composer-retained-available: false;
+    in-out property <bool> thread-pending-blocked: false;
+    in-out property <bool> thread-unconfirmed: false;
+    in-out property <bool> thread-retained-available: false;
+    property <bool> composer-status-visible: root.composer-unconfirmed || root.composer-pending-count > 0 || (root.composer-retained-available && root.composer-text == "");
+    property <bool> thread-status-visible: root.thread-unconfirmed || root.thread-send-pending || (root.thread-retained-available && root.thread-composer-text == "");
     in-out property <string> login-homeserver: "https://matrix.org";
     property <string> login-username;
     property <string> login-password;
@@ -2327,10 +2344,52 @@ export component AppWindow inherits Window {
                         }
                     }
                     Rectangle {
-                        height: (root.composer-mode == 0 ? max(78px, 1.5 * root.message-font-px + 48px) : max(109px, 1.5 * root.message-font-px + 79px)) + (root.attachment-busy ? 29px : 0px);
+                        height: (root.composer-mode == 0 ? max(78px, 1.5 * root.message-font-px + 48px) : max(109px, 1.5 * root.message-font-px + 79px)) + (root.attachment-busy ? 29px : 0px) + (root.composer-status-visible ? 33px : 0px);
                         background: root.canvas;
+                        if root.composer-status-visible : HorizontalLayout {
+                            x: 22px; y: (root.composer-mode == 0 ? 2px : 33px) + (root.attachment-busy ? 29px : 0px);
+                            width: parent.width - 44px; height: 32px; spacing: 8px;
+                            Text {
+                                text: root.composer-unconfirmed ? "A message may not have finished sending before Morpheus closed. Check the conversation, then choose."
+                                    : root.composer-pending-blocked ? "Sending is paused. Retry or cancel."
+                                    : root.composer-pending-count == 1 ? "1 message is waiting to send."
+                                    : root.composer-pending-count > 1 ? root.composer-pending-count + " messages are waiting to send."
+                                    : "Unsent text is available.";
+                                color: root.muted;
+                                font-size: 11px * root.text-scale;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                                accessible-live-region: polite;
+                            }
+                            if root.composer-unconfirmed : TextAction {
+                                text: "It was sent"; ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                                outline: root.divider; text-scale: root.text-scale; reveal-full-control: true;
+                                activated => { root.review-unconfirmed-send(false, true); }
+                            }
+                            if root.composer-unconfirmed : TextAction {
+                                text: "Not sent, keep my text"; ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                                outline: root.divider; text-scale: root.text-scale; reveal-full-control: true;
+                                activated => { root.review-unconfirmed-send(false, false); }
+                            }
+                            if !root.composer-unconfirmed && root.composer-pending-blocked : TextAction {
+                                text: "Retry"; ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                                outline: root.divider; text-scale: root.text-scale; reveal-full-control: true;
+                                activated => { root.retry-pending-send(false); }
+                            }
+                            if !root.composer-unconfirmed && root.composer-pending-count > 0 : TextAction {
+                                text: "Cancel sending"; ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                                outline: root.divider; text-scale: root.text-scale; reveal-full-control: true;
+                                activated => { root.cancel-pending-send(false); }
+                            }
+                            if !root.composer-unconfirmed && root.composer-retained-available && root.composer-text == "" : TextAction {
+                                text: "Restore text"; ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                                outline: root.divider; text-scale: root.text-scale; reveal-full-control: true;
+                                activated => { root.restore-retained-text(false); }
+                            }
+                        }
                         if root.attachment-busy : HorizontalLayout {
-                            x: 22px; y: root.composer-mode == 0 ? 2px : 33px;
+                            x: 22px; y: (root.composer-mode == 0 ? 2px : 33px) + (root.composer-status-visible ? 33px : 0px);
                             width: parent.width - 44px; height: 28px; spacing: 8px;
                             Text {
                                 text: root.attachment-status;
@@ -2368,7 +2427,7 @@ export component AppWindow inherits Window {
                         }
                         Rectangle {
                             x: root.content-inset;
-                            y: (root.composer-mode == 0 ? 7px : 38px) + (root.attachment-busy ? 29px : 0px);
+                            y: (root.composer-mode == 0 ? 7px : 38px) + (root.attachment-busy ? 29px : 0px) + (root.composer-status-visible ? 33px : 0px);
                             width: max(0px, parent.width - 2 * root.content-inset);
                             height: max(58px, 1.5 * root.message-font-px + 28px);
                             border-radius: StyleTokens.radius * 1.1;
@@ -3976,9 +4035,45 @@ export component AppWindow inherits Window {
                         }
                     }
                     if root.thread-root-id != "" : Rectangle {
-                        height: max(64px, 1.5 * root.message-font-px + 24px); background: root.panel;
+                        height: max(64px, 1.5 * root.message-font-px + 24px) + (root.thread-status-visible ? 33px : 0px); background: root.panel;
+                        if root.thread-status-visible : HorizontalLayout {
+                            x: 10px; y: 4px; width: parent.width - 20px; height: 32px; spacing: 6px;
+                            Text {
+                                text: root.thread-unconfirmed ? "A reply may not have finished sending before Morpheus closed. Check the thread, then choose."
+                                    : root.thread-pending-blocked ? "Sending is paused. Retry or cancel."
+                                    : root.thread-send-pending ? "A reply is waiting to send."
+                                    : "Unsent text is available.";
+                                color: root.muted; font-size: 11px * root.text-scale; vertical-alignment: center;
+                                horizontal-stretch: 1; overflow: elide; accessible-live-region: polite;
+                            }
+                            if root.thread-unconfirmed : TextAction {
+                                text: "It was sent"; ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                                outline: root.divider; text-scale: root.text-scale; reveal-full-control: true;
+                                activated => { root.review-unconfirmed-send(true, true); }
+                            }
+                            if root.thread-unconfirmed : TextAction {
+                                text: "Not sent, keep my text"; ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                                outline: root.divider; text-scale: root.text-scale; reveal-full-control: true;
+                                activated => { root.review-unconfirmed-send(true, false); }
+                            }
+                            if !root.thread-unconfirmed && root.thread-pending-blocked : TextAction {
+                                text: "Retry"; ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                                outline: root.divider; text-scale: root.text-scale; reveal-full-control: true;
+                                activated => { root.retry-pending-send(true); }
+                            }
+                            if !root.thread-unconfirmed && root.thread-send-pending : TextAction {
+                                text: "Cancel sending"; ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                                outline: root.divider; text-scale: root.text-scale; reveal-full-control: true;
+                                activated => { root.cancel-pending-send(true); }
+                            }
+                            if !root.thread-unconfirmed && root.thread-retained-available && root.thread-composer-text == "" : TextAction {
+                                text: "Restore text"; ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                                outline: root.divider; text-scale: root.text-scale; reveal-full-control: true;
+                                activated => { root.restore-retained-text(true); }
+                            }
+                        }
                         HorizontalLayout {
-                            padding-left: 10px; padding-right: 10px; padding-top: 8px; padding-bottom: 8px; spacing: 5px;
+                            padding-left: 10px; padding-right: 10px; padding-top: 8px + (root.thread-status-visible ? 33px : 0px); padding-bottom: 8px; spacing: 5px;
                             Rectangle {
                                 horizontal-stretch: 1; background: root.elevated; border-radius: 8px;
                                 thread-input := MentionInput {

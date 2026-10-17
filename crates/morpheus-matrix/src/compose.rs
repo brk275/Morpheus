@@ -9,10 +9,14 @@ use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use ruma::html::{Html, NodeData, NodeRef};
 
 use crate::TextFormat;
+use crate::draft_recovery::{DraftEnvelope, MAX_ENVELOPE_HEX_BYTES};
 
 pub const MAX_COMPOSE_BYTES: usize = 64 * 1024;
 pub const MAX_MENTION_SPANS: usize = 32;
-const MAX_DRAFT_HTML_BYTES: usize = MAX_COMPOSE_BYTES * 8 + MAX_MENTION_SPANS * 4096;
+const MAX_DRAFT_HTML_BYTES: usize =
+    MAX_COMPOSE_BYTES * 8 + MAX_MENTION_SPANS * 4096 + MAX_ENVELOPE_HEX_BYTES + 64;
+const DRAFT_VERSION_PLAIN: &str = "1";
+const DRAFT_VERSION_RECOVERY: &str = "2";
 
 #[derive(Clone, Eq, PartialEq)]
 pub enum MentionTarget {
@@ -107,11 +111,20 @@ pub enum ComposeError {
     TooLarge,
     #[error("The selected mention is no longer valid. Select it again.")]
     InvalidMention,
+    #[error("The saved send status for this draft could not be encoded.")]
+    InvalidRecovery,
 }
 
 pub struct RestoredCompose {
     pub text: ComposeText,
     pub discarded_rich_intent: bool,
+    /// Recovery metadata saved with the text, or a fresh envelope for legacy
+    /// rows and rows whose metadata could not be read.
+    pub envelope: DraftEnvelope,
+    /// The row carried recovery metadata this build could not interpret. The
+    /// text is still restored; the metadata is carried in `envelope` when it
+    /// fits, and no pending send is inferred from it.
+    pub metadata_unreadable: bool,
 }
 
 impl ComposeText {
@@ -394,13 +407,37 @@ impl ComposeText {
         Ok(mentions)
     }
 
+    /// Legacy canonical draft encoding without recovery metadata. Kept so
+    /// rows written by earlier builds stay decodable and testable; new rows
+    /// are written with `encode_draft`. Never used for outbound events.
     pub fn draft_html(&self) -> Result<String, ComposeError> {
+        self.render_draft(DRAFT_VERSION_PLAIN, None)
+    }
+
+    /// Canonical draft encoding carrying the recovery envelope in one
+    /// attribute, so text and metadata share a single encrypted row write.
+    pub fn encode_draft(&self, envelope: &DraftEnvelope) -> Result<String, ComposeError> {
+        let meta = envelope
+            .encode()
+            .map_err(|_| ComposeError::InvalidRecovery)?;
+        self.render_draft(DRAFT_VERSION_RECOVERY, Some(&meta))
+    }
+
+    fn render_draft(&self, version: &str, meta: Option<&str>) -> Result<String, ComposeError> {
         self.validate()?;
         let format = match self.format {
             TextFormat::Plain => "plain",
             TextFormat::Markdown => "markdown",
         };
-        let mut html = format!("<span data-morpheus-compose=\"1\" data-format=\"{format}\">");
+        let mut html =
+            format!("<span data-morpheus-compose=\"{version}\" data-format=\"{format}\"");
+        if let Some(meta) = meta {
+            // The envelope is lowercase hex, so no attribute escaping applies.
+            html.push_str(" data-morpheus-meta=\"");
+            html.push_str(meta);
+            html.push('"');
+        }
+        html.push('>');
         let mut cursor = 0;
         for span in &self.mentions {
             html.push_str(&escape_html(&self.body[cursor..span.range.start]));
@@ -413,14 +450,23 @@ impl ComposeText {
     }
 
     pub fn restore_draft(body: String, html: Option<&str>) -> RestoredCompose {
-        let restored = html.and_then(|html| Self::decode_draft(&body, html));
-        RestoredCompose {
-            discarded_rich_intent: html.is_some() && restored.is_none(),
-            text: restored.unwrap_or_else(|| Self::plain(body)),
+        match html.and_then(|html| Self::decode_draft(&body, html)) {
+            Some((text, envelope, metadata_unreadable)) => RestoredCompose {
+                text,
+                discarded_rich_intent: false,
+                envelope,
+                metadata_unreadable,
+            },
+            None => RestoredCompose {
+                discarded_rich_intent: html.is_some(),
+                text: Self::plain(body),
+                envelope: DraftEnvelope::fresh(),
+                metadata_unreadable: false,
+            },
         }
     }
 
-    fn decode_draft(body: &str, html: &str) -> Option<Self> {
+    fn decode_draft(body: &str, html: &str) -> Option<(Self, DraftEnvelope, bool)> {
         if body.len() > MAX_COMPOSE_BYTES || html.len() > MAX_DRAFT_HTML_BYTES {
             return None;
         }
@@ -435,9 +481,14 @@ impl ComposeText {
             return None;
         }
         let attrs = element.attrs.borrow();
-        if attrs.len() != 2 || attribute(&attrs, "data-morpheus-compose")? != "1" {
-            return None;
-        }
+        let version = attribute(&attrs, "data-morpheus-compose")?;
+        let meta = match version.as_str() {
+            DRAFT_VERSION_PLAIN if attrs.len() == 2 => None,
+            DRAFT_VERSION_RECOVERY if attrs.len() == 3 => {
+                Some(attribute(&attrs, "data-morpheus-meta")?)
+            }
+            _ => return None,
+        };
         let format = match attribute(&attrs, "data-format")?.as_str() {
             "plain" => TextFormat::Plain,
             "markdown" => TextFormat::Markdown,
@@ -483,10 +534,30 @@ impl ComposeText {
         }
         // Byte-for-byte canonical equality also rejects parser repairs, comments,
         // duplicate attributes, unknown metadata, and alternative URI spellings.
-        if decoded.body != body || decoded.draft_html().ok()?.as_str() != html {
+        // The metadata attribute is compared verbatim here and interpreted
+        // separately, so an unreadable envelope never discards the text's
+        // formatting or mention intent.
+        if decoded.body != body
+            || decoded
+                .render_draft(&version, meta.as_deref())
+                .ok()?
+                .as_str()
+                != html
+        {
             return None;
         }
-        Some(decoded)
+        let (envelope, unreadable) = match meta {
+            None => (DraftEnvelope::fresh(), false),
+            Some(meta) => match DraftEnvelope::decode(&meta) {
+                Ok(envelope) => (envelope, false),
+                Err(_) => {
+                    let mut envelope = DraftEnvelope::fresh();
+                    envelope.carry_unreadable(&meta);
+                    (envelope, true)
+                }
+            },
+        };
+        Some((decoded, envelope, unreadable))
     }
 }
 
@@ -632,6 +703,59 @@ mod tests {
                 .mentions
                 .is_empty()
         );
+    }
+    #[test]
+    fn recovery_envelope_rides_the_canonical_draft_and_fails_closed_without_losing_text() {
+        use crate::draft_recovery::{DraftEnvelope, Generation};
+        let value = selected("send ", " now");
+        let mut envelope = DraftEnvelope::fresh();
+        let nonce = Generation::fresh();
+        envelope
+            .begin_pending(nonce.clone(), envelope.generation().clone(), false)
+            .unwrap();
+        assert!(envelope.mark_queued(&nonce, "abcdef0123456789abcdef0123456789"));
+        envelope.set_retained_for(Some(nonce));
+        envelope.index_thread("$root:example.org").unwrap();
+        let html = value.encode_draft(&envelope).unwrap();
+        assert!(html.contains("data-morpheus-compose=\"2\""));
+        let restored = ComposeText::restore_draft(value.body.clone(), Some(&html));
+        assert_eq!(restored.text, value);
+        assert_eq!(restored.envelope, envelope);
+        assert!(!restored.discarded_rich_intent && !restored.metadata_unreadable);
+        // A metadata-only row keeps its envelope with an empty body.
+        let empty = ComposeText::new(String::new(), TextFormat::Markdown);
+        let html = empty.encode_draft(&envelope).unwrap();
+        let restored = ComposeText::restore_draft(String::new(), Some(&html));
+        assert_eq!(restored.text, empty);
+        assert_eq!(restored.envelope, envelope);
+        // Unreadable metadata fails closed: text and intent restore, no pending
+        // send is inferred, and the raw metadata is carried for explicit review.
+        let html = value.encode_draft(&envelope).unwrap();
+        let broken = html.replace("data-morpheus-meta=\"", "data-morpheus-meta=\"ff");
+        let restored = ComposeText::restore_draft(value.body.clone(), Some(&broken));
+        assert_eq!(restored.text, value);
+        assert!(restored.metadata_unreadable && !restored.discarded_rich_intent);
+        assert!(restored.envelope.pending().is_empty());
+        assert!(restored.envelope.unreadable().is_some_and(|raw| raw.starts_with("ff")));
+        // The carried metadata survives a re-encode and a later clear.
+        let carried = value.encode_draft(&restored.envelope).unwrap();
+        let again = ComposeText::restore_draft(value.body.clone(), Some(&carried));
+        assert!(!again.metadata_unreadable);
+        assert_eq!(again.envelope.unreadable(), restored.envelope.unreadable());
+        // Legacy rows decode to a fresh, empty envelope.
+        let legacy = ComposeText::restore_draft(value.body.clone(), Some(&value.draft_html().unwrap()));
+        assert_eq!(legacy.text, value);
+        assert!(legacy.envelope.is_empty() && !legacy.metadata_unreadable);
+        // Version 2 without the attribute, or version 1 with it, is not ours.
+        for bad in [
+            html.replace(&format!(" data-morpheus-meta=\"{}\"", envelope.encode().unwrap()), ""),
+            html.replace("data-morpheus-compose=\"2\"", "data-morpheus-compose=\"1\""),
+            html.replace("data-morpheus-compose=\"2\"", "data-morpheus-compose=\"3\""),
+        ] {
+            let restored = ComposeText::restore_draft(value.body.clone(), Some(&bad));
+            assert!(restored.discarded_rich_intent);
+            assert!(restored.text.mentions.is_empty());
+        }
     }
     #[test]
     fn markdown_excludes_code_links_images_escaped_and_raw_html() {

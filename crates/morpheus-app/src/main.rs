@@ -11,6 +11,7 @@ mod call_membership;
 #[cfg(feature = "native-calls")]
 mod calls;
 mod composer_mentions;
+mod draft_recovery;
 mod drafts;
 mod image_previews;
 #[cfg(feature = "native-calls")]
@@ -3800,14 +3801,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let draft = thread_live.composed_draft(&account_id, &room_id, Some(&event_id));
             ui.set_thread_composer_text(draft.body.into());
             ui.set_thread_markdown(draft.format == TextFormat::Markdown);
-            ui.set_thread_send_pending(thread_live.thread_send_pending(
-                &account_id,
-                &room_id,
-                &event_id,
-            ));
-            if ui.get_thread_send_pending() {
+            let summary = thread_live.pending_summary(&account_id, &room_id, Some(&event_id));
+            draft_recovery::publish_thread(&ui, &summary);
+            if summary.unconfirmed || summary.metadata_unreadable {
                 ui.set_transfer_notice(
-                    "Thread reply is queued or unconfirmed; it may still send".into(),
+                    "A reply here may not have finished sending before Morpheus closed. Check the thread, then choose.".into(),
+                );
+            } else if summary.count > 0 {
+                ui.set_transfer_notice(
+                    "A thread reply is still waiting to send; it may still send".into(),
                 );
             }
             let live = thread_live.clone();
@@ -3849,6 +3851,102 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let live = close_live.clone();
         let generation = live.begin_thread_request();
         close_handle.spawn(async move { live.clear_thread_if_current(generation).await });
+    });
+
+    // Queued-send controls act on the exact saved record of the visible scope.
+    let weak = ui.as_weak();
+    let pending_live = live.clone();
+    let pending_handle = runtime.handle().clone();
+    ui.on_cancel_pending_send(move |threaded| {
+        let Some(ui) = weak.upgrade() else { return };
+        if !pending_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(scope) = draft_recovery::current_scope(&ui, threaded) else { return };
+        let live = pending_live.clone();
+        let weak = weak.clone();
+        pending_handle.spawn(async move { live.cancel_pending_send(scope, weak).await });
+    });
+    let weak = ui.as_weak();
+    let retry_live = live.clone();
+    let retry_handle = runtime.handle().clone();
+    ui.on_retry_pending_send(move |threaded| {
+        let Some(ui) = weak.upgrade() else { return };
+        if !retry_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(scope) = draft_recovery::current_scope(&ui, threaded) else { return };
+        let live = retry_live.clone();
+        let weak = weak.clone();
+        retry_handle.spawn(async move { live.retry_pending_send(scope, weak).await });
+    });
+    let weak = ui.as_weak();
+    let review_live = live.clone();
+    let review_handle = runtime.handle().clone();
+    ui.on_review_unconfirmed_send(move |threaded, sent| {
+        let Some(ui) = weak.upgrade() else { return };
+        if !review_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(scope) = draft_recovery::current_scope(&ui, threaded) else { return };
+        let live = review_live.clone();
+        let weak = weak.clone();
+        review_handle.spawn(async move {
+            let resolution = live
+                .review_unconfirmed_sends(&scope.account, &scope.room, scope.thread(), sent)
+                .await;
+            let restored = resolution.and_then(|resolution| resolution.restored);
+            let current = live.clone();
+            let _ = weak.upgrade_in_event_loop(move |window| {
+                if !draft_recovery::scope_visible(&window, &scope) {
+                    return;
+                }
+                if let Some(text) = &restored {
+                    let empty = if threaded { window.get_thread_composer_text().is_empty() } else { window.get_composer_text().is_empty() };
+                    if empty {
+                        if threaded {
+                            window.set_thread_composer_text(text.body.clone().into());
+                            window.set_thread_markdown(text.format == TextFormat::Markdown);
+                        } else {
+                            window.set_composer_text(text.body.clone().into());
+                            window.set_composer_markdown(text.format == TextFormat::Markdown);
+                        }
+                    }
+                }
+                draft_recovery::publish_scope(&window, &current, &scope);
+                window.set_transfer_notice(if sent {
+                    "Marked as sent. Nothing was resent."
+                } else if restored.is_some() {
+                    "Marked as not sent; your text is back in the composer. Nothing was resent."
+                } else {
+                    "Marked as not sent. Nothing was resent."
+                }.into());
+            });
+        });
+    });
+    let weak = ui.as_weak();
+    let restore_live = live.clone();
+    ui.on_restore_retained_text(move |threaded| {
+        let Some(ui) = weak.upgrade() else { return };
+        if !restore_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(scope) = draft_recovery::current_scope(&ui, threaded) else { return };
+        let empty = if threaded { ui.get_thread_composer_text().is_empty() } else { ui.get_composer_text().is_empty() };
+        if !empty {
+            return;
+        }
+        if let Some(text) = restore_live.restore_retained_text(&scope.account, &scope.room, scope.thread()) {
+            if threaded {
+                ui.set_thread_composer_text(text.body.into());
+                ui.set_thread_markdown(text.format == TextFormat::Markdown);
+            } else {
+                ui.set_composer_text(text.body.into());
+                ui.set_composer_markdown(text.format == TextFormat::Markdown);
+            }
+            ui.set_transfer_notice("Unsent text restored. The queued message may still send.".into());
+        }
+        draft_recovery::publish_scope(&ui, &restore_live, &scope);
     });
 
     let weak = ui.as_weak();

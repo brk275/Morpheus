@@ -2703,6 +2703,47 @@ remain open.
   visible. This is preferences UI and file watcher evidence on macOS, not a
   notification banner, sound, or Linux/Windows acceptance check.
 
+## 2026-10-17 durable draft-send recovery (source only, unverified)
+
+Room and thread sends now carry durable recovery metadata inside the existing
+encrypted `ComposerDraft` HTML envelope: the canonical draft span gains a
+version `2` form with a bounded lowercase-hex JSON attribute holding the draft
+generation, a bounded list of pending send records (opaque nonce, generation,
+state and exact transaction id), the room's thread index and an optional
+retained-text marker. Text and metadata are one atomic SDK draft write; no raw
+state-store custom values, no new dependency and no metadata in outbound
+message HTML. Unknown or malformed metadata fails closed: the text is still
+restored, the row is marked unreadable, sends from that scope are refused until
+the user reviews it, and nothing is inferred from it.
+
+The send path records the enqueuing state, and for threads the room index,
+before the SDK assigns a transaction id, then saves the exact id once known.
+Several room sends may wait independently; one send per thread may wait. At
+account selection the core scans the client's rooms and their thread indexes
+before enabling the send queue, subscribes to each room's queue while it is
+still disabled and attaches observers only to requests whose transaction id
+matches a saved record; records the queue no longer holds become explicit
+unconfirmed entries. Native strips offer Retry, Cancel sending, Restore text and
+the two unconfirmed choices (It was sent / Not sent, keep my text) with plain
+wording; cancel is never described as preventing delivery. Account switch and
+removal end observers through the selection guard, and every write checks the
+record nonce and generation so a later edit, including identical text, is never
+cleared by an earlier send's result.
+
+Prepared regressions: six core codec/envelope tests, one canonical-draft
+round-trip test, thirteen draft-cache tests (atomic same-text edits, two queued
+room sends resolved out of order, restart as unconfirmed versus attached,
+unreadable carry, bounds, thread-index order and re-selection re-checks), two
+wording tests, and an
+extended `drafts_local` fixture covering two queued records, a thread index, a
+metadata-only row, exact-id removal and raw-byte scans for the encoded envelope.
+None of these has been compiled or run; no formatting, Clippy, build, native
+UI, live homeserver or CI check was executed for this change. Known limits:
+only the most recent pending record in a scope keeps a restorable copy of its
+text; rooms the client does not know at selection are not scanned; legacy
+untracked send paths carry no record; an unconfirmed send always requires the
+user's judgement after checking the conversation.
+
 ## Native outgoing video GUI acceptance (partial)
 
 An ad hoc signed macOS Apple Silicon QA app used a temporary, debug-only

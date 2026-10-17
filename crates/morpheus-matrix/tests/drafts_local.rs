@@ -14,7 +14,10 @@ use matrix_sdk::{
     ComposerDraft, ComposerDraftType,
     ruma::{EventId, RoomId},
 };
-use morpheus_matrix::{AccountManager, ComposeText, MentionTarget, QueuedSendOutcome, TextFormat};
+use morpheus_matrix::{
+    AccountManager, ComposeText, DraftEnvelope, Generation, MentionTarget, QueuedSendOutcome,
+    TextFormat,
+};
 use serde::Deserialize;
 use tokio::time::{Instant, sleep};
 use uuid::Uuid;
@@ -157,7 +160,7 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
             .expect("First login failed");
         wait_for_room(&manager, a_room).await;
         manager
-            .save_composed_draft_for(&a_account.id, a_room, None, &typed_room)
+            .save_composed_draft_for(&a_account.id, a_room, None, &typed_room, &DraftEnvelope::fresh())
             .await
             .expect("Cannot persist first draft");
         for (thread, body) in [
@@ -170,9 +173,78 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
                 .expect("Cannot persist encrypted thread draft");
         }
         manager
-            .save_composed_draft_for(&a_account.id, a_room, Some(first_thread), &typed_thread)
+            .save_composed_draft_for(
+                &a_account.id,
+                a_room,
+                Some(first_thread),
+                &typed_thread,
+                &DraftEnvelope::fresh(),
+            )
             .await
             .expect("Cannot persist typed thread draft");
+        // Durable send recovery: a room row carries two independent pending
+        // records and a thread index; a thread row carries one pending record.
+        // Nonces, generations and transaction ids are opaque and must never
+        // appear in plaintext storage either.
+        let pending_room_text = ComposeText::new(
+            format!("private-pending-room-{}", Uuid::new_v4()),
+            TextFormat::Plain,
+        );
+        let pending_thread = "$draft-pending-root:fixture.invalid";
+        let pending_thread_text = ComposeText::new(
+            format!("private-pending-thread-{}", Uuid::new_v4()),
+            TextFormat::Plain,
+        );
+        let first_nonce = Generation::fresh();
+        let second_nonce = Generation::fresh();
+        let thread_nonce = Generation::fresh();
+        let first_txn = format!("fixture{}", Uuid::new_v4().simple());
+        let second_txn = format!("fixture{}", Uuid::new_v4().simple());
+        let mut pending_room_envelope = DraftEnvelope::fresh();
+        pending_room_envelope
+            .begin_pending(first_nonce.clone(), Generation::fresh(), false)
+            .expect("first room record");
+        pending_room_envelope
+            .begin_pending(second_nonce.clone(), Generation::fresh(), false)
+            .expect("second room record");
+        assert!(pending_room_envelope.mark_queued(&first_nonce, &first_txn));
+        assert!(pending_room_envelope.mark_queued(&second_nonce, &second_txn));
+        assert!(
+            pending_room_envelope
+                .index_thread(pending_thread)
+                .expect("thread index")
+        );
+        let mut pending_thread_envelope = DraftEnvelope::fresh();
+        pending_thread_envelope
+            .begin_pending(thread_nonce.clone(), Generation::fresh(), true)
+            .expect("thread record");
+        manager
+            .save_composed_draft_for(
+                &a_account.id,
+                a_room,
+                Some(pending_thread),
+                &pending_thread_text,
+                &pending_thread_envelope,
+            )
+            .await
+            .expect("Cannot persist pending thread row");
+        manager
+            .save_composed_draft_for(
+                &a_account.id,
+                a_room,
+                None,
+                &pending_room_text,
+                &pending_room_envelope,
+            )
+            .await
+            .expect("Cannot persist pending room row");
+        // The envelope rides the room text; restore the typed draft with the
+        // same envelope so the later text checks and the recovery checks share
+        // one row.
+        manager
+            .save_composed_draft_for(&a_account.id, a_room, None, &typed_room, &pending_room_envelope)
+            .await
+            .expect("Cannot persist typed room draft with pending records");
         let client = manager.active_client().await.expect("Draft client missing");
         let room = client
             .get_room(&RoomId::parse(a_room).expect("Invalid draft room"))
@@ -280,6 +352,25 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
             !contains_plaintext(&root, typed_thread.draft_html().unwrap().as_bytes()),
             "Typed thread intent encoding leaked into plaintext storage"
         );
+        for secret in [
+            pending_room_text.body.as_str(),
+            pending_thread_text.body.as_str(),
+            first_txn.as_str(),
+            second_txn.as_str(),
+            "data-morpheus-meta",
+        ] {
+            assert!(
+                !contains_plaintext(&root, secret.as_bytes()),
+                "Send recovery metadata leaked into plaintext storage"
+            );
+        }
+        assert!(
+            !contains_plaintext(
+                &root,
+                pending_room_envelope.encode().unwrap().as_bytes()
+            ),
+            "Encoded recovery envelope leaked into plaintext storage"
+        );
         let manager = AccountManager::open(&root).expect("Cannot reopen account manager");
         let restored = manager
             .restore_last_active()
@@ -330,6 +421,105 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
         assert!(
             restored_room.text == typed_room && !restored_room.discarded_rich_intent,
             "Room format or explicit mention intent changed across restart"
+        );
+        assert!(
+            !restored_room.metadata_unreadable,
+            "Recovery metadata failed closed on a valid envelope"
+        );
+        let recovered: Vec<(&Generation, Option<&str>)> = restored_room
+            .envelope
+            .pending()
+            .iter()
+            .map(|record| (record.nonce(), record.transaction_id()))
+            .collect();
+        assert_eq!(
+            recovered,
+            vec![
+                (&first_nonce, Some(first_txn.as_str())),
+                (&second_nonce, Some(second_txn.as_str())),
+            ],
+            "Queued room records or their order changed across restart"
+        );
+        assert_eq!(
+            restored_room.envelope.threads(),
+            &[pending_thread.to_owned()],
+            "Thread index changed across restart"
+        );
+        let restored_pending_thread = manager
+            .load_composed_draft_for(&a_account.id, a_room, Some(pending_thread))
+            .await
+            .expect("Cannot restore pending thread row");
+        assert!(restored_pending_thread.text == pending_thread_text);
+        let thread_records = restored_pending_thread.envelope.pending();
+        assert!(
+            thread_records.len() == 1
+                && thread_records[0].nonce() == &thread_nonce
+                && !thread_records[0].is_queued(),
+            "Enqueuing thread record did not survive restart as unconfirmed"
+        );
+        // Resolving the second room record out of order keeps the first and
+        // the thread index; clearing the room text keeps a metadata-only row.
+        let mut room_envelope = restored_room.envelope.clone();
+        assert!(
+            room_envelope
+                .remove_pending(&second_nonce, Some(second_txn.as_str()))
+                .is_some()
+        );
+        assert!(
+            room_envelope
+                .remove_pending(&second_nonce, Some(second_txn.as_str()))
+                .is_none(),
+            "A resolved record was removable twice"
+        );
+        assert!(
+            room_envelope
+                .remove_pending(&first_nonce, Some(second_txn.as_str()))
+                .is_none(),
+            "A record was removable with another record's transaction id"
+        );
+        manager
+            .save_composed_draft_for(
+                &a_account.id,
+                a_room,
+                None,
+                &ComposeText::new(String::new(), TextFormat::Plain),
+                &room_envelope,
+            )
+            .await
+            .expect("Cannot save metadata-only room row");
+        let metadata_only = manager
+            .load_composed_draft_for(&a_account.id, a_room, None)
+            .await
+            .expect("Cannot reload metadata-only room row");
+        assert!(metadata_only.text.body.is_empty());
+        assert_eq!(metadata_only.envelope.pending().len(), 1);
+        assert_eq!(metadata_only.envelope.pending()[0].nonce(), &first_nonce);
+        assert_eq!(metadata_only.envelope.threads(), &[pending_thread.to_owned()]);
+        // Put the typed text back for the remaining legacy checks, with the
+        // generation refreshed as any edit would do.
+        let mut edited_envelope = metadata_only.envelope.clone();
+        edited_envelope.set_generation(Generation::fresh());
+        assert_ne!(edited_envelope.generation(), metadata_only.envelope.generation());
+        manager
+            .save_composed_draft_for(&a_account.id, a_room, None, &typed_room, &edited_envelope)
+            .await
+            .expect("Cannot restore typed room draft");
+        manager
+            .save_composed_draft_for(
+                &a_account.id,
+                a_room,
+                Some(pending_thread),
+                &ComposeText::new(String::new(), TextFormat::Plain),
+                &DraftEnvelope::fresh(),
+            )
+            .await
+            .expect("Cannot clear resolved thread row");
+        assert_eq!(
+            manager
+                .load_scoped_composer_draft_for(&a_account.id, a_room, Some(pending_thread))
+                .await
+                .unwrap(),
+            ""
         );
         let restored_thread = manager
             .load_composed_draft_for(&a_account.id, a_room, Some(first_thread))
@@ -394,6 +584,34 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
                 .unwrap(),
             ""
         );
+        // The plain clear keeps the pending record and thread index.
+        let after_clear = manager
+            .load_composed_draft_for(&a_account.id, a_room, None)
+            .await
+            .expect("Cannot reload cleared room row");
+        assert_eq!(after_clear.envelope.pending().len(), 1);
+        assert_eq!(after_clear.envelope.threads(), &[pending_thread.to_owned()]);
+        // Resolving the last record and dropping the index leaves nothing to
+        // keep: the row is deleted.
+        let mut final_envelope = after_clear.envelope.clone();
+        assert!(final_envelope.remove_pending(&first_nonce, Some(first_txn.as_str())).is_some());
+        assert!(final_envelope.unindex_thread(pending_thread));
+        assert!(final_envelope.is_empty());
+        manager
+            .save_composed_draft_for(
+                &a_account.id,
+                a_room,
+                None,
+                &ComposeText::new(String::new(), TextFormat::Plain),
+                &final_envelope,
+            )
+            .await
+            .expect("Cannot delete empty room row");
+        let gone = manager
+            .load_composed_draft_for(&a_account.id, a_room, None)
+            .await
+            .expect("Cannot reload deleted room row");
+        assert!(gone.text.body.is_empty() && gone.envelope.is_empty());
         manager
             .logout_account(&a_account.id)
             .await

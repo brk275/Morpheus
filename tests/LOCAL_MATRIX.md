@@ -168,10 +168,19 @@ as raw bytes. The Matrix SDK's passphrase-protected SQLite state store holds
 the drafts; the passphrase remains in the OS credential vault.
 
 Morpheus retains a queued message's encrypted draft until the room send queue
-reports server acceptance. A send failure restores unchanged text. If the app
-exits before the send result arrives, the draft is retained, but the pending
-transaction marker is currently process-local. A send that completes after
-restart can therefore leave a stale draft for the user to clear.
+reports server acceptance. A send failure restores unchanged text. Before a
+room or thread message is handed to the SDK queue, its pending record (an
+opaque ownership nonce, the draft generation and, once assigned, the exact
+transaction id) is written into the same encrypted draft row as the text, and
+a thread send also records its root in the room row's thread index. After a
+restart the records are matched only against the SDK's own queue by exact
+transaction id: matching requests are observed to their result, a request the
+queue no longer holds is shown as unconfirmed for the user to check in the
+conversation, and nothing is adopted by content or time or resent
+automatically. The same fixture now also round-trips two queued room records,
+a thread index and a metadata-only room row, and scans the raw account data
+for the encoded envelope and its marker attribute. This recovery path has not
+yet been built or run.
 
 ## Test encrypted-history recovery
 
