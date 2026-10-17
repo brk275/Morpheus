@@ -229,27 +229,49 @@ class OwnershipTests(unittest.TestCase):
     def test_owned_pid_requires_own_group_and_session_live_state_and_the_installed_executable(self):
         executable = "/Applications/Morpheus.app/Contents/MacOS/morpheus-app"
         proc = self.Proc({PID: executable, 5000: executable, 6000: "/usr/bin/true"})
-        owned = table((PID, PID, PID, "S+"))
-        self.assertTrue(ui.owned_mac_pid(PID, PID, executable, owned, proc))
+        own_session = lambda pid: PID
+        owned = table((PID, PID, "S+"))
+        self.assertTrue(ui.owned_mac_pid(PID, PID, executable, owned, proc, own_session))
         cases = {
-            "other_group": table((PID, 1, PID, "S")),
-            "other_session": table((PID, PID, 1, "S")),
-            "zombie": table((PID, PID, PID, "Z")),
-            "missing": table((5000, 5000, 5000, "S")),
-            "duplicate_rows": table((PID, PID, PID, "S"), (PID, PID, PID, "S")),
+            "other_group": (table((PID, 1, "S")), own_session),
+            "other_session": (owned, lambda pid: 1),
+            "session_unreadable": (owned, lambda pid: None),
+            "zombie": (table((PID, PID, "Z")), own_session),
+            "missing": (table((5000, 5000, "S")), own_session),
+            "duplicate_rows": (table((PID, PID, "S"), (PID, PID, "S")), own_session),
         }
-        for name, rows in cases.items():
+        for name, (rows, session) in cases.items():
             with self.subTest(case=name):
-                self.assertFalse(ui.owned_mac_pid(PID, PID, executable, rows, proc))
+                self.assertFalse(ui.owned_mac_pid(PID, PID, executable, rows, proc, session))
         # Same group and session, but a different executable behind the PID.
-        self.assertFalse(ui.owned_mac_pid(6000, 6000, executable, table((6000, 6000, 6000, "S")), proc))
-        self.assertFalse(ui.owned_mac_pid(7000, 7000, executable, table((7000, 7000, 7000, "S")), proc))
+        self.assertFalse(ui.owned_mac_pid(6000, 6000, executable, table((6000, 6000, "S")), proc, lambda pid: 6000))
+        self.assertFalse(ui.owned_mac_pid(7000, 7000, executable, table((7000, 7000, "S")), proc, lambda pid: 7000))
+
+    def test_session_comes_from_getsid_and_never_from_the_darwin_process_table(self):
+        # Darwin ps prints the session structure's kernel address under "sess"
+        # (adv_cmds ps/keyword.c), which never equals the leader's PID. Such a
+        # snapshot must neither parse as a session nor pass as a malformed row.
+        darwin = " 4242 4242 ffffff801a2b3c4d S+\n 4243 4242 ffffff801a2b3c4d Z\n"
+        self.assertEqual(ui.process_table(darwin), [])
+        self.assertEqual(ui.process_table(" 4242 4242 4242 S+\n"), [])  # No fourth column is ever accepted.
+        executable = "/Applications/Morpheus.app/Contents/MacOS/morpheus-app"
+        proc = self.Proc({PID: executable})
+        with patch.object(ui.os, "getsid", return_value=PID) as getsid:
+            self.assertEqual(ui.session_of(PID), PID)
+            self.assertTrue(ui.owned_mac_pid(PID, PID, executable, table((PID, PID, "S")), proc))
+        self.assertEqual([entry.args for entry in getsid.call_args_list], [(PID,), (PID,)])
+        for error in (ProcessLookupError(), PermissionError()):
+            with self.subTest(error=type(error).__name__), patch.object(ui.os, "getsid", side_effect=error):
+                self.assertIsNone(ui.session_of(PID))
+                self.assertFalse(ui.owned_mac_pid(PID, PID, executable, table((PID, PID, "S")), proc))
+        with patch.object(ui.os, "getsid", return_value=PID + 1):
+            self.assertFalse(ui.owned_mac_pid(PID, PID, executable, table((PID, PID, "S")), proc))
 
     def test_process_table_parsing_ignores_malformed_rows_and_group_members_exclude_zombies(self):
-        rows = ui.process_table(" 4242 4242 4242 S+\n 4243 4242 4242 Z\n bad line\n 1 1 1 Ss\n 4244 4242 4242 R\n")
-        self.assertEqual(rows, [(4242, 4242, 4242, "S+"), (4243, 4242, 4242, "Z"), (1, 1, 1, "Ss"), (4244, 4242, 4242, "R")])
-        self.assertEqual(ui.group_members(4242, rows), [(4242, 4242, 4242, "S+"), (4244, 4242, 4242, "R")])
-        self.assertEqual(ui.group_members(4242, table((4242, 4242, 4242, "Z"))), [])
+        rows = ui.process_table(" 4242 4242 S+\n 4243 4242 Z\n bad line\n 1 1 Ss\n 4244 4242 R\n x 4242 S\n")
+        self.assertEqual(rows, [(4242, 4242, "S+"), (4243, 4242, "Z"), (1, 1, "Ss"), (4244, 4242, "R")])
+        self.assertEqual(ui.group_members(4242, rows), [(4242, 4242, "S+"), (4244, 4242, "R")])
+        self.assertEqual(ui.group_members(4242, table((4242, 4242, "Z"))), [])
 
 
 class ProfileLifecycleTests(unittest.TestCase):
@@ -283,15 +305,60 @@ class ProfileLifecycleTests(unittest.TestCase):
                     arrange(roots)
                     before = sorted(str(path) for path in home.rglob("*"))
                     with self.assertRaises(RuntimeError):
-                        ui.PackageProfile.create(NONCE, roots)
+                        ui.PackageProfile.create(NONCE, roots, home)
                     self.assertEqual(sorted(str(path) for path in home.rglob("*")), before)
             self.assertEqual((elsewhere / "vault").read_bytes(), b"not ours")
+
+    def test_redirected_library_ancestor_is_refused_before_create_open_or_remove(self):
+        # A symbolic link at ~/Library (above the bases the old check looked at)
+        # redirects every project path into foreign material. Create, open and
+        # remove must all refuse it, and the foreign material must survive.
+        with tempfile.TemporaryDirectory() as folder:
+            foreign = Path(folder) / "foreign"
+            for base in ui.LIBRARY_BASES:
+                (foreign / base.name / ui.PROJECT_DIR).mkdir(parents=True)
+                (foreign / base.name / ui.PROJECT_DIR / ui.MARKER).write_text(NONCE, encoding="ascii")
+            (foreign / "Application Support" / ui.PROJECT_DIR / "config.toml").write_text(ui.SEED_CONFIG, encoding="utf-8")
+            (foreign / "Application Support" / ui.PROJECT_DIR / "vault").write_bytes(b"not ours")
+            before = sorted(str(path) for path in foreign.rglob("*"))
+            home = Path(folder) / "Users" / "runner"
+            home.mkdir(parents=True)
+            os.symlink(foreign, home / "Library", target_is_directory=True)
+            roots = ui.profile_roots(home)
+            self.assertFalse(ui.plain_ancestors(home, roots[0]))
+            with self.assertRaises(RuntimeError):
+                ui.PackageProfile.create(NONCE, roots, home)
+            with self.assertRaises(ui.DiagnosticFailure) as error:
+                ui.PackageProfile.open(NONCE, roots, home)
+            self.assertEqual(error.exception.code, "profile_invalid")
+            with self.assertRaises(RuntimeError):
+                ui.PackageProfile(roots, NONCE, home).remove()
+            self.assertEqual(sorted(str(path) for path in foreign.rglob("*")), before)
+            self.assertEqual((foreign / "Application Support" / ui.PROJECT_DIR / "vault").read_bytes(), b"not ours")
+            # A symbolic link at the home itself, or roots outside the home, fail the same proof.
+            link = Path(folder) / "home-link"
+            os.symlink(temp_home(Path(folder) / "real"), link, target_is_directory=True)
+            self.assertFalse(ui.plain_ancestors(link, ui.profile_roots(link)[0]))
+            self.assertFalse(ui.plain_ancestors(temp_home(Path(folder) / "other"), roots[0]))
+        with tempfile.TemporaryDirectory() as folder:
+            home = temp_home(folder)
+            roots = ui.profile_roots(home)
+            self.assertTrue(all(ui.plain_ancestors(home, root) for root in roots))
+            profile = ui.PackageProfile.create(NONCE, roots, home)
+            # Redirecting Library after creation must stop the removal too.
+            real = home / "Library"
+            moved = Path(folder) / "moved-library"
+            real.rename(moved)
+            os.symlink(moved, real, target_is_directory=True)
+            with self.assertRaises(RuntimeError):
+                profile.remove()
+            self.assertEqual((moved / "Application Support" / ui.PROJECT_DIR / ui.MARKER).read_text(encoding="ascii"), NONCE)
 
     def test_create_seeds_markers_and_root_config_and_a_failed_create_removes_only_its_roots(self):
         with tempfile.TemporaryDirectory() as folder:
             home = temp_home(folder)
             roots = ui.profile_roots(home)
-            profile = ui.PackageProfile.create(NONCE, roots)
+            profile = ui.PackageProfile.create(NONCE, roots, home)
             self.assertEqual(profile.config, roots[0] / "config.toml")  # macOS config_dir is the project folder.
             self.assertEqual(profile.config.read_text(encoding="utf-8"), ui.SEED_CONFIG)
             for root in roots:
@@ -308,41 +375,42 @@ class ProfileLifecycleTests(unittest.TestCase):
                 return original(self, data, *args, **kwargs)
 
             with patch.object(Path, "write_text", failing), self.assertRaises(OSError):
-                ui.PackageProfile.create(NONCE, roots)
+                ui.PackageProfile.create(NONCE, roots, home)
             for root in roots:
                 self.assertFalse(root.exists())
                 self.assertTrue(root.parent.is_dir())
             for nonce in ["", "short", "G" * 32, NONCE.upper(), 12]:
                 with self.subTest(nonce=nonce), self.assertRaises(RuntimeError):
-                    ui.PackageProfile.create(nonce, roots)
+                    ui.PackageProfile.create(nonce, roots, home)
 
     def test_open_accepts_only_the_marked_profile_even_after_the_app_created_its_store(self):
         with tempfile.TemporaryDirectory() as folder:
             home = temp_home(folder)
             roots = ui.profile_roots(home)
-            profile = ui.PackageProfile.create(NONCE, roots)
+            profile = ui.PackageProfile.create(NONCE, roots, home)
             (roots[0] / "accounts").mkdir()
             (roots[0] / "accounts" / "db").write_bytes(b"synthetic store")
             (roots[1] / "fonts").write_bytes(b"cache")
-            self.assertEqual(ui.PackageProfile.open(NONCE, roots).config, profile.config)
+            self.assertEqual(ui.PackageProfile.open(NONCE, roots, home).config, profile.config)
             for nonce in ["f" * 32, "not-a-nonce"]:
                 with self.subTest(nonce=nonce), self.assertRaises(ui.DiagnosticFailure) as error:
-                    ui.PackageProfile.open(nonce, roots)
+                    ui.PackageProfile.open(nonce, roots, home)
                 self.assertEqual(error.exception.code, "profile_invalid")
             (roots[1] / ui.MARKER).unlink()
             with self.assertRaises(ui.DiagnosticFailure):
-                ui.PackageProfile.open(NONCE, roots)
+                ui.PackageProfile.open(NONCE, roots, home)
             (roots[1] / ui.MARKER).write_text(NONCE, encoding="ascii")
             profile.config.unlink()
             with self.assertRaises(ui.DiagnosticFailure):
-                ui.PackageProfile.open(NONCE, roots)
+                ui.PackageProfile.open(NONCE, roots, home)
             profile.config.write_text(ui.SEED_CONFIG, encoding="utf-8")
-            self.assertTrue(ui.PackageProfile.open(NONCE, roots).remove())
+            self.assertTrue(ui.PackageProfile.open(NONCE, roots, home).remove())
             self.assertFalse(roots[0].exists())
         with tempfile.TemporaryDirectory() as folder:
-            roots = ui.profile_roots(temp_home(folder))
+            home = temp_home(folder)
+            roots = ui.profile_roots(home)
             with self.assertRaises(ui.DiagnosticFailure):
-                ui.PackageProfile.open(NONCE, roots)  # Never created: nothing to own.
+                ui.PackageProfile.open(NONCE, roots, home)  # Never created: nothing to own.
 
     def test_remove_refuses_redirected_or_foreign_roots(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -353,13 +421,13 @@ class ProfileLifecycleTests(unittest.TestCase):
             roots = ui.profile_roots(home)
             os.symlink(elsewhere, roots[0], target_is_directory=True)
             with self.assertRaises(RuntimeError):
-                ui.PackageProfile(roots, NONCE).remove()
+                ui.PackageProfile(roots, NONCE, home).remove()
             self.assertEqual((elsewhere / "vault").read_bytes(), b"not ours")
             os.unlink(roots[0])
             (roots[0] / "accounts").mkdir(parents=True)
             (roots[0] / "accounts" / "db").write_bytes(b"account")
             with self.assertRaises(RuntimeError):
-                ui.PackageProfile(roots, NONCE).remove()
+                ui.PackageProfile(roots, NONCE, home).remove()
             self.assertEqual((roots[0] / "accounts" / "db").read_bytes(), b"account")
 
     def test_smoke_compiles_probes_permissions_creates_the_profile_then_launches_and_removes_after_verified_stops(self):
@@ -383,11 +451,11 @@ class ProfileLifecycleTests(unittest.TestCase):
                 events.append(("launch", path))
 
             def keyboard(path, nonce, binary):
-                ui.PackageProfile.open(nonce, roots)
+                ui.PackageProfile.open(nonce, roots, home)
                 events.append(("keyboard", path, nonce, binary))
                 return True, True
 
-            with patch.object(ui, "profile_roots", return_value=roots), patch.object(ui, "probe_permissions", side_effect=probe), \
+            with patch.object(ui, "home_directory", return_value=home), patch.object(ui, "probe_permissions", side_effect=probe), \
                     patch.object(smoke, "macos_bridge_build", side_effect=build), \
                     patch.object(smoke, "launch_smoke", side_effect=plain_launch), \
                     patch.object(smoke, "macos_keyboard_launch", side_effect=keyboard), \
@@ -404,8 +472,9 @@ class ProfileLifecycleTests(unittest.TestCase):
 
     def test_permission_failure_stops_before_any_profile_or_launch(self):
         with tempfile.TemporaryDirectory() as folder:
-            roots = ui.profile_roots(temp_home(folder))
-            with patch.object(ui, "profile_roots", return_value=roots), \
+            home = temp_home(folder)
+            roots = ui.profile_roots(home)
+            with patch.object(ui, "home_directory", return_value=home), \
                     patch.object(smoke, "macos_bridge_build", return_value=Path(folder) / "bridge"), \
                     patch.object(ui, "probe_permissions", side_effect=ui.DiagnosticFailure("permission_unavailable")), \
                     patch.object(smoke, "launch_smoke") as launch, patch.object(smoke, "macos_keyboard_launch") as keyboard:
@@ -418,14 +487,15 @@ class ProfileLifecycleTests(unittest.TestCase):
     def test_smoke_retains_the_profile_unless_both_stops_are_verified(self):
         for case in ("plain_launch_failed", "driver_unverified_stop", "driver_report_invalid"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as folder:
-                roots = ui.profile_roots(temp_home(folder))
+                home = temp_home(folder)
+                roots = ui.profile_roots(home)
                 captured = io.StringIO()
                 launch = Mock(side_effect=RuntimeError("startup") if case == "plain_launch_failed" else None)
                 if case == "driver_report_invalid":
                     keyboard = Mock(side_effect=RuntimeError("Missing or ambiguous installed keyboard evidence"))
                 else:
                     keyboard = Mock(return_value=(False, False))
-                with patch.object(ui, "profile_roots", return_value=roots), patch.object(ui, "probe_permissions"), \
+                with patch.object(ui, "home_directory", return_value=home), patch.object(ui, "probe_permissions"), \
                         patch.object(smoke, "macos_bridge_build", return_value=Path(folder) / "bridge"), \
                         patch.object(smoke, "launch_smoke", launch), patch.object(smoke, "macos_keyboard_launch", keyboard), \
                         patch.object(smoke, "record"), contextlib.redirect_stdout(captured):
@@ -438,10 +508,11 @@ class ProfileLifecycleTests(unittest.TestCase):
 
     def test_existing_profile_is_refused_before_any_launch(self):
         with tempfile.TemporaryDirectory() as folder:
-            roots = ui.profile_roots(temp_home(folder))
+            home = temp_home(folder)
+            roots = ui.profile_roots(home)
             (roots[0] / "accounts").mkdir(parents=True)
             (roots[0] / "accounts" / "db").write_bytes(b"account")
-            with patch.object(ui, "profile_roots", return_value=roots), patch.object(ui, "probe_permissions"), \
+            with patch.object(ui, "home_directory", return_value=home), patch.object(ui, "probe_permissions"), \
                     patch.object(smoke, "macos_bridge_build", return_value=Path(folder) / "bridge"), \
                     patch.object(smoke, "launch_smoke") as launch, patch.object(smoke, "macos_keyboard_launch") as keyboard:
                 with self.assertRaises(RuntimeError):
@@ -716,7 +787,7 @@ class BridgeProtocolTests(unittest.TestCase):
         statuses = {"value": status}
         with patch.object(ui.subprocess, "Popen", return_value=child) as popen, \
                 patch.object(smoke, "process_status", side_effect=lambda process: statuses["value"]), \
-                patch.object(smoke, "stop_process", side_effect=stop or (lambda process: None)) as stopper:
+                patch.object(ui, "stop_group", side_effect=stop or (lambda process: None)) as stopper:
             try:
                 bridge = ui.Bridge(["/work/morpheus-ax-bridge"], diagnostics, environment=dict(HOSTED))
             except BaseException:
@@ -731,7 +802,7 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertEqual(kwargs["stderr"], ui.subprocess.DEVNULL)
         self.assertEqual(kwargs["env"]["ImageOS"], "macos15")
         self.assertEqual(popen.call_args.args[0], ["/work/morpheus-ax-bridge"])
-        with patch.object(smoke, "process_status", return_value=None), patch.object(smoke, "stop_process") as stop:
+        with patch.object(smoke, "process_status", return_value=None), patch.object(ui, "stop_group") as stop:
             bridge.close()
         stop.assert_called_once_with(child)
         child.release()
@@ -747,7 +818,7 @@ class BridgeProtocolTests(unittest.TestCase):
             self.assertEqual(stops, [5151])
 
     def test_spawn_failure_leaves_nothing_to_stop(self):
-        with patch.object(ui.subprocess, "Popen", side_effect=OSError("missing")), patch.object(smoke, "stop_process") as stop:
+        with patch.object(ui.subprocess, "Popen", side_effect=OSError("missing")), patch.object(ui, "stop_group") as stop:
             with self.assertRaises(OSError):
                 ui.Bridge(["/work/morpheus-ax-bridge"], ui.Diagnostics({}), environment={})
         stop.assert_not_called()
@@ -755,7 +826,7 @@ class BridgeProtocolTests(unittest.TestCase):
     def test_stop_failure_propagates_instead_of_pretending(self):
         bridge, child, _, _, _ = self.start(b'{"ok":true,"ready":true}\n')
         with patch.object(smoke, "process_status", return_value=None), \
-                patch.object(smoke, "stop_process", side_effect=RuntimeError("Smoke app did not stop")):
+                patch.object(ui, "stop_group", side_effect=RuntimeError("Smoke app did not stop")):
             with self.assertRaises(RuntimeError):
                 bridge.close()
         child.release()
@@ -770,7 +841,7 @@ class BridgeProtocolTests(unittest.TestCase):
             self.assertEqual(error.exception.code, "bridge_overflow")
             self.assertEqual(bridge.replies.qsize(), 1)
             self.assertIsNone(bridge.replies.get_nowait())
-        with patch.object(smoke, "process_status", return_value=0), patch.object(smoke, "stop_process"):
+        with patch.object(smoke, "process_status", return_value=0), patch.object(ui, "stop_group"):
             bridge.close()
         child.release()
 
@@ -792,7 +863,7 @@ class BridgeProtocolTests(unittest.TestCase):
             bridge.reader.join(timeout=2)
             self.assertFalse(bridge.reader.is_alive())
         finally:
-            with patch.object(smoke, "process_status", return_value=0), patch.object(smoke, "stop_process"):
+            with patch.object(smoke, "process_status", return_value=0), patch.object(ui, "stop_group"):
                 bridge.close()
             child.release()
 
@@ -846,60 +917,120 @@ class BridgeProtocolTests(unittest.TestCase):
 class CloseAndCleanupTests(unittest.TestCase):
     executable = "/Applications/Morpheus.app/Contents/MacOS/morpheus-app"
 
-    live = table((PID, PID, PID, "S+"))
+    live = table((PID, PID, "S+"))
 
-    def close(self, statuses, after, close_reply=None, owned=True, before=None):
+    def close(self, statuses, after, close_reply=None, owned=True, before=None, session=None):
         diagnostics = ui.Diagnostics({})
         bridge = fake_bridge(diagnostics, close=close_reply)
         process = Mock(pid=PID, returncode=None)
         proc = OwnershipTests.Proc({PID: self.executable if owned else "/usr/bin/true"})
         with patch.object(smoke, "process_status", side_effect=statuses):
             ui.normal_close(bridge, process, diagnostics, self.executable, self.live if before is None else before,
-                            after, proc, seconds=0.5)
+                            after, proc, (lambda pid: PID) if session is None else session, seconds=0.5)
         return bridge, diagnostics
 
     def test_normal_close_requires_zero_exit_and_an_empty_live_group(self):
         # Before: the live leader; after: only its unreaped zombie remains in the group.
-        bridge, diagnostics = self.close([None, 0], table((PID, PID, PID, "Z")))
+        bridge, diagnostics = self.close([None, 0], table((PID, PID, "Z")))
         self.assertEqual([command["op"] for command in bridge.commands], ["close"])
-        for statuses, after, expected in [([None, 3], table((PID, PID, PID, "Z")), "exit_status"),
-                                          ([None, -15], table((PID, PID, PID, "Z")), "exit_status"),
+        for statuses, after, expected in [([None, 3], table((PID, PID, "Z")), "exit_status"),
+                                          ([None, -15], table((PID, PID, "Z")), "exit_status"),
                                           ([None] * 100, self.live, "exit_status"),
-                                          ([None, 0], table((PID, PID, PID, "Z"), (PID + 1, PID, PID, "S")), "process_remaining")]:
+                                          ([None, 0], table((PID, PID, "Z"), (PID + 1, PID, "S")), "process_remaining")]:
             with self.subTest(statuses=statuses, after=after), self.assertRaises(ui.DiagnosticFailure) as error:
                 self.close(statuses, after)
             self.assertEqual(error.exception.code, expected)
 
     def test_close_is_refused_when_the_pid_no_longer_runs_the_installed_executable(self):
-        for arrangement in ({"owned": False}, {"before": table((PID, 1, PID, "S"))}, {"before": table((PID, PID, PID, "Z"))}):
-            with self.subTest(arrangement=arrangement), self.assertRaises(ui.DiagnosticFailure) as error:
-                self.close([None, 0], table((PID, PID, PID, "Z")), **arrangement)
+        for arrangement in ({"owned": False}, {"before": table((PID, 1, "S"))}, {"before": table((PID, PID, "Z"))},
+                            {"session": lambda pid: 1}, {"session": lambda pid: None}):
+            with self.subTest(arrangement=list(arrangement)), self.assertRaises(ui.DiagnosticFailure) as error:
+                self.close([None, 0], table((PID, PID, "Z")), **arrangement)
             self.assertEqual(error.exception.code, "ownership_lost")
         diagnostics = ui.Diagnostics({})
         bridge = fake_bridge(diagnostics)
         with patch.object(smoke, "process_status", return_value=None):
             with self.assertRaises(ui.DiagnosticFailure):
                 ui.normal_close(bridge, Mock(pid=PID), diagnostics, self.executable, self.live, self.live,
-                                OwnershipTests.Proc({PID: "/usr/bin/true"}))
+                                OwnershipTests.Proc({PID: "/usr/bin/true"}), lambda pid: PID)
         self.assertEqual(bridge.commands, [])  # No close button press toward an unowned process.
 
     def test_close_button_failures_map_to_fixed_tokens(self):
         for reply, expected in [({"ok": False, "error": "window_count"}, "window_count"),
                                 ({"ok": False, "error": "close_unavailable"}, "bridge_invalid")]:
             with self.subTest(reply=reply), self.assertRaises(ui.DiagnosticFailure) as error:
-                self.close([None, 0], table((PID, PID, PID, "Z")), close_reply=reply)
+                self.close([None, 0], table((PID, PID, "Z")), close_reply=reply)
             self.assertEqual(error.exception.code, expected)
+
+    def stop(self, statuses, tables, process=None):
+        """stop_group with scripted leader statuses, scripted table reads and recorded group signals."""
+        process = Mock(pid=PID, returncode=None) if process is None else process
+        signals = []
+        values = list(tables)
+
+        def read_table():
+            # Scripted reads; the last value repeats for as long as the bound allows.
+            value = values.pop(0) if len(values) > 1 else values[0]
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        with patch.object(smoke, "process_status", side_effect=statuses), \
+                patch.object(smoke, "signal_process_group", side_effect=lambda target, sig: signals.append((target.pid, sig))), \
+                patch.object(ui.time, "sleep"):
+            ui.stop_group(process, read_table, seconds=0.5)
+        return process, signals
+
+    def test_stop_group_proves_the_group_empty_before_the_anchored_leader_is_reaped(self):
+        # The leader exits on TERM; one member outlives it for one table read, then
+        # only the leader's zombie remains, and only then is the leader reaped.
+        process = Mock(pid=PID, returncode=None)
+        process.wait.side_effect = lambda timeout: setattr(process, "returncode", 0)
+        process, signals = self.stop([None, None, 0], [table((PID, PID, "Z"), (PID + 1, PID, "S")), table((PID, PID, "Z"))],
+                                     process)
+        self.assertEqual(signals, [(PID, ui.signal.SIGTERM), (PID, ui.signal.SIGKILL)])
+        process.wait.assert_called_once_with(timeout=0.5)
+        process.poll.assert_not_called()
+
+    def test_stop_group_leaves_the_leader_anchored_when_a_member_remains_or_the_table_is_unknown(self):
+        survivor = table((PID, PID, "Z"), (PID + 1, PID, "S"))
+        for tables in ([survivor], [smoke.subprocess.CalledProcessError(1, "ps")], [OSError("ps")]):
+            with self.subTest(tables=type(tables[0]).__name__), self.assertRaises(ui.DiagnosticFailure) as error:
+                self.stop([None, 0], tables)
+            self.assertEqual(error.exception.code, "process_remaining")
+        process = Mock(pid=PID, returncode=None)
+        with self.assertRaises(ui.DiagnosticFailure):
+            self.stop([None, 0], [survivor], process)
+        process.wait.assert_not_called()  # The group ID stays anchored for the retained-profile report.
+
+    def test_stop_group_rejects_a_reaped_leader_and_a_leader_that_never_stops(self):
+        # smoke.process_status itself refuses a reaped leader before any signal.
+        process = Mock(pid=PID, returncode=0)
+        with patch.object(smoke, "signal_process_group") as signalled:
+            with self.assertRaises(RuntimeError):
+                ui.stop_group(process, lambda: [], seconds=0.5)
+        signalled.assert_not_called()
+        process = Mock(pid=PID, returncode=None)
+        process.wait.side_effect = lambda timeout: None  # Reaping recorded no status.
+        with self.assertRaises(RuntimeError):
+            self.stop(lambda target: None, [table((PID, PID, "Z"))], process)
+
+    def test_bridge_close_and_acceptance_cleanup_stop_through_the_group_proof(self):
+        source = SOURCE.read_text(encoding="utf-8")
+        self.assertNotIn("smoke.stop_process(", source)
+        self.assertEqual(source.count("stop_group(self.process)"), 1)
+        self.assertEqual(source.count("stop_group(process)"), 1)
 
     def test_acceptance_keeps_the_leader_unreaped_until_cleanup_and_never_touches_the_profile(self):
         with tempfile.TemporaryDirectory() as folder:
             home = temp_home(folder)
             roots = ui.profile_roots(home)
-            ui.PackageProfile.create(NONCE, roots)
+            ui.PackageProfile.create(NONCE, roots, home)
             executable = bundle(folder)
             bridge_binary = Path(folder) / "bridge"
             bridge_binary.write_bytes(b"binary")
             bridge_binary.chmod(0o700)
-            for stop_error, expected_cleanup in [(None, "passed"), (RuntimeError("Smoke app did not stop"), "failed")]:
+            for stop_error, expected_cleanup in [(None, "passed"), (ui.DiagnosticFailure("process_remaining"), "failed")]:
                 record = {}
                 trace = ui.Diagnostics(record)
                 process = Mock(pid=PID, returncode=None)
@@ -913,18 +1044,18 @@ class CloseAndCleanupTests(unittest.TestCase):
                         raise stop_error
 
                 with patch.object(ui, "guard"), patch.object(smoke, "require_nonreaping_wait"), \
-                        patch.object(ui, "profile_roots", return_value=roots), \
+                        patch.object(ui, "home_directory", return_value=home), \
                         patch.object(ui, "Bridge", return_value=bridge), patch.object(ui, "check_permissions"), \
                         patch.object(ui.subprocess, "Popen", return_value=process), \
                         patch.object(ui, "owned_mac_pid", return_value=True), \
                         patch.object(ui, "owned_window", side_effect=ui.DiagnosticFailure("window_count")), \
-                        patch.object(smoke, "stop_process", side_effect=stop), \
+                        patch.object(ui, "stop_group", side_effect=stop), \
                         patch.object(smoke, "process_status", return_value=None):
-                    with self.subTest(cleanup=expected_cleanup), \
-                            self.assertRaises(RuntimeError if stop_error else ui.DiagnosticFailure):
+                    with self.subTest(cleanup=expected_cleanup), self.assertRaises(ui.DiagnosticFailure) as error:
                         ui.acceptance(executable, NONCE, bridge_binary, record, trace)
                 self.assertEqual(order, ["bridge", "app"])  # The app anchor is released last.
-                self.assertEqual(trace.value["failure"], "window_count")
+                self.assertEqual(error.exception.code, "process_remaining" if stop_error else "window_count")
+                self.assertEqual(trace.value["failure"], "window_count")  # The first failure position is kept.
                 self.assertEqual(trace.value["cleanup"], expected_cleanup)
                 self.assertTrue(trace.value["profile_owned"])
                 self.assertTrue((roots[0] / ui.MARKER).exists())
@@ -935,18 +1066,18 @@ class CloseAndCleanupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             home = temp_home(folder)
             roots = ui.profile_roots(home)
-            ui.PackageProfile.create(NONCE, roots)
+            ui.PackageProfile.create(NONCE, roots, home)
             executable = bundle(folder)
             bridge_binary = Path(folder) / "bridge"
             bridge_binary.write_bytes(b"binary")
             bridge_binary.chmod(0o700)
             process = Mock(pid=PID, returncode=None)
             with patch.object(ui, "guard"), patch.object(smoke, "require_nonreaping_wait"), \
-                    patch.object(ui, "profile_roots", return_value=roots), patch.object(ui, "Bridge"), \
+                    patch.object(ui, "home_directory", return_value=home), patch.object(ui, "Bridge"), \
                     patch.object(ui, "check_permissions"), patch.object(ui, "OWNERSHIP_SECONDS", 0.2), \
                     patch.object(ui.subprocess, "Popen", return_value=process) as popen, \
                     patch.object(ui, "owned_mac_pid", return_value=False), \
-                    patch.object(smoke, "process_status", return_value=None), patch.object(smoke, "stop_process"):
+                    patch.object(smoke, "process_status", return_value=None), patch.object(ui, "stop_group"):
                 with self.assertRaises(ui.DiagnosticFailure) as error:
                     ui.acceptance(executable, NONCE, bridge_binary, {}, ui.Diagnostics({}))
             self.assertEqual(error.exception.code, "install_state")

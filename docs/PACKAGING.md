@@ -253,24 +253,38 @@ profile from `HOME`, then the passwd entry, to `~/Library/Application
 Support/io.github.brk275.Morpheus` (configuration file and account store at
 its root) and `~/Library/Caches/io.github.brk275.Morpheus`. The smoke
 requires `HOME` to be the runner account's real home, never redirects it,
-refuses to continue if either project folder exists or is a symbolic link,
-creates both folders with a marker file carrying the run nonce, and seeds only
-`config.toml` with a 110% font scale. Both launches share that profile; the
-driver only proves the markers. The smoke removes the two folders only after
-the plain launch stopped and the driver reported a verified stop; otherwise
-the synthetic profile is retained and the smoke fails. The Library folders
-themselves are never created or removed.
+requires every folder from the home down to each Library base (`~`,
+`~/Library`, `~/Library/Application Support`, `~/Library/Caches`) to be a
+plain directory rather than a symbolic link before any create, open or
+remove, refuses to continue if either project folder exists or is a symbolic
+link, creates both folders with a marker file carrying the run nonce, and
+seeds only `config.toml` with a 110% font scale. Both launches share that
+profile; the driver only proves the markers. The smoke removes the two
+folders only after the plain launch stopped and the driver reported a
+verified stop; otherwise the synthetic profile is retained and the smoke
+fails. The Library folders themselves are never created or removed, and a
+redirected ancestor stops the removal as well, so foreign material behind a
+link is never deleted. Folders above the home are not checked.
 
 **Containment.** macOS has no job object. The application is started with its
 own session and process group; the leader stays an unreaped child (`waitid`
 with `WNOWAIT`) until every cleanup signal and the final accessibility action
 have happened, so its PID and group ID cannot be recycled under the check.
-Ownership is proven from the kernel process table (own group and session,
-not a zombie) and `proc_pidpath` of the PID against the installed bundle
+Ownership is proven from three independent reads of the PID: group and
+non-zombie state from the kernel process table (`ps -axo pid=,pgid=,stat=`),
+the session from `getsid`, and `proc_pidpath` against the installed bundle
 executable; the bridge additionally checks the running application's bundle
-identifier and executable URL before attaching. The bridge itself is a child
-in its own group, stopped through the same group-signalling path. Nothing is
-launched through `open` or LaunchServices.
+identifier and executable URL before attaching. Darwin's `ps` prints the
+session structure's kernel address under `sess` (Apple adv_cmds
+`ps/keyword.c`), never the session ID, so that column is not read. Stopping
+either group (the bridge's or the application's) signals the group with TERM
+and then KILL while the leader is still an unreaped child, reads the process
+table while that PID still names the group, and reaps the leader only once no
+live member remains; a member alive at the bound, or a table that cannot be
+read, is the fixed failure `process_remaining`, the leader stays anchored,
+cleanup is reported as failed and the smoke retains the profile. A descendant
+that moved itself to another group is outside this proof. Nothing is launched
+through `open` or LaunchServices.
 
 **Flow.** After one on-screen window owned by the process exists, the bridge
 takes bounded snapshots of that process's accessibility tree only (recorded

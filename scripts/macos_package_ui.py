@@ -15,8 +15,10 @@ Containment primitives: macOS has no job object. The application starts with
 start_new_session, so it leads its own process group and session; the leader
 stays an unreaped child (waitid with WNOWAIT) until every cleanup signal and
 the final accessibility action have happened, so its PID and group ID cannot
-be recycled under us; group members are read from the kernel's process table
-and signalled with killpg; the executable behind the PID is read with
+be recycled under us; the session comes from getsid (Darwin ps prints a kernel
+address under "sess", not the session ID), group and state come from the
+kernel's process table, groups are signalled with killpg and proven empty
+before the leader is reaped, and the executable behind the PID is read with
 proc_pidpath and compared with the installed bundle executable.
 """
 
@@ -30,6 +32,7 @@ import queue
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -57,6 +60,7 @@ ACCEPTANCE_SECONDS = 180
 BRIDGE_REPLY_SECONDS = 20
 BRIDGE_EXIT_SECONDS = 5
 OWNERSHIP_SECONDS = 5
+STOP_SECONDS = 5
 WAIT_SECONDS = 12
 BRIDGE_LINE_BOUND = 4 * 1024 * 1024
 BRIDGE_QUEUE_BOUND = 4
@@ -177,6 +181,28 @@ def plain_directory(path):
     return path.is_dir() and not symlink(path)
 
 
+def plain_ancestors(home, root):
+    """Every directory from the home down to the profile root's parent is a plain directory.
+
+    Checking only the project folder and its Library base would let a symbolic
+    link higher up (~/Library itself) redirect every create, open and remove
+    into foreign material. Folders above the home are the account's own and are
+    not checked.
+    """
+    try:
+        relative = root.parent.relative_to(home)
+    except ValueError:
+        return False
+    current = home
+    if not plain_directory(current):
+        return False
+    for part in relative.parts:
+        current = current / part
+        if not plain_directory(current):
+            return False
+    return True
+
+
 def profile_roots(home=None):
     home = home_directory() if home is None else home
     return [home / base / PROJECT_DIR for base in LIBRARY_BASES]
@@ -190,10 +216,11 @@ class PackageProfile:
     marker file carrying the run nonce in each root proves the roots are this
     run's; any other existing profile material is refused and never read,
     inspected or deleted. The Library bases are the account's real folders and
-    are never created or removed here.
+    are never created or removed here, and every folder from the home down to
+    each base must be a plain directory before any create, open or remove.
     """
-    def __init__(self, roots, nonce):
-        self.roots, self.nonce = list(roots), nonce
+    def __init__(self, roots, nonce, home):
+        self.roots, self.nonce, self.home = list(roots), nonce, Path(home)
         self.config = self.roots[0] / "config.toml"
 
     @staticmethod
@@ -201,17 +228,18 @@ class PackageProfile:
         return type(nonce) is str and re.fullmatch(r"[0-9a-f]{32}", nonce) is not None
 
     @classmethod
-    def create(cls, nonce=None, roots=None):
+    def create(cls, nonce=None, roots=None, home=None):
         nonce = secrets.token_hex(16) if nonce is None else nonce
         smoke.require(cls.valid_nonce(nonce), "Invalid package smoke profile nonce")
-        roots = profile_roots() if roots is None else list(roots)
+        home = home_directory() if home is None else Path(home)
+        roots = profile_roots(home) if roots is None else list(roots)
         for root in roots:
-            smoke.require(plain_directory(root.parent), "Runner Library folder is missing or redirected")
+            smoke.require(plain_ancestors(home, root), "Runner Library folder is missing or redirected")
             # Anything at the project path, including a symbolic link, may hold
             # or redirect to real profile or vault material: refuse, never inspect.
             smoke.require(not symlink(root) and not root.exists(),
                           "Refusing an existing application profile on this runner")
-        profile = cls(roots, nonce)
+        profile = cls(roots, nonce, home)
         created = []
         try:
             for root in roots:
@@ -229,12 +257,13 @@ class PackageProfile:
         return profile
 
     @classmethod
-    def open(cls, nonce, roots=None):
+    def open(cls, nonce, roots=None, home=None):
         require_ui(cls.valid_nonce(nonce), "profile_invalid")
-        roots = profile_roots() if roots is None else list(roots)
-        profile = cls(roots, nonce)
+        home = home_directory() if home is None else Path(home)
+        roots = profile_roots(home) if roots is None else list(roots)
+        profile = cls(roots, nonce, home)
         for root in roots:
-            require_ui(plain_directory(root.parent) and plain_directory(root), "profile_invalid")
+            require_ui(plain_ancestors(home, root) and plain_directory(root), "profile_invalid")
             try:
                 marker = (root / MARKER).read_text(encoding="ascii")
             except (OSError, UnicodeError):
@@ -245,7 +274,7 @@ class PackageProfile:
 
     def remove(self):
         for root in self.roots:
-            smoke.require(not symlink(root) and plain_directory(root.parent),
+            smoke.require(not symlink(root) and plain_ancestors(self.home, root),
                           "Refusing to remove a redirected profile root")
             if root.exists():
                 try:
@@ -301,35 +330,91 @@ def executable_of(pid, library=None):
 
 
 def process_table(snapshot=None):
-    """(pid, pgid, sess, state) rows of the live process table."""
+    """(pid, pgid, state) rows of the live process table.
+
+    The session is deliberately not read from ps: Darwin's ps formats "sess" as
+    the kernel address of the session structure (adv_cmds ps/keyword.c), which
+    never equals a PID. Sessions come from session_of; a line with any other
+    column count is malformed and skipped.
+    """
     if snapshot is None:
-        snapshot = subprocess.run(["ps", "-axo", "pid=,pgid=,sess=,stat="], check=True, capture_output=True,
+        snapshot = subprocess.run(["ps", "-axo", "pid=,pgid=,stat="], check=True, capture_output=True,
                                   text=True, timeout=5).stdout
     rows = []
     for line in snapshot.splitlines():
         parts = line.split()
-        if len(parts) < 4 or not all(part.isdigit() for part in parts[:3]):
+        if len(parts) != 3 or not all(part.isdigit() for part in parts[:2]):
             continue
-        rows.append((int(parts[0]), int(parts[1]), int(parts[2]), parts[3]))
+        rows.append((int(parts[0]), int(parts[1]), parts[2]))
     return rows
+
+
+def session_of(pid):
+    """The kernel's session ID of pid through getsid, or None when it cannot be read."""
+    try:
+        return os.getsid(pid)
+    except OSError:
+        return None
 
 
 def group_members(leader, table=None):
     """Live (non-zombie) members of the leader's process group, including the leader."""
     table = process_table() if table is None else table
-    return [row for row in table if row[1] == leader and not row[3].startswith("Z")]
+    return [row for row in table if row[1] == leader and not row[2].startswith("Z")]
 
 
-def owned_mac_pid(pid, leader, executable, table=None, library=None):
-    """pid leads its own group and session as our unreaped child and runs the installed executable."""
+def owned_mac_pid(pid, leader, executable, table=None, library=None, session=None):
+    """pid leads its own group and session as our unreaped child and runs the installed executable.
+
+    Group and state come from the process table, the session from getsid and
+    the executable from libproc: three independent reads of the same PID.
+    """
     rows = [row for row in (process_table() if table is None else table) if row[0] == pid]
     if len(rows) != 1:
         return False
-    _, pgid, sess, state = rows[0]
-    if pgid != leader or sess != leader or state.startswith("Z"):
+    _, pgid, state = rows[0]
+    if pgid != leader or state.startswith("Z"):
+        return False
+    if (session_of(pid) if session is None else session(pid)) != leader:
         return False
     path = executable_of(pid, library)
     return path is not None and path == Path(executable)
+
+
+def stop_group(process, read_table=None, seconds=STOP_SECONDS):
+    """Stop the leader's whole group and prove it empty while the leader stays anchored.
+
+    smoke.stop_process reaps the leader as soon as it has exited, which
+    releases the group ID before anyone has looked for surviving members. Here
+    the group is signalled with TERM, then KILL, while the leader remains our
+    unreaped child, so its PID still names this group and no other when the
+    process table is read; only a table with no live member left in the group
+    lets the leader be reaped. A table that cannot be read, or a member still
+    alive at the bound, is a bounded failure (process_remaining) that leaves
+    the leader anchored, so the smoke retains the profile.
+    """
+    read_table = process_table if read_table is None else read_table
+    smoke.process_status(process)  # Reject an already-reaped, unowned PID.
+    try:
+        smoke.signal_process_group(process, signal.SIGTERM)
+        deadline = time.monotonic() + seconds
+        while smoke.process_status(process) is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+    finally:
+        # A leader may exit on TERM while descendants ignore it.
+        smoke.signal_process_group(process, signal.SIGKILL)
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            remaining = group_members(process.pid, read_table())
+        except (OSError, ValueError, subprocess.SubprocessError):
+            raise DiagnosticFailure("process_remaining") from None
+        if not remaining:
+            break
+        require_ui(time.monotonic() < deadline, "process_remaining")
+        time.sleep(0.05)
+    process.wait(timeout=seconds)
+    smoke.require(process.returncode is not None, "Smoke app did not stop")
 
 
 def bridge_command(binary):
@@ -434,8 +519,8 @@ class Bridge:
                     deadline = time.monotonic() + BRIDGE_EXIT_SECONDS
                     while smoke.process_status(self.process) is None and time.monotonic() < deadline:
                         time.sleep(0.05)
-                # Signals the group, waits, then reaps the leader last.
-                smoke.stop_process(self.process)
+                # Signals the group, proves it empty, then reaps the leader last.
+                stop_group(self.process)
         finally:
             with contextlib.suppress(OSError, ValueError):
                 if self.stdin is not None:
@@ -723,16 +808,17 @@ def owned_window(bridge, process, diagnostics, seconds=30):
         time.sleep(0.25)
 
 
-def normal_close(bridge, process, diagnostics, executable, table=None, after_table=None, library=None, seconds=15):
+def normal_close(bridge, process, diagnostics, executable, table=None, after_table=None, library=None, session=None,
+                 seconds=15):
     """Press the owned window's close button, then require exit status zero and an empty live group.
 
     The leader stays unreaped throughout, so the status is read with WNOWAIT and
     the group ID still names this launch when its members are counted. `table`
     is the process table before the close, `after_table` the one after exit;
-    both default to live reads.
+    both default to live reads, as does the `session` read.
     """
     diagnostics.operation("ownership")
-    require_ui(owned_mac_pid(process.pid, process.pid, executable, table, library), "ownership_lost")
+    require_ui(owned_mac_pid(process.pid, process.pid, executable, table, library, session), "ownership_lost")
     diagnostics.operation("close_request")
     try:
         bridge.call({"op": "close"}, allow_error=True)
@@ -807,8 +893,9 @@ def acceptance(executable, nonce, bridge_binary, report, diagnostics=None):
     finally:
         # Preserve the first failure position if bounded cleanup also fails.
         # The profile is never touched here: the smoke removes it only after
-        # this process reported a verified stop (cleanup passed). The app's
-        # leader is signalled with its group and reaped last.
+        # this process reported a verified stop (cleanup passed). Each group
+        # is signalled and proven empty while its leader is still anchored;
+        # the app's leader is reaped last, and never while a member remains.
         failure = None
         try:
             if bridge is not None:
@@ -817,7 +904,7 @@ def acceptance(executable, nonce, bridge_binary, report, diagnostics=None):
             failure = error
         try:
             if process is not None:
-                smoke.stop_process(process)
+                stop_group(process)
         except Exception as error:  # noqa: BLE001
             failure = failure or error
         if failure is None:
