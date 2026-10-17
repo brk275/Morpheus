@@ -94,7 +94,9 @@ published. A selector pass that could not read one node's child count (libatspi
 reports an unanswered `ChildCount` call as `-1` without an error) or that
 skipped a node for a transient IPC error is not evidence: the driver counts it
 and runs another pass within the existing wait, so only a complete traversal of
-the owned tree can match a label or report ambiguity.
+the owned tree can match a label, report ambiguity or establish keyboard focus.
+Only libatspi's exact `-1` sentinel is treated this way; any other invalid
+length still fails the run.
 
 On Linux startup failure, a bounded private-log reducer may report a fixed
 loader-error category and a reviewed literal library name. It requires exit

@@ -479,6 +479,106 @@ class SequenceDiagnosticTests(unittest.TestCase):
                 raise IndexError
             return self.children[index]
 
+    def test_only_the_exact_minus_one_sentinel_is_retryable(self):
+        # at-spi2-core documents -1 alone; anything else is not a known signal
+        # and keeps failing closed through len().
+        for count in (-2, -2147483648):
+            sequence = self.Sequence([], count=count)
+            diagnostics = ui.Diagnostics({})
+            with self.assertRaises(ValueError) as error:
+                list(ui.ObservedSequence(sequence, diagnostics, "node"))
+            diagnostics.failed(error.exception)
+            self.assertEqual(sequence.calls, ["count"])
+            self.assertEqual(diagnostics.value["operation"], "node_child_count")
+            self.assertEqual(diagnostics.value["failure"], "value_error")
+            self.assertEqual(diagnostics.value["child_count_unavailable"], 0)
+        with self.assertRaises(TypeError):
+            list(ui.ObservedSequence(self.Sequence([], count="PRIVATE_LENGTH"), ui.Diagnostics({}), "node"))
+
+    def test_ownership_lost_mid_tree_marks_the_pass_incomplete(self):
+        hidden = self.Node("PRIVATE_HIDDEN")
+        child = self.Node("PRIVATE_CHILD", [hidden])
+        app = self.Node("PRIVATE_APP", [child])
+        driver = fake_driver([app])
+        answers = iter([True, True, False])
+        driver.owned = lambda _: next(answers)
+        self.assertEqual(list(driver.nodes()), [app])
+        self.assertTrue(driver.pass_incomplete)
+        self.assertEqual(child.cleared, 1)
+        self.assertEqual(hidden.cleared, 0)
+        self.assertTrue(driver.diagnostics.value["owned_node_seen"])
+
+    def focused(self, name, state_error=None):
+        node = Mock()
+        node.name = name
+        if state_error is None:
+            node.getState.return_value.contains.return_value = True
+        else:
+            node.getState.side_effect = state_error
+        return node
+
+    def test_focus_from_an_incomplete_pass_is_refused_then_retried(self):
+        driver = fake_driver([])
+        driver.api.STATE_FOCUSED = object()
+        focused = self.focused("Account menu")
+        passes = []
+
+        def nodes():
+            passes.append(len(passes))
+            driver.pass_incomplete = len(passes) == 1
+            yield focused
+
+        driver.nodes = nodes
+        with self.assertRaises(ui.IncompleteTraversal) as error:
+            driver.focused_name()
+        self.assertIsInstance(error.exception, LookupError)
+        self.assertEqual(driver.diagnostics.value["incomplete_passes"], 1)
+        with patch.object(smoke, "process_status", return_value=None):
+            self.assertTrue(driver.expect_focus("Account menu"))
+        self.assertEqual(passes, [0, 1])
+        self.assertEqual(driver.diagnostics.value["incomplete_passes"], 1)
+
+    def test_state_read_failure_marks_focus_pass_incomplete(self):
+        driver = fake_driver([])
+        driver.api.STATE_FOCUSED = object()
+        unreadable = self.focused("PRIVATE_UNREADABLE", state_error=driver.transient_error())
+        driver.nodes = lambda: iter([unreadable, self.focused("Account menu")])
+        with self.assertRaises(ui.IncompleteTraversal):
+            driver.focused_name()
+        self.assertNotIn("PRIVATE", json.dumps(driver.diagnostics.value))
+
+    def test_two_focused_nodes_fail_even_when_the_pass_is_incomplete(self):
+        driver = fake_driver([])
+        driver.api.STATE_FOCUSED = object()
+
+        def nodes():
+            driver.pass_incomplete = True
+            yield self.focused("Account menu")
+            yield self.focused("Settings")
+
+        driver.nodes = nodes
+        with self.assertRaises(RuntimeError) as error:
+            driver.focused_name()
+        self.assertNotIsInstance(error.exception, LookupError)
+        self.assertEqual(driver.diagnostics.value["incomplete_passes"], 0)
+
+    def test_persistent_focus_gap_ends_as_wait_timeout(self):
+        driver = fake_driver([])
+        driver.api.STATE_FOCUSED = object()
+
+        def stalled():
+            driver.pass_incomplete = True
+            yield self.focused("Account menu")
+
+        driver.nodes = stalled
+        with patch.object(smoke, "process_status", return_value=None), \
+                patch.object(ui.time, "monotonic", side_effect=[0.0, 0.0, 0.1, 0.2, 100.0]), \
+                patch.object(ui.time, "sleep"):
+            with self.assertRaises(ui.DiagnosticFailure) as error:
+                driver.expect_focus("Account menu")
+        self.assertEqual(error.exception.code, "wait_timeout")
+        self.assertEqual(driver.diagnostics.value["incomplete_passes"], 2)
+
     def test_unavailable_child_count_skips_only_that_subtree_and_marks_pass_incomplete(self):
         hidden = self.Node("PRIVATE_HIDDEN")
         stalled = self.Node("PRIVATE_STALLED", [hidden], count=-1)
