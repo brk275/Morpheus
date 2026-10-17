@@ -896,13 +896,11 @@ fn apply_config(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
     shortcuts::apply_config(ui, config);
     audio_devices::apply_config(ui, config);
     image_previews::apply_config(ui, config);
-    let mode = match config.appearance.theme {
-        ThemeMode::Dark => 0,
-        ThemeMode::Light => 1,
-        ThemeMode::HighContrast => 2,
-        ThemeMode::System => 3,
-    };
-    ui.set_theme_mode(mode);
+    // The theme mode follows the window's active account: its configured
+    // override, else the global appearance. Only this accepted configuration
+    // replaces the remembered preferences.
+    appearance::remember_theme_preferences(config);
+    appearance::apply_theme_mode(ui);
     ui.set_font_scale_percent(config.appearance.scale_percent.into());
     ui.set_density_mode(match config.appearance.density {
         Density::Compact => 0,
