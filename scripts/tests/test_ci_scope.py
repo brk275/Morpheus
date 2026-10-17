@@ -2,7 +2,8 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from scripts.ci_scope import MACOS, PLATFORMS, WAYLAND_UNRELATED_NATIVE_INPUTS, changed_paths, classify
+from scripts.ci_scope import (MACOS, PLATFORMS, WAYLAND_UNRELATED_NATIVE_INPUTS,
+                              WAYLAND_UNRELATED_THEME_INPUTS, changed_paths, classify)
 
 
 class ScopeTests(unittest.TestCase):
@@ -30,11 +31,28 @@ class ScopeTests(unittest.TestCase):
                         "packaging/linux/appimage_peer.rs", "scripts/run_wayland_acceptance.py",
                         "scripts/wayland_fixture_backend.py", "scripts/element_process_namespace.py",
                         "crates/morpheus-rtc/tests/support/pipewire_probe.rs", "new-build-input.conf",
-                        "crates/morpheus-app/src/new-input.rs", "scripts/new-input.py"):
+                        "crates/morpheus-app/src/new-input.rs", "scripts/new-input.py",
+                        "themes/unknown.toml", "themes/Cargo.toml", "themes/build.rs"):
             with self.subTest(path=changed):
                 result = classify([theme, changed])
                 self.assertEqual(result["native_matrix"]["os"], list(PLATFORMS))
                 self.assertTrue(result["wayland"])
+
+    def test_shipped_theme_data_keeps_app_checks_without_unrelated_portal_fixture(self):
+        themes = {"themes/aurora.toml", "themes/nocturne.toml",
+                  "themes/paper.toml", "themes/terminal.toml"}
+        self.assertEqual(WAYLAND_UNRELATED_THEME_INPUTS, themes)
+        for path in sorted(themes):
+            with self.subTest(path=path):
+                self.assertTrue(classify([path])["config"])
+                self.assertFalse(classify([path])["native"])
+                combined = classify([path, "crates/morpheus-app/src/appearance.rs"])
+                self.assertEqual(combined["native_matrix"]["os"], list(PLATFORMS))
+                self.assertFalse(combined["wayland"])
+                self.assertTrue(classify([path], force_all=True)["wayland"])
+        combined = classify(sorted(themes | WAYLAND_UNRELATED_NATIVE_INPUTS))
+        self.assertEqual(combined["native_matrix"]["os"], list(PLATFORMS))
+        self.assertFalse(combined["config"] or combined["wayland"])
 
     def test_wayland_requires_linux_and_forced_full_always_selects_it(self):
         for paths in ([], ["README.md"], ["themes/aurora.toml"], ["scripts/ci_scope.py"],

@@ -12,6 +12,12 @@ runtime, workflow or unknown inputs select that fixture conservatively; manual
 full verification always includes it. An omitted development check does not
 clear its existing failed release gate.
 
+The four shipped theme TOML files are also outside that standalone fixture's
+inputs. Theme-only edits retain configuration checks; combining those exact
+files with app appearance edits retains all four native targets and Linux
+Matrix acceptance. Unknown theme files and mixed build/dependency changes
+continue to select the system fixture conservatively.
+
 Pull requests now produce the same fictional native preview captures as main
 pushes. Their images and provenance require review before publication in the
 gallery. Installers remain excluded from workflow uploads.
