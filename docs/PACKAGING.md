@@ -65,7 +65,7 @@ override is deliberately not used for release packages.
 | Target | Automated checks |
 | --- | --- |
 | macOS Apple Silicon and Intel | Verify and mount the DMG read-only without interaction; copy the app into a temporary Applications directory; check native Mach-O architecture, bundle identifier/version, microphone/camera/screen purpose strings, exact license and theme contents; launch the installed executable for 12 seconds, stop it, remove the app, detach the DMG. |
-| Windows x64 | Silently install NSIS into a temporary path containing spaces; check x64 PE32+ GUI subsystem, license/theme and Add/Remove Programs registration/version; require the installed process to survive 12 seconds and create a Win32 window with its visible flag set; close/stop the process, run the real silent uninstaller and verify application directory and registration removal. |
+| Windows x64 | Silently install NSIS into a temporary path containing spaces; check x64 PE32+ GUI subsystem, license/theme and Add/Remove Programs registration/version; require the installed process to survive 12 seconds and create a Win32 window with its visible flag set; close/stop the process. Then relaunch the same installed executable for the bounded keyboard/UI Automation check below, and afterwards run the real silent uninstaller and verify application directory and registration removal. |
 | Linux x64 DEB | Resolve/install the DEB in a fresh Ubuntu 24.04 container with no compiler or library development packages; verify declared ABI floors and `libxi6`, direct shared libraries and dynamic loading of `libXi.so.6` **before** adding Xvfb; check ELF architecture/symbol floors, desktop entry/icon and license/theme; launch as an unprivileged user under X11/Xvfb for 12 seconds and require a visible window owned by that launch; stop the process and purge the package. |
 | Linux x64 AppImage | In a separate fresh Ubuntu 24.04 container with a minimal X11 desktop runtime, inspect the extracted metadata/resources/ELF, then launch the **AppImage itself** as an unprivileged user using its extract-and-run runtime (no FUSE mount); require a visible window owned by that launch and 12-second survival. Only then install accessibility test tools and relaunch the same package for the bounded keyboard/AT-SPI checks below. Remove the portable file. No DEB is installed in this container. |
 
@@ -142,6 +142,74 @@ not claim keyboard-only entry.
 The check does not cover the DEB's UI, Wayland, VoiceOver or Narrator. No native
 media device or permission prompt is exercised.
 
+#### Installed Windows keyboard and UI Automation check
+
+`scripts/windows_package_ui.py` runs only on a fresh standard GitHub-hosted
+`windows-2025` runner (`RUNNER_ENVIRONMENT=github-hosted`, `ImageOS=win25`),
+after the plain visible-window smoke of the same installed executable passed
+and before the uninstaller runs. It uses Windows built-ins only: Windows
+PowerShell 5.1 with the `System.Windows.Automation` client assemblies and
+`SendInput`, driven through [`scripts/windows_package_ui.ps1`](../scripts/windows_package_ui.ps1).
+No tool is installed or downloaded.
+
+The release executable resolves its profile through the shell known folders
+(`RoamingAppData\brk275\Morpheus` for configuration and the account store,
+`LocalAppData\brk275\Morpheus` for local data and cache), never through
+`APPDATA`-style environment variables, and its debug-only profile override is
+compiled out. The driver resolves the same known folders, refuses to start if
+either `brk275` organization folder, Morpheus root, or a reparse point at those
+paths already exists, seeds only `config\config.toml` with a 110% font scale,
+and removes exactly the directories it created. It never reads, redirects or
+deletes existing profile or vault material and never changes registry or shell
+settings. No account is used and no credential is entered.
+
+The app starts inside a kernel job object (assigned before its first
+instruction, kill-on-close) so every descendant is accounted for. After one
+owned visible window appears, the bridge takes bounded raw-view snapshots of
+that window's UI Automation tree only (5000 nodes maximum). A snapshot in which
+any node could not be read or stopped belonging to the owned process is
+incomplete and is retried within the existing wait; a partial pass can still
+reject two matches as ambiguous but can never establish a label or focus. Then:
+
+- Checks that `Homeserver URL` and `Matrix ID or username` are edit controls
+  and that `Password` is an edit control with the UI Automation password flag.
+  No value, text or value pattern is ever requested from any field.
+- Focuses the preview action through UI Automation and presses Return as a
+  real key, entering the fictional offline preview without signing in.
+- Repeats the Linux account-menu sequence with real Return, Space, Tab,
+  Shift+Tab and Escape keys: menu open, dismissal with focus return, keyboard
+  reachability of Manage accounts through menu choices only, modal Tab order
+  and Escape back to the trigger. Before every key the focused element must
+  belong to the owned process and the bridge must observe the exact owned
+  window handle and process as the foreground window; one
+  `SetForegroundWindow` recovery is attempted and counted, otherwise the run
+  fails rather than typing toward another window.
+- Opens Settings and reaches `Increase font scale` with bounded real Tab
+  presses (160 maximum), checking the owned focused name after each one.
+  Settings rows below the fold are clipped out of the accessibility tree until
+  focus reveals them, so the driver never waits for the distant scale label
+  first. Once focused, it checks the `110%` row label, presses Space, checks
+  `120%`, and reads the saved TOML for `scale_percent = 120`.
+- Posts a normal `WM_CLOSE` to the owned window after reverifying its owner,
+  requires exit status zero within 15 seconds and zero active processes in the
+  job, then releases the job and removes the synthetic profile. Forced job
+  termination on failure never counts as a normal close.
+
+The whole driver and bridge stream stays private; only the fixed JSON record
+with reviewed phase tokens, booleans and bounded counts (`selector_matches`,
+`incomplete_passes`, `foreground_recoveries`, `bounded_snapshots`) is printed
+and validated by the smoke before it is accepted. Names, values, handles,
+process identifiers, paths and raw PowerShell or application output are never
+published. It has a 180-second deadline inside the smoke's 360-second launcher
+bound.
+
+This is focused UI Automation/keyboard coverage, **not Narrator acceptance**,
+whole-app keyboard reachability, live account or credential-vault behavior,
+the installed-settings file watcher (the invalid-TOML edit check exists only
+on Linux), signing or installer UI. It requires the hosted runner's
+interactive desktop; a session without one fails closed at the foreground
+check instead of sending input elsewhere.
+
 After applicable native jobs and cache posts finish, review their results and
 run only the affected ordinary package check with `platform=linux`,
 `linux_formats=appimage`, `appimage_updates=false`, `appimage_capture=false`.
@@ -157,7 +225,7 @@ contact is missing. Debian's release checks remain open.
 These checks are implemented automation, not evidence that a particular
 candidate passed. A successful run establishes only the checks listed above
 for its exact source and package hashes. macOS startup is process liveness;
-the Windows visible-window flag and virtual X11 window do not establish visual
+the Windows visible-window flag, UI Automation tree and virtual X11 window do not establish visual
 quality or complete accessibility. Signing/notarization, installer UI, full desktop
 integration, real account/credential-vault behavior, native media permissions,
 Wayland, hardware, updates and rollback remain release acceptance gates.
