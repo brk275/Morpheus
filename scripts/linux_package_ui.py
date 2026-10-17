@@ -121,7 +121,9 @@ class ObservedSequence:
         # Call the bound __len__ directly: len() would turn libatspi's -1 into
         # a ValueError before the sentinel can be recognized.
         count = type(self.accessible).__len__(self.accessible)
-        if isinstance(count, int) and count < 0:
+        # Exactly -1 is libatspi's documented sentinel. Any other negative or
+        # non-integer length is unexpected and still fails closed through len().
+        if isinstance(count, int) and count == -1:
             self.diagnostics.count("child_count_unavailable")
             raise ChildCountUnavailable()
         return count
@@ -198,6 +200,10 @@ class AccessibleUI:
                             yield node
                             self.diagnostics.operation("node_children")
                             pending.extend(list(ObservedSequence(node, self.diagnostics, "node")))
+                        else:
+                            # The application was owned when this pass began;
+                            # losing that proof mid-tree leaves its subtree unseen.
+                            self.pass_incomplete = True
                     except (LookupError, self.transient_error):
                         self.pass_incomplete = True
                         continue
@@ -251,8 +257,14 @@ class AccessibleUI:
                 if node.getState().contains(self.api.STATE_FOCUSED):
                     found.append(node.name or "")
             except self.transient_error:
+                self.pass_incomplete = True
                 continue
+        # Two focused nodes are ambiguous whatever else the pass missed; a pass
+        # that skipped any node could hide a second one, so it is not evidence.
         smoke.require(len(found) <= 1, "Installed accessibility focus is ambiguous")
+        if getattr(self, "pass_incomplete", False):
+            self.diagnostics.count("incomplete_passes")
+            raise IncompleteTraversal()
         return found[0] if found else None
 
     def expect_focus(self, name, *, prefix=False):
