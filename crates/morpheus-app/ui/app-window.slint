@@ -22,6 +22,11 @@ export struct ThemeRoleSet {
     destructive: ColorRole,
     destructive-ink: ColorRole,
     voice: ColorRole,
+    timestamp: ColorRole,
+    sender: ColorRole,
+    message: ColorRole,
+    own-message: ColorRole,
+    own-surface: ColorRole,
 }
 
 // Runtime geometry shared by small reusable controls and the main view.
@@ -812,6 +817,9 @@ export component AppWindow inherits Window {
     in-out property <bool> color-message-senders: false;
     in-out property <[color]> sender-palette;
     in-out property <int> nickname-width-px: 128;
+    in-out property <bool> nickname-brackets: false;
+    in-out property <int> nickname-alignment: 1; // 0 left, 1 right
+    callback choose-nickname-alignment(int);
     in-out property <string> appearance-ui-font-input;
     in-out property <string> appearance-message-font-input;
     in-out property <string> appearance-mono-font-input;
@@ -831,6 +839,34 @@ export component AppWindow inherits Window {
         let clock = root.timestamp-format == 1 ? message.time-24h
             : root.timestamp-format == 2 ? message.time-24h-seconds : message.time;
         return clock == "" ? "" : root.timestamp-brackets ? "[" + clock + "]" : clock;
+    }
+    // Halloy-style nickname column decoration. Accessible labels keep the
+    // plain name, so the brackets are visual only.
+    pure function nickname-column-label(sender: string) -> string {
+        return root.nickname-brackets ? "<" + sender + ">" : sender;
+    }
+    // Message text and surface precedence: selection first, then the sender
+    // palette for names, then own-message roles from real is-own metadata,
+    // then the plain roles, then the legacy ink/muted/transparent colors.
+    pure function clock-ink(selected: bool) -> color {
+        return selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color
+            : StyleTokens.roles.timestamp.present ? StyleTokens.roles.timestamp.color : root.muted;
+    }
+    pure function sender-ink(selected: bool, own: bool, palette-index: int, accent: color) -> color {
+        return selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color
+            : root.color-message-senders ? (root.sender-palette.length > 0 ? root.sender-palette[mod(palette-index, max(1, root.sender-palette.length))] : accent)
+            : own && StyleTokens.roles.own-message.present ? StyleTokens.roles.own-message.color
+            : StyleTokens.roles.sender.present ? StyleTokens.roles.sender.color : root.ink;
+    }
+    pure function body-ink(selected: bool, own: bool) -> color {
+        return selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color
+            : own && StyleTokens.roles.own-message.present ? StyleTokens.roles.own-message.color
+            : StyleTokens.roles.message.present ? StyleTokens.roles.message.color : root.ink;
+    }
+    pure function row-surface(selected: bool, hovered: bool, own: bool, idle: color) -> color {
+        return selected ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover)
+            : hovered ? root.elevated
+            : own && StyleTokens.roles.own-surface.present ? StyleTokens.roles.own-surface.color : idle;
     }
 
     in-out property <string> config-error;
@@ -2123,7 +2159,7 @@ export component AppWindow inherits Window {
                                 - (root.show-message-avatars ? self.avatar-size + (root.message-layout == 0 ? 10px : 7px) : 0px)
                                 - (self.columns ? self.column-width + 7px + (message-row.show-time ? root.timestamp-width-px * 1px * root.text-scale + 7px : 0px) : 0px));
                             min-height: max(28px + 2 * root.message-row-gap, root.show-message-avatars ? self.avatar-size + 2 * root.message-row-gap : 0px);
-                            background: message-row.selected-message ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : message-hover.has-hover ? root.elevated : transparent;
+                            background: root.row-surface(message-row.selected-message, message-hover.has-hover, message.is-own, transparent);
                             message-hover := TouchArea { mouse-cursor: default; }
                             message-flow := HorizontalLayout {
                                 padding-left: root.content-inset; padding-right: root.content-inset;
@@ -2137,15 +2173,16 @@ export component AppWindow inherits Window {
                                 }
                                 if message-row.columns && message-row.show-time : Text {
                                     width: root.timestamp-width-px * 1px * root.text-scale; text: message-row.time-label;
-                                    color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.muted; font-family: root.monospace-font-family;
+                                    color: root.clock-ink(message-row.selected-message); font-family: root.monospace-font-family;
                                     font-size: 10px * root.text-scale; overflow: elide;
                                     accessible-label: message-row.time-label;
                                 }
                                 if message-row.columns : Text {
-                                    width: message-row.column-width; text: message.sender;
-                                    color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.color-message-senders ? (root.sender-palette.length > 0 ? root.sender-palette[mod(message.sender-palette-index, max(1, root.sender-palette.length))] : message.accent) : root.ink;
+                                    width: message-row.column-width; text: root.nickname-column-label(message.sender);
+                                    color: root.sender-ink(message-row.selected-message, message.is-own, message.sender-palette-index, message.accent);
                                     font-family: root.message-font-family; font-size: root.message-font-px;
-                                    font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 650; horizontal-alignment: right; overflow: elide;
+                                    font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 650;
+                                    horizontal-alignment: root.nickname-alignment == 0 ? TextHorizontalAlignment.left : TextHorizontalAlignment.right; overflow: elide;
                                     accessible-label: message.sender;
                                 }
                                 message-content := VerticalLayout {
@@ -2158,13 +2195,13 @@ export component AppWindow inherits Window {
                                         spacing: 8px;
                                         if message-row.tight-header : Text {
                                             text: message.sender + (message-row.show-time && message-row.time-label != "" ? " · " + message-row.time-label : "");
-                                            color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.color-message-senders ? (root.sender-palette.length > 0 ? root.sender-palette[mod(message.sender-palette-index, max(1, root.sender-palette.length))] : message.accent) : root.ink;
+                                            color: root.sender-ink(message-row.selected-message, message.is-own, message.sender-palette-index, message.accent);
                                             font-family: root.message-font-family; font-size: root.message-font-px;
                                             font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 650; overflow: elide; vertical-alignment: top;
                                             accessible-label: message.sender + (message-row.show-time && message-row.time-label != "" ? ", " + message-row.time-label : "");
                                         }
                                         if !message-row.tight-header : Text {
-                                            text: message.sender; color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.color-message-senders ? (root.sender-palette.length > 0 ? root.sender-palette[mod(message.sender-palette-index, max(1, root.sender-palette.length))] : message.accent) : root.ink;
+                                            text: message.sender; color: root.sender-ink(message-row.selected-message, message.is-own, message.sender-palette-index, message.accent);
                                             font-family: root.message-font-family;
                                             font-size: root.message-layout == 0 ? root.message-font-px : max(10px, root.message-font-px - 2px);
                                             font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 650; overflow: elide;
@@ -2172,7 +2209,7 @@ export component AppWindow inherits Window {
                                             accessible-label: message.sender;
                                         }
                                         if !message-row.tight-header && message-row.show-time : Text {
-                                            text: message-row.time-label; color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.muted; font-family: root.monospace-font-family;
+                                            text: message-row.time-label; color: root.clock-ink(message-row.selected-message); font-family: root.monospace-font-family;
                                             font-size: 10px * root.text-scale; vertical-alignment: center;
                                             horizontal-stretch: 0;
                                         }
@@ -2192,7 +2229,7 @@ export component AppWindow inherits Window {
                                     StyledText {
                                         width: max(0px, message-content.width - (message-row.columns ? message-row.action-width + 8px : 0px));
                                         text: message.rich-body;
-                                        default-color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink;
+                                        default-color: root.body-ink(message-row.selected-message, message.is-own);
                                         default-font-size: root.message-font-px;
                                         default-font-family: root.message-font-family;
                                         link-color: message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : StyleTokens.roles.link.present ? StyleTokens.roles.link.color : root.accent;
@@ -2769,6 +2806,31 @@ export component AppWindow inherits Window {
                                 Text { text: root.timestamp-brackets ? "On" : "Off"; color: root.accent; font-size: 12px * root.text-scale; }
                             }
                         }
+                        ActionRect {
+                            height: 42px * root.text-scale;
+                            label: "Nickname angle brackets" + (root.nickname-brackets ? ", on" : ", off");
+                            background: self.has-hover ? root.hover : root.elevated; border-radius: StyleTokens.radius * 0.8; focus-color: root.accent;
+                            activated => { root.set-style-flag(4, !root.nickname-brackets); }
+                            HorizontalLayout { padding: 12px; spacing: 8px;
+                                Text { text: "Nickname angle brackets"; color: root.ink; font-size: 12px * root.text-scale; horizontal-stretch: 1; }
+                                Text { text: root.nickname-brackets ? "On" : "Off"; color: root.accent; font-size: 12px * root.text-scale; }
+                            }
+                        }
+                        Text { text: "Nickname alignment"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+                        HorizontalLayout {
+                            spacing: 10px;
+                            for name[index] in ["Left", "Right"] : ActionRect {
+                                width: 142px; height: 40px; border-radius: StyleTokens.radius * 0.9;
+                                label: "Nickname alignment: " + name + (root.nickname-alignment == index ? ", selected" : "");
+                                background: root.nickname-alignment == index ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : self.has-hover ? root.hover : root.elevated;
+                                border-width: root.nickname-alignment == index ? 1px : 0px; border-color: root.accent; focus-color: root.accent;
+                                activated => { root.choose-nickname-alignment(index); }
+                                Text { text: name; color: root.nickname-alignment == index && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink;
+                                    font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
+                            }
+                        }
+                        Text { text: "Brackets and alignment apply to the nickname column in Columns layout. Screen readers hear the plain name.";
+                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
                         StyleNumberSetting { label: "Timestamp column width"; value: root.timestamp-width-px; minimum: 48; maximum: 160; step: 4;
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
                             changed-value(value) => { root.change-style-number(6, value); } }
@@ -3927,10 +3989,10 @@ export component AppWindow inherits Window {
                             spacing: 10px;
                             alignment: start;
                             vertical-stretch: 0;
-                            Text { text: root.thread-root-sender; color: root.ink; font-size: 12px * root.text-scale; font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 750; vertical-stretch: 0; }
+                            Text { text: root.thread-root-sender; color: StyleTokens.roles.sender.present ? StyleTokens.roles.sender.color : root.ink; font-size: 12px * root.text-scale; font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 750; vertical-stretch: 0; }
                             StyledText {
                                 text: root.thread-root-rich-body;
-                                default-color: root.ink;
+                                default-color: StyleTokens.roles.message.present ? StyleTokens.roles.message.color : root.ink;
                                 default-font-size: 12px * root.text-scale;
                                 link-color: StyleTokens.roles.link.present ? StyleTokens.roles.link.color : root.accent;
                                 accessible-role: text;
@@ -3943,14 +4005,14 @@ export component AppWindow inherits Window {
                                 property <string> time-label: root.message-time-label(reply);
                                 min-height: 43px;
                                 vertical-stretch: 0;
-                                background: root.elevated;
+                                background: root.row-surface(false, false, reply.is-own, root.elevated);
                                 border-radius: StyleTokens.radius * 0.8;
                                 VerticalLayout {
                                     padding: min(12px, root.content-inset); spacing: max(2px, root.message-row-gap);
-                                    Text { text: reply.sender + ((root.show-message-timestamps || reply.time == "Sending…" || reply.time == "Failed to send") && thread-reply.time-label != "" ? " · " + thread-reply.time-label : ""); color: root.color-message-senders ? (root.sender-palette.length > 0 ? root.sender-palette[mod(reply.sender-palette-index, max(1, root.sender-palette.length))] : reply.accent) : root.ink; font-size: 11px * root.text-scale; font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 700; wrap: word-wrap; }
+                                    Text { text: reply.sender + ((root.show-message-timestamps || reply.time == "Sending…" || reply.time == "Failed to send") && thread-reply.time-label != "" ? " · " + thread-reply.time-label : ""); color: root.sender-ink(false, reply.is-own, reply.sender-palette-index, reply.accent); font-size: 11px * root.text-scale; font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 700; wrap: word-wrap; }
                                     StyledText {
                                         text: reply.rich-body;
-                                        default-color: root.ink;
+                                        default-color: root.body-ink(false, reply.is-own);
                                         default-font-size: root.message-font-px;
                                         default-font-family: root.message-font-family;
                                         link-color: StyleTokens.roles.link.present ? StyleTokens.roles.link.color : root.accent;

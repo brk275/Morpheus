@@ -139,6 +139,8 @@ edit, so spelling mistakes do not silently become inactive settings.
 | `chat.timestamp_width` | `72` | 48–160 logical pixels before text scaling; timestamp gutter in Columns layout |
 | `chat.color_senders` | `false` | Use the current sender palette for name text |
 | `chat.nickname_width` | `128` | 64–240; desired nickname column width |
+| `chat.nickname_brackets` | `false` | Show the Columns nickname as `<name>`; the accessible name stays plain |
+| `chat.nickname_alignment` | `"right"` | `"left"` or `"right"`; text alignment inside the Columns nickname column |
 
 Font names must be nonblank, at most 128 UTF-8 bytes, and contain no control or
 direction-format characters. The app selects installed font families; it does
@@ -182,7 +184,10 @@ When the conversation is narrower than 640 logical pixels, or 640 multiplied by
 a text scale above 100%, columns uses a compact header. A timestamp width above
 72 adds the extra scaled width to that threshold, preserving message/action
 space. Nickname columns also
-stay within 20% of the conversation width. Pane sizes contribute to the minimum
+stay within 20% of the conversation width. **Nickname angle brackets** and
+**Nickname alignment** in Settings → Appearance decorate and align that column
+only; stacked and compact headers, thread replies and every accessible label
+keep the plain name. The Terminal preset turns brackets on. Pane sizes contribute to the minimum
 window width, preserving at least 360 logical pixels for the main content.
 Hide the details panel or reduce the pane widths for a smaller workspace.
 
@@ -219,6 +224,8 @@ timestamp_brackets = true
 timestamp_width = 88
 color_senders = true
 nickname_width = 112
+nickname_brackets = true
+nickname_alignment = "right"
 ```
 
 The appearance controls cover the main conversation, navigation, composer and
@@ -311,6 +318,11 @@ also include `[roles]` and `[senders]`. These belong in the theme TOML beside
 | `destructive` | Destructive-action backgrounds and logout text |
 | `destructive_ink` | Their text |
 | `voice` | Voice-room icons and labels |
+| `timestamp` | Timeline and thread clock text; omitted keeps the muted color |
+| `sender` | Sender names while colored sender names are off; omitted keeps ink |
+| `message` | Message body text; omitted keeps ink |
+| `own_message` | Name and body text of your own messages in the timeline and thread replies; omitted falls back to `sender`, `message`, then ink. Thread-root headings carry no ownership data and use `sender` and `message` |
+| `own_surface` | Row background of your own messages when the row is neither selected nor hovered; omitted keeps rows transparent |
 
 For example, keep the `[colors]` table from the dark Nocturne theme and set
 these optional sections in that theme file:
@@ -332,6 +344,11 @@ unread_ink = "#201733"
 destructive = "#F1A1AC"
 destructive_ink = "#39141F"
 voice = "#9DD8CD"
+timestamp = "#A5AFBE"
+sender = "#E8EDF2"
+message = "#E8EDF2"
+own_message = "#F3F6FA"
+own_surface = "#20283A"
 
 [senders]
 colors = ["#C2AEFA", "#9DD8CD", "#F0C28F", "#ACCEFF", "#E7AED1", "#C7D59B"]
@@ -341,7 +358,13 @@ All colors must be `#RRGGBB`; names, transparency values and malformed strings
 are rejected. `senders.colors` accepts **1–16 colors**. An empty list is invalid;
 omit it to restore the previous sender colors. Repeated colors and a one-color
 palette are allowed. Sender colors apply when **Settings → Appearance → Colored
-sender names** is on (`chat.color_senders = true`). This palette changes name text,
+sender names** is on (`chat.color_senders = true`). It takes precedence over the
+`sender` and `own_message` roles for name text. Selection colors take precedence
+over every message role on a selected row, and hover keeps its surface over
+`own_surface`. Own-message styling follows the account that sent the event, not
+a display name. Loading a theme replaces the whole role set, so a role the new
+file omits falls back to ink, muted or a transparent row as if it were never
+set. This palette changes name text,
 in timeline messages and thread replies, independently of avatar backgrounds,
 account badges and Space identity colors. Thread-root headings and search
 result authors retain their existing text colors, with selection colors when

@@ -171,6 +171,7 @@ impl Config {
                 self.chat.show_avatars = false;
                 self.chat.color_senders = true;
                 self.chat.nickname_width = 112;
+                self.chat.nickname_brackets = true;
                 self.layout.room_list_width = 220;
                 self.layout.details_width = 240;
                 self.layout.show_member_panel = false;
@@ -532,6 +533,18 @@ pub struct ChatStyle {
     pub timestamp_width: u16,
     pub color_senders: bool,
     pub nickname_width: u16,
+    /// Wrap the Columns nickname as `<name>`; accessible names stay plain.
+    pub nickname_brackets: bool,
+    /// Text alignment inside the Columns nickname column.
+    pub nickname_alignment: NicknameAlignment,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NicknameAlignment {
+    Left,
+    #[default]
+    Right,
 }
 
 impl Default for ChatStyle {
@@ -545,6 +558,8 @@ impl Default for ChatStyle {
             timestamp_width: 72,
             color_senders: false,
             nickname_width: 128,
+            nickname_brackets: false,
+            nickname_alignment: NicknameAlignment::Right,
         }
     }
 }
@@ -1298,10 +1313,27 @@ pub struct ThemeRoles {
     pub destructive_ink: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub voice: Option<String>,
+    /// Timeline and thread clock text; omitted keeps the muted color.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+    /// Sender names when the sender palette is off; omitted keeps ink.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
+    /// Message body text; omitted keeps ink.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Name and body text of the account's own messages; omitted falls back
+    /// to `sender` and `message`, then ink. The sender palette still wins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub own_message: Option<String>,
+    /// Row background of the account's own messages when neither selected
+    /// nor hovered; omitted keeps rows transparent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub own_surface: Option<String>,
 }
 
 impl ThemeRoles {
-    pub fn entries(&self) -> [(&'static str, Option<&str>); 15] {
+    pub fn entries(&self) -> [(&'static str, Option<&str>); 20] {
         [
             ("error", self.error.as_deref()),
             ("error_surface", self.error_surface.as_deref()),
@@ -1318,6 +1350,11 @@ impl ThemeRoles {
             ("destructive", self.destructive.as_deref()),
             ("destructive_ink", self.destructive_ink.as_deref()),
             ("voice", self.voice.as_deref()),
+            ("timestamp", self.timestamp.as_deref()),
+            ("sender", self.sender.as_deref()),
+            ("message", self.message.as_deref()),
+            ("own_message", self.own_message.as_deref()),
+            ("own_surface", self.own_surface.as_deref()),
         ]
     }
 
@@ -2104,6 +2141,12 @@ mod tests {
                 config.appearance.theme_pack.as_deref(),
                 Some(preset.theme_name())
             );
+            assert_eq!(
+                config.chat.nickname_brackets,
+                preset == BuiltInStylePreset::Terminal,
+                "only the Terminal preset brackets nicknames"
+            );
+            assert_eq!(config.chat.nickname_alignment, NicknameAlignment::Right);
             styles.push((
                 config.chat.layout,
                 config.geometry.corner_radius,
@@ -2167,7 +2210,27 @@ mod tests {
         assert_eq!(partial.roles.link.as_deref(), Some("#123456"));
         assert_eq!(partial.roles.selection, None);
         assert_eq!(partial.roles.error, None);
+        assert_eq!(partial.roles.timestamp, None);
+        assert_eq!(partial.roles.own_surface, None);
         assert_eq!(partial.senders.colors, None);
+        let message_roles = format!(
+            "{encoded}\n[roles]\ntimestamp = '#A5AFBE'\nsender = '#E8EDF2'\nmessage = '#E8EDF2'\nown_message = '#F3F6FA'\nown_surface = '#20283A'\n"
+        );
+        let message_roles: ThemePack = toml::from_str(&message_roles).unwrap();
+        message_roles.validate().unwrap();
+        assert_eq!(message_roles.roles.own_surface.as_deref(), Some("#20283A"));
+        assert_eq!(message_roles.roles.entries().len(), 20);
+        for field in [
+            "timestamp",
+            "sender",
+            "message",
+            "own_message",
+            "own_surface",
+        ] {
+            let bad: ThemePack =
+                toml::from_str(&format!("{encoded}\n[roles]\n{field} = 'tomato'\n")).unwrap();
+            assert!(bad.validate().is_err(), "{field} must be #RRGGBB");
+        }
     }
 
     #[test]
@@ -2309,11 +2372,10 @@ mod tests {
                     4.5,
                 );
             }
-            for background in surfaces
-                .into_iter()
-                .map(String::as_str)
-                .chain([roles.selection.as_deref().unwrap()])
-            {
+            for background in surfaces.into_iter().map(String::as_str).chain([
+                roles.selection.as_deref().unwrap(),
+                roles.own_surface.as_deref().unwrap(),
+            ]) {
                 assert_contrast(
                     &theme.name,
                     roles.focus.as_deref().unwrap(),
@@ -2321,6 +2383,23 @@ mod tests {
                     3.0,
                 );
             }
+            // Message text roles draw on the row surfaces and on an own-message
+            // surface; selected rows switch every text to selection_ink instead.
+            for foreground in [
+                &roles.timestamp,
+                &roles.sender,
+                &roles.message,
+                &roles.own_message,
+            ] {
+                for background in surfaces
+                    .into_iter()
+                    .map(String::as_str)
+                    .chain([roles.own_surface.as_deref().unwrap()])
+                {
+                    assert_contrast(&theme.name, foreground.as_deref().unwrap(), background, 4.5);
+                }
+            }
+            assert_ne!(roles.own_surface, Some(theme.colors.canvas.clone()));
             assert_contrast(
                 &theme.name,
                 roles.voice.as_deref().unwrap(),
@@ -2447,6 +2526,38 @@ mod tests {
                 let encoded = toml::to_string_pretty(&config).unwrap();
                 assert_eq!(toml::from_str::<Config>(&encoded).unwrap(), config);
             }
+        }
+        for (text, brackets, alignment) in [
+            ("schema_version=1", false, NicknameAlignment::Right),
+            (
+                "[chat]\nnickname_brackets=true",
+                true,
+                NicknameAlignment::Right,
+            ),
+            (
+                "[chat]\nnickname_brackets=true\nnickname_alignment='left'",
+                true,
+                NicknameAlignment::Left,
+            ),
+            (
+                "[chat]\nnickname_alignment='right'",
+                false,
+                NicknameAlignment::Right,
+            ),
+        ] {
+            let config: Config = toml::from_str(text).unwrap();
+            config.validate().unwrap();
+            assert_eq!(config.chat.nickname_brackets, brackets);
+            assert_eq!(config.chat.nickname_alignment, alignment);
+            let encoded = toml::to_string_pretty(&config).unwrap();
+            assert_eq!(toml::from_str::<Config>(&encoded).unwrap(), config);
+        }
+        for text in [
+            "[chat]\nnickname_alignment='center'",
+            "[chat]\nnickname_alignment=1",
+            "[chat]\nnickname_brackets='yes'",
+        ] {
+            assert!(toml::from_str::<Config>(text).is_err(), "{text}");
         }
         for text in [
             "[typography]\nsender_weight=0",

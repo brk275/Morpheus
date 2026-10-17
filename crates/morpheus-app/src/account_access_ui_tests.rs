@@ -454,12 +454,94 @@ async fn assert_palette_and_density_keyboard(ui: &AppWindow) {
         }
     }
 
+    assert_nickname_controls_keyboard(ui).await;
+
     // These choices are always enabled in the product. Existing sign-in tests
     // cover the shared ActionRect's disabled-retained-focus activation guard.
     // Keep later account scenarios on the same window with their prior state.
     ui.on_choose_theme(|_| {});
     ui.on_choose_density(|_| {});
     apply_config(ui, &Config::default(), None);
+    ui.set_page(0);
+    settle(ui).await;
+}
+
+/// Nickname brackets and alignment reach the generated window from the
+/// configuration and stay keyboard-editable through the real controls; the
+/// accessible names of the controls carry their state, never a message.
+async fn assert_nickname_controls_keyboard(ui: &AppWindow) {
+    use morpheus_config::NicknameAlignment;
+    use std::{cell::RefCell, rc::Rc};
+
+    let flags = Rc::new(RefCell::new(Vec::new()));
+    let observed = flags.clone();
+    let weak = ui.as_weak();
+    ui.on_set_style_flag(move |field, value| {
+        observed.borrow_mut().push((field, value));
+        if field == 4 {
+            weak.upgrade().unwrap().set_nickname_brackets(value);
+        }
+    });
+    let alignments = Rc::new(RefCell::new(Vec::new()));
+    let observed = alignments.clone();
+    let weak = ui.as_weak();
+    ui.on_choose_nickname_alignment(move |index| {
+        observed.borrow_mut().push(index);
+        weak.upgrade().unwrap().set_nickname_alignment(index);
+    });
+
+    // Defaults keep the previous presentation: plain names, right-aligned.
+    apply_config(ui, &Config::default(), None);
+    assert!(!ui.get_nickname_brackets());
+    assert_eq!(ui.get_nickname_alignment(), 1);
+    let mut config = Config::default();
+    config.chat.nickname_brackets = true;
+    config.chat.nickname_alignment = NicknameAlignment::Left;
+    apply_config(ui, &config, None);
+    assert!(ui.get_nickname_brackets());
+    assert_eq!(ui.get_nickname_alignment(), 0);
+    config.apply_style_preset(BuiltInStylePreset::Terminal);
+    apply_config(ui, &config, None);
+    assert!(
+        ui.get_nickname_brackets(),
+        "the Terminal preset brackets nicknames"
+    );
+    assert_eq!(ui.get_nickname_alignment(), 1);
+    apply_config(ui, &Config::default(), None);
+
+    ui.set_page(1);
+    settle(ui).await;
+    tab_to_control(ui, "Nickname angle brackets, off");
+    key(ui, Key::Space);
+    assert_eq!(flags.borrow().as_slice(), &[(4, true)]);
+    assert!(ui.get_nickname_brackets());
+    assert!(focused_control_has_label(ui, "Nickname angle brackets, on"));
+    key(ui, Key::Return);
+    assert_eq!(flags.borrow().as_slice(), &[(4, true), (4, false)]);
+    assert!(focused_control_has_label(
+        ui,
+        "Nickname angle brackets, off"
+    ));
+
+    tab_to_control(ui, "Nickname alignment: Left");
+    key(ui, Key::Return);
+    assert_eq!(alignments.borrow().as_slice(), &[0]);
+    assert_eq!(ui.get_nickname_alignment(), 0);
+    assert!(focused_control_has_label(
+        ui,
+        "Nickname alignment: Left, selected"
+    ));
+    tab_to_control(ui, "Nickname alignment: Right");
+    key(ui, Key::Space);
+    assert_eq!(alignments.borrow().as_slice(), &[0, 1]);
+    assert_eq!(ui.get_nickname_alignment(), 1);
+    assert!(focused_control_has_label(
+        ui,
+        "Nickname alignment: Right, selected"
+    ));
+
+    ui.on_set_style_flag(|_, _| {});
+    ui.on_choose_nickname_alignment(|_| {});
     ui.set_page(0);
     settle(ui).await;
 }

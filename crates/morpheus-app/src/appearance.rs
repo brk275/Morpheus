@@ -2,7 +2,7 @@
 
 use morpheus_config::{
     BuiltInStylePreset, Config, ConfigStore, ConversationHeaderMode, MessageLayout, NavigationMode,
-    ThemePack, TimestampFormat,
+    NicknameAlignment, ThemePack, TimestampFormat,
 };
 use slint::fontique_011::fontique;
 use slint::{ComponentHandle, ModelRc, VecModel};
@@ -46,6 +46,11 @@ fn theme_projection(theme: Option<&ThemePack>) -> (ThemeRoleSet, Vec<slint::Colo
             destructive: color_role(roles.destructive.as_deref()),
             destructive_ink: color_role(roles.destructive_ink.as_deref()),
             voice: color_role(roles.voice.as_deref()),
+            timestamp: color_role(roles.timestamp.as_deref()),
+            sender: color_role(roles.sender.as_deref()),
+            message: color_role(roles.message.as_deref()),
+            own_message: color_role(roles.own_message.as_deref()),
+            own_surface: color_role(roles.own_surface.as_deref()),
         },
         theme
             .senders
@@ -156,6 +161,11 @@ pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
     ui.set_show_message_timestamps(config.chat.show_timestamps);
     ui.set_color_message_senders(config.chat.color_senders);
     ui.set_nickname_width_px(config.chat.nickname_width.into());
+    ui.set_nickname_brackets(config.chat.nickname_brackets);
+    ui.set_nickname_alignment(match config.chat.nickname_alignment {
+        NicknameAlignment::Left => 0,
+        NicknameAlignment::Right => 1,
+    });
     ui.set_appearance_ui_font_input(config.appearance.font_family.as_str().into());
     ui.set_appearance_message_font_input(
         config
@@ -314,7 +324,7 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
     let weak = ui.as_weak();
     let store_for_flag = store.clone();
     ui.on_set_style_flag(move |field, value| {
-        if !(0..=3).contains(&field) {
+        if !(0..=4).contains(&field) {
             return;
         }
         if let Some(ui) = weak.upgrade() {
@@ -323,7 +333,23 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
                 1 => config.chat.show_timestamps = value,
                 2 => config.chat.color_senders = value,
                 3 => config.chat.timestamp_brackets = value,
+                4 => config.chat.nickname_brackets = value,
                 _ => unreachable!("validated appearance flag"),
+            });
+        }
+    });
+
+    let weak = ui.as_weak();
+    let store_for_alignment = store.clone();
+    ui.on_choose_nickname_alignment(move |index| {
+        let alignment = match index {
+            0 => NicknameAlignment::Left,
+            1 => NicknameAlignment::Right,
+            _ => return,
+        };
+        if let Some(ui) = weak.upgrade() {
+            let _ = save_config_change(&ui, &store_for_alignment, |config| {
+                config.chat.nickname_alignment = alignment;
             });
         }
     });
@@ -354,7 +380,8 @@ mod theme_tests {
                 "ink": "#070707", "muted": "#080808", "divider": "#090909",
                 "accent": "#0A0A0A", "accent_ink": "#0B0B0B"
             },
-            "roles": {"error": "#121314", "focus": "#212223", "selection_ink": "#313233"},
+            "roles": {"error": "#121314", "focus": "#212223", "selection_ink": "#313233",
+                      "own_surface": "#616263", "timestamp": "#717273"},
             "senders": {"colors": ["#414243", "#515253"]}
         }))
         .unwrap();
@@ -365,6 +392,14 @@ mod theme_tests {
         );
         assert!(roles.error.present && roles.focus.present && roles.selection_ink.present);
         assert!(!roles.success.present);
+        // Message-surface roles project individually; omitted ones stay absent
+        // so the rows keep their previous ink, muted and transparent colors.
+        assert!(roles.own_surface.present && roles.timestamp.present);
+        assert_eq!(
+            roles.own_surface.color,
+            slint::Color::from_rgb_u8(0x61, 0x62, 0x63)
+        );
+        assert!(!roles.sender.present && !roles.message.present && !roles.own_message.present);
         assert_eq!(
             senders,
             vec![
