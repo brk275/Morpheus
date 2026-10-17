@@ -64,7 +64,7 @@ override is deliberately not used for release packages.
 
 | Target | Automated checks |
 | --- | --- |
-| macOS Apple Silicon and Intel | Verify and mount the DMG read-only without interaction; copy the app into a temporary Applications directory; check native Mach-O architecture, bundle identifier/version, microphone/camera/screen purpose strings, exact license and theme contents; launch the installed executable for 12 seconds, stop it, remove the app, detach the DMG. |
+| macOS Apple Silicon and Intel | Verify and mount the DMG read-only without interaction; copy the app into a temporary Applications directory; check native Mach-O architecture, bundle identifier/version, microphone/camera/screen purpose strings, exact license and theme contents; compile the Swift accessibility bridge and prove its read-only permission state; create the one synthetic release profile described below; launch the installed executable for 12 seconds and stop it; relaunch the same bundle executable for the bounded keyboard/accessibility check; remove the profile only after both launches verifiably stopped; remove the app, detach the DMG. |
 | Windows x64 | Silently install NSIS into a temporary path containing spaces; check x64 PE32+ GUI subsystem, license/theme and Add/Remove Programs registration/version; create the one synthetic release profile described below; require the installed process to survive 12 seconds and create a Win32 window with its visible flag set; close/stop the process. Then relaunch the same installed executable for the bounded keyboard/UI Automation check, remove the profile only after both launches verifiably stopped, and run the real silent uninstaller and verify application directory and registration removal. |
 | Linux x64 DEB | Resolve/install the DEB in a fresh Ubuntu 24.04 container with no compiler or library development packages; verify declared ABI floors and `libxi6`, direct shared libraries and dynamic loading of `libXi.so.6` **before** adding Xvfb; check ELF architecture/symbol floors, desktop entry/icon and license/theme; launch as an unprivileged user under X11/Xvfb for 12 seconds and require a visible window owned by that launch; stop the process and purge the package. |
 | Linux x64 AppImage | In a separate fresh Ubuntu 24.04 container with a minimal X11 desktop runtime, inspect the extracted metadata/resources/ELF, then launch the **AppImage itself** as an unprivileged user using its extract-and-run runtime (no FUSE mount); require a visible window owned by that launch and 12-second survival. Only then install accessibility test tools and relaunch the same package for the bounded keyboard/AT-SPI checks below. Remove the portable file. No DEB is installed in this container. |
@@ -227,6 +227,92 @@ on Linux), signing or installer UI. It requires the hosted runner's
 interactive desktop; a session without one fails closed at the foreground
 check instead of sending input elsewhere.
 
+#### Installed macOS keyboard and accessibility API check
+
+`scripts/macos_package_ui.py` runs only on fresh standard GitHub-hosted
+`macos-15` and `macos-15-intel` runners (`RUNNER_ENVIRONMENT=github-hosted`,
+`ImageOS=macos15`), after the plain 12-second launch of the same installed
+bundle executable passed. It uses system frameworks only: the smoke compiles
+[`scripts/macos_package_ui.swift`](../scripts/macos_package_ui.swift) with the
+runner's Swift toolchain (`xcrun swiftc`) before any application starts, and
+the resulting bridge links AppKit, ApplicationServices and CoreGraphics. No
+tool is installed or downloaded, and the binary stays on the ephemeral runner.
+
+**Permission.** The bridge reports its own `AXIsProcessTrusted()` and
+`CGPreflightPostEventAccess()` state; both calls are read-only and never
+prompt. The smoke proves both are true before the profile or the application
+exists, and the driver proves them again at every real run. A false value
+fails closed with `permission_unavailable`; nothing requests, grants or
+changes a permission, and TCC is never touched. GitHub's hosted macOS image
+pre-authorizes its runner process chain for Accessibility and event posting;
+the check depends on that image state and reports it as a fixed token, so an
+image change fails the run instead of silently degrading it.
+
+**Profile.** The release executable (directories 6 / dirs-sys) resolves its
+profile from `HOME`, then the passwd entry, to `~/Library/Application
+Support/io.github.brk275.Morpheus` (configuration file and account store at
+its root) and `~/Library/Caches/io.github.brk275.Morpheus`. The smoke
+requires `HOME` to be the runner account's real home, never redirects it,
+refuses to continue if either project folder exists or is a symbolic link,
+creates both folders with a marker file carrying the run nonce, and seeds only
+`config.toml` with a 110% font scale. Both launches share that profile; the
+driver only proves the markers. The smoke removes the two folders only after
+the plain launch stopped and the driver reported a verified stop; otherwise
+the synthetic profile is retained and the smoke fails. The Library folders
+themselves are never created or removed.
+
+**Containment.** macOS has no job object. The application is started with its
+own session and process group; the leader stays an unreaped child (`waitid`
+with `WNOWAIT`) until every cleanup signal and the final accessibility action
+have happened, so its PID and group ID cannot be recycled under the check.
+Ownership is proven from the kernel process table (own group and session,
+not a zombie) and `proc_pidpath` of the PID against the installed bundle
+executable; the bridge additionally checks the running application's bundle
+identifier and executable URL before attaching. The bridge itself is a child
+in its own group, stopped through the same group-signalling path. Nothing is
+launched through `open` or LaunchServices.
+
+**Flow.** After one on-screen window owned by the process exists, the bridge
+takes bounded snapshots of that process's accessibility tree only (recorded
+plus queued elements capped at 5000 before any child is enqueued, names cut
+at 256 characters, reply lines bounded at 4 MiB before allocation through a
+bounded queue). Names come from `AXTitle`; only an `AXStaticText` without a
+title may fall back to `AXValue`, and the driver rejects any value-sourced
+name on another role. Editable and protected fields are never asked for a
+value. A snapshot with an unreadable or unowned node is incomplete and is
+retried; a partial pass can reject two matches as ambiguous but never
+establishes a label or focus. Then:
+
+- `Homeserver URL` and `Matrix ID or username` must be `AXTextField` without
+  the secure subrole; `Password` must be `AXTextField` with
+  `AXSecureTextField`.
+- Focus moves through `AXFocused` on the owned element, and Return enters the
+  fictional offline preview without signing in.
+- The account-menu sequence of the Linux and Windows checks runs with real
+  Return, Space, Tab, Shift+Tab and Escape transitions. Each transition is a
+  `CGEvent` posted directly to the owned process (`postToPid`), never to the
+  session, and the owned process must be the frontmost application
+  immediately before every post, including releases; one activation recovery
+  is attempted and counted, and a failed proof ends the chord with nothing
+  further posted.
+- Settings opens and `Increase font scale` is reached with bounded real Tab
+  presses (160 maximum); only then are the `110%` label, Space and the `120%`
+  label checked, followed by the saved TOML.
+- The window's own close button is pressed through its accessibility action
+  after an ownership recheck. The run requires observable exit status zero
+  within 15 seconds and no live member left in the leader's group; a merely
+  terminated or not-running state never substitutes for status zero.
+
+The whole driver, bridge and compiler stream stays private; only the fixed
+record `installed_macos_keyboard_ax` with reviewed tokens, booleans and bounded
+counts is printed and validated by the smoke. Names, values, paths, PIDs,
+accessibility trees and raw output are never published.
+
+This is accessibility API/keyboard coverage, **not VoiceOver acceptance**,
+whole-app keyboard reachability, live account or keychain behavior, the
+installed-settings file watcher (Linux only), signing, notarization or
+Gatekeeper behavior of a signed release.
+
 After applicable native jobs and cache posts finish, review their results and
 run only the affected ordinary package check with `platform=linux`,
 `linux_formats=appimage`, `appimage_updates=false`, `appimage_capture=false`.
@@ -241,7 +327,7 @@ contact is missing. Debian's release checks remain open.
 
 These checks are implemented automation, not evidence that a particular
 candidate passed. A successful run establishes only the checks listed above
-for its exact source and package hashes. macOS startup is process liveness;
+for its exact source and package hashes. macOS startup is process liveness, with the separate installed accessibility check above;
 the Windows visible-window flag, UI Automation tree and virtual X11 window do not establish visual
 quality or complete accessibility. Signing/notarization, installer UI, full desktop
 integration, real account/credential-vault behavior, native media permissions,
