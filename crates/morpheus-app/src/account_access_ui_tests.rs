@@ -5,11 +5,12 @@
 use super::*;
 use crate::{
     AccountItem, MemberItem, MessageItem, MessageSearchItem, RoomItem, apply_config,
-    voice_spaces::VoiceSpaces,
+    color_from_hex, voice_spaces::VoiceSpaces,
 };
 use morpheus_config::{BuiltInStylePreset, Config, NavigationMode};
 use slint::fontique_011::fontique;
 use slint::platform::{Key, WindowEvent};
+use slint::{Color, StyledText};
 use std::time::Duration;
 
 fn key(ui: &AppWindow, text: impl Into<slint::SharedString>) {

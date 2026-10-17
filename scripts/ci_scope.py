@@ -170,12 +170,23 @@ def main():
     parser.add_argument("paths", nargs="*")
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--github-event", action="store_true")
+    parser.add_argument("--desktop-tests-only", action="store_true")
     args = parser.parse_args()
+    # This explicitly selected repair mode is never inferred from a PR's
+    # files and cannot narrow a push, pull request, or ordinary full dispatch.
+    if args.desktop_tests_only and (not args.github_event
+                                   or os.environ.get("GITHUB_EVENT_NAME") != "workflow_dispatch"):
+        parser.error("Desktop test mode requires an explicit manual dispatch")
     paths, force_all = args.paths, args.all
     if args.github_event:
         with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as event_file:
             paths, force_all = changed_paths(json.load(event_file), os.environ["GITHUB_EVENT_NAME"])
     result = classify(paths, force_all)
+    if args.desktop_tests_only:
+        # The desktop test crate compiles the native app and its shared code
+        # on all four targets. It does not run the separate portal fixture.
+        result = classify([], force_all=True)
+        result["wayland"] = False
     print(json.dumps(result, sort_keys=True))
     if args.github_event:
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
