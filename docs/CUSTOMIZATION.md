@@ -17,10 +17,12 @@ width. Existing controls cover font scale (75–200%), room/message density,
 unread-first sorting, pane widths and the details panel. These preferences use
 the same configuration path in live sessions and the offline preview.
 
-At `a38fe43`, native builds and the configuration, navigation and generated-Slint
-keyboard guards passed on all four targets. Twelve Linux captures passed visual
-review, including sidebar navigation and labeled Spaces. Full platform font
-coverage, installed interaction and screen-reader acceptance remain open; see
+At `2fddb7f`, [native validation](https://github.com/brk275/Morpheus/actions/runs/39074067812)
+passed on all four targets, including 39 configuration tests, message/theme
+projections and the generated-Slint keyboard guards at 100%/200% text sizes.
+Twelve Linux captures passed privacy and visual review; eight are in the
+[native screenshot gallery](screenshots/README.md). Full platform font coverage,
+installed interaction and screen-reader acceptance remain open. See
 [verification](VERIFICATION.md), including the separate failed system Wayland
 capture check.
 
@@ -79,7 +81,7 @@ Omitting the table restores rail mode, hidden rail labels and separate DMs.
 Unknown modes or misspelled fields reject the edit; the app keeps its last valid
 configuration. Appearance presets preserve these three navigation preferences.
 
-The native projection/focus guards passed on all four targets at `a38fe43`;
+The native projection/focus guards passed on all four targets at `2fddb7f`;
 the sidebar and labeled rail passed Linux visual review. Broader installed
 keyboard and screen-reader checks remain required, including long names, many
 Spaces and 200% text scale.
@@ -421,8 +423,8 @@ font/layout/geometry fields, so use that when resetting the whole style.
 
 The new roles cover their documented controls. They do not recolor images,
 video, avatar backgrounds, modal scrims or theme-preview swatches. Native
-rendering, live-reload interaction and accessibility checks remain required;
-source contrast checks alone do not establish those results.
+preview renders are recorded in the screenshot gallery. Live-session interaction,
+file-watcher edge cases and accessibility checks remain required.
 
 Morpheus rejects an unknown schema version instead of silently discarding
 settings. New versions read existing schema 1 configuration and theme files
