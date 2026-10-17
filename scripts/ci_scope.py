@@ -23,6 +23,15 @@ WAYLAND_UNRELATED_NATIVE_INPUTS = {
     "crates/morpheus-app/ui/app-window.slint",
     "crates/morpheus-config/src/lib.rs",
 }
+# These validated appearance packs are consumed by the app/configuration
+# crate, not the standalone RTC portal fixture. Keep this an exact allowlist:
+# unknown theme inputs and mixed build/dependency changes remain conservative.
+WAYLAND_UNRELATED_THEME_INPUTS = {
+    "themes/aurora.toml",
+    "themes/nocturne.toml",
+    "themes/paper.toml",
+    "themes/terminal.toml",
+}
 # These Python drivers run only in explicitly selected installed-AppImage QA.
 # Ordinary native CI cannot exercise them; its always-on helper suite covers
 # their pure/mocked contracts. Unknown package inputs still select Linux.
@@ -85,7 +94,7 @@ def classify(paths, force_all=False):
                 or (path.startswith("docs/screenshots/") and path.endswith(".png"))
                 or path in {"LICENSE", ".gitignore", ".gitleaksignore"}):
             continue
-        if path not in WAYLAND_UNRELATED_NATIVE_INPUTS:
+        if path not in WAYLAND_UNRELATED_NATIVE_INPUTS | WAYLAND_UNRELATED_THEME_INPUTS:
             wayland_affected = True
         if path == "Cargo.lock" or path.endswith("Cargo.toml"):
             native.update(PLATFORMS)
