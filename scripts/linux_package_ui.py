@@ -46,6 +46,7 @@ class Diagnostics:
             "username_seen": False, "password_seen": False,
             "selector_matches": 0, "password_role": "unchecked",
             "traversed_node_matched": False,
+            "child_count_unavailable": 0, "incomplete_passes": 0,
             "cleanup": "not_started",
         }
 
@@ -55,6 +56,11 @@ class Diagnostics:
 
     def operation(self, operation):
         self.value["operation"] = operation
+
+    def count(self, key):
+        # Bounded like selector_matches: the fact that it happened, and whether
+        # it happened more than once, is all the public record needs.
+        self.value[key] = min(self.value[key] + 1, 2)
 
     def failed(self, error):
         if self.value["failure"] != "none":
@@ -83,6 +89,23 @@ class Diagnostics:
         self.value["failure"] = code if code in smoke.KEYBOARD_FAILURES else "unclassified"
 
 
+class ChildCountUnavailable(LookupError):
+    """One node's ChildCount call failed without a GError.
+
+    at-spi2-core's atspi_accessible_get_child_count returns -1, and sets no
+    error, when the D-Bus property call gets no reply (the configured 1000 ms
+    timeout) or a malformed reply; an unreachable or hung application raises
+    GLib.Error instead. pyatspi 2.46.1 binds Accessible.__len__ directly to
+    get_child_count, so that -1 reaches Python's len(), which raises ValueError
+    about the protocol rather than about the node. This is the same per-call
+    IPC failure the driver already retries as GLib.Error, not a value bug.
+    """
+
+
+class IncompleteTraversal(LookupError):
+    """A selector pass skipped an owned node; its result is not evidence."""
+
+
 class ObservedSequence:
     """Observe pyatspi's sequence protocol without changing its API calls.
 
@@ -95,7 +118,13 @@ class ObservedSequence:
 
     def __len__(self):
         self.diagnostics.operation(self.kind + "_child_count")
-        return len(self.accessible)
+        # Call the bound __len__ directly: len() would turn libatspi's -1 into
+        # a ValueError before the sentinel can be recognized.
+        count = type(self.accessible).__len__(self.accessible)
+        if isinstance(count, int) and count < 0:
+            self.diagnostics.count("child_count_unavailable")
+            raise ChildCountUnavailable()
+        return count
 
     def __getitem__(self, index):
         self.diagnostics.operation(self.kind + "_child_index")
@@ -139,6 +168,10 @@ class AccessibleUI:
 
     def nodes(self):
         count = 0
+        # A pass that skipped any node, for an IPC failure or a vanished node,
+        # has not seen the complete owned tree. find() refuses its result and
+        # wait_for() runs another pass instead.
+        self.pass_incomplete = False
         self.diagnostics.operation("desktop")
         desktop = self.api.Registry.getDesktop(0)
         for application in ObservedSequence(desktop, self.diagnostics, "desktop"):
@@ -166,8 +199,10 @@ class AccessibleUI:
                             self.diagnostics.operation("node_children")
                             pending.extend(list(ObservedSequence(node, self.diagnostics, "node")))
                     except (LookupError, self.transient_error):
+                        self.pass_incomplete = True
                         continue
             except (LookupError, self.transient_error):
+                self.pass_incomplete = True
                 continue
 
     def find(self, label, *, prefix=False):
@@ -183,8 +218,13 @@ class AccessibleUI:
                     matches.append(node)
                     self.diagnostics.value["selector_matches"] = min(len(matches), 2)
             except self.transient_error:
+                self.pass_incomplete = True
                 continue
+        # Two matches are ambiguous whatever else the pass missed.
         require_ui(len(matches) <= 1, "selector_ambiguous")
+        if getattr(self, "pass_incomplete", False):
+            self.diagnostics.count("incomplete_passes")
+            raise IncompleteTraversal()
         return matches[0] if matches else None
 
     def wait_for(self, predicate, seconds=12):
