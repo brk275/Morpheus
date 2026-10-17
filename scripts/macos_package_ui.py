@@ -193,6 +193,10 @@ def plain_ancestors(home, root):
         relative = root.parent.relative_to(home)
     except ValueError:
         return False
+    # relative_to is lexical: a ".." component would pass it while escaping the
+    # home, so it is refused outright instead of being resolved.
+    if any(part == ".." for part in relative.parts):
+        return False
     current = home
     if not plain_directory(current):
         return False
@@ -330,12 +334,14 @@ def executable_of(pid, library=None):
 
 
 def process_table(snapshot=None):
-    """(pid, pgid, state) rows of the live process table.
+    """(pid, pgid, state) rows of a complete live process table.
 
     The session is deliberately not read from ps: Darwin's ps formats "sess" as
     the kernel address of the session structure (adv_cmds ps/keyword.c), which
-    never equals a PID. Sessions come from session_of; a line with any other
-    column count is malformed and skipped.
+    never equals a PID. Sessions come from session_of. Blank lines are ignored;
+    any other line that is not exactly "pid pgid stat", or a snapshot without a
+    single row, means the table cannot be trusted and raises ValueError, so an
+    unparsed process is never mistaken for an absent one.
     """
     if snapshot is None:
         snapshot = subprocess.run(["ps", "-axo", "pid=,pgid=,stat="], check=True, capture_output=True,
@@ -343,9 +349,13 @@ def process_table(snapshot=None):
     rows = []
     for line in snapshot.splitlines():
         parts = line.split()
-        if len(parts) != 3 or not all(part.isdigit() for part in parts[:2]):
+        if not parts:
             continue
+        if len(parts) != 3 or not all(part.isdigit() for part in parts[:2]):
+            raise ValueError("Process table snapshot is not a complete pid/pgid/stat table")
         rows.append((int(parts[0]), int(parts[1]), parts[2]))
+    if not rows:
+        raise ValueError("Process table snapshot is empty")
     return rows
 
 
@@ -367,9 +377,14 @@ def owned_mac_pid(pid, leader, executable, table=None, library=None, session=Non
     """pid leads its own group and session as our unreaped child and runs the installed executable.
 
     Group and state come from the process table, the session from getsid and
-    the executable from libproc: three independent reads of the same PID.
+    the executable from libproc: three independent reads of the same PID. A
+    table that cannot be read or trusted proves nothing and answers False.
     """
-    rows = [row for row in (process_table() if table is None else table) if row[0] == pid]
+    try:
+        table = process_table() if table is None else table
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    rows = [row for row in table if row[0] == pid]
     if len(rows) != 1:
         return False
     _, pgid, state = rows[0]
@@ -815,7 +830,8 @@ def normal_close(bridge, process, diagnostics, executable, table=None, after_tab
     The leader stays unreaped throughout, so the status is read with WNOWAIT and
     the group ID still names this launch when its members are counted. `table`
     is the process table before the close, `after_table` the one after exit;
-    both default to live reads, as does the `session` read.
+    both default to live reads, as does the `session` read. A table that
+    cannot be read or trusted after exit counts as a remaining member.
     """
     diagnostics.operation("ownership")
     require_ui(owned_mac_pid(process.pid, process.pid, executable, table, library, session), "ownership_lost")
@@ -830,7 +846,11 @@ def normal_close(bridge, process, diagnostics, executable, table=None, after_tab
         time.sleep(0.1)
     require_ui(status == 0, "exit_status")
     diagnostics.operation("group_query")
-    require_ui(not group_members(process.pid, after_table), "process_remaining")
+    try:
+        remaining = group_members(process.pid, after_table)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        raise DiagnosticFailure("process_remaining") from None
+    require_ui(not remaining, "process_remaining")
 
 
 def acceptance(executable, nonce, bridge_binary, report, diagnostics=None):

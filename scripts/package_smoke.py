@@ -340,7 +340,14 @@ def startup_failure_diagnostics(log, status):
     return facts
 
 
-def launch_smoke(executable, window_check=None, seconds=12):
+def launch_smoke(executable, window_check=None, seconds=12, stop=None):
+    """Launch the installed executable for `seconds`, require it to keep running, then stop it.
+
+    `stop` receives the Popen object in the finally block and defaults to the
+    shared stop_process. The macOS smoke passes its driver's stop_group so the
+    plain launch's whole group is proven empty before its leader is reaped;
+    Linux and Windows keep the default.
+    """
     if os.name != "nt":
         require_nonreaping_wait()
     env = os.environ.copy()
@@ -376,7 +383,7 @@ def launch_smoke(executable, window_check=None, seconds=12):
             print(json.dumps(failure, sort_keys=True), flush=True)
             raise
         finally:
-            stop_process(process)
+            (stop_process if stop is None else stop)(process)
     record("installed_startup_and_stop", seconds=seconds, window_check=window_check or "process_liveness_only")
 
 
@@ -471,9 +478,11 @@ def macos_installed_launches(executable, work):
     profile = module.PackageProfile.create()
     stopped = False
     try:
-        launch_smoke(executable)
-        # launch_smoke's stop_process raised unless the process stopped. The
-        # keyboard driver relaunches the identical installed bundle executable.
+        # The plain launch stops through the driver's group proof: its leader is
+        # reaped only once no live group member remains, otherwise this raises
+        # and the profile is retained before any second launch. The keyboard
+        # driver then relaunches the identical installed bundle executable.
+        launch_smoke(executable, stop=module.stop_group)
         passed, stopped = macos_keyboard_launch(executable, profile.nonce, bridge)
         require(passed, "Installed macOS keyboard acceptance failed")
     finally:

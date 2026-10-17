@@ -264,7 +264,9 @@ folders only after the plain launch stopped and the driver reported a
 verified stop; otherwise the synthetic profile is retained and the smoke
 fails. The Library folders themselves are never created or removed, and a
 redirected ancestor stops the removal as well, so foreign material behind a
-link is never deleted. Folders above the home are not checked.
+link is never deleted. The ancestor check is lexical: a `..` component in a
+profile path is refused rather than resolved. Folders above the home are not
+checked.
 
 **Containment.** macOS has no job object. The application is started with its
 own session and process group; the leader stays an unreaped child (`waitid`
@@ -276,15 +278,21 @@ the session from `getsid`, and `proc_pidpath` against the installed bundle
 executable; the bridge additionally checks the running application's bundle
 identifier and executable URL before attaching. Darwin's `ps` prints the
 session structure's kernel address under `sess` (Apple adv_cmds
-`ps/keyword.c`), never the session ID, so that column is not read. Stopping
-either group (the bridge's or the application's) signals the group with TERM
-and then KILL while the leader is still an unreaped child, reads the process
-table while that PID still names the group, and reaps the leader only once no
-live member remains; a member alive at the bound, or a table that cannot be
-read, is the fixed failure `process_remaining`, the leader stays anchored,
-cleanup is reported as failed and the smoke retains the profile. A descendant
-that moved itself to another group is outside this proof. Nothing is launched
-through `open` or LaunchServices.
+`ps/keyword.c`), never the session ID, so that column is not read. Every
+group the smoke starts on macOS (the plain 12-second launch, the bridge and
+the keyboard relaunch) stops through the same proof: the group is signalled
+with TERM and then KILL while the leader is still an unreaped child, the
+process table is read while that PID still names the group, and the leader is
+reaped only once no live member remains. A member alive at the bound, or a
+table that cannot be read or trusted, is the fixed failure
+`process_remaining`, the leader stays anchored, cleanup is reported as failed
+and the smoke retains the profile; when the plain launch fails this way, the
+keyboard relaunch never starts. A trustworthy table is a complete
+`pid pgid stat` snapshot with at least one row: blank lines are ignored, but
+any other malformed row, an old four-column snapshot or an empty one is
+rejected for ownership and cleanup alike, so an unparsed process is never
+mistaken for an absent one. A descendant that moved itself to another group
+is outside this proof. Nothing is launched through `open` or LaunchServices.
 
 **Flow.** After one on-screen window owned by the process exists, the bridge
 takes bounded snapshots of that process's accessibility tree only (recorded

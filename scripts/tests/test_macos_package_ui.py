@@ -252,8 +252,10 @@ class OwnershipTests(unittest.TestCase):
         # (adv_cmds ps/keyword.c), which never equals the leader's PID. Such a
         # snapshot must neither parse as a session nor pass as a malformed row.
         darwin = " 4242 4242 ffffff801a2b3c4d S+\n 4243 4242 ffffff801a2b3c4d Z\n"
-        self.assertEqual(ui.process_table(darwin), [])
-        self.assertEqual(ui.process_table(" 4242 4242 4242 S+\n"), [])  # No fourth column is ever accepted.
+        with self.assertRaises(ValueError):
+            ui.process_table(darwin)
+        with self.assertRaises(ValueError):
+            ui.process_table(" 4242 4242 4242 S+\n")  # No fourth column is ever accepted.
         executable = "/Applications/Morpheus.app/Contents/MacOS/morpheus-app"
         proc = self.Proc({PID: executable})
         with patch.object(ui.os, "getsid", return_value=PID) as getsid:
@@ -267,11 +269,23 @@ class OwnershipTests(unittest.TestCase):
         with patch.object(ui.os, "getsid", return_value=PID + 1):
             self.assertFalse(ui.owned_mac_pid(PID, PID, executable, table((PID, PID, "S")), proc))
 
-    def test_process_table_parsing_ignores_malformed_rows_and_group_members_exclude_zombies(self):
-        rows = ui.process_table(" 4242 4242 S+\n 4243 4242 Z\n bad line\n 1 1 Ss\n 4244 4242 R\n x 4242 S\n")
+    def test_process_table_rejects_incomplete_snapshots_and_group_members_exclude_zombies(self):
+        rows = ui.process_table(" 4242 4242 S+\n\n 4243 4242 Z\n   \n 1 1 Ss\n 4244 4242 R\n")
         self.assertEqual(rows, [(4242, 4242, "S+"), (4243, 4242, "Z"), (1, 1, "Ss"), (4244, 4242, "R")])
         self.assertEqual(ui.group_members(4242, rows), [(4242, 4242, "S+"), (4244, 4242, "R")])
         self.assertEqual(ui.group_members(4242, table((4242, 4242, "Z"))), [])
+        # A malformed non-blank row anywhere, an old four-column sess row, or no
+        # row at all means an unparsed process may be alive: never an empty group.
+        for snapshot in [" 4242 4242 S+\n bad line\n 4244 4242 R\n", " x 4242 S\n", " 4242 x S\n",
+                         " 4242 4242 4242 S+\n 4243 4242 4242 R\n", "", "\n\n", "ps: cannot read\n"]:
+            with self.subTest(snapshot=snapshot), self.assertRaises(ValueError):
+                ui.process_table(snapshot)
+        executable = "/Applications/Morpheus.app/Contents/MacOS/morpheus-app"
+        proc = self.Proc({PID: executable})
+        with patch.object(ui, "process_table", side_effect=ValueError("incomplete")):
+            self.assertFalse(ui.owned_mac_pid(PID, PID, executable, None, proc, lambda pid: PID))
+        with patch.object(ui.subprocess, "run", return_value=Mock(stdout=" 4242 4242 4242 S+\n")):
+            self.assertFalse(ui.owned_mac_pid(PID, PID, executable, None, proc, lambda pid: PID))
 
 
 class ProfileLifecycleTests(unittest.TestCase):
@@ -340,6 +354,27 @@ class ProfileLifecycleTests(unittest.TestCase):
             os.symlink(temp_home(Path(folder) / "real"), link, target_is_directory=True)
             self.assertFalse(ui.plain_ancestors(link, ui.profile_roots(link)[0]))
             self.assertFalse(ui.plain_ancestors(temp_home(Path(folder) / "other"), roots[0]))
+        with tempfile.TemporaryDirectory() as folder:
+            # relative_to is lexical, so a ".." component inside the home prefix is
+            # refused before anything is resolved, created or removed.
+            home = temp_home(folder)
+            elsewhere = Path(folder) / "elsewhere" / "Application Support" / ui.PROJECT_DIR
+            elsewhere.mkdir(parents=True)
+            (elsewhere / ui.MARKER).write_text(NONCE, encoding="ascii")
+            (elsewhere / "vault").write_bytes(b"not ours")
+            escaping = home / "Library" / ".." / ".." / ".." / "elsewhere" / "Application Support" / ui.PROJECT_DIR
+            inside = home / "Library" / ".." / "Library" / "Application Support" / ui.PROJECT_DIR
+            self.assertEqual(escaping.resolve(), elsewhere.resolve())
+            for root in (escaping, inside):
+                with self.subTest(root=root.relative_to(home)):
+                    self.assertFalse(ui.plain_ancestors(home, root))
+                    with self.assertRaises(RuntimeError):
+                        ui.PackageProfile.create(NONCE, [root, ui.profile_roots(home)[1]], home)
+                    with self.assertRaises(RuntimeError):
+                        ui.PackageProfile([root, ui.profile_roots(home)[1]], NONCE, home).remove()
+            self.assertEqual((elsewhere / "vault").read_bytes(), b"not ours")
+            self.assertTrue((elsewhere / ui.MARKER).exists())
+            self.assertFalse(ui.profile_roots(home)[0].exists())
         with tempfile.TemporaryDirectory() as folder:
             home = temp_home(folder)
             roots = ui.profile_roots(home)
@@ -444,8 +479,9 @@ class ProfileLifecycleTests(unittest.TestCase):
             def probe(binary):
                 events.append(("probe", binary))
 
-            def plain_launch(path):
+            def plain_launch(path, stop):
                 self.assertTrue(roots[0].exists())  # The profile exists before the first launch.
+                self.assertIs(stop, ui.stop_group)  # The plain launch stops through the group proof.
                 (roots[0] / "accounts").mkdir()
                 (roots[0] / "accounts" / "db").write_bytes(b"synthetic store")
                 events.append(("launch", path))
@@ -485,12 +521,14 @@ class ProfileLifecycleTests(unittest.TestCase):
             self.assertFalse(roots[0].exists())
 
     def test_smoke_retains_the_profile_unless_both_stops_are_verified(self):
-        for case in ("plain_launch_failed", "driver_unverified_stop", "driver_report_invalid"):
+        first_launch = {"plain_launch_failed": RuntimeError("startup"),
+                        "plain_launch_survivor": ui.DiagnosticFailure("process_remaining")}
+        for case in ("plain_launch_failed", "plain_launch_survivor", "driver_unverified_stop", "driver_report_invalid"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as folder:
                 home = temp_home(folder)
                 roots = ui.profile_roots(home)
                 captured = io.StringIO()
-                launch = Mock(side_effect=RuntimeError("startup") if case == "plain_launch_failed" else None)
+                launch = Mock(side_effect=first_launch.get(case))
                 if case == "driver_report_invalid":
                     keyboard = Mock(side_effect=RuntimeError("Missing or ambiguous installed keyboard evidence"))
                 else:
@@ -503,8 +541,41 @@ class ProfileLifecycleTests(unittest.TestCase):
                         smoke.macos_installed_launches(Path("/installed/Morpheus.app/Contents/MacOS/morpheus-app"), folder)
                 self.assertTrue((roots[0] / ui.MARKER).exists())
                 self.assertEqual(json.loads(captured.getvalue()), {"check": "macos_profile_retained", "status": "failed"})
-                if case == "plain_launch_failed":
-                    keyboard.assert_not_called()
+                if case in first_launch:
+                    keyboard.assert_not_called()  # No second launch without a verified first stop.
+                else:
+                    self.assertIs(launch.call_args.kwargs["stop"], ui.stop_group)
+
+    def test_plain_launch_stops_through_the_given_callback_and_keeps_the_default_elsewhere(self):
+        process = Mock(pid=PID, returncode=None)
+        for stop_error in (None, ui.DiagnosticFailure("process_remaining")):
+            stops = []
+
+            def stop(target):
+                stops.append(target)
+                if stop_error:
+                    raise stop_error
+
+            with patch.object(smoke.sys, "platform", "darwin"), patch.object(smoke, "require_nonreaping_wait"), \
+                    patch.object(smoke.subprocess, "Popen", return_value=process), \
+                    patch.object(smoke, "process_status", return_value=None), patch.object(smoke, "stop_process") as shared, \
+                    patch.object(smoke, "record") as record, patch.object(smoke.time, "sleep"):
+                if stop_error:
+                    with self.subTest(stop="raises"), self.assertRaises(ui.DiagnosticFailure) as error:
+                        smoke.launch_smoke(Path("/i/Morpheus.app/Contents/MacOS/morpheus-app"), seconds=0.05, stop=stop)
+                    self.assertEqual(error.exception.code, "process_remaining")
+                    record.assert_not_called()  # No startup record without a verified stop.
+                else:
+                    smoke.launch_smoke(Path("/i/Morpheus.app/Contents/MacOS/morpheus-app"), seconds=0.05, stop=stop)
+                    record.assert_called_once()
+                shared.assert_not_called()
+            self.assertEqual(stops, [process])
+        with patch.object(smoke.sys, "platform", "darwin"), patch.object(smoke, "require_nonreaping_wait"), \
+                patch.object(smoke.subprocess, "Popen", return_value=process), \
+                patch.object(smoke, "process_status", return_value=None), patch.object(smoke, "stop_process") as shared, \
+                patch.object(smoke, "record"), patch.object(smoke.time, "sleep"):
+            smoke.launch_smoke(Path("/i/Morpheus.app/Contents/MacOS/morpheus-app"), seconds=0.05)
+        shared.assert_called_once_with(process)  # Linux and Windows keep the shared stop.
 
     def test_existing_profile_is_refused_before_any_launch(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -962,6 +1033,17 @@ class CloseAndCleanupTests(unittest.TestCase):
                 self.close([None, 0], table((PID, PID, "Z")), close_reply=reply)
             self.assertEqual(error.exception.code, expected)
 
+    def test_untrusted_table_after_exit_counts_as_a_remaining_member(self):
+        for failure in (ValueError("incomplete"), OSError("ps"), smoke.subprocess.CalledProcessError(1, "ps")):
+            with self.subTest(failure=type(failure).__name__), patch.object(ui, "process_table", side_effect=failure), \
+                    self.assertRaises(ui.DiagnosticFailure) as error:
+                self.close([None, 0], None)
+            self.assertEqual(error.exception.code, "process_remaining")
+        with patch.object(ui.subprocess, "run", return_value=Mock(stdout=" 4242 4242 4242 Z\n")), \
+                self.assertRaises(ui.DiagnosticFailure) as error:
+            self.close([None, 0], None)
+        self.assertEqual(error.exception.code, "process_remaining")
+
     def stop(self, statuses, tables, process=None):
         """stop_group with scripted leader statuses, scripted table reads and recorded group signals."""
         process = Mock(pid=PID, returncode=None) if process is None else process
@@ -994,7 +1076,8 @@ class CloseAndCleanupTests(unittest.TestCase):
 
     def test_stop_group_leaves_the_leader_anchored_when_a_member_remains_or_the_table_is_unknown(self):
         survivor = table((PID, PID, "Z"), (PID + 1, PID, "S"))
-        for tables in ([survivor], [smoke.subprocess.CalledProcessError(1, "ps")], [OSError("ps")]):
+        for tables in ([survivor], [smoke.subprocess.CalledProcessError(1, "ps")], [OSError("ps")],
+                       [ValueError("incomplete")]):
             with self.subTest(tables=type(tables[0]).__name__), self.assertRaises(ui.DiagnosticFailure) as error:
                 self.stop([None, 0], tables)
             self.assertEqual(error.exception.code, "process_remaining")
@@ -1002,6 +1085,17 @@ class CloseAndCleanupTests(unittest.TestCase):
         with self.assertRaises(ui.DiagnosticFailure):
             self.stop([None, 0], [survivor], process)
         process.wait.assert_not_called()  # The group ID stays anchored for the retained-profile report.
+        # The real table reader fed an old four-column, a truncated or an empty
+        # ps snapshot fails closed the same way, with the leader still unreaped.
+        for stdout in (" 4242 4242 ffffff801a2b3c4d Z\n", " 4242 4242 Z\n 4243 4242\n", ""):
+            process = Mock(pid=PID, returncode=None)
+            with self.subTest(stdout=stdout), patch.object(smoke, "process_status", side_effect=[None, 0]), \
+                    patch.object(smoke, "signal_process_group"), patch.object(ui.time, "sleep"), \
+                    patch.object(ui.subprocess, "run", return_value=Mock(stdout=stdout)), \
+                    self.assertRaises(ui.DiagnosticFailure) as error:
+                ui.stop_group(process, seconds=0.5)
+            self.assertEqual(error.exception.code, "process_remaining")
+            process.wait.assert_not_called()
 
     def test_stop_group_rejects_a_reaped_leader_and_a_leader_that_never_stops(self):
         # smoke.process_status itself refuses a reaped leader before any signal.
