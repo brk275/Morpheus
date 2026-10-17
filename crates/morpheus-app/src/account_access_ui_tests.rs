@@ -742,7 +742,7 @@ async fn assert_message_role_precedence_and_thread_metadata(ui: &AppWindow) {
     // message's ownership, palette index and accent; the thread root heading
     // and replies then follow the same precedence as the timeline.
     apply_config(ui, &config, Some(&full));
-    ui.set_thread_messages(ModelRc::new(VecModel::from(vec![
+    let replies = vec![
         role_message(
             "$reply-other",
             false,
@@ -759,7 +759,7 @@ async fn assert_message_role_precedence_and_thread_metadata(ui: &AppWindow) {
             "9:00 AM",
             own_accent,
         ),
-    ])));
+    ];
     settle(ui).await;
     assert!(!ui.get_thread_root_is_own());
     tab_to_control(ui, "Open thread for Own Author");
@@ -772,6 +772,12 @@ async fn assert_message_role_precedence_and_thread_metadata(ui: &AppWindow) {
     assert_eq!(ui.get_thread_root_accent(), own_accent);
     assert_eq!(ui.get_side_panel_tab(), 1);
     assert!(ui.get_show_side_panel());
+    // The real open action clears the old reply model before the asynchronous
+    // response arrives. Populate this synthetic response only after that
+    // boundary, rather than asserting against replies the action removed.
+    assert_eq!(ui.get_thread_messages().row_count(), 0);
+    ui.set_thread_messages(ModelRc::new(VecModel::from(replies)));
+    settle(ui).await;
     // Timeline row and thread-root heading both show the own author's name.
     assert_text_color(ui, "Own Author", own_message, 2);
     assert_text_color(ui, "Reply Author", sender, 1);
@@ -822,6 +828,8 @@ async fn assert_message_role_precedence_and_thread_metadata(ui: &AppWindow) {
     config.chat.color_senders = false;
 
     // Opening another author's thread replaces the metadata with that message.
+    apply_config(ui, &config, Some(&full));
+    settle(ui).await;
     tab_to_control(ui, "Open thread for Other Author");
     key(ui, Key::Space);
     settle(ui).await;
@@ -829,6 +837,15 @@ async fn assert_message_role_precedence_and_thread_metadata(ui: &AppWindow) {
     assert!(!ui.get_thread_root_is_own());
     assert_eq!(ui.get_thread_root_palette_index(), 2);
     assert_eq!(ui.get_thread_root_accent(), other_accent);
+    assert_text_color(ui, "Other Author", sender, 2);
+    assert_eq!(
+        ui.invoke_body_ink(false, ui.get_thread_root_is_own()),
+        role(&full.roles.message)
+    );
+    assert_eq!(
+        ui.invoke_row_surface(false, false, ui.get_thread_root_is_own(), transparent),
+        transparent
+    );
 
     // Closing the thread resets the forwarded metadata.
     ui.set_thread_root_is_own(true);
@@ -842,7 +859,22 @@ async fn assert_message_role_precedence_and_thread_metadata(ui: &AppWindow) {
 
     // Narrow rows at 200% use the compact header: the name keeps its role and
     // the clock, including delivery status, is a separate timestamp-role text.
-    ui.window().set_size(slint::PhysicalSize::new(400, 760));
+    // Use the actual supported minimum, including saved pane sizes. A
+    // 400-pixel window would be below the production minimum and would not
+    // establish behavior available to a desktop user.
+    let rail = if ui.get_navigation_mode() == 0 {
+        ui.get_rail_width_px()
+    } else {
+        0
+    };
+    let details = if ui.get_show_side_panel() {
+        ui.get_details_width()
+    } else {
+        0
+    };
+    let narrow_width = (rail + ui.get_room_list_width() + details + 360).max(940);
+    ui.window()
+        .set_size(slint::PhysicalSize::new(narrow_width as u32, 760));
     apply_config(ui, &config, Some(&full));
     ui.set_font_scale_percent(200);
     settle(ui).await;

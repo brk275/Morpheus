@@ -362,15 +362,15 @@ sender names** is on (`chat.color_senders = true`). It takes precedence over the
 `sender` and `own_message` roles for name text. Selection colors take precedence
 over every message role on a selected row, and hover keeps its surface over
 `own_surface`. Own-message styling follows the account that sent the event, not
-a display name; an opened thread carries that ownership from the root message. Loading a theme replaces the whole role set, so a role the new
-file omits falls back to ink, muted or a transparent row as if it were never
-set. This palette changes name text,
-in timeline messages and thread replies, independently of avatar backgrounds,
-account badges and Space identity colors. Thread-root headings and search
-result authors retain their existing text colors, with selection colors when
-applicable. Users choose their own contrast; syntactically valid low-contrast colors are
-not silently replaced. The three shipped presets include semantic roles and
-sender text palettes with source contrast checks.
+a display name; an opened thread carries that ownership from the root message.
+Loading a theme replaces the whole role set, so a role the new file omits falls
+back to ink, muted or the previous row background as if it were never set.
+This palette changes name text in timeline messages, thread roots and thread
+replies, independently of avatar backgrounds, account badges and Space identity
+colors. Search result authors retain their existing text colors, with selection
+colors when applicable. Users choose their own contrast; syntactically valid
+low-contrast colors are not silently replaced. The three shipped presets include
+semantic roles and sender text palettes with source contrast checks.
 
 Old eleven-token themes keep their previous per-control fallbacks. Omitting a
 role restores that control's existing color; it does not borrow the value from
