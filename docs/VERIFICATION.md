@@ -3,6 +3,31 @@
 Morpheus is pre-alpha software with no approved installer release. This log records checks actually completed;
 the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
+## Per-account theme validation and integration: `0d75626`
+
+[PR 6](https://github.com/brk275/Morpheus/pull/6) was reviewed and merged after
+[run 39052430665](https://github.com/brk275/Morpheus/actions/runs/39052430665)
+passed on Apple Silicon, Intel Mac, Windows and Linux. Each target passed the
+configuration, Matrix/RTC model, desktop/controller, native-device, vendored
+security and pinned SDK checks, including the generated Slint account/dialog
+keyboard scenario and the new theme projection regressions. Windows also
+passed owned synthetic capture.
+
+Linux passed twenty Rust acceptance commands and the stock Element Call
+presynced interoperability case. All 46 fixed setup/test/cleanup records passed,
+including protected account access, classic search, encrypted recovery, both
+OAuth refresh flows, ringing and account replay rejection. The system Wayland
+fixture was outside the changed inputs and remains an open release gate.
+
+All jobs and cache posts completed. Seven complete job logs scanned with zero
+findings. Twelve actual fictional preview PNGs were validated against their
+provenance and reviewed for visuals/privacy; the run published no installers.
+The tested PR merge was `1be8afde0efcb173ee4ef94128cd30be8d479e3a`.
+Main merge `0d756260255f4cf6630aaed184d38bdb46a08c5e` has the identical
+source tree, `3a6b9a847456fa573ec9802628682765d97c3b39`; its skip marker
+avoided a duplicate native matrix. This is development evidence, not installed
+screen-reader, physical-device, signing or update acceptance.
+
 ## Development check selection
 
 The reviewed appearance files still select all four native targets and Linux
