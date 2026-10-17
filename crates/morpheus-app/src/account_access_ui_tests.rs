@@ -390,7 +390,7 @@ fn focused_control_has_label(ui: &AppWindow, expected: &str) -> bool {
 
 fn tab_to_control(ui: &AppWindow, label: &str) {
     use slint::private_unstable_api::re_exports::{
-        AccessibleStringProperty, ItemRc, TextInput, WindowInner,
+        AccessibleStringProperty, Clip, Flickable, ItemRc, TextInput, WindowInner,
     };
     use std::ops::ControlFlow;
 
@@ -441,6 +441,57 @@ fn tab_to_control(ui: &AppWindow, label: &str) {
         .borrow()
         .upgrade()
         .is_some_and(|item| item.downcast::<TextInput>().is_some());
+    // Failure-only structural geometry: no element names, field values,
+    // addresses or filesystem data. Read the target's ancestor items by
+    // subtree membership instead of changing focus or scrolling the viewport.
+    let root = ItemRc::new_root(window.component());
+    let mut target_items = Vec::new();
+    root.visit_descendants(|item| {
+        if item
+            .accessible_string_property(AccessibleStringProperty::Label)
+            .as_deref()
+            == Some(label)
+            && target_items.len() < 2
+        {
+            target_items.push(item.clone());
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    eprintln!(
+        "appearance_focus_window: width={}, height={}",
+        ui.window().size().width,
+        ui.window().size().height
+    );
+    for target in target_items {
+        let mut count = 0usize;
+        root.visit_descendants(|item| {
+            let contains = item == &target || item.visit_descendants(|child| {
+                if child == &target { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+            }).is_some();
+            if contains {
+                count += 1;
+                if count <= 48 {
+                    let geometry = item.geometry();
+                    let point = item.map_to_native_window(geometry.origin);
+                    let flickable = item.downcast::<Flickable>();
+                    let clip = item.downcast::<Clip>();
+                    let kind = if item == &target { "target" } else if flickable.is_some() { "flickable" } else if clip.is_some() { "clip" } else { "other" };
+                    let clipping = item.borrow().as_ref().clips_children();
+                    let visibility_clip = clip.as_ref().is_some_and(|clip| clip.as_pin_ref().is_visibility_clip());
+                    eprintln!("appearance_focus_ancestor: kind={kind}, visible={}, clipping={clipping}, visibility_clip={visibility_clip}, x={}, y={}, width={}, height={}", item.is_visible(), point.x, point.y, geometry.size.width, geometry.size.height);
+                    if let Some(flickable) = flickable {
+                        let flickable = flickable.as_pin_ref();
+                        eprintln!("appearance_focus_scroll: x={}, y={}, width={}, height={}", flickable.content_x().0, flickable.content_y().0, flickable.content_width().0, flickable.content_height().0);
+                    }
+                }
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        eprintln!(
+            "appearance_focus_ancestor_bound: count={count}, bounded={}",
+            count > 48
+        );
+    }
     panic!(
         "Appearance control is not keyboard reachable: {label}; page={}, scale={}, distinct_focus={}, unchanged_focus={}, missing_focus={}, target_nodes={}, visible_targets={}, nonzero_targets={}, focused_text_input={}",
         ui.get_page(),

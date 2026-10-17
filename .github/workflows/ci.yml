@@ -28,6 +28,7 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
+          shared-key: compile
           save-if: false
       - name: Run only the reviewed synthetic generated-UI test
         run: cargo test --locked -p morpheus-app --features native-calls --bin morpheus-app account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation -- --exact
