@@ -3,6 +3,28 @@
 Morpheus is pre-alpha software with no approved installer release. This log records checks actually completed;
 the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
+## Windows native vault acceptance: `cad1abc`
+
+[Run 39057684016](https://github.com/brk275/Morpheus/actions/runs/39057684016)
+passed on the standard Windows x64 runner at
+`cad1abca4d953e2a115731b9e80df21499dab886` after the reviewed SID-alias
+normalization. All five fixture contracts, 13 preparation checks and 11
+restart/removal checks passed. They cover password enable/change, wrong,
+cancelled and stale authorization, protected direct-switch rejection,
+persisted protection after restart, separate native credential targets, exact
+account removal and reset only after complete removal. Children stopped,
+platform state was restored and the private profile was removed; no cleanup
+failure remained.
+
+Both jobs and cache posts completed. Complete logs scanned with zero findings,
+and no artifacts were uploaded. A private evidence parser initially retained
+an old source-contract hash; rebinding that hash to the independently reviewed
+candidate and rerunning its 32 synthetic tests allowed offline verification of
+the same complete log. No runner retry or acceptance assertion change was needed.
+This establishes the synthetic core/vault path, not installed UI, real Matrix
+sign-in or Narrator behavior. The earlier two Mac vault passes below cover their
+unchanged core inputs; installed interaction and screen-reader gates remain.
+
 ## Per-account theme validation and integration: `0d75626`
 
 [PR 6](https://github.com/brk275/Morpheus/pull/6) was reviewed and merged after
