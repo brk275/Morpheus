@@ -46,7 +46,7 @@ class Diagnostics:
             "username_seen": False, "password_seen": False,
             "selector_matches": 0, "password_role": "unchecked",
             "traversed_node_matched": False,
-            "child_count_unavailable": 0, "incomplete_passes": 0,
+            "child_count_unavailable": 0, "child_unavailable": 0, "incomplete_passes": 0,
             "cleanup": "not_started",
         }
 
@@ -106,31 +106,58 @@ class IncompleteTraversal(LookupError):
     """A selector pass skipped an owned node; its result is not evidence."""
 
 
-class ObservedSequence:
-    """Observe pyatspi's sequence protocol without changing its API calls.
+class ChildUnavailable(LookupError):
+    """get_child_at_index returned no object for an index inside the count.
 
-    pyatspi 2.46.1 assigns Accessible.__len__ and __getitem__ (no __iter__).
-    Forward those exact operations so list() still checks its length hint and
-    traverses to the same IndexError terminator. No node/exception text is read.
+    libatspi returns NULL, with no GError, when the GetChildAtIndex call fails;
+    pyatspi hands that back as None. Treating it as an empty position would
+    present a subtree the driver never saw as complete.
+    """
+
+
+class ObservedSequence:
+    """Drive pyatspi's child protocol with libatspi's sentinels recognized.
+
+    pyatspi 2.46.1 binds Accessible.__len__ to get_child_count and defines
+    Accessible_getitem as: call get_child_count again, adjust a negative index,
+    raise IndexError when the index is outside that count, else return
+    get_child_at_index. A -1 at the second count therefore ends iteration early
+    as if the sequence were complete. This class issues the same native calls
+    in the same order, so list() still reads the length hint, repeats the count
+    for every index and stops at the same IndexError, but a -1 at any count or
+    a missing child raises instead of truncating. No node/exception text is read.
     """
     def __init__(self, accessible, diagnostics, kind):
         self.accessible, self.diagnostics, self.kind = accessible, diagnostics, kind
 
-    def __len__(self):
+    def count(self):
         self.diagnostics.operation(self.kind + "_child_count")
-        # Call the bound __len__ directly: len() would turn libatspi's -1 into
-        # a ValueError before the sentinel can be recognized.
-        count = type(self.accessible).__len__(self.accessible)
+        count = self.accessible.get_child_count()
         # Exactly -1 is libatspi's documented sentinel. Any other negative or
-        # non-integer length is unexpected and still fails closed through len().
+        # non-integer length is unexpected and fails closed.
         if isinstance(count, int) and count == -1:
             self.diagnostics.count("child_count_unavailable")
             raise ChildCountUnavailable()
         return count
 
+    def __len__(self):
+        # An unexpected length still reaches len(), which raises ValueError.
+        return self.count()
+
     def __getitem__(self, index):
+        count = self.count()
+        if type(count) is not int or count < 0:
+            raise ValueError()
+        if index < 0:
+            index = count + index
+        if index < 0 or index >= count:
+            raise IndexError
         self.diagnostics.operation(self.kind + "_child_index")
-        return self.accessible[index]
+        child = self.accessible.get_child_at_index(index)
+        if child is None:
+            self.diagnostics.count("child_unavailable")
+            raise ChildUnavailable()
+        return child
 
 
 def command(arguments):
