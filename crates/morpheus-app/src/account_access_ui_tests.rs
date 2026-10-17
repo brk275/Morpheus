@@ -388,9 +388,162 @@ fn focused_control_has_label(ui: &AppWindow, expected: &str) -> bool {
     .is_some()
 }
 
+// Raw tab-order graph of the live tree: `ItemRc::next_focus_item` followed
+// from the root until it returns to the root or the bound is reached. Only
+// weak identities are kept; the walk reads the item tree and never touches
+// focus, callbacks, actions or scrolling.
+struct FocusGraph {
+    order: Vec<slint::private_unstable_api::re_exports::ItemWeak>,
+    closed: bool,
+    bounded: bool,
+    target_hits: usize,
+    target_ordinal: i64,
+    target_subtree_hits: usize,
+    target_scope_ordinal: i64,
+}
+
+const FOCUS_GRAPH_BOUND: usize = 5000;
+const FOCUS_LOSS_BOUND: usize = 16;
+const FOCUS_STEP_BOUND: usize = 32;
+
+fn graph_ordinal(
+    graph: &FocusGraph,
+    item: &slint::private_unstable_api::re_exports::ItemWeak,
+) -> i64 {
+    graph
+        .order
+        .iter()
+        .position(|entry| entry == item)
+        .map_or(-1, |index| index as i64)
+}
+
+// The one control carrying `label`, as a weak identity; strong references are
+// dropped before this returns.
+fn target_identity(
+    ui: &AppWindow,
+    label: &str,
+) -> Option<slint::private_unstable_api::re_exports::ItemWeak> {
+    use slint::private_unstable_api::re_exports::{AccessibleStringProperty, ItemRc, WindowInner};
+    use std::ops::ControlFlow;
+
+    let window = WindowInner::from_pub(ui.window());
+    let mut found = None;
+    ItemRc::new_root(window.component()).visit_descendants(|item| {
+        if item
+            .accessible_string_property(AccessibleStringProperty::Label)
+            .as_deref()
+            == Some(label)
+        {
+            found = Some(item.downgrade());
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    found
+}
+
+// Weak identities of the target and every item inside its subtree, read once;
+// the target is upgraded only for the duration of this read.
+fn subtree_identities(
+    target: Option<&slint::private_unstable_api::re_exports::ItemWeak>,
+) -> Vec<slint::private_unstable_api::re_exports::ItemWeak> {
+    use std::ops::ControlFlow;
+
+    let Some(target) = target.and_then(|target| target.upgrade()) else {
+        return Vec::new();
+    };
+    let mut identities = vec![target.downgrade()];
+    target.visit_descendants(|child| {
+        identities.push(child.downgrade());
+        ControlFlow::<()>::Continue(())
+    });
+    identities
+}
+
+fn focus_graph(
+    ui: &AppWindow,
+    target: Option<&slint::private_unstable_api::re_exports::ItemWeak>,
+) -> FocusGraph {
+    use slint::private_unstable_api::re_exports::{FocusScope, ItemRc, WindowInner};
+
+    let window = WindowInner::from_pub(ui.window());
+    let root = ItemRc::new_root(window.component());
+    let mut graph = FocusGraph {
+        order: vec![root.downgrade()],
+        closed: false,
+        bounded: false,
+        target_hits: 0,
+        target_ordinal: -1,
+        target_subtree_hits: 0,
+        target_scope_ordinal: -1,
+    };
+    let subtree = subtree_identities(target);
+    let mut current = root.clone();
+    loop {
+        let next = current.next_focus_item();
+        if next == root {
+            graph.closed = true;
+            break;
+        }
+        if graph.order.len() >= FOCUS_GRAPH_BOUND {
+            graph.bounded = true;
+            break;
+        }
+        let identity = next.downgrade();
+        if let Some(target) = target {
+            let ordinal = graph.order.len() as i64;
+            if identity == *target {
+                graph.target_hits += 1;
+                if graph.target_ordinal < 0 {
+                    graph.target_ordinal = ordinal;
+                }
+            }
+            if subtree.contains(&identity) {
+                graph.target_subtree_hits += 1;
+                if graph.target_scope_ordinal < 0 && next.downcast::<FocusScope>().is_some() {
+                    graph.target_scope_ordinal = ordinal;
+                }
+            }
+        }
+        graph.order.push(identity);
+        current = next;
+    }
+    graph
+}
+
+// Up to FOCUS_STEP_BOUND raw `next_focus_item` steps from a weak identity,
+// as weak identities. Every strong reference is dropped before this returns.
+fn raw_steps(
+    start: &slint::private_unstable_api::re_exports::ItemWeak,
+) -> Vec<slint::private_unstable_api::re_exports::ItemWeak> {
+    let Some(mut item) = start.upgrade() else {
+        return Vec::new();
+    };
+    let mut steps = Vec::with_capacity(FOCUS_STEP_BOUND);
+    for _ in 0..FOCUS_STEP_BOUND {
+        item = item.next_focus_item();
+        steps.push(item.downgrade());
+    }
+    steps
+}
+
+// Closed numeric kind of the item a weak focus identity points at:
+// 0 none (no item or a dropped tree), 1 FocusScope, 2 TextInput, 3 any other item.
+fn focus_item_kind(item: &slint::private_unstable_api::re_exports::ItemWeak) -> u8 {
+    use slint::private_unstable_api::re_exports::{FocusScope, TextInput};
+
+    match item.upgrade() {
+        None => 0,
+        Some(item) if item.downcast::<FocusScope>().is_some() => 1,
+        Some(item) if item.downcast::<TextInput>().is_some() => 2,
+        Some(_) => 3,
+    }
+}
+
 fn tab_to_control(ui: &AppWindow, label: &str) {
     use slint::private_unstable_api::re_exports::{
-        AccessibleStringProperty, Clip, Flickable, ItemRc, TextInput, WindowInner,
+        AccessibleStringProperty, Clip, Flickable, FocusScope, ItemRc, TextInput, WindowInner,
     };
     use std::ops::ControlFlow;
 
@@ -398,6 +551,14 @@ fn tab_to_control(ui: &AppWindow, label: &str) {
     // Keep only weak identities for diagnostics; never retain a removed tree,
     // print other controls' names, set focus, or invoke an action directly.
     let window = WindowInner::from_pub(ui.window());
+    // The raw graph is prepared only for the call known to fail, so the other
+    // helper calls keep their original cost. The target identity is weak.
+    let traced = label == "Decrease font scale";
+    let target = if traced { target_identity(ui, label) } else { None };
+    let initial = traced.then(|| focus_graph(ui, target.as_ref()));
+    // (previous ordinal in the initial graph, after-item kind, after-item
+    // ordinal, ordinals of the raw steps computed before the key)
+    let mut losses: Vec<(i64, u8, i64, Vec<i64>)> = Vec::new();
     let mut seen = Vec::new();
     let mut previous = None;
     let mut unchanged = 0usize;
@@ -417,8 +578,27 @@ fn tab_to_control(ui: &AppWindow, label: &str) {
         } else {
             missing += 1;
         }
-        previous = Some(current);
+        // Raw graph steps from the pre-key item are read before the key and
+        // kept only as weak identities; no strong item reference survives
+        // into the dispatch below.
+        let recording = initial.is_some() && losses.len() < FOCUS_LOSS_BOUND;
+        let steps = if recording { raw_steps(&current) } else { Vec::new() };
+        previous = Some(current.clone());
         key(ui, Key::Tab);
+        if let Some(graph) = initial.as_ref().filter(|_| recording) {
+            let after = window.focus_item.borrow().clone();
+            let kind = focus_item_kind(&after);
+            // A press that ends without an item, or on an item that is neither
+            // a FocusScope nor a TextInput, lost keyboard focus.
+            if kind == 0 || kind == 3 {
+                losses.push((
+                    graph_ordinal(graph, &current),
+                    kind,
+                    graph_ordinal(graph, &after),
+                    steps.iter().map(|step| graph_ordinal(graph, step)).collect(),
+                ));
+            }
+        }
     }
     let mut targets = 0usize;
     let mut visible = 0usize;
@@ -462,11 +642,11 @@ fn tab_to_control(ui: &AppWindow, label: &str) {
         ui.window().size().width,
         ui.window().size().height
     );
-    for target in target_items {
+    for target in &target_items {
         let mut count = 0usize;
         root.visit_descendants(|item| {
-            let contains = item == &target || item.visit_descendants(|child| {
-                if child == &target { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+            let contains = item == target || item.visit_descendants(|child| {
+                if child == target { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
             }).is_some();
             if contains {
                 count += 1;
@@ -475,7 +655,7 @@ fn tab_to_control(ui: &AppWindow, label: &str) {
                     let point = item.map_to_native_window(geometry.origin);
                     let flickable = item.downcast::<Flickable>();
                     let clip = item.downcast::<Clip>();
-                    let kind = if item == &target { "target" } else if flickable.is_some() { "flickable" } else if clip.is_some() { "clip" } else { "other" };
+                    let kind = if item == target { "target" } else if flickable.is_some() { "flickable" } else if clip.is_some() { "clip" } else { "other" };
                     let clipping = item.borrow().as_ref().clips_children();
                     let visibility_clip = clip.as_ref().is_some_and(|clip| clip.as_pin_ref().is_visibility_clip());
                     eprintln!("appearance_focus_ancestor: kind={kind}, visible={}, clipping={clipping}, visibility_clip={visibility_clip}, x={}, y={}, width={}, height={}", item.is_visible(), point.x, point.y, geometry.size.width, geometry.size.height);
@@ -491,6 +671,73 @@ fn tab_to_control(ui: &AppWindow, label: &str) {
             "appearance_focus_ancestor_bound: count={count}, bounded={}",
             count > 48
         );
+    }
+    // Failure-only raw graph facts: ordinals, counts, kinds and booleans only.
+    // The final graph is read on the tree as it stands after the presses; the
+    // initial one was read before the first press.
+    if let Some(initial) = &initial {
+        let final_target = target_identity(ui, label);
+        let final_graph = focus_graph(ui, final_target.as_ref());
+        let initial_alive = initial.order.iter().filter(|item| item.upgrade().is_some()).count();
+        let initial_in_final = initial
+            .order
+            .iter()
+            .filter(|item| graph_ordinal(&final_graph, item) >= 0)
+            .count();
+        for (phase, graph) in [("initial", initial), ("final", &final_graph)] {
+            eprintln!(
+                "appearance_focus_graph: phase={phase}, items={}, closed={}, bounded={}, target_hits={}, target_ordinal={}, target_subtree_hits={}, target_scope_ordinal={}",
+                graph.order.len(),
+                graph.closed,
+                graph.bounded,
+                graph.target_hits,
+                graph.target_ordinal,
+                graph.target_subtree_hits,
+                graph.target_scope_ordinal
+            );
+        }
+        eprintln!(
+            "appearance_focus_graph_identity: initial_alive={initial_alive}, initial_in_final={initial_in_final}, target_identity_kept={}",
+            target.is_some() && target == final_target
+        );
+        for (index, (pre_ordinal, after_kind, after_ordinal, steps)) in losses.iter().enumerate() {
+            eprintln!(
+                "appearance_focus_loss: index={index}, pre_ordinal={pre_ordinal}, after_kind={after_kind}, after_ordinal={after_ordinal}, step_ordinals={steps:?}"
+            );
+        }
+        eprintln!(
+            "appearance_focus_loss_bound: losses={}, bounded={}",
+            losses.len(),
+            losses.len() >= FOCUS_LOSS_BOUND
+        );
+        // The target control's own FocusScope flags and those of its
+        // descendants, read without changing them.
+        let mut scopes = 0usize;
+        for target_item in &target_items {
+            let mut report = |item: &ItemRc| {
+                if let Some(scope) = item.downcast::<FocusScope>() {
+                    scopes += 1;
+                    if scopes <= 4 {
+                        let scope = scope.as_pin_ref();
+                        eprintln!(
+                            "appearance_focus_target_scope: index={}, enabled={}, focus_on_tab_navigation={}, has_focus={}, visible={}, final_ordinal={}",
+                            scopes - 1,
+                            scope.enabled(),
+                            scope.focus_on_tab_navigation(),
+                            scope.has_focus(),
+                            item.is_visible(),
+                            graph_ordinal(&final_graph, &item.downgrade())
+                        );
+                    }
+                }
+            };
+            report(target_item);
+            target_item.visit_descendants(|item| {
+                report(item);
+                ControlFlow::<()>::Continue(())
+            });
+        }
+        eprintln!("appearance_focus_target_scope_bound: scopes={scopes}, bounded={}", scopes > 4);
     }
     panic!(
         "Appearance control is not keyboard reachable: {label}; page={}, scale={}, distinct_focus={}, unchanged_focus={}, missing_focus={}, target_nodes={}, visible_targets={}, nonzero_targets={}, focused_text_input={}",
