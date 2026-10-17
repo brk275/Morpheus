@@ -176,22 +176,42 @@ def shell_libraries():
     return shell32, ole32
 
 
-def known_folder(name, libraries=None, read_wide=None):
+def read_wide_char(address):
+    return ctypes.wstring_at(address, 1)
+
+
+def read_terminated(address, read_char=None, limit=None):
+    """Read a NUL-terminated wide string one character at a time.
+
+    The shell allocates exactly the path and its terminator, so no read may
+    reach past the first NUL; the cap only stops a runaway read of a buffer
+    that is never terminated.
+    """
+    read_char = read_wide_char if read_char is None else read_char
+    limit = KNOWN_FOLDER_CHARS if limit is None else limit
+    stride = ctypes.sizeof(ctypes.c_wchar)
+    characters = []
+    for index in range(limit):
+        character = read_char(address + index * stride)
+        if character == "\0":
+            return "".join(characters)
+        characters.append(character)
+    raise RuntimeError("Application profile folder path is not terminated")
+
+
+def known_folder(name, libraries=None, read_char=None):
     shell32, ole32 = shell_libraries() if libraries is None else libraries
-    read_wide = ctypes.wstring_at if read_wide is None else read_wide
     guid = ctypes.create_string_buffer(16)
     smoke.require(ole32.CLSIDFromString(KNOWN_FOLDERS[name], guid) == 0, "Invalid known folder identifier")
     pointer = ctypes.c_void_p()
     status = shell32.SHGetKnownFolderPath(guid, 0, None, ctypes.byref(pointer))
     try:
         smoke.require(status == 0 and pointer.value, "Could not resolve the application profile folder")
-        # Bounded wide read of the returned buffer, up to its terminator.
-        text = read_wide(pointer.value, KNOWN_FOLDER_CHARS)
-        end = text.find("\0")
-        smoke.require(end > 0, "Application profile folder path is not terminated")
+        text = read_terminated(pointer.value, read_char)
+        smoke.require(text != "", "Application profile folder path is empty")
         # Judged as a Windows path (drive plus root) wherever this runs.
-        smoke.require(PureWindowsPath(text[:end]).is_absolute(), "Application profile folder path is not absolute")
-        return Path(text[:end])
+        smoke.require(PureWindowsPath(text).is_absolute(), "Application profile folder path is not absolute")
+        return Path(text)
     finally:
         # The shell allocates the string on success only; free every allocation.
         if pointer.value:
@@ -440,6 +460,7 @@ class WindowsUI:
     def __init__(self, bridge, pid, job, handle, diagnostics):
         self.bridge, self.pid, self.job, self.handle, self.diagnostics = bridge, pid, job, handle, diagnostics
         self.pass_incomplete = False
+        self.focus_truncated = False
 
     def alive(self):
         self.diagnostics.operation("process_status")
@@ -473,13 +494,15 @@ class WindowsUI:
             yield node
 
     def find(self, label, *, prefix=False):
+        smoke.require(0 < len(label) < NAME_BOUND, "Acceptance label exceeds the name bound")
         matches = []
         self.diagnostics.value["selector_matches"] = 0
         for node in self.nodes():
             self.diagnostics.operation("node_name")
-            # A cut name can still carry a short exact label or prefix; it can
-            # never hide a second match because the cut keeps the first 256 chars.
-            matched = node.name.startswith(label) if prefix else node.name == label
+            # A cut name can still carry a prefix and cannot hide a second match
+            # because the cut keeps the first 256 characters, but it never proves
+            # a complete exact label.
+            matched = node.name.startswith(label) if prefix else (node.name == label and not node.truncated)
             self.diagnostics.value["traversed_node_matched"] = matched
             if matched:
                 matches.append(node)
@@ -510,18 +533,22 @@ class WindowsUI:
     def focused_name(self):
         self.diagnostics.operation("focused_element")
         value = self.bridge.call({"op": "focused"})
-        require_ui(all(type(value.get(key)) is bool for key in ("present", "owned"))
+        require_ui(all(type(value.get(key)) is bool for key in ("present", "owned", "truncated"))
                    and type(value.get("name")) is str and len(value["name"]) <= NAME_BOUND, "bridge_invalid")
         if not value["present"]:
+            self.focus_truncated = False
             return None
         # Focus elsewhere on the desktop is never treated as our focus state
         # and no key is sent toward it.
         require_ui(value["owned"], "focus_unowned")
+        # A cut name can match a prefix but never proves a complete exact label.
+        self.focus_truncated = value["truncated"]
         return value["name"]
 
     def expect_focus(self, name, *, prefix=False):
+        smoke.require(0 < len(name) < NAME_BOUND, "Acceptance label exceeds the name bound")
         return self.wait_for(lambda: (focused := self.focused_name()) is not None
-                             and (focused.startswith(name) if prefix else focused == name))
+                             and (focused.startswith(name) if prefix else (focused == name and not self.focus_truncated)))
 
     def focus(self, label, *, prefix=False):
         node = self.wait(label, prefix=prefix)

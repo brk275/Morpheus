@@ -45,8 +45,8 @@ def snapshot(*nodes, bounded=False):
     return {"ok": True, "nodes": [node(0, pid=77, type="window", parent=-1), *nodes], "bounded": bounded}
 
 
-def focused_reply(name, owned=True, present=True):
-    return {"ok": True, "present": present, "owned": owned, "name": name}
+def focused_reply(name, owned=True, present=True, truncated=False):
+    return {"ok": True, "present": present, "owned": owned, "name": name, "truncated": truncated}
 
 
 def fake_bridge(diagnostics, snapshots=(), focused=(), key_replies=()):
@@ -94,7 +94,14 @@ def driver(snapshots=(), focused=(), key_replies=(), pid=77, alive=True):
 
 
 def temp_roots(base, name=""):
-    return [Path(base) / name / "roaming" / "brk275" / "Morpheus", Path(base) / name / "local" / "brk275" / "Morpheus"]
+    """Mocked RoamingAppData/LocalAppData bases exist, as on a real runner; the
+    brk275 organization chain below them never does unless a test arranges it."""
+    roots = []
+    for folder in ("roaming", "local"):
+        known = Path(base) / name / folder
+        known.mkdir(parents=True, exist_ok=True)
+        roots.append(known / "brk275" / "Morpheus")
+    return roots
 
 
 class GuardTests(unittest.TestCase):
@@ -153,6 +160,28 @@ class GuardTests(unittest.TestCase):
         self.assertFalse(result["native"])
 
 
+class ShortAllocation:
+    """A fake CoTaskMem block holding exactly the characters the shell wrote.
+
+    Any read past its last character models an access beyond the allocation
+    and fails the test immediately instead of returning stale memory.
+    """
+    def __init__(self, text, base=0x1000):
+        self.text, self.base = text, base
+        self.reads = []
+        self.stride = ctypes.sizeof(ctypes.c_wchar)
+
+    def read_char(self, address):
+        offset = address - self.base
+        if offset < 0 or offset % self.stride:
+            raise AssertionError("misaligned wide read")
+        index = offset // self.stride
+        if index >= len(self.text):
+            raise AssertionError("read past the shell allocation")
+        self.reads.append(index)
+        return self.text[index]
+
+
 class KnownFolderTests(unittest.TestCase):
     """Native shell calls are mocked at the ctypes boundary; nothing runs on Windows here."""
     class Shell:
@@ -172,26 +201,47 @@ class KnownFolderTests(unittest.TestCase):
             return self.status
 
     def resolve(self, shell, text):
-        read = Mock(return_value=text)
-        path = ui.known_folder("roaming", libraries=(shell, shell), read_wide=read)
-        return path, read
+        allocation = ShortAllocation(text)
+        path = ui.known_folder("roaming", libraries=(shell, shell), read_char=allocation.read_char)
+        return path, allocation
 
-    def test_success_reads_a_bounded_terminated_string_and_frees_the_allocation(self):
+    def test_success_reads_exactly_up_to_the_terminator_and_frees_the_allocation(self):
         shell = self.Shell()
-        path, read = self.resolve(shell, "C:\\Users\\qa\\AppData\\Roaming\0stale bytes after the terminator")
+        path, allocation = self.resolve(shell, "C:\\Users\\qa\\AppData\\Roaming\0")
         self.assertEqual(path, Path("C:\\Users\\qa\\AppData\\Roaming"))
         self.assertEqual(shell.guid_text, ui.KNOWN_FOLDERS["roaming"])
         self.assertEqual((shell.flags, shell.token), (0, None))
-        read.assert_called_once_with(0x1000, ui.KNOWN_FOLDER_CHARS)
+        # One read per character plus the terminator, in order, and nothing past it.
+        self.assertEqual(allocation.reads, list(range(len("C:\\Users\\qa\\AppData\\Roaming") + 1)))
         shell.CoTaskMemFree.assert_called_once()
         self.assertEqual(shell.CoTaskMemFree.call_args.args[0].value, 0x1000)
 
-    def test_failure_status_frees_nothing_and_unterminated_or_relative_paths_still_free(self):
+    def test_reads_advance_by_the_wide_character_stride(self):
+        allocation = ShortAllocation("ab\0", base=0x2000)
+        self.assertEqual(ui.read_terminated(0x2000, allocation.read_char), "ab")
+        self.assertEqual(allocation.reads, [0, 1, 2])
+        with patch.object(ui, "KNOWN_FOLDER_CHARS", 3):
+            self.assertEqual(ui.read_terminated(0x2000, allocation.read_char), "ab")
+        source = SOURCE.read_text(encoding="utf-8")
+        # The only wide read in the driver is one character at the given address.
+        self.assertEqual(source.count("wstring_at("), 1)
+        self.assertIn("ctypes.wstring_at(address, 1)", source)
+        self.assertIn("ctypes.sizeof(ctypes.c_wchar)", source)
+
+    def test_unterminated_allocation_stops_at_the_cap_and_frees(self):
+        shell = self.Shell()
+        allocation = ShortAllocation("ABCDEFGHIJ")  # No terminator; longer than the cap below.
+        with patch.object(ui, "KNOWN_FOLDER_CHARS", 8), self.assertRaises(RuntimeError):
+            ui.known_folder("roaming", libraries=(shell, shell), read_char=allocation.read_char)
+        self.assertEqual(allocation.reads, list(range(8)))
+        shell.CoTaskMemFree.assert_called_once()
+
+    def test_failure_status_frees_nothing_and_empty_or_relative_paths_still_free(self):
         shell = self.Shell(status=-2147024894, pointer=0)
         with self.assertRaises(RuntimeError):
             self.resolve(shell, "")
         shell.CoTaskMemFree.assert_not_called()
-        for text in ["C:\\no terminator within the bound", "\0", "relative\\path\0"]:
+        for text in ["\0", "relative\\path\0"]:
             shell = self.Shell()
             with self.subTest(text=text), self.assertRaises(RuntimeError):
                 self.resolve(shell, text)
@@ -252,8 +302,7 @@ class ProfileLifecycleTests(unittest.TestCase):
                                                os.symlink(elsewhere, roots[0], target_is_directory=True)),
                 "dangling_symlink": lambda roots: (roots[1].parent.mkdir(parents=True),
                                                    os.symlink(base / "missing", roots[1])),
-                "organization_symlink": lambda roots: (roots[0].parent.parent.mkdir(parents=True),
-                                                       os.symlink(elsewhere, roots[0].parent, target_is_directory=True)),
+                "organization_symlink": lambda roots: os.symlink(elsewhere, roots[0].parent, target_is_directory=True),
             }
             for name, arrange in cases.items():
                 with self.subTest(case=name):
@@ -547,6 +596,31 @@ class FocusAndKeyTests(unittest.TestCase):
             instance.key("Alt+F4")
         self.assertEqual(bridge.commands, [])
 
+    def test_truncated_focus_or_node_name_matches_a_prefix_but_never_an_exact_label(self):
+        label = "L" * (ui.NAME_BOUND - 1)
+        instance, _, _ = driver(focused=[focused_reply(label, truncated=True)] * 50)
+        with patch.object(ui, "WAIT_SECONDS", 0.3), self.assertRaises(ui.DiagnosticFailure) as error:
+            instance.expect_focus(label)
+        self.assertEqual(error.exception.code, "wait_timeout")
+        instance, _, _ = driver(focused=[focused_reply(label, truncated=True)])
+        instance.expect_focus("L" * 8, prefix=True)
+        instance, _, _ = driver(focused=[focused_reply(label)])
+        instance.expect_focus(label)
+        instance, _, _ = driver([snapshot(node(1, label, truncated=True))] * 2)
+        self.assertIsNone(instance.find(label))
+        self.assertEqual(instance.find("L" * 8, prefix=True).id, 1)
+        for reply in (focused_reply("Done"), {"ok": True, "present": True, "owned": True, "name": "Done"}):
+            reply = dict(reply)
+            reply.pop("truncated", None)
+            instance, _, _ = driver(focused=[reply])
+            with self.subTest(reply=reply), self.assertRaises(ui.DiagnosticFailure) as error:
+                instance.focused_name()
+            self.assertEqual(error.exception.code, "bridge_invalid")
+        for label in ("", "x" * ui.NAME_BOUND):
+            instance, _, _ = driver(focused=[focused_reply("Done")])
+            with self.subTest(label=label), self.assertRaises(RuntimeError):
+                instance.expect_focus(label)
+
     def test_focus_command_targets_the_found_snapshot_element(self):
         instance, bridge, _ = driver([snapshot(node(1, "Open settings", type="button"))],
                                      focused=[focused_reply("Open settings")])
@@ -720,17 +794,30 @@ class BridgeContainmentTests(unittest.TestCase):
             bridge.close()
 
     def test_flooded_replies_stay_within_the_bounded_queue(self):
-        output = b'{"ok":true,"ready":true}\n' + b'{"ok":true,"flood":1}\n' * 500
-        job = FakeJob(output=output, hold_open=True)
+        # Far more lines than the queue holds, yet under 1 KiB in total so the
+        # synchronous fake producer never depends on any OS pipe capacity.
+        flood = 40
+        output = b'{"ok":true,"ready":true}\n' + b'{"ok":true,"flood":1}\n' * flood
+        self.assertLess(len(output), 1024)
+        self.assertGreater(flood, 2 * ui.BRIDGE_QUEUE_BOUND)
+        job = FakeJob(output=output)
+        bridge = ui.Bridge(["bridge"], job, ui.Diagnostics({}), environment={})
         try:
-            bridge = ui.Bridge(["bridge"], job, ui.Diagnostics({}), environment={})
             for _ in range(10):
                 self.assertLessEqual(bridge.replies.qsize(), ui.BRIDGE_QUEUE_BOUND)
                 self.assertEqual(bridge.reply(), {"ok": True, "flood": 1})
             self.assertLessEqual(bridge.replies.qsize(), ui.BRIDGE_QUEUE_BOUND)
+            # Drain the rest so the bounded reader can finish, and verify it did.
+            for _ in range(flood - 10):
+                self.assertEqual(bridge.reply(), {"ok": True, "flood": 1})
+            with self.assertRaises(ui.DiagnosticFailure) as error:
+                bridge.reply()
+            self.assertEqual(error.exception.code, "bridge_exited")
+            bridge.reader.join(timeout=2)
+            self.assertFalse(bridge.reader.is_alive())
         finally:
-            job.release()
             bridge.close()
+        self.assertTrue(bridge.stdin.closed and bridge.stdout.closed)
 
     def test_acceptance_cleanup_never_removes_the_profile_and_reports_an_unverified_stop(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -815,15 +902,23 @@ class PowerShellSourceTests(unittest.TestCase):
         between = send_key[proof:chord]
         self.assertNotIn("SendInput", between)
         self.assertNotIn("Release", between)
-        # Releases of a partially accepted chord happen only after a fresh
-        # ownership proof and only inside the failure branch.
+        # A partially accepted chord is repaired by exactly one native call that
+        # releases every held key, issued in the same statement as a fresh
+        # ownership proof, so no release can follow a lost foreground.
         failure_branch = send_key.split("if ($sent -ne $expected)")[1]
-        self.assertIn("ForegroundOwned", failure_branch.split("Release")[0])
+        self.assertEqual(failure_branch.count("[MorpheusInput]::"), 1)
+        self.assertIn("if ($held.Count -gt 0 -and (ForegroundOwned)) { [void][MorpheusInput]::ReleaseAll($held.ToArray()) }",
+                      failure_branch)
+        self.assertNotIn("::Release(", self.source)
         self.assertIn("Fail 'input_rejected'", failure_branch)
-        # The C# chord builds every transition first and issues a single SendInput.
-        chord_source = self.source.split("public static uint Chord(")[1].split("public static uint Release(")[0]
+        self.assertLess(failure_branch.index("ReleaseAll"), failure_branch.index("Fail 'input_rejected'"))
+        # The C# chord and release builders each issue a single SendInput over a complete array.
+        chord_source = self.source.split("public static uint Chord(")[1].split("public static uint ReleaseAll(")[0]
         self.assertEqual(chord_source.count("SendInput("), 1)
         self.assertIn("SendInput((uint)count, inputs", chord_source)
+        release_source = self.source.split("public static uint ReleaseAll(")[1].split("public static uint WindowProcess(")[0]
+        self.assertEqual(release_source.count("SendInput("), 1)
+        self.assertIn("SendInput((uint)virtualKeys.Length, inputs", release_source)
 
     def test_snapshot_bounds_are_enforced_before_enumeration_and_serialization(self):
         snapshot_source = self.source.split("function Snapshot")[1].split("function FocusElement")[0]
@@ -837,6 +932,10 @@ class PowerShellSourceTests(unittest.TestCase):
         self.assertEqual(ui.TREE_BOUND, 5000)
         self.assertEqual(ui.NAME_BOUND, 256)
         self.assertIn("if ($line.Length -gt 256) { Fail 'invalid_command'", self.source)
+        focused_source = self.source.split("function Focused")[1].split("function ForegroundOwned")[0]
+        self.assertLess(focused_source.index("$name.Substring(0, $MaxName); $truncated = $true"),
+                        focused_source.index("Reply @{ ok = $true; present = $true"))
+        self.assertIn("truncated = $truncated", focused_source)
 
 
 class DiagnosticsAndReportTests(unittest.TestCase):

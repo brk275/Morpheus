@@ -53,10 +53,11 @@ public static class MorpheusInput {
         if (shift) { Transition(inputs, index++, 0x10, true); }
         return SendInput((uint)count, inputs, Marshal.SizeOf(typeof(INPUT)));
     }
-    public static uint Release(ushort virtualKey) {
-        INPUT[] inputs = new INPUT[1];
-        Transition(inputs, 0, virtualKey, true);
-        return SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
+    // Every release a partially accepted chord still needs, in ONE native call.
+    public static uint ReleaseAll(ushort[] virtualKeys) {
+        INPUT[] inputs = new INPUT[virtualKeys.Length];
+        for (int index = 0; index < virtualKeys.Length; index++) { Transition(inputs, index, virtualKeys[index], true); }
+        return SendInput((uint)virtualKeys.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
     }
     public static uint WindowProcess(IntPtr window) { uint owner = 0; GetWindowThreadProcessId(window, out owner); return owner; }
 }
@@ -156,8 +157,12 @@ function Focused {
         if ($element -eq $null) { Reply @{ ok = $true; present = $false; owned = $false; name = '' }; return }
         $owned = Owned $element
         $name = ''
-        if ($owned) { $name = [string]$element.Current.Name }
-        Reply @{ ok = $true; present = $true; owned = $owned; name = $name }
+        $truncated = $false
+        if ($owned) {
+            $name = [string]$element.Current.Name
+            if ($name.Length -gt $MaxName) { $name = $name.Substring(0, $MaxName); $truncated = $true }
+        }
+        Reply @{ ok = $true; present = $true; owned = $owned; name = $name; truncated = $truncated }
     } catch { Fail 'element_unavailable' }
 }
 
@@ -187,13 +192,16 @@ function SendKey([string]$name) {
     if ($shift) { $expected = [uint32]4 }
     $sent = [MorpheusInput]::Chord($Keys[$name], $shift)
     if ($sent -ne $expected) {
-        # The system accepted only a prefix of the chord. Release whatever that
-        # prefix left pressed, but only toward the still-owned foreground window;
-        # a changed foreground gets nothing, and the run fails either way.
-        if ($sent -gt 0 -and (ForegroundOwned)) {
-            if ($shift -and $sent -ge 1) { [void][MorpheusInput]::Release($Shift) }
-            if (($shift -and $sent -eq 2) -or (-not $shift -and $sent -eq 1)) { [void][MorpheusInput]::Release($Keys[$name]) }
-        }
+        # The system accepted only a prefix of the chord. Every key that prefix
+        # left pressed is released in ONE native call, immediately after one
+        # fresh proof of the owned foreground window; a changed foreground gets
+        # nothing. The run fails either way.
+        $held = New-Object 'System.Collections.Generic.List[uint16]'
+        if ($shift) {
+            if ($sent -eq 2) { $held.Add($Keys[$name]) }
+            if ($sent -ge 1 -and $sent -le 3) { $held.Add($Shift) }
+        } elseif ($sent -eq 1) { $held.Add($Keys[$name]) }
+        if ($held.Count -gt 0 -and (ForegroundOwned)) { [void][MorpheusInput]::ReleaseAll($held.ToArray()) }
         Fail 'input_rejected'
         return
     }
