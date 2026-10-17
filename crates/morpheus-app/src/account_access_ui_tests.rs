@@ -546,6 +546,67 @@ async fn assert_nickname_controls_keyboard(ui: &AppWindow) {
     settle(ui).await;
 }
 
+/// A scrolled Settings action needs a nonzero focus rectangle matching the
+/// visible button, so Slint can reveal it when reached with the keyboard.
+/// This checks generated geometry; installed accessibility remains a separate
+/// check against the actual packaged application.
+async fn assert_scale_keyboard_and_focus_bounds(ui: &AppWindow) {
+    use slint::private_unstable_api::re_exports::{AccessibleStringProperty, ItemRc, WindowInner};
+    use std::{cell::RefCell, ops::ControlFlow, rc::Rc};
+
+    let requests = Rc::new(RefCell::new(Vec::new()));
+    let observed = requests.clone();
+    let weak = ui.as_weak();
+    ui.on_change_font_scale(move |value| {
+        observed.borrow_mut().push(value);
+        weak.upgrade()
+            .unwrap()
+            .set_font_scale_percent(value.clamp(75, 200));
+    });
+    for scale in [100, 200] {
+        apply_config(ui, &Config::default(), None);
+        ui.set_page(1);
+        ui.set_font_scale_percent(scale);
+        settle(ui).await;
+        for (label, activation, delta) in [
+            ("Increase font scale", Key::Space, 10),
+            ("Decrease font scale", Key::Return, -10),
+        ] {
+            tab_to_control(ui, label);
+            settle(ui).await;
+            let window = WindowInner::from_pub(ui.window());
+            let focused = window.focus_item.borrow().upgrade().unwrap();
+            let root = ItemRc::new_root(window.component());
+            let mut controls = Vec::new();
+            root.visit_descendants(|item| {
+                if item
+                    .accessible_string_property(AccessibleStringProperty::Label)
+                    .as_deref()
+                    == Some(label)
+                {
+                    controls.push(item.clone());
+                }
+                ControlFlow::<()>::Continue(())
+            });
+            assert_eq!(controls.len(), 1, "unique scale action");
+            assert!(focused_control_has_label(ui, label));
+            assert!(focused.geometry().size.width > 0.0 && focused.geometry().size.height > 0.0);
+            assert_eq!(focused.geometry().size, controls[0].geometry().size);
+            assert!(focused.is_visible() && controls[0].is_visible());
+            let expected = ui.get_font_scale_percent() + delta;
+            let before = requests.borrow().len();
+            key(ui, activation);
+            assert_eq!(requests.borrow().len(), before + 1);
+            assert_eq!(requests.borrow().last(), Some(&expected));
+            assert_eq!(ui.get_font_scale_percent(), expected.clamp(75, 200));
+        }
+    }
+    ui.on_change_font_scale(|_| {});
+    apply_config(ui, &Config::default(), None);
+    ui.set_page(0);
+    settle(ui).await;
+}
+
 // Colors of every native text item currently showing `text`, read from the
 // generated item tree so the assertions trace the real color bindings rather
 // than a helper called with assumed inputs. Items inside `for` and `if` are
@@ -1068,6 +1129,7 @@ async fn exercise_account_ui(runtime: Handle) {
     settle(&ui).await;
     assert_navigation_projection_and_focus(&ui).await;
     assert_palette_and_density_keyboard(&ui).await;
+    assert_scale_keyboard_and_focus_bounds(&ui).await;
     assert_message_role_precedence_and_thread_metadata(&ui).await;
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),

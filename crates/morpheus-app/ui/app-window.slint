@@ -244,6 +244,8 @@ component IconAction inherits Rectangle {
     in property <bool> enabled: true;
     in property <bool> quiet: false;
     in property <bool> context-hover: false;
+    // Scrollable settings opt in so keyboard focus reveals the whole button.
+    in property <bool> reveal-full-control: false;
     property <bool> vector-icon: icon == "S" || icon == "C" || icon == "P" || icon == "⌂" || icon == "+" || icon == "↓" || icon == "F" || icon == "↩" || icon == "♥" || icon == "⌫" || icon == "✎" || icon == "☷";
     opacity: !quiet || context-hover || area.has-hover || keyboard-focus.has-focus ? 1 : 0;
     callback activated();
@@ -279,8 +281,9 @@ component IconAction inherits Rectangle {
     }
     keyboard-focus := FocusScope {
         x: 0px;
-        width: 0px;
-        height: 0px;
+        width: root.reveal-full-control ? root.width : 0px;
+        height: root.reveal-full-control ? root.height : 0px;
+        focus-on-click: !root.reveal-full-control;
         enabled: root.enabled;
         focus-gained(reason) => { root.focus-state-changed(true); }
         focus-lost(reason) => { root.focus-state-changed(false); }
@@ -2914,8 +2917,8 @@ export component AppWindow inherits Window {
                                     Text { text: "Font scale"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
                                     Text { text: root.font-scale-percent + "% · text throughout the app"; color: root.muted; font-size: 11px * root.text-scale; }
                                 }
-                                IconAction { icon: "−"; label: "Decrease font scale"; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-font-scale(root.font-scale-percent - 10); } }
-                                IconAction { icon: "+"; label: "Increase font scale"; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-font-scale(root.font-scale-percent + 10); } }
+                                IconAction { icon: "−"; label: "Decrease font scale"; reveal-full-control: true; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-font-scale(root.font-scale-percent - 10); } }
+                                IconAction { icon: "+"; label: "Increase font scale"; reveal-full-control: true; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-font-scale(root.font-scale-percent + 10); } }
                             }
                         }
                         Text { text: "Density"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
