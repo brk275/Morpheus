@@ -499,6 +499,8 @@ KEYBOARD_FAILURES = frozenset({
 KEYBOARD_STEPS = frozenset({
     "setup", "atspi_setup", "homeserver", "username", "password", "password_role",
     "preview", "account_menu", "appearance", "normal_close", "cleanup", "complete",
+    "appearance_reach_scale", "appearance_initial_scale", "appearance_saved_scale",
+    "appearance_invalid_notice", "appearance_invalid_retained", "appearance_restored",
 })
 KEYBOARD_OPERATIONS = frozenset({
     "none", "desktop", "application_pid", "ownership", "node_cache", "node_children",

@@ -244,3 +244,16 @@ Build and install on macOS Apple Silicon and Intel, Windows x64, and Linux x64 u
 For Linux attachment open/save dialogs, the app builds `rfd` with its XDG portal backend. Runtime testing needs a working `xdg-desktop-portal` service and a desktop-specific portal implementation; `rfd` can fall back to `zenity` when the portal request fails. Test attachment pickers under both Wayland and X11 with the packaged app. The packaging runner's successful compile does not prove that a target desktop provides either dialog path.
 
 Cargo Packager configuration and updater: <https://docs.crabnebula.dev/packager/configuration/>, <https://docs.crabnebula.dev/packager/updater/>. Apple permission and hardened-runtime requirements: <https://developer.apple.com/documentation/xcode/configuring-the-hardened-runtime>, <https://developer.apple.com/documentation/screencapturekit>.
+
+### Scrollable installed appearance checks
+
+The Linux installed keyboard driver reaches the font-scale action with at most
+160 real Tab keys, rechecking the owned foreground window for each key. It
+requires a complete unambiguous selector at the target before activation.
+Waiting for a distant label before scrolling is insufficient: the pinned
+Slint/AccessKit stack omits clipped items from AT-SPI. Fixed appearance
+checkpoints distinguish reaching the control, initial/saved scale, invalid-edit
+feedback, retained scale and restoration; arbitrary labels and raw errors are
+not public diagnostics. Success still requires persistence, invalid-edit
+retention, normal close and cleanup, in addition to the earlier sign-in and
+account-menu checks. This does not establish screen-reader acceptance.
