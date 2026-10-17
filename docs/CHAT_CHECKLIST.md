@@ -1,12 +1,9 @@
-# Cinny v4.12.7 comparison checklist
+# Chat and desktop behavior checklist
 
-Cinny v4.12.7 is the product breadth reference for the first Morpheus beta.
-This is a behavior checklist, not a source-code dependency or a promise that
-every behavior is implemented. Review the released Cinny app alongside
-Morpheus before marking a line complete. The [v4.12.7 release](https://github.com/cinnyapp/cinny/releases/tag/v4.12.7)
-is the pinned comparison point; its [release history](https://github.com/cinnyapp/cinny/releases)
-documents earlier voice/video rooms, DM and room video starts, code-block
-formatting, media, and device-management changes.
+This checklist defines the behavior required for Morpheus's first beta.
+Unchecked items remain release requirements, including partially implemented
+features. Mark an item complete only after testing the full behavior and
+recording the source revision, supported platforms and results.
 
 The completed `a38fe43` verification in
 [run 38737708120](https://github.com/brk275/Morpheus/actions/runs/38737708120)

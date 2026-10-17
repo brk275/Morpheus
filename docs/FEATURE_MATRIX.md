@@ -1,8 +1,8 @@
 # Feature and release matrix
 
 This is the beta gate, not a claim that the features are already implemented.
-Use the [Cinny comparison checklist](CINNY_BENCHMARK.md) for the detailed
-chat-behavior benchmark.
+Use the [chat and desktop checklist](CHAT_CHECKLIST.md) for the detailed
+behavior requirements.
 Mark an item complete only after it works on macOS, Linux, and Windows where
 platform behavior is relevant.
 

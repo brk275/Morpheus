@@ -2832,4 +2832,4 @@ The current checks do not establish current-format Element Call interoperability
 live received video in the Morpheus call stage,
 packaged-app screen-sharing controls and permissions, Linux or Windows GUI
 behavior, screen-reader acceptance, install/update/remove behavior, signed
-packages, or Cinny-level messaging and administration breadth.
+packages, or the full messaging and administration requirements.
