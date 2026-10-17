@@ -16,6 +16,40 @@ Pull requests now produce the same fictional native preview captures as main
 pushes. Their images and provenance require review before publication in the
 gallery. Installers remain excluded from workflow uploads.
 
+## Native vault and installed accessibility diagnostics: `3fe1285`
+
+[Native-vault run 38771813135](https://github.com/brk275/Morpheus/actions/runs/38771813135)
+tested `3fe1285e27877501339aeb315df2c516093b0cbc` on the standard Apple
+Silicon, Intel Mac and Windows runners. Both Macs passed five fixture contracts,
+all 13 preparation checks and all 11 restart/removal checks against disposable
+native keychain entries. These cover password enable/change, wrong-password
+rejection, cancellation, protected direct-switch rejection, persisted
+authorization after restart, exact removal of each account and password reset
+only after all accounts are gone. Children stopped, original keychain settings
+were restored, and private profiles were removed. This is core acceptance with
+synthetic accounts, not installed UI or real Matrix sign-in acceptance.
+
+Windows passed the five contracts, then failed before either acceptance phase
+at `windows_root_prepare` with `windows_isolation_acl_owner`. Cleanup passed.
+The result identifies an owner-representation rejection, but does not establish
+which SID spelling Windows returned. A source correction resolves SDDL aliases
+through Windows before comparing exact SIDs; its mocked tests pass, while native
+verification remains pending. The protected two-ACE policy is unchanged.
+
+[Linux package run 38771819496](https://github.com/brk275/Morpheus/actions/runs/38771819496)
+tested the ordinary AppImage at the same revision with updates and fixed-client
+capture disabled. Resources, desktop entry/icon, ELF baseline and the owned
+12-second X11 startup/stop check passed. Installed accessibility traversal failed
+with `value_error` at `node_child_count` during the username lookup, on a node
+that did not match the selector. The owned application and homeserver field
+were seen; username/password semantics, account-menu keyboard interaction,
+appearance editing and normal close remain unverified. Cleanup passed. AppImage
+SHA-256: `d62cb75ca55de3f900730713b09b035169ef4d8622fed882ab5392079a75f4ba`.
+
+Every job and cache post in both runs completed, their six complete logs scanned
+with zero findings, and neither run uploaded artifacts. System Wayland capture,
+screen readers, physical devices, signing and updates remain open release gates.
+
 ## Native vault and installed accessibility diagnostics: `ff2c353`
 
 [Native-vault run 38765972179](https://github.com/brk275/Morpheus/actions/runs/38765972179)

@@ -130,6 +130,7 @@ class _Api:
             (self.advapi, "ConvertStringSecurityDescriptorToSecurityDescriptorW", [ctypes.c_wchar_p, DWORD, ctypes.POINTER(PTR), ctypes.POINTER(DWORD)], BOOL),
             (self.advapi, "GetNamedSecurityInfoW", [ctypes.c_wchar_p, ctypes.c_int, DWORD, PTR, PTR, PTR, PTR, ctypes.POINTER(PTR)], DWORD),
             (self.advapi, "ConvertSecurityDescriptorToStringSecurityDescriptorW", [PTR, DWORD, DWORD, ctypes.POINTER(PTR), ctypes.POINTER(DWORD)], BOOL),
+            (self.advapi, "ConvertStringSidToSidW", [ctypes.c_wchar_p, ctypes.POINTER(PTR)], BOOL),
         )
         for library, name, arguments, result in signatures:
             function = getattr(library, name)
@@ -183,11 +184,37 @@ class _Api:
             raw = ctypes.wstring_at(output, length.value)
             text, separator, padding = raw.partition("\0")
             require(separator and not padding.strip("\0"), "descriptor_termination")
-            return text
+            # SDDL can spell the same SID as an alias (for example LA).
+            # Resolve aliases through Windows before the exact owner/ACE
+            # comparison; never infer identity from an alias or RID suffix.
+            return re.sub(r"(?<=O:)[A-Z]{2}(?=D:)|(?<=;;;)[A-Z]{2}(?=\))",
+                          lambda match: (match.group() if match.group() == "SY"
+                                         else self.alias_sid(match.group())), text)
         finally:
             if output.value:
                 self.kernel.LocalFree(output)
             self.kernel.LocalFree(descriptor)
+
+    def alias_sid(self, alias):
+        """Copy a Windows-resolved SDDL alias to canonical SID text."""
+        require(type(alias) is str and re.fullmatch(r"[A-Z]{2}", alias) is not None,
+                "descriptor_convert")
+        output = PTR()
+        if not self.advapi.ConvertStringSidToSidW(alias, ctypes.byref(output)):
+            raise NativeVaultWindowsError("descriptor_convert", ctypes.get_last_error())
+        try:
+            require(output.value is not None, "descriptor_bounds")
+            # ConvertStringSidToSidW owns a valid SID allocation. Read its
+            # fixed header first, then copy only its bounded subauthorities.
+            header = ctypes.string_at(output, 8)
+            require(header[0] == 1 and 1 <= header[1] <= 15, "descriptor_bounds")
+            raw = ctypes.string_at(output, 8 + 4 * header[1])
+            return ("S-1-" + str(int.from_bytes(raw[2:8], "big"))
+                    + "".join("-" + str(int.from_bytes(raw[n:n + 4], "little"))
+                              for n in range(8, len(raw), 4)))
+        finally:
+            if output.value:
+                self.kernel.LocalFree(output)
 
 
 def _verify(root, api, sid):
