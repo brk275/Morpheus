@@ -16,6 +16,7 @@ def diagnostic(**overrides):
             "homeserver_seen": True, "username_seen": True, "password_seen": True,
             "selector_matches": 1, "password_role": "password_text", "cleanup": "passed",
             "traversed_node_matched": False,
+            "child_count_unavailable": 0, "child_unavailable": 0, "incomplete_passes": 0,
             **overrides}
 
 
@@ -235,16 +236,45 @@ class KeyboardFlowMockTests(unittest.TestCase):
 
 
 
+def pyatspi_getitem(self, i):
+    # Verbatim Accessible_getitem from pyatspi 2.46.1 pyatspi/Accessibility.py.
+    len=self.get_child_count()
+    if i < 0:
+            i = len + i
+    if i < 0 or i >= len:
+            raise IndexError
+    return self.get_child_at_index(i)
+
+
+class FakeDesktop:
+    """The desktop root, exposing pyatspi 2.46.1's native calls and protocol."""
+    def __init__(self, applications):
+        self.applications = list(applications)
+
+    def get_child_count(self):
+        return len(self.applications)
+
+    def get_child_at_index(self, index):
+        return self.applications[index]
+
+    __len__ = get_child_count
+    __getitem__ = pyatspi_getitem
+
+
+def fake_driver(applications=()):
+    driver = object.__new__(ui.AccessibleUI)
+    driver.diagnostics = ui.Diagnostics({})
+    driver.api = Mock()
+    driver.api.Registry.getDesktop.return_value = FakeDesktop(applications)
+    driver.transient_error = type("Transient", (Exception,), {})
+    driver.process = Mock()
+    driver.owned = lambda _: True
+    return driver
+
+
 class BoundedDiagnosticTests(unittest.TestCase):
     def driver(self, applications=()):
-        driver = object.__new__(ui.AccessibleUI)
-        driver.diagnostics = ui.Diagnostics({})
-        driver.api = Mock()
-        driver.api.Registry.getDesktop.return_value = applications
-        driver.transient_error = type("Transient", (Exception,), {})
-        driver.process = Mock()
-        driver.owned = lambda _: True
-        return driver
+        return fake_driver(applications)
 
     def test_duplicate_exact_labels_remain_failure_with_bounded_match_count(self):
         driver = self.driver()
@@ -374,11 +404,22 @@ class BoundedDiagnosticTests(unittest.TestCase):
         bad = [diagnostic(step="PRIVATE_PATH"), diagnostic(step=[]), diagnostic(operation="PRIVATE_LABEL"),
                diagnostic(failure="PRIVATE_ERROR"), diagnostic(password_role="PRIVATE_ROLE"),
                diagnostic(selector_matches=3), diagnostic(selector_matches=True),
+               diagnostic(child_count_unavailable=3), diagnostic(child_count_unavailable=-1),
+               diagnostic(child_unavailable=3), diagnostic(child_unavailable=False),
+               diagnostic(incomplete_passes=True), diagnostic(incomplete_passes="1"),
                diagnostic(owned_app_seen=1), diagnostic(cleanup="failed"),
                diagnostic(homeserver_seen=False), diagnostic(private_text="SECRET")]
         for value in bad:
             with self.subTest(value=value), self.assertRaises(RuntimeError):
                 smoke.keyboard_report(json.dumps(report(diagnostic=value)).encode())
+        missing = diagnostic()
+        del missing["incomplete_passes"]
+        with self.assertRaises(RuntimeError):
+            smoke.keyboard_report(json.dumps(report(diagnostic=missing)).encode())
+        # Retried IPC failures are facts, not blockers: a complete final pass passes.
+        for value in (diagnostic(child_count_unavailable=2, incomplete_passes=2),
+                      diagnostic(child_count_unavailable=1)):
+            self.assertEqual(smoke.keyboard_report(json.dumps(report(diagnostic=value)).encode())["status"], "passed")
 
     def test_exception_text_never_reaches_final_record(self):
         for error in (AttributeError("PRIVATE_PATH"), TypeError("PRIVATE_SECRET"),
@@ -393,43 +434,363 @@ class BoundedDiagnosticTests(unittest.TestCase):
 
 class SequenceDiagnosticTests(unittest.TestCase):
     class Sequence:
-        def __init__(self, values, error_at=None, error=None, count=None):
-            self.values, self.error_at, self.error, self.count = values, error_at, error, count
+        """pyatspi 2.46.1's Accessible protocol over fake native calls.
+
+        __len__ is get_child_count and __getitem__ repeats get_child_count
+        before get_child_at_index. `count` fixes every count answer; `counts`
+        lists successive answers, the last one repeating; `missing` indexes
+        return None like libatspi's NULL child.
+        """
+        def __init__(self, values, error_at=None, error=None, count=None, counts=None, missing=()):
+            self.values, self.error_at, self.error = values, error_at, error
+            self.count, self.counts, self.missing = count, list(counts or ()), set(missing)
             self.calls = []
 
-        def __len__(self):
+        def get_child_count(self):
             self.calls.append("count")
+            if self.counts:
+                return self.counts.pop(0) if len(self.counts) > 1 else self.counts[0]
             return len(self.values) if self.count is None else self.count
 
-        def __getitem__(self, index):
+        def get_child_at_index(self, index):
             self.calls.append(index)
             if index == self.error_at:
                 raise self.error
+            if index in self.missing:
+                return None
             return self.values[index]
+
+        __len__ = get_child_count
+        __getitem__ = pyatspi_getitem
 
     def test_list_preserves_exact_length_and_index_operations(self):
         original, observed = self.Sequence([1, 2, 3]), self.Sequence([1, 2, 3])
         diagnostics = ui.Diagnostics({})
         self.assertEqual(list(original), list(ui.ObservedSequence(observed, diagnostics, "node")))
         self.assertEqual(original.calls, observed.calls)
-        self.assertEqual(diagnostics.value["operation"], "node_child_index")
+        self.assertEqual(observed.calls, ["count", "count", 0, "count", 1, "count", 2, "count"])
+        # The terminating IndexError comes from the last repeated count.
+        self.assertEqual(diagnostics.value["operation"], "node_child_count")
 
     def test_desktop_for_loop_preserves_index_only_protocol(self):
         original, observed = self.Sequence([1, 2]), self.Sequence([1, 2])
         self.assertEqual([x for x in original],
                          [x for x in ui.ObservedSequence(observed, ui.Diagnostics({}), "desktop")])
+        # No length hint: pyatspi counts once per index, then stops at IndexError.
         self.assertEqual(original.calls, observed.calls)
-        self.assertNotIn("count", observed.calls)
+        self.assertEqual(observed.calls, ["count", 0, "count", 1, "count"])
 
-    def test_negative_child_count_reports_value_error_at_count_without_skipping(self):
+    def test_negative_child_count_is_libatspi_ipc_failure_not_python_value_error(self):
+        # at-spi2-core returns -1 without a GError when the ChildCount call got
+        # no reply; pyatspi 2.46.1 binds __len__ to get_child_count, so len()
+        # would report ValueError. The sentinel is recognized before len() and
+        # surfaces as the retryable LookupError the traversal already handles.
         sequence = self.Sequence([], count=-1)
         diagnostics = ui.Diagnostics({})
-        with self.assertRaises(ValueError) as error:
+        with self.assertRaises(ui.ChildCountUnavailable) as error:
             list(ui.ObservedSequence(sequence, diagnostics, "node"))
-        diagnostics.failed(error.exception)
+        self.assertIsInstance(error.exception, LookupError)
         self.assertEqual(sequence.calls, ["count"])
         self.assertEqual(diagnostics.value["operation"], "node_child_count")
-        self.assertEqual(diagnostics.value["failure"], "value_error")
+        self.assertEqual(diagnostics.value["child_count_unavailable"], 1)
+        diagnostics.failed(error.exception)
+        self.assertEqual(diagnostics.value["failure"], "lookup_error")
+        # Repeats stay bounded; a non-negative count is forwarded unchanged.
+        with self.assertRaises(ui.ChildCountUnavailable):
+            list(ui.ObservedSequence(sequence, diagnostics, "node"))
+        with self.assertRaises(ui.ChildCountUnavailable):
+            list(ui.ObservedSequence(sequence, diagnostics, "node"))
+        self.assertEqual(diagnostics.value["child_count_unavailable"], 2)
+        self.assertEqual(list(ui.ObservedSequence(self.Sequence([5]), diagnostics, "node")), [5])
+
+    class Node:
+        """A fake accessible exposing pyatspi 2.46.1's native calls and protocol."""
+        def __init__(self, name, children=(), count=None, counts=None, missing=(), focused=False):
+            self.name, self.children, self.count = name, list(children), count
+            self.counts, self.missing, self.focused = list(counts or ()), set(missing), focused
+            self.cleared = 0
+
+        def clearCache(self):
+            self.cleared += 1
+
+        def get_process_id(self):
+            return 4242
+
+        def getState(self):
+            return Mock(contains=Mock(return_value=self.focused))
+
+        def get_child_count(self):
+            if self.counts:
+                return self.counts.pop(0) if len(self.counts) > 1 else self.counts[0]
+            return len(self.children) if self.count is None else self.count
+
+        def get_child_at_index(self, index):
+            return None if index in self.missing else self.children[index]
+
+        __len__ = get_child_count
+        __getitem__ = pyatspi_getitem
+
+    def test_indexed_count_failure_cannot_hide_a_second_match_or_focus(self):
+        # Hosted shape: the length hint succeeds, then -1 arrives while reading
+        # index 1. pyatspi alone would yield only the first child, so a duplicate
+        # label or a second focused node behind it would stay unseen and the
+        # pass would wrongly look unique.
+        def tree():
+            first = self.Node("Homeserver URL", focused=True)
+            second = self.Node("Homeserver URL", focused=True)
+            return self.Node("PRIVATE_APP", [first, second], counts=[2, 2, -1, 2])
+
+        # list() reads the length hint first, exactly as the driver does; pyatspi
+        # then returns only the first child.
+        self.assertEqual([child.name for child in list(tree())], ["Homeserver URL"])
+
+        driver = fake_driver([tree()])
+        with self.assertRaises(ui.IncompleteTraversal):
+            driver.find("Homeserver URL")
+        value = driver.diagnostics.value
+        self.assertEqual(value["child_count_unavailable"], 1)
+        self.assertEqual(value["incomplete_passes"], 1)
+        self.assertTrue(driver.pass_incomplete)
+        # The retry sees the complete tree and reports the real ambiguity.
+        with patch.object(smoke, "process_status", return_value=None):
+            with self.assertRaises(ui.DiagnosticFailure) as error:
+                driver.wait("Homeserver URL")
+        self.assertEqual(error.exception.code, "selector_ambiguous")
+        self.assertEqual(value["selector_matches"], 2)
+
+        driver = fake_driver([tree()])
+        driver.api.STATE_FOCUSED = object()
+        with self.assertRaises(ui.IncompleteTraversal):
+            driver.focused_name()
+        with patch.object(smoke, "process_status", return_value=None):
+            with self.assertRaises(RuntimeError) as error:
+                driver.expect_focus("Homeserver URL")
+        self.assertNotIsInstance(error.exception, LookupError)
+        self.assertNotIn("PRIVATE", json.dumps(driver.diagnostics.value))
+
+    def test_missing_child_during_traversal_marks_the_pass_incomplete(self):
+        hidden = self.Node("Homeserver URL")
+        app = self.Node("PRIVATE_APP", [self.Node("PRIVATE_LEAF"), hidden], missing={1})
+        driver = fake_driver([app])
+        self.assertEqual(list(driver.nodes()), [app])
+        self.assertTrue(driver.pass_incomplete)
+        self.assertEqual(driver.diagnostics.value["child_unavailable"], 1)
+        self.assertEqual(hidden.cleared, 0)
+
+    def test_only_the_exact_minus_one_sentinel_is_retryable(self):
+        # at-spi2-core documents -1 alone; anything else is not a known signal
+        # and keeps failing closed through len().
+        for count in (-2, -2147483648):
+            sequence = self.Sequence([], count=count)
+            diagnostics = ui.Diagnostics({})
+            with self.assertRaises(ValueError) as error:
+                list(ui.ObservedSequence(sequence, diagnostics, "node"))
+            diagnostics.failed(error.exception)
+            self.assertEqual(sequence.calls, ["count"])
+            self.assertEqual(diagnostics.value["operation"], "node_child_count")
+            self.assertEqual(diagnostics.value["failure"], "value_error")
+            self.assertEqual(diagnostics.value["child_count_unavailable"], 0)
+        with self.assertRaises(TypeError):
+            list(ui.ObservedSequence(self.Sequence([], count="PRIVATE_LENGTH"), ui.Diagnostics({}), "node"))
+        # The same closed failure applies to the repeated count inside an index
+        # read, where pyatspi itself would have ended the list quietly.
+        truncating = self.Sequence([1, 2], counts=[2, -2])
+        self.assertEqual(list(truncating), [])
+        checked = self.Sequence([1, 2], counts=[2, -2])
+        with self.assertRaises(ValueError):
+            list(ui.ObservedSequence(checked, ui.Diagnostics({}), "node"))
+        self.assertEqual(checked.calls, ["count", "count"])
+
+    def test_minus_one_at_an_indexed_count_is_not_end_of_sequence(self):
+        # pyatspi's own protocol: a good length hint, then -1 while reading
+        # index 1 raises IndexError and silently drops the second child.
+        native = self.Sequence(["first", "second"], counts=[2, 2, -1])
+        self.assertEqual(list(native), ["first"])
+        observed = self.Sequence(["first", "second"], counts=[2, 2, -1])
+        diagnostics = ui.Diagnostics({})
+        with self.assertRaises(ui.ChildCountUnavailable):
+            list(ui.ObservedSequence(observed, diagnostics, "node"))
+        self.assertEqual(observed.calls, ["count", "count", 0, "count"])
+        self.assertEqual(diagnostics.value["child_count_unavailable"], 1)
+        self.assertEqual(diagnostics.value["operation"], "node_child_count")
+
+    def test_missing_child_object_is_not_an_empty_position(self):
+        native = self.Sequence(["first", "second"], missing={1})
+        self.assertEqual(list(native), ["first", None])
+        observed = self.Sequence(["first", "second"], missing={1})
+        diagnostics = ui.Diagnostics({})
+        with self.assertRaises(ui.ChildUnavailable) as error:
+            list(ui.ObservedSequence(observed, diagnostics, "node"))
+        self.assertIsInstance(error.exception, LookupError)
+        self.assertEqual(observed.calls, ["count", "count", 0, "count", 1])
+        self.assertEqual(diagnostics.value["child_unavailable"], 1)
+        self.assertEqual(diagnostics.value["operation"], "node_child_index")
+
+    def test_ownership_lost_mid_tree_marks_the_pass_incomplete(self):
+        hidden = self.Node("PRIVATE_HIDDEN")
+        child = self.Node("PRIVATE_CHILD", [hidden])
+        app = self.Node("PRIVATE_APP", [child])
+        driver = fake_driver([app])
+        answers = iter([True, True, False])
+        driver.owned = lambda _: next(answers)
+        self.assertEqual(list(driver.nodes()), [app])
+        self.assertTrue(driver.pass_incomplete)
+        self.assertEqual(child.cleared, 1)
+        self.assertEqual(hidden.cleared, 0)
+        self.assertTrue(driver.diagnostics.value["owned_node_seen"])
+
+    def focused(self, name, state_error=None):
+        node = Mock()
+        node.name = name
+        if state_error is None:
+            node.getState.return_value.contains.return_value = True
+        else:
+            node.getState.side_effect = state_error
+        return node
+
+    def test_focus_from_an_incomplete_pass_is_refused_then_retried(self):
+        driver = fake_driver([])
+        driver.api.STATE_FOCUSED = object()
+        focused = self.focused("Account menu")
+        passes = []
+
+        def nodes():
+            passes.append(len(passes))
+            driver.pass_incomplete = len(passes) == 1
+            yield focused
+
+        driver.nodes = nodes
+        with self.assertRaises(ui.IncompleteTraversal) as error:
+            driver.focused_name()
+        self.assertIsInstance(error.exception, LookupError)
+        self.assertEqual(driver.diagnostics.value["incomplete_passes"], 1)
+        with patch.object(smoke, "process_status", return_value=None):
+            self.assertTrue(driver.expect_focus("Account menu"))
+        self.assertEqual(passes, [0, 1])
+        self.assertEqual(driver.diagnostics.value["incomplete_passes"], 1)
+
+    def test_state_read_failure_marks_focus_pass_incomplete(self):
+        driver = fake_driver([])
+        driver.api.STATE_FOCUSED = object()
+        unreadable = self.focused("PRIVATE_UNREADABLE", state_error=driver.transient_error())
+        driver.nodes = lambda: iter([unreadable, self.focused("Account menu")])
+        with self.assertRaises(ui.IncompleteTraversal):
+            driver.focused_name()
+        self.assertNotIn("PRIVATE", json.dumps(driver.diagnostics.value))
+
+    def test_two_focused_nodes_fail_even_when_the_pass_is_incomplete(self):
+        driver = fake_driver([])
+        driver.api.STATE_FOCUSED = object()
+
+        def nodes():
+            driver.pass_incomplete = True
+            yield self.focused("Account menu")
+            yield self.focused("Settings")
+
+        driver.nodes = nodes
+        with self.assertRaises(RuntimeError) as error:
+            driver.focused_name()
+        self.assertNotIsInstance(error.exception, LookupError)
+        self.assertEqual(driver.diagnostics.value["incomplete_passes"], 0)
+
+    def test_persistent_focus_gap_ends_as_wait_timeout(self):
+        driver = fake_driver([])
+        driver.api.STATE_FOCUSED = object()
+
+        def stalled():
+            driver.pass_incomplete = True
+            yield self.focused("Account menu")
+
+        driver.nodes = stalled
+        with patch.object(smoke, "process_status", return_value=None), \
+                patch.object(ui.time, "monotonic", side_effect=[0.0, 0.0, 0.1, 0.2, 100.0]), \
+                patch.object(ui.time, "sleep"):
+            with self.assertRaises(ui.DiagnosticFailure) as error:
+                driver.expect_focus("Account menu")
+        self.assertEqual(error.exception.code, "wait_timeout")
+        self.assertEqual(driver.diagnostics.value["incomplete_passes"], 2)
+
+    def test_unavailable_child_count_skips_only_that_subtree_and_marks_pass_incomplete(self):
+        hidden = self.Node("PRIVATE_HIDDEN")
+        stalled = self.Node("PRIVATE_STALLED", [hidden], count=-1)
+        sibling = self.Node("PRIVATE_SIBLING")
+        app = self.Node("PRIVATE_APP", [stalled, sibling])
+        driver = fake_driver([app])
+        seen = list(driver.nodes())
+        # Every reachable node is still visited and cache-cleared; only the
+        # children behind the failed count are missing, and the pass says so.
+        self.assertEqual(seen, [app, sibling, stalled])
+        self.assertTrue(all(node.cleared == 1 for node in seen))
+        self.assertTrue(driver.pass_incomplete)
+        value = driver.diagnostics.value
+        self.assertEqual(value["child_count_unavailable"], 1)
+        self.assertTrue(value["owned_node_seen"])
+        self.assertNotIn("PRIVATE", json.dumps(value))
+        # A healthy tree is a complete pass.
+        healthy = fake_driver([self.Node("PRIVATE_APP", [self.Node("PRIVATE_LEAF")])])
+        self.assertEqual(len(list(healthy.nodes())), 2)
+        self.assertFalse(healthy.pass_incomplete)
+        self.assertEqual(healthy.diagnostics.value["child_count_unavailable"], 0)
+
+    def test_find_refuses_a_match_from_an_incomplete_pass_and_retries(self):
+        driver = fake_driver([])
+        match = Mock()
+        match.name = "Matrix ID or username"
+        passes = []
+
+        def nodes():
+            passes.append(len(passes))
+            driver.pass_incomplete = len(passes) == 1
+            yield match
+
+        driver.nodes = nodes
+        # The hosted failure shape: the label is present, but the owned tree
+        # was not completely traversed. That pass is not evidence.
+        with self.assertRaises(ui.IncompleteTraversal) as error:
+            driver.find("Matrix ID or username")
+        self.assertIsInstance(error.exception, LookupError)
+        value = driver.diagnostics.value
+        self.assertEqual(value["selector_matches"], 1)
+        self.assertTrue(value["traversed_node_matched"])
+        self.assertEqual(value["incomplete_passes"], 1)
+        # wait_for treats it like any transient lookup failure and runs the
+        # next pass, which is complete and returns the same match.
+        with patch.object(smoke, "process_status", return_value=None):
+            self.assertIs(driver.wait("Matrix ID or username"), match)
+        self.assertEqual(passes, [0, 1])
+        self.assertEqual(value["incomplete_passes"], 1)
+
+    def test_incomplete_pass_never_hides_ambiguity_or_becomes_a_pass(self):
+        driver = fake_driver([])
+        first, second = Mock(), Mock()
+        first.name = second.name = "Homeserver URL"
+
+        def nodes():
+            driver.pass_incomplete = True
+            yield first
+            yield second
+
+        driver.nodes = nodes
+        with self.assertRaises(ui.DiagnosticFailure) as error:
+            driver.find("Homeserver URL")
+        self.assertEqual(error.exception.code, "selector_ambiguous")
+        # A pass that keeps failing to complete ends as the existing timeout,
+        # with the counters bounded, never as a silent success.
+        single = Mock()
+        single.name = "Homeserver URL"
+
+        def stalled():
+            driver.pass_incomplete = True
+            yield single
+
+        driver.nodes = stalled
+        with patch.object(smoke, "process_status", return_value=None), \
+                patch.object(ui.time, "monotonic", side_effect=[0.0, 0.0, 0.1, 0.2, 100.0]), \
+                patch.object(ui.time, "sleep"):
+            with self.assertRaises(ui.DiagnosticFailure) as error:
+                driver.wait("Homeserver URL")
+        self.assertEqual(error.exception.code, "wait_timeout")
+        self.assertEqual(driver.diagnostics.value["incomplete_passes"], 2)
 
     def test_child_index_runtime_failure_is_not_an_empty_subtree(self):
         sequence = self.Sequence([1, 2], error_at=1, error=RuntimeError("PRIVATE_NODE_DATA"))
@@ -437,7 +798,7 @@ class SequenceDiagnosticTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as error:
             list(ui.ObservedSequence(sequence, diagnostics, "node"))
         diagnostics.failed(error.exception)
-        self.assertEqual(sequence.calls, ["count", 0, 1])
+        self.assertEqual(sequence.calls, ["count", "count", 0, "count", 1])
         self.assertEqual(diagnostics.value["operation"], "node_child_index")
         self.assertEqual(diagnostics.value["failure"], "runtime_error")
         self.assertNotIn("PRIVATE", json.dumps(diagnostics.value))

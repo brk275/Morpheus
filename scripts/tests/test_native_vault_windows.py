@@ -245,6 +245,74 @@ class ApiTests(unittest.TestCase):
                     api.descriptor(Path("owned-root"))
             self.assertEqual([call.args[0].value for call in api.kernel.LocalFree.call_args_list], [567] if fault == "failure" else [789, 567])
 
+class AliasTests(unittest.TestCase):
+    api = ApiTests.api
+
+    def test_os_resolved_alias_is_compared_as_an_exact_sid_not_a_rid(self):
+        for resolved in (USER, USER.replace("-1001", "-500"), "S-1-5-32-544"):
+            with self.subTest(resolved=resolved):
+                api = self.api()
+                value = "O:LAD:P(A;OICI;FA;;;LA)(A;OICI;FA;;;SY)"
+                memory = ctypes.create_unicode_buffer(value)
+                def query(*args):
+                    args[-1]._obj.value = 567
+                    return 0
+                def convert(descriptor, revision, information, output, length):
+                    output._obj.value = ctypes.addressof(memory)
+                    length._obj.value = len(memory)
+                    return 1
+                api.advapi.GetNamedSecurityInfoW = query
+                api.advapi.ConvertSecurityDescriptorToStringSecurityDescriptorW = convert
+                api.alias_sid = Mock(return_value=resolved)
+                descriptor = api.descriptor(Path("owned-root"))
+                self.assertEqual(api.alias_sid.call_args_list, [unittest.mock.call("LA")] * 2)
+                self.assertEqual(W.descriptor_is_private(descriptor, USER), resolved == USER)
+                self.assertEqual(api.kernel.LocalFree.call_count, 2)
+
+    def test_alias_sid_copies_only_the_os_allocated_sid_and_frees_it(self):
+        for values in ((21, 11, 22, 33, 1001), (18,), (32, 544)):
+            api = self.api()
+            raw = bytes([1, len(values)]) + (5).to_bytes(6, "big")
+            raw += b"".join(value.to_bytes(4, "little") for value in values)
+            memory = ctypes.create_string_buffer(raw)
+            def convert(alias, output):
+                self.assertEqual(alias, "LA")
+                output._obj.value = ctypes.addressof(memory)
+                return 1
+            api.advapi.ConvertStringSidToSidW = convert
+            self.assertEqual(api.alias_sid("LA"), "S-1-5-" + "-".join(map(str, values)))
+            self.assertEqual(api.kernel.LocalFree.call_args.args[0].value, ctypes.addressof(memory))
+
+    def test_alias_validation_and_bad_native_headers_fail_closed(self):
+        api = self.api()
+        api.advapi.ConvertStringSidToSidW = Mock()
+        for alias in ("", "LA\0", "la", USER, "LA)(A;;FA;;;WD)"):
+            with self.assertRaises(W.NativeVaultWindowsError):
+                api.alias_sid(alias)
+        api.advapi.ConvertStringSidToSidW.assert_not_called()
+        for header in (bytes([2, 1]) + bytes(6), bytes([1, 0]) + bytes(6),
+                       bytes([1, 16]) + bytes(6)):
+            api = self.api()
+            memory = ctypes.create_string_buffer(header)
+            def convert(alias, output):
+                output._obj.value = ctypes.addressof(memory)
+                return 1
+            api.advapi.ConvertStringSidToSidW = convert
+            with self.assertRaises(W.NativeVaultWindowsError) as caught:
+                api.alias_sid("LA")
+            self.assertEqual(caught.exception.code, "descriptor_bounds")
+            self.assertEqual(api.kernel.LocalFree.call_count, 1)
+
+    def test_alias_api_failure_never_exposes_os_error_text(self):
+        api = self.api()
+        api.advapi.ConvertStringSidToSidW = Mock(return_value=0)
+        with patch.object(ctypes, "get_last_error", return_value=1337, create=True):
+            with self.assertRaises(W.NativeVaultWindowsError) as caught:
+                api.alias_sid("LA")
+        self.assertEqual(str(caught.exception), "descriptor_convert")
+        api.kernel.LocalFree.assert_not_called()
+
+
 class ClosedDiagnosticTests(unittest.TestCase):
     api = ApiTests.api
     def test_policy_categories_do_not_admit_any_new_descriptor(self):

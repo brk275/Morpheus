@@ -90,7 +90,16 @@ This accepts the AppImage runtime's child process and rejects an unrelated
 window with the same title. Raw application logs are never printed on startup
 failure; the keyboard driver's entire output is private except for validated
 fixed phases and boolean results. No accessibility trees or screenshots are
-published.
+published. A selector pass that could not read one node's child count (libatspi
+reports an unanswered `ChildCount` call as `-1` without an error, and pyatspi
+repeats that call for every index, where a `-1` would otherwise end the list
+early), that received no object for a child index, or that skipped a node for a
+transient IPC error is not evidence: the driver counts it and runs another pass
+within the existing wait. A partial traversal can still reject two matches as
+ambiguous; only a complete traversal can establish a unique label or keyboard
+focus. Only libatspi's
+exact `-1` sentinel is treated this way; any other invalid length still fails
+the run.
 
 On Linux startup failure, a bounded private-log reducer may report a fixed
 loader-error category and a reviewed literal library name. It requires exit

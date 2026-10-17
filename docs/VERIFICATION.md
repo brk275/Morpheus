@@ -3,6 +3,31 @@
 Morpheus is pre-alpha software with no approved installer release. This log records checks actually completed;
 the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
+## Per-account theme validation and integration: `0d75626`
+
+[PR 6](https://github.com/brk275/Morpheus/pull/6) was reviewed and merged after
+[run 39052430665](https://github.com/brk275/Morpheus/actions/runs/39052430665)
+passed on Apple Silicon, Intel Mac, Windows and Linux. Each target passed the
+configuration, Matrix/RTC model, desktop/controller, native-device, vendored
+security and pinned SDK checks, including the generated Slint account/dialog
+keyboard scenario and the new theme projection regressions. Windows also
+passed owned synthetic capture.
+
+Linux passed twenty Rust acceptance commands and the stock Element Call
+presynced interoperability case. All 46 fixed setup/test/cleanup records passed,
+including protected account access, classic search, encrypted recovery, both
+OAuth refresh flows, ringing and account replay rejection. The system Wayland
+fixture was outside the changed inputs and remains an open release gate.
+
+All jobs and cache posts completed. Seven complete job logs scanned with zero
+findings. Twelve actual fictional preview PNGs were validated against their
+provenance and reviewed for visuals/privacy; the run published no installers.
+The tested PR merge was `1be8afde0efcb173ee4ef94128cd30be8d479e3a`.
+Main merge `0d756260255f4cf6630aaed184d38bdb46a08c5e` has the identical
+source tree, `3a6b9a847456fa573ec9802628682765d97c3b39`; its skip marker
+avoided a duplicate native matrix. This is development evidence, not installed
+screen-reader, physical-device, signing or update acceptance.
+
 ## Development check selection
 
 The reviewed appearance files still select all four native targets and Linux
@@ -12,9 +37,49 @@ runtime, workflow or unknown inputs select that fixture conservatively; manual
 full verification always includes it. An omitted development check does not
 clear its existing failed release gate.
 
+The four shipped theme TOML files are also outside that standalone fixture's
+inputs. Theme-only edits retain configuration checks; combining those exact
+files with app appearance edits retains all four native targets and Linux
+Matrix acceptance. Unknown theme files and mixed build/dependency changes
+continue to select the system fixture conservatively.
+
 Pull requests now produce the same fictional native preview captures as main
 pushes. Their images and provenance require review before publication in the
 gallery. Installers remain excluded from workflow uploads.
+
+## Native vault and installed accessibility diagnostics: `3fe1285`
+
+[Native-vault run 38771813135](https://github.com/brk275/Morpheus/actions/runs/38771813135)
+tested `3fe1285e27877501339aeb315df2c516093b0cbc` on the standard Apple
+Silicon, Intel Mac and Windows runners. Both Macs passed five fixture contracts,
+all 13 preparation checks and all 11 restart/removal checks against disposable
+native keychain entries. These cover password enable/change, wrong-password
+rejection, cancellation, protected direct-switch rejection, persisted
+authorization after restart, exact removal of each account and password reset
+only after all accounts are gone. Children stopped, original keychain settings
+were restored, and private profiles were removed. This is core acceptance with
+synthetic accounts, not installed UI or real Matrix sign-in acceptance.
+
+Windows passed the five contracts, then failed before either acceptance phase
+at `windows_root_prepare` with `windows_isolation_acl_owner`. Cleanup passed.
+The result identifies an owner-representation rejection, but does not establish
+which SID spelling Windows returned. A source correction resolves SDDL aliases
+through Windows before comparing exact SIDs; its mocked tests pass, while native
+verification remains pending. The protected two-ACE policy is unchanged.
+
+[Linux package run 38771819496](https://github.com/brk275/Morpheus/actions/runs/38771819496)
+tested the ordinary AppImage at the same revision with updates and fixed-client
+capture disabled. Resources, desktop entry/icon, ELF baseline and the owned
+12-second X11 startup/stop check passed. Installed accessibility traversal failed
+with `value_error` at `node_child_count` during the username lookup, on a node
+that did not match the selector. The owned application and homeserver field
+were seen; username/password semantics, account-menu keyboard interaction,
+appearance editing and normal close remain unverified. Cleanup passed. AppImage
+SHA-256: `d62cb75ca55de3f900730713b09b035169ef4d8622fed882ab5392079a75f4ba`.
+
+Every job and cache post in both runs completed, their six complete logs scanned
+with zero findings, and neither run uploaded artifacts. System Wayland capture,
+screen readers, physical devices, signing and updates remain open release gates.
 
 ## Native vault and installed accessibility diagnostics: `ff2c353`
 

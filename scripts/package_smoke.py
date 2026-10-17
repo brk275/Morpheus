@@ -513,14 +513,18 @@ KEYBOARD_OBSERVATIONS = frozenset({
 
 def validate_keyboard_diagnostic(value, passed):
     expected = KEYBOARD_OBSERVATIONS | {"step", "operation", "failure", "selector_matches",
-                                        "password_role", "cleanup", "traversed_node_matched"}
+                                        "password_role", "cleanup", "traversed_node_matched",
+                                        "child_count_unavailable", "child_unavailable",
+                                        "incomplete_passes"}
     require(type(value) is dict and value.keys() == expected, "Invalid installed keyboard diagnostic shape")
     require(all(type(value[key]) is str for key in ("step", "operation", "failure", "password_role", "cleanup"))
             and value["step"] in KEYBOARD_STEPS and value["operation"] in KEYBOARD_OPERATIONS
             and value["failure"] in KEYBOARD_FAILURES
             and value["password_role"] in {"unchecked", "password_text", "entry", "text", "other"}
             and value["cleanup"] in {"not_started", "passed", "failed"}
-            and type(value["selector_matches"]) is int and 0 <= value["selector_matches"] <= 2
+            and all(type(value[key]) is int and 0 <= value[key] <= 2
+                    for key in ("selector_matches", "child_count_unavailable", "child_unavailable",
+                                "incomplete_passes"))
             and all(type(value[key]) is bool for key in KEYBOARD_OBSERVATIONS)
             and type(value["traversed_node_matched"]) is bool,
             "Invalid installed keyboard diagnostic value")

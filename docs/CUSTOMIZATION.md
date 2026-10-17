@@ -248,12 +248,45 @@ consumer. Changing them does not enable the described behavior:
 | `media.noise_suppression` | Configurable noise suppression |
 | `media.autoplay_animated_media` | Animated-media autoplay policy |
 | `experimental.background_account_sync` | Background syncing of inactive accounts |
-| `account_overrides.<id>.theme` | Per-account theme override |
 
 Microphone and speaker selection, notification overrides and the appearance
 controls documented above do have consumers. The monospace font setting covers
 timestamps and security codes; it does not replace every rich-message code
 font.
+
+## Per-account theme
+
+Each saved account can show its own theme mode. The override is a TOML
+preference keyed by the local account ID, the same key the notification and
+call-mode overrides use:
+
+```toml
+[appearance]
+theme = "dark"
+
+[account_overrides."<local account ID>"]
+theme = "light"
+```
+
+The window shows an account's `theme` only after that account has been
+activated: a successful switch, a protected activation with the right app
+password, or a startup restore. A wrong password, a cancelled dialog or a
+switch that became stale keeps the current account's appearance. Removing or
+logging out of the active account, or locking every account, returns the
+window to the global `appearance.theme`; it never shows another account's
+choice. An account without an override, or an unknown ID, also uses the
+global theme. The value accepts `dark`, `light`, `high_contrast` and `system`.
+
+**Settings → Appearance → Base palette for all accounts** edits the global
+`appearance.theme` and highlights that global choice, not the palette on
+screen. While the active account has an override, a notice under the picker
+names the override, the window keeps showing it, and the global edit applies
+to the other accounts; the TOML entry has to change or be removed for this
+account to follow the global choice. Theme packs (`appearance.theme_pack`),
+fonts, geometry and layout remain global.
+Invalid edits keep the last valid configuration, including each account's
+last valid theme, until the file is valid again. The override is a local
+presentation preference; it is not written to Matrix.
 
 ## Notifications
 

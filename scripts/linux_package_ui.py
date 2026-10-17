@@ -46,6 +46,7 @@ class Diagnostics:
             "username_seen": False, "password_seen": False,
             "selector_matches": 0, "password_role": "unchecked",
             "traversed_node_matched": False,
+            "child_count_unavailable": 0, "child_unavailable": 0, "incomplete_passes": 0,
             "cleanup": "not_started",
         }
 
@@ -55,6 +56,11 @@ class Diagnostics:
 
     def operation(self, operation):
         self.value["operation"] = operation
+
+    def count(self, key):
+        # Bounded like selector_matches: the fact that it happened, and whether
+        # it happened more than once, is all the public record needs.
+        self.value[key] = min(self.value[key] + 1, 2)
 
     def failed(self, error):
         if self.value["failure"] != "none":
@@ -83,23 +89,77 @@ class Diagnostics:
         self.value["failure"] = code if code in smoke.KEYBOARD_FAILURES else "unclassified"
 
 
-class ObservedSequence:
-    """Observe pyatspi's sequence protocol without changing its API calls.
+class ChildCountUnavailable(LookupError):
+    """One node's ChildCount call failed without a GError.
 
-    pyatspi 2.46.1 assigns Accessible.__len__ and __getitem__ (no __iter__).
-    Forward those exact operations so list() still checks its length hint and
-    traverses to the same IndexError terminator. No node/exception text is read.
+    at-spi2-core's atspi_accessible_get_child_count returns -1, and sets no
+    error, when the D-Bus property call gets no reply (the configured 1000 ms
+    timeout) or a malformed reply; an unreachable or hung application raises
+    GLib.Error instead. pyatspi 2.46.1 binds Accessible.__len__ directly to
+    get_child_count, so that -1 reaches Python's len(), which raises ValueError
+    about the protocol rather than about the node. This is the same per-call
+    IPC failure the driver already retries as GLib.Error, not a value bug.
+    """
+
+
+class IncompleteTraversal(LookupError):
+    """A selector pass skipped an owned node; its result is not evidence."""
+
+
+class ChildUnavailable(LookupError):
+    """get_child_at_index returned no object for an index inside the count.
+
+    libatspi returns NULL, with no GError, when the GetChildAtIndex call fails;
+    pyatspi hands that back as None. Treating it as an empty position would
+    present a subtree the driver never saw as complete.
+    """
+
+
+class ObservedSequence:
+    """Drive pyatspi's child protocol with libatspi's sentinels recognized.
+
+    pyatspi 2.46.1 binds Accessible.__len__ to get_child_count and defines
+    Accessible_getitem as: call get_child_count again, adjust a negative index,
+    raise IndexError when the index is outside that count, else return
+    get_child_at_index. A -1 at the second count therefore ends iteration early
+    as if the sequence were complete. This class issues the same native calls
+    in the same order, so list() still reads the length hint, repeats the count
+    for every index and stops at the same IndexError, but a -1 at any count or
+    a missing child raises instead of truncating. No node/exception text is read.
     """
     def __init__(self, accessible, diagnostics, kind):
         self.accessible, self.diagnostics, self.kind = accessible, diagnostics, kind
 
-    def __len__(self):
+    def count(self):
         self.diagnostics.operation(self.kind + "_child_count")
-        return len(self.accessible)
+        count = self.accessible.get_child_count()
+        # Exactly -1 is libatspi's documented sentinel. Any other negative or
+        # non-integer length is unexpected and fails closed.
+        if isinstance(count, int) and count == -1:
+            self.diagnostics.count("child_count_unavailable")
+            raise ChildCountUnavailable()
+        return count
+
+    def __len__(self):
+        # An unexpected length still reaches len(), which raises ValueError.
+        return self.count()
 
     def __getitem__(self, index):
+        count = self.count()
+        if type(count) is not int:
+            raise TypeError()
+        if count < 0:
+            raise ValueError()
+        if index < 0:
+            index = count + index
+        if index < 0 or index >= count:
+            raise IndexError
         self.diagnostics.operation(self.kind + "_child_index")
-        return self.accessible[index]
+        child = self.accessible.get_child_at_index(index)
+        if child is None:
+            self.diagnostics.count("child_unavailable")
+            raise ChildUnavailable()
+        return child
 
 
 def command(arguments):
@@ -139,6 +199,10 @@ class AccessibleUI:
 
     def nodes(self):
         count = 0
+        # A pass that skipped any node, for an IPC failure or a vanished node,
+        # has not seen the complete owned tree. find() refuses its result and
+        # wait_for() runs another pass instead.
+        self.pass_incomplete = False
         self.diagnostics.operation("desktop")
         desktop = self.api.Registry.getDesktop(0)
         for application in ObservedSequence(desktop, self.diagnostics, "desktop"):
@@ -165,9 +229,15 @@ class AccessibleUI:
                             yield node
                             self.diagnostics.operation("node_children")
                             pending.extend(list(ObservedSequence(node, self.diagnostics, "node")))
+                        else:
+                            # The application was owned when this pass began;
+                            # losing that proof mid-tree leaves its subtree unseen.
+                            self.pass_incomplete = True
                     except (LookupError, self.transient_error):
+                        self.pass_incomplete = True
                         continue
             except (LookupError, self.transient_error):
+                self.pass_incomplete = True
                 continue
 
     def find(self, label, *, prefix=False):
@@ -183,8 +253,13 @@ class AccessibleUI:
                     matches.append(node)
                     self.diagnostics.value["selector_matches"] = min(len(matches), 2)
             except self.transient_error:
+                self.pass_incomplete = True
                 continue
+        # Two matches are ambiguous whatever else the pass missed.
         require_ui(len(matches) <= 1, "selector_ambiguous")
+        if getattr(self, "pass_incomplete", False):
+            self.diagnostics.count("incomplete_passes")
+            raise IncompleteTraversal()
         return matches[0] if matches else None
 
     def wait_for(self, predicate, seconds=12):
@@ -211,8 +286,14 @@ class AccessibleUI:
                 if node.getState().contains(self.api.STATE_FOCUSED):
                     found.append(node.name or "")
             except self.transient_error:
+                self.pass_incomplete = True
                 continue
+        # Two focused nodes are ambiguous whatever else the pass missed; a pass
+        # that skipped any node could hide a second one, so it is not evidence.
         smoke.require(len(found) <= 1, "Installed accessibility focus is ambiguous")
+        if getattr(self, "pass_incomplete", False):
+            self.diagnostics.count("incomplete_passes")
+            raise IncompleteTraversal()
         return found[0] if found else None
 
     def expect_focus(self, name, *, prefix=False):

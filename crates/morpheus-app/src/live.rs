@@ -413,6 +413,9 @@ impl LiveUi {
             ui.set_live_session(false);
             ui.set_preview_session(false);
             ui.set_active_account_local_id("".into());
+            // No account is active: show the global theme, never a departed
+            // account's override.
+            crate::appearance::apply_theme_mode(&ui);
             ui.set_active_account_index(-1);
             ui.set_active_account_name("Choose an account".into());
             ui.set_active_account_handle("".into());
@@ -1970,6 +1973,10 @@ pub(crate) fn apply_account_menu(ui: &AppWindow, accounts: &[AccountInfo], activ
     ui.set_account_options(ModelRc::new(VecModel::from(options)));
     ui.set_active_account_index(active_index as i32);
     ui.set_active_account_local_id(active.id.as_str().into());
+    // The theme follows the account this accepted snapshot publishes. A
+    // superseded activation refresh returns without reaching here, so only
+    // the winning snapshot's account can select the palette.
+    crate::appearance::apply_theme_mode(ui);
     ui.set_active_account_name(account.name.clone());
     ui.set_active_account_handle(account.handle.clone());
     ui.set_active_account_initials(account.initials.clone());
