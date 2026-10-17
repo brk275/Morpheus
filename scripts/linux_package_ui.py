@@ -146,7 +146,9 @@ class ObservedSequence:
 
     def __getitem__(self, index):
         count = self.count()
-        if type(count) is not int or count < 0:
+        if type(count) is not int:
+            raise TypeError()
+        if count < 0:
             raise ValueError()
         if index < 0:
             index = count + index
