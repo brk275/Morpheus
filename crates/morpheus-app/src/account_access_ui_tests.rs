@@ -389,7 +389,7 @@ fn focused_control_has_label(ui: &AppWindow, expected: &str) -> bool {
 }
 
 fn tab_to_control(ui: &AppWindow, label: &str) {
-    use slint::private_unstable_api::re_exports::WindowInner;
+    use slint::private_unstable_api::re_exports::{FocusScope, TextInput, WindowInner};
 
     // Walk the real current tab order without activating intervening controls.
     // A missing FocusScope must fail instead of silently invoking the callback.
@@ -400,11 +400,24 @@ fn tab_to_control(ui: &AppWindow, label: &str) {
         }
         key(ui, Key::Tab);
         // A later Tab must not hide a focus loss by restarting at the root.
-        // Drop the upgraded reference before dispatching the next key.
-        assert!(
-            window.focus_item.borrow().upgrade().is_some(),
-            "Tab navigation lost its focus target while finding {label}"
-        );
+        // End this scope before another key can dispatch or rebuild the tree.
+        {
+            let focused = window.focus_item.borrow().upgrade().unwrap_or_else(|| {
+                panic!("Tab navigation lost its focus target while finding {label}")
+            });
+            if let Some(scope) = focused.downcast::<FocusScope>() {
+                assert!(
+                    scope.as_pin_ref().has_focus(),
+                    "Tab did not focus a live control"
+                );
+            }
+            if let Some(input) = focused.downcast::<TextInput>() {
+                assert!(
+                    input.as_pin_ref().has_focus(),
+                    "Tab did not focus a live input"
+                );
+            }
+        }
     }
     panic!("Appearance control is not keyboard reachable: {label}");
 }
