@@ -680,6 +680,7 @@ async fn assert_native_motion_and_preference(ui: &AppWindow, config_path: &std::
                     "bounds_before": numeric(bounds_before),
                     "bounds_after": numeric(focused_control_bounds(ui)),
                     "window": window_size(ui), "page": ui.get_page(),
+                    "layout": motion_layout_geometry(ui),
                     "config_error_present": !ui.get_config_error().is_empty(),
                     "presentation": ui.global::<crate::StyleTokens>().get_reduced_motion(),
                 })
@@ -2844,6 +2845,44 @@ fn geometry_trace(
         }
     }
     trace
+}
+
+/// Failure-only geometry: root bounds, then at most sixteen scroll viewports
+/// with their content origins and extents. No labels, IDs, text or paths.
+fn motion_layout_geometry(ui: &AppWindow) -> Vec<[f32; 8]> {
+    use slint::private_unstable_api::re_exports::Flickable;
+    let nodes = geometry_nodes(ui);
+    let root = item_bounds(&nodes[0]);
+    let mut rows = vec![[
+        root.left,
+        root.top,
+        root.right,
+        root.bottom,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    ]];
+    for node in &nodes {
+        if let Some(scroll) = node.downcast::<Flickable>() {
+            let bounds = item_bounds(node);
+            let scroll = scroll.as_pin_ref();
+            rows.push([
+                bounds.left,
+                bounds.top,
+                bounds.right,
+                bounds.bottom,
+                scroll.content_x().0,
+                scroll.content_y().0,
+                scroll.content_width().0,
+                scroll.content_height().0,
+            ]);
+            if rows.len() == 17 {
+                break;
+            }
+        }
+    }
+    rows
 }
 
 /// Bounds of the control that currently has keyboard focus, if any.
