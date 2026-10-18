@@ -1895,7 +1895,7 @@ async fn exercise_account_ui(runtime: Handle) {
     assert_recovery_strip_projection(&ui).await;
     assert_sticker_picker_projection(&ui).await;
     // The real picker controller over a recording fake core: admission,
-    // persistence, single-flight commands, quarantine and queue recovery.
+    // persistence, single-flight commands, held sends and exact reconciliation.
     crate::stickers::controller_tests::run(&ui, runtime.clone()).await;
     // Exercise chat controls before opening the one-time-key modal. Then
     // render that private surface as well before testing the real detach.
