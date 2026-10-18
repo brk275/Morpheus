@@ -1,15 +1,18 @@
 //! Linux/Xvfb capability probe for real FemtoVG OpenGL rendering callbacks.
 //!
 //! Opens one small animated Slint window through the winit backend with the
-//! FemtoVG renderer, requires Slint's `NativeOpenGL` graphics API and matched
-//! `BeforeRendering`/`AfterRendering` pairs, then closes the window. The
+//! FemtoVG renderer. Every rendering callback must report Slint's
+//! `NativeOpenGL` graphics API within one recorded renderer lifecycle, and
+//! `BeforeRendering`/`AfterRendering` must pair up; then the window closes. The
 //! software renderer has no rendering notifier and is never accepted. See
 //! docs/FRAME_TIMING_PROBE.md: the numbers are CPU render-callback timings
 //! before presentation, not display FPS, GPU time or timeline performance.
 //!
-//! Reads only environment variables: no files, network, accounts, profiles or
-//! credential stores. Prints one JSON line of fixed tokens and numbers, never
-//! backend error text.
+//! The example itself reads only environment variables and makes no file,
+//! network, account, profile or credential-store calls. Slint and Mesa still
+//! load OS libraries, fonts and configuration, and connect to the local X11
+//! session. Prints one JSON line of fixed tokens and numbers, never backend
+//! error text or environment values.
 
 use std::{
     cell::RefCell,
@@ -53,16 +56,25 @@ slint::slint! {
     }
 }
 
+/// The single renderer lifecycle the probe accepts. Slint exposes no context
+/// identity, so frames are bound to this recorded lifecycle, not a GL context.
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Lifecycle {
+    #[default]
+    NotStarted,
+    Active,
+    TornDown,
+}
+
 /// Bounded frame records. Only the first failure is kept.
 #[derive(Default)]
 struct Frames {
-    setup: bool,
+    lifecycle: Lifecycle,
     pending: Option<Instant>,
     last_start: Option<Instant>,
     completed: usize,
     render_us: Vec<u64>,
     interval_us: Vec<u64>,
-    teardown: bool,
     failure: Option<&'static str>,
 }
 
@@ -80,14 +92,37 @@ impl Frames {
             return;
         }
         let now = Instant::now();
+        let opengl = matches!(api, GraphicsAPI::NativeOpenGL { .. });
+        let frame = matches!(
+            state,
+            RenderingState::BeforeRendering | RenderingState::AfterRendering
+        );
+        // Frames count only while the one recorded lifecycle is active, and
+        // every callback, including AfterRendering, must report NativeOpenGL.
+        if frame && self.lifecycle != Lifecycle::Active {
+            self.fail("frame_outside_lifecycle");
+            return;
+        }
+        if !opengl {
+            self.fail("graphics_api_not_native_opengl");
+            return;
+        }
         match state {
-            RenderingState::RenderingSetup if self.setup => self.fail("setup_repeated"),
-            RenderingState::RenderingSetup if native_opengl(api) => self.setup = true,
-            RenderingState::RenderingSetup => self.fail("graphics_api_not_native_opengl"),
+            RenderingState::RenderingSetup if self.lifecycle == Lifecycle::NotStarted => {
+                self.lifecycle = Lifecycle::Active;
+            }
+            RenderingState::RenderingTeardown if self.lifecycle == Lifecycle::Active => {
+                if self.pending.is_some() {
+                    self.fail("unpaired_frame");
+                } else {
+                    self.lifecycle = Lifecycle::TornDown;
+                }
+            }
+            RenderingState::RenderingSetup | RenderingState::RenderingTeardown => {
+                self.fail("lifecycle_invalid");
+            }
             RenderingState::BeforeRendering => {
-                if !self.setup || !matches!(api, GraphicsAPI::NativeOpenGL { .. }) {
-                    self.fail("graphics_api_not_native_opengl");
-                } else if self.pending.replace(now).is_some() {
+                if self.pending.replace(now).is_some() {
                     self.fail("unpaired_frame");
                 } else {
                     // Only between two measured frames, so at most SAMPLES - 1.
@@ -109,7 +144,6 @@ impl Frames {
                 }
                 None => self.fail("unpaired_frame"),
             },
-            RenderingState::RenderingTeardown => self.teardown = true,
             _ => self.fail("unknown_rendering_state"),
         }
     }
@@ -132,19 +166,8 @@ impl Frames {
             "samples": SAMPLES,
             "render_callback_us": summary(&self.render_us),
             "frame_start_interval_us": summary(&self.interval_us),
-            "teardown_observed": self.teardown,
+            "teardown_observed": self.lifecycle == Lifecycle::TornDown,
         }))
-    }
-}
-
-/// Slint reports an OpenGL context that resolves a core entry point. The
-/// returned pointer is only checked for null, never called.
-fn native_opengl(api: &GraphicsAPI) -> bool {
-    match api {
-        GraphicsAPI::NativeOpenGL { get_proc_address } => {
-            !get_proc_address(c"glGetString").is_null()
-        }
-        _ => false,
     }
 }
 
@@ -171,13 +194,34 @@ fn check_environment() -> Result<(), &'static str> {
     if std::env::var("LIBGL_ALWAYS_SOFTWARE").as_deref() != Ok("1") {
         return Err("software_gl_not_requested");
     }
-    if std::env::var_os("DISPLAY").is_none() {
-        return Err("x11_display_missing");
+    match std::env::var("DISPLAY") {
+        Err(std::env::VarError::NotPresent) => return Err("x11_display_missing"),
+        Ok(display) if local_x11_display(&display) => {}
+        // Checked before Slint starts, so no connection is attempted.
+        _ => return Err("x11_display_not_local"),
     }
-    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+    // winit prefers Wayland when either variable is set.
+    if std::env::var_os("WAYLAND_DISPLAY").is_some()
+        || std::env::var_os("WAYLAND_SOCKET").is_some()
+    {
         return Err("wayland_display_present");
     }
     Ok(())
+}
+
+/// Only `:N` or `:N.S`, with up to four display and two screen digits. Any
+/// host, address, `unix` prefix or other form is refused, never echoed.
+fn local_x11_display(display: &str) -> bool {
+    let digits = |part: &str, max: usize| {
+        (1..=max).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_digit())
+    };
+    let Some(rest) = display.strip_prefix(':') else {
+        return false;
+    };
+    match rest.split_once('.') {
+        Some((number, screen)) => digits(number, 4) && digits(screen, 2),
+        None => digits(rest, 4),
+    }
 }
 
 fn probe() -> Result<serde_json::Value, &'static str> {
@@ -244,16 +288,24 @@ fn main() -> ExitCode {
         return fail(reason);
     }
     let (done, finished) = mpsc::channel::<()>();
-    let watchdog = thread::spawn(move || {
-        if matches!(finished.recv_timeout(WATCHDOG), Err(mpsc::RecvTimeoutError::Timeout)) {
-            print_error("watchdog_expired");
-            std::process::exit(3);
-        }
-    });
+    let spawned = thread::Builder::new()
+        .name("frame-probe-watchdog".into())
+        .spawn(move || {
+            if matches!(finished.recv_timeout(WATCHDOG), Err(mpsc::RecvTimeoutError::Timeout)) {
+                print_error("watchdog_expired");
+                std::process::exit(3);
+            }
+        });
+    // Never probe without the independent watchdog.
+    let Ok(watchdog) = spawned else {
+        return fail("watchdog_unavailable");
+    };
     let outcome = std::panic::catch_unwind(probe).unwrap_or(Err("probe_panicked"));
-    // Disconnecting ends the watchdog's wait at once.
+    // Disconnecting ends the watchdog's bounded wait at once.
     drop(done);
-    let _ = watchdog.join();
+    if watchdog.join().is_err() {
+        return fail("watchdog_failed");
+    }
     match outcome {
         Ok(report) => {
             println!("{report}");

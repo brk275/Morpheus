@@ -16,22 +16,32 @@ encrypted history, through both sync adapters.
 ## What it checks
 
 - The environment explicitly requests `SLINT_BACKEND=winit-femtovg` and Mesa
-  software OpenGL (`LIBGL_ALWAYS_SOFTWARE=1`), on Linux with an X11 `DISPLAY`
-  and no `WAYLAND_DISPLAY`. The probe cannot prove which OpenGL driver ran; the
-  variable records intent.
+  software OpenGL (`LIBGL_ALWAYS_SOFTWARE=1`) on Linux, with neither
+  `WAYLAND_DISPLAY` nor `WAYLAND_SOCKET` set. The probe cannot prove which
+  OpenGL driver ran; the variable records intent.
+- `DISPLAY` must be a local display such as `:99` or `:99.0`: a colon, one to
+  four ASCII digits and an optional one- or two-digit screen. A host name, IP
+  address, `unix` prefix, empty or malformed value fails with
+  `x11_display_not_local` before Slint starts, so no connection is attempted,
+  and the value is never printed. An accepted `:N` names the local socket.
+  libxcb may retry the same display number on loopback TCP if that socket is
+  unavailable, so a run should start its own Xvfb first.
 - `BackendSelector` names both the winit backend and the FemtoVG renderer.
   Winit can still fall back to another renderer if FemtoVG cannot be created.
   The only other renderer compiled into this package is the software renderer,
   which has no rendering notifier, so the probe then fails with
   `renderer_not_opengl` and never reports software-renderer frame counts.
-- `Window::set_rendering_notifier` must report `RenderingSetup` with
-  `GraphicsAPI::NativeOpenGL` whose loader resolves `glGetString` (the pointer
-  is checked, never called), and every `BeforeRendering` must be matched by one
-  `AfterRendering` on the same OpenGL API.
+- Every `Window::set_rendering_notifier` callback, including `AfterRendering`,
+  must report `GraphicsAPI::NativeOpenGL`. The probe accepts one recorded
+  renderer lifecycle: one `RenderingSetup`, frames only until its
+  `RenderingTeardown`, and each `BeforeRendering` matched by one
+  `AfterRendering`. Slint exposes no OpenGL context identity, so this shows the
+  API type within that lifecycle; it does not compare context IDs.
 - After 10 warm-up frames it stores at most 120 samples, then hides the window
   and leaves the event loop. An event-loop deadline (10 s) closes the window if
   samples are incomplete; an independent watchdog thread (20 s) ends the
-  process if rendering or closing hangs.
+  process if rendering or closing hangs. The probe does not start without that
+  thread.
 
 In Slint 1.18.1's FemtoVG renderer, the `BeforeRendering` to `AfterRendering`
 interval covers item rendering and the OpenGL command submission, but not the
@@ -51,10 +61,12 @@ SLINT_BACKEND=winit-femtovg LIBGL_ALWAYS_SOFTWARE=1 \
 ```
 
 A debug build gives debug-profile timings; record the profile with any result.
-The probe reads only environment variables. It opens no files, network
-connections, accounts, profiles or credential stores, and never prints backend
-error text. Mesa, winit or Slint may still write their own messages to stderr,
-so keep that stream private like other native logs.
+The example's own code reads only environment variables and makes no file,
+network, account, profile or credential-store calls, and it never prints
+backend error text or environment values. The process is not file- or
+socket-free: Slint, winit and Mesa load OS libraries, fonts and configuration,
+and connect to the local X11 session. They may also write their own messages to
+stderr, so keep that stream private like other native logs.
 
 ## Output
 
@@ -66,7 +78,8 @@ microseconds, shown here as placeholder zeros:
 ```
 
 Percentiles use the nearest rank of the stored samples. `teardown_observed`
-is informational: on X11, hiding a window keeps its OpenGL context until the
+reports whether the recorded lifecycle reached `RenderingTeardown`. It does
+not gate a pass: on X11, hiding a window keeps its OpenGL context until the
 event loop exits.
 
 A failure prints `{"probe":"morpheus_frame_timing","result":"error","reason":…}`
@@ -78,9 +91,12 @@ with one fixed reason and exits with status 1:
 | `backend_not_winit_femtovg` | `SLINT_BACKEND` is not exactly `winit-femtovg` |
 | `software_gl_not_requested` | `LIBGL_ALWAYS_SOFTWARE` is not `1` |
 | `x11_display_missing`, `wayland_display_present` | Not an X11-only session |
+| `x11_display_not_local` | `DISPLAY` is not a local `:N` or `:N.S` display |
+| `watchdog_unavailable`, `watchdog_failed` | The watchdog thread could not start, or ended abnormally |
 | `backend_unavailable`, `window_unavailable`, `window_show_failed`, `event_loop_failed` | Slint could not start, show or run the window |
 | `renderer_not_opengl`, `notifier_unavailable` | No rendering notifier, such as a software-renderer fallback |
-| `graphics_api_not_native_opengl`, `setup_repeated`, `unknown_rendering_state` | Callbacks did not come from one OpenGL context |
+| `graphics_api_not_native_opengl` | A callback did not report `NativeOpenGL` |
+| `lifecycle_invalid`, `frame_outside_lifecycle`, `unknown_rendering_state` | Callbacks left the single recorded renderer lifecycle |
 | `unpaired_frame` | A `BeforeRendering`/`AfterRendering` pair was broken |
 | `insufficient_frames` | Fewer than 130 complete frames before the deadline |
 | `close_failed`, `probe_panicked` | The window could not be closed, or the probe panicked |
