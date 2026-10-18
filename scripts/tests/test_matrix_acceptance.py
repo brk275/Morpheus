@@ -664,7 +664,10 @@ class AppRecoveryEvidenceTests(unittest.TestCase):
             with self.child(runner, output, timeout=True) as (visible, _):
                 with self.assertRaisesRegex(RuntimeError, "deadline"):
                     runner.run(acceptance_module.APP_RECOVERY_LABEL, ["mock-test"], test=True, seconds=1)
-            record = json.loads(visible.getvalue())
+            records = [json.loads(line) for line in visible.getvalue().splitlines()
+                       if line.startswith("{")]
+            self.assertEqual(len(records), 1)
+            record = records[0]
             self.assertEqual(record["app_recovery_diagnostics"], {"stage": "typed_retention"})
             self.assertEqual(record["native_process"]["result"], "deadline")
             self.assertNotIn("private", visible.getvalue())
