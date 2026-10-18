@@ -376,6 +376,13 @@ also include `[roles]` and `[senders]`. These belong in the theme TOML beside
 | `message` | Message body text; omitted keeps ink |
 | `own_message` | Name and body text of your own messages in the timeline, the thread root and thread replies; omitted falls back to `sender`, `message`, then ink |
 | `own_surface` | Background of your own messages (timeline rows, the thread root and thread replies) when the row is neither selected nor hovered; omitted keeps the previous row background |
+| `scrim` | Backdrop behind dialogs and the image viewer, usually translucent; omitted keeps the built-in dark backdrop |
+| `shadow` | Shadow beneath popups, usually translucent; omitted keeps `#00000044` |
+| `media_backdrop` | Background behind an opened image; omitted keeps `#11131B` |
+| `presence_online` | The online dot beside member names; omitted keeps `#64C9A7` |
+| `avatar_ink` | Initials on avatar backgrounds, whose colors stay identity colors; omitted keeps `#FFFFFF` |
+
+Every shipped theme sets every role explicitly.
 
 For example, keep the `[colors]` table from the dark Nocturne theme and set
 these optional sections in that theme file:
@@ -402,6 +409,11 @@ sender = "#E8EDF2"
 message = "#E8EDF2"
 own_message = "#F3F6FA"
 own_surface = "#20283A"
+scrim = "#000000AA"
+shadow = "#00000044"
+media_backdrop = "#111216"
+presence_online = "#9FD5BD"
+avatar_ink = "#FFFFFF"
 
 [senders]
 colors = ["#C2AEFA", "#9DD8CD", "#F0C28F", "#ACCEFF", "#E7AED1", "#C7D59B"]

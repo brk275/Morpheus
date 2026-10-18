@@ -279,7 +279,7 @@ fn semantic_diagnostic(file: FileKind, raw: &str, error: &ConfigError) -> Diagno
         ConfigError::Field { field, problem } | ConfigError::ThemeField { field, problem } => {
             (problem.code(), problem.to_string(), Some(field.clone()))
         }
-        ConfigError::Version(_) => (
+        ConfigError::Version => (
             "schema-version",
             "this version supports schema_version = 1".to_owned(),
             Some("schema_version".to_owned()),

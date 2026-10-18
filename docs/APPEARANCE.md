@@ -162,7 +162,10 @@ apply when neither `[colors]` nor the theme sets the token.
 | Avatars | `avatar_ink` | Role (new) | `#FFFFFF` |
 
 Custom colors are the owner's choice: syntactically valid low-contrast values
-are applied as written. The shipped presets keep their separate contrast tests.
+are applied as written. The shipped presets set every role explicitly and keep
+their separate contrast tests, including 3:1 for the online indicator on every
+surface. With a preset, one `scrim` value replaces the per-dialog built-in
+dimming.
 
 ### Deliberately not themeable
 

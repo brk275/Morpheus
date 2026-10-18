@@ -34,8 +34,10 @@ pub enum ConfigError {
     Decode(diagnostics::DecodeError),
     #[error("could not encode TOML configuration: {0}")]
     Encode(#[from] toml::ser::Error),
+    /// The rejected number is file content, so the error carries none:
+    /// neither its text nor its `Debug` form can repeat it.
     #[error("unsupported configuration schema version; this version reads schema_version = 1")]
-    Version(u32),
+    Version,
     #[error("invalid configuration: {0}")]
     Invalid(String),
     #[error("invalid theme pack: {0}")]
@@ -217,7 +219,7 @@ impl Default for Config {
 impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.schema_version != SCHEMA_VERSION {
-            return Err(ConfigError::Version(self.schema_version));
+            return Err(ConfigError::Version);
         }
         validate_range("appearance.scale_percent", self.appearance.scale_percent, 75, 200)?;
         validate_range("layout.room_list_width", self.layout.room_list_width, 180, 480)?;
@@ -1408,7 +1410,7 @@ pub struct ThemePack {
 impl ThemePack {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.schema_version != SCHEMA_VERSION {
-            return Err(ConfigError::Version(self.schema_version));
+            return Err(ConfigError::Version);
         }
         if self.name.trim().is_empty() || self.name.chars().count() > 80 {
             return Err(theme_error("name", Problem::ThemeDisplayName));
@@ -1788,7 +1790,7 @@ mod tests {
         let store = ConfigStore::at(dir.path().join("config.toml"));
         store.save(&Config::default()).unwrap();
         fs::write(store.path(), "schema_version = 99\n").unwrap();
-        assert!(matches!(store.load(), Err(ConfigError::Version(99))));
+        assert!(matches!(store.load(), Err(ConfigError::Version)));
         assert_eq!(
             fs::read_to_string(store.path()).unwrap(),
             "schema_version = 99\n"
@@ -2612,6 +2614,15 @@ mod tests {
                 for background in surfaces {
                     assert_contrast(&theme.name, foreground.as_deref().unwrap(), background, 4.5);
                 }
+            }
+            // The online dot is a non-text indicator beside member names.
+            for background in surfaces {
+                assert_contrast(
+                    &theme.name,
+                    roles.presence_online.as_deref().unwrap(),
+                    background,
+                    3.0,
+                );
             }
             for (foreground, background) in [
                 (&roles.error_ink, &roles.error_surface),
