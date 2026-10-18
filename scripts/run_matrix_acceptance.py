@@ -111,8 +111,8 @@ APP_TIMELINE_CHECKS = frozenset((
 ))
 APP_TIMELINE_STAGES = frozenset((
     "setup", "activation", "room_open", "room_delivery", "thread_delivery",
-    "revocation", "renewal", "reopen", "queued_callbacks", "queued_revocation",
-    "queued_rejection", "queued_reopen", "cleanup", "complete",
+    "revocation", "renewal", "reopen", "queued_revocation", "queued_drain",
+    "queued_reopen", "cleanup", "complete",
 ))
 APP_TIMELINE_STAGE = re.compile(r"^MORPHEUS_LIVE_TIMELINE_STAGE ([a-z_]{1,48})$", re.MULTILINE)
 APP_TIMELINE_CHECK = re.compile(r"MORPHEUS_LIVE_TIMELINE_CHECK ([a-z_]{1,48})=(true|false)")
@@ -1040,7 +1040,10 @@ class Acceptance:
              "--bin", "morpheus-app", APP_TIMELINE_CASE, "--", "--exact",
              "--nocapture", "--test-threads=1"],
             extra={"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture)},
-            seconds=420, test=True, pid_namespace=True,
+            # The existing account harness has a 20-second bound before the
+            # live scenario's 420-second bound. Preserve time for both plus
+            # process startup; final credential scanning has its own reserve.
+            seconds=480, test=True, pid_namespace=True,
         )
 
     def draft_recovery_cases(self, fixture: Path):

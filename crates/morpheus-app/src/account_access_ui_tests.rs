@@ -1518,9 +1518,15 @@ fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
     let _entered = runtime.enter();
     let runtime_handle = runtime.handle().clone();
     slint::spawn_local(async move {
-        tokio::time::timeout(Duration::from_secs(20), exercise_account_ui(runtime_handle))
-            .await
-            .expect("account UI scenario must finish without network or vault access");
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            exercise_account_ui(runtime_handle.clone()),
+        )
+        .await
+        .expect("account UI scenario must finish without network or vault access");
+        // Opt-in live room/thread controller coverage shares this one event
+        // loop; it returns at once unless a disposable local fixture is set.
+        crate::live::timeline_controller_tests::run_if_configured(runtime_handle).await;
         slint::quit_event_loop().unwrap();
     })
     .unwrap();

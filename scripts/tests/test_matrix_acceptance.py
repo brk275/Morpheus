@@ -178,11 +178,27 @@ class FocusedSuiteTests(unittest.TestCase):
 class AppTimelineEvidenceTests(unittest.TestCase):
     @staticmethod
     def output():
-        lines = ["running 1 test", "MORPHEUS_LIVE_TIMELINE_STAGE setup"]
-        lines.extend(f"MORPHEUS_LIVE_TIMELINE_CHECK {name}=true"
-                     for name in sorted(acceptance_module.APP_TIMELINE_CHECKS))
-        lines.extend(("MORPHEUS_LIVE_TIMELINE_STAGE complete",
-                      "test result: ok. 1 passed; 0 failed; 0 ignored;"))
+        # Representative records from the reviewed native harness, including
+        # the real queued_drain phase. Keep these independent of the parser's
+        # allowlists so an incompatible whitelist fails this contract.
+        records = (
+            "STAGE setup", "STAGE activation", "STAGE room_open",
+            "STAGE room_delivery", "CHECK room_delivery=true",
+            "STAGE thread_delivery", "CHECK thread_delivery=true",
+            "CHECK thread_root_excluded=true", "CHECK feeds_running=true",
+            "STAGE revocation", "CHECK old_lease_revoked=true",
+            "CHECK idle_feeds_stopped=true", "STAGE renewal",
+            "CHECK late_events_in_core=true", "CHECK stale_room_rejected=true",
+            "CHECK stale_thread_rejected=true", "STAGE reopen",
+            "CHECK renewed_room_delivery=true", "CHECK renewed_thread_delivery=true",
+            "STAGE queued_revocation", "CHECK queued_callbacks_observed=true",
+            "STAGE queued_drain", "CHECK queued_room_rejected=true",
+            "CHECK queued_thread_rejected=true", "STAGE queued_reopen",
+            "STAGE cleanup", "CHECK cleanup_complete=true", "STAGE complete",
+        )
+        lines = ["running 1 test"]
+        lines.extend("MORPHEUS_LIVE_TIMELINE_" + record for record in records)
+        lines.append("test result: ok. 1 passed; 0 failed; 0 ignored;")
         return "\n".join(lines) + "\n"
 
     def test_one_harness_requires_all_fifteen_observable_facts_and_cleanup(self):
@@ -241,15 +257,15 @@ class AppTimelineEvidenceTests(unittest.TestCase):
 
     def test_excessive_stage_records_are_rejected_before_unbounded_proof_growth(self):
         expanded = self.output().replace("MORPHEUS_LIVE_TIMELINE_STAGE complete",
-                                       "MORPHEUS_LIVE_TIMELINE_STAGE queued_callbacks\n" * 65
+                                       "MORPHEUS_LIVE_TIMELINE_STAGE queued_drain\n" * 65
                                        + "MORPHEUS_LIVE_TIMELINE_STAGE complete")
         with self.assertRaises(RuntimeError):
             acceptance_module.app_timeline_evidence(expanded)
 
     def test_diagnostics_reveal_only_fixed_entered_and_stage_values(self):
-        output = "private-token\nMORPHEUS_LIVE_TIMELINE_STAGE setup\nMORPHEUS_LIVE_TIMELINE_STAGE queued_callbacks\nMORPHEUS_LIVE_TIMELINE_STAGE private_token\n"
+        output = "private-token\nMORPHEUS_LIVE_TIMELINE_STAGE setup\nMORPHEUS_LIVE_TIMELINE_STAGE queued_drain\nMORPHEUS_LIVE_TIMELINE_STAGE private_token\n"
         self.assertEqual(acceptance_module.app_timeline_diagnostics(output),
-                         {"test_entered": True, "stage": "queued_callbacks"})
+                         {"test_entered": True, "stage": "queued_drain"})
         self.assertEqual(acceptance_module.app_timeline_diagnostics("private-token"), {"test_entered": False})
 
     def test_validated_record_requires_native_test_mode_and_attaches_safe_facts(self):
@@ -279,7 +295,7 @@ class AppTimelineEvidenceTests(unittest.TestCase):
                                       "--bin", "morpheus-app", acceptance_module.APP_TIMELINE_CASE,
                                       "--", "--exact", "--nocapture", "--test-threads=1"])
             self.assertEqual(options, {"extra": {"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture)},
-                                       "seconds": 420, "test": True, "pid_namespace": True})
+                                       "seconds": 480, "test": True, "pid_namespace": True})
 
     def test_live_ui_case_remains_required_in_full_and_timeline_profiles(self):
         for suite in ("full", "timeline-reads"):
