@@ -30,6 +30,8 @@ mod room_settings;
 mod security;
 mod shortcuts;
 mod sso;
+#[cfg(not(morpheus_timeline_acceptance))]
+mod startup_error;
 // Instrumented release builds only (see build.rs); unit tests cover its pure checks.
 #[cfg(any(test, morpheus_timeline_acceptance))]
 mod timeline_acceptance;
@@ -1533,7 +1535,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .to_path_buf()
     };
     #[cfg(not(morpheus_timeline_acceptance))]
-    let manager = Arc::new(AccountManager::open(data_dir)?);
+    let manager = match AccountManager::open(data_dir) {
+        Ok(manager) => Arc::new(manager),
+        Err(error) => {
+            // No account worker, sign-in callback or preview is initialized
+            // on this path. Keep the saved-account protection fail-closed.
+            ui.hide()?;
+            startup_error::show(&error)?;
+            return Err("Saved-account startup was blocked".into());
+        }
+    };
     // A sliding run keeps the shipping automatic policy; a classic run forces
     // the same classic /sync loop that policy falls back to.
     #[cfg(morpheus_timeline_acceptance)]

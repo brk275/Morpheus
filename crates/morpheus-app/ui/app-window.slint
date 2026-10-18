@@ -929,6 +929,48 @@ component StyleFontSetting inherits Rectangle {
     }
 }
 
+// Separate from AppWindow so a blocked account store exposes no sign-in,
+// account switching, preview, file deletion or policy-reset callbacks.
+export component StartupErrorWindow inherits Window {
+    title: "Morpheus — account recovery";
+    preferred-width: 560px;
+    preferred-height: 360px;
+    min-width: 440px;
+    min-height: 340px;
+    background: #10131f;
+    in property <string> detail;
+    callback exit-requested();
+    forward-focus: close-button;
+
+    VerticalLayout {
+        padding: 28px;
+        spacing: 16px;
+        Text {
+            text: "Morpheus";
+            color: #f2f4ff;
+            font-size: 26px;
+            font-weight: 750;
+        }
+        Text {
+            text: "Saved accounts could not be opened";
+            color: #c7baff;
+            font-size: 18px;
+            wrap: word-wrap;
+        }
+        Text {
+            text: root.detail;
+            color: #f2f4ff;
+            font-size: 14px;
+            wrap: word-wrap;
+            vertical-stretch: 1;
+        }
+        close-button := Button {
+            text: "Close Morpheus";
+            clicked => { root.exit-requested(); }
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     title: "Morpheus";
     preferred-width: 1310px;
