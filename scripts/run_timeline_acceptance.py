@@ -42,8 +42,9 @@ CHECK = "morpheus_timeline_10k"
 ADAPTERS = ("sliding", "classic")
 BACKENDS = {"sliding": "sliding_sticky", "classic": "classic"}
 EVENTS = 10_000
-# Each enrolled profile signs Bob in once; the seeder adds one more device.
-BOB_DEVICES = len(ADAPTERS) + 1
+# Each enrolled profile records its own Bob device ID privately; the seeder
+# waits for exactly those devices' keys, never for a device count.
+DEVICE_ID = re.compile(r"[A-Za-z0-9._=+/-]{1,64}")
 ENROLL_SECONDS = 15 * 60
 SEED_SECONDS = 60 * 60
 MEASURE_SECONDS = 50 * 60
@@ -73,20 +74,22 @@ profile_not_fresh login account_mismatch sync_not_running adapter_mismatch
 account_option_missing room_not_shown room_file_mode profile_not_enrolled restore
 pagination_bound pagination_not_started pagination_timeout pagination_error
 history_incomplete timeline_not_visible input_dispatch scroll_not_rendered
-switch_away switch_back
+switch_away switch_back device_record device_record_invalid
 """.split())
 STAGES = frozenset("""
 start watchdog first_render enroll_profile enroll_switch_account enroll_measured_account
 restore sync room_listed open_room pagination history_complete scroll switch_away
-switch_back reopen_room complete fixture_account homeserver_not_loopback
-fixture_user_not_synthetic client login output_path output_in_checkout bob_devices
-fixture fixture_user stores create_room invite join devices send output seed_deadline
+switch_back reopen_room complete enroll_device_record fixture_account homeserver_not_loopback
+fixture_user_not_synthetic client login output_path output_in_checkout bob_device_ids
+fixture fixture_user stores create_room invite join seeder_device member_query
+devices_query bob_join seeder_device_absent seeder_device_keys enrolled_device_absent
+enrolled_device_keys send output seed_deadline
 """.split())
 STEPS = ("setup", "enroll", "seed", "measure")
 SUMMARY_PREFIX = "MORPHEUS_TIMELINE_10K_SUMMARY "
 SEED_FAILURE = re.compile(r"MORPHEUS_TIMELINE_SEED_FAILURE ([a-z_]{1,48})$", re.MULTILINE)
 SEED_COMPLETE = f"MORPHEUS_TIMELINE_SEED_COMPLETE events={EVENTS}"
-SEED_RESULT = re.compile(r"^test result: ok\. 2 passed; 0 failed;", re.MULTILINE)
+SEED_RESULT = re.compile(r"^test result: ok\. 5 passed; 0 failed;", re.MULTILINE)
 
 BUILD = {
     "variant": ("const", "instrumented_release"),
@@ -335,6 +338,7 @@ class Acceptance:
         self.environment = child_environment(os.environ if environment is None else environment)
         self.environment.pop("MORPHEUS_TIMELINE_ACCEPTANCE_BUILD", None)
         self.room = self.work / "room.json"
+        self.devices: dict[str, str] = {}
 
     def run(self) -> dict:
         for adapter in ADAPTERS:
@@ -350,9 +354,12 @@ class Acceptance:
             os.chmod(profile, 0o700)
         report = self.work / f"report-{mode}-{adapter}.json"
         run_file = self.work / f"run-{mode}-{adapter}.json"
+        device = self.work / f"device-{adapter}.json"
         content = {"mode": mode, "adapter": adapter, "profile": str(profile),
                    "fixture": str(self.fixture), "report": str(report)}
-        if mode == "measure":
+        if mode == "enroll":
+            content["device"] = str(device)
+        else:
             content["room"] = str(self.room)
         write_private(run_file, json.dumps(content), create=True)
         environment = self.environment | {"MORPHEUS_TIMELINE_ACCEPTANCE": str(run_file)}
@@ -369,13 +376,26 @@ class Acceptance:
             raise StepFailure(mode, adapter, "exit_status")
         if not valid_report(value, mode, adapter):
             raise StepFailure(mode, adapter, "report_invalid")
+        if mode == "enroll":
+            record = load_json(device)
+            if (not isinstance(record, dict) or set(record) != {"device_id"}
+                    or not isinstance(record["device_id"], str)
+                    or not DEVICE_ID.fullmatch(record["device_id"])
+                    or record["device_id"] in self.devices.values()):
+                raise StepFailure(mode, adapter, "device_record_invalid")
+            self.devices[adapter] = record["device_id"]
         return value
 
     def seed(self) -> None:
+        if sorted(self.devices) != sorted(ADAPTERS):
+            raise StepFailure("seed", None, "device_record_invalid")
+        devices = self.work / "bob-devices.json"
+        write_private(devices, json.dumps({"device_ids": [self.devices[adapter] for adapter in ADAPTERS]}),
+                      create=True)
         environment = self.environment | {
             "MORPHEUS_MATRIX_TEST_ACCOUNTS": str(self.fixture),
             "MORPHEUS_TIMELINE_10K_SEED": str(self.room),
-            "MORPHEUS_TIMELINE_10K_BOB_DEVICES": str(BOB_DEVICES),
+            "MORPHEUS_TIMELINE_10K_BOB_DEVICE_IDS": str(devices),
         }
         log = self.work / "log-seed.txt"
         command = ["cargo", "test", "--locked", "-p", "morpheus-matrix", "--test", "timeline_10k_local",

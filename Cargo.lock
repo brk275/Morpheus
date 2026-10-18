@@ -6178,6 +6178,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "keyring",
+ "libc",
  "libsqlite3-sys",
  "matrix-sdk",
  "matrix-sdk-crypto",

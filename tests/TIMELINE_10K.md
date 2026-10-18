@@ -110,13 +110,22 @@ and raw logs stay in a private directory outside the checkout. They are never
 printed or uploaded.
 
 1. **Enroll** one fresh generated profile per adapter. Carol signs in first,
-   then Bob, so startup restores Bob.
+   then Bob, so startup restores Bob. Each enrollment writes Bob's own device
+   ID for that profile to a new owner-only file the run file names, separate
+   from its closed report. The runner accepts one plausible, distinct ID per
+   profile and hands both to the seeder in another private file. The Unix
+   seeder opens it without following final symlinks or blocking on special
+   files, and requires a private regular file of at most 4 KiB outside the
+   checkout. Directory aliases into the checkout are rejected.
 2. **Seed once.**
    [`timeline_10k_local`](../crates/morpheus-matrix/tests/timeline_10k_local.rs)
    uses the pinned SDK:
    - Alice creates a new private encrypted room and invites Bob.
    - Bob joins from a disposable device.
-   - Before the first message, Alice must see at least three Bob devices.
+   - Before the first message, Alice must see Bob's join in his member state
+     and hold identity and Olm keys for exactly the two enrolled devices and
+     the seeder device. No device count is used: other devices of Bob's could
+     meet one.
    - Alice then sends exactly 10,000 messages, paced below the fixture's
      unchanged limit of 10 messages per second. That takes about 18 minutes.
    - The bodies cycle through seven deterministic kinds: short, two and nine
@@ -169,6 +178,30 @@ The accessibility row counts in the offline record above remain a proxy.
   display refresh are not measured.
 - **Fixture variety.** Replies, reactions, edits, attachments and images are
   not in the fixture.
-- **Device key timing.** The device count only guards key distribution. The
-  authoritative check is that all 10,000 events decrypt in each profile.
+- **Device key timing.** The exact-device wait only guards key distribution.
+  The authoritative check is that all 10,000 events decrypt in each profile.
+  An enrolled app that quits before publishing its device keys fails the seed
+  at `enrolled_device_absent`; enrollment does not yet wait for that itself.
+
+### Seed run 39165425640: the `devices` stage
+
+The optimized seed failed at the fixed stage `devices`. That stage covered
+three causes: a device query error, Bob's join not being seen, and too few
+devices. Source review of the pinned SDK and fixture homeserver finds one of
+them is certain:
+
+- the old wait required `room.joined_members_count() >= 2`;
+- in the pinned SDK, classic `/sync` updates that count only from the
+  response's room summary;
+- Synapse v1.162.0 sends a room summary only when the sync filter lazy-loads
+  members, and the seeder's `sync_once` uses no filter.
+
+The count therefore never changed, and the wait could only time out, whatever
+devices existed. The seeder now reads Bob's own member event instead. Each
+cause also has its own closed stage: `member_query` and `devices_query` for
+query errors, `bob_join`, `seeder_device_absent`, `seeder_device_keys`,
+`enrolled_device_absent` and `enrolled_device_keys`. A wait reports the first
+unmet one, in that order. Malformed enrolled device input fails at
+`bob_device_ids`. No retry was added; the next hosted run shows whether
+anything remains.
 - **Workflow integration.** No workflow runs this yet.
