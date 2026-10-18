@@ -2916,7 +2916,48 @@ what it held, and that late completions under the departed selection leave the
 cache and the saved record untouched while the renewed selection adopts the
 exact request. No unsolicited runtime send was observed or claimed.
 
-Known limits and open points: an uncovered room is scanned only when it is
+Fourth source-review round (same branch, still unrun). Send preparation is
+selection-bound end to end: `prepare_pending_send` re-checks its selection
+after every await, a committed enqueuing record survives a selection that ends
+after it was written (the next discovery restores it as unconfirmed), and a
+failed preparation rolls back only its own uncommitted steps once the
+selection is gone, with no write, no unindex and no scheduled flush;
+`persist_scope_and_index` re-checks before touching the room index. Re-seeding
+a scope the cache kept across an account switch marks every awaiting record
+restored (queued only where discovery attached the exact request, otherwise
+unconfirmed, including records that never received an id; kept text stays
+kept). The account-bound background flush is unchanged. In the core, a fresh
+record's capability has three states (saved, granted, consumed): a record may
+still be abandoned before its capability is consumed, but once the SDK
+boundary was crossed it cannot leave the row without an exact release, even
+before its transaction id is persisted. The gated fixtures no longer rely on
+the client-wide queue toggle, which the product's per-room resume overrides
+and which races with the SDK's in-flight peek; they hold a room's queue with a
+fixture-owned wedged head (an oversize raw event the homeserver refuses
+permanently, observed as the SDK's own unrecoverable send error and shown
+wedged at the head of its store), account for its exact id in every persisted
+set, lift it by aborting exactly it before any "nothing held" check, recover
+its exact handle after restart, and fail rather than pretend when the hold
+event is delivered or not recorded. Discard binding (D7) was traced rather
+than changed: the cache sets a scope's unreadable original only when the
+scope enters the cache and clears it only on the explicit discard, so a
+discard that reads the cache when it runs sees the original the notice was
+rendered for, or none; the exact core row comparison stays as the authority
+and this invariant is recorded on the cache type.
+
+Added coverage, also unrun: cache tests for the re-seed rule and the
+non-dirtying drop of uncommitted steps; a core regression for the capability
+states (before grant, after grant, after consume, release without an id,
+wrong epoch, revocation); an opt-in app regression that prepares a send,
+switches A to B to A, replays the stale rollback, re-seeds, flushes and proves
+the committed record is preserved and the cache stays consistent; and the
+reworked holds in both gated fixtures, including an encrypted new room.
+
+Known limits and open points: the hold relies on the local homeserver refusing
+an oversize event permanently, which the fixture verifies at run time rather
+than assumes; the interrupted-preparation regression replays the stale
+rollback directly because the interruption cannot be injected mid-await
+without a hook, which this branch does not add; an uncovered room is scanned only when it is
 opened or a scan is requested for it; discovery failures caused by a store read
 error cannot be forced by the fixture and are covered by unit tests of the
 registry only; a persisted SDK request whose record never received its id

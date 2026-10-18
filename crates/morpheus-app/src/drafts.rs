@@ -196,6 +196,15 @@ enum Quarantine {
 /// The unreadable original of one scope with the opaque identity the core
 /// minted for exactly that complete stored row. A discard names the identity;
 /// the core compares the complete row again before releasing anything.
+///
+/// Invariant: while a selection stays current, a cached scope's original is
+/// never replaced. It is set only when the scope enters the cache
+/// (`from_restored`, a vacant entry) and cleared only by the explicit
+/// `discard_quarantine`; a re-seed of an occupied scope re-statuses records
+/// and leaves it alone, and the whole entry disappears only with
+/// `forget_account` on logout, which follows the selection's revocation. So
+/// the identity a discard reads from the cache when it runs is the identity
+/// of the original the notice was rendered for, or none.
 struct Blocked {
     kind: Quarantine,
     revision: RowRevision,

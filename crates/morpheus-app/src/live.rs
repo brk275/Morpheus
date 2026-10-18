@@ -3145,6 +3145,99 @@ mod account_presentation_tests {
 mod stale_observer_tests {
     use super::*;
     use crate::draft_recovery::SendScope;
+    use matrix_sdk::{
+        ruma::{RoomId, serde::Raw},
+        send_queue::{LocalEchoContent, RoomSendQueueUpdate},
+    };
+
+    /// A fixture-owned hold on one room's SDK queue (see the core fixture's
+    /// `QueueHold`): a request the homeserver refuses permanently, recorded by
+    /// the SDK as wedged at the head, so every later request stays persisted
+    /// whatever the product does to the room's enabled flag. Established only
+    /// once the SDK reports the refusal; a delivered hold fails the test.
+    struct QueueHold {
+        transaction_id: String,
+        handle: matrix_sdk::send_queue::SendHandle,
+    }
+
+    impl QueueHold {
+        async fn place(room: &matrix_sdk::Room) -> Self {
+            let (echoes_before, mut updates) =
+                room.send_queue().subscribe().await.expect("Cannot observe the room send queue");
+            assert!(echoes_before.is_empty(), "a hold is placed only on an empty room queue");
+            let content = Raw::new(&serde_json::json!({
+                "msgtype": "m.text",
+                "body": "x".repeat(128 * 1024),
+            }))
+            .expect("Cannot encode the hold event")
+            .cast();
+            let handle = room
+                .send_queue()
+                .send_raw(content, "m.room.message".into())
+                .await
+                .expect("Cannot enqueue the hold event");
+            let transaction_id = handle.transaction_id().to_string();
+            room.send_queue().set_enabled(true);
+            tokio::time::timeout(Duration::from_secs(60), async {
+                loop {
+                    match updates.recv().await {
+                        Ok(RoomSendQueueUpdate::SendError { transaction_id: failed, is_recoverable, .. })
+                            if failed.as_str() == transaction_id =>
+                        {
+                            assert!(!is_recoverable, "the hold must be a permanent refusal");
+                            return;
+                        }
+                        Ok(RoomSendQueueUpdate::SentEvent { transaction_id: sent, .. })
+                            if sent.as_str() == transaction_id =>
+                        {
+                            panic!("The hold event was delivered; nothing holds the queue");
+                        }
+                        Ok(_) => {}
+                        Err(error) => panic!("Send queue observation ended: {error}"),
+                    }
+                }
+            })
+            .await
+            .expect("Timed out waiting for the SDK to refuse the hold event");
+            room.send_queue().set_enabled(false);
+            let (echoes, _) = room.send_queue().subscribe().await.expect("Cannot observe the room send queue");
+            let head = echoes.first().expect("the hold left the SDK queue");
+            assert_eq!(head.transaction_id.as_str(), transaction_id, "the hold must be the head");
+            assert!(
+                matches!(&head.content, LocalEchoContent::Event { send_error: Some(_), .. }),
+                "the hold is not recorded as wedged"
+            );
+            Self {
+                transaction_id,
+                handle,
+            }
+        }
+
+        async fn release(self, room: &matrix_sdk::Room) {
+            assert!(self.handle.abort().await.expect("Cannot abort the hold event"), "the hold was already gone");
+            let (echoes, _) = room.send_queue().subscribe().await.expect("Cannot observe the room send queue");
+            assert!(
+                !echoes.iter().any(|echo| echo.transaction_id.as_str() == self.transaction_id),
+                "the hold must leave the SDK queue on release"
+            );
+        }
+    }
+
+    /// Release the profile the way the app does: the draft worker holds the
+    /// manager until its channel closes.
+    async fn close_profile(directory: tempfile::TempDir, live: Arc<LiveUi>) {
+        let manager = live.manager.clone();
+        drop(live);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while Arc::strong_count(&manager) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the draft worker must release the profile");
+        drop(manager);
+        directory.close().unwrap();
+    }
 
     struct FixtureAccount {
         homeserver_url: String,
@@ -3214,10 +3307,12 @@ mod stale_observer_tests {
         manager.take_recovered_drafts(&selection).await.unwrap();
         live.is_live.store(true, Ordering::Release);
         *live.selected_room.lock().await = Some(a_room.clone());
-        // Barrier: the request stays persisted and the SDK never emits for it,
-        // so every observer below ends only through revocation.
+        // Hold: a wedged head keeps the recorded request persisted and the SDK
+        // never emits for it, so every observer below ends only through
+        // revocation. The product's own per-room resume cannot send past it.
         let client = manager.active_client().await.unwrap();
-        client.send_queue().set_enabled(false).await;
+        let room = client.get_room(&RoomId::parse(&a_room).unwrap()).expect("Room missing");
+        let hold = QueueHold::place(&room).await;
 
         let scope = SendScope {
             account: a_account.id.clone(),
@@ -3313,21 +3408,33 @@ mod stale_observer_tests {
         );
         // The saved state is intact for the renewed selection: discovery
         // adopts exactly the persisted request, so nothing valid was dropped.
-        let recovered = manager.take_recovered_drafts(&renewed).await.unwrap();
+        let mut recovered = manager.take_recovered_drafts(&renewed).await.unwrap();
         let send = recovered
-            .iter()
+            .iter_mut()
             .find(|draft| draft.room_id == a_room && draft.thread_root.is_none())
-            .and_then(|draft| draft.sends.iter().find(|send| send.nonce == nonce))
+            .and_then(|draft| draft.sends.iter_mut().find(|send| send.nonce == nonce))
             .expect("the record survives the switch");
         assert_eq!(send.transaction_id.as_deref(), Some(transaction.as_str()));
-        assert!(send.queued.is_some(), "the exact persisted request is adopted");
+        let adopted = send.queued.take().expect("the exact persisted request is adopted");
+        // The hold is the fixture's: lift it, let the adopted request complete
+        // under the renewed selection, then release the SDK handles before the
+        // accounts are removed.
+        hold.release(&room).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(30), adopted.wait_outcome())
+                .await
+                .expect("Timed out waiting for the adopted send"),
+            morpheus_matrix::QueuedSendOutcome::Sent
+        );
+        drop(room);
+        drop(client);
+        drop(recovered);
 
         manager.logout_account(&a_account.id).await.expect("Cannot remove first account");
         manager.logout_account(&b_account.id).await.expect("Cannot remove second account");
         manager.stop().await;
-        drop(live);
         drop(manager);
-        directory.close().unwrap();
+        close_profile(directory, live).await;
     }
 
     /// A send preparation interrupted by an account switch. The enqueuing
@@ -3428,15 +3535,7 @@ mod stale_observer_tests {
         manager.logout_account(&a_account.id).await.expect("Cannot remove first account");
         manager.logout_account(&b_account.id).await.expect("Cannot remove second account");
         manager.stop().await;
-        drop(live);
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while Arc::strong_count(&manager) != 1 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the draft worker must release the profile");
         drop(manager);
-        directory.close().unwrap();
+        close_profile(directory, live).await;
     }
 }

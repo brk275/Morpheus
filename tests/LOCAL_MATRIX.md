@@ -183,7 +183,10 @@ until the user discards it, pausing that room's queue meanwhile. The draft
 fixture round-trips two room records with their text, a thread index and a
 metadata-only row, and scans the raw account data for the encoded envelope and
 its marker attribute. A second gated scenario in the same file drives real SDK
-requests through controlled queue barriers: records durable before enqueue,
+requests behind a fixture-owned hold (an oversize raw event the homeserver
+refuses permanently, which the SDK records as a wedged head that blocks every
+later request; the client-wide queue toggle is not a hold, because the
+product's per-room resume overrides it): records durable before enqueue,
 single-use enqueue grants, stale and wrong-authority refusals, out-of-order
 cancellation, crash windows restored as unconfirmed (including a request the
 SDK persisted while the row still said enqueuing), exact adoption of a

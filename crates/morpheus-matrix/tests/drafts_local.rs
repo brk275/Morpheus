@@ -15,8 +15,9 @@ use matrix_sdk::{
     ruma::{
         EventId, RoomId,
         events::room::join_rules::{JoinRule, RoomJoinRulesEventContent},
+        serde::Raw,
     },
-    send_queue::RoomSendQueueUpdate,
+    send_queue::{LocalEchoContent, RoomSendQueueUpdate},
 };
 use morpheus_matrix::{
     AccountManager, AccountSelection, ComposeSendTarget, ComposeText, DraftEnvelope, Generation,
@@ -721,6 +722,137 @@ fn read_fixture() -> Option<(Fixture, PathBuf)> {
     Some((fixture, root))
 }
 
+/// Body size of the hold event: well over the event size any homeserver
+/// accepts, so the request is refused permanently rather than delivered.
+const HOLD_BODY_BYTES: usize = 128 * 1024;
+
+/// A fixture-owned hold on one room's SDK queue. The SDK sends a room's
+/// requests strictly in order and never past a head request it has recorded
+/// as wedged (refused with an unrecoverable error), so a wedged request at the
+/// head keeps every later request persisted whatever the product's gate does
+/// to the room's enabled flag. The hold is established only once the SDK
+/// itself reports the permanent refusal and shows the request as wedged; a
+/// delivered or still-pending hold event fails the fixture instead of
+/// pretending to hold anything.
+struct QueueHold {
+    transaction_id: String,
+    handle: matrix_sdk::send_queue::SendHandle,
+}
+
+impl QueueHold {
+    /// Place the hold. The subscription is taken before anything is enqueued
+    /// so the refusal cannot be missed.
+    async fn place(room: &matrix_sdk::Room) -> Self {
+        let (echoes_before, mut updates) = room
+            .send_queue()
+            .subscribe()
+            .await
+            .expect("Cannot observe the room send queue");
+        assert!(echoes_before.is_empty(), "a hold is placed only on an empty room queue");
+        let content = Raw::new(&serde_json::json!({
+            "msgtype": "m.text",
+            "body": "x".repeat(HOLD_BODY_BYTES),
+        }))
+        .expect("Cannot encode the hold event")
+        .cast();
+        let handle = room
+            .send_queue()
+            .send_raw(content, "m.room.message".into())
+            .await
+            .expect("Cannot enqueue the hold event");
+        let transaction_id = handle.transaction_id().to_string();
+        // Let the SDK attempt exactly this request so it records the refusal.
+        room.send_queue().set_enabled(true);
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                match updates.recv().await {
+                    Ok(RoomSendQueueUpdate::SendError { transaction_id: failed, is_recoverable, .. })
+                        if failed.as_str() == transaction_id =>
+                    {
+                        assert!(!is_recoverable, "the hold must be a permanent refusal, not a paused queue");
+                        return;
+                    }
+                    Ok(RoomSendQueueUpdate::SentEvent { transaction_id: sent, .. })
+                        if sent.as_str() == transaction_id =>
+                    {
+                        panic!("The hold event was delivered; the homeserver accepted it and nothing holds the queue");
+                    }
+                    Ok(_) => {}
+                    Err(error) => panic!("Send queue observation ended: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("Timed out waiting for the SDK to refuse the hold event");
+        // Leave the flag as the product expects; the parked task sends nothing
+        // past the wedged head anyway.
+        room.send_queue().set_enabled(false);
+        let hold = Self {
+            transaction_id,
+            handle,
+        };
+        hold.assert_wedged_head(room).await;
+        hold
+    }
+
+    /// After a restart: the exact hold, recovered from the SDK's own store.
+    async fn recover(room: &matrix_sdk::Room, transaction_id: &str) -> Self {
+        let (echoes, _) = room
+            .send_queue()
+            .subscribe()
+            .await
+            .expect("Cannot observe the room send queue");
+        let handle = echoes
+            .iter()
+            .find_map(|echo| match &echo.content {
+                LocalEchoContent::Event { send_handle, send_error, .. }
+                    if echo.transaction_id.as_str() == transaction_id =>
+                {
+                    assert!(send_error.is_some(), "the recovered hold is not recorded as wedged");
+                    Some(send_handle.clone())
+                }
+                _ => None,
+            })
+            .expect("the hold did not survive the restart");
+        let hold = Self {
+            transaction_id: transaction_id.to_owned(),
+            handle,
+        };
+        hold.assert_wedged_head(room).await;
+        hold
+    }
+
+    /// The SDK's own view: the hold is present, wedged, and the head.
+    async fn assert_wedged_head(&self, room: &matrix_sdk::Room) {
+        let (echoes, _) = room
+            .send_queue()
+            .subscribe()
+            .await
+            .expect("Cannot observe the room send queue");
+        let head = echoes.first().expect("the hold left the SDK queue");
+        assert_eq!(head.transaction_id.as_str(), self.transaction_id, "the hold must be the head of the queue");
+        match &head.content {
+            LocalEchoContent::Event { send_error, .. } => {
+                assert!(send_error.is_some(), "the hold is not recorded as wedged");
+            }
+            _ => panic!("the hold is not an event request"),
+        }
+    }
+
+    /// Lift the hold by aborting exactly it; the SDK then sends the next head
+    /// if the room is enabled.
+    async fn release(self, room: &matrix_sdk::Room) {
+        assert!(
+            self.handle.abort().await.expect("Cannot abort the hold event"),
+            "the hold was already gone"
+        );
+        assert!(
+            !persisted_requests(room).await.contains(&self.transaction_id),
+            "the hold must leave the SDK queue on release"
+        );
+    }
+}
+
 /// Exact ids of the requests the SDK store still holds for a room.
 async fn persisted_requests(room: &matrix_sdk::Room) -> HashSet<String> {
     room.send_queue()
@@ -841,9 +973,10 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
         let client = manager.active_client().await.expect("Client missing");
         let room = client.get_room(&RoomId::parse(a_room).unwrap()).expect("Room missing");
 
-        // Barrier: hold the SDK queue so persisted requests stay observable.
-        client.send_queue().set_enabled(false).await;
-        assert!(persisted_requests(&room).await.is_empty());
+        // Hold: a fixture-owned wedged head keeps every later request
+        // persisted; the product's own per-room resume cannot send past it.
+        let hold = QueueHold::place(&room).await;
+        assert_eq!(persisted_requests(&room).await, HashSet::from([hold.transaction_id.clone()]));
 
         // 1. Pending record durable before enqueue; enqueue needs the grant.
         let mut envelope = DraftEnvelope::fresh();
@@ -856,7 +989,7 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
             .unwrap();
         let on_disk = manager.load_composed_draft_for(&a_account.id, a_room, None).await.unwrap();
         assert_eq!(on_disk.envelope.pending().len(), 1);
-        assert!(persisted_requests(&room).await.is_empty(), "the row leads the SDK");
+        assert_eq!(persisted_requests(&room).await, HashSet::from([hold.transaction_id.clone()]), "the row leads the SDK");
         assert!(matches!(
             manager
                 .send_composed_owned_for(&selection, a_room, ComposeSendTarget::Room, &first_text, None, Some(&first))
@@ -885,7 +1018,7 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
         assert_ne!(first_txn, second_txn);
         assert_eq!(
             persisted_requests(&room).await,
-            HashSet::from([first_txn.clone(), second_txn.clone()])
+            HashSet::from([hold.transaction_id.clone(), first_txn.clone(), second_txn.clone()])
         );
 
         // 2. Stale snapshots and wrong authority touch nothing.
@@ -907,7 +1040,7 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
             manager.release_pending_record_for(&selection, a_room, None, &first, None).await,
             Err(MatrixCoreError::PendingSendUnknown)
         ));
-        assert_eq!(persisted_requests(&room).await.len(), 2);
+        assert_eq!(persisted_requests(&room).await.len(), 3);
         let on_disk = manager.load_composed_draft_for(&a_account.id, a_room, None).await.unwrap();
         assert_eq!(on_disk.envelope.pending().len(), 2);
 
@@ -931,7 +1064,7 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
         assert_eq!(after.envelope.pending().len(), 1);
         assert_eq!(after.envelope.pending()[0].text().to_compose().unwrap(), first_text);
         assert_eq!(after.text, second_text, "the live text is untouched by the resolution");
-        assert_eq!(persisted_requests(&room).await, HashSet::from([first_txn.clone()]));
+        assert_eq!(persisted_requests(&room).await, HashSet::from([hold.transaction_id.clone(), first_txn.clone()]));
 
         // 4. Crash windows. A third record is saved as enqueuing and never
         // enqueued; the first sends while the row still says queued; the
@@ -944,7 +1077,7 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
             .save_composed_draft_for(&a_account.id, a_room, None, &third_text, &envelope)
             .await
             .unwrap();
-        client.send_queue().set_enabled(true).await;
+        hold.release(&room).await;
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(30), queued_first.wait_outcome())
                 .await
@@ -1015,10 +1148,13 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
 
         // 5. A request the SDK still holds across a restart is adopted
         // exactly, through the subscription taken before the queue resumes.
-        client.send_queue().set_enabled(false).await;
+        let hold = QueueHold::place(&room).await;
+        let hold_id = hold.transaction_id.clone();
         let mut envelope = DraftEnvelope::fresh();
         let (_queued_fourth, fourth_txn) =
             record_and_enqueue(&manager, &selection, &a_account.id, a_room, &mut envelope, &fourth, &fourth_text).await;
+        assert_eq!(persisted_requests(&room).await, HashSet::from([hold_id.clone(), fourth_txn.clone()]));
+        drop(hold);
         drop(room);
         drop(client);
         manager.stop().await;
@@ -1034,6 +1170,14 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
         let send = scope.sends.iter_mut().find(|send| send.nonce == fourth).unwrap();
         assert_eq!(send.transaction_id.as_deref(), Some(fourth_txn.as_str()));
         let adopted = send.queued.take().expect("the exact persisted request was adopted");
+        {
+            // The hold survived the restart ahead of the adopted request;
+            // lifting it lets the room (resumed by discovery) send.
+            let client = manager.active_client().await.unwrap();
+            let room = client.get_room(&RoomId::parse(a_room).unwrap()).unwrap();
+            assert_eq!(persisted_requests(&room).await, HashSet::from([hold_id.clone(), fourth_txn.clone()]));
+            QueueHold::recover(&room, &hold_id).await.release(&room).await;
+        }
         assert!(matches!(
             manager.cancel_pending_send_for(&selection, a_room, None, &Generation::fresh(), &fourth_txn).await,
             Err(MatrixCoreError::PendingSendUnknown)
@@ -1054,10 +1198,13 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
         // event; re-selection rediscovers and adopts before the queue resumes.
         let client = manager.active_client().await.unwrap();
         let room = client.get_room(&RoomId::parse(a_room).unwrap()).unwrap();
-        client.send_queue().set_enabled(false).await;
+        let hold = QueueHold::place(&room).await;
+        let hold_id = hold.transaction_id.clone();
         let mut envelope = DraftEnvelope::fresh();
         let (_queued_sixth, sixth_txn) =
             record_and_enqueue(&manager, &selection, &a_account.id, a_room, &mut envelope, &sixth, &sixth_text).await;
+        assert_eq!(persisted_requests(&room).await, HashSet::from([hold_id.clone(), sixth_txn.clone()]));
+        drop(hold);
         drop(room);
         drop(client);
         let old_selection = selection;
@@ -1086,6 +1233,12 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
             .expect("The room scope was rediscovered");
         let send = scope.sends.iter_mut().find(|send| send.nonce == sixth).unwrap();
         let adopted = send.queued.take().expect("the request was adopted again on re-selection");
+        {
+            let client = manager.active_client().await.unwrap();
+            let room = client.get_room(&RoomId::parse(a_room).unwrap()).unwrap();
+            assert_eq!(persisted_requests(&room).await, HashSet::from([hold_id.clone(), sixth_txn.clone()]));
+            QueueHold::recover(&room, &hold_id).await.release(&room).await;
+        }
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(30), adopted.wait_outcome())
                 .await
@@ -1103,7 +1256,8 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
         // own persisted request is what sends once the room resumes.
         let client = manager.active_client().await.unwrap();
         let room = client.get_room(&RoomId::parse(a_room).unwrap()).unwrap();
-        client.send_queue().set_enabled(false).await;
+        let hold = QueueHold::place(&room).await;
+        let hold_id = hold.transaction_id.clone();
         let seventh = Generation::fresh();
         let seventh_text = ComposeText::plain(format!("recovery-seventh-{marker}"));
         let mut envelope = DraftEnvelope::fresh();
@@ -1120,9 +1274,10 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
             .await
             .unwrap();
         let seventh_txn = queued_seventh.transaction_id().to_owned();
-        assert_eq!(persisted_requests(&room).await, HashSet::from([seventh_txn.clone()]));
+        assert_eq!(persisted_requests(&room).await, HashSet::from([hold_id.clone(), seventh_txn.clone()]));
         // The process stops before the id reaches the row.
         drop(queued_seventh);
+        drop(hold);
         drop(room);
         drop(client);
         manager.stop().await;
@@ -1136,6 +1291,9 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
         // part of discovery and the persisted request sends on its own.
         let (echoes_now, mut seventh_updates) = room.send_queue().subscribe().await.unwrap();
         let recovered = manager.take_recovered_drafts(&selection).await.unwrap();
+        // Discovery resumed the room; only lifting the hold lets the SDK's own
+        // persisted request go.
+        QueueHold::recover(&room, &hold_id).await.release(&room).await;
         let scope = recovered
             .iter()
             .find(|draft| draft.room_id == a_room && draft.thread_root.is_none())
@@ -1187,10 +1345,12 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
         // column, and resumes only after the explicit discard of exactly it.
         let client = manager.active_client().await.unwrap();
         let room = client.get_room(&RoomId::parse(a_room).unwrap()).unwrap();
-        client.send_queue().set_enabled(false).await;
+        let hold = QueueHold::place(&room).await;
+        let hold_id = hold.transaction_id.clone();
         let mut envelope = DraftEnvelope::fresh();
         let (_queued_fifth, fifth_txn) =
             record_and_enqueue(&manager, &selection, &a_account.id, a_room, &mut envelope, &fifth, &fifth_text).await;
+        assert_eq!(persisted_requests(&room).await, HashSet::from([hold_id.clone(), fifth_txn.clone()]));
         // What a newer Morpheus would leave behind: the same row under a
         // version this build does not know, written through the same SDK API.
         let row = room.load_composer_draft(None).await.unwrap().expect("Row missing");
@@ -1211,6 +1371,7 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
         )
         .await
         .unwrap();
+        drop(hold);
         drop(room);
         drop(client);
         manager.stop().await;
@@ -1234,7 +1395,7 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
         let room = client.get_room(&RoomId::parse(a_room).unwrap()).unwrap();
         assert!(!client.send_queue().is_enabled(), "the client-wide queue is never enabled; rooms resume one by one");
         assert!(!room.send_queue().is_enabled(), "the affected room stays paused");
-        assert_eq!(persisted_requests(&room).await, HashSet::from([fifth_txn.clone()]));
+        assert_eq!(persisted_requests(&room).await, HashSet::from([hold_id.clone(), fifth_txn.clone()]));
         // Both stored columns and the kind are carried, so the plain column
         // that differs from the HTML survives an edit of the live draft.
         let carried = scope.restored.envelope.quarantine().unwrap();
@@ -1291,6 +1452,10 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
         ), "a stale discard names another original");
         assert!(!room.send_queue().is_enabled());
         let (_, resumed) = room.send_queue().subscribe().await.unwrap();
+        // The hold goes first; the room itself stays paused by the gate until
+        // the explicit discard below resumes it.
+        QueueHold::recover(&room, &hold_id).await.release(&room).await;
+        assert!(!room.send_queue().is_enabled(), "lifting the hold resumes nothing by itself");
         manager.discard_quarantine_for(&selection, a_room, None, &revision).await.unwrap();
         manager
             .save_composed_draft_for(&a_account.id, a_room, None, &empty, &DraftEnvelope::fresh())
@@ -1463,11 +1628,15 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
             .send_state_event(RoomJoinRulesEventContent::new(JoinRule::Public))
             .await
             .expect("Cannot open the room's join rule");
-        client.send_queue().set_enabled(false).await;
+        // The hold works in an encrypted room too: the oversize event is
+        // encrypted and still refused, or fails to encrypt, either way
+        // permanently; a delivered hold fails this fixture.
+        let hold = QueueHold::place(&sdk_new_room).await;
+        let hold_id = hold.transaction_id.clone();
         let mut left_envelope = DraftEnvelope::fresh();
         let (_queued_eighth, eighth_txn) =
             record_and_enqueue(&manager, &selection, &a_account.id, &new_room, &mut left_envelope, &eighth, &eighth_text).await;
-        assert_eq!(persisted_requests(&sdk_new_room).await, HashSet::from([eighth_txn.clone()]));
+        assert_eq!(persisted_requests(&sdk_new_room).await, HashSet::from([hold_id.clone(), eighth_txn.clone()]));
         let left_row = sdk_new_room.load_composer_draft(None).await.unwrap().expect("Row missing");
         let left_broken = left_row
             .html_text
@@ -1492,6 +1661,7 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
             assert!(Instant::now() < deadline, "Timed out waiting to leave");
             sleep(Duration::from_millis(300)).await;
         }
+        drop(hold);
         drop(sdk_new_room);
         drop(room);
         drop(client);
@@ -1511,7 +1681,7 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
             Err(MatrixCoreError::RecoveryIncomplete)
         ), "a room that is not joined is not scanned");
         assert!(!sdk_new_room.send_queue().is_enabled(), "the left room stays paused");
-        assert_eq!(persisted_requests(&sdk_new_room).await, HashSet::from([eighth_txn.clone()]), "its persisted request is kept, not dropped or sent");
+        assert_eq!(persisted_requests(&sdk_new_room).await, HashSet::from([hold_id.clone(), eighth_txn.clone()]), "its persisted request is kept, not dropped or sent");
         assert!(matches!(
             manager
                 .send_composed_owned_for(&selection, &new_room, ComposeSendTarget::Room, &eighth_text, None, None)
@@ -1546,6 +1716,8 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
         ));
         let left_revision = left_scope.restored.blocked_revision().cloned().unwrap();
         let (_, resumed_again) = sdk_new_room.send_queue().subscribe().await.unwrap();
+        QueueHold::recover(&sdk_new_room, &hold_id).await.release(&sdk_new_room).await;
+        assert!(!sdk_new_room.send_queue().is_enabled(), "lifting the hold resumes nothing by itself");
         manager.discard_quarantine_for(&selection, &new_room, None, &left_revision).await.unwrap();
         manager.save_composed_draft_for(&a_account.id, &new_room, None, &empty, &DraftEnvelope::fresh()).await.unwrap();
         assert!(sdk_new_room.send_queue().is_enabled(), "the explicit discard resumes the rejoined room");
