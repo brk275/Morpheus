@@ -1157,7 +1157,7 @@ class DiagnosticsAndReportTests(unittest.TestCase):
             self.assertEqual((trace.value["window_candidates"], trace.value["event_targets_ignored"]), (1, 1))
 
     def test_near_match_helpers_are_not_discarded(self):
-        changes = ({"class": "unknown private class"}, {"style": 0x94000000},
+        changes = ({"class": "unknown private class"}, {"style": 0x92000000},
                    {"exstyle": 0x080801A0}, {"owner": 65538})
         job = Mock()
         job.kernel.WaitForSingleObject.return_value = 258
@@ -1171,6 +1171,34 @@ class DiagnosticsAndReportTests(unittest.TestCase):
             self.assertEqual(error.exception.code, "window_count")
             self.assertEqual(trace.value["window_candidates"], 2)
             self.assertNotIn("private", json.dumps(trace.value))
+
+    def test_installed_helper_signature_keeps_the_real_window_in_either_order(self):
+        job = Mock()
+        job.kernel.WaitForSingleObject.return_value = 258
+        for style in (0x90000000, 0x94000000):
+            for order in ([2, 65538], [65538, 2]):
+                api = WindowQuery()
+                api.windows[2].update(style=style, rect=(0, 0, 16, 16))
+                trace = ui.Diagnostics({})
+                with (self.subTest(style=style, order=order),
+                      patch.object(smoke, "visible_windows", return_value=order)):
+                    self.assertEqual(ui.owned_window(job, 20, 77, trace, api=api), 65538)
+                self.assertEqual(trace.value["event_targets_ignored"], 1)
+                self.assertEqual(trace.value["window_candidates"], 1)
+
+    def test_every_other_single_style_bit_change_remains_a_candidate(self):
+        accepted = (0x90000000, 0x94000000)
+        for original in accepted:
+            for field, expected in (("style", original), ("exstyle", 0x080800A0)):
+                for bit in range(32):
+                    changed = expected ^ (1 << bit)
+                    if field == "style" and changed in accepted:
+                        continue
+                    api = WindowQuery()
+                    api.windows[2].update(style=original)
+                    api.windows[2][field] = changed
+                    with self.subTest(original=original, field=field, bit=bit):
+                        self.assertEqual(ui.keyboard_window_kind(api, 2, 77), "candidate")
 
     def test_exact_event_target_identity_does_not_depend_on_geometry(self):
         # The actual hosted probe found a nonzero-area event target. A zero
@@ -1239,10 +1267,10 @@ class DiagnosticsAndReportTests(unittest.TestCase):
 
     def test_window_count_inventory_publishes_complete_words_for_the_deciding_poll(self):
         # A synthetic event target whose style word carries one extra bit
-        # (WS_CLIPSIBLINGS) reproduces the hosted failure tokens; the inventory
-        # then shows which complete word differs. The selector is unchanged.
+        # (WS_CLIPCHILDREN) remains an unknown signature; the inventory shows
+        # which complete word differs without relaxing the selector.
         api = WindowQuery()
-        api.windows[2].update(style=0x94000000, rect=(0, 0, 136, 39))
+        api.windows[2].update(style=0x92000000, rect=(0, 0, 136, 39))
         job = Mock()
         job.kernel.WaitForSingleObject.return_value = 258
         record = {}
@@ -1254,7 +1282,7 @@ class DiagnosticsAndReportTests(unittest.TestCase):
         self.assertEqual((trace.value["window_candidates"], trace.value["event_targets_ignored"],
                           trace.value["owned_window_seen"]), (2, 0, False))
         self.assertEqual(trace.value["window_inventory"],
-                         inventory(fact(), event_target_fact(style=0x94000000, width=136, height=39)))
+                         inventory(fact(), event_target_fact(style=0x92000000, width=136, height=39)))
         trace.step("window")
         trace.failed(error.exception)
         parsed = self.parse_failed_window_report(record)

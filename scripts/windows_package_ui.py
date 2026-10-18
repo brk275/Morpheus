@@ -701,10 +701,11 @@ def keyboard_window_kind(api, window, pid):
     if not visible:
         return "hidden"
     # Pinned winit 0.30.13 create_event_target_window. Compare complete raw
-    # style words, not the probe's projection of named flags. An added bit,
-    # owner or different class keeps this window as a candidate. Geometry is
-    # not identity: the real hosted probe found a nonzero event-target area.
-    if (name == "Winit Thread Event Target" and style == 0x90000000
+    # style words, not the probe's projection of named flags. The installed
+    # native-calls build in run 39156003947 observed WS_CLIPSIBLINGS as well.
+    # Accept exactly these two words; no other bits, class or owner qualify.
+    # Geometry is not identity: hosted event targets have nonzero area.
+    if (name == "Winit Thread Event Target" and style in (0x90000000, 0x94000000)
             and exstyle == 0x080800A0 and not owner):
         return "event_target"
     return "candidate"

@@ -98,9 +98,10 @@ was found.
 ## Installed keyboard selection
 
 The installed driver excludes only the pinned event target's exact class,
-complete raw style words (`0x90000000` and `0x080800a0`) and absent owner.
+complete raw style (`0x90000000` or `0x94000000`), extended style
+(`0x080800a0`) and absent owner.
 Geometry is not an identity check. It rechecks the borrowed handle's process
-ownership before and after queries. A different class, extra style bit or owner
+ownership before and after queries. A different class, any other style word or owner
 keeps the window as a candidate. Two candidates remain an error; enumeration order
 never chooses one. An event target alone keeps the driver waiting for the app.
 
@@ -164,7 +165,24 @@ NSIS install and registration passed, then the keyboard driver failed at
 - Alternatively, an extended-style bit differs, or a window not visible in the
   default-feature probe appears in the installed native-calls build.
 
-The selector stays unchanged until raw evidence decides between these.
+These were hypotheses before the inventory run below.
+
+### Installed signature evidence
+
+[Package run 39156003947](https://github.com/brk275/Morpheus/actions/runs/39156003947)
+built `540a40e67a6f5896873178a0308e3d0a90a8ed80`. Installation and the initial
+visible startup passed. The keyboard check again failed with two candidates.
+Its deciding-poll inventory recorded an unowned, visible `winit_event_target`
+with complete style `0x94000000`, extended style `0x080800a0` and a 16 by 16
+extent, alongside the visible `winit_window`. Neither window was cloaked.
+This confirms the extra `WS_CLIPSIBLINGS` bit for that installed build.
+
+The selector now permits precisely the requested and observed helper style
+words with the same exact class, extended style and absent-owner checks.
+It does not mask arbitrary bits or select by size or enumeration order.
+Synthetic regression checks cover both accepted words in either order and
+every single-bit deviation in both complete style words. Installed keyboard
+interaction must still pass separately; this inventory does not prove it.
 
 ### Diagnostic
 
