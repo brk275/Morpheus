@@ -4895,14 +4895,18 @@ mod stale_observer_tests {
         // Unchanged composer: the record is dropped, the text stays once.
         live.drafts
             .set(&a_account.id, &a_room, "unchanged submission");
+        let unchanged = live
+            .drafts
+            .get_composed_scoped(&a_account.id, &a_room, None);
+        assert_eq!(unchanged.body, "unchanged submission");
+        assert_eq!(unchanged.format, TextFormat::Markdown);
+        assert!(
+            unchanged.mentions.is_empty(),
+            "the old mention was not retained"
+        );
         let revision = live.drafts.revision(&a_account.id, &a_room).unwrap();
         let again = live
-            .prepare_pending_send(
-                &selection,
-                &scope,
-                &ComposeText::plain("unchanged submission"),
-                revision,
-            )
+            .prepare_pending_send(&selection, &scope, &unchanged, revision)
             .await
             .expect("the second preparation succeeds");
         let second = again.nonce().clone();
@@ -4921,6 +4925,13 @@ mod stale_observer_tests {
             .load_composed_draft_for(&a_account.id, &a_room, None)
             .await
             .unwrap();
+        assert_eq!(row.text, unchanged);
+        assert_eq!(
+            live.drafts
+                .get_composed_scoped(&a_account.id, &a_room, None),
+            unchanged,
+            "abandoning the unchanged submission preserves its complete typed text"
+        );
         assert!(row.envelope.find(&second).is_none());
         assert!(
             row.envelope

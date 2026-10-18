@@ -16,6 +16,69 @@ import run_matrix_acceptance as acceptance_module
 from run_element_acceptance import CHECKS as ELEMENT_CHECKS
 
 
+class FocusedSuiteTests(unittest.TestCase):
+    def test_completion_requires_every_selected_check_and_default_still_requires_full(self):
+        with tempfile.TemporaryDirectory() as folder:
+            focused = Acceptance(Path(folder), "scanner", suite="draft-recovery")
+            focused.results = [{"check": label} for label in acceptance_module.DRAFT_RECOVERY_CHECKS]
+            focused.finish_checks()
+            full = Acceptance(Path(folder), "scanner")
+            full.results = list(focused.results)
+            with self.assertRaisesRegex(RuntimeError, "failed or unexecuted"):
+                full.finish_checks()
+            for missing in acceptance_module.DRAFT_RECOVERY_CHECKS:
+                focused.results = [{"check": label} for label in acceptance_module.DRAFT_RECOVERY_CHECKS
+                                   if label != missing]
+                with self.subTest(missing=missing), self.assertRaises(RuntimeError):
+                    focused.finish_checks()
+
+    def test_unknown_suite_rejected_before_creating_directories(self):
+        with patch.object(acceptance_module, "private_directory") as directory:
+            with self.assertRaisesRegex(ValueError, "Unknown acceptance suite"):
+                Acceptance(Path("unused"), "scanner", suite="arbitrary")
+        directory.assert_not_called()
+
+    def test_focused_order_includes_moderation_prerequisite_and_all_app_guards(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "scanner", suite="draft-recovery")
+            fixture = Path(folder) / "fixture.json"
+            with patch.object(runner, "test") as test, patch.object(runner, "app_recovery") as app:
+                runner.draft_recovery_cases(fixture)
+            self.assertEqual([call.args for call in test.call_args_list], [
+                ("drafts_local", fixture), ("formatted_local", fixture), ("moderation_local", fixture),
+            ])
+            app.assert_called_once_with(fixture)
+            self.assertEqual(runner.not_run, {})
+
+    def test_failed_prerequisite_skips_moderation_but_runs_independent_recovery(self):
+        with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()):
+            runner = Acceptance(Path(folder), "scanner", suite="draft-recovery")
+            failure = acceptance_module.CheckFailure("formatted_local", "test_failed")
+            with patch.object(runner, "test", side_effect=[None, failure]) as test, \
+                    patch.object(runner, "app_recovery") as app:
+                runner.draft_recovery_cases(Path(folder) / "fixture.json")
+            self.assertEqual(test.call_count, 2)
+            app.assert_called_once()
+            self.assertEqual(runner.not_run, {"moderation_local": "dependency_failed"})
+            with self.assertRaises(RuntimeError):
+                runner.finish_checks()
+
+    def test_summary_labels_focused_evidence_and_does_not_require_unselected_checks(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="draft-recovery")
+            runner.results = [{"check": label, "passed": 1, "seconds": 1}
+                              for label in acceptance_module.DRAFT_RECOVERY_CHECKS]
+            summary = root / "summary.md"
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
+                runner.summary()
+            report = json.loads((root / "outcomes.json").read_text())
+            self.assertEqual(report["suite"], "draft-recovery")
+            self.assertEqual(report["not_run"], {})
+            self.assertIn("not full acceptance", summary.read_text())
+            self.assertNotIn("Full suite:", summary.read_text())
+
+
 class StartupOwnershipTests(unittest.TestCase):
     @contextlib.contextmanager
     def preflight(self, responses):
@@ -124,6 +187,32 @@ class FinalizationTests(unittest.TestCase):
             self.assertIsNone(acceptance_module.main())
         self.assert_both_cleanups(runner)
         self.assertEqual(visible.getvalue(), "")
+
+    def test_focused_suite_uses_only_its_declared_checks_and_preserves_cleanup(self):
+        with self.mocked_main() as (runner, _):
+            with patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner",
+                                           "--suite", "draft-recovery"]):
+                self.assertIsNone(acceptance_module.main())
+        runner.draft_recovery_cases.assert_called_once()
+        runner.finish_checks.assert_called_once()
+        runner.test.assert_not_called()
+        runner.app_recovery.assert_not_called()
+        runner.oauth_cases.assert_not_called()
+        runner.outgoing_ring_cases.assert_not_called()
+        runner.rtc_cases.assert_not_called()
+        runner.element_case.assert_not_called()
+        self.assert_both_cleanups(runner)
+
+    def test_focused_suite_failure_cannot_become_success_and_still_cleans_up(self):
+        original = RuntimeError("fixed focused failure")
+        with self.mocked_main() as (runner, _):
+            runner.finish_checks.side_effect = original
+            with patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner",
+                                           "--suite", "draft-recovery"]):
+                with self.assertRaises(RuntimeError) as caught:
+                    acceptance_module.main()
+        self.assertIs(caught.exception, original)
+        self.assert_both_cleanups(runner)
 
     def test_outgoing_ring_failure_keeps_original_failure_and_cleans_both_services(self):
         original = RuntimeError("fixed outgoing ring failure")

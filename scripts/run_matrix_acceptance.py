@@ -330,6 +330,10 @@ ELEMENT_TEST_STAGES = frozenset((
 ))
 RTC_CHECKS = ("unsupported_transport_local", *RING_LABELS, *RTC_LABELS, ELEMENT_LABEL)
 PLANNED_CHECKS = (*CHAT_CHECKS, APP_RECOVERY_LABEL, "recovery_local", *OAUTH_LABELS, *RTC_CHECKS)
+# A focused retry still establishes the identity required by moderation and
+# runs every app recovery guard. It cannot stand in for full acceptance.
+DRAFT_RECOVERY_CHECKS = ("drafts_local", "formatted_local", "moderation_local", APP_RECOVERY_LABEL)
+SUITES = {"full": PLANNED_CHECKS, "draft-recovery": DRAFT_RECOVERY_CHECKS}
 # Leave a full minute before the workflow's 55-minute hard kill. Work stops
 # with eleven minutes left: up to three for nested OAuth/Element cleanup, then
 # eight for both shared-service cleanups, checked inventories and log scans.
@@ -666,7 +670,11 @@ def fixture_from_output(output: str, root: Path) -> Path:
 
 
 class Acceptance:
-    def __init__(self, root: Path, gitleaks: str, *, started=None):
+    def __init__(self, root: Path, gitleaks: str, *, started=None, suite="full"):
+        if suite not in SUITES:
+            raise ValueError("Unknown acceptance suite")
+        self.suite = suite
+        self.planned_checks = SUITES[suite]
         self.root = private_directory(root)
         self.logs = private_directory(root / "logs")
         self.gitleaks = gitleaks
@@ -713,7 +721,7 @@ class Acceptance:
 
     def finish_checks(self):
         completed = {item["check"] for item in self.results}
-        if self.failures or self.not_run or any(label not in completed for label in PLANNED_CHECKS):
+        if self.failures or self.not_run or any(label not in completed for label in self.planned_checks):
             raise RuntimeError("Matrix acceptance has failed or unexecuted required checks")
 
     def require_containment(self):
@@ -954,6 +962,17 @@ class Acceptance:
             test=True, pid_namespace=True,
         )
 
+    def draft_recovery_cases(self, fixture: Path):
+        self.group(("drafts_local",), lambda: self.test("drafts_local", fixture))
+        formatted = self.group(("formatted_local",), lambda: self.test("formatted_local", fixture))
+        if formatted:
+            self.group(("moderation_local",), lambda: self.test("moderation_local", fixture))
+        else:
+            self.not_run["moderation_local"] = "dependency_failed"
+            print(json.dumps({"check": "moderation_local", "status": "not_run",
+                              "reason": "dependency_failed"}), flush=True)
+        self.group((APP_RECOVERY_LABEL,), lambda: self.app_recovery(fixture))
+
     def rtc_cases(self):
         # Every run gets different users/room: existing devices and keys would
         # hide a regression in either encrypted sticky membership dialect.
@@ -1080,16 +1099,22 @@ class Acceptance:
     def summary(self):
         completed = {item["check"] for item in self.results + self.failures}
         unexecuted = {label: self.not_run.get(label, "prerequisite_failed")
-                      for label in PLANNED_CHECKS if label not in completed}
+                      for label in self.planned_checks if label not in completed}
         write_private(self.root / "outcomes.json", json.dumps({
+            "suite": self.suite,
             "passed": self.results, "failed": self.failures, "not_run": unexecuted,
         }, indent=2) + "\n")
         summary = os.environ.get("GITHUB_STEP_SUMMARY")
         if summary:
             with open(summary, "a", encoding="utf-8") as output:
                 output.write("### Disposable Matrix integration\n\n")
-                output.write("Real Synapse, Matrix Authentication Service, OS Secret Service and LiveKit; "
-                             "synthetic call media and OAuth browser-form protocol automation.\n\n")
+                if self.suite == "full":
+                    output.write("Full suite: real Synapse, Matrix Authentication Service, OS Secret Service and LiveKit; "
+                                 "synthetic call media and OAuth browser-form protocol automation.\n\n")
+                else:
+                    output.write("Focused draft-recovery rerun: real Synapse and an ephemeral OS Secret Service. "
+                                 "Includes the formatting prerequisite for moderation and all app recovery guards. "
+                                 "No OAuth or RTC checks; this is not full acceptance.\n\n")
                 output.write("| Check | Passed tests | Seconds |\n| --- | ---: | ---: |\n")
                 for item in self.results:
                     if "passed" in item:
@@ -1128,6 +1153,8 @@ def main():
     started = time.monotonic()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gitleaks", required=True)
+    parser.add_argument("--suite", choices=tuple(SUITES), default="full",
+                        help="Focused retries do not establish full acceptance (default: full)")
     args = parser.parse_args()
     if os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_OS") != "Linux":
         raise RuntimeError("This harness is restricted to ephemeral Linux GitHub runners")
@@ -1152,13 +1179,17 @@ def main():
         if set(result.stdout.splitlines()).intersection(names):
             raise RuntimeError("Pre-existing Matrix fixture found; refusing to modify it")
     root = Path(tempfile.mkdtemp(prefix="morpheus-hosted-acceptance-", dir=os.environ.get("RUNNER_TEMP")))
-    acceptance = Acceptance(root, args.gitleaks, started=started)
+    acceptance = Acceptance(root, args.gitleaks, started=started, suite=args.suite)
     body_failed = False
     try:
         acceptance.start_keyring()
         acceptance.require_containment()
         acceptance.script("local_matrix_env", "up")
         fixture = fixture_from_output(str(root / "accounts.json"), root)
+        if args.suite == "draft-recovery":
+            acceptance.draft_recovery_cases(fixture)
+            acceptance.finish_checks()
+            return
         # Each selector owns its local profile, fresh devices and unique test
         # data. They share seeded accounts/rooms, not the preceding result.
         # Moderation is the one exception: it asserts an existing identity is

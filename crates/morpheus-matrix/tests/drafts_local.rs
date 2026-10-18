@@ -2342,8 +2342,22 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
             .discard_quarantine_for(&selection, a_room, None, &plain_review)
             .await
             .unwrap();
+        // Discard releases this exact revision for a typed replacement. The
+        // plain convenience API still refuses to normalize unsupported data.
+        assert!(matches!(
+            manager
+                .save_composer_draft_for(&a_account.id, a_room, "after review")
+                .await,
+            Err(MatrixCoreError::RecoveryBlocked)
+        ));
         manager
-            .save_composer_draft_for(&a_account.id, a_room, "after review")
+            .save_composed_draft_for(
+                &a_account.id,
+                a_room,
+                None,
+                &ComposeText::plain("after review"),
+                &DraftEnvelope::fresh(),
+            )
             .await
             .unwrap();
         let rewritten = room
