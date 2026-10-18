@@ -1663,7 +1663,7 @@ async fn exercise_account_ui(runtime: Handle) {
     // This suite tests the actual dialog/controller boundary, not credentials.
     // A denied account-change guard also prevents any mistaken key sequence
     // from starting policy writes, account activation, or local deletion.
-    let access = AccountAccessUi::register(&ui, live.clone(), runtime, || false);
+    let access = AccountAccessUi::register(&ui, live.clone(), runtime.clone(), || false);
     ui.set_composer_text("untouched conversation draft".into());
     settle(&ui).await;
 

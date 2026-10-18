@@ -1965,13 +1965,13 @@ impl<B: StickerBackend> StickerUi<B> {
             return;
         };
         let owner = self.clone();
-        let weak = weak.clone();
+        let task_weak = weak.clone();
         self.runtime.spawn(async move {
             let hold = owner
-                .check_queue(id, &selection, &destination, &transaction, &weak)
+                .check_queue(id, &selection, &destination, &transaction, &task_weak)
                 .await;
             owner.end_check(id, hold);
-            owner.schedule_publish(&weak);
+            owner.schedule_publish(&task_weak);
         });
         self.schedule_publish(weak);
     }
