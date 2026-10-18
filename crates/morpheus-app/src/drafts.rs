@@ -46,8 +46,6 @@ fn key(account: &str, room: &str, thread: Option<&str>) -> DraftKey {
     )
 }
 
-/// In-session view of one saved send record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// How a released enqueuing record was reconciled with the composer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reconciled {
@@ -57,6 +55,8 @@ pub enum Reconciled {
     Kept,
 }
 
+/// In-session view of one saved send record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PendingStatus {
     /// Saved before the SDK assigned a transaction id.
     Enqueuing,
