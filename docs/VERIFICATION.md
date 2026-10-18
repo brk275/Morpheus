@@ -2943,12 +2943,19 @@ the row keeps: the release, not fresh ownership, authorizes the drop, the
 account-bound flush completes a failed write, and a refused release leaves
 cache and row alike for discovery. The typed submission is never lost by a
 definite pre-enqueue failure: the composer stays editable during the
-preparation, and if the user typed on meanwhile the record becomes kept text
-(through the same exact release, the core's one path from enqueuing to kept)
-beside the newer composer text, with a thread keeping its index entry; a
-never-written record that must be kept is first made durable, and if even that
-write fails it stays in the cache for review rather than being dropped. An
-unchanged composer simply drops the record, so nothing is duplicated.
+preparation, and the cache decides drop-or-keep at the moment it mutates,
+under its own lock, against the complete typed text the composer holds right
+then (no earlier comparison is carried across an await). A composer that still
+holds exactly the submission drops the record, so nothing is duplicated; one
+that moved on turns the record into kept text (through the same exact release,
+the core's one path from enqueuing to kept) beside the newer composer text,
+with a thread keeping its index entry. A never-written record that must be
+kept is first made durable, and if even that write fails it stays in the cache
+for review rather than being dropped; after a revocation a never-written
+record is dropped only while the composer still holds it, and otherwise
+retained for the account-bound flush and the next discovery. Test pause points
+are one-shot: consumed when reached, so a later pass through the same code
+runs unpaused.
 `persist_scope_and_index` re-checks before
 touching the room index and before scheduling a retry. Re-seeding
 a scope the cache kept across an account switch marks every awaiting record

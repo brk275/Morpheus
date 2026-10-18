@@ -48,6 +48,15 @@ fn key(account: &str, room: &str, thread: Option<&str>) -> DraftKey {
 
 /// In-session view of one saved send record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// How a released enqueuing record was reconciled with the composer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reconciled {
+    /// The composer still held exactly the submission; the record is gone.
+    Dropped,
+    /// The composer had moved on; the submission is kept text now.
+    Kept,
+}
+
 pub enum PendingStatus {
     /// Saved before the SDK assigned a transaction id.
     Enqueuing,
@@ -690,32 +699,6 @@ impl DraftStore {
         true
     }
 
-    /// Drop an enqueuing record that never reached the row: the cache was
-    /// ahead of the row, so removing it reconciles the two. No write is
-    /// scheduled and the dirty flag is left as it was, because this is a
-    /// reconciliation of the cache, not a change the row has to learn.
-    pub fn drop_uncommitted_pending(
-        &self,
-        account: &str,
-        room: &str,
-        thread: Option<&str>,
-        nonce: &Generation,
-    ) -> bool {
-        let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
-        let Some(draft) = drafts.get_mut(&key(account, room, thread)) else {
-            return false;
-        };
-        let Some(index) = draft.pending.iter().position(|pending| {
-            pending.nonce == *nonce
-                && pending.transaction_id.is_none()
-                && pending.status == PendingStatus::Enqueuing
-        }) else {
-            return false;
-        };
-        draft.pending.remove(index);
-        true
-    }
-
     /// Record the exact SDK transaction id. Returns whether the submission was
     /// cleared from the composer, which happens only when the composer is
     /// unchanged since `begin_pending`; the record keeps the text either way.
@@ -970,42 +953,67 @@ impl DraftStore {
             .map(|pending| pending.text.clone())
     }
 
-    /// Whether the composer of this scope still holds exactly the typed
-    /// submission a record was created from (body, format and mentions).
-    pub fn composer_holds_record(
+    /// Drop a record that never reached the row, but only while the composer
+    /// still holds exactly the typed submission it was created from (body,
+    /// format and mentions), so the text is right there once. Decided and
+    /// applied under one cache lock: a composer edit cannot slip between the
+    /// comparison and the removal. Returns whether the record was dropped; a
+    /// record the composer no longer holds is left in the cache, dirty, as
+    /// the recoverable enqueuing record it is.
+    pub fn drop_uncommitted_pending_if_held(
         &self,
         account: &str,
         room: &str,
         thread: Option<&str>,
         nonce: &Generation,
     ) -> bool {
-        let drafts = self.by_room.lock().expect("draft mutex poisoned");
-        let Some(draft) = drafts.get(&key(account, room, thread)) else {
-            return false;
-        };
-        draft
-            .pending
-            .iter()
-            .any(|pending| pending.nonce == *nonce && pending.text == draft.text)
-    }
-
-    /// Turn an awaiting record that never received an id into kept text, so a
-    /// submission the composer no longer holds stays recoverable beside the
-    /// newer text. This changes the row (the caller writes it under the
-    /// core's exact release); `set_pending_status` deliberately refuses it.
-    pub fn keep_pending(&self, account: &str, room: &str, thread: Option<&str>, nonce: &Generation) -> bool {
         let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
         let Some(draft) = drafts.get_mut(&key(account, room, thread)) else {
             return false;
         };
-        let Some(pending) = draft.pending.iter_mut().find(|pending| {
-            pending.nonce == *nonce && pending.awaits_send() && pending.transaction_id.is_none()
+        let Some(index) = draft.pending.iter().position(|pending| {
+            pending.nonce == *nonce
+                && pending.transaction_id.is_none()
+                && pending.status == PendingStatus::Enqueuing
+                && pending.text == draft.text
         }) else {
             return false;
         };
-        pending.status = PendingStatus::Kept;
-        draft.changed();
+        draft.pending.remove(index);
         true
+    }
+
+    /// Reconcile an enqueuing record without an id after the core granted
+    /// its exact release: dropped while the composer still holds exactly its
+    /// typed submission, otherwise turned into kept text beside the newer
+    /// composer text. The comparison and the mutation happen under one cache
+    /// lock, so the text the composer held when the decision was made is the
+    /// text it is made about. Either outcome changes the row (the caller
+    /// writes it under that release); `set_pending_status` deliberately
+    /// refuses Kept.
+    pub fn reconcile_released_pending(
+        &self,
+        account: &str,
+        room: &str,
+        thread: Option<&str>,
+        nonce: &Generation,
+    ) -> Option<Reconciled> {
+        let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
+        let draft = drafts.get_mut(&key(account, room, thread))?;
+        let index = draft.pending.iter().position(|pending| {
+            pending.nonce == *nonce
+                && pending.transaction_id.is_none()
+                && pending.status == PendingStatus::Enqueuing
+        })?;
+        let outcome = if draft.pending[index].text == draft.text {
+            draft.pending.remove(index);
+            Reconciled::Dropped
+        } else {
+            draft.pending[index].status = PendingStatus::Kept;
+            Reconciled::Kept
+        };
+        draft.changed();
+        Some(outcome)
     }
 
     /// Explicitly discard kept text. Only kept records can be discarded; a
@@ -1920,32 +1928,61 @@ mod tests {
     }
 
     #[test]
-    fn a_record_is_kept_only_when_the_composer_no_longer_holds_its_exact_submission() {
+    fn a_released_record_is_dropped_or_kept_by_what_the_composer_holds_at_that_moment() {
+        let drafts = DraftStore::default();
+        let typed = typed();
+        // Unchanged composer: the record goes, the text stays once.
+        let handle = begin_typed(&drafts, "a", "room", None, typed.clone());
+        drafts.clear_dirty_like_a_write_would("a", "room", None);
+        assert_eq!(
+            drafts.reconcile_released_pending("a", "room", None, handle.nonce()),
+            Some(Reconciled::Dropped)
+        );
+        assert!(drafts.record_status("a", "room", None, handle.nonce()).is_none());
+        assert!(drafts.dirty_keys().contains(&key("a", "room", None)));
+        assert_eq!(drafts.record_text("a", "room", None, handle.nonce()), None);
+        // The same body in another format is not the same submission: the
+        // record becomes kept text with its exact typed submission, the newer
+        // composer text is untouched, and the scope is dirty.
+        let handle = begin_typed(&drafts, "a", "room", None, typed.clone());
+        drafts.set_composed_scoped("a", "room", None, ComposeText::plain(typed.body.clone())).unwrap();
+        drafts.clear_dirty_like_a_write_would("a", "room", None);
+        assert_eq!(
+            drafts.reconcile_released_pending("a", "room", None, handle.nonce()),
+            Some(Reconciled::Kept)
+        );
+        assert!(drafts.dirty_keys().contains(&key("a", "room", None)));
+        assert_eq!(drafts.record_status("a", "room", None, handle.nonce()), Some(PendingStatus::Kept));
+        assert_eq!(drafts.record_text("a", "room", None, handle.nonce()), Some(typed.clone()));
+        assert_eq!(drafts.get("a", "room"), typed.body);
+        assert!(drafts.reconcile_released_pending("a", "room", None, handle.nonce()).is_none(), "kept once");
+        assert_eq!(drafts.pending_summary("a", "room", None).kept, 1);
+        // A record with an id is never reconciled this way.
+        drafts.set("a", "room", "something newer");
+        let queued = begin(&drafts, "a", "room", None, "something newer");
+        drafts.mark_pending_queued("a", "room", None, &queued, &"5".repeat(32));
+        assert!(drafts.reconcile_released_pending("a", "room", None, queued.nonce()).is_none());
+        assert!(!drafts.drop_uncommitted_pending_if_held("a", "room", None, queued.nonce()));
+        assert_eq!(drafts.record_status("a", "room", None, queued.nonce()), Some(PendingStatus::Queued));
+    }
+
+    #[test]
+    fn an_uncommitted_record_is_dropped_only_while_the_composer_holds_its_submission() {
         let drafts = DraftStore::default();
         let typed = typed();
         let handle = begin_typed(&drafts, "a", "room", None, typed.clone());
-        assert!(drafts.composer_holds_record("a", "room", None, handle.nonce()));
-        // The same body in another format is not the same submission.
-        drafts.set_composed_scoped("a", "room", None, ComposeText::plain(typed.body.clone())).unwrap();
-        assert!(!drafts.composer_holds_record("a", "room", None, handle.nonce()));
-        drafts.set_composed_scoped("a", "room", None, typed.clone()).unwrap();
-        assert!(drafts.composer_holds_record("a", "room", None, handle.nonce()));
-        drafts.set("a", "room", "something newer");
-        assert!(!drafts.composer_holds_record("a", "room", None, handle.nonce()));
-        // Keeping turns the id-less awaiting record into kept text with its
-        // exact typed submission, dirties the scope, and leaves the newer
-        // composer text alone; a record with an id is never kept this way.
-        drafts.clear_dirty_like_a_write_would("a", "room", None);
-        assert!(drafts.keep_pending("a", "room", None, handle.nonce()));
+        // Typed over: the record stays in the cache, dirty, text intact.
+        drafts.set("a", "room", "typed over");
+        assert!(!drafts.drop_uncommitted_pending_if_held("a", "room", None, handle.nonce()));
+        assert_eq!(drafts.record_status("a", "room", None, handle.nonce()), Some(PendingStatus::Enqueuing));
+        assert_eq!(drafts.record_text("a", "room", None, handle.nonce()), Some(typed.clone()));
+        assert_eq!(drafts.get("a", "room"), "typed over");
         assert!(drafts.dirty_keys().contains(&key("a", "room", None)));
-        assert_eq!(drafts.record_status("a", "room", None, handle.nonce()), Some(PendingStatus::Kept));
-        assert_eq!(drafts.record_text("a", "room", None, handle.nonce()), Some(typed));
-        assert_eq!(drafts.get("a", "room"), "something newer");
-        assert!(!drafts.keep_pending("a", "room", None, handle.nonce()), "kept once");
-        let queued = begin(&drafts, "a", "room", None, "something newer");
-        drafts.mark_pending_queued("a", "room", None, &queued, &"5".repeat(32));
-        assert!(!drafts.keep_pending("a", "room", None, queued.nonce()));
-        assert_eq!(drafts.pending_summary("a", "room", None).kept, 1);
+        // Typed back to exactly the submission: now it is dropped.
+        drafts.set_composed_scoped("a", "room", None, typed.clone()).unwrap();
+        assert!(drafts.drop_uncommitted_pending_if_held("a", "room", None, handle.nonce()));
+        assert!(drafts.record_status("a", "room", None, handle.nonce()).is_none());
+        assert_eq!(drafts.get("a", "room"), typed.body);
     }
 
     #[test]
@@ -1957,15 +1994,16 @@ mod tests {
         assert!(drafts.is_dirty("a", "room", None), "beginning a record dirties the scope");
         assert!(drafts.clear_dirty_like_a_write_would("a", "room", None), "the write was attempted");
         // The write failed: the record never reached the row. Dropping it
-        // reconciles the cache and leaves the dirty flag as it is.
-        assert!(drafts.drop_uncommitted_pending("a", "room", None, handle.nonce()));
+        // (the composer still holds its text) reconciles the cache and leaves
+        // the dirty flag as it is.
+        assert!(drafts.drop_uncommitted_pending_if_held("a", "room", None, handle.nonce()));
         assert!(!drafts.is_dirty("a", "room", None));
         assert!(drafts.pending_items("a", "room", None).is_empty());
-        assert!(!drafts.drop_uncommitted_pending("a", "room", None, handle.nonce()));
+        assert!(!drafts.drop_uncommitted_pending_if_held("a", "room", None, handle.nonce()));
         // A record that has an id is never dropped this way.
         let queued = begin(&drafts, "a", "room", None, "text");
         drafts.mark_pending_queued("a", "room", None, &queued, &"4".repeat(32));
-        assert!(!drafts.drop_uncommitted_pending("a", "room", None, queued.nonce()));
+        assert!(!drafts.drop_uncommitted_pending_if_held("a", "room", None, queued.nonce()));
         // The index reports whether a root was newly added, so a preparation
         // knows which entry is its own to undo; an existing entry is never
         // removed on its account, and only an added entry dirties the room.
