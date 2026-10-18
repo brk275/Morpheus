@@ -649,7 +649,7 @@ KEYBOARD_OPERATIONS = frozenset({
 })
 KEYBOARD_OBSERVATIONS = frozenset({
     "desktop_app_seen", "owned_app_seen", "owned_node_seen", "homeserver_seen",
-    "username_seen", "password_seen",
+    "username_seen", "password_seen", "focus_anchor_seen", "focus_requested",
 })
 
 
@@ -786,6 +786,8 @@ def validate_keyboard_diagnostic(value, passed):
             and all(type(value[key]) is bool for key in KEYBOARD_OBSERVATIONS)
             and type(value["traversed_node_matched"]) is bool,
             "Invalid installed keyboard diagnostic value")
+    require(not value["focus_requested"] or value["focus_anchor_seen"],
+            "Inconsistent installed keyboard focus request diagnostic")
     require((value["focus_kind"] in {"unavailable", "none"} and value["focused_nodes"] == 0)
             or (value["focus_kind"] == "ambiguous" and value["focused_nodes"] == 2)
             or (value["focus_kind"] not in {"unavailable", "none", "ambiguous"}

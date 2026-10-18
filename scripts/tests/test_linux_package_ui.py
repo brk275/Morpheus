@@ -18,6 +18,7 @@ def diagnostic(**overrides):
             "traversed_node_matched": False,
             "child_count_unavailable": 0, "child_unavailable": 0, "incomplete_passes": 0,
             "focus_kind": "other", "focused_nodes": 1,
+            "focus_anchor_seen": True, "focus_requested": True,
             **overrides}
 
 
@@ -233,6 +234,23 @@ class KeyboardFlowMockTests(unittest.TestCase):
         self.assertEqual(driver.keys, [])
         self.assertEqual(diagnostics.value["step"], "menu_trigger_focus")
         self.assertNotIn("PRIVATE", json.dumps(diagnostics.value))
+
+    def test_focus_diagnostics_distinguish_lookup_request_and_observation_failure(self):
+        for stage, anchor_seen, requested in [("lookup", False, False),
+                                              ("request", True, False),
+                                              ("observation", True, True)]:
+            driver = object.__new__(ui.AccessibleUI)
+            driver.diagnostics = ui.Diagnostics({})
+            driver.window = Mock(return_value="0x123")
+            target = Mock()
+            target.queryComponent.return_value.grabFocus.return_value = stage != "request"
+            driver.wait = Mock(side_effect=ui.DiagnosticFailure("wait_timeout")) if stage == "lookup" else Mock(return_value=target)
+            driver.expect_focus = Mock(side_effect=ui.DiagnosticFailure("wait_timeout"))
+            with patch.object(ui, "command"), self.assertRaises(RuntimeError):
+                driver.focus("Account menu for PRIVATE_ACCOUNT", prefix=True)
+            self.assertEqual(driver.diagnostics.value["focus_anchor_seen"], anchor_seen)
+            self.assertEqual(driver.diagnostics.value["focus_requested"], requested)
+            self.assertNotIn("PRIVATE", json.dumps(driver.diagnostics.value))
 
     def test_menu_escape_without_focus_return_fails(self):
         with self.assertRaisesRegex(RuntimeError, "focus mismatch"):
@@ -827,6 +845,8 @@ class SequenceDiagnosticTests(unittest.TestCase):
 
     def test_report_rejects_raw_focus_text_and_inconsistent_or_ambiguous_success(self):
         for value in [diagnostic(focus_kind="PRIVATE_ACCOUNT"), diagnostic(focused_nodes=True),
+                      diagnostic(focus_requested="PRIVATE_ACCOUNT"), diagnostic(focus_anchor_seen=1),
+                      diagnostic(focus_anchor_seen=False, focus_requested=True),
                       diagnostic(focus_kind="none", focused_nodes=1),
                       diagnostic(focus_kind="unavailable", focused_nodes=0),
                       diagnostic(focus_kind="ambiguous", focused_nodes=2)]:

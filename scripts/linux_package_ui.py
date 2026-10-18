@@ -48,6 +48,7 @@ class Diagnostics:
             "traversed_node_matched": False,
             "child_count_unavailable": 0, "child_unavailable": 0, "incomplete_passes": 0,
             "focus_kind": "unavailable", "focused_nodes": 0,
+            "focus_anchor_seen": False, "focus_requested": False,
             "cleanup": "not_started",
         }
 
@@ -316,9 +317,15 @@ class AccessibleUI:
     def focus(self, label, *, prefix=False):
         # The initial anchor is explicitly focused through AT-SPI; subsequent
         # Tab/Shift+Tab/Escape/activation steps are real XTEST key events.
+        self.diagnostics.value["focus_anchor_seen"] = False
+        self.diagnostics.value["focus_requested"] = False
+        self.diagnostics.value["focus_kind"] = "unavailable"
+        self.diagnostics.value["focused_nodes"] = 0
         command(["xdotool", "windowfocus", "--sync", self.window()])
         node = self.wait(label, prefix=prefix)
+        self.diagnostics.value["focus_anchor_seen"] = True
         smoke.require(node.queryComponent().grabFocus(), "Installed control could not receive focus")
+        self.diagnostics.value["focus_requested"] = True
         self.expect_focus(label, prefix=prefix)
 
     def key(self, key):
