@@ -14,7 +14,10 @@ use matrix_sdk::{
     ComposerDraft, ComposerDraftType, DraftAttachment, DraftAttachmentContent, RoomState,
     ruma::{
         EventId, RoomId,
-        events::room::join_rules::{JoinRule, RoomJoinRulesEventContent},
+        events::room::{
+            join_rules::{JoinRule, RoomJoinRulesEventContent},
+            message::RoomMessageEventContent,
+        },
         serde::Raw,
     },
     send_queue::{LocalEchoContent, RoomSendQueueUpdate},
@@ -858,10 +861,9 @@ impl QueueHold {
             echoes_before.is_empty(),
             "a hold is placed only on an empty room queue"
         );
-        let content = Raw::new(&serde_json::json!({
-            "msgtype": "m.text",
-            "body": "x".repeat(HOLD_BODY_BYTES),
-        }))
+        let content = Raw::new(&RoomMessageEventContent::text_plain(
+            "x".repeat(HOLD_BODY_BYTES),
+        ))
         .expect("Cannot encode the hold event")
         .cast();
         let handle = room

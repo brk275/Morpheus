@@ -3438,7 +3438,7 @@ mod stale_observer_tests {
     use super::*;
     use crate::draft_recovery::SendScope;
     use matrix_sdk::{
-        ruma::{RoomId, serde::Raw},
+        ruma::{RoomId, events::room::message::RoomMessageEventContent, serde::Raw},
         send_queue::{LocalEchoContent, RoomSendQueueUpdate},
     };
 
@@ -3475,12 +3475,9 @@ mod stale_observer_tests {
                 echoes_before.is_empty(),
                 "a hold is placed only on an empty room queue"
             );
-            let content = Raw::new(&serde_json::json!({
-                "msgtype": "m.text",
-                "body": "x".repeat(128 * 1024),
-            }))
-            .expect("Cannot encode the hold event")
-            .cast();
+            let content = Raw::new(&RoomMessageEventContent::text_plain("x".repeat(128 * 1024)))
+                .expect("Cannot encode the hold event")
+                .cast();
             let handle = room
                 .send_queue()
                 .send_raw(content, "m.room.message".into())
