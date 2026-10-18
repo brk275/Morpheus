@@ -1,6 +1,6 @@
 # TEMPORARY focused native offline app checks. NEVER MERGE this workflow.
 name: Reviewed sticker native checks
-run-name: Reviewed sticker app 8db21c4 - affected Linux checks
+run-name: Sticker 200 percent closed layout diagnosis - 8db21c4
 on:
   workflow_dispatch:
 permissions:
@@ -10,7 +10,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   contracts:
-    name: Reviewed native sticker UI and encrypted media tests
+    name: Diagnose reviewed sticker control bounds
     if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 180
@@ -50,7 +50,7 @@ jobs:
         with:
           key: verified-sdk-archives-v1
           save-if: false
-      - name: Test the corrected generated UI scenario with private bounded logs
+      - name: Identify the exact failing synthetic control with private bounded logs
         timeout-minutes: 105
         env:
           CARGO_BUILD_JOBS: "2"
@@ -126,8 +126,26 @@ jobs:
           needed={'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'}
           summaries=re.findall(r'^test result: ok\. ([0-9]+) passed; 0 failed; ([0-9]+) ignored;',output,re.MULTILINE)
           passed=reason is None and code==0 and needed<=ok and len(summaries)==1 and int(summaries[0][0])==1 and int(summaries[0][1])==0
+          # Only fixed synthetic control names and finite bounded coordinates
+          # may leave the private log. Never print arbitrary panic text.
+          import math
+          labels = ('Search stickers by description, shortcode or pack','Sticker pack',
+              'Close sticker picker','Allow sticker images here','Cancel and close the sticker picker')
+          numeric = r'(-?[0-9]+(?:\.[0-9]+)?)'
+          pattern = (r'(room|thread): ('+'|'.join(re.escape(label) for label in labels)
+              + r') is outside the window: Bounds \{ left: '+numeric+r', top: '+numeric
+              + r', right: '+numeric+r', bottom: '+numeric+r' \}')
+          matches = re.findall(pattern, output)
+          layout = None
+          if len(matches) == 1:
+              scope, label, *raw_bounds = matches[0]
+              bounds = [float(value) for value in raw_bounds]
+              if all(math.isfinite(value) and abs(value) <= 1000000 for value in bounds):
+                  layout = {'scope':scope,'control':labels.index(label),
+                      'bounds':dict(zip(('left','top','right','bottom'),bounds))}
           print(json.dumps({'check':'focused_native_sticker_ui','status':'passed' if passed else 'failed',
               'source':'8db21c4bea86de451957c8d2473d008c3932d975','failure':reason,
+              'synthetic_layout_failure':layout,
               'tests_passed':int(summaries[0][0]) if len(summaries)==1 else None,
               'ignored':int(summaries[0][1]) if len(summaries)==1 else None,
               'required_tests':{name:name in ok for name in sorted(needed)},
@@ -138,22 +156,4 @@ jobs:
               'native_installed_app':False},sort_keys=True),flush=True)
           if not passed: raise SystemExit(1)
           PY
-      - name: Compile the reviewed media fixture before generated accounts exist
-        timeout-minutes: 25
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CARGO_INCREMENTAL: "0"
-          CARGO_PROFILE_DEV_DEBUG: "0"
-          CARGO_PROFILE_TEST_DEBUG: "0"
-        run: cargo test --locked -p morpheus-matrix --test media_local --no-run
-      - name: Verify encrypted sticker catalog send and receive with disposable accounts
-        timeout-minutes: 55
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CARGO_INCREMENTAL: "0"
-          CARGO_PROFILE_DEV_DEBUG: "0"
-          CARGO_PROFILE_TEST_DEBUG: "0"
-        run: >-
-          dbus-run-session -- python3 scripts/run_matrix_acceptance.py
-          --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks" --suite media-only
-      # Fresh hosted synthetic vault only; no owner data, signing material or artifacts.
+      # Diagnosis only. No accounts, media fixture, installers or artifact uploads.
