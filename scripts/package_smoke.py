@@ -680,6 +680,16 @@ WINDOWS_KEYBOARD_OBSERVATIONS = frozenset({
     "owned_window_seen", "uia_root_seen", "homeserver_seen", "username_seen", "password_seen",
 })
 WINDOWS_PASSWORD_SEMANTICS = frozenset({"unchecked", "protected", "unprotected", "not_edit"})
+# Window inventory of the deciding selection poll: closed class families (kept
+# equal to windows_window_probe.FAMILIES by a contract test), complete 32-bit
+# style words, owner kind, DWM cloaking and clamped size. None marks a fact
+# whose query failed on a live owned window.
+WINDOWS_INVENTORY_STATUSES = frozenset({"not_collected", "collected", "incomplete", "failed"})
+WINDOWS_WINDOW_FAMILIES = frozenset({"winit_window", "winit_event_target", "ime", "text_services", "ole",
+                                     "other"})
+WINDOWS_WINDOW_OWNERS = frozenset({"none", "same_process", "other_process"})
+WINDOWS_INVENTORY_BOUND = 8
+WINDOWS_WINDOW_EXTENT = 32767
 WINDOWS_BRIDGE_ERRORS = frozenset({
     "root_unavailable", "unowned_root", "invalid_id", "unowned", "element_unavailable",
     "invalid_key", "window_gone", "foreground_unowned", "input_rejected", "invalid_command",
@@ -745,12 +755,49 @@ def validate_macos_keyboard_diagnostic(value, passed):
             "Incomplete installed macOS keyboard diagnostics")
 
 
+def valid_windows_inventory(value):
+    keys = {"family", "style", "exstyle", "visible", "owner", "cloaked", "width", "height"}
+
+    def optional(item, check):
+        return item is None or check(item)
+
+    def token(allowed):
+        return lambda item: type(item) is str and item in allowed
+
+    def flag(item):
+        return type(item) is bool
+
+    def word(item):
+        return type(item) is int and 0 <= item <= 0xFFFFFFFF
+
+    def extent(item):
+        return type(item) is int and 0 <= item <= WINDOWS_WINDOW_EXTENT
+
+    def entry(item):
+        return (type(item) is dict and item.keys() == keys
+                and optional(item["family"], token(WINDOWS_WINDOW_FAMILIES))
+                and optional(item["style"], word) and optional(item["exstyle"], word)
+                and optional(item["visible"], flag)
+                and optional(item["owner"], token(WINDOWS_WINDOW_OWNERS))
+                and optional(item["cloaked"], flag)
+                and optional(item["width"], extent) and optional(item["height"], extent))
+
+    return (type(value) is dict and value.keys() == {"status", "windows", "truncated", "discarded"}
+            and token(WINDOWS_INVENTORY_STATUSES)(value["status"])
+            and type(value["windows"]) is list and len(value["windows"]) <= WINDOWS_INVENTORY_BOUND
+            and all(entry(item) for item in value["windows"])
+            and flag(value["truncated"])
+            and type(value["discarded"]) is int and 0 <= value["discarded"] <= 2
+            and (value["status"] not in {"not_collected", "failed"}
+                 or (value["windows"] == [] and not value["truncated"] and value["discarded"] == 0)))
+
+
 def validate_windows_keyboard_diagnostic(value, passed):
     counts = ("selector_matches", "incomplete_passes", "foreground_recoveries", "bounded_snapshots",
               "window_candidates", "event_targets_ignored")
     expected = WINDOWS_KEYBOARD_OBSERVATIONS | set(counts) | {
         "step", "operation", "failure", "password_semantics", "cleanup", "profile_owned",
-        "traversed_node_matched", "bridge_error",
+        "traversed_node_matched", "bridge_error", "window_inventory",
     }
     require(type(value) is dict and value.keys() == expected, "Invalid installed Windows keyboard diagnostic shape")
     require(all(type(value[key]) is str for key in ("step", "operation", "failure", "password_semantics",
@@ -762,7 +809,8 @@ def validate_windows_keyboard_diagnostic(value, passed):
             and value["bridge_error"] in WINDOWS_BRIDGE_ERRORS | {"none"}
             and all(type(value[key]) is int and 0 <= value[key] <= 2 for key in counts)
             and all(type(value[key]) is bool for key in WINDOWS_KEYBOARD_OBSERVATIONS)
-            and type(value["traversed_node_matched"]) is bool and type(value["profile_owned"]) is bool,
+            and type(value["traversed_node_matched"]) is bool and type(value["profile_owned"]) is bool
+            and valid_windows_inventory(value["window_inventory"]),
             "Invalid installed Windows keyboard diagnostic value")
     require(not passed or (value["step"] == "complete" and value["failure"] == "none"
             and value["cleanup"] == "passed" and value["profile_owned"]
