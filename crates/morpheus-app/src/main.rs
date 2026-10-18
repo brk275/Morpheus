@@ -32,10 +32,10 @@ mod shortcuts;
 mod sso;
 #[cfg(not(morpheus_timeline_acceptance))]
 mod startup_error;
+mod stickers;
 // Instrumented release builds only (see build.rs); unit tests cover its pure checks.
 #[cfg(any(test, morpheus_timeline_acceptance))]
 mod timeline_acceptance;
-mod stickers;
 mod timeline_delivery;
 mod timeline_model;
 mod update_controller;

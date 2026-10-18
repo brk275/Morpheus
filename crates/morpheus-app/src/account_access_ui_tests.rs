@@ -2540,7 +2540,9 @@ async fn assert_sticker_picker_projection(ui: &AppWindow) {
     // The controller publishes permission and the decoded preview. Move focus
     // to Send before the consent prompt disappears from the tree.
     ui.set_sticker_can_send(true);
-    ui.set_sticker_preview_image(Image::from_rgba8(SharedPixelBuffer::<Rgba8Pixel>::new(2, 2)));
+    ui.set_sticker_preview_image(Image::from_rgba8(SharedPixelBuffer::<Rgba8Pixel>::new(
+        2, 2,
+    )));
     ui.set_sticker_preview_loaded(true);
     settle(ui).await;
     tab_to_control(ui, "Send sticker");

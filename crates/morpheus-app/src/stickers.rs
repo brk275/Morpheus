@@ -1094,7 +1094,9 @@ fn pending_status(label: &str, wedged: bool, others: usize, truncated: bool) -> 
         text.push_str(" It could not be sent; retry or cancel it.");
     }
     if truncated {
-        text.push_str(&format!(" At least {others} more queued here will send in order."));
+        text.push_str(&format!(
+            " At least {others} more queued here will send in order."
+        ));
     } else if others > 0 {
         text.push_str(&format!(" {others} more queued here will send in order."));
     }
@@ -2315,7 +2317,10 @@ impl<B: StickerBackend> StickerUi<B> {
         let threaded = place
             .or(tracked.map(|tracked| &tracked.destination))
             .map(Destination::threaded);
-        let shown = (held.map(|held| held.id), tracked.map(|tracked| tracked.send));
+        let shown = (
+            held.map(|held| held.id),
+            tracked.map(|tracked| tracked.send),
+        );
         ui.set_sticker_send_status(text.into());
         ui.set_sticker_send_can_cancel(can_cancel);
         ui.set_sticker_send_can_retry(can_retry);
@@ -2440,7 +2445,16 @@ mod tests {
         assert_eq!(parse_key(&item_key(7, 9), 7, &rows), Some(1));
         assert_eq!(parse_key(&item_key(6, 9), 7, &rows), None);
         assert_eq!(parse_key(&item_key(7, 5), 7, &rows), None);
-        for key in ["", "7", "7:", ":9", "7:x", "x:9", "7:9:1", "mxc://example.org/a"] {
+        for key in [
+            "",
+            "7",
+            "7:",
+            ":9",
+            "7:x",
+            "x:9",
+            "7:9:1",
+            "mxc://example.org/a",
+        ] {
             assert_eq!(parse_key(key, 7, &rows), None, "{key:?}");
         }
     }
@@ -3166,8 +3180,12 @@ pub(crate) mod controller_tests {
         // catalog needs consent, so no preview starts without an admitted one.
         backend.encrypted.store(true, Ordering::SeqCst);
         let changes: [(&str, fn(&AppWindow)); 5] = [
-            ("room", |ui| ui.set_active_room_id("!two:example.org".into())),
-            ("account", |ui| ui.set_active_account_local_id("fixture-b".into())),
+            ("room", |ui| {
+                ui.set_active_room_id("!two:example.org".into())
+            }),
+            ("account", |ui| {
+                ui.set_active_account_local_id("fixture-b".into())
+            }),
             ("composer", |ui| ui.set_composer_mode(1)),
             ("modal", |ui| ui.set_quick_switcher_open(true)),
             ("session", |ui| ui.set_live_session(false)),

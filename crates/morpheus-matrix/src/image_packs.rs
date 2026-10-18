@@ -378,8 +378,7 @@ impl AccountManager {
             }
         }
         let source = MediaSource::Plain(image.url.clone());
-        let bytes =
-            media::fetch_bounded_media(&client, &source, MAX_STICKER_PREVIEW_BYTES).await?;
+        let bytes = media::fetch_bounded_media(&client, &source, MAX_STICKER_PREVIEW_BYTES).await?;
         // Nothing fetched may be presented for a departed selection, room,
         // consent decision or pack.
         let (room, client) = self
@@ -416,9 +415,8 @@ impl AccountManager {
             current(selection)?;
             joined(&room)?;
             require_consent(catalog, &room, consent).await?;
-            let content = sticker_content(
-                validated_choice(catalog, index, &room, &loaded.client).await?,
-            )?;
+            let content =
+                sticker_content(validated_choice(catalog, index, &room, &loaded.client).await?)?;
             let timeline = match &catalog.thread_root {
                 Some(root) => Some(loaded.thread_timeline(&catalog.room_id, root).await?),
                 None => None,
@@ -726,8 +724,10 @@ impl AccountManager {
                 );
             }
         }
-        for (pack_type, format) in [(ROOM_PACK, Format::Stable), (LEGACY_ROOM_PACK, Format::Legacy)]
-        {
+        for (pack_type, format) in [
+            (ROOM_PACK, Format::Stable),
+            (LEGACY_ROOM_PACK, Format::Legacy),
+        ] {
             let events = room
                 .get_state_events(StateEventType::from(pack_type))
                 .await
@@ -1043,7 +1043,10 @@ fn choose_room_packs(events: &[Option<&str>]) -> (Vec<usize>, usize) {
         skipped += chosen.len() - MAX_PACKS_PER_ROOM;
         chosen.truncate(MAX_PACKS_PER_ROOM);
     }
-    (chosen.into_iter().map(|(_, index)| index).collect(), skipped)
+    (
+        chosen.into_iter().map(|(_, index)| index).collect(),
+        skipped,
+    )
 }
 
 enum AccountContent {
@@ -1712,7 +1715,12 @@ mod tests {
         assert_eq!(catalog.entries()[0].label, "Agnirts waving cat");
         assert_eq!(catalog.entries()[0].shortcode, "described");
         assert_eq!(catalog.entries()[1].label, "plain");
-        let public = format!("{:?} {:?} {:?}", catalog, catalog.entries(), catalog.packs());
+        let public = format!(
+            "{:?} {:?} {:?}",
+            catalog,
+            catalog.entries(),
+            catalog.packs()
+        );
         assert!(!public.contains("mxc://"));
         assert!(catalog.requires_public_media_consent());
     }
