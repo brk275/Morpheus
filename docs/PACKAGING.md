@@ -73,7 +73,11 @@ separate owner authorization.
 
 On Ubuntu, CI's helper job and the Linux package job first run
 [`scripts/harden_linux_notice_host.py`](../scripts/harden_linux_notice_host.py)
-as root, before any other checkout code. The installed-notice inventory accepts
+as root, before any other checkout code. Inline Git checks first verify the
+selected checkout identity. The helper bytes come from the immutable workflow
+revision through `git show`, piped to isolated standard-library Python; they
+do not come from a separately selected older package checkout. This also
+keeps older package revisions testable. The installed-notice inventory accepts
 a copyright or common-license file only when every path component is
 root-owned and not group- or world-writable, but the hosted Ubuntu 24.04 image
 ships `/usr/share`, `/usr/share/doc` and `/usr/share/common-licenses`

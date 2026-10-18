@@ -31,7 +31,7 @@ from scripts import harden_linux_notice_host as H
 REPO = Path(__file__).resolve().parents[2]
 SOURCE = REPO / "scripts/harden_linux_notice_host.py"
 COMMAND = ("sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_OS,ImageOS "
-           "/usr/bin/python3 -I -B scripts/harden_linux_notice_host.py")
+           "/usr/bin/python3 -I -B -")
 HOSTED_ENVIRONMENT = {"GITHUB_ACTIONS": "true", "RUNNER_ENVIRONMENT": "github-hosted",
                       "RUNNER_OS": "Linux", "ImageOS": "ubuntu24"}
 SYSTEM = types.SimpleNamespace(sysname="Linux", machine="x86_64")
@@ -671,6 +671,13 @@ class WorkflowTests(unittest.TestCase):
         self.assertLess(job.index("actions/checkout@"), start)
         self.assertEqual(job.index("python3"), start + COMMAND.index("python3"))
         self.assertNotIn("persist-credentials: true", text)
+        # Privileged bootstrap uses the reviewed workflow blob, not a file
+        # provided by an older or separately selected package checkout.
+        self.assertIn('git show --no-ext-diff --no-textconv "$GITHUB_SHA:scripts/harden_linux_notice_host.py" |', job)
+        self.assertIn('[[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]', job)
+        self.assertLess(job.index("Verify checkout identity before host provisioning"), start)
+        self.assertLess(job.index('test "$(git rev-parse HEAD)" = "$REVIEWED_SOURCE"'), start)
+        self.assertIn('set -euo pipefail', job)
 
     def test_ci_helpers_harden_before_any_helper_import(self):
         text, helpers = self.job("ci.yml", "helpers", "config")
