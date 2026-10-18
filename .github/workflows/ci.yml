@@ -1,4 +1,4 @@
-# TEMPORARY focused helper contracts. NEVER MERGE this workflow.
+# TEMPORARY focused native offline app checks. NEVER MERGE this workflow.
 name: Beta offline native checks
 run-name: Beta offline UI 5d7826f - Linux native app tests
 on:
@@ -22,7 +22,7 @@ jobs:
           persist-credentials: false
       - name: Verify exact reviewed source
         run: test "$(git rev-parse HEAD)" = 5d7826f31b2e8bc524fae235e7a09e2af2d7764b
-      - name: Scan source before executing reviewed mocked contracts
+      - name: Scan source before executing reviewed native tests
         shell: bash
         run: |
           set -euo pipefail
@@ -113,7 +113,7 @@ jobs:
                   child.stdout.close()
           with (root/'scan.log').open('wb') as output:
               scan=subprocess.run([os.environ['RUNNER_TEMP']+'/gitleaks/gitleaks','dir',str(logs),
-                  '--redact=100','--ignore-gitleaks-allow','--no-banner',
+                  '--redact=100','--ignore-gitleaks-allow','--no-banner','--max-target-megabytes','0',
                   '--config',os.environ['RUNNER_TEMP']+'/default.toml',
                   '--gitleaks-ignore-path',os.environ['RUNNER_TEMP']+'/empty.ignore'],
                   stdout=output,stderr=subprocess.STDOUT,timeout=60)
