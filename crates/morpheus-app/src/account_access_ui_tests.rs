@@ -2490,7 +2490,25 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
     ];
     tab_to_record_control(ui, CANCEL_LABEL);
     let mut room_strip_controls = 0;
-    for _ in 0..400 {
+    // Bounded, numeric-only failure evidence: classify focus against the
+    // fixture's known labels without printing any input or account contents.
+    let mut room_focus_trace = Vec::new();
+    for step in 0..400 {
+        if room_focus_trace.len() < 64 {
+            let category = if focused_control_has_label(ui, &composer_label) {
+                0
+            } else {
+                strip_labels
+                    .iter()
+                    .position(|label| focused_control_has_label(ui, label))
+                    .map(|index| index + 1)
+                    .unwrap_or(8)
+            };
+            let state = (category, focused_control_bounds(ui));
+            if room_focus_trace.last().map(|(_, previous)| previous) != Some(&state) {
+                room_focus_trace.push((step, state));
+            }
+        }
         if focused_control_has_label(ui, &composer_label) {
             break;
         }
@@ -2516,7 +2534,10 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
     );
     assert!(
         focused_control_has_label(ui, &composer_label),
-        "the tab walk must leave the strip and reach the composer input"
+        "the tab walk must leave the strip and reach the composer input; mode={}, controls={}, trace={:?}",
+        ui.get_composer_mode(),
+        room_strip_controls,
+        room_focus_trace
     );
     let focused = focused_control_bounds(ui).unwrap();
     assert!(
