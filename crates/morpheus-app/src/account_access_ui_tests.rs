@@ -965,7 +965,7 @@ async fn assert_scale_keyboard_and_focus_bounds(ui: &AppWindow) {
             );
             assert!(
                 values[0].top >= reveal.top - 0.5 && values[0].bottom <= reveal.bottom + 0.5,
-                "scale value must fit inside the revealed row: {:?} vs {reveal:?}",
+                "scale value must fit inside the revealed row (initial scale {scale}, {label}): {:?} vs {reveal:?}",
                 values[0]
             );
             let expected = ui.get_font_scale_percent() + delta;

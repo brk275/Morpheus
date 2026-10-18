@@ -308,6 +308,7 @@ component IconAction inherits Rectangle {
     }
     keyboard-focus := FocusScope {
         x: 0px;
+        y: (root.height - self.height) / 2;
         width: root.reveal-full-control ? root.width : 0px;
         height: root.reveal-full-control ? max(root.height, root.reveal-height) : 0px;
         // Slint's accessibility bridge requests focus with PointerClick.
@@ -3204,19 +3205,38 @@ export component AppWindow inherits Window {
                             accessible-role: text; accessible-label: root.account-theme-notice;
                         }
                         font-scale-row := Rectangle {
-                            height: max(70px, 70px * root.text-scale); border-radius: StyleTokens.radius * 1; background: root.elevated;
-                            HorizontalLayout {
-                                padding-left: 16px; padding-right: 16px; spacing: 9px;
-                                VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 3px;
-                                    Text { text: "Font scale"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
-                                    Text {
-                                        text: root.font-scale-percent + "% · text throughout the app";
-                                        color: root.muted; font-size: 11px * root.text-scale;
-                                        accessible-role: text; accessible-label: self.text;
-                                    }
-                                }
-                                IconAction { icon: "−"; label: "Decrease font scale"; reveal-full-control: true; reveal-height: font-scale-row.height; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-font-scale(root.font-scale-percent - 10); } }
-                                IconAction { icon: "+"; label: "Increase font scale"; reveal-full-control: true; reveal-height: font-scale-row.height; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-font-scale(root.font-scale-percent + 10); } }
+                            height: max(70px, max(70px * root.text-scale, font-scale-title.preferred-height + font-scale-value.preferred-height + 35px));
+                            border-radius: StyleTokens.radius * 1; background: root.elevated;
+                            // Anchor both labels to the same row the actions reveal.
+                            // Intrinsic text heights accommodate custom fonts without
+                            // a nested layout pushing the value beyond the focus band.
+                            font-scale-title := Text {
+                                x: 16px; width: max(0px, parent.width - 118px);
+                                height: self.preferred-height;
+                                y: (parent.height - self.height - font-scale-value.height - 3px) / 2;
+                                text: "Font scale"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700;
+                            }
+                            font-scale-value := Text {
+                                x: font-scale-title.x; width: font-scale-title.width;
+                                height: self.preferred-height;
+                                y: font-scale-title.y + font-scale-title.height + 3px;
+                                text: root.font-scale-percent + "% · text throughout the app";
+                                color: root.muted; font-size: 11px * root.text-scale;
+                                accessible-role: text; accessible-label: self.text;
+                            }
+                            decrease-font-scale := IconAction {
+                                x: increase-font-scale.x - self.width - 9px;
+                                y: (parent.height - self.height) / 2;
+                                icon: "−"; label: "Decrease font scale"; reveal-full-control: true; reveal-height: font-scale-row.height;
+                                ink: root.ink; surface: root.panel; hover-surface: root.hover;
+                                activated => { root.change-font-scale(root.font-scale-percent - 10); }
+                            }
+                            increase-font-scale := IconAction {
+                                x: parent.width - self.width - 16px;
+                                y: (parent.height - self.height) / 2;
+                                icon: "+"; label: "Increase font scale"; reveal-full-control: true; reveal-height: font-scale-row.height;
+                                ink: root.ink; surface: root.panel; hover-surface: root.hover;
+                                activated => { root.change-font-scale(root.font-scale-percent + 10); }
                             }
                         }
                         Text { text: "Density"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
