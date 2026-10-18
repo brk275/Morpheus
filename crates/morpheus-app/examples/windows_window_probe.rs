@@ -53,7 +53,10 @@ fn main() -> ExitCode {
     let spawned = thread::Builder::new()
         .name("window-probe-watchdog".into())
         .spawn(move || {
-            if matches!(finished.recv_timeout(WATCHDOG), Err(mpsc::RecvTimeoutError::Timeout)) {
+            if matches!(
+                finished.recv_timeout(WATCHDOG),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
                 std::process::exit(3);
             }
         });

@@ -39,6 +39,8 @@ SNAPSHOT_SECONDS = 0.5
 # The example closes itself after 30 seconds; its own watchdog fires at 45.
 # A contract test keeps these bounds consistent with the example's source.
 EXIT_SECONDS = 50
+# WindowsJob.close bounds job drainage and its single retained process wait.
+CLEANUP_RESERVE_SECONDS = 20
 WINDOW_BOUND = 64
 KIND_BOUND = 16
 CLASS_CHARS = 256
@@ -68,7 +70,8 @@ EXITS = {0: "normal", 1: "platform_error", 3: "watchdog", 4: "watchdog_unavailab
          5: "watchdog_failed"}
 FAILURES = frozenset({"none", "guard", "arguments", "executable", "job", "process_start",
                       "process_id", "window_enumeration", "window_bound", "window_facts",
-                      "first_window_timeout", "app_exited", "exit_timeout", "process_wait",
+                      "first_window_timeout", "app_exited", "exit_timeout", "exit_status", "process_wait",
+                      "window_unowned",
                       "process_remaining", "deadline", "cleanup", "unclassified"})
 STAGES = frozenset({"setup", "launch", "first_window", "snapshots", "exit", "complete"})
 
@@ -139,6 +142,7 @@ def family(class_name):
 def inspect(api, window, pid):
     """Fixed facts for one owned top-level window, or None if it vanished."""
     try:
+        require(api.process_of(window) == pid, "window_unowned")
         name = api.class_name(window)
         style = api.long(window, GWL_STYLE)
         exstyle = api.long(window, GWL_EXSTYLE)
@@ -146,6 +150,10 @@ def inspect(api, window, pid):
         left, top, right, bottom = api.rect(window)
         visible = api.is_visible(window)
         owner_pid = api.process_of(owner) if owner else None
+        cloaked = api.cloaked(window)
+        # EnumWindows supplied a borrowed handle. Recheck ownership around all
+        # queries so a destroyed/reused handle cannot supply foreign facts.
+        require(api.process_of(window) == pid, "window_unowned")
     except ApiError:
         if not api.is_window(window):
             return None
@@ -157,7 +165,7 @@ def inspect(api, window, pid):
         "exstyle": flags(exstyle, EXSTYLE_FLAGS),
         "owner": "none" if not owner else ("same_process" if owner_pid == pid else "other_process"),
         "area": "nonzero" if right > left and bottom > top else "zero",
-        "cloaked": api.cloaked(window),
+        "cloaked": cloaked,
     }
 
 
@@ -196,7 +204,7 @@ def summarize(snapshots):
         "visible_count_max": max(counts) if counts else None,
         "hidden_count_max": max((item["hidden_count"] for item in snapshots), default=None),
         "hidden_families": sorted({name for item in snapshots for name in item["hidden"]}),
-        "vanished": min(sum(item["vanished"] for item in snapshots), WINDOW_BOUND),
+        "vanished": sum(item["vanished"] for item in snapshots),
         "visible_kinds": visible_kinds[:KIND_BOUND],
         "visible_kinds_truncated": len(visible_kinds) > KIND_BOUND,
         # Whether the keyboard driver's "exactly one" rule would have held.
@@ -316,7 +324,11 @@ def observe(api, job, handle, pid, report, deadline):
     while True:
         require(time.monotonic() < deadline, "deadline")
         require(alive(job, handle), "app_exited")
-        if snapshot(api, pid)["visible"]:
+        visible = snapshot(api, pid)["visible"]
+        # The event target can become visible before the subject is created.
+        # Start sampling only once the real, nonzero-area Slint window exists.
+        if any(item["family"] == "winit_window" and item["area"] == "nonzero"
+               for item in visible):
             report["first_window_seen"] = True
             break
         require(time.monotonic() < first, "first_window_timeout")
@@ -331,11 +343,14 @@ def observe(api, job, handle, pid, report, deadline):
             time.sleep(SNAPSHOT_SECONDS)
     report.update(summarize(snapshots))
     report["stage"] = "exit"
+    remaining = deadline - time.monotonic() - CLEANUP_RESERVE_SECONDS
+    require(remaining > 0, "deadline")
     try:
-        code = job.wait(handle, EXIT_SECONDS)
+        code = job.wait(handle, min(EXIT_SECONDS, remaining))
     except capture.Failure as error:
         raise ProbeFailure("exit_timeout" if error.code == "deadline" else "process_wait") from None
     report["exit"] = EXITS.get(code, "other")
+    require(code == 0, "exit_status")
     # The job accounts for every descendant, including re-parented ones.
     require(job.active() == 0, "process_remaining")
 
@@ -346,28 +361,35 @@ def run(executable, report, *, api_factory=Win32, job_factory=None):
     executable = example_executable(executable)
     api = api_factory()
     report["stage"] = "launch"
-    job = None
+    cleanup = "not_started"
     try:
-        try:
-            job = (job_factory or capture.WindowsJob)()
-        except capture.Failure:
-            raise ProbeFailure("job") from None
         with tempfile.TemporaryDirectory(prefix="morpheus-window-probe-") as temporary, \
                 tempfile.TemporaryFile() as log:
+            job = None
             try:
-                handle = job.spawn([str(executable)], child_environment(temporary), log)
-            except capture.Failure:
-                raise ProbeFailure("process_start") from None
-            pid = process_id(job, handle)
-            observe(api, job, handle, pid, report, deadline)
-    finally:
-        cleanup = "passed"
-        try:
-            if job is not None:
-                job.close()
-        except Exception:  # noqa: BLE001 - only a fixed token leaves this process
-            cleanup = "failed"
-        report["cleanup"] = cleanup
+                try:
+                    job = (job_factory or capture.WindowsJob)()
+                except capture.Failure:
+                    raise ProbeFailure("job") from None
+                try:
+                    handle = job.spawn([str(executable)], child_environment(temporary), log)
+                except capture.Failure:
+                    raise ProbeFailure("process_start") from None
+                pid = process_id(job, handle)
+                observe(api, job, handle, pid, report, deadline)
+            finally:
+                # Keep the inherited log handle and temp tree alive until all
+                # children are stopped, including on an observation failure.
+                cleanup = "passed"
+                try:
+                    if job is not None:
+                        job.close()
+                except Exception:  # noqa: BLE001 - fixed token only
+                    cleanup = "failed"
+                report["cleanup"] = cleanup
+    except OSError:
+        report["cleanup"] = "failed"
+        raise ProbeFailure("cleanup") from None
     require(cleanup == "passed", "cleanup")
     report["stage"] = "complete"
 
@@ -388,27 +410,43 @@ def public(report):
     def count(value, bound):
         return value is None or (type(value) is int and 0 <= value <= bound)
 
+    def token(value, allowed):
+        return type(value) is str and value in allowed
+
+    def token_list(value, allowed):
+        return (type(value) is list and len(value) <= len(allowed)
+                and all(token(item, allowed) for item in value)
+                and value == sorted(set(value)))
+
     def kind(value):
-        return (type(value) is dict and set(value) == kind_keys and value["family"] in tokens
-                and type(value["style"]) is list and set(value["style"]) <= {name for name, _ in STYLE_FLAGS}
-                and type(value["exstyle"]) is list and set(value["exstyle"]) <= {name for name, _ in EXSTYLE_FLAGS}
-                and value["owner"] in {"none", "same_process", "other_process"}
-                and value["area"] in {"zero", "nonzero"} and value["cloaked"] in {True, False, None}
+        return (type(value) is dict and set(value) == kind_keys and token(value["family"], tokens)
+                and token_list(value["style"], {name for name, _ in STYLE_FLAGS})
+                and token_list(value["exstyle"], {name for name, _ in EXSTYLE_FLAGS})
+                and token(value["owner"], {"none", "same_process", "other_process"})
+                and token(value["area"], {"zero", "nonzero"})
+                and (value["cloaked"] is None or type(value["cloaked"]) is bool)
                 and type(value["snapshots"]) is int and 1 <= value["snapshots"] <= SNAPSHOTS)
 
-    valid = (set(report) == set(new_report()) and report["check"] == CHECK
-             and report["status"] in {"passed", "failed"} and report["failure"] in FAILURES
-             and report["stage"] in STAGES and type(report["first_window_seen"]) is bool
-             and count(report["snapshots"], SNAPSHOTS)
+    valid = (type(report) is dict and set(report) == set(new_report()) and report["check"] == CHECK
+             and token(report["status"], {"passed", "failed"}) and token(report["failure"], FAILURES)
+             and token(report["stage"], STAGES) and type(report["first_window_seen"]) is bool
+             and type(report["snapshots"]) is int and 0 <= report["snapshots"] <= SNAPSHOTS
+             and type(report["vanished"]) is int and count(report["vanished"], WINDOW_BOUND * SNAPSHOTS)
              and all(count(report[key], WINDOW_BOUND) for key in
-                     ("visible_count_min", "visible_count_max", "hidden_count_max", "vanished"))
-             and type(report["hidden_families"]) is list and set(report["hidden_families"]) <= tokens
+                     ("visible_count_min", "visible_count_max", "hidden_count_max"))
+             and token_list(report["hidden_families"], tokens)
              and type(report["visible_kinds"]) is list and len(report["visible_kinds"]) <= KIND_BOUND
              and all(kind(item) for item in report["visible_kinds"])
              and type(report["visible_kinds_truncated"]) is bool
-             and report["driver_rule"] in {"exactly_one", "not_one"}
-             and report["exit"] in {*EXITS.values(), "other", "not_observed"}
-             and report["cleanup"] in {"not_started", "passed", "failed"})
+             and token(report["driver_rule"], {"exactly_one", "not_one"})
+             and token(report["exit"], {*EXITS.values(), "other", "not_observed"})
+             and token(report["cleanup"], {"not_started", "passed", "failed"}))
+    if valid and report["status"] == "passed":
+        valid = (report["failure"] == "none" and report["stage"] == "complete"
+                 and report["first_window_seen"] is True and report["snapshots"] == SNAPSHOTS
+                 and report["exit"] == "normal" and report["cleanup"] == "passed"
+                 and all(type(report[key]) is int for key in
+                         ("visible_count_min", "visible_count_max", "hidden_count_max")))
     return report if valid else {"check": CHECK, "status": "failed", "failure": "unclassified",
                                  "diagnostics": "withheld"}
 
@@ -424,8 +462,9 @@ def main(argv=None):
         report["failure"] = error.code
     except Exception:  # noqa: BLE001 - never print another exception's text
         report["failure"] = "unclassified"
-    print(json.dumps(public(report), sort_keys=True), flush=True)
-    return 0 if report["status"] == "passed" else 1
+    output = public(report)
+    print(json.dumps(output, sort_keys=True), flush=True)
+    return 0 if output["status"] == "passed" else 1
 
 
 if __name__ == "__main__":

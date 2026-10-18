@@ -45,10 +45,14 @@ native calls, whose libraries this probe does not load.
   (`win25` or `win25-vs2026`) and `MORPHEUS_WINDOWS_WINDOW_PROBE=1`.
 - Accepts only `target\{debug,release}\examples\windows_window_probe.exe`
   under this checkout.
-- Waits up to 20 seconds for a first visible window, then takes 8 snapshots
+- Waits up to 20 seconds for a visible, nonzero-area Slint subject window (the
+  event target alone does not start sampling), then takes 8 snapshots
   0.5 seconds apart, at most 64 windows each. It then waits up to 50 seconds
-  for the example's own exit, requires an empty job, and always closes the job.
-  The whole run is bounded at 100 seconds.
+  for the example's own normal exit, reserves 20 seconds for cleanup, requires
+  an empty job, and closes the job before releasing its log or temporary tree.
+  The run budget is 100 seconds. Hosted supervision supplies an outer deadline.
+- Rechecks each borrowed window handle's process ownership before and after
+  metadata queries. Vanished windows are counted; foreign ownership fails.
 - Sends no input and no window messages, and starts no profile, account,
   vault, network or capture work.
 - Reads class names only to map exact known names to fixed families

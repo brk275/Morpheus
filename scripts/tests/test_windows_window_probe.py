@@ -1,4 +1,5 @@
 """Mocked contracts for the Windows window probe; no Win32 call or process."""
+import contextlib
 import json
 from pathlib import Path
 import re
@@ -121,6 +122,15 @@ def assert_private_values_absent(test, text):
 
 
 class InventoryTests(unittest.TestCase):
+    def test_borrowed_window_owner_is_checked_before_and_after_queries(self):
+        for owners in ([OTHER_PID], [PID, OTHER_PID]):
+            api = FakeApi()
+            with (self.subTest(owners=owners),
+                  patch.object(api, "process_of", side_effect=owners),
+                  self.assertRaises(P.ProbeFailure) as caught):
+                P.inspect(api, MAIN, PID)
+            self.assertEqual(caught.exception.code, "window_unowned")
+
     def test_snapshot_counts_owned_visible_windows_like_the_keyboard_driver(self):
         result = P.snapshot(FakeApi(), PID)
         self.assertEqual(len(result["visible"]), 2)
@@ -173,6 +183,11 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(P.summarize([one, one])["driver_rule"], "exactly_one")
         self.assertEqual(P.summarize([])["driver_rule"], "not_one")
 
+    def test_vanished_count_keeps_all_bounded_snapshots(self):
+        vanished = {"visible": [], "hidden": [], "hidden_count": 0, "vanished": P.WINDOW_BOUND}
+        summary = P.summarize([vanished] * P.SNAPSHOTS)
+        self.assertEqual(summary["vanished"], P.WINDOW_BOUND * P.SNAPSHOTS)
+
 
 class GuardTests(unittest.TestCase):
     def test_guard_requires_opt_in_on_a_reviewed_hosted_windows_image(self):
@@ -214,6 +229,68 @@ class GuardTests(unittest.TestCase):
 
 
 class RunTests(unittest.TestCase):
+    def test_helper_or_unknown_windows_do_not_start_subject_sampling(self):
+        for change in ({"visible": False}, {"class": "unknown"}, {"rect": (0, 0, 0, 0)}):
+            table = windows()
+            table[MAIN].update(change)
+            with self.subTest(change=change), patch.object(P, "FIRST_WINDOW_SECONDS", 0):
+                report = run(FakeJob(), FakeApi(table))
+            self.assertEqual(report["failure"], "first_window_timeout")
+            self.assertFalse(report["first_window_seen"])
+            self.assertEqual(report["snapshots"], 0)
+            self.assertEqual(report["cleanup"], "passed")
+
+    def test_nonzero_subject_exit_never_counts_as_success(self):
+        for code in (1, 3, 4, 5, 99):
+            with self.subTest(code=code):
+                report = run(FakeJob(exit_code=code))
+                self.assertEqual((report["status"], report["failure"]), ("failed", "exit_status"))
+                self.assertEqual(report["exit"], P.EXITS.get(code, "other"))
+                self.assertEqual(report["cleanup"], "passed")
+                self.assertEqual(P.public(report), report)
+
+    def test_exit_wait_reserves_the_owned_cleanup_budget(self):
+        job = FakeJob()
+        job.wait = Mock(wraps=job.wait)
+        with patch.object(P.time, "monotonic", return_value=50), patch.object(P.time, "sleep"):
+            P.observe(FakeApi(), job, 991, PID, P.new_report(), deadline=100)
+        job.wait.assert_called_once_with(991, 30)
+        job.wait.reset_mock()
+        with (patch.object(P.time, "monotonic", return_value=80), patch.object(P.time, "sleep"),
+              self.assertRaises(P.ProbeFailure) as caught):
+            P.observe(FakeApi(), job, 991, PID, P.new_report(), deadline=100)
+        self.assertEqual(caught.exception.code, "deadline")
+        job.wait.assert_not_called()
+
+    def test_job_stops_before_log_and_temp_directory_are_released(self):
+        real_file = tempfile.TemporaryFile
+        for alive in (True, False):
+            job = FakeJob(alive=alive)
+            events = []
+
+            @contextlib.contextmanager
+            def directory(**_):
+                try:
+                    yield "synthetic-private-temp"
+                finally:
+                    self.assertTrue(job.closed)
+                    events.append("directory_closed")
+
+            @contextlib.contextmanager
+            def logfile():
+                with real_file() as stream:
+                    try:
+                        yield stream
+                    finally:
+                        self.assertTrue(job.closed)
+                        events.append("log_closed")
+
+            with (self.subTest(alive=alive), patch.object(P.tempfile, "TemporaryDirectory", directory),
+                  patch.object(P.tempfile, "TemporaryFile", logfile)):
+                report = run(job)
+            self.assertEqual(report["cleanup"], "passed")
+            self.assertEqual(events, ["log_closed", "directory_closed"])
+
     def test_complete_run_records_fixed_facts_and_lets_the_example_close_itself(self):
         job = FakeJob()
         report = run(job)
@@ -262,6 +339,25 @@ class RunTests(unittest.TestCase):
         kind = {**report["visible_kinds"][0], "family": "Winit Thread Event Target"}
         self.assertEqual(P.public({**report, "visible_kinds": [kind]})["diagnostics"], "withheld")
 
+    def test_public_report_rejects_malformed_tokens_and_incomplete_success(self):
+        report = run(FakeJob())
+        for key, value in (("stage", []), ("failure", {}), ("snapshots", None),
+                           ("vanished", None), ("hidden_families", [{}]), ("cleanup", "failed"),
+                           ("exit", "watchdog"), ("first_window_seen", False), ("snapshots", 1)):
+            with self.subTest(key=key, value=value):
+                self.assertEqual(P.public({**report, key: value}).get("diagnostics"), "withheld")
+        for value in (0, 1, "false", []):
+            kind = {**report["visible_kinds"][0], "cloaked": value}
+            self.assertEqual(P.public({**report, "visible_kinds": [kind]}).get("diagnostics"), "withheld")
+        self.assertEqual(P.public(None).get("diagnostics"), "withheld")
+
+    def test_main_rejects_an_invalid_success_record(self):
+        def invalid_success(_, report):
+            report.update(status="passed", stage="complete", exit="watchdog")
+        with patch.object(P, "run", side_effect=invalid_success), patch("builtins.print") as printed:
+            self.assertEqual(P.main(["unused"]), 1)
+        self.assertEqual(json.loads(printed.call_args.args[0]).get("diagnostics"), "withheld")
+
     def test_main_prints_one_fixed_record_for_bad_arguments(self):
         with patch("builtins.print") as printed:
             self.assertEqual(P.main([]), 1)
@@ -283,7 +379,7 @@ class SourceContractTests(unittest.TestCase):
         self.assertGreater(seconds["LIFETIME"], observed + 2)
         self.assertLess(seconds["LIFETIME"], seconds["WATCHDOG"])
         self.assertLess(seconds["WATCHDOG"], P.EXIT_SECONDS)
-        self.assertLessEqual(observed + P.EXIT_SECONDS, P.RUN_SECONDS)
+        self.assertLessEqual(observed + P.EXIT_SECONDS + P.CLEANUP_RESERVE_SECONDS, P.RUN_SECONDS)
 
     def test_driver_reads_windows_without_input_messages_titles_or_app_code(self):
         source = DRIVER_SOURCE.read_text()
