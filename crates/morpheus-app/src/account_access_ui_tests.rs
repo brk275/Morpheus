@@ -436,13 +436,12 @@ fn request_bridge_focus(ui: &AppWindow, label: &str) {
 }
 
 fn click_control_once(ui: &AppWindow, label: &str) {
-    use slint::private_unstable_api::re_exports::LogicalPoint;
-
     let target = control_with_label(ui, label);
-    let origin = target.map_to_window(LogicalPoint::default());
-    let size = target.geometry().size;
-    let position =
-        slint::LogicalPosition::new(origin.x + size.width / 2.0, origin.y + size.height / 2.0);
+    // map_to_window takes a point in the item's parent coordinates; it does
+    // not add the item's own x/y. Pass the full geometry's center so an action
+    // positioned at the bottom of a layout is actually the one we click.
+    let center = target.map_to_window(target.geometry().center());
+    let position = slint::LogicalPosition::new(center.x, center.y);
     let window_size = ui.window().size().to_logical(ui.window().scale_factor());
     assert!(position.x > 0.0 && position.x < window_size.width);
     assert!(position.y > 0.0 && position.y < window_size.height);
