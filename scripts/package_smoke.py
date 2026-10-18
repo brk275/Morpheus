@@ -731,16 +731,24 @@ MACOS_BRIDGE_ERRORS = frozenset({
 })
 
 
+# Closed stage tokens isolate installed Appearance failures without exposing UI text.
+APPEARANCE_STAGES = frozenset({
+    "not_started", "open_settings", "reach_scale", "read_seed_scale", "increase_scale",
+    "read_changed_scale", "persist_scale", "complete",
+})
+
+
 def validate_macos_keyboard_diagnostic(value, passed):
     counts = ("selector_matches", "incomplete_passes", "activation_recoveries", "bounded_snapshots")
     expected = MACOS_KEYBOARD_OBSERVATIONS | set(counts) | {
         "step", "operation", "failure", "password_semantics", "cleanup", "profile_owned",
-        "traversed_node_matched", "bridge_error",
+        "traversed_node_matched", "bridge_error", "appearance_stage",
     }
     require(type(value) is dict and value.keys() == expected, "Invalid installed macOS keyboard diagnostic shape")
     require(all(type(value[key]) is str for key in ("step", "operation", "failure", "password_semantics",
-                                                     "cleanup", "bridge_error"))
+                                                     "cleanup", "bridge_error", "appearance_stage"))
             and value["step"] in MACOS_KEYBOARD_STEPS and value["operation"] in MACOS_KEYBOARD_OPERATIONS
+            and value["appearance_stage"] in APPEARANCE_STAGES
             and value["failure"] in MACOS_KEYBOARD_FAILURES
             and value["password_semantics"] in MACOS_PASSWORD_SEMANTICS
             and value["cleanup"] in {"not_started", "passed", "failed"}
@@ -750,6 +758,7 @@ def validate_macos_keyboard_diagnostic(value, passed):
             and type(value["traversed_node_matched"]) is bool and type(value["profile_owned"]) is bool,
             "Invalid installed macOS keyboard diagnostic value")
     require(not passed or (value["step"] == "complete" and value["failure"] == "none"
+            and value["appearance_stage"] == "complete"
             and value["cleanup"] == "passed" and value["profile_owned"]
             and value["password_semantics"] == "protected" and value["bridge_error"] == "none"
             and all(value[key] for key in MACOS_KEYBOARD_OBSERVATIONS)),
@@ -798,12 +807,13 @@ def validate_windows_keyboard_diagnostic(value, passed):
               "window_candidates", "event_targets_ignored")
     expected = WINDOWS_KEYBOARD_OBSERVATIONS | set(counts) | {
         "step", "operation", "failure", "password_semantics", "cleanup", "profile_owned",
-        "traversed_node_matched", "bridge_error", "window_inventory",
+        "traversed_node_matched", "bridge_error", "appearance_stage", "window_inventory",
     }
     require(type(value) is dict and value.keys() == expected, "Invalid installed Windows keyboard diagnostic shape")
     require(all(type(value[key]) is str for key in ("step", "operation", "failure", "password_semantics",
-                                                     "cleanup", "bridge_error"))
+                                                     "cleanup", "bridge_error", "appearance_stage"))
             and value["step"] in WINDOWS_KEYBOARD_STEPS and value["operation"] in WINDOWS_KEYBOARD_OPERATIONS
+            and value["appearance_stage"] in APPEARANCE_STAGES
             and value["failure"] in WINDOWS_KEYBOARD_FAILURES
             and value["password_semantics"] in WINDOWS_PASSWORD_SEMANTICS
             and value["cleanup"] in {"not_started", "passed", "failed"}
@@ -814,6 +824,7 @@ def validate_windows_keyboard_diagnostic(value, passed):
             and valid_windows_inventory(value["window_inventory"]),
             "Invalid installed Windows keyboard diagnostic value")
     require(not passed or (value["step"] == "complete" and value["failure"] == "none"
+            and value["appearance_stage"] == "complete"
             and value["cleanup"] == "passed" and value["profile_owned"]
             and value["password_semantics"] == "protected" and value["bridge_error"] == "none"
             and value["window_candidates"] == 1

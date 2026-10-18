@@ -37,6 +37,7 @@ def inventory(*windows, **overrides):
 
 def diagnostic(**overrides):
     return {"step": "complete", "operation": "none", "failure": "none", "bridge_error": "none",
+            "appearance_stage": "complete",
             "owned_window_seen": True, "uia_root_seen": True, "homeserver_seen": True,
             "username_seen": True, "password_seen": True,
             "selector_matches": 1, "incomplete_passes": 0, "foreground_recoveries": 0,
@@ -798,6 +799,64 @@ class FocusAndKeyTests(unittest.TestCase):
             ui.appearance_keyboard(instance)
         self.assertEqual(error.exception.code, "scale_unreachable")
         self.assertLessEqual(sum(1 for command in bridge.commands if command["op"] == "key"), ui.SETTINGS_TAB_BOUND + 1)
+
+
+class AppearanceStageTests(unittest.TestCase):
+    def test_failure_stage_survives_lower_level_operations_and_cleanup(self):
+        cases = [("focus", "Open settings", "open_settings"),
+                 ("focused_name", None, "reach_scale"),
+                 ("wait", "110% · text throughout the app", "read_seed_scale"),
+                 ("key", "Space", "increase_scale"),
+                 ("wait", "120% · text throughout the app", "read_changed_scale")]
+        for method, argument, expected in cases:
+            with self.subTest(stage=expected):
+                diagnostics = ui.Diagnostics({})
+                instance = Mock()
+                instance.diagnostics = diagnostics
+                instance.focused_name.return_value = "Increase font scale"
+
+                def fail(*arguments):
+                    diagnostics.operation("node_name")
+                    if argument is None or arguments == (argument,):
+                        raise ui.DiagnosticFailure("wait_timeout")
+
+                getattr(instance, method).side_effect = fail
+                with self.assertRaises(ui.DiagnosticFailure) as error:
+                    ui.appearance_keyboard(instance)
+                diagnostics.failed(error.exception)
+                diagnostics.step("cleanup")
+                self.assertEqual(diagnostics.value["appearance_stage"], expected)
+                self.assertEqual(diagnostics.value["failure"], "wait_timeout")
+
+    def test_complete_stage_requires_successful_persistence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.toml"
+            diagnostics = ui.Diagnostics({})
+            config.write_text("[appearance]\nscale_percent = 110\n")
+            with self.assertRaises(ui.DiagnosticFailure):
+                ui.config_persisted(config, diagnostics, seconds=0)
+            self.assertEqual(diagnostics.value["appearance_stage"], "persist_scale")
+            config.write_text("[appearance]\nscale_percent = 120\n")
+            ui.config_persisted(config, diagnostics, seconds=0)
+            self.assertEqual(diagnostics.value["appearance_stage"], "complete")
+
+    def test_unknown_stages_never_enter_a_report(self):
+        diagnostics = ui.Diagnostics({})
+        for value in ("PRIVATE_TEXT", "", None, 1, []):
+            with self.subTest(value=value), self.assertRaises(ui.DiagnosticFailure):
+                diagnostics.appearance_stage(value)
+            self.assertEqual(diagnostics.value["appearance_stage"], "not_started")
+
+    def test_report_accepts_only_closed_stages_and_requires_complete_on_success(self):
+        validator = smoke.validate_windows_keyboard_diagnostic
+        for stage in smoke.APPEARANCE_STAGES:
+            validator(diagnostic(appearance_stage=stage), False)
+            if stage != "complete":
+                with self.assertRaises(RuntimeError):
+                    validator(diagnostic(appearance_stage=stage), True)
+        for stage in ("PRIVATE_TEXT", None, [], True):
+            with self.subTest(stage=stage), self.assertRaises(RuntimeError):
+                validator(diagnostic(appearance_stage=stage), False)
 
 
 class SignInSemanticsTests(unittest.TestCase):

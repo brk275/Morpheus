@@ -80,6 +80,7 @@ class Diagnostics:
     def __init__(self, report):
         self.value = report["diagnostic"] = {
             "step": "setup", "operation": "none", "failure": "none", "bridge_error": "none",
+            "appearance_stage": "not_started",
             "owned_window_seen": False, "uia_root_seen": False, "homeserver_seen": False,
             "username_seen": False, "password_seen": False,
             "selector_matches": 0, "incomplete_passes": 0, "foreground_recoveries": 0,
@@ -93,6 +94,10 @@ class Diagnostics:
     def step(self, step):
         self.value["step"] = step
         self.value["operation"] = "none"
+
+    def appearance_stage(self, stage):
+        require_ui(type(stage) is str and stage in smoke.APPEARANCE_STAGES, "unclassified")
+        self.value["appearance_stage"] = stage
 
     def operation(self, operation):
         self.value["operation"] = operation
@@ -648,6 +653,7 @@ def menu_keyboard(ui):
 
 
 def appearance_keyboard(ui):
+    ui.diagnostics.appearance_stage("open_settings")
     ui.focus("Open settings")
     ui.key("Return")
     # Settings rows below the fold are clipped out of the accessibility tree
@@ -655,6 +661,7 @@ def appearance_keyboard(ui):
     # for from here. Reach the control with bounded real Tab presses, checking
     # the owned focused name after each one; focus reveals the row, and only
     # then is its label queried.
+    ui.diagnostics.appearance_stage("reach_scale")
     for _ in range(SETTINGS_TAB_BOUND):
         focused = ui.focused_name()
         require_ui(focused is not None, "focus_unowned")
@@ -664,12 +671,16 @@ def appearance_keyboard(ui):
         ui.wait_for(lambda: (name := ui.focused_name()) is not None and name != focused)
     else:
         raise DiagnosticFailure("scale_unreachable")
+    ui.diagnostics.appearance_stage("read_seed_scale")
     ui.wait("110% · text throughout the app")
+    ui.diagnostics.appearance_stage("increase_scale")
     ui.key("Space")
+    ui.diagnostics.appearance_stage("read_changed_scale")
     ui.wait("120% · text throughout the app")
 
 
 def config_persisted(config, diagnostics, seconds=10):
+    diagnostics.appearance_stage("persist_scale")
     deadline = time.monotonic() + seconds
     while True:
         diagnostics.check_deadline()
@@ -679,6 +690,7 @@ def config_persisted(config, diagnostics, seconds=10):
         except (OSError, ValueError):
             value = {}
         if value.get("appearance", {}).get("scale_percent") == 120:
+            diagnostics.appearance_stage("complete")
             return
         require_ui(time.monotonic() < deadline, "config_mismatch")
         time.sleep(0.2)

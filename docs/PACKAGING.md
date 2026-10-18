@@ -557,3 +557,10 @@ feedback, retained scale and restoration; arbitrary labels and raw errors are
 not public diagnostics. Success still requires persistence, invalid-edit
 retention, normal close and cleanup, in addition to the earlier sign-in and
 account-menu checks. This does not establish screen-reader acceptance.
+
+The macOS and Windows drivers retain a separate, closed `appearance_stage`
+through lower-level selector operations and cleanup. It identifies opening
+Settings, reaching the scale control, reading the seeded value, increasing it,
+reading the changed value and persisting it. Only successful persistence marks
+this stage complete; the overall installed check still requires normal close
+and cleanup. Unknown stage strings are rejected rather than included in reports.
