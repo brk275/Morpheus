@@ -5,7 +5,7 @@
 //! Revocation drops the read future; an HTTP request already handed to a server
 //! cannot be recalled.
 
-use std::future::Future;
+use std::{future::Future, pin::Pin};
 
 use super::*;
 
@@ -177,11 +177,23 @@ impl AccountManager {
                 if !selection.is_current() {
                     return Err(MatrixCoreError::SelectedAccountChanged);
                 }
-                request(loaded).await
+                start_on_heap(request, loaded).await
             })
             .await
             .ok_or(MatrixCoreError::SelectedAccountChanged)?
     }
+}
+
+/// Own a started timeline request on the heap. Held inline, the SDK timeline
+/// open was embedded in every public read future and its callers; unoptimized
+/// poll frames then exhausted the 2 MiB test-thread stack. Building it in this
+/// short-lived frame keeps the temporary out of the frame that polls it.
+/// Dropping the box cancels the request and releases its loaded-client hold.
+fn start_on_heap<F, Wait>(request: F, loaded: Arc<LoadedAccount>) -> Pin<Box<Wait>>
+where
+    F: FnOnce(Arc<LoadedAccount>) -> Wait,
+{
+    Box::pin(request(loaded))
 }
 
 #[cfg(test)]
@@ -531,6 +543,65 @@ mod tests {
                 Err(MatrixCoreError::SelectedAccountChanged)
             ));
             drop(state);
+            drop(manager);
+            fs::remove_dir_all(directory).unwrap();
+        });
+    }
+
+    /// Size of the future a call would return; the call is never made.
+    fn future_size<Fut: Future>(_call: impl FnOnce() -> Fut) -> usize {
+        std::mem::size_of::<Fut>()
+    }
+
+    #[test]
+    fn public_timeline_reads_keep_unpolled_futures_within_budget() {
+        // Unoptimized poll frames reserve stack for each future they build, so
+        // an SDK timeline open held inline by these wrappers overflowed callers
+        // awaiting several reads. Staying below the SDK open itself also fails
+        // a wrapper that embeds it while that open happens to fit the budget.
+        const BUDGET: usize = 16 * 1024;
+        runtime().block_on(async {
+            let (directory, manager, account) = fixture(None).await;
+            let selection = manager.account_selection(&account.id).unwrap();
+            let loaded = {
+                let state = manager.state.lock().await;
+                state.loaded.get(&account.id).unwrap().clone()
+            };
+            let (id, room, root) = (account.id.as_str(), "!unused:example.org", "$root");
+            let sdk_open = future_size(|| loaded.timeline(room))
+                .min(future_size(|| loaded.thread_timeline(room, root)));
+            let reads = [
+                ("messages_snapshot", future_size(|| manager.messages_snapshot(room))),
+                ("message_feed", future_size(|| manager.message_feed(room))),
+                (
+                    "message_feed_selected",
+                    future_size(|| manager.message_feed_selected(&selection, room)),
+                ),
+                (
+                    "thread_message_feed_for",
+                    future_size(|| manager.thread_message_feed_for(id, room, root)),
+                ),
+                (
+                    "thread_message_feed_selected",
+                    future_size(|| manager.thread_message_feed_selected(&selection, room, root)),
+                ),
+                ("paginate_backwards", future_size(|| manager.paginate_backwards(room, 50))),
+                (
+                    "paginate_backwards_for",
+                    future_size(|| manager.paginate_backwards_for(id, room, 50)),
+                ),
+                (
+                    "paginate_backwards_selected",
+                    future_size(|| manager.paginate_backwards_selected(&selection, room, 50)),
+                ),
+            ];
+            for (method, bytes) in reads {
+                assert!(
+                    bytes <= BUDGET && bytes < sdk_open,
+                    "{method} future is {bytes} bytes; budget {BUDGET}, SDK open {sdk_open}"
+                );
+            }
+            drop(loaded);
             drop(manager);
             fs::remove_dir_all(directory).unwrap();
         });
