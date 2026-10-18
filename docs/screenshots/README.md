@@ -1,16 +1,7 @@
 # Native screenshots
 
-These are real Slint window captures of Morpheus from the tested
-[PR 9](https://github.com/brk275/Morpheus/pull/9) merge snapshot
-`78f6f46d401d0dd091eedae1278c015c459760c9`, using fictional offline preview accounts.
-They were captured on the standard Ubuntu runner in
-[CI run 39074067812](https://github.com/brk275/Morpheus/actions/runs/39074067812),
-attempt 1, on October 17, 2026.
-
-The images are 1440 × 900 lossless PNGs with unchanged pixels and no embedded
-metadata. They are application screenshots, not generated artwork. A preview
-capture demonstrates the interface; it does not establish live Matrix or release
-acceptance.
+Real native captures with fictional offline accounts. Each image is a
+1440 × 900 lossless PNG. These show the interface; Morpheus remains pre-alpha.
 
 ## Terminal and account switching
 
@@ -59,6 +50,15 @@ retry control. See [account access](../ACCOUNT_ACCESS.md) for behavior and limit
 
 ## Capture provenance
 
+<details>
+<summary>Source revision, capture run and image checksums</summary>
+
+Captured on October 17, 2026, from the tested
+[PR 9](https://github.com/brk275/Morpheus/pull/9) merge snapshot
+`78f6f46d401d0dd091eedae1278c015c459760c9`, on the standard Ubuntu runner in
+[CI run 39074067812](https://github.com/brk275/Morpheus/actions/runs/39074067812),
+attempt 1. The pixels are unchanged and the files contain no embedded metadata.
+
 The native capture command is `--morpheus-capture-preview`; CI converts its RGB
 snapshots to PNG with `scripts/encode_preview_pngs.py`. The source artifact was
 `native-preview-78f6f46d401d0dd091eedae1278c015c459760c9-1`, ID `12116672244`.
@@ -79,3 +79,5 @@ review. All eight images below came from the same native executable, SHA-256
 | `sign-in.png` | `efcf41e65b1ca636511c612f2fbb56a024ba9b1f32c1ef906766e10a9d6ef367` |
 | `terminal-sidebar.png` | `113c69a3ef7fd607c884a6973424766969b706721098c424116ab4fb47770766` |
 | `terminal-space-labels.png` | `4250c62a176e235b6877cc02d63bbe1ec93a9049a818527b2fac9b92a1af8781` |
+
+</details>
