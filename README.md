@@ -1,66 +1,63 @@
 # Morpheus
 
-A native Matrix client built in Rust for **macOS, Linux and Windows**.
-Multiple accounts, configurable layouts, and themes you can make your own.
+A native Matrix client for **macOS, Linux and Windows**, built in Rust.
+Separate accounts. Live configuration. An interface you can make your own.
 
 [Screenshots](docs/screenshots/README.md) · [Customization](docs/CUSTOMIZATION.md) ·
 [Documentation](docs/README.md) · [Contributing](CONTRIBUTING.md)
 
-**Pre-alpha · No installer release yet.** See [development status](#development).
+**Pre-alpha.** Source is available; installers are not released yet.
 
-![Morpheus with the Terminal preset and bottom-left account switcher](docs/screenshots/account-switcher.png)
+![Morpheus in the Terminal preset, with text navigation and nickname columns](docs/screenshots/terminal-sidebar.png)
 
-*Terminal preset. Real native capture with fictional accounts.*
+*Terminal preset · Native app capture · Fictional preview accounts*
 
-## Your setup
+## Make it yours
 
-Start with a preset or create a TOML theme. Customize:
+Start with **Nocturne**, **Terminal** or **Paper**, then change the details:
 
-- **Type:** separate interface, message and monospace fonts.
-- **Messages:** stacked, compact or nickname columns; avatars, timestamps and spacing.
-- **Navigation:** icon rail or text sidebar, Space labels and room ordering.
-- **Layout:** pane widths, headers, density and corners.
-- **Color:** theme packs with dedicated focus, unread, link, voice and sender colors.
+- Separate fonts for the interface, messages and code.
+- Stacked, compact or nickname-column messages, with adjustable spacing and avatars.
+- An icon rail or text sidebar, Space labels and room ordering.
+- Pane widths, headers, density and corner radius.
+- TOML palettes with colors for focus, unread messages, links, voice and senders.
 
-Settings and `config.toml` control the same preferences. Valid edits reload live;
-invalid edits keep the last working configuration.
-[Customization guide](docs/CUSTOMIZATION.md)
+Settings and `config.toml` edit the same preferences. Changes reload live;
+invalid edits show an error and keep the last working configuration.
 
-| Nocturne | Paper |
-| :---: | :---: |
-| ![Nocturne: dark surfaces and stacked messages](docs/screenshots/desktop.png) | ![Paper: light surfaces and serif messages](docs/screenshots/paper.png) |
+[Customization guide](docs/CUSTOMIZATION.md) · [All presets and screenshots](docs/screenshots/README.md)
 
 ## Multiple accounts
 
-The bottom-left profile menu switches between accounts on different homeservers.
-Each account has separate sessions, encryption stores, drafts and vault entries.
-Inactive accounts pause by default.
+Switch accounts from the bottom-left profile menu. Each account has its own
+session, encryption store, drafts and credential-vault entry. Inactive accounts
+pause by default.
 
-An optional local app password protects switches and startup restore.
-Remove accounts from **Manage accounts**, with retries for incomplete cleanup.
-[Account controls](docs/ACCOUNT_ACCESS.md)
+One optional local app password protects account switches and startup restore.
+**Manage accounts** provides direct removal and a retry control for incomplete
+cleanup. [Account controls](docs/ACCOUNT_ACCESS.md)
 
 ## Build from source
 
-Follow the [build policy](AGENTS.md), install the
-[native dependencies](docs/PACKAGING.md) and use the pinned Rust toolchain:
+Install the [native dependencies](docs/PACKAGING.md) and use the repository's
+pinned Rust toolchain:
 
 ```sh
 cargo run --locked -p morpheus-app
 ```
 
-The app opens at Matrix sign-in and offers an offline preview. Native calls
-require a compatible MatrixRTC service.
+The app opens at Matrix sign-in and offers an offline preview. Calls require a
+compatible MatrixRTC service. See the [build and verification policy](AGENTS.md)
+before running hosted checks.
 
 ## Development
 
-Morpheus is still in active development. Messaging, encryption and native calls
-have open acceptance checks, alongside accessibility, installed-app behavior,
-device compatibility, signing and updates. Do not rely on it for important
-conversations or encryption-key recovery yet.
+Morpheus is not ready for daily use. Messaging, encryption, calls, accessibility
+and installation still have open release checks. Do not rely on it for important
+conversations or key recovery yet.
 
 [Feature status](docs/FEATURE_MATRIX.md) · [Release checklist](docs/RELEASE_CHECKLIST.md) ·
-[Private security reports](SECURITY.md)
+[Contributing](CONTRIBUTING.md) · [Report a vulnerability privately](SECURITY.md)
 
 ## License
 
