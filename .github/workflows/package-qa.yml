@@ -36,7 +36,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: package-qa-${{ github.ref }}
+  # Independent platform requests can run together.
+  # Every worker below still holds the exact candidate/OS lock shared with CI.
+  group: package-qa-${{ github.ref }}-${{ inputs.platform }}
   # Let an in-flight packaging run finish and populate its cache.
   cancel-in-progress: false
 
