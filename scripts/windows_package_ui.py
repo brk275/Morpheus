@@ -746,7 +746,7 @@ def window_facts(api, window, pid):
     """Publishable facts for one borrowed handle of the task-owned process.
 
     Returns None, keeping no facts, unless the handle belongs to pid before
-    and after every query. A query that fails on a live owned window yields
+    and after the query group. A query that fails on a live owned window yields
     None for that fact only. The class name is reduced to a closed family
     here and never kept; titles, handles, process IDs and positions are never
     read into the result.
@@ -778,7 +778,7 @@ def window_facts(api, window, pid):
         owner_kind = None
     rect = query(api.rect, window)
     cloaked = query(api.cloaked, window)
-    # A destroyed and reused handle must not supply another process's facts.
+    # Discard facts if the handle vanished or now belongs to another process.
     if not api.is_window(window) or query(api.process_of, window) != pid:
         return None
     family = window_probe.family(name) if name is not None else None

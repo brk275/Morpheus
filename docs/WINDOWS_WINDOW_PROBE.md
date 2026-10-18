@@ -157,10 +157,10 @@ NSIS install and registration passed, then the keyboard driver failed at
 
 ### Hypotheses, not findings
 
-- Windows may keep `WS_CLIPSIBLINGS` when the style word of a top-level window
-  is replaced. Wine's reimplementation does so explicitly. If Windows does
-  too, the event target reports `0x94000000` and stays a candidate next to
-  the real window. This is the leading explanation. It is unverified.
+- An extra `WS_CLIPSIBLINGS` bit would make the event target report
+  `0x94000000` and remain a candidate next to the real window. The installed
+  build's resulting style words have not yet been recorded, so this remains
+  an unverified explanation.
 - Alternatively, an extended-style bit differs, or a window not visible in the
   default-feature probe appears in the installed native-calls build.
 
@@ -175,9 +175,10 @@ any error inside it becomes `status=failed` without changing the outcome.
 
 For each handle the inventory does the following:
 
-- It requires the task-owned process before and after the queries. A vanished
-  or reused handle keeps no facts and only increments `discarded`, which
-  saturates at 2.
+- It requires the task-owned process before and after the query group. A
+  vanished handle or one reused by another process keeps no facts and only
+  increments `discarded`, which saturates at 2. This check cannot detect
+  destruction and reuse by the same process between those two observations.
 - It publishes at most eight entries, sorted so enumeration order is not
   reported. More entries set `truncated`.
 
