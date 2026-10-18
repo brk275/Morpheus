@@ -24,6 +24,16 @@ WAYLAND_UNRELATED_NATIVE_INPUTS = {
     "crates/morpheus-app/ui/app-window.slint",
     "crates/morpheus-config/src/lib.rs",
 }
+# The standalone portal target and its driver do not compile this separate
+# Matrix test binary or import the Matrix acceptance coordinator. Keep their
+# existing native/helper selections; omit only the unrelated Wayland fixture.
+# Shared containment, SDK/core source, dependencies and unknown paths remain
+# conservative, and manual full verification still selects Wayland.
+WAYLAND_UNRELATED_MATRIX_DIAGNOSTIC_INPUTS = {
+    "crates/morpheus-matrix/tests/drafts_local.rs",
+    "scripts/run_matrix_acceptance.py",
+    "scripts/tests/test_matrix_acceptance.py",
+}
 # These validated appearance packs are consumed by the app/configuration
 # crate, not the standalone RTC portal fixture. Keep this an exact allowlist:
 # unknown theme inputs and mixed build/dependency changes remain conservative.
@@ -95,7 +105,8 @@ def classify(paths, force_all=False):
                 or (path.startswith("docs/screenshots/") and path.endswith(".png"))
                 or path in {"LICENSE", ".gitignore", ".gitleaksignore"}):
             continue
-        if path not in WAYLAND_UNRELATED_NATIVE_INPUTS | WAYLAND_UNRELATED_THEME_INPUTS:
+        if path not in (WAYLAND_UNRELATED_NATIVE_INPUTS | WAYLAND_UNRELATED_THEME_INPUTS
+                        | WAYLAND_UNRELATED_MATRIX_DIAGNOSTIC_INPUTS):
             wayland_affected = True
         if path == "Cargo.lock" or path.endswith("Cargo.toml"):
             native.update(PLATFORMS)
