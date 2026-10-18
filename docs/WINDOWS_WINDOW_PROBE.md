@@ -12,7 +12,7 @@ keyboard window selection is a separate check.
 
 winit 0.30.13 creates a per-thread "Winit Thread Event Target" window when its
 event loop starts (`platform_impl/windows/event_loop.rs`,
-`create_event_target_window`). It is a top-level, unowned, zero-size popup with
+`create_event_target_window`). It requests a top-level, unowned, zero-size popup with
 `WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_TOOLWINDOW`, and
 winit then sets `WS_VISIBLE | WS_POPUP` so it receives `WM_PAINT` during
 resizes. `IsWindowVisible` therefore reports it as visible, so
@@ -22,8 +22,12 @@ no Win32 class name, so its window keeps winit's default `Window Class`. Its
 Windows OpenGL probe window is created hidden and destroyed. The app UI uses
 no native menu bar, tray or popup window.
 
-This is unproven on a hosted runner. The installed app is also built with
-native calls, whose libraries this probe does not load.
+The standard Windows runner confirmed both families in all eight snapshots in
+[run 39145646856](https://github.com/brk275/Morpheus/actions/runs/39145646856),
+using source `0677707285c50967b71e8155c77d5bbae7800f5a`. Both windows had
+nonzero area: the requested creation size does not establish runtime geometry.
+The probe exited normally and its job cleanup passed. The installed app is
+also built with native calls, whose libraries this probe does not load.
 
 ## Files
 
@@ -94,10 +98,10 @@ was found.
 ## Installed keyboard selection
 
 The installed driver excludes only the pinned event target's exact class,
-complete raw style words (`0x90000000` and `0x080800a0`), absent owner and zero
-width **and** height. It rechecks the borrowed handle's process ownership before
-and after queries. A different class, extra style bit, owner or dimension keeps
-the window as a candidate. Two candidates remain an error; enumeration order
+complete raw style words (`0x90000000` and `0x080800a0`) and absent owner.
+Geometry is not an identity check. It rechecks the borrowed handle's process
+ownership before and after queries. A different class, extra style bit or owner
+keeps the window as a candidate. Two candidates remain an error; enumeration order
 never chooses one. An event target alone keeps the driver waiting for the app.
 
 Diagnostics expose only candidate and ignored-target counts, each saturating at
@@ -106,6 +110,6 @@ exact candidate count of one. Raw names, coordinates, handles and process IDs
 are never published. A vanished window can be retried; a live metadata failure
 or foreign handle fails the check.
 
-This selector change still requires hosted native-probe and installed-package
-verification. The tiny default-feature subject does not establish the complete
+This selector change still requires installed-package verification. The tiny
+default-feature subject does not establish the complete
 window set of an installed native-calls build.

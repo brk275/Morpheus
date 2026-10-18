@@ -1132,8 +1132,7 @@ class DiagnosticsAndReportTests(unittest.TestCase):
 
     def test_near_match_helpers_are_not_discarded(self):
         changes = ({"class": "unknown private class"}, {"style": 0x94000000},
-                   {"exstyle": 0x080801A0}, {"owner": 65538},
-                   {"rect": (0, 0, 1, 0)}, {"rect": (0, 0, 0, 1)})
+                   {"exstyle": 0x080801A0}, {"owner": 65538})
         job = Mock()
         job.kernel.WaitForSingleObject.return_value = 258
         for change in changes:
@@ -1146,6 +1145,20 @@ class DiagnosticsAndReportTests(unittest.TestCase):
             self.assertEqual(error.exception.code, "window_count")
             self.assertEqual(trace.value["window_candidates"], 2)
             self.assertNotIn("private", json.dumps(trace.value))
+
+    def test_exact_event_target_identity_does_not_depend_on_geometry(self):
+        # The actual hosted probe found a nonzero-area event target. A zero
+        # CreateWindowEx size is not proof of the eventual GetWindowRect size.
+        for rectangle in ((0, 0, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1),
+                          (10, 20, 330, 220), (-600, -400, -100, -100)):
+            api = WindowQuery()
+            api.windows[2]["rect"] = rectangle
+            trace = ui.Diagnostics({})
+            with (self.subTest(rectangle=rectangle),
+                  patch.object(smoke, "visible_windows", return_value=[2, 65538]),
+                  patch.object(api, "rect", side_effect=AssertionError("Geometry is not identity"))):
+                self.assertEqual(ui.keyboard_window_candidates(77, trace, api), [65538])
+            self.assertEqual(trace.value["event_targets_ignored"], 1)
 
     def test_event_target_alone_waits_for_the_actual_window(self):
         job = Mock()

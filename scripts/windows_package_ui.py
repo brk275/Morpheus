@@ -691,7 +691,6 @@ def keyboard_window_kind(api, window, pid):
         style = api.long(window, window_probe.GWL_STYLE)
         exstyle = api.long(window, window_probe.GWL_EXSTYLE)
         owner = api.owner(window)
-        left, top, right, bottom = api.rect(window)
         visible = api.is_visible(window)
         require_ui(api.process_of(window) == pid, "window_unowned")
     except window_probe.ApiError:
@@ -702,10 +701,10 @@ def keyboard_window_kind(api, window, pid):
         return "hidden"
     # Pinned winit 0.30.13 create_event_target_window. Compare complete raw
     # style words, not the probe's projection of named flags. An added bit,
-    # owner, dimension or different class keeps this window as a candidate.
+    # owner or different class keeps this window as a candidate. Geometry is
+    # not identity: the real hosted probe found a nonzero event-target area.
     if (name == "Winit Thread Event Target" and style == 0x90000000
-            and exstyle == 0x080800A0 and not owner
-            and left == right and top == bottom):
+            and exstyle == 0x080800A0 and not owner):
         return "event_target"
     return "candidate"
 
