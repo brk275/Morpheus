@@ -229,6 +229,12 @@ impl Config {
             200,
         )?;
         validate_range(
+            "appearance.hover_duration_ms",
+            self.appearance.hover_duration_ms,
+            0,
+            1000,
+        )?;
+        validate_range(
             "layout.room_list_width",
             self.layout.room_list_width,
             180,
@@ -589,6 +595,8 @@ pub struct Appearance {
     pub density: Density,
     pub scale_percent: u16,
     pub reduce_motion: bool,
+    /// Duration of Morpheus decorative hover fades; reduce_motion overrides it.
+    pub hover_duration_ms: u16,
 }
 
 impl Default for Appearance {
@@ -600,6 +608,7 @@ impl Default for Appearance {
             density: Density::Comfortable,
             scale_percent: 100,
             reduce_motion: false,
+            hover_duration_ms: 90,
         }
     }
 }

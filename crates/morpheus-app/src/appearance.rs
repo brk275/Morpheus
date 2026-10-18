@@ -268,6 +268,8 @@ pub(super) fn take_motion_probe() -> (u32, bool, bool) {
 pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
     ui.global::<StyleTokens>()
         .set_reduced_motion(config.appearance.reduce_motion);
+    ui.global::<StyleTokens>()
+        .set_hover_duration_ms(config.appearance.hover_duration_ms.into());
     let opacity = config.window.opacity_percent;
     ui.global::<StyleTokens>()
         .set_window_opacity(f32::from(opacity) / 100.0);
@@ -459,7 +461,7 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
     let weak = ui.as_weak();
     let store_for_number = store.clone();
     ui.on_change_style_number(move |field, value| {
-        if !(0..=6).contains(&field) {
+        if !(0..=7).contains(&field) {
             return;
         }
         if let Some(ui) = weak.upgrade() {
@@ -471,6 +473,7 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
                 4 => config.geometry.rail_width = value.clamp(44, 100) as u16,
                 5 => config.chat.nickname_width = value.clamp(64, 240) as u16,
                 6 => config.chat.timestamp_width = value.clamp(48, 160) as u16,
+                7 => config.appearance.hover_duration_ms = value.clamp(0, 1000) as u16,
                 _ => unreachable!("validated appearance field"),
             });
         }

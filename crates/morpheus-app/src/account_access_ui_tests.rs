@@ -714,6 +714,29 @@ async fn assert_native_motion_and_preference(ui: &AppWindow, config_path: &std::
     store.save(&defaults).unwrap();
     apply_config(ui, &store.load().unwrap(), None);
     ui.set_config_error("".into());
+    // Edit the same persisted preference through a real generated button,
+    // then verify reduced motion takes priority without discarding it.
+    tab_to_control(ui, "Increase Hover fade duration");
+    key(ui, Key::Space);
+    assert_eq!(store.load().unwrap().appearance.hover_duration_ms, 100);
+    assert_eq!(
+        ui.global::<crate::StyleTokens>().get_interaction_duration(),
+        100
+    );
+    tab_to_control(ui, "Reduce motion, off");
+    key(ui, Key::Space);
+    assert_eq!(store.load().unwrap().appearance.hover_duration_ms, 100);
+    assert_eq!(
+        ui.global::<crate::StyleTokens>().get_interaction_duration(),
+        0
+    );
+    key(ui, Key::Return);
+    assert_eq!(
+        ui.global::<crate::StyleTokens>().get_interaction_duration(),
+        100
+    );
+    store.save(&defaults).unwrap();
+    apply_config(ui, &defaults, None);
     ui.on_set_reduce_motion(|_| {});
     ui.set_page(0);
     settle(ui).await;

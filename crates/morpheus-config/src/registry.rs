@@ -587,6 +587,15 @@ pub const FIELDS: &[FieldSpec] = &[
         "Immediate hover feedback instead of short fades.",
     ),
     field(
+        "appearance.hover_duration_ms",
+        Integer {
+            minimum: 0,
+            maximum: 1000,
+        },
+        "90",
+        "Decorative button and navigation hover fade in milliseconds; reduce_motion overrides it.",
+    ),
+    field(
         "typography.message_font_family",
         FieldKind::FontFamily,
         "(none)",
@@ -1024,6 +1033,21 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
             "motion",
             "reduced motion",
             "accessibility",
+        ],
+    ),
+    target(
+        "appearance.hover_duration",
+        APPEARANCE,
+        "Settings › Appearance › Hover fade duration",
+        "Hover fade duration",
+        "Set button and navigation hover timing; Reduce motion takes priority.",
+        &[
+            "fade",
+            "hover",
+            "duration",
+            "timing",
+            "animation speed",
+            "milliseconds",
         ],
     ),
     target(
