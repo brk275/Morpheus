@@ -558,6 +558,135 @@ fn tab_to_control(ui: &AppWindow, label: &str) {
     panic!("Appearance control is not keyboard reachable: {label}");
 }
 
+fn settings_hover_opacity(ui: &AppWindow) -> f32 {
+    use slint::private_unstable_api::re_exports::Opacity;
+    use std::ops::ControlFlow;
+
+    let control = control_with_label(ui, "Open settings");
+    let mut levels = Vec::new();
+    control.visit_descendants(|item| {
+        if let Some(opacity) = item.downcast::<Opacity>() {
+            levels.push(opacity.as_pin_ref().opacity());
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    // The decorative layer is the only changing opacity in this non-quiet
+    // action. Read real generated items, not an assumed animation progress.
+    assert!(!levels.is_empty(), "the hover surface must exist");
+    assert!(levels.iter().all(|level| (0.0..=1.0).contains(level)));
+    assert!(levels.iter().filter(|level| **level != 1.0).count() <= 1);
+    levels.into_iter().product()
+}
+
+async fn assert_native_motion_and_preference(ui: &AppWindow, config_path: &std::path::Path) {
+    use morpheus_config::ConfigStore;
+
+    let defaults = Config::default();
+    apply_config(ui, &defaults, None);
+    ui.set_page(0);
+    settle(ui).await;
+    request_bridge_focus(ui, "Open settings");
+    ui.window().dispatch_event(WindowEvent::PointerExited);
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
+    assert_eq!(settings_hover_opacity(ui), 0.0);
+
+    let control = control_with_label(ui, "Open settings");
+    let bounds = control.geometry();
+    let center = control.map_to_window(bounds.center());
+    let position = slint::LogicalPosition::new(center.x, center.y);
+    ui.window()
+        .dispatch_event(WindowEvent::PointerMoved { position });
+    assert_eq!(settings_hover_opacity(ui), 0.0);
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(30));
+    let during = settings_hover_opacity(ui);
+    assert!(
+        during > 0.0 && during < 1.0,
+        "native hover must interpolate"
+    );
+    assert!(focused_control_has_label(ui, "Open settings"));
+    assert_eq!(control_with_label(ui, "Open settings").geometry(), bounds);
+
+    let mut reduced = defaults.clone();
+    reduced.appearance.reduce_motion = true;
+    apply_config(ui, &reduced, None);
+    assert_eq!(
+        ui.global::<crate::StyleTokens>().get_interaction_duration(),
+        0
+    );
+    assert_eq!(
+        settings_hover_opacity(ui),
+        1.0,
+        "live preference interrupts visible motion"
+    );
+    assert_eq!(control_with_label(ui, "Open settings").geometry(), bounds);
+    assert!(focused_control_has_label(ui, "Open settings"));
+    ui.window().dispatch_event(WindowEvent::PointerExited);
+    assert_eq!(
+        settings_hover_opacity(ui),
+        0.0,
+        "reduced feedback has no delay"
+    );
+
+    apply_config(ui, &defaults, None);
+    assert_eq!(
+        ui.global::<crate::StyleTokens>().get_interaction_duration(),
+        90
+    );
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
+    assert_eq!(settings_hover_opacity(ui), 0.0);
+    ui.window()
+        .dispatch_event(WindowEvent::PointerMoved { position });
+    assert_eq!(settings_hover_opacity(ui), 0.0);
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
+    assert_eq!(settings_hover_opacity(ui), 1.0);
+    assert!(
+        !ui.window().has_active_animations(),
+        "settled feedback must become idle"
+    );
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(500));
+    assert_eq!(settings_hover_opacity(ui), 1.0);
+    assert!(!ui.window().has_active_animations());
+    ui.window().dispatch_event(WindowEvent::PointerExited);
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
+    assert_eq!(settings_hover_opacity(ui), 0.0);
+
+    let store = ConfigStore::at(config_path);
+    crate::appearance::install_callbacks(ui, &store);
+    for scale in [100, 200] {
+        let mut config = defaults.clone();
+        config.appearance.scale_percent = scale;
+        store.save(&config).unwrap();
+        apply_config(ui, &config, None);
+        ui.set_page(1);
+        settle(ui).await;
+        tab_to_control(ui, "Reduce motion, off");
+        key(ui, Key::Space);
+        assert!(store.load().unwrap().appearance.reduce_motion);
+        assert!(ui.global::<crate::StyleTokens>().get_reduced_motion());
+        assert_eq!(
+            ui.global::<crate::StyleTokens>().get_interaction_duration(),
+            0
+        );
+        assert!(focused_control_has_label(ui, "Reduce motion, on"));
+        key(ui, Key::Return);
+        assert!(!store.load().unwrap().appearance.reduce_motion);
+        assert!(!ui.global::<crate::StyleTokens>().get_reduced_motion());
+        assert!(focused_control_has_label(ui, "Reduce motion, off"));
+    }
+    let invalid = "[appearance\nreduce_motion = true\n";
+    std::fs::write(config_path, invalid).unwrap();
+    key(ui, Key::Space);
+    assert_eq!(std::fs::read_to_string(config_path).unwrap(), invalid);
+    assert!(!ui.global::<crate::StyleTokens>().get_reduced_motion());
+    assert!(!ui.get_config_error().is_empty());
+    store.save(&defaults).unwrap();
+    apply_config(ui, &store.load().unwrap(), None);
+    ui.set_config_error("".into());
+    ui.on_set_reduce_motion(|_| {});
+    ui.set_page(0);
+    settle(ui).await;
+}
+
 async fn assert_palette_and_density_keyboard(ui: &AppWindow) {
     use std::{cell::RefCell, rc::Rc};
 
@@ -1288,6 +1417,7 @@ async fn exercise_account_ui(runtime: Handle) {
     settle(&ui).await;
     assert_navigation_projection_and_focus(&ui).await;
     assert_accessible_action_focus_and_first_click(&ui).await;
+    assert_native_motion_and_preference(&ui, &directory.path().join("appearance.toml")).await;
     assert_palette_and_density_keyboard(&ui).await;
     assert_scale_keyboard_and_focus_bounds(&ui).await;
     assert_message_role_precedence_and_thread_metadata(&ui).await;

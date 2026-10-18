@@ -33,6 +33,18 @@ export struct ThemeRoleSet {
 export global StyleTokens {
     in-out property <length> radius: 10px;
     in-out property <ThemeRoleSet> roles;
+    in-out property <bool> reduced-motion: false;
+    out property <duration> interaction-duration: StyleTokens.reduced-motion ? 0ms : 90ms;
+}
+
+// Animate only the decorative hover layer. Selection colors, content, focus
+// outlines and hit geometry change immediately. The direct reduced-motion
+// branch also hides an in-flight transition as soon as the preference changes.
+component HoverSurface inherits Rectangle {
+    in property <bool> highlighted;
+    property <float> intensity: root.highlighted ? 1 : 0;
+    animate intensity { duration: StyleTokens.interaction-duration; easing: ease-out; }
+    opacity: StyleTokens.reduced-motion ? (root.highlighted ? 1 : 0) : root.intensity;
 }
 
 export struct EmojiItem {
@@ -253,12 +265,18 @@ component IconAction inherits Rectangle {
     width: 34px;
     height: 34px;
     border-radius: StyleTokens.radius * 0.9;
-    background: selected ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : hover-surface) : area.has-hover ? hover-surface : surface;
+    background: selected ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : hover-surface) : surface;
     forward-focus: keyboard-focus;
     accessible-role: button;
     accessible-label: label;
     accessible-enabled: enabled;
     accessible-action-default => { if root.enabled { root.activated(); } }
+    HoverSurface {
+        width: parent.width; height: parent.height; border-radius: parent.border-radius;
+        visible: !root.selected;
+        highlighted: root.enabled && area.has-hover;
+        background: root.hover-surface;
+    }
     if !root.vector-icon : Text {
         text: root.icon;
         color: root.selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink;
@@ -383,7 +401,13 @@ component NavigationRoomRow inherits ActionRect {
     height: max(root.direct ? (root.density-mode == 0 ? 32px : root.density-mode == 2 ? 47px : 39px)
         : (root.density-mode == 0 ? 30px : root.density-mode == 2 ? 44px : 36px), 22px * root.text-scale);
     border-radius: StyleTokens.radius * 0.8;
-    background: root.selected ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : self.has-hover ? root.elevated : transparent;
+    background: root.selected ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : transparent;
+    HoverSurface {
+        width: parent.width; height: parent.height; border-radius: parent.border-radius;
+        visible: !root.selected;
+        highlighted: root.enabled && root.has-hover;
+        background: root.elevated;
+    }
     focus-color: root.accent;
     label: root.room.voice-space ? (root.direct ? "Enter voice space with " : "Enter voice space ") + root.room.name
         : (root.direct ? "Open direct message with " : "Open room ") + root.room.name;
@@ -428,7 +452,13 @@ component NavigationTextAction inherits ActionRect {
     height: max(32px, 22px * root.text-scale + 8px); vertical-stretch: 0;
     reveal-full-control: true;
     border-radius: StyleTokens.radius * 0.8;
-    background: root.selected ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : self.has-hover ? root.hover : transparent;
+    background: root.selected ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : transparent;
+    HoverSurface {
+        width: parent.width; height: parent.height; border-radius: parent.border-radius;
+        visible: !root.selected;
+        highlighted: root.enabled && root.has-hover;
+        background: root.hover;
+    }
     focus-color: root.accent;
     label: root.text;
     Text {
@@ -454,8 +484,13 @@ component TextAction inherits ActionRect {
     border-radius: StyleTokens.radius * 0.7;
     border-width: 1px;
     border-color: outline;
-    background: self.enabled && self.has-hover ? hover-surface : surface;
+    background: surface;
     focus-color: ink;
+    HoverSurface {
+        width: parent.width; height: parent.height; border-radius: parent.border-radius;
+        highlighted: root.enabled && root.has-hover;
+        background: root.hover-surface;
+    }
     caption := Text {
         x: 12px * root.text-scale;
         width: parent.width - 24px * root.text-scale;
@@ -693,6 +728,7 @@ export component AppWindow inherits Window {
     callback choose-navigation-mode(int);
     callback set-show-space-labels(bool);
     callback set-group-direct-messages(bool);
+    callback set-reduce-motion(bool);
     property <int> navigation-focus-owner: -1;
     property <string> navigation-focus-token;
     function navigation-focus-changed(owner: int, token: string, focused: bool) {
@@ -2738,6 +2774,21 @@ export component AppWindow inherits Window {
                                     color: root.muted; font-size: 10px * root.text-scale; wrap: word-wrap; }
                             }
                         }
+                        ActionRect {
+                            height: 42px * root.text-scale;
+                            label: "Reduce motion" + (StyleTokens.reduced-motion ? ", on" : ", off");
+                            accessible-checkable: true;
+                            accessible-checked: StyleTokens.reduced-motion;
+                            background: self.has-hover ? root.hover : root.elevated;
+                            border-radius: StyleTokens.radius * 0.8; focus-color: root.accent;
+                            activated => { root.set-reduce-motion(!StyleTokens.reduced-motion); }
+                            HorizontalLayout { padding: 12px; spacing: 8px;
+                                Text { text: "Reduce motion"; color: root.ink; font-size: 12px * root.text-scale; horizontal-stretch: 1; }
+                                Text { text: StyleTokens.reduced-motion ? "On" : "Off"; color: root.accent; font-size: 12px * root.text-scale; }
+                            }
+                        }
+                        Text { text: "Use immediate hover feedback for buttons and navigation.";
+                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
                         Text { text: "Fonts"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         StyleFontSetting { label: "Interface font family"; family <=> root.appearance-ui-font-input;
                             ink: root.ink; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; }
