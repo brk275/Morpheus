@@ -645,8 +645,8 @@ component PendingRecordActions inherits VerticalLayout {
 
 // Saved send status for one composer scope: a quiet notice when saved data
 // needs review, then one block per record with its own exact controls. The
-// content keeps every record and action; the parent bounds the viewport with
-// `viewport-cap` and reads `content-height` to size itself. Focused controls are
+// content keeps every record and action; `viewport-cap` bounds its visible
+// height independently of the window's layout constraints. Focused controls are
 // scrolled into view by the ScrollView, so every action stays keyboard
 // reachable in a narrow pane or at large text sizes.
 component PendingSendStrip inherits ScrollView {
@@ -660,7 +660,7 @@ component PendingSendStrip inherits ScrollView {
     in property <color> outline;
     in property <float> text-scale: 1;
     in property <length> viewport-cap: 240px;
-    out property <length> content-height: content.preferred-height;
+    out property <length> natural-height: content.preferred-height;
     callback cancel(string);
     callback retry(string);
     callback review(string, bool);
@@ -669,10 +669,21 @@ component PendingSendStrip inherits ScrollView {
     callback discard(string);
     callback discard-unreadable();
     property <bool> narrow: self.width < 620px * root.text-scale;
-    height: min(root.viewport-cap, root.content-height);
+    min-width: 0px;
+    min-height: 0px;
+    height: min(root.viewport-cap, root.natural-height);
+    // Override Flickable's inferred content width: a child's intrinsic minimum
+    // must never enlarge the horizontal canvas and center the actions offscreen.
+    content-width: self.visible-width;
+    content-height: root.natural-height;
+    content-x: 0px;
     horizontal-scrollbar-policy: always-off;
     content := VerticalLayout {
-    width: root.width - 12px;
+    x: 0px; y: 0px;
+    width: root.visible-width;
+    height: self.preferred-height;
+    // Leave room for styles whose vertical scrollbar overlays the viewport.
+    padding-right: 16px;
     spacing: 8px;
     if root.blocked-notice != "" : VerticalLayout {
         spacing: 4px;
@@ -2666,7 +2677,6 @@ export component AppWindow inherits Window {
                         composer-status := PendingSendStrip {
                             x: 22px; y: (root.composer-mode == 0 ? 2px : 33px) + (root.attachment-busy ? 29px : 0px);
                             width: parent.width - 44px;
-                            viewport-cap: max(96px, root.height / 3);
                             items: root.composer-pending-items; blocked-notice: root.composer-blocked-notice;
                             composer-empty: root.composer-text == "";
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
@@ -4415,7 +4425,6 @@ export component AppWindow inherits Window {
                         height: max(64px, 1.5 * root.message-font-px + 24px) + self.status-height; background: root.panel;
                         thread-status := PendingSendStrip {
                             x: 10px; y: 6px; width: parent.width - 20px;
-                            viewport-cap: max(96px, root.height / 3);
                             items: root.thread-pending-items; blocked-notice: root.thread-blocked-notice;
                             composer-empty: root.thread-composer-text == "";
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
