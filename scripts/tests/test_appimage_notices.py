@@ -43,6 +43,42 @@ class ParseTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(N.InventoryFailure):
                 N.parse_elf_report(bad)
 
+    def test_elf_failures_identify_the_rejected_check_without_report_contents(self):
+        good = "Build ID: " + "a" * 40 + "\n"
+        cases = [
+            ("", "elf_build_id"), (good + good, "elf_build_id"),
+            ("Build ID: abc\n", "elf_build_id"),
+            (good + "0 (NEEDED) Shared library: [../private.so]\n", "elf_needed"),
+            (good + "0 (NEEDED) Shared library: [libc.so.6]\n" * 2, "elf_needed"),
+            (good + "0 (SONAME) Library soname: [liba.so]\n" * 2, "elf_soname"),
+            (good + "0 (SONAME) Library soname: [../private.so]\n", "elf_soname"),
+            (good + "0 (RPATH) Library rpath: [$ORIGIN]\n0 (RUNPATH) Library runpath: [$ORIGIN]\n", "elf_search"),
+        ]
+        for report, reason in cases:
+            with self.subTest(reason=reason), self.assertRaises(N.InventoryFailure) as caught:
+                N.parse_elf_report(report)
+            self.assertEqual(caught.exception.reason, reason)
+            self.assertNotIn("private", str(caught.exception))
+
+    def test_elf_role_labels_are_closed_and_never_execute_inspected_objects(self):
+        runner = mock.Mock()
+        runner.run.return_value = b"Build ID: " + b"a" * 40 + b"\n"
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            path = root / "object"
+            path.write_bytes(elf_bytes())
+            with mock.patch.object(N, "root_owned", return_value=Path("/usr/bin/readelf")):
+                for label in ("inventory-elf", "inventory-elf-client", "inventory-elf-dependency", "inventory-elf-deployed"):
+                    N.elf_record(runner, path, root, {}, label)
+                    self.assertEqual(runner.run.call_args.args[0], label)
+                    self.assertEqual(runner.run.call_args.args[1],
+                                     ["/usr/bin/readelf", "--wide", "--dynamic", "--notes", str(path)])
+                runner.reset_mock()
+                for label in ("private-object-name", [], None):
+                    with self.assertRaises(N.InventoryFailure):
+                        N.elf_record(runner, path, root, {}, label)
+                runner.run.assert_not_called()
+
     def test_package_source_and_version_must_be_exact_bounded_fields(self):
         source = "libsample1:amd64\t1.2-3ubuntu4\tsample\t1.2-3ubuntu4\n"
         self.assertEqual(N.parse_package_record(source, "libsample1:amd64")["source_package"], "sample")
