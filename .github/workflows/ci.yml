@@ -1,4 +1,4 @@
-name: Recovery helper diagnostic
+name: Native preview helper diagnostic
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   helper:
-    name: Recovery acceptance helper checks only
+    name: Native preview contract helper checks only
     if: github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/codex/draft-recovery-helper-probe' && github.event_name == 'workflow_dispatch' && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -38,7 +38,14 @@ jobs:
             --config "$RUNNER_TEMP/gitleaks-default.toml" \
             --gitleaks-ignore-path "$RUNNER_TEMP/gitleaks-empty.ignore" \
             --log-opts=--all .
-      - name: Test reviewed recovery acceptance helpers
-        run: python3 -m unittest discover -s scripts/tests -p test_matrix_acceptance.py -v
+      - name: Check the exact reviewed native workflow as source data
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show 3fb712484b41abf9d913e77d9468bdc4f535401e:.github/workflows/ci.yml > "$RUNNER_TEMP/reviewed-native-ci.yml"
+          echo "df7218b7d027e6ad437ca9743595237fff64c80712cdfaa2d5522e3f25451ac8  $RUNNER_TEMP/reviewed-native-ci.yml" | sha256sum --check --status
+          cp "$RUNNER_TEMP/reviewed-native-ci.yml" .github/workflows/ci.yml
+      - name: Test native preview codec and exact frame contracts
+        run: python3 -m unittest discover -s scripts/tests -p test_encode_preview_pngs.py -v
       # No Rust, native, live Matrix, package or release check runs here.
       # Temporary diagnostic workflow: never merge this file into main.
