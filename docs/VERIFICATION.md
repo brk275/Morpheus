@@ -35,6 +35,26 @@ README cleanup; all non-Markdown file modes and blob IDs match that tested
 snapshot. These results establish the selected native checks, not installed
 interaction, screen-reader behavior, physical media, signing or beta readiness.
 
+## Installed Linux keyboard check: `4037b3a`
+
+[Run 39079458014](https://github.com/brk275/Morpheus/actions/runs/39079458014)
+built the ordinary unsigned AppImage and passed license/theme resources,
+desktop metadata, the ELF baseline, owned X11 startup/stop and all three
+sign-in field checks, including the protected password role. Its AppImage
+SHA-256 is `3ad34a5bf00cd2f13f8d5ab7cf369c19ba3b6339f5592639f4d08b9ee369dd6c`.
+
+The installed account-menu keyboard phase timed out. Its fixed diagnostics
+reported an incomplete accessibility traversal and unavailable child-count
+calls; those observations do not establish the underlying cause. Appearance
+interaction and normal close were not reached. Cleanup passed, all jobs/cache
+posts completed, complete logs scanned with zero credential findings and no
+installer artifact was uploaded.
+
+The next diagnostic change adds exact menu checkpoints and fixed focus
+categories. It preserves the same keyboard sequence, ownership, unique-match,
+complete-traversal and focus assertions, plus the existing time limits. This
+instrumentation is not a fix or evidence that the installed interaction passes.
+
 ## Installed Linux keyboard progress: `cad1abc`
 
 [Run 39057685675](https://github.com/brk275/Morpheus/actions/runs/39057685675)
