@@ -1,17 +1,27 @@
 # TEMPORARY owner-selected native diagnostic. NEVER MERGE into main.
 # The unchanged system PipeWire first-frame failure remains an OPEN release gate.
-# This run compiles/tests all four supported targets and live recovery only.
-name: Beta native diagnostic - release gates remain open
+# Two nonoverlapping dispatches cover all four targets at one reviewed source.
+# Each dispatch proves only its explicitly selected targets; release gates remain open.
+name: Beta native diagnostic - selected platforms only
+run-name: Native candidate ${{ inputs.platform_group }} - release gates open
 
 on:
   workflow_dispatch:
+    inputs:
+      platform_group:
+        description: Nonoverlapping subset; both groups are required for the complete native matrix
+        required: true
+        type: choice
+        options:
+          - arm-and-windows
+          - intel-and-linux
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: native-diagnostic-${{ github.ref }}-${{ inputs.platform_group }}
+  cancel-in-progress: false
 
 env:
   CARGO_BUILD_JOBS: "2"
@@ -67,12 +77,27 @@ jobs:
             --config "$RUNNER_TEMP/morpheus-gitleaks-default.toml" \
             --gitleaks-ignore-path "$RUNNER_TEMP/morpheus-gitleaks-empty.ignore" \
             --log-opts=--all .
-      - name: Select checks from changed inputs using reviewed classifier
+      - name: Select only the explicit nonoverlapping native group
         id: scope
-        working-directory: candidate
-        # Isolated mode excludes the candidate working directory and Python
-        # environment hooks from import lookup. The classifier uses stdlib only.
-        run: python3 -I ../trusted/scripts/ci_scope.py --github-event
+        env:
+          PLATFORM_GROUP: ${{ inputs.platform_group }}
+        shell: bash
+        run: |
+          python3 -I -B - <<'PY_NATIVE_GROUP'
+          import json
+          import os
+
+          groups = {
+              "arm-and-windows": ["macos-15", "windows-2025"],
+              "intel-and-linux": ["macos-15-intel", "ubuntu-24.04"],
+          }
+          selected = groups.get(os.environ.get("PLATFORM_GROUP"))
+          if selected is None:
+              raise SystemExit("An explicit supported platform group is required.")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("native=true\nconfig=false\n")
+              output.write("native_matrix=" + json.dumps({"os": selected}) + "\n")
+          PY_NATIVE_GROUP
 
   helpers:
     name: Validation helper tests
