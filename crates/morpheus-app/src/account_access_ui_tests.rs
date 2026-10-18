@@ -688,9 +688,9 @@ async fn assert_native_motion_and_preference(ui: &AppWindow, config_path: &std::
 }
 
 async fn assert_lazy_timeline_view(ui: &AppWindow) {
-    use crate::timeline_model::{projection_count, tests::fixture, update};
+    use crate::timeline_model::{projection_count, tests::fixture, update_shared};
     use slint::private_unstable_api::re_exports::{AccessibleStringProperty, ItemRc, WindowInner};
-    use std::ops::ControlFlow;
+    use std::{ops::ControlFlow, sync::Arc};
 
     let has_label = |label: &str| {
         let window = WindowInner::from_pub(ui.window());
@@ -710,9 +710,9 @@ async fn assert_lazy_timeline_view(ui: &AppWindow) {
     };
     ui.set_page(0);
     ui.set_font_scale_percent(100);
-    let mut rows: Vec<_> = (0..10_000).map(fixture).collect();
+    let mut rows: Vec<_> = (0..10_000).map(|i| Arc::new(fixture(i))).collect();
     let original = rows[0].body.clone();
-    let model = update(ModelRc::default(), rows.clone());
+    let model = update_shared(ModelRc::default(), rows.clone());
     assert_eq!(projection_count(&model), 0);
     ui.set_messages(model.clone());
     settle(ui).await;
@@ -723,10 +723,11 @@ async fn assert_lazy_timeline_view(ui: &AppWindow) {
     );
     assert!(has_label(&original));
 
-    rows[0].body = "Updated visible timeline fixture".into();
-    rows[0].rich_markdown = Some(rows[0].body.clone());
-    rows[0].rich_accessible = Some(rows[0].body.clone());
-    let changed = update(ui.get_messages(), rows.clone());
+    let edited = Arc::make_mut(&mut rows[0]);
+    edited.body = "Updated visible timeline fixture".into();
+    edited.rich_markdown = Some(edited.body.clone());
+    edited.rich_accessible = Some(edited.body.clone());
+    let changed = update_shared(ui.get_messages(), rows.clone());
     assert_eq!(changed, model, "an edit must retain the live model");
     ui.set_messages(changed);
     settle(ui).await;
@@ -738,8 +739,8 @@ async fn assert_lazy_timeline_view(ui: &AppWindow) {
         "editing one row must not format the entire history"
     );
 
-    rows.push(fixture(10_000));
-    let appended = update(ui.get_messages(), rows);
+    rows.push(Arc::new(fixture(10_000)));
+    let appended = update_shared(ui.get_messages(), rows);
     assert_eq!(appended, model);
     ui.set_messages(appended);
     settle(ui).await;
