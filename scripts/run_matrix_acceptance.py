@@ -93,8 +93,20 @@ DRAFTS_STAGES = frozenset((
     "stop_primary", "plaintext_scan", "reopen", "restore_carol", "switch_alice",
     "verify_alice", "clear_alice", "logout_alice", "switch_carol", "verify_carol",
     "logout_carol", "stop_final", "cleanup", "complete",
+    "recovery_fixture", "recovery_prepare", "recovery_wrong_owner", "recovery_cancel",
+    "recovery_crash", "recovery_adopt", "recovery_reselect", "recovery_missing_id",
+    "recovery_quarantine", "recovery_unsupported", "recovery_coverage",
+    "recovery_stop", "recovery_cleanup", "recovery_complete",
 ))
 DRAFTS_STAGE = re.compile(r"^MORPHEUS_DRAFTS_STAGE ([a-z_]{1,48})$", re.MULTILINE)
+APP_RECOVERY_LABEL = "app-draft-recovery"
+APP_RECOVERY_CASES = frozenset((
+    "observer_revocation", "interrupted_prepare", "rollback_race", "writer_transaction",
+    "thread_index", "release_revocation", "write_revocation", "writer_lock_revocation",
+    "typed_retention", "late_typing_retention", "revoked_retention", "thread_retention",
+))
+APP_RECOVERY_STAGE = re.compile(r"^MORPHEUS_APP_RECOVERY_STAGE ([a-z_]{1,48})$", re.MULTILINE)
+APP_RECOVERY_CHECK = re.compile(r"^MORPHEUS_APP_RECOVERY_CHECK ([a-z_]{1,48})=(true|false)$", re.MULTILINE)
 LATE_JOIN_EVIDENCE = re.compile(r"^MORPHEUS_RTC_LATE_JOIN historical_member=(true|false)$", re.MULTILINE)
 LATE_JOIN_DECRYPT_RESULTS = frozenset((
     "decrypted", "MissingMegolmSession", "UnknownMegolmMessageIndex", "otherUTD", "unavailable",
@@ -317,7 +329,7 @@ ELEMENT_TEST_STAGES = frozenset((
     "browser_leave", "native_test", "complete",
 ))
 RTC_CHECKS = ("unsupported_transport_local", *RING_LABELS, *RTC_LABELS, ELEMENT_LABEL)
-PLANNED_CHECKS = (*CHAT_CHECKS, "recovery_local", *OAUTH_LABELS, *RTC_CHECKS)
+PLANNED_CHECKS = (*CHAT_CHECKS, APP_RECOVERY_LABEL, "recovery_local", *OAUTH_LABELS, *RTC_CHECKS)
 # Leave a full minute before the workflow's 55-minute hard kill. Work stops
 # with eleven minutes left: up to three for nested OAuth/Element cleanup, then
 # eight for both shared-service cleanups, checked inventories and log scans.
@@ -365,6 +377,37 @@ def drafts_diagnostics(output: str) -> dict:
             result["test_entered"] |= stage == "fixture"
             result["stage"] = stage
     return result
+
+
+def drafts_completed(output: str) -> bool:
+    # Either test order is valid; both fixtures must enter and finish cleanup.
+    stages = {match[1] for match in DRAFTS_STAGE.finditer(output)
+              if match[1] in DRAFTS_STAGES}
+    return {"fixture", "complete", "recovery_fixture", "recovery_complete"} <= stages
+
+
+def app_recovery_diagnostics(output: str) -> dict:
+    result = {}
+    for match in APP_RECOVERY_STAGE.finditer(output):
+        if match[1] in APP_RECOVERY_CASES:
+            result["stage"] = match[1]
+    return result
+
+
+def app_recovery_evidence(output: str) -> dict[str, bool]:
+    checks = {}
+    for match in APP_RECOVERY_CHECK.finditer(output):
+        name, value = match[1], match[2]
+        if name in APP_RECOVERY_CASES:
+            if name in checks or value != "true":
+                raise RuntimeError("Live app recovery evidence is incomplete")
+            checks[name] = True
+    entered = {match[1] for match in APP_RECOVERY_STAGE.finditer(output)
+               if match[1] in APP_RECOVERY_CASES}
+    if (passed_tests(output) != len(APP_RECOVERY_CASES)
+            or entered != APP_RECOVERY_CASES or checks.keys() != APP_RECOVERY_CASES):
+        raise RuntimeError("Live app recovery evidence is incomplete")
+    return {name: True for name in sorted(APP_RECOVERY_CASES)}
 
 
 def native_process_diagnostics(output: str, returncode, timed_out: bool) -> dict:
@@ -780,6 +823,9 @@ class Acceptance:
                 evidence["native_process"] = native_process_diagnostics(output, observed_returncode, timed_out)
                 if timed_out:
                     evidence["drafts_diagnostics"]["failure"] = "deadline"
+            if label == APP_RECOVERY_LABEL:
+                evidence["app_recovery_diagnostics"] = app_recovery_diagnostics(output)
+                evidence["native_process"] = native_process_diagnostics(output, observed_returncode, timed_out)
             if fixture_diagnostics := matrix_fixture_diagnostics(output):
                 if timed_out:
                     fixture_diagnostics["failure"] = "deadline"
@@ -859,10 +905,12 @@ class Acceptance:
             record["live_diagnostics"] = diagnostics
         if label == "drafts_local":
             diagnostics = drafts_diagnostics(output)
-            if not diagnostics["test_entered"] or diagnostics.get("stage") != "complete":
+            if record.get("passed") != 2 or not drafts_completed(output):
                 print(json.dumps({"check": label, "drafts_diagnostics": diagnostics}), flush=True)
                 raise RuntimeError("Draft restart acceptance completion evidence is incomplete")
             record["drafts_diagnostics"] = diagnostics
+        if label == APP_RECOVERY_LABEL:
+            record["app_recovery_checks"] = app_recovery_evidence(output)
         if label == "moderation_local":
             # A green moderation result must exercise an existing, unverified
             # account identity on this fresh device without changing trust.
@@ -895,6 +943,16 @@ class Acceptance:
         if env.get("MORPHEUS_RTC_LATE_JOIN") == "1":
             label += "-late-join"
         self.run(label, args, extra=env, test=True, pid_namespace=True)
+
+    def app_recovery(self, fixture: Path):
+        self.run(
+            APP_RECOVERY_LABEL,
+            ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
+             "--bin", "morpheus-app", "live::stale_observer_tests::", "--",
+             "--nocapture", "--test-threads=1"],
+            extra={"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture)},
+            test=True, pid_namespace=True,
+        )
 
     def rtc_cases(self):
         # Every run gets different users/room: existing devices and keys would
@@ -1117,6 +1175,7 @@ def main():
                 formatted_passed = succeeded
         acceptance.group(("search_local-classic",), lambda: acceptance.test(
             "search_local", fixture, extra={"MORPHEUS_MATRIX_SEARCH_CLASSIC": "1"}))
+        acceptance.group((APP_RECOVERY_LABEL,), lambda: acceptance.app_recovery(fixture))
         def recovery_case():
             recovery = fixture_from_output(acceptance.script("local_matrix_env", "recovery-fixture"), root)
             acceptance.test("recovery_local", recovery, extra={"MORPHEUS_MATRIX_TEST_RECOVERY": "1"})

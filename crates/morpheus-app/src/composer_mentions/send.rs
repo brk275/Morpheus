@@ -1,12 +1,18 @@
 //! Shared live send adapter. Queue acceptance never clears a reply/edit/thread;
 //! every UI completion is bound to the selection, scope and local edit revision.
+//!
+//! Room and thread sends are recorded in the encrypted draft row before the
+//! SDK sees them and resolved only by their exact transaction id. Replies and
+//! edits have no durable draft and keep the in-session lease only. Every wait
+//! on the SDK ends with the account selection, and every exit path releases
+//! the lease it held, so a paused queue or a switch cannot pin a scope.
 
 use super::{
     Scope, Target,
     ui::{ComposerUi, Submission},
 };
-use crate::{AppWindow, live::LiveUi};
-use morpheus_matrix::QueuedSendUpdate;
+use crate::{AppWindow, draft_recovery::SendScope, live::LiveUi};
+use morpheus_matrix::{AccountSelection, QueuedSendUpdate};
 use slint::ComponentHandle;
 use std::sync::Arc;
 use tokio::runtime::Handle;
@@ -17,13 +23,28 @@ const MAX_PENDING_SCOPES: usize = 64;
 pub(super) struct SendLease {
     scope: Scope,
     identity: Arc<()>,
+    /// The selection the send runs under; a lease outlives it only until the
+    /// next reservation, which evicts leases of departed selections.
+    selection: Option<AccountSelection>,
 }
 #[derive(Default)]
 pub(super) struct SendLedger {
     leases: Vec<SendLease>,
 }
 impl SendLedger {
-    pub(super) fn reserve(&mut self, scope: Scope) -> Option<SendLease> {
+    pub(super) fn reserve(
+        &mut self,
+        scope: Scope,
+        selection: Option<AccountSelection>,
+    ) -> Option<SendLease> {
+        // Leases of a revoked selection can never complete; drop them so a
+        // switch or removal cannot leave a scope blocked or the ledger full.
+        self.leases.retain(|lease| {
+            lease
+                .selection
+                .as_ref()
+                .is_none_or(AccountSelection::is_current)
+        });
         if self.leases.len() >= MAX_PENDING_SCOPES
             || self.leases.iter().any(|lease| lease.scope == scope)
         {
@@ -32,6 +53,7 @@ impl SendLedger {
         let lease = SendLease {
             scope,
             identity: Arc::new(()),
+            selection,
         };
         self.leases.push(lease.clone());
         Some(lease)
@@ -44,6 +66,17 @@ impl SendLedger {
         };
         self.leases.remove(index);
         true
+    }
+}
+
+fn send_scope(submission: &Submission) -> SendScope {
+    SendScope {
+        account: submission.scope.account.clone(),
+        room: submission.scope.room.clone(),
+        thread: match &submission.scope.target {
+            Target::Thread(root) => Some(root.clone()),
+            _ => None,
+        },
     }
 }
 
@@ -78,38 +111,42 @@ impl ComposerUi {
                 return;
             }
         };
-        let Some(lease) = self.reserve_send(&submission.scope) else {
-            if !threaded {
-                window.set_composer_busy(true);
-            }
-            window.set_transfer_notice("A previous send is still queued or unconfirmed; it may still send. Check the conversation after restarting before retrying.".into());
-            return;
-        };
-        let account = &submission.scope.account;
-        let room = &submission.scope.room;
-        let thread = match &submission.scope.target {
-            Target::Thread(root) => Some(root.as_str()),
-            _ => None,
-        };
-        if let Some(root) = thread {
-            if !live.begin_thread_send(account, room, root) {
-                self.release_send(&lease);
-                window
-                    .set_transfer_notice("Thread reply is still queued; it may still send".into());
+        let durable = matches!(submission.scope.target, Target::Room | Target::Thread(_));
+        let scope = send_scope(&submission);
+        if durable {
+            let summary = live.pending_summary(&scope.account, &scope.room, scope.thread());
+            if summary.blocks_sends() {
+                if !threaded {
+                    window.set_composer_busy(false);
+                }
+                window.set_transfer_notice(if summary.unconfirmed {
+                    "An earlier message here may not have finished sending. Check the conversation and choose before sending again."
+                } else {
+                    "Saved send status here must be reviewed before sending."
+                }.into());
                 return;
             }
         }
-        let durable = matches!(submission.scope.target, Target::Room | Target::Thread(_));
+        let Some(lease) = self.reserve_send(&submission.scope, &submission.selection) else {
+            if !threaded {
+                window.set_composer_busy(true);
+            }
+            window.set_transfer_notice(
+                "A previous send is still being recorded; wait a moment before retrying.".into(),
+            );
+            return;
+        };
         if durable
             && live
-                .remember_composed_draft(account, room, thread, submission.text.clone())
+                .remember_composed_draft(
+                    &scope.account,
+                    &scope.room,
+                    scope.thread(),
+                    submission.text.clone(),
+                )
                 .is_err()
         {
-            if self.release_send(&lease) {
-                if let Some(root) = thread {
-                    live.finish_thread_send(account, room, root);
-                }
-            }
+            self.release_send(&lease);
             if !threaded {
                 window.set_composer_busy(false);
             }
@@ -117,10 +154,8 @@ impl ComposerUi {
                 .set_session_error("Could not retain this draft. The message was not sent.".into());
             return;
         }
-        let revision = if let Some(root) = thread {
-            live.thread_draft_revision(account, room, root)
-        } else if durable {
-            live.draft_revision(account, room)
+        let revision = if durable {
+            live.scoped_revision(&scope.account, &scope.room, scope.thread())
         } else {
             None
         };
@@ -132,104 +167,189 @@ impl ComposerUi {
         let live = live.clone();
         let weak = window.as_weak();
         runtime.spawn(async move {
+            let selection = submission.selection.clone();
+            let fail = |message: &'static str, release: bool| {
+                let shown = submission.clone();
+                let current = live.clone();
+                let composer = owner.clone();
+                let lease = lease.clone();
+                let _ = weak.upgrade_in_event_loop(move |window| {
+                    if release {
+                        composer.release_send(&lease);
+                    }
+                    if visible(&window, &shown, operation) {
+                        if release && !threaded {
+                            window.set_composer_busy(false);
+                        }
+                        crate::draft_recovery::publish_scope(&window, &current, &send_scope(&shown));
+                        window.set_session_error(message.into());
+                    }
+                });
+            };
+            // Room and thread sends are saved as pending, with the room's
+            // thread index, before the SDK assigns a transaction id. The core
+            // then issues the single-use enqueue grant for that record.
+            let handle = if durable {
+                let Some(revision) = revision else {
+                    fail("Could not record this message's send status. It was not sent; your text is retained.", true);
+                    return;
+                };
+                match live
+                    .prepare_pending_send(&selection, &scope, &submission.text, revision)
+                    .await
+                {
+                    Ok(handle) => Some(handle),
+                    Err(error) => {
+                        let message = error.to_string();
+                        let shown = submission.clone();
+                        let current = live.clone();
+                        let composer = owner.clone();
+                        let _ = weak.upgrade_in_event_loop(move |window| {
+                            composer.release_send(&lease);
+                            if visible(&window, &shown, operation) {
+                                if !threaded { window.set_composer_busy(false); }
+                                crate::draft_recovery::publish_scope(&window, &current, &send_scope(&shown));
+                                window.set_session_error(message.into());
+                            }
+                        });
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             let result = live.send_composed(
-                submission.selection.clone(), submission.scope.room.clone(), submission.target(),
-                trimmed, submission.baseline.clone(),
+                selection.clone(), submission.scope.room.clone(), submission.target(),
+                trimmed, submission.baseline.clone(), handle.as_ref().map(|handle| handle.nonce()),
             ).await;
+            // The selection is checked again after every await before the
+            // cache is touched: a switch, removal or A->B->A while the core
+            // call ran leaves the departed account's cache exactly as it was.
+            // The saved enqueuing record outlives this process's ownership and
+            // is reviewed by the next discovery, never abandoned or guessed.
             let mut queued = match result {
+                Ok(_) | Err(_) if !crate::draft_recovery::still_owned(&selection, &scope) => {
+                    fail(
+                        "Send could not be confirmed; the request may still send. Your text is retained. Check the conversation, then choose.",
+                        handle.is_some(),
+                    );
+                    return;
+                }
                 Ok(queued) => queued,
+                Err(morpheus_matrix::MatrixCoreError::SelectedAccountChanged) => {
+                    fail(
+                        "Send could not be confirmed; the request may still send. Your text is retained. Check the conversation, then choose.",
+                        handle.is_some(),
+                    );
+                    return;
+                }
                 Err(error) => {
-                    let uncertain = matches!(error, morpheus_matrix::MatrixCoreError::ComposedSendUncertain);
-                    if !uncertain && owner.release_send(&lease) {
-                        if let Target::Thread(root) = &submission.scope.target {
-                            live.finish_thread_send(&submission.scope.account, &submission.scope.room, root);
+                    // An uncertain outcome cannot tell whether the request was
+                    // stored; the record is reviewed, not abandoned.
+                    let uncertain = matches!(
+                        error,
+                        morpheus_matrix::MatrixCoreError::ComposedSendUncertain
+                    );
+                    if let Some(handle) = &handle {
+                        if uncertain {
+                            // The SDK may hold the request without our id: the
+                            // saved enqueuing record stays, marked for review.
+                            live.mark_pending_unconfirmed(&selection, &scope, handle.nonce()).await;
+                        } else {
+                            live.abandon_pending_send(&selection, &scope, handle.nonce()).await;
                         }
                     }
-                    let _ = weak.upgrade_in_event_loop(move |window| {
-                        if visible(&window, &submission, operation) {
-                            if !uncertain {
-                                if let Target::Thread(root) = &submission.scope.target {
-                                    window.set_thread_send_pending(live.thread_send_pending(&submission.scope.account, &submission.scope.room, root));
-                                } else { window.set_composer_busy(false); }
-                            }
-                            window.set_session_error(if uncertain {
-                                "Send could not be confirmed; the request may still send. Your text is retained. Restart, then check the conversation before retrying."
-                            } else {
-                                "The message could not be prepared. Your text and selected mentions are retained; an edit may need to be reopened."
-                            }.into());
-                        }
-                    });
+                    // A durable record now guards the scope, so its lease can
+                    // go; an uncertain reply or edit keeps the in-session lease
+                    // until the selection changes.
+                    let release = !uncertain || handle.is_some();
+                    fail(
+                        if uncertain {
+                            "Send could not be confirmed; the request may still send. Your text is retained. Check the conversation, then choose."
+                        } else {
+                            "The message could not be prepared. Your text and selected mentions are retained; an edit may need to be reopened."
+                        },
+                        release,
+                    );
                     return;
                 }
             };
+            let transaction = queued.transaction_id().to_owned();
+            // The exact transaction id is saved before any acknowledgement is
+            // acted on; an unchanged composer is cleared, the record holds the
+            // submitted text.
+            let hidden = match &handle {
+                Some(handle) => live
+                    .record_pending_queued(&selection, &scope, handle, &transaction)
+                    .await
+                    .unwrap_or(false),
+                None => false,
+            };
             let room_send = matches!(submission.scope.target, Target::Room);
-            let tracked = room_send && revision.is_some_and(|revision| live.mark_composed_queued(
-                &submission.scope.account, &submission.scope.room, &submission.text, revision,
-                queued.transaction_id(),
-            ));
-            if room_send {
-                owner.release_send(&lease);
-                let shown = submission.clone(); let current = live.clone(); let composer = owner.clone();
+            {
+                let shown = submission.clone();
+                let current = live.clone();
+                let composer = owner.clone();
+                let lease = lease.clone();
                 let _ = weak.upgrade_in_event_loop(move |window| {
+                    if room_send {
+                        // Several room messages may wait at once; the lease
+                        // covered only the recording window.
+                        composer.release_send(&lease);
+                    }
                     if visible(&window, &shown, operation) {
-                        if tracked { composer.complete(&window, &current, &shown); }
-                        window.set_composer_busy(false);
+                        if hidden { composer.complete(&window, &current, &shown); }
+                        if room_send { window.set_composer_busy(false); }
+                        crate::draft_recovery::publish_scope(&window, &current, &send_scope(&shown));
                     }
                 });
             }
-            let transaction = queued.transaction_id().to_owned();
             loop {
-                let update = queued.next_update().await;
-                let mut restored = false;
-                let mut cleared_revision = None;
-                if room_send && tracked && matches!(update, QueuedSendUpdate::Sent | QueuedSendUpdate::Cancelled) {
-                    restored = live.resolve_queued_draft(&submission.scope.account, &submission.scope.room,
-                        &transaction, update == QueuedSendUpdate::Sent);
-                }
-                if let Target::Thread(root) = &submission.scope.target {
-                    if update == QueuedSendUpdate::Sent {
-                        cleared_revision = revision.and_then(|revision| live.acknowledge_composed_thread(
-                            &submission.scope.account, &submission.scope.room, root, &submission.text, revision,
-                        ));
+                // A paused queue may never emit again: the wait ends with the
+                // selection, and the lease goes with it.
+                let update = tokio::select! {
+                    _ = selection.revoked() => {
+                        owner.release_send(&lease);
+                        return;
                     }
-                    if matches!(update, QueuedSendUpdate::Sent | QueuedSendUpdate::Cancelled) && owner.release_send(&lease) {
-                        live.finish_thread_send(&submission.scope.account, &submission.scope.room, root);
-                    }
-                }
-                if !threaded && !room_send && matches!(update, QueuedSendUpdate::Sent | QueuedSendUpdate::Cancelled) {
+                    update = queued.next_update() => update,
+                };
+                if !selection.is_current() {
                     owner.release_send(&lease);
+                    return;
                 }
                 let terminal = matches!(update, QueuedSendUpdate::Sent | QueuedSendUpdate::Cancelled | QueuedSendUpdate::Unknown);
-                let shown = submission.clone(); let current = live.clone(); let composer = owner.clone();
-                let _ = weak.upgrade_in_event_loop(move |window| {
-                    if !visible(&window, &shown, operation) { return; }
-                    if let Target::Thread(root) = &shown.scope.target {
-                        window.set_thread_send_pending(current.thread_send_pending(&shown.scope.account, &shown.scope.room, root));
+                if let Some(handle) = &handle {
+                    live.apply_pending_update(&selection, &scope, handle.nonce(), &transaction, update, &weak).await;
+                    if terminal && !room_send && owner.release_send(&lease) {
+                        let shown = submission.clone();
+                        let current = live.clone();
+                        let _ = weak.upgrade_in_event_loop(move |window| {
+                            if visible(&window, &shown, operation) {
+                                crate::draft_recovery::publish_scope(&window, &current, &send_scope(&shown));
+                            }
+                        });
                     }
-                    if update == QueuedSendUpdate::Sent && !room_send {
-                        let may_clear = match &shown.scope.target {
-                            Target::Thread(root) => cleared_revision.is_some()
-                                && current.thread_draft_revision(&shown.scope.account, &shown.scope.room, root) == cleared_revision,
-                            _ => true,
-                        };
-                        if may_clear { composer.complete(&window, &current, &shown); }
+                } else {
+                    // Replies and edits: lease only, no durable record. An
+                    // unknown outcome keeps the lease until the selection ends.
+                    if matches!(update, QueuedSendUpdate::Sent | QueuedSendUpdate::Cancelled) {
+                        owner.release_send(&lease);
                     }
-                    if update == QueuedSendUpdate::Cancelled && room_send && restored
-                        && window.get_composer_mode() == 0 && window.get_composer_text().is_empty() {
-                        composer.restore_normal(&window, &current);
-                    }
-                    if !threaded && !room_send && matches!(update, QueuedSendUpdate::Sent | QueuedSendUpdate::Cancelled) {
-                        window.set_composer_busy(false);
-                    }
-                    let notice = match update {
-                        QueuedSendUpdate::Sent => "Message sent",
-                        QueuedSendUpdate::Cancelled => "Queued message cancelled; draft retained",
-                        QueuedSendUpdate::Retained { recoverable: true } => "Message queued for retry; it may still send",
-                        QueuedSendUpdate::Retained { recoverable: false } => "Message send paused; the request remains queued. Do not send a duplicate",
-                        QueuedSendUpdate::Unknown => "Could not confirm send; the request may still send. Restart, then check the conversation before sending again",
-                    };
-                    window.set_transfer_notice(notice.into());
-                });
+                    let shown = submission.clone();
+                    let current = live.clone();
+                    let composer = owner.clone();
+                    let _ = weak.upgrade_in_event_loop(move |window| {
+                        if !visible(&window, &shown, operation) { return; }
+                        if update == QueuedSendUpdate::Sent {
+                            composer.complete(&window, &current, &shown);
+                        }
+                        if matches!(update, QueuedSendUpdate::Sent | QueuedSendUpdate::Cancelled) {
+                            window.set_composer_busy(false);
+                        }
+                        window.set_transfer_notice(crate::draft_recovery::update_notice(update, None).into());
+                    });
+                }
                 if terminal { break; }
             }
         });
@@ -271,17 +391,17 @@ mod tests {
     fn pending_scope_blocks_duplicates_but_not_other_accounts_or_threads() {
         let mut ledger = SendLedger::default();
         let lease = ledger
-            .reserve(scope("a", Target::Thread("$one".into())))
+            .reserve(scope("a", Target::Thread("$one".into())), None)
             .unwrap();
-        assert!(ledger.reserve(lease.scope.clone()).is_none());
+        assert!(ledger.reserve(lease.scope.clone(), None).is_none());
         assert!(
             ledger
-                .reserve(scope("b", Target::Thread("$one".into())))
+                .reserve(scope("b", Target::Thread("$one".into())), None)
                 .is_some()
         );
         assert!(
             ledger
-                .reserve(scope("a", Target::Thread("$two".into())))
+                .reserve(scope("a", Target::Thread("$two".into())), None)
                 .is_some()
         );
     }
@@ -289,27 +409,27 @@ mod tests {
     fn old_completion_cannot_release_new_same_scope_after_return() {
         let mut ledger = SendLedger::default();
         let scope = scope("a", Target::Room);
-        let old = ledger.reserve(scope.clone()).unwrap();
+        let old = ledger.reserve(scope.clone(), None).unwrap();
         assert!(ledger.release(&old));
-        let newer = ledger.reserve(scope.clone()).unwrap();
+        let newer = ledger.reserve(scope.clone(), None).unwrap();
         assert!(!ledger.release(&old));
-        assert!(ledger.reserve(scope).is_none());
+        assert!(ledger.reserve(scope, None).is_none());
         assert!(ledger.release(&newer));
     }
     #[test]
     fn uncertain_scopes_are_bounded_without_evicting_the_first() {
         let mut ledger = SendLedger::default();
-        let first = ledger.reserve(scope("a", Target::Room)).unwrap();
+        let first = ledger.reserve(scope("a", Target::Room), None).unwrap();
         for i in 1..MAX_PENDING_SCOPES {
             assert!(
                 ledger
-                    .reserve(scope("a", Target::Reply(format!("$r{i}"))))
+                    .reserve(scope("a", Target::Reply(format!("$r{i}"))), None)
                     .is_some()
             );
         }
-        assert!(ledger.reserve(scope("b", Target::Room)).is_none());
-        assert!(ledger.reserve(first.scope.clone()).is_none());
+        assert!(ledger.reserve(scope("b", Target::Room), None).is_none());
+        assert!(ledger.reserve(first.scope.clone(), None).is_none());
         assert!(ledger.release(&first));
-        assert!(ledger.reserve(scope("b", Target::Room)).is_some());
+        assert!(ledger.reserve(scope("b", Target::Room), None).is_some());
     }
 }

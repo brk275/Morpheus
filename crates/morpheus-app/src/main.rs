@@ -11,6 +11,7 @@ mod call_membership;
 #[cfg(feature = "native-calls")]
 mod calls;
 mod composer_mentions;
+mod draft_recovery;
 mod drafts;
 mod image_previews;
 #[cfg(feature = "native-calls")]
@@ -53,8 +54,8 @@ use morpheus_config::{
     Config, ConfigStore, Density, LoadedConfig, RoomCallMode, ThemeMode, ThemePack,
 };
 use morpheus_matrix::{
-    AccountManager, AttachmentSendUpdate, MatrixLinkTarget, MessageInfo, MessageSearchResult,
-    PublicRoomInfo, PublicRoomsQuery, TextFormat, parse_matrix_link_target,
+    AccountManager, AttachmentSendUpdate, Generation, MatrixLinkTarget, MessageInfo,
+    MessageSearchResult, PublicRoomInfo, PublicRoomsQuery, TextFormat, parse_matrix_link_target,
 };
 use slint::{Color, Model, ModelRc, SharedString, StyledText, VecModel};
 use url::Url;
@@ -3804,14 +3805,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let draft = thread_live.composed_draft(&account_id, &room_id, Some(&event_id));
             ui.set_thread_composer_text(draft.body.into());
             ui.set_thread_markdown(draft.format == TextFormat::Markdown);
-            ui.set_thread_send_pending(thread_live.thread_send_pending(
-                &account_id,
-                &room_id,
-                &event_id,
-            ));
-            if ui.get_thread_send_pending() {
+            let summary = thread_live.pending_summary(&account_id, &room_id, Some(&event_id));
+            let items = thread_live.pending_items(&account_id, &room_id, Some(&event_id));
+            draft_recovery::publish_thread(&ui, &summary, &items);
+            if summary.unconfirmed {
                 ui.set_transfer_notice(
-                    "Thread reply is queued or unconfirmed; it may still send".into(),
+                    "A reply here may not have finished sending before Morpheus closed. Check the thread, then choose.".into(),
+                );
+            } else if summary.quarantined || summary.read_only {
+                ui.set_transfer_notice(
+                    "Saved send status for this thread needs review before replying.".into(),
+                );
+            } else if summary.count > 0 {
+                ui.set_transfer_notice(
+                    "A thread reply is still waiting to send; it may still send".into(),
                 );
             }
             let live = thread_live.clone();
@@ -3853,6 +3860,197 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let live = close_live.clone();
         let generation = live.begin_thread_request();
         close_handle.spawn(async move { live.clear_thread_if_current(generation).await });
+    });
+
+    // Saved-send controls act on the exact record, selection and edit
+    // revision the user clicked on, all captured synchronously here; every
+    // later step re-checks them before changing anything.
+    let weak = ui.as_weak();
+    let pending_live = live.clone();
+    let pending_handle = runtime.handle().clone();
+    ui.on_cancel_pending_send(move |threaded, key| {
+        let Some(ui) = weak.upgrade() else { return };
+        if !pending_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(scope) = draft_recovery::current_scope(&ui, threaded) else {
+            return;
+        };
+        let Some(nonce) = Generation::from_key(&key) else {
+            return;
+        };
+        let Some(selection) = pending_live.account_selection(&scope.account) else {
+            return;
+        };
+        let Some(target) = pending_live.request_target(&scope, &nonce) else {
+            return;
+        };
+        let live = pending_live.clone();
+        let weak = weak.clone();
+        pending_handle.spawn(async move {
+            live.cancel_pending_send(selection, scope, target, weak)
+                .await
+        });
+    });
+    let weak = ui.as_weak();
+    let retry_live = live.clone();
+    let retry_handle = runtime.handle().clone();
+    ui.on_retry_pending_send(move |threaded, key| {
+        let Some(ui) = weak.upgrade() else { return };
+        if !retry_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(scope) = draft_recovery::current_scope(&ui, threaded) else {
+            return;
+        };
+        let Some(nonce) = Generation::from_key(&key) else {
+            return;
+        };
+        let Some(selection) = retry_live.account_selection(&scope.account) else {
+            return;
+        };
+        let Some(target) = retry_live.request_target(&scope, &nonce) else {
+            return;
+        };
+        let live = retry_live.clone();
+        let weak = weak.clone();
+        retry_handle.spawn(async move {
+            live.retry_pending_send(selection, scope, target, weak)
+                .await
+        });
+    });
+    let weak = ui.as_weak();
+    let review_live = live.clone();
+    let review_handle = runtime.handle().clone();
+    ui.on_review_unconfirmed_send(move |threaded, key, sent| {
+        let Some(ui) = weak.upgrade() else { return };
+        if !review_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(scope) = draft_recovery::current_scope(&ui, threaded) else {
+            return;
+        };
+        let Some(nonce) = Generation::from_key(&key) else {
+            return;
+        };
+        let Some(selection) = review_live.account_selection(&scope.account) else {
+            return;
+        };
+        let live = review_live.clone();
+        let weak = weak.clone();
+        review_handle.spawn(async move {
+            live.review_unconfirmed_send(selection, scope, nonce, sent, weak)
+                .await
+        });
+    });
+    let weak = ui.as_weak();
+    let restore_live = live.clone();
+    let restore_handle = runtime.handle().clone();
+    ui.on_restore_record_text(move |threaded, key| {
+        let Some(ui) = weak.upgrade() else { return };
+        if !restore_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(scope) = draft_recovery::current_scope(&ui, threaded) else {
+            return;
+        };
+        let Some(nonce) = Generation::from_key(&key) else {
+            return;
+        };
+        let Some(selection) = restore_live.account_selection(&scope.account) else {
+            return;
+        };
+        let empty = if threaded {
+            ui.get_thread_composer_text().is_empty()
+        } else {
+            ui.get_composer_text().is_empty()
+        };
+        let Some(revision) =
+            restore_live.scoped_revision(&scope.account, &scope.room, scope.thread())
+        else {
+            return;
+        };
+        if !empty {
+            ui.set_transfer_notice(
+                "Clear the composer first; saved text never replaces what you typed.".into(),
+            );
+            return;
+        }
+        let live = restore_live.clone();
+        let weak = weak.clone();
+        restore_handle.spawn(async move {
+            live.restore_record_text(selection, scope, nonce, revision, weak)
+                .await
+        });
+    });
+    let weak = ui.as_weak();
+    let copy_live = live.clone();
+    ui.on_copy_record_text(move |threaded, key| {
+        let Some(ui) = weak.upgrade() else { return };
+        if !copy_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(scope) = draft_recovery::current_scope(&ui, threaded) else {
+            return;
+        };
+        let Some(nonce) = Generation::from_key(&key) else {
+            return;
+        };
+        let Some(text) = copy_live.record_text(&scope, &nonce) else {
+            return;
+        };
+        let copied = arboard::Clipboard::new()
+            .and_then(|mut clipboard| clipboard.set_text(text.body))
+            .is_ok();
+        ui.set_transfer_notice(
+            if copied {
+                "Message text copied to the system clipboard."
+            } else {
+                "Could not access the clipboard. Use Restore text with an empty composer instead."
+            }
+            .into(),
+        );
+    });
+    let weak = ui.as_weak();
+    let discard_live = live.clone();
+    let discard_handle = runtime.handle().clone();
+    ui.on_discard_record_text(move |threaded, key| {
+        let Some(ui) = weak.upgrade() else { return };
+        if !discard_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(scope) = draft_recovery::current_scope(&ui, threaded) else {
+            return;
+        };
+        let Some(nonce) = Generation::from_key(&key) else {
+            return;
+        };
+        let Some(selection) = discard_live.account_selection(&scope.account) else {
+            return;
+        };
+        let live = discard_live.clone();
+        let weak = weak.clone();
+        discard_handle
+            .spawn(async move { live.discard_kept_text(selection, scope, nonce, weak).await });
+    });
+    let weak = ui.as_weak();
+    let unreadable_live = live.clone();
+    let unreadable_handle = runtime.handle().clone();
+    ui.on_discard_unreadable_status(move |threaded| {
+        let Some(ui) = weak.upgrade() else { return };
+        if !unreadable_live.is_live.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(scope) = draft_recovery::current_scope(&ui, threaded) else {
+            return;
+        };
+        let Some(selection) = unreadable_live.account_selection(&scope.account) else {
+            return;
+        };
+        let live = unreadable_live.clone();
+        let weak = weak.clone();
+        unreadable_handle
+            .spawn(async move { live.discard_unreadable_status(selection, scope, weak).await });
     });
 
     let weak = ui.as_weak();

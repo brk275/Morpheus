@@ -249,6 +249,13 @@ impl AccountManager {
             return Err(MatrixCoreError::SelectedAccountChanged);
         }
         let room = account_room(&state, expected_account_id, room_id)?;
+        let loaded = state
+            .loaded
+            .get(expected_account_id)
+            .ok_or_else(|| MatrixCoreError::AccountNotFound(expected_account_id.into()))?;
+        // Attachments enter the same room queue; the discovery gate decides
+        // whether that queue may run.
+        crate::resume_room_queue(loaded, &room).await?;
         let queue = room.send_queue();
         let (_, updates) = queue
             .subscribe()

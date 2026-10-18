@@ -2758,6 +2758,283 @@ remain open.
   visible. This is preferences UI and file watcher evidence on macOS, not a
   notification banner, sound, or Linux/Windows acceptance check.
 
+## 2026-10-17 durable draft-send recovery (source only, unverified)
+
+The integration candidate now preserves the tested timeline model, focus and
+motion changes. Hosted acceptance explicitly selects the twelve app recovery
+regressions with the disposable Matrix fixture, serialized inside process
+containment and the ephemeral credential vault. Each regression emits a fixed
+entry token and a completion token after its profile cleanup. Acceptance needs
+all twelve unique completions and twelve passing tests with no ignored or
+opted-out cases; ordinary controller tests without the fixture do not prove this
+gate. Both core draft scenarios must also enter and complete cleanup. The
+second scenario has fixed progress tokens, so a timeout cannot be mistaken for
+completion of the first. Raw child logs remain private and scanner-gated.
+These integration checks have not been run. Source formatting/parsing is not
+runtime or compilation evidence.
+
+Room and thread sends carry durable recovery metadata inside the existing
+encrypted `ComposerDraft` HTML envelope: the canonical draft span gains a
+version `2` form with a bounded lowercase-hex JSON attribute holding the draft
+generation, a bounded list of pending send records and the room's thread index.
+Every record stores the complete typed content it was created from (body,
+format and explicit mentions, up to the supported 64 KiB and 32 mentions), so a
+failed, cancelled or unconfirmed message survives later edits, later
+submissions and restarts and can be reviewed, copied or restored one record at
+a time without touching newer live text. Records never take the live
+generation; acknowledged text leaves with its record and is not restored. All
+size limits are derived from the supported message size before any allocation
+(per record, per envelope, per row), and text plus metadata remain one atomic
+SDK draft write with no raw state-store values, no new dependency and no
+metadata in outbound message HTML.
+
+A Morpheus-written row this build cannot read (future version, missing or
+extra attributes, non-hex, non-canonical or oversized metadata, a foreign
+element carrying the marker) is quarantined, never normalized: its typed text
+still restores, the complete original row is carried verbatim inside every
+later save until the user explicitly discards it, and when the row is too large
+to carry the scope stays read-only in place. Quarantined scopes refuse sends,
+and their room's SDK queue stays paused, so a persisted request whose record
+cannot be read is neither resumed nor dropped until the user decides. Genuine
+version `1` rows migrate; non-Morpheus HTML still falls back to the plain body.
+
+The core is the authority. Each scope's state (records, block, process-local
+fresh records, single-use enqueue grants, exact releases) is mirrored from the
+row and every save is checked against it: a snapshot that would drop or
+rewrite a record without an exact release, give a restored record a
+transaction id, or drop a carried original, is refused and the row keeps its
+last valid data. The plain draft save is a read-modify-write under one account
+lock. Discovery runs outside the account lock while the SDK queue is disabled,
+within a bounded room, scope and byte budget; rooms it cannot read or does not
+reach stay paused and are scanned when opened, and only a current selection's
+fresh record can consume its one enqueue grant at the SDK boundary.
+
+Controllers capture the selection, the exact record (nonce and transaction id)
+and the edit revision at the user's action, re-check them after every await,
+and apply restored text only while the scope is still shown at that revision.
+Observers wait with the selection's revocation, so a paused queue cannot pin a
+task and an account switch or removal ends normal and restored observers
+without another SDK event; composer leases are evicted with their selection.
+Adoption of discovered scopes reads the account epoch before waiting on the
+core, so a removal in between repopulates nothing. Detach clears both the room
+and the thread strip. The strips show one block per record with its own
+controls (It was sent / Not sent, keep my text / Retry / Cancel sending /
+Restore text / Copy text / Discard text) and a fixed notice with an explicit
+discard for unreadable saved data; layouts derive their height from content and
+stack controls in narrow panes or at large text sizes.
+
+Prepared regressions, none compiled or run: nine core codec, envelope and
+scope-registry tests (per-record text, exact release, grants, stale and
+replayed saves, quarantine and read-only blocks, derived size extremes), two
+compose tests (round trip, quarantine shapes), fifteen draft-cache tests (kept
+text, per-record restore and discard, stale revisions, epoch-checked adoption,
+quarantine persistence, read-only scopes, re-selection re-checks), three glue
+wording tests, three lease tests, one generated-Slint scenario inside the
+existing real-window account test (per-record controls route exact keys, the
+unreadable-data notice, the narrow thread pane at 200% text with every control
+inside the window, and detach clearing both strips), two presentation-only
+capture frames (`send-recovery.ppm`, `send-recovery-thread-large.ppm`), and two
+gated `drafts_local` scenarios: the original one aligned with the core's
+release discipline, and a new one driving real SDK requests through controlled
+queue barriers (record durable before enqueue, single-use grant, stale and
+wrong-authority refusals, out-of-order cancel keeping the first typed
+submission, enqueue-before-id and SDK-removal-before-acknowledgement crash
+windows restored as unconfirmed, exact adoption of a persisted request before
+the queue resumes, revocation ending waits and controls, re-selection
+rediscovery, and a quarantined row pausing its room until the explicit
+discard). No formatting, Clippy, build, native UI, live homeserver or CI check
+was executed for this change.
+
+Second source-review round (same branch, still unrun). The pinned SDK's
+client-wide `set_enabled(true)` re-enables every room queue, so Morpheus no
+longer enables the client-wide queue at all: room queues start paused and
+every enqueue path (recorded sends, legacy text, replies, edits, reactions,
+thread replies, attachments) resumes its room through one gate that refuses
+rooms discovery has not covered or that hold unreadable saved data; the
+error-retry worker and the explicit re-selection resume through the same gate
+and the worker no longer exits before discovery finishes. Enqueue grants are
+issued once per prepared record under the selection epoch and die with it, so
+A to B to A can neither regrant nor abandon an old enqueuing record. A room
+snapshot may drop a thread from its index only after the core proved that
+thread's row holds no record, kept text or unreadable data. Unreadable rows are
+carried with both stored columns and the draft kind; a save may ride only the
+exact carried original and a discard names exactly the reviewed original (the
+third round below replaces the hash this round used for that identity).
+Automatic restoration after a cancelled or
+reviewed send requires the record to still own the draft generation; a draft
+emptied by a later edit keeps the text as its own record instead, and every
+control validates its original selection at the cache mutation. The record
+strip is a bounded scroll view (at most a third of the window) that keeps every
+record and action reachable by keyboard.
+
+Added coverage, also unrun: registry tests for consume-then-regrant, the
+selection-epoch revocation, dropped index entries, exact-carry and exact
+discard checks; a selection test proving a guarded wait with no further event
+ends on revocation and releases its hold; cache tests for generation-owned
+restoration and identity-bound discard; the real-window scenario now walks
+eight records in the room composer and the narrow thread pane at 200% text,
+asserting each focused control and the composer inputs fully inside the window
+on both axes; the real-SDK fixture now covers a request persisted while the row
+still says enqueuing, a stale room snapshot that would orphan an indexed
+thread, both stored columns surviving an edit of a quarantined scope and a
+discard that names the wrong original.
+
+Third source-review round (same branch, still unrun). Discovery coverage is
+now positive: the gate records the rooms a scan under the current selection
+epoch read successfully, and only those may resume. A room absent from the
+discovery snapshot (created or joined later), skipped because it was left,
+banned or only invited, past the budget or unreadable is not covered: it stays
+paused, counts as recovery-incomplete, and every enqueue path (recorded sends,
+persisted retries, re-selection, replies, edits, reactions, thread replies,
+attachments) refuses it until the on-demand scan covers it. That scan waits for
+discovery to finish, scans only a joined room, and enables nothing when it
+fails or finds unreadable data; the end of discovery no longer enables any
+persisted room it did not scan. Unreadable-row identity is no longer a 64-bit
+hash. Every blocked row (carried or read-only) gets an opaque, process-local
+`RowRevision` minted for the complete stored row; a reload that returns the
+identical complete row keeps it, and a discard re-reads the row and compares
+it to the reviewed original before releasing anything: the exact carried
+columns for a carried row, the complete `ComposerDraft` (both text columns,
+draft kind and every attachment value) held verbatim and bounded for a
+read-only row. A row changed underneath the review in only an attachment value
+or only its kind is refused as stale; a row too large to hold stays read-only
+and reports that it cannot be verified rather than being discarded. The
+carried row's checksum remains as an integrity check only. Readable rows that
+another client stored with attachments or a reply or edit kind are now
+preserved read-only (shown, never rewritten as a plain new message) until the
+same exact discard, and the discovery budget counts attachment bytes. In the
+app, every observer and completion helper re-checks its original selection
+after each awaited core call and before any cache mutation; a core call that
+returns after a switch, removal or A to B to A ends the stale observer without
+touching the departed account's cache, scheduling a write, or dropping the
+saved record, and a selection-changed result from the core does the same. The
+re-export the app already relied on for the read-only row type is now present.
+
+Added coverage, also unrun: registry tests for stable identity across an
+identical reload and a live-text save, a new identity for a different carry or
+a changed read-only row, and a carry that may only be dropped or kept exactly
+after the discard; compose tests for kind-only, attachment-only and no-HTML
+attachment preservation; a cache test for preserved unsupported rows; the
+real-SDK fixture now drives, through the SDK's own draft API, an attachment-only
+change and a kind-only change that make an earlier review stale, a plain row
+with an attachment kept untouched until review, a room created after discovery
+that stays paused until its safe scan and then sends, and a room left with a
+persisted request and an unreadable row that discovery skips, that cannot be
+scanned while left, and that after rejoining is scanned on demand, stays
+paused on the unreadable row and resumes only after the exact discard; and a
+new opt-in app regression (same fixture file) that spawns the real observer on
+a real persisted request, revokes its selection by adding a second account and
+switching back without any SDK event, and proves the observer ends, releases
+what it held, and that late completions under the departed selection leave the
+cache and the saved record untouched while the renewed selection adopts the
+exact request. No unsolicited runtime send was observed or claimed.
+
+Fourth source-review round (same branch, still unrun). Send preparation is
+selection-bound end to end: `prepare_pending_send` re-checks its selection
+after every await, a committed enqueuing record survives a selection that ends
+after it was written (the next discovery restores it as unconfirmed), and a
+failed preparation rolls back only its own steps: once the selection is gone
+it drops only a record that never reached the row, never removes an index
+entry (durable before the call or the anchor a committed record needs; the
+account-bound flush writes a cached entry the row still lacks), makes no
+write and schedules no flush; while the selection is current it re-checks
+ownership after every write before the next write or the scheduled flush. For
+a thread send the durable order is now room index, then thread record, then
+grant, and the whole preparation runs as one writer transaction: the draft
+store's writer lock, through which every app-side row write goes, is held from
+before the record exists in the cache until the preparation returns, so the
+background flush waits, a record reaches the store only through the
+preparation's own write, and a step that did not return success did not reach
+the store (the one caveat is a store write that commits yet reports an error,
+which the next discovery would restore as unconfirmed rather than lose). A
+crash leaves at most an empty index entry. The cache reports whether indexing
+added the root so only an added entry is ever undone. A committed
+pre-enqueue record is removed from the cache only after the core granted its
+exact release (nonce, no transaction id) and ownership was re-checked, so a
+revocation during the rollback write cannot leave the cache without a record
+the row keeps: the release, not fresh ownership, authorizes the drop, the
+account-bound flush completes a failed write, and a refused release leaves
+cache and row alike for discovery. The typed submission is never lost by a
+definite pre-enqueue failure: the composer stays editable during the
+preparation, and the cache decides drop-or-keep at the moment it mutates,
+under its own lock, against the complete typed text the composer holds right
+then (no earlier comparison is carried across an await). A composer that still
+holds exactly the submission drops the record, so nothing is duplicated; one
+that moved on turns the record into kept text (through the same exact release,
+the core's one path from enqueuing to kept) beside the newer composer text,
+with a thread keeping its index entry. A never-written record that must be
+kept is first made durable, and if even that write fails it stays in the cache
+for review rather than being dropped; after a revocation a never-written
+record is dropped only while the composer still holds it, and otherwise
+retained for the account-bound flush and the next discovery. Test pause points
+are one-shot: consumed when reached, so a later pass through the same code
+runs unpaused.
+`persist_scope_and_index` re-checks before
+touching the room index and before scheduling a retry. Re-seeding
+a scope the cache kept across an account switch marks every awaiting record
+restored (queued only where discovery attached the exact request, otherwise
+unconfirmed, including records that never received an id; kept text stays
+kept). The account-bound background flush is unchanged. In the core, a fresh
+record's capability has three states (saved, granted, consumed): a record may
+still be abandoned before its capability is consumed, but once the SDK
+boundary was crossed it cannot leave the row without an exact release, even
+before its transaction id is persisted. The gated fixtures no longer rely on
+the client-wide queue toggle, which the product's per-room resume overrides
+and which races with the SDK's in-flight peek; they hold a room's queue with a
+fixture-owned wedged head (an oversize raw event the homeserver refuses
+permanently, observed as the SDK's own unrecoverable send error and shown
+wedged at the head of its store), account for its exact id in every persisted
+set, lift it by aborting exactly it before any "nothing held" check, recover
+its exact handle after restart, and fail rather than pretend when the hold
+event is delivered or not recorded. Discard binding (D7) was traced rather
+than changed: the cache sets a scope's unreadable original only when the
+scope enters the cache and clears it only on the explicit discard, so a
+discard that reads the cache when it runs sees the original the notice was
+rendered for, or none; the exact core row comparison stays as the authority
+and this invariant is recorded on the cache type.
+
+Added coverage, also unrun: cache tests for the re-seed rule and the
+non-dirtying drop of uncommitted steps; a core regression for the capability
+states (before grant, after grant, after consume, release without an id,
+wrong epoch, revocation); an opt-in app regression that prepares a send,
+switches A to B to A, replays the stale rollback, re-seeds, flushes and proves
+the committed record is preserved and the cache stays consistent; and the
+reworked holds in both gated fixtures, including an encrypted new room.
+
+Known limits and open points: the hold relies on the local homeserver refusing
+an oversize event permanently, which the fixture verifies at run time rather
+than assumes; the interrupted-preparation regression replays the stale
+rollback directly after a complete preparation (room and thread scopes),
+because the interruption cannot be injected mid-await without a hook, which
+this branch does not add; the forced interleavings are covered by
+test-only pause points at the real write and authorization boundaries of
+preparation and rollback (after the index commit, after the record is created
+but before its write, after the core release, and after the cache removal but
+before the write), each exercised by an opt-in regression together with a
+race-based one; an uncovered room is scanned only when it is
+opened or a scan is requested for it; discovery failures caused by a store read
+error cannot be forced by the fixture and are covered by unit tests of the
+registry only; a persisted SDK request whose record never received its id
+sends on its own once its room resumes, and its record stays unconfirmed for
+the user's review; a read-only row larger than the hold bound (64 MiB per row,
+256 MiB per account, counted as the complete retained row: the row, attachment
+and thumbnail structs, both text columns, the draft kind's event id and every
+attachment and thumbnail field including file names, MIME types, BlurHashes and
+payloads, with checked arithmetic, and the same count charged to the discovery
+budget; this bounds what Morpheus retains, not the SDK's own decode of the row
+on load) cannot be discarded from this build because its complete
+identity cannot be verified without a stronger digest, and adding one (for
+example the `sha2` crate already present through the pinned SDK) is a
+dependency edge for root review rather than a change made here; the
+"core call returned Ok but the selection was revoked meanwhile" window in the
+app is covered by the same post-await check as the error path but cannot be
+delayed from a test without a hook, which this branch does not add; an
+unconfirmed send always requires the user's judgement after checking the
+conversation; the pinned SDK's room send queue keeps its broadcast sender while
+the room lives, and no strong client or SQLite handle leak has been shown from
+this path, so Windows file cleanup after these observers end is simply
+untested here.
+
 ## Native outgoing video GUI acceptance (partial)
 
 An ad hoc signed macOS Apple Silicon QA app used a temporary, debug-only

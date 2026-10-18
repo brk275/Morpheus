@@ -62,9 +62,14 @@ fresh evidence. See [the verification log](VERIFICATION.md).
       per-thread guard prevents duplicate submissions during that session.
       Controller regressions passed all four native targets at `3f1a3df`;
       Linux live checks passed encrypted persistence/isolation and tracked-send
-      acknowledgement. Live thread UI acceptance remains open. Pending sends
-      completed after app exit can leave stale drafts; queue reconciliation
-      after restart and retry/cancel controls remain open.
+      acknowledgement. Live thread UI acceptance remains open. Queued room
+      and thread sends are now recorded in the encrypted draft row before
+      enqueue with their complete typed text, reconciled by exact transaction
+      after restart, and offered per-record native retry, cancel, restore,
+      copy and unconfirmed-review choices; unreadable saved data, and readable
+      drafts other clients stored with attachments or reply/edit targets, are
+      kept untouched until an explicit review of exactly that row. That source
+      has not been built or run yet.
 - [ ] Render long and mixed-height timelines with virtualization and keyboard
       navigation; benchmark a 10,000-message room.
 

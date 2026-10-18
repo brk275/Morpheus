@@ -1823,8 +1823,11 @@ mod tests {
                     manager.pause_active_sync_for(rejected).await,
                     Err(MatrixCoreError::SelectedAccountChanged)
                 ));
-                assert!(client.send_queue().is_enabled());
+                // The client-wide queue is never enabled; the live sync task
+                // and the current selection show the account is still active.
+                assert!(!client.send_queue().is_enabled());
                 assert!(manager.state.lock().await.sync_task.is_some());
+                assert!(current.is_current());
             }
             manager.pause_active_sync_for(&current).await.unwrap();
             assert!(!client.send_queue().is_enabled());
@@ -1938,7 +1941,16 @@ mod tests {
             assert_eq!(manager.activate(grant).await.unwrap(), second.clone());
             assert!(!previous.is_current());
             assert!(!client_a.send_queue().is_enabled());
-            assert!(client_b.send_queue().is_enabled());
+            // Never client-wide: the selected account is known by its
+            // discovery readiness, not by a global queue flag.
+            assert!(!client_b.send_queue().is_enabled());
+            assert!(
+                manager
+                    .take_recovered_drafts(&manager.account_selection(&second.id).unwrap())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             let removal = manager.remove_account(&second.id).await.unwrap();
             assert!(removal.complete);
             assert!(manager.active_account().await.is_none());

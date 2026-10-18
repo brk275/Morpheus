@@ -525,7 +525,7 @@ class DraftStageTests(unittest.TestCase):
         emitted = re.findall(r"phase!\(([a-z_]+)\)", source)
         self.assertEqual(set(emitted), acceptance_module.DRAFTS_STAGES)
         self.assertEqual(len(emitted), len(set(emitted)))
-        self.assertEqual((emitted[0], emitted[-1]), ("fixture", "complete"))
+        self.assertEqual((emitted[0], emitted[-1]), ("fixture", "recovery_complete"))
         self.assertLess(source.index("phase!(tracked_enqueue)"),
                         source.index(".send_text_tracked_for("))
         self.assertLess(source.index('.expect("Cannot queue tracked message")'),
@@ -534,13 +534,20 @@ class DraftStageTests(unittest.TestCase):
                         source.index("queued.wait_outcome()"))
         self.assertLess(source.index('fs::remove_dir_all(root)'),
                         source.index("phase!(complete)"))
+        self.assertLess(source.rindex('fs::remove_dir_all(root)'),
+                        source.index("phase!(recovery_complete)"))
 
     def test_success_requires_positive_test_result_entry_and_completed_cleanup(self):
-        passed = "test result: ok. 1 passed; 0 failed; 0 ignored;\n"
+        passed = "test result: ok. 2 passed; 0 failed; 0 ignored;\n"
         entry = "MORPHEUS_DRAFTS_STAGE fixture\n"
         complete = "MORPHEUS_DRAFTS_STAGE complete\n"
+        recovery = ("MORPHEUS_DRAFTS_STAGE recovery_fixture\n"
+                    "MORPHEUS_DRAFTS_STAGE recovery_complete\n")
         for output, accepted in ((passed, False), (complete + passed, False),
-                                 (entry + passed, False), (entry + complete + passed, True),
+                                 (entry + passed, False), (entry + complete + passed, False),
+                                 (entry + complete + recovery + passed, True),
+                                 (recovery + entry + complete + passed, True),
+                                 (entry + complete + recovery + passed.replace("2 passed", "1 passed"), False),
                                  (entry + complete + "test result: ok. 0 passed; 0 failed; 1 ignored;\n", False)):
             with self.subTest(output=output), tempfile.TemporaryDirectory() as folder:
                 runner = Acceptance(Path(folder), "unused-scanner")
@@ -579,6 +586,90 @@ class DraftStageTests(unittest.TestCase):
             self.assertEqual(runner.results, [])
 
 
+class AppRecoveryEvidenceTests(unittest.TestCase):
+    child = LiveStageTests.child
+
+    @staticmethod
+    def complete():
+        return "".join(
+            f"MORPHEUS_APP_RECOVERY_STAGE {name}\nMORPHEUS_APP_RECOVERY_CHECK {name}=true\n"
+            for name in sorted(acceptance_module.APP_RECOVERY_CASES)
+        ) + "test result: ok. 12 passed; 0 failed; 0 ignored;\n"
+
+    def test_requires_every_live_case_once_and_no_opt_out(self):
+        complete = self.complete()
+        name = sorted(acceptance_module.APP_RECOVERY_CASES)[0]
+        self.assertEqual(acceptance_module.app_recovery_evidence(complete),
+                         dict.fromkeys(sorted(acceptance_module.APP_RECOVERY_CASES), True))
+        for output in (
+            "test result: ok. 12 passed; 0 failed; 0 ignored;\n",
+            complete.replace(f"MORPHEUS_APP_RECOVERY_STAGE {name}\n", ""),
+            complete.replace(f"MORPHEUS_APP_RECOVERY_CHECK {name}=true\n", ""),
+            complete + f"MORPHEUS_APP_RECOVERY_CHECK {name}=true\n",
+            complete + f"MORPHEUS_APP_RECOVERY_CHECK {name}=false\n",
+            complete.replace("12 passed", "11 passed"),
+            complete.replace("0 ignored", "1 ignored"),
+            complete + "Skipped local fixture\n",
+        ):
+            with self.subTest(output=output), self.assertRaises(RuntimeError):
+                acceptance_module.app_recovery_evidence(output)
+
+    def test_exact_source_tokens_cover_each_real_test_and_follow_cleanup(self):
+        source = (Path(__file__).resolve().parents[2] / "crates/morpheus-app/src/live.rs").read_text()
+        source = source.split("mod stale_observer_tests {", 1)[1]
+        tests = re.split(r"#\[tokio::test\]", source)[1:]
+        self.assertEqual(len(tests), len(acceptance_module.APP_RECOVERY_CASES))
+        completed = []
+        for body in tests:
+            phases = re.findall(r"recovery_phase!\(([a-z_]+)\)", body)
+            checks = re.findall(r"recovery_check!\(([a-z_]+)\)", body)
+            self.assertEqual(phases, checks)
+            self.assertEqual(len(checks), 1)
+            self.assertLess(body.index("fixture()"), body.index("recovery_phase!("))
+            self.assertLess(body.index("close_profile(directory, live).await;"),
+                            body.index("recovery_check!("))
+            completed.extend(checks)
+        self.assertEqual(set(completed), acceptance_module.APP_RECOVERY_CASES)
+        self.assertEqual(len(completed), len(set(completed)))
+
+    def test_runs_actual_app_tests_contained_with_fixture_and_serial_execution(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            with patch.object(runner, "run") as run:
+                runner.app_recovery(Path(folder) / "fixture.json")
+            label, args = run.call_args.args
+            self.assertEqual(label, acceptance_module.APP_RECOVERY_LABEL)
+            self.assertEqual(args, ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
+                                    "--bin", "morpheus-app", "live::stale_observer_tests::", "--",
+                                    "--nocapture", "--test-threads=1"])
+            self.assertEqual(run.call_args.kwargs, {
+                "extra": {"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(Path(folder) / "fixture.json")},
+                "test": True, "pid_namespace": True,
+            })
+
+    def test_scanner_rejection_precedes_any_evidence_publication(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            with self.child(runner, self.complete(), scanner_code=1) as (visible, _):
+                with self.assertRaisesRegex(RuntimeError, "credential scanning"):
+                    runner.run(acceptance_module.APP_RECOVERY_LABEL, ["mock-test"], test=True)
+            self.assertNotIn("app_recovery", visible.getvalue())
+            self.assertEqual(runner.results, [])
+
+    def test_deadline_exposes_only_fixed_stage_and_process_facts(self):
+        output = ("MORPHEUS_APP_RECOVERY_STAGE typed_retention\n"
+                  "MORPHEUS_APP_RECOVERY_STAGE private_token\nprivate-server-response\n")
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            with self.child(runner, output, timeout=True) as (visible, _):
+                with self.assertRaisesRegex(RuntimeError, "deadline"):
+                    runner.run(acceptance_module.APP_RECOVERY_LABEL, ["mock-test"], test=True, seconds=1)
+            record = json.loads(visible.getvalue())
+            self.assertEqual(record["app_recovery_diagnostics"], {"stage": "typed_retention"})
+            self.assertEqual(record["native_process"]["result"], "deadline")
+            self.assertNotIn("private", visible.getvalue())
+
+
 class LiveEvidenceTests(unittest.TestCase):
     def test_rtc_bootstrap_follows_independent_checks_and_failure_stays_fatal(self):
         for failed in (False, True):
@@ -606,6 +697,7 @@ class LiveEvidenceTests(unittest.TestCase):
                 from unittest.mock import call
                 rtc_up = calls.index(call.script("local_matrix_rtc", "up"))
                 self.assertLess(calls.index(call.oauth_cases()), rtc_up)
+                self.assertLess(calls.index(call.app_recovery(Path(folder) / "fixture.json")), rtc_up)
                 for name in (*acceptance_module.CHAT_TESTS, "recovery_local"):
                     indexes = [i for i, item in enumerate(calls) if item[0] == "test" and item.args[0] == name]
                     self.assertTrue(indexes)
