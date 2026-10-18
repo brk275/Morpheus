@@ -1,12 +1,12 @@
 # TEMPORARY focused native offline app checks. NEVER MERGE this workflow.
 name: Reviewed native motion diagnostics
-run-name: Native motion activation diagnosis - ddfbf39
+run-name: Native motion viewport diagnosis - ddbc5b3
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: native-motion-diagnostics-ddfbf39
+  group: native-motion-layout-ddbc5b3
   cancel-in-progress: false
 jobs:
   contracts:
@@ -17,11 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ddfbf39d38bc9a6bc0843fb332b2360a50cd4539
+          ref: ddbc5b3bedb2a5bd7098ad005fbb668d3ffc0259
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact reviewed source
-        run: test "$(git rev-parse HEAD)" = ddfbf39d38bc9a6bc0843fb332b2360a50cd4539
+        run: test "$(git rev-parse HEAD)" = ddbc5b3bedb2a5bd7098ad005fbb668d3ffc0259
       - name: Scan source before executing reviewed native tests
         shell: bash
         run: |
@@ -136,14 +136,14 @@ jobs:
           probes=[]
           probe_invalid=False
           expected={'scale','calls','requested','saved','focus_before','focus_after',
-              'bounds_before','bounds_after','window','page','config_error_present','presentation'}
+              'bounds_before','bounds_after','window','page','config_error_present','presentation','layout'}
           def vector(value,length):
               return isinstance(value,list) and len(value)==length and all(
                   type(x) in (int,float) and math.isfinite(x) and abs(x)<=100000 for x in value)
           for line in output.splitlines():
               if not line.startswith('MORPHEUS_MOTION_FAILURE '): continue
               try:
-                  assert len(line)<=2048 and len(probes)<2
+                  assert len(line)<=8192 and len(probes)<2
                   data=json.loads(line.split(' ',1)[1])
                   assert type(data) is dict and set(data)==expected
                   assert type(data['scale']) is int and data['scale'] in (100,200)
@@ -152,13 +152,15 @@ jobs:
                   assert all(type(data[k]) is bool for k in ('requested','saved','focus_before',
                       'focus_after','config_error_present','presentation'))
                   assert vector(data['window'],2)
+                  assert type(data['layout']) is list and 1<=len(data['layout'])<=17
+                  assert all(vector(row,8) for row in data['layout'])
                   assert all(data[k] is None or vector(data[k],4) for k in ('bounds_before','bounds_after'))
                   probes.append(data)
               except (AssertionError,ValueError,TypeError):
                   probe_invalid=True
           passed=passed and not probe_invalid and not probes
           print(json.dumps({'check':'native_motion_activation_diagnostics','motion_probe':probes,'probe_invalid':probe_invalid,'status':'passed' if passed else 'failed',
-              'source':'ddfbf39d38bc9a6bc0843fb332b2360a50cd4539','failure':reason,
+              'source':'ddbc5b3bedb2a5bd7098ad005fbb668d3ffc0259','failure':reason,
               'ignored_tests':sorted(ignored),'ui_binding_loop_warnings':binding_loops[:8],
               'tests_passed':int(summaries[0][0]) if len(summaries)==1 else None,
               'ignored':int(summaries[0][1]) if len(summaries)==1 else None,
