@@ -33,6 +33,9 @@ else:
     import run_windows_capture_acceptance as capture
 
 CHECK = "installed_windows_keyboard_uia"
+# Both are the standard x64 Windows Server2025 family; Visual Studio packaging
+# changed the image identifier. Unknown OS images remain unsupported.
+HOSTED_WINDOWS_IMAGES = ("win25", "win25-vs2026")
 PROFILE_RELATIVE = Path("brk275") / "Morpheus"
 # directories 6 / dirs-sys resolve io.github/brk275/Morpheus through the shell
 # known folders (never APPDATA or LOCALAPPDATA): <RoamingAppData>\brk275\Morpheus
@@ -141,7 +144,7 @@ def guard(environment=None, platform=None):
                and environment.get("GITHUB_ACTIONS") == "true"
                and environment.get("RUNNER_ENVIRONMENT") == "github-hosted"
                and environment.get("RUNNER_OS") == "Windows"
-               and environment.get("ImageOS") == "win25", "guard")
+               and environment.get("ImageOS") in HOSTED_WINDOWS_IMAGES, "guard")
 
 
 def powershell_path(environment=None):
@@ -812,6 +815,22 @@ def acceptance(executable, nonce, report, diagnostics=None):
 
 
 def main():
+    if sys.argv[1:2] == ["--check-host"]:
+        # Run before package compilation. No profile, registry, window, bridge
+        # or application process may be touched by this metadata-only mode.
+        report = {"check": "windows_keyboard_host_preflight", "status": "failed", "failure": "guard"}
+        if len(sys.argv) != 2:
+            report["failure"] = "arguments"
+            print(json.dumps(report, sort_keys=True), flush=True)
+            return 1
+        try:
+            guard()
+        except DiagnosticFailure:
+            print(json.dumps(report, sort_keys=True), flush=True)
+            return 1
+        report.update(status="passed", failure="none")
+        print(json.dumps(report, sort_keys=True), flush=True)
+        return 0
     report = {"check": CHECK, "status": "failed", "phase": "setup",
               "sign_in_semantics": False, "account_menu_keyboard": False, "appearance_config": False,
               "normal_window_close": False, "app_log_public": False, "screen_reader_acceptance": False}

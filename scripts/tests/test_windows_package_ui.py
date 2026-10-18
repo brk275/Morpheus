@@ -116,6 +116,74 @@ class GuardTests(unittest.TestCase):
         with self.assertRaises(ui.DiagnosticFailure):
             ui.guard(HOSTED, "linux")
 
+    def test_only_the_two_reviewed_windows_2025_images_are_accepted(self):
+        self.assertEqual(set(ui.HOSTED_WINDOWS_IMAGES), {"win25", "win25-vs2026"})
+        for image in ui.HOSTED_WINDOWS_IMAGES:
+            with self.subTest(image=image):
+                ui.guard(dict(HOSTED, ImageOS=image), "win32")
+        for image in ("win22", "win26", "win25-unknown", "", None):
+            with self.subTest(image=image), self.assertRaises(ui.DiagnosticFailure):
+                ui.guard(dict(HOSTED, ImageOS=image), "win32")
+
+    def test_metadata_preflight_has_no_application_or_profile_side_effects(self):
+        for image in ui.HOSTED_WINDOWS_IMAGES:
+            visible = io.StringIO()
+            with patch.dict(os.environ, dict(HOSTED, ImageOS=image), clear=True), \
+                    patch.object(ui.sys, "platform", "win32"), \
+                    patch.object(ui.sys, "argv", ["driver", "--check-host"]), \
+                    patch.object(ui, "acceptance") as acceptance, \
+                    patch.object(ui.PackageProfile, "open") as profile, \
+                    patch.object(capture, "WindowsJob") as job, contextlib.redirect_stdout(visible):
+                self.assertEqual(ui.main(), 0)
+            self.assertEqual(json.loads(visible.getvalue()), {
+                "check": "windows_keyboard_host_preflight", "status": "passed", "failure": "none",
+            })
+            acceptance.assert_not_called()
+            profile.assert_not_called()
+            job.assert_not_called()
+
+    def test_preflight_still_rejects_nonhosted_and_unknown_images_without_mutation(self):
+        for changed in ({"GITHUB_ACTIONS": "false"}, {"RUNNER_ENVIRONMENT": "self-hosted"},
+                        {"RUNNER_OS": "Linux"}, {"ImageOS": "win22"}, {"ImageOS": "win25-other"}):
+            visible = io.StringIO()
+            with patch.dict(os.environ, HOSTED | changed, clear=True), \
+                    patch.object(ui.sys, "platform", "win32"), \
+                    patch.object(ui.sys, "argv", ["driver", "--check-host"]), \
+                    patch.object(ui, "acceptance") as acceptance, \
+                    patch.object(ui, "profile_roots") as roots, contextlib.redirect_stdout(visible):
+                self.assertEqual(ui.main(), 1)
+            self.assertEqual(json.loads(visible.getvalue()), {
+                "check": "windows_keyboard_host_preflight", "status": "failed", "failure": "guard",
+            })
+            acceptance.assert_not_called()
+            roots.assert_not_called()
+
+    def test_invalid_preflight_arguments_cannot_enter_the_installed_driver(self):
+        visible = io.StringIO()
+        with patch.object(ui.sys, "argv", ["driver", "--check-host", "private-value"]), \
+                patch.object(ui, "guard") as guard, patch.object(ui, "acceptance") as acceptance, \
+                contextlib.redirect_stdout(visible):
+            self.assertEqual(ui.main(), 1)
+        self.assertEqual(json.loads(visible.getvalue()), {
+            "check": "windows_keyboard_host_preflight", "status": "failed", "failure": "arguments",
+        })
+        guard.assert_not_called()
+        acceptance.assert_not_called()
+        self.assertNotIn("private-value", visible.getvalue())
+
+    def test_host_preflight_precedes_compilers_and_keeps_interactive_desktop_guard(self):
+        workflow = (SOURCE.parents[1] / ".github/workflows/package-qa.yml").read_text()
+        source_check = workflow.index("Verify exact reviewed source checkout")
+        preflight = workflow.index("Check Windows keyboard host before building")
+        compiler = workflow.index("Install pinned Rust toolchain")
+        self.assertLess(source_check, preflight)
+        self.assertLess(preflight, compiler)
+        block = workflow[preflight:workflow.index("Require reviewed installed capture adapter", preflight)]
+        self.assertIn("if: runner.os == 'Windows'", block)
+        self.assertIn("shell: powershell", block)
+        self.assertIn("[Environment]::UserInteractive", block)
+        self.assertIn("python3 scripts/windows_package_ui.py --check-host", block)
+
     def test_guard_failure_cannot_create_a_job_or_touch_a_profile(self):
         with patch.dict(os.environ, {"GITHUB_ACTIONS": "false"}, clear=False), \
                 patch.object(ui.sys, "platform", "win32"), \
@@ -895,7 +963,7 @@ class PowerShellSourceTests(unittest.TestCase):
                           "Write-Host", "Write-Error", "Write-Output"]:
             self.assertNotIn(forbidden, self.source)
         for required in ["$env:GITHUB_ACTIONS -ne 'true'", "$env:RUNNER_ENVIRONMENT -ne 'github-hosted'",
-                         "$env:ImageOS -ne 'win25'", "[Environment]::UserInteractive", "IsPassword",
+                         "@('win25', 'win25-vs2026') -notcontains $env:ImageOS", "[Environment]::UserInteractive", "IsPassword",
                          "HasKeyboardFocus", "GetForegroundWindow", "RawViewWalker"]:
             self.assertIn(required, self.source)
         for token in re.findall(r"Fail '([a-z_]+)'", self.source):

@@ -116,6 +116,14 @@ jobs:
           persist-credentials: false
       - name: Verify exact reviewed source checkout
         run: python3 scripts/package_revision.py --verify-checkout .
+      - name: Check Windows keyboard host before building
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          if (-not [Environment]::UserInteractive) {
+            throw 'Windows keyboard QA requires an interactive hosted desktop'
+          }
+          python3 scripts/windows_package_ui.py --check-host
       - name: Require reviewed installed capture adapter
         if: runner.os == 'Linux' && inputs.appimage_capture
         run: python3 packaging/linux/package_appimage.py --check-readiness
