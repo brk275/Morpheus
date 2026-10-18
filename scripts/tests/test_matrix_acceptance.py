@@ -17,6 +17,29 @@ from run_element_acceptance import CHECKS as ELEMENT_CHECKS
 
 
 class FocusedSuiteTests(unittest.TestCase):
+    def test_media_only_completion_and_summary_cannot_claim_full_acceptance(self):
+        self.assertEqual(acceptance_module.SUITES["media-only"], ("media_local",))
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="media-only")
+            with self.assertRaises(RuntimeError):
+                runner.finish_checks()
+            runner.results = [{"check": "media_local", "passed": 1, "seconds": 1}]
+            runner.finish_checks()
+            full = Acceptance(root, "scanner")
+            full.results = list(runner.results)
+            with self.assertRaises(RuntimeError):
+                full.finish_checks()
+            summary = root / "summary.md"
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
+                runner.summary()
+            report = json.loads((root / "outcomes.json").read_text())
+            self.assertEqual(report["suite"], "media-only")
+            self.assertEqual(report["not_run"], {})
+            self.assertIn("Only media_local ran", summary.read_text())
+            self.assertIn("not full acceptance", summary.read_text())
+            self.assertNotIn("Full suite:", summary.read_text())
+
     def test_completion_requires_every_selected_check_and_default_still_requires_full(self):
         with tempfile.TemporaryDirectory() as folder:
             focused = Acceptance(Path(folder), "scanner", suite="draft-recovery")
@@ -519,6 +542,32 @@ class FinalizationTests(unittest.TestCase):
         runner.rtc_cases.assert_not_called()
         runner.outgoing_ring_cases.assert_not_called()
         runner.element_case.assert_not_called()
+        self.assert_both_cleanups(runner)
+
+    def test_media_only_main_runs_only_media_and_preserves_cleanup(self):
+        with self.mocked_main() as (runner, _):
+            with patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner", "--suite", "media-only"]):
+                self.assertIsNone(acceptance_module.main())
+        runner.test.assert_called_once()
+        self.assertEqual(runner.test.call_args.args[0], "media_local")
+        runner.finish_checks.assert_called_once()
+        runner.timeline_read_cases.assert_not_called()
+        runner.draft_recovery_cases.assert_not_called()
+        runner.app_recovery.assert_not_called()
+        runner.oauth_cases.assert_not_called()
+        runner.rtc_cases.assert_not_called()
+        runner.outgoing_ring_cases.assert_not_called()
+        runner.element_case.assert_not_called()
+        self.assert_both_cleanups(runner)
+
+    def test_media_only_incomplete_results_still_fail_after_cleanup(self):
+        original = RuntimeError("fixed incomplete media result")
+        with self.mocked_main() as (runner, _):
+            runner.finish_checks.side_effect = original
+            with patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner", "--suite", "media-only"]):
+                with self.assertRaises(RuntimeError) as caught:
+                    acceptance_module.main()
+        self.assertIs(caught.exception, original)
         self.assert_both_cleanups(runner)
 
     def test_timeline_read_main_uses_only_selected_checks_and_preserves_cleanup(self):

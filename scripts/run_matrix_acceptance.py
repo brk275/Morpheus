@@ -357,9 +357,10 @@ TIMELINE_READ_CHECKS = (*TIMELINE_READ_TESTS, "search_local-classic", "recovery_
 # Retry the two failed binaries and formatting's dependent moderation check.
 # Passing room/thread UI, media and search cases retain their own evidence.
 TIMELINE_FAILURE_CHECKS = ("formatted_local", "moderation_local", "recovery_local")
+MEDIA_ONLY_CHECKS = ("media_local",)
 SUITES = {"full": PLANNED_CHECKS, "draft-recovery": DRAFT_RECOVERY_CHECKS,
           "drafts-only": DRAFT_ONLY_CHECKS, "timeline-reads": TIMELINE_READ_CHECKS,
-          "timeline-failures": TIMELINE_FAILURE_CHECKS}
+          "timeline-failures": TIMELINE_FAILURE_CHECKS, "media-only": MEDIA_ONLY_CHECKS}
 # Leave a full minute before the workflow's 55-minute hard kill. Work stops
 # with eleven minutes left: up to three for nested OAuth/Element cleanup, then
 # eight for both shared-service cleanups, checked inventories and log scans.
@@ -1251,6 +1252,10 @@ class Acceptance:
                     output.write("Focused drafts-only rerun: real Synapse and an ephemeral OS Secret Service. "
                                  "Only the draft persistence/recovery cases ran. "
                                  "No app recovery, moderation, OAuth or RTC checks; this is not full acceptance.\n\n")
+                elif self.suite == "media-only":
+                    output.write("Focused encrypted media checks: real Synapse and an ephemeral OS Secret Service. "
+                                 "Only media_local ran; this is not full acceptance. "
+                                 "Native picker, keyboard, physical devices and installed-package checks remain separate.\n\n")
                 else:
                     output.write("Focused draft-recovery rerun: real Synapse and an ephemeral OS Secret Service. "
                                  "Includes the formatting prerequisite for moderation and all app recovery guards. "
@@ -1326,6 +1331,10 @@ def main():
         acceptance.require_containment()
         acceptance.script("local_matrix_env", "up")
         fixture = fixture_from_output(str(root / "accounts.json"), root)
+        if args.suite == "media-only":
+            acceptance.group(MEDIA_ONLY_CHECKS, lambda: acceptance.test("media_local", fixture))
+            acceptance.finish_checks()
+            return
         if args.suite == "drafts-only":
             acceptance.group(DRAFT_ONLY_CHECKS, lambda: acceptance.test("drafts_local", fixture))
             acceptance.finish_checks()
