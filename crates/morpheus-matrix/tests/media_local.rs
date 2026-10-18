@@ -341,6 +341,7 @@ fn encrypted_file_roundtrips_between_disposable_accounts() {
                 ))
                 .await
                 .map_err(|_| ())?
+                .response
                 .event_id
                 .to_string();
             loop {
@@ -412,6 +413,7 @@ fn encrypted_file_roundtrips_between_disposable_accounts() {
                 .send(thread_content)
                 .await
                 .map_err(|_| ())?
+                .response
                 .event_id
                 .to_string();
             loop {
@@ -496,6 +498,7 @@ fn encrypted_file_roundtrips_between_disposable_accounts() {
                 )
                 .await
                 .map_err(|_| ())?
+                .response
                 .event_id
                 .to_string();
             assert!(matches!(

@@ -14,6 +14,11 @@ pub use media::{
     AttachmentKind, AttachmentMetadata, AttachmentSendUpdate, DownloadedAttachment,
     ImagePreviewDownload, MAX_ATTACHMENT_BYTES, MAX_IMAGE_PREVIEW_BYTES, QueuedAttachment,
 };
+mod image_packs;
+pub use image_packs::{
+    MAX_STICKER_PREVIEW_BYTES, PublicMediaConsent, StickerCatalog, StickerEntry, StickerPack,
+    StickerPackSource, StickerPreview,
+};
 mod discovery;
 pub use discovery::{
     MatrixLinkTarget, PublicRoomInfo, PublicRoomsPage, PublicRoomsQuery, ResolvedRoomAlias,
@@ -195,6 +200,12 @@ pub enum MatrixCoreError {
     MediaTooLarge { maximum: u64, actual: u64 },
     #[error("this event is not a media attachment")]
     NotMediaAttachment,
+    #[error(
+        "Sticker images are not encrypted. Allow public sticker media for this conversation before loading or sending them."
+    )]
+    StickerConsentRequired,
+    #[error("This sticker or its pack changed or is no longer available. Choose a sticker again.")]
+    StickerUnavailable,
     #[error("invalid user ID: {0}")]
     InvalidUserId(String),
     #[error("invalid room power level: {0}")]
