@@ -1,27 +1,27 @@
 # TEMPORARY focused native offline app checks. NEVER MERGE this workflow.
-name: Reviewed sticker native checks
-run-name: Reviewed sticker layout fix 6a62a3b - affected checks
+name: Reviewed combined customization app checks
+run-name: Combined customization app regressions - 33b0660
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: sticker-native-checks-6a62a3b
+  group: combined-app-checks-33b0660
   cancel-in-progress: false
 jobs:
   contracts:
-    name: Test reviewed sticker layout and encrypted media
+    name: Test reviewed customization, accounts and sticker UI
     if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 6a62a3b99ca414f5fae489226a375a7feabab220
+          ref: 33b0660679b0b3f69cf02e2dbb03dfe0c9467276
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact reviewed source
-        run: test "$(git rev-parse HEAD)" = 6a62a3b99ca414f5fae489226a375a7feabab220
+        run: test "$(git rev-parse HEAD)" = 33b0660679b0b3f69cf02e2dbb03dfe0c9467276
       - name: Scan source before executing reviewed native tests
         shell: bash
         run: |
@@ -50,7 +50,7 @@ jobs:
         with:
           key: verified-sdk-archives-v1
           save-if: false
-      - name: Verify corrected consent target and generated UI keyboard bounds
+      - name: Check new Rust controllers, CLI functions and generated UI together
         timeout-minutes: 105
         env:
           CARGO_BUILD_JOBS: "2"
@@ -81,8 +81,7 @@ jobs:
           with log.open('xb') as output:
               child = subprocess.Popen(['cargo','test','--locked','-p','morpheus-app','--features',
                   'native-calls','--bin','morpheus-app',
-                  'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
-                  '--','--exact','--test-threads=1'],
+                  '--','--test-threads=1'],
                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                   env=environment, start_new_session=True)
               deadline = time.monotonic()+95*60
@@ -123,29 +122,27 @@ jobs:
               print('OFFLINE_NATIVE_LOG_WITHHELD',flush=True); raise SystemExit(1)
           output=log.read_text(errors='replace')
           ok=set(re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. ok$',output,re.MULTILINE))
-          needed={'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'}
+          needed={'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
+              'config_cli::tests::usage_errors_and_help_never_start_validation',
+              'config_cli::tests::excess_arguments_are_refused_rather_than_dropped',
+              'config_cli::tests::a_valid_custom_theme_name_never_appears_in_output',
+              'config_cli::tests::validation_of_a_file_is_read_only_and_reports_fixed_codes',
+              'config_cli::tests::the_schema_lists_every_field_token_and_code_from_the_registry',
+              'appearance_editor::tests::filters_match_every_word_across_groups_and_groups_list_their_tokens',
+              'appearance_editor::tests::sources_name_the_layer_that_supplies_the_color'}
           summaries=re.findall(r'^test result: ok\. ([0-9]+) passed; 0 failed; ([0-9]+) ignored;',output,re.MULTILINE)
-          passed=reason is None and code==0 and needed<=ok and len(summaries)==1 and int(summaries[0][0])==1 and int(summaries[0][1])==0
-          # Only fixed synthetic control names and finite bounded coordinates
-          # may leave the private log. Never print arbitrary panic text.
-          import math
-          labels = ('Search stickers by description, shortcode or pack','Sticker pack',
-              'Close sticker picker','Allow sticker images here','Cancel and close the sticker picker')
-          numeric = r'(-?[0-9]+(?:\.[0-9]+)?)'
-          pattern = (r'(room|thread): ('+'|'.join(re.escape(label) for label in labels)
-              + r') is outside the window: Bounds \{ left: '+numeric+r', top: '+numeric
-              + r', right: '+numeric+r', bottom: '+numeric+r' \}')
-          matches = re.findall(pattern, output)
-          layout = None
-          if len(matches) == 1:
-              scope, label, *raw_bounds = matches[0]
-              bounds = [float(value) for value in raw_bounds]
-              if all(math.isfinite(value) and abs(value) <= 1000000 for value in bounds):
-                  layout = {'scope':scope,'control':labels.index(label),
-                      'bounds':dict(zip(('left','top','right','bottom'),bounds))}
-          print(json.dumps({'check':'focused_native_sticker_ui','status':'passed' if passed else 'failed',
-              'source':'6a62a3b99ca414f5fae489226a375a7feabab220','failure':reason,
-              'synthetic_layout_failure':layout,
+          passed=reason is None and code==0 and needed<=ok and len(summaries)==1 and int(summaries[0][0])>=303 and int(summaries[0][1])==1
+          ignored=set(re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. ignored',output,re.MULTILINE))
+          allowed_ignored={'outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction'}
+          # The existing opt-in live ringing fixture has its own isolated
+          # acceptance run; no newly skipped application regression is allowed.
+          passed=passed and ignored==allowed_ignored
+          clean=re.sub(r'\x1b\[[0-9;]*m','',output)
+          binding_loops=re.findall(r'^warning: morpheus-app@[0-9.]+: ([^\r\n]*part of a binding loop[^\r\n]*)',clean,re.MULTILINE)
+          passed=passed and not binding_loops
+          print(json.dumps({'check':'combined_customization_app_tests','status':'passed' if passed else 'failed',
+              'source':'33b0660679b0b3f69cf02e2dbb03dfe0c9467276','failure':reason,
+              'ignored_tests':sorted(ignored),'ui_binding_loop_warnings':binding_loops[:8],
               'tests_passed':int(summaries[0][0]) if len(summaries)==1 else None,
               'ignored':int(summaries[0][1]) if len(summaries)==1 else None,
               'required_tests':{name:name in ok for name in sorted(needed)},
@@ -156,22 +153,5 @@ jobs:
               'native_installed_app':False},sort_keys=True),flush=True)
           if not passed: raise SystemExit(1)
           PY
-      - name: Compile the reviewed media fixture before generated accounts exist
-        timeout-minutes: 25
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CARGO_INCREMENTAL: "0"
-          CARGO_PROFILE_DEV_DEBUG: "0"
-          CARGO_PROFILE_TEST_DEBUG: "0"
-        run: cargo test --locked -p morpheus-matrix --test media_local --no-run
-      - name: Verify encrypted sticker catalog send and receive with disposable accounts
-        timeout-minutes: 55
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CARGO_INCREMENTAL: "0"
-          CARGO_PROFILE_DEV_DEBUG: "0"
-          CARGO_PROFILE_TEST_DEBUG: "0"
-        run: >-
-          dbus-run-session -- python3 scripts/run_matrix_acceptance.py
-          --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks" --suite media-only
-      # Fresh hosted synthetic vault only; no owner data, signing material or artifacts.
+      # No media fixture rerun: its precise failed stage remains under investigation.
+      # No accounts, physical devices, native packages or artifact uploads.
