@@ -75,6 +75,25 @@ func attribute(_ element: AXUIElement, _ name: String) -> CFTypeRef? {
     return result == .success ? value : nil
 }
 
+// AXError.noValue explicitly reports that this attribute has no value. Native
+// AppKit leaf buttons use it for AXChildren. It is distinct from an unsupported
+// attribute or an unreadable subtree: those errors must remain incomplete.
+// A success with no array, or a noValue result with a contradictory payload,
+// proves nothing. Keep this classification separate for native boundary tests.
+func classifiedChildren(_ result: AXError, _ value: CFTypeRef?) -> [AXUIElement]? {
+    if result == .noValue && value == nil {
+        return []
+    }
+    guard result == .success else { return nil }
+    return value as? [AXUIElement]
+}
+
+func childElements(_ element: AXUIElement) -> [AXUIElement]? {
+    var value: CFTypeRef? = nil
+    let result = AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &value)
+    return classifiedChildren(result, value)
+}
+
 func string(_ element: AXUIElement, _ name: String) -> String? {
     return attribute(element, name) as? String
 }
@@ -231,7 +250,7 @@ func snapshot() {
                 node["truncated"] = truncated
                 node["name_source"] = source
                 node["focused"] = (attribute(element, kAXFocusedAttribute as String) as? Bool) ?? false
-                if let children = attribute(element, kAXChildrenAttribute as String) as? [AXUIElement] {
+                if let children = childElements(element) {
                     for child in children {
                         if elements.count + (queue.count - index) >= maxNodes {
                             wasBounded = true
