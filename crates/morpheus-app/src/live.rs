@@ -3941,10 +3941,13 @@ mod stale_observer_tests {
             .nonce;
         assert!(live.drafts.dirty_keys().contains(&(a_account.id.clone(), a_room.clone(), None)));
         assert!(!row_has_record(&manager, &a_account.id, &a_room, None, &nonce).await, "nothing is in the store yet");
-        let flush_live = live.clone();
-        let flush = tokio::spawn(async move { flush_live.flush_drafts().await });
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(!flush.is_finished(), "the flush waits on the preparation's writer transaction");
+        // Poll the production flush once: the dirty scan is synchronous, so
+        // its only await is the writer lock the preparation holds.
+        let mut flush = Box::pin(live.flush_drafts());
+        assert!(
+            futures_util::poll!(flush.as_mut()).is_pending(),
+            "the flush waits on the preparation's writer transaction"
+        );
         assert!(!row_has_record(&manager, &a_account.id, &a_room, None, &nonce).await, "the flush could not commit the record first");
         point.proceed();
         let handle = tokio::time::timeout(Duration::from_secs(30), prepare)
@@ -3956,7 +3959,6 @@ mod stale_observer_tests {
         tokio::time::timeout(Duration::from_secs(30), flush)
             .await
             .expect("the flush must finish")
-            .unwrap()
             .expect("the flush succeeds after the transaction");
         assert!(row_has_record(&manager, &a_account.id, &a_room, None, &nonce).await);
 
@@ -4166,17 +4168,17 @@ mod stale_observer_tests {
         let revision = live.drafts.scoped_revision(&a_account.id, &a_room, Some(root)).unwrap();
         let dirty_before = live.drafts.dirty_keys();
         // The writer lock is held, as the background flush would hold it.
+        // Poll the production preparation once: the room is already cached
+        // by the set and flush above, so its load completes synchronously
+        // and the only thing it can wait on is the held writer lock, which
+        // it reaches only after passing its initial selection check.
         let held = live.drafts.begin_write_transaction().await;
-        let (prep_live, prep_selection, prep_scope) = (live.clone(), selection.clone(), scope.clone());
-        let prepare = tokio::spawn(async move {
-            prep_live
-                .prepare_pending_send(&prep_selection, &prep_scope, &ComposeText::plain("thread reply"), revision)
-                .await
-        });
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        assert!(!prepare.is_finished(), "the preparation waits for the writer lock");
+        let text = ComposeText::plain("thread reply");
+        let mut prepare = Box::pin(live.prepare_pending_send(&selection, &scope, &text, revision));
+        assert!(
+            futures_util::poll!(prepare.as_mut()).is_pending(),
+            "the preparation waits for the writer lock"
+        );
         // A -> B -> A while it waits.
         let b_account = manager
             .add_password_account(&carol.homeserver_url, &carol.username, &carol.password)
@@ -4185,10 +4187,10 @@ mod stale_observer_tests {
         manager.switch_to(&a_account.id).await.expect("Cannot switch back");
         assert!(!selection.is_current());
         drop(held);
+        // The same future resumes with the lock and must create nothing.
         let outcome = tokio::time::timeout(Duration::from_secs(30), prepare)
             .await
-            .expect("the preparation must finish")
-            .unwrap();
+            .expect("the preparation must finish");
         assert!(matches!(outcome, Err(PrepareError::Store(MatrixCoreError::SelectedAccountChanged))));
         assert!(live.drafts.pending_items(&a_account.id, &a_room, Some(root)).is_empty(), "no record was created");
         assert!(!live.drafts.thread_send_pending(&a_account.id, &a_room, root));

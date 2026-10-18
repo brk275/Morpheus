@@ -4692,16 +4692,16 @@ mod tests {
             loaded_a.recovery_ready.send_replace(true);
             let stale_selection = manager.account_selection(&first.id).unwrap();
 
-            // Hold the recovered vector, then start the take: it passes its
-            // selection check and blocks behind the lock.
+            // Hold the recovered vector, then poll the production take once:
+            // discovery is ready and the manager state is free, so the only
+            // thing it can wait on is the held lock, which it reaches only
+            // after passing its selection check.
             let mut held = loaded_a.recovered.lock().await;
-            let stale_manager = manager.clone();
-            let stale = stale_selection.clone();
-            let stale_take = tokio::spawn(async move { stale_manager.take_recovered_drafts(&stale).await });
-            for _ in 0..8 {
-                tokio::task::yield_now().await;
-            }
-            assert!(!stale_take.is_finished(), "the take waits behind the recovered lock");
+            let mut stale_take = Box::pin(manager.take_recovered_drafts(&stale_selection));
+            assert!(
+                futures_util::poll!(stale_take.as_mut()).is_pending(),
+                "the take waits behind the recovered lock"
+            );
             // A -> B -> A: the old selection is revoked and a fresh one issued
             // for the same account, whose discovery result is placed under the
             // held lock.
@@ -4716,8 +4716,9 @@ mod tests {
                 sends: Vec::new(),
             }];
             drop(held);
+            // The same future resumes past the lock and is refused.
             assert!(matches!(
-                tokio::time::timeout(Duration::from_secs(5), stale_take).await.unwrap().unwrap(),
+                tokio::time::timeout(Duration::from_secs(5), stale_take).await.unwrap(),
                 Err(MatrixCoreError::SelectedAccountChanged)
             ), "the stale take is refused");
             let fresh = manager.take_recovered_drafts(&fresh_selection).await.unwrap();
