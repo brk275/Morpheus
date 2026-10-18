@@ -2021,14 +2021,6 @@ fn control_extents(ui: &AppWindow, label: &str) -> Vec<(f32, f32)> {
 /// chain without changing focus, scrolling, callbacks or widget properties.
 /// Only numeric geometry and static compiler element names/IDs are reported.
 fn clipped_control_geometry(ui: &AppWindow, label: &str) -> Vec<String> {
-    control_ancestor_geometry(ui, label, true)
-}
-
-fn control_ancestor_geometry(
-    ui: &AppWindow,
-    label: &str,
-    require_horizontal_clip: bool,
-) -> Vec<String> {
     use slint::private_unstable_api::re_exports::{
         AccessibleStringProperty, BorderRectangle, Clip, Empty, Flickable, FocusScope, ItemRc,
         Opacity, Rectangle, WindowInner,
@@ -2054,7 +2046,7 @@ fn control_ancestor_geometry(
             == Some(label)
             && {
                 let bounds = item_bounds(item);
-                !require_horizontal_clip || bounds.left < -0.5 || bounds.right > width + 0.5
+                bounds.left < -0.5 || bounds.right > width + 0.5
             }
     });
     let mut trace = vec![format!(
@@ -2147,122 +2139,6 @@ fn control_ancestor_geometry(
     trace
 }
 
-/// Read-only snapshot of the raw tab graph for the synthetic composer.
-/// No handles survive the call, and output contains only numeric geometry,
-/// fixed keys and booleans. It does not dispatch events or change focus.
-fn composer_focus_evidence(ui: &AppWindow, label: &str) -> Vec<String> {
-    use slint::private_unstable_api::re_exports::{
-        AccessibleStringProperty, ItemRc, TextInput, WindowInner,
-    };
-    use std::ops::ControlFlow;
-
-    let window = WindowInner::from_pub(ui.window());
-    let root = ItemRc::new_root(window.component());
-    let mut targets = Vec::new();
-    let mut visited = 0;
-    root.visit_descendants(|item| {
-        visited += 1;
-        if item
-            .accessible_string_property(AccessibleStringProperty::Label)
-            .as_deref()
-            == Some(label)
-        {
-            targets.push(item.clone());
-        }
-        if visited >= 4096 {
-            ControlFlow::Break(())
-        } else {
-            ControlFlow::Continue(())
-        }
-    });
-    let mut cursor = root.clone();
-    let mut target_ordinals = Vec::new();
-    let mut closed = false;
-    let mut graph_size = 0;
-    for ordinal in 0..4096 {
-        if targets.contains(&cursor) {
-            target_ordinals.push(ordinal);
-        }
-        graph_size += 1;
-        cursor = cursor.next_focus_item();
-        if cursor == root {
-            closed = true;
-            break;
-        }
-    }
-    let mut evidence = vec![format!(
-        "targets={}; visited={visited}; graph_size={graph_size}; closed={closed}; target_ordinals={target_ordinals:?}",
-        targets.len()
-    )];
-    for target in targets.iter().take(4) {
-        evidence.push(format!(
-            "visible={}; input_enabled={:?}; bounds={:?}",
-            target.is_visible(),
-            target
-                .downcast::<TextInput>()
-                .map(|input| input.as_pin_ref().enabled()),
-            item_bounds(target)
-        ));
-    }
-    evidence.extend(control_ancestor_geometry(ui, label, false));
-    evidence
-}
-
-/// Inspect only the next bounded raw graph segment and numeric viewport
-/// state at the known synthetic focus-loss boundary. Never print labels/text.
-fn focus_boundary_evidence(ui: &AppWindow) -> Vec<String> {
-    use slint::private_unstable_api::re_exports::{
-        Flickable, FocusScope, ItemRc, TextInput, WindowInner,
-    };
-    use std::ops::ControlFlow;
-    let window = WindowInner::from_pub(ui.window());
-    let root = ItemRc::new_root(window.component());
-    let mut evidence = Vec::new();
-    if let Some(focused) = window.focus_item.borrow().upgrade() {
-        let mut cursor = focused;
-        for offset in 0..32 {
-            let (kind, enabled) = if let Some(input) = cursor.downcast::<TextInput>() {
-                (1, Some(input.as_pin_ref().enabled()))
-            } else if let Some(scope) = cursor.downcast::<FocusScope>() {
-                (2, Some(scope.as_pin_ref().enabled()))
-            } else {
-                (0, None)
-            };
-            evidence.push(format!(
-                "offset={offset}; kind={kind}; enabled={enabled:?}; visible={}; bounds={:?}",
-                cursor.is_visible(),
-                item_bounds(&cursor)
-            ));
-            cursor = cursor.next_focus_item();
-        }
-    } else {
-        evidence.push("no focus".into());
-    }
-    let mut visited = 0;
-    root.visit_descendants(|item| {
-        visited += 1;
-        if evidence.len() < 48 {
-            if let Some(flickable) = item.downcast::<Flickable>() {
-                let f = flickable.as_pin_ref();
-                evidence.push(format!(
-                    "viewport={:?}; canvas=({},{},{},{})",
-                    item_bounds(item),
-                    f.content_x().0,
-                    f.content_y().0,
-                    f.content_width().0,
-                    f.content_height().0
-                ));
-            }
-        }
-        if visited >= 4096 {
-            ControlFlow::Break(())
-        } else {
-            ControlFlow::Continue(())
-        }
-    });
-    evidence
-}
-
 /// Bounds of the control that currently has keyboard focus, if any.
 fn focused_control_bounds(ui: &AppWindow) -> Option<Bounds> {
     use slint::private_unstable_api::re_exports::WindowInner;
@@ -2311,6 +2187,65 @@ fn assert_details_pane_inside_window(ui: &AppWindow) {
         bounds[0],
         clipped_control_geometry(ui, "Conversation details")
     );
+}
+
+/// Every saved action must lie within its scrollable content, including
+/// wrapped captions/statuses below the initial viewport. A window-bounds check
+/// alone cannot detect a scroll range shorter than its laid-out children.
+fn assert_record_scroll_range(ui: &AppWindow, labels: &[&str], threaded: bool) {
+    use slint::private_unstable_api::re_exports::{
+        AccessibleStringProperty, Flickable, ItemRc, WindowInner,
+    };
+    use std::ops::ControlFlow;
+
+    let window = WindowInner::from_pub(ui.window());
+    let root = ItemRc::new_root(window.component());
+    let midpoint = window_size(ui).0 / 2.0;
+    let mut targets = Vec::new();
+    let mut visited = 0;
+    root.visit_descendants(|item| {
+        visited += 1;
+        let label = item.accessible_string_property(AccessibleStringProperty::Label);
+        if labels.iter().any(|wanted| label.as_deref() == Some(wanted))
+            && (item_bounds(item).left >= midpoint) == threaded
+        {
+            targets.push(item.clone());
+        }
+        if visited >= 4096 {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    assert_eq!(
+        targets.len(),
+        28,
+        "eight records retain all expected actions"
+    );
+    for target in targets {
+        let bounds = item_bounds(&target);
+        let mut ancestors = 0;
+        root.visit_descendants(|item| {
+            if let Some(flickable) = item.downcast::<Flickable>() {
+                let contains = item.visit_descendants(|child| {
+                    if child == &target { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
+                }).is_some();
+                if contains {
+                    ancestors += 1;
+                    let f = flickable.as_pin_ref();
+                    let viewport = item_bounds(item);
+                    let content_bottom = viewport.top + f.content_y().0 + f.content_height().0;
+                    assert!(bounds.bottom <= content_bottom + 0.5,
+                        "saved action exceeds its scroll range: action={bounds:?}, content_bottom={content_bottom}, threaded={threaded}");
+                }
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        assert_eq!(
+            ancestors, 1,
+            "each action belongs to one saved-send viewport"
+        );
+    }
 }
 
 /// Walk the real tab order to a saved-send control with a budget sized for a
@@ -2627,30 +2562,11 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
         "Retry sending this message",
         "Discard this kept text",
     ];
+    assert_record_scroll_range(ui, &strip_labels, false);
     tab_to_record_control(ui, CANCEL_LABEL);
-    let composer_before_walk = composer_focus_evidence(ui, &composer_label);
     let mut room_strip_controls = 0;
     let mut room_control_identities = Vec::new();
-    // Bounded, numeric-only failure evidence: classify focus against the
-    // fixture's known labels without printing any input or account contents.
-    let mut room_focus_trace = Vec::new();
-    let mut loss_boundary = Vec::new();
-    for step in 0..400 {
-        if room_focus_trace.len() < 64 {
-            let category = if focused_control_has_label(ui, &composer_label) {
-                0
-            } else {
-                strip_labels
-                    .iter()
-                    .position(|label| focused_control_has_label(ui, label))
-                    .map(|index| index + 1)
-                    .unwrap_or(8)
-            };
-            let state = (category, focused_control_bounds(ui));
-            if room_focus_trace.last().map(|(_, previous)| previous) != Some(&state) {
-                room_focus_trace.push((step, state));
-            }
-        }
+    for _ in 0..400 {
         if focused_control_has_label(ui, &composer_label) {
             break;
         }
@@ -2672,19 +2588,7 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
                 room_strip_controls += 1;
             }
         }
-        if step == 24 {
-            loss_boundary.push(focus_boundary_evidence(ui));
-            let tab: slint::SharedString = Key::Tab.into();
-            ui.window()
-                .dispatch_event(WindowEvent::KeyPressed { text: tab.clone() });
-            loss_boundary.push(focus_boundary_evidence(ui));
-            ui.window()
-                .dispatch_event(WindowEvent::KeyReleased { text: tab });
-            i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
-            loss_boundary.push(focus_boundary_evidence(ui));
-        } else {
-            key(ui, Key::Tab);
-        }
+        key(ui, Key::Tab);
     }
     assert!(
         room_strip_controls >= 28,
@@ -2692,13 +2596,7 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
     );
     assert!(
         focused_control_has_label(ui, &composer_label),
-        "the tab walk must leave the strip and reach the composer input; mode={}, controls={}, trace={:?}; before={:?}; after={:?}; loss_boundary={:?}",
-        ui.get_composer_mode(),
-        room_strip_controls,
-        room_focus_trace,
-        composer_before_walk,
-        composer_focus_evidence(ui, &composer_label),
-        loss_boundary
+        "the tab walk must leave the strip and reach the composer input"
     );
     assert_eq!(
         room_control_identities.len(),
@@ -2734,6 +2632,7 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
         "the thread strip must leave room above: {:?}",
         thread_input[0]
     );
+    assert_record_scroll_range(ui, &strip_labels, true);
     // Walk from the thread tab into the thread strip: every focused control
     // is fully inside the window on both axes, including stacked ones.
     tab_to_control(ui, "Show thread");

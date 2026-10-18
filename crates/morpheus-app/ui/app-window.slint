@@ -683,31 +683,38 @@ component PendingSendStrip inherits ScrollView {
     // Leave room for styles whose vertical scrollbar overlays the viewport.
     padding-right: 16px;
     spacing: 8px;
-    if root.blocked-notice != "" : VerticalLayout {
-        spacing: 4px;
-        Text {
+    if root.blocked-notice != "" : Rectangle {
+        height: notice.height + 4px + discard-status.height;
+        notice := Text {
+            width: parent.width; height: self.preferred-height;
             text: root.blocked-notice; color: root.muted; font-size: 12px * root.text-scale;
             wrap: word-wrap; accessible-live-region: polite;
         }
-        HorizontalLayout {
-            alignment: start;
-            TextAction {
-                wrap-caption: root.narrow;
-                text: "Discard unreadable saved status"; ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
-                outline: root.outline; text-scale: root.text-scale; reveal-full-control: true;
-                accessible-label: "Discard saved send status this version cannot read; your typed text stays";
-                activated => { root.discard-unreadable(); }
-            }
+        discard-status := TextAction {
+            y: notice.height + 4px;
+            width: root.narrow ? parent.width : min(parent.width, self.preferred-width);
+            height: self.preferred-height;
+            wrap-caption: root.narrow;
+            text: "Discard unreadable saved status"; ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+            outline: root.outline; text-scale: root.text-scale; reveal-full-control: true;
+            accessible-label: "Discard saved send status this version cannot read; your typed text stays";
+            activated => { root.discard-unreadable(); }
         }
     }
-    for item in root.items : VerticalLayout {
-        spacing: 4px;
-        Text {
+    // Measure each wrapped status at its allocated width before summing the
+    // scroll extent. Layout preferred-height alone can use an unwrapped text
+    // estimate and leave the final records beyond the scrollbar's limit.
+    for item in root.items : Rectangle {
+        height: record-status.height + 4px + record-actions.height;
+        record-status := Text {
+            width: parent.width; height: self.preferred-height;
             text: item.status + (item.preview != "" ? ": “" + item.preview + "”" : "");
             color: root.muted; font-size: 12px * root.text-scale;
             wrap: word-wrap; accessible-live-region: polite;
         }
-        PendingRecordActions {
+        record-actions := PendingRecordActions {
+            y: record-status.height + 4px;
+            width: parent.width; height: self.preferred-height;
             item: item; narrow: root.narrow; composer-empty: root.composer-empty;
             ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
             outline: root.outline; text-scale: root.text-scale;
