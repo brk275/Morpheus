@@ -169,6 +169,28 @@ pub struct DraftStore {
     write_lock: AsyncMutex<()>,
 }
 
+/// An exclusive hold on the draft row writer; see
+/// `DraftStore::begin_write_transaction`.
+pub struct WriteTransaction<'a> {
+    store: &'a DraftStore,
+    _guard: tokio::sync::MutexGuard<'a, ()>,
+}
+
+impl WriteTransaction<'_> {
+    /// `DraftStore::persist_scoped` under the held writer lock.
+    pub async fn persist_scoped(
+        &self,
+        manager: &AccountManager,
+        account_id: &str,
+        room_id: &str,
+        thread: Option<&str>,
+    ) -> Result<(), MatrixCoreError> {
+        self.store
+            .persist_scoped_locked(manager, account_id, room_id, thread)
+            .await
+    }
+}
+
 struct PendingDraft {
     nonce: Generation,
     generation: Generation,
@@ -1203,6 +1225,20 @@ impl DraftStore {
             .await
     }
 
+    /// Hold the row writer for a multi-row operation. Every encrypted draft
+    /// row write in the app goes through this store's writer lock, so while a
+    /// transaction is held no background flush and no other controller path
+    /// can write any row: a record created inside the transaction reaches the
+    /// store only through the transaction's own writes, and a write the
+    /// transaction never made (or that returned an error) did not happen.
+    /// Live composer edits never take this lock and continue meanwhile.
+    pub async fn begin_write_transaction(&self) -> WriteTransaction<'_> {
+        WriteTransaction {
+            store: self,
+            _guard: self.write_lock.lock().await,
+        }
+    }
+
     /// Write one scope's live text, generation, records and index as a single
     /// encrypted row; delete the row only when nothing at all remains. A
     /// read-only scope is never written: its original row stays in place and
@@ -1217,6 +1253,18 @@ impl DraftStore {
         // All writes are serialized so an older edit cannot land after a
         // successful send clears the draft.
         let _write = self.write_lock.lock().await;
+        self.persist_scoped_locked(manager, account_id, room_id, thread)
+            .await
+    }
+
+    /// `persist_scoped` for a caller that already holds the writer lock.
+    async fn persist_scoped_locked(
+        &self,
+        manager: &AccountManager,
+        account_id: &str,
+        room_id: &str,
+        thread: Option<&str>,
+    ) -> Result<(), MatrixCoreError> {
         let key = key(account_id, room_id, thread);
         let snapshot = {
             let mut drafts = self.by_room.lock().expect("draft mutex poisoned");

@@ -2927,11 +2927,15 @@ account-bound flush writes a cached entry the row still lacks), makes no
 write and schedules no flush; while the selection is current it re-checks
 ownership after every write before the next write or the scheduled flush. For
 a thread send the durable order is now room index, then thread record, then
-grant, and the record is created in the shared cache only after the room row
-holds the root, so neither a crash nor the background writer (which may
-persist any dirty scope at any moment) can put an unindexed record in the
-store; a crash leaves at most an empty index entry. The cache reports whether
-indexing added the root so only an added entry is ever undone. A committed
+grant, and the whole preparation runs as one writer transaction: the draft
+store's writer lock, through which every app-side row write goes, is held from
+before the record exists in the cache until the preparation returns, so the
+background flush waits, a record reaches the store only through the
+preparation's own write, and a step that did not return success did not reach
+the store (the one caveat is a store write that commits yet reports an error,
+which the next discovery would restore as unconfirmed rather than lose). A
+crash leaves at most an empty index entry. The cache reports whether indexing
+added the root so only an added entry is ever undone. A committed
 pre-enqueue record is removed from the cache only after the core granted its
 exact release (nonce, no transaction id) and ownership was re-checked, so a
 revocation during the rollback write cannot leave the cache without a record
@@ -2974,10 +2978,12 @@ an oversize event permanently, which the fixture verifies at run time rather
 than assumes; the interrupted-preparation regression replays the stale
 rollback directly after a complete preparation (room and thread scopes),
 because the interruption cannot be injected mid-await without a hook, which
-this branch does not add; a further opt-in regression races the owned
-rollback of a committed record against the real account switch and switch
-back and asserts cache and row agree afterwards whatever the interleaving,
-which exercises the real awaits without fixing the point of revocation; an uncovered room is scanned only when it is
+this branch does not add; the forced interleavings are covered by
+test-only pause points at the real write and authorization boundaries of
+preparation and rollback (after the index commit, after the record is created
+but before its write, after the core release, and after the cache removal but
+before the write), each exercised by an opt-in regression together with a
+race-based one; an uncovered room is scanned only when it is
 opened or a scan is requested for it; discovery failures caused by a store read
 error cannot be forced by the fixture and are covered by unit tests of the
 registry only; a persisted SDK request whose record never received its id
