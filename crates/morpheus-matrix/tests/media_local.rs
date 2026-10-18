@@ -578,6 +578,56 @@ const UNJOINED_ROOM: &str = "!fixture-unjoined:invalid";
 /// A failed step names itself with fixed text; nothing secret is reported.
 type Step<T = ()> = Result<T, &'static str>;
 
+/// Fixed progress labels for private fixture logs, without room/account/media IDs.
+enum StickerStage {
+    Catalog,
+    Consent,
+    RoomPreview,
+    RoomEnqueue,
+    RoomOutcome,
+    RoomReceive,
+    RoomQueueClear,
+    ThreadCatalog,
+    ThreadSend,
+    ThreadReceive,
+    ThreadQueueClear,
+    Barrier,
+    PackChange,
+    EnabledPacks,
+    PlainRoom,
+    DisablePack,
+    RecoveryGate,
+    GateSend,
+    Departure,
+    Complete,
+}
+
+fn sticker_stage(stage: StickerStage) {
+    let code = match stage {
+        StickerStage::Catalog => "catalog",
+        StickerStage::Consent => "consent",
+        StickerStage::RoomPreview => "room_preview",
+        StickerStage::RoomEnqueue => "room_enqueue",
+        StickerStage::RoomOutcome => "room_outcome",
+        StickerStage::RoomReceive => "room_receive",
+        StickerStage::RoomQueueClear => "room_queue_clear",
+        StickerStage::ThreadCatalog => "thread_catalog",
+        StickerStage::ThreadSend => "thread_send",
+        StickerStage::ThreadReceive => "thread_receive",
+        StickerStage::ThreadQueueClear => "thread_queue_clear",
+        StickerStage::Barrier => "barrier",
+        StickerStage::PackChange => "pack_change",
+        StickerStage::EnabledPacks => "enabled_packs",
+        StickerStage::PlainRoom => "plain_room",
+        StickerStage::DisablePack => "disable_pack",
+        StickerStage::RecoveryGate => "recovery_gate",
+        StickerStage::GateSend => "gate_send",
+        StickerStage::Departure => "departure",
+        StickerStage::Complete => "complete",
+    };
+    eprintln!("\nMORPHEUS_STICKER_STAGE {code}");
+}
+
 fn ensure(condition: bool, failure: &'static str) -> Step {
     condition.then_some(()).ok_or(failure)
 }
@@ -766,6 +816,7 @@ async fn sticker_scenario(
     plain_room: &str,
     marker: &str,
 ) -> Step<(StickerCatalog, usize, PublicMediaConsent)> {
+    sticker_stage(StickerStage::Catalog);
     let client = sender
         .active_client()
         .await
@@ -810,6 +861,7 @@ async fn sticker_scenario(
 
     // An encrypted conversation needs explicit consent for this exact
     // catalog before public pack media is loaded or sent.
+    sticker_stage(StickerStage::Consent);
     let asks = catalog.requires_public_media_consent();
     ensure(asks, "Encrypted room did not ask for consent")?;
     expect_error(
@@ -863,6 +915,7 @@ async fn sticker_scenario(
         "A foreign catalog loaded a sticker",
     )?;
 
+    sticker_stage(StickerStage::RoomPreview);
     let room_consent = catalog.public_media_consent();
     original(
         preview(sender, &catalog, owl, Some(&room_consent)).await,
@@ -871,6 +924,7 @@ async fn sticker_scenario(
     // The exact lookup that reconciles a lost outcome finds the request by its
     // transaction while it is queued, never another one, and nothing once the
     // request is sent.
+    sticker_stage(StickerStage::RoomEnqueue);
     let queued = sender
         .send_sticker_for(&catalog, owl, Some(&room_consent))
         .await
@@ -885,12 +939,14 @@ async fn sticker_scenario(
         Err(_) => false,
     };
     ensure(exact, "The exact lookup found another request")?;
+    sticker_stage(StickerStage::RoomOutcome);
     sent(Ok(queued.wait_outcome().await), "Room sticker was not sent")?;
     let late = sender
         .queued_sticker_for(selection, room_id, &transaction)
         .await;
     let gone = matches!(late, Ok(None));
     ensure(gone, "A sent sticker was still found by its transaction")?;
+    sticker_stage(StickerStage::RoomReceive);
     let row = feed_row(&receiver_feed, &room_body).await;
     let card = row.attachment_name.as_deref() == Some("Sticker") && row.attachment_is_image;
     ensure(card, "Room sticker was not shown as one")?;
@@ -911,6 +967,7 @@ async fn sticker_scenario(
         .map_err(|_| "Received sticker preview failed")?;
     let same = received.bytes == PREVIEW_PNG;
     ensure(same, "Received sticker bytes differ")?;
+    sticker_stage(StickerStage::RoomQueueClear);
     // Once sent, the persistent queue holds nothing more for this room; the
     // read-only lookup used after restarts and uncertain sends agrees.
     loop {
@@ -922,6 +979,7 @@ async fn sticker_scenario(
     }
 
     // A thread target goes through the thread timeline, which relates it.
+    sticker_stage(StickerStage::ThreadCatalog);
     let root_text = RoomMessageEventContent::text_plain(format!("Sticker thread {marker}"));
     let root = room
         .send(root_text)
@@ -945,10 +1003,12 @@ async fn sticker_scenario(
         "Room consent was accepted for a thread",
     )?;
     let thread_consent = threaded.public_media_consent();
+    sticker_stage(StickerStage::ThreadSend);
     sent(
         send(sender, &threaded, reply, Some(&thread_consent)).await,
         "Thread sticker was not sent",
     )?;
+    sticker_stage(StickerStage::ThreadReceive);
     let row = feed_row(&thread_feed, "owl_wave").await;
     let thread_event = row.event_id.ok_or("Thread sticker has no event")?;
     let (encrypted, content) = received_content(&receiver_room, &thread_event).await?;
@@ -960,6 +1020,7 @@ async fn sticker_scenario(
         && content["info"].get("thumbnail_url").is_none()
         && content["info"].get("fixture.extension").is_none();
     ensure(related, "Thread sticker content differs")?;
+    sticker_stage(StickerStage::ThreadQueueClear);
     loop {
         let lookup = sender.pending_sticker_for(selection, room_id, thread);
         if matches!(lookup.await, Ok(None)) {
@@ -969,6 +1030,7 @@ async fn sticker_scenario(
     }
     // A later ordinary message is the ordered barrier for the room feed;
     // checking absence straight after thread delivery could pass falsely.
+    sticker_stage(StickerStage::Barrier);
     let barrier = format!("Sticker barrier {marker}");
     sender
         .send_text_for(selection.account_id(), room_id, barrier.clone())
@@ -982,6 +1044,7 @@ async fn sticker_scenario(
     ensure(kept_out, "Thread sticker reached the room feed")?;
 
     // Changing the pack revokes earlier choices and their consent.
+    sticker_stage(StickerStage::PackChange);
     let changed_body = format!("Owl after change {marker}");
     publish_pack(&room, PACK_KEY, owl_pack(&uri, &changed_body)).await?;
     let changed = catalog_with(sender, selection, room_id, None, &changed_body, true).await;
@@ -1019,6 +1082,7 @@ async fn sticker_scenario(
 
     // A pack enabled from another joined room serves every conversation, and
     // disabling it revokes earlier choices. An unjoined room is only counted.
+    sticker_stage(StickerStage::EnabledPacks);
     let plain = sdk_room(&client, plain_room)?;
     let enabled_body = format!("Enabled owl {marker}");
     let enabled_pack = json!({
@@ -1047,6 +1111,7 @@ async fn sticker_scenario(
     )?;
     // An unencrypted destination needs no consent; its own pack is a room
     // pack there, even while the list also names it.
+    sticker_stage(StickerStage::PlainRoom);
     let open = catalog_with(sender, selection, plain_room, None, &enabled_body, true).await;
     let open_owl = label_index(&open, &enabled_body).ok_or("No plain room sticker")?;
     let local = source_of(&open, open_owl) == StickerPackSource::Room;
@@ -1056,6 +1121,7 @@ async fn sticker_scenario(
         preview(sender, &open, open_owl, None).await,
         "Plain room sticker preview differs",
     )?;
+    sticker_stage(StickerStage::DisablePack);
     let disabled = json!({ "rooms": {} });
     set_enabled_packs(&client, &disabled).await?;
     catalog_with(sender, selection, room_id, None, &enabled_body, false).await;
@@ -1076,6 +1142,7 @@ async fn sticker_scenario(
 
     // A room created after discovery stays behind the recovery gate until it
     // is opened: the sticker is refused there, never sent around the gate.
+    sticker_stage(StickerStage::RecoveryGate);
     let gate_room_id = sender
         .create_private_room(&format!("Sticker gate {marker}"))
         .await
@@ -1104,12 +1171,14 @@ async fn sticker_scenario(
     )?;
     let paused = !gate.send_queue().is_enabled();
     ensure(paused, "Gate room queue was enabled")?;
+    sticker_stage(StickerStage::GateSend);
     opened_room::scan(sender, &gate_room_id).await?;
     sent(
         send(sender, &gated, gate_owl, Some(&gate_consent)).await,
         "Opened room sticker was not sent",
     )?;
     // Leaving the room revokes its choices.
+    sticker_stage(StickerStage::Departure);
     sender
         .leave_room(&gate_room_id)
         .await
@@ -1127,6 +1196,7 @@ async fn sticker_scenario(
         MatrixCoreError::StickerUnavailable,
         "A sticker loaded after leaving",
     )?;
+    sticker_stage(StickerStage::Complete);
     Ok((changed, changed_owl, changed_consent))
 }
 
@@ -1231,6 +1301,16 @@ fn sticker_packs_send_between_disposable_accounts() {
         )
         .await
         .unwrap_or(Err("Sticker scenario exceeded its deadline"));
+        if let Err(failure) = &outcome {
+            let code = if *failure == "Sticker scenario exceeded its deadline" {
+                "scenario_deadline"
+            } else {
+                // Assertion details can identify a security boundary; keep
+                // both the message and its phase out of public diagnostics.
+                "check_failed"
+            };
+            eprintln!("\nMORPHEUS_STICKER_FAILURE {code}");
+        }
         // Restore the shared fixture rooms and account data even after a
         // failed step, while the selection is still current.
         let cleaned = timeout(
@@ -1239,6 +1319,9 @@ fn sticker_packs_send_between_disposable_accounts() {
         )
         .await
         .unwrap_or(Err("Sticker cleanup exceeded its deadline"));
+        if cleaned.is_err() {
+            eprintln!("\nMORPHEUS_STICKER_CLEANUP_FAILURE failed");
+        }
         sender.stop().await;
         receiver.stop().await;
         // Stopping ends the selection: a kept catalog and its consent must

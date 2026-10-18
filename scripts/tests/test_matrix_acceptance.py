@@ -865,6 +865,32 @@ class FixtureAbsenceTests(unittest.TestCase):
                 self.assertNotIn("private", visible.getvalue() + str(caught.exception))
 
 
+class StickerFailureForwardingTests(unittest.TestCase):
+    def invoke(self, output, **kwargs):
+        return TimelineFailureForwardingTests.invoke(self, output, label="media_local", **kwargs)
+
+    def test_timeout_stage_is_forwarded_after_scanning_without_private_payload(self):
+        output = self.invoke("private-server-response\nMORPHEUS_STICKER_STAGE room_receive\n"
+                             "MORPHEUS_STICKER_FAILURE scenario_deadline\n")
+        records = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
+        self.assertEqual(records[0]["sticker_diagnostics"]["stage"], "room_receive")
+        self.assertNotIn("private-server-response", output)
+
+    def test_failed_scanner_does_not_publish_even_the_closed_stage(self):
+        output = self.invoke("MORPHEUS_STICKER_STAGE room_receive\n"
+                             "MORPHEUS_STICKER_FAILURE scenario_deadline\n", scanner_code=1)
+        self.assertNotIn("sticker_diagnostics", output)
+        self.assertNotIn("room_receive", output)
+
+    def test_check_failure_withholds_potential_security_boundary_details(self):
+        output = self.invoke("MORPHEUS_STICKER_STAGE consent\n"
+                             "MORPHEUS_STICKER_FAILURE check_failed\n"
+                             "private-server-response\n")
+        self.assertIn('"stage": "withheld"', output)
+        self.assertNotIn("consent", output)
+        self.assertNotIn("private-server-response", output)
+
+
 class NativeProcessDiagnosticTests(unittest.TestCase):
     def test_exit_facts_are_bounded_and_timeout_is_not_reported_as_a_kill(self):
         for code, expected in ((0, ("exited", "exit_code", 0)),

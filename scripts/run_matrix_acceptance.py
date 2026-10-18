@@ -24,6 +24,7 @@ from fixture_paths import external_path, private_directory, write_private
 from element_peer_fixture import VERSION as ELEMENT_VERSION, IMAGE_DIGEST as ELEMENT_IMAGE_DIGEST
 from run_element_acceptance import diagnostics as element_diagnostics, evidence as element_evidence
 from matrix_fixture_diagnostics import is_progress_line, matrix_fixture_diagnostics
+from sticker_diagnostics import sticker_diagnostics
 from element_process_namespace import namespace_command, stop_owned, wait_owned
 
 
@@ -905,6 +906,9 @@ class Acceptance:
                 evidence["drafts_diagnostics"] = drafts_diagnostics(output)
                 if timed_out:
                     evidence["drafts_diagnostics"]["failure"] = "deadline"
+            if label == "media_local":
+                if diagnostics := sticker_diagnostics(output):
+                    evidence["sticker_diagnostics"] = diagnostics
             if label == APP_RECOVERY_LABEL:
                 evidence["app_recovery_diagnostics"] = app_recovery_diagnostics(output)
             if label == APP_TIMELINE_LABEL:
