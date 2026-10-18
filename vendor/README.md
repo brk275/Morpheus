@@ -12,6 +12,7 @@ provenance and regression tests when updating a dependency.
 | matrix-sdk-base 0.19.1 | Preserve bounded encrypted keyless sticky receipts and their revocation | [Patch notes](matrix-sdk-base/MORPHEUS_PATCH.md) |
 | livekit-api 0.5.3 | Secure signaling, fallback endpoints, and authenticated redirects | [Patch notes](livekit-api/README.md) |
 | webrtc-sys 0.3.35 | Isolate pinned Linux WebRTC PipeWire stubs from the system PipeWire API | [Patch notes](webrtc-sys/MORPHEUS_PATCH.md) |
+| webrtc-sys-build 0.3.18 | Verify pinned archive downloads and constrain native SDK extraction | [Patch notes](webrtc-sys-build/MORPHEUS_PATCH.md) |
 | cargo-packager-updater 0.2.3 | HTTPS and bounded signed-update staging; installation disabled pending recovery checks | [Patch notes](cargo-packager-updater/README.md) |
 | nokhwa 0.10.11 / nokhwa-bindings-macos 0.2.4 | Correct and bound native macOS capture | Details below |
 

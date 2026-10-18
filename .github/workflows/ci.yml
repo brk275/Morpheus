@@ -284,6 +284,7 @@ jobs:
           cargo test --locked -p matrix-rtc-livekit --lib
           cargo test --locked -p matrix-rtc-core --features testing --lib --test key_rotation
           cargo test --locked -p cargo-packager-updater --lib
+          cargo test --locked -p webrtc-sys-build --lib
       - name: Test pinned SDK sticky receipt and redaction regressions
         id: sdk-receipt-tests
         # Keep collecting the independently built app's live acceptance. The

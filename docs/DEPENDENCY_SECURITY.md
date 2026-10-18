@@ -32,8 +32,11 @@ standalone crates are being consolidated into `zbus`. These require upstream
 migration planning, not a claim of confirmed exploitation.
 
 The locked `zip` build dependency has additional published advisory matches.
-Its source and extraction callers require a separate assessment before beta
-approval; the TLS update does not resolve that review.
+The candidate's local [native SDK build-helper patch](../vendor/webrtc-sys-build/MORPHEUS_PATCH.md)
+replaces its extraction call and verifies pinned archive bytes before unpacking.
+Source review and guarded tests do not replace actual four-platform download,
+extraction and integration acceptance, which remains pending. Version-only ZIP
+matches remain visible; no blanket advisory suppression is added.
 
 ## Applied panic-safety backport
 
