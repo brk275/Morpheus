@@ -100,6 +100,22 @@ DRAFTS_STAGES = frozenset((
 ))
 DRAFTS_STAGE = re.compile(r"^MORPHEUS_DRAFTS_STAGE ([a-z_]{1,48})$", re.MULTILINE)
 APP_RECOVERY_LABEL = "app-draft-recovery"
+APP_TIMELINE_LABEL = "app-live-timeline"
+APP_TIMELINE_CASE = "account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation"
+APP_TIMELINE_CHECKS = frozenset((
+    "room_delivery", "thread_delivery", "thread_root_excluded", "feeds_running",
+    "old_lease_revoked", "idle_feeds_stopped", "late_events_in_core",
+    "stale_room_rejected", "stale_thread_rejected", "renewed_thread_delivery",
+    "renewed_room_delivery", "queued_callbacks_observed", "queued_room_rejected",
+    "queued_thread_rejected", "cleanup_complete",
+))
+APP_TIMELINE_STAGES = frozenset((
+    "setup", "activation", "room_open", "room_delivery", "thread_delivery",
+    "revocation", "renewal", "reopen", "queued_callbacks", "queued_revocation",
+    "queued_rejection", "queued_reopen", "cleanup", "complete",
+))
+APP_TIMELINE_STAGE = re.compile(r"^MORPHEUS_LIVE_TIMELINE_STAGE ([a-z_]{1,48})$", re.MULTILINE)
+APP_TIMELINE_CHECK = re.compile(r"MORPHEUS_LIVE_TIMELINE_CHECK ([a-z_]{1,48})=(true|false)")
 APP_RECOVERY_CASES = frozenset((
     "observer_revocation", "interrupted_prepare", "rollback_race", "writer_transaction",
     "thread_index", "release_revocation", "write_revocation", "writer_lock_revocation",
@@ -329,7 +345,7 @@ ELEMENT_TEST_STAGES = frozenset((
     "browser_leave", "native_test", "complete",
 ))
 RTC_CHECKS = ("unsupported_transport_local", *RING_LABELS, *RTC_LABELS, ELEMENT_LABEL)
-PLANNED_CHECKS = (*CHAT_CHECKS, APP_RECOVERY_LABEL, "recovery_local", *OAUTH_LABELS, *RTC_CHECKS)
+PLANNED_CHECKS = (*CHAT_CHECKS, APP_TIMELINE_LABEL, APP_RECOVERY_LABEL, "recovery_local", *OAUTH_LABELS, *RTC_CHECKS)
 # A focused retry still establishes the identity required by moderation and
 # runs every app recovery guard. It cannot stand in for full acceptance.
 DRAFT_RECOVERY_CHECKS = ("drafts_local", "formatted_local", "moderation_local", APP_RECOVERY_LABEL)
@@ -337,7 +353,7 @@ DRAFT_ONLY_CHECKS = ("drafts_local",)
 # These fixtures call snapshot/room/thread feed reads. Preserve the formatting
 # prerequisite for moderation, both search sync paths and real key recovery.
 TIMELINE_READ_TESTS = ("live_local", "formatted_local", "media_local", "moderation_local", "search_local")
-TIMELINE_READ_CHECKS = (*TIMELINE_READ_TESTS, "search_local-classic", "recovery_local", "unsupported_transport_local")
+TIMELINE_READ_CHECKS = (*TIMELINE_READ_TESTS, "search_local-classic", "recovery_local", "unsupported_transport_local", APP_TIMELINE_LABEL)
 SUITES = {"full": PLANNED_CHECKS, "draft-recovery": DRAFT_RECOVERY_CHECKS,
           "drafts-only": DRAFT_ONLY_CHECKS, "timeline-reads": TIMELINE_READ_CHECKS}
 # Leave a full minute before the workflow's 55-minute hard kill. Work stops
@@ -418,6 +434,44 @@ def app_recovery_evidence(output: str) -> dict[str, bool]:
             or entered != APP_RECOVERY_CASES or checks.keys() != APP_RECOVERY_CASES):
         raise RuntimeError("Live app recovery evidence is incomplete")
     return {name: True for name in sorted(APP_RECOVERY_CASES)}
+
+
+def app_timeline_diagnostics(output: str) -> dict:
+    result = {"test_entered": False}
+    for match in APP_TIMELINE_STAGE.finditer(output):
+        if match[1] in APP_TIMELINE_STAGES:
+            result["test_entered"] |= match[1] == "setup"
+            result["stage"] = match[1]
+    return result
+
+
+def app_timeline_evidence(output: str) -> dict[str, bool]:
+    """One real harness, all fixed assertions, and cleanup before completion."""
+    checks = {}
+    proof = []
+    error = "Live timeline UI evidence is incomplete"
+    for line in output.splitlines():
+        if line.startswith("MORPHEUS_LIVE_TIMELINE_CHECK"):
+            match = APP_TIMELINE_CHECK.fullmatch(line)
+            if (not match or match[1] not in APP_TIMELINE_CHECKS
+                    or match[1] in checks or match[2] != "true"):
+                raise RuntimeError(error)
+            checks[match[1]] = True
+            proof.append(("check", match[1]))
+        elif line.startswith("MORPHEUS_LIVE_TIMELINE_STAGE"):
+            match = APP_TIMELINE_STAGE.fullmatch(line)
+            if not match or match[1] not in APP_TIMELINE_STAGES:
+                raise RuntimeError(error)
+            proof.append(("stage", match[1]))
+        if len(proof) > 64:
+            raise RuntimeError(error)
+    if (passed_tests(output) != 1 or checks.keys() != APP_TIMELINE_CHECKS
+            or not proof or proof[0] != ("stage", "setup")
+            or proof[-1] != ("stage", "complete")
+            or proof.count(("stage", "setup")) != 1
+            or proof.count(("stage", "complete")) != 1):
+        raise RuntimeError(error)
+    return {name: True for name in sorted(APP_TIMELINE_CHECKS)}
 
 
 def native_process_diagnostics(output: str, returncode, timed_out: bool) -> dict:
@@ -840,6 +894,9 @@ class Acceptance:
             if label == APP_RECOVERY_LABEL:
                 evidence["app_recovery_diagnostics"] = app_recovery_diagnostics(output)
                 evidence["native_process"] = native_process_diagnostics(output, observed_returncode, timed_out)
+            if label == APP_TIMELINE_LABEL:
+                evidence["app_timeline_diagnostics"] = app_timeline_diagnostics(output)
+                evidence["native_process"] = native_process_diagnostics(output, observed_returncode, timed_out)
             if fixture_diagnostics := matrix_fixture_diagnostics(output):
                 if timed_out:
                     fixture_diagnostics["failure"] = "deadline"
@@ -925,6 +982,14 @@ class Acceptance:
             record["drafts_diagnostics"] = diagnostics
         if label == APP_RECOVERY_LABEL:
             record["app_recovery_checks"] = app_recovery_evidence(output)
+        if label == APP_TIMELINE_LABEL:
+            if not test:
+                raise RuntimeError("Live timeline UI evidence is incomplete")
+            try:
+                record["app_timeline_checks"] = app_timeline_evidence(output)
+            except RuntimeError:
+                print(json.dumps({"check": label, "app_timeline_diagnostics": app_timeline_diagnostics(output)}), flush=True)
+                raise
         if label == "moderation_local":
             # A green moderation result must exercise an existing, unverified
             # account identity on this fresh device without changing trust.
@@ -968,6 +1033,16 @@ class Acceptance:
             test=True, pid_namespace=True,
         )
 
+    def app_timeline(self, fixture: Path):
+        self.run(
+            APP_TIMELINE_LABEL,
+            ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
+             "--bin", "morpheus-app", APP_TIMELINE_CASE, "--", "--exact",
+             "--nocapture", "--test-threads=1"],
+            extra={"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture)},
+            seconds=420, test=True, pid_namespace=True,
+        )
+
     def draft_recovery_cases(self, fixture: Path):
         self.group(("drafts_local",), lambda: self.test("drafts_local", fixture))
         formatted = self.group(("formatted_local",), lambda: self.test("formatted_local", fixture))
@@ -1004,6 +1079,7 @@ class Acceptance:
             self.test("unsupported_transport_local", gate, rtc=True,
                       extra={"MORPHEUS_MATRIX_RTC_GATE_TEST_ACCOUNTS": str(gate)})
         self.group(("unsupported_transport_local",), unsupported_case)
+        self.group((APP_TIMELINE_LABEL,), lambda: self.app_timeline(fixture))
 
     def rtc_cases(self):
         # Every run gets different users/room: existing devices and keys would
@@ -1145,7 +1221,7 @@ class Acceptance:
                                  "synthetic call media and OAuth browser-form protocol automation.\n\n")
                 elif self.suite == "timeline-reads":
                     output.write("Focused timeline-read checks: real Synapse and an ephemeral OS Secret Service. "
-                                 "Includes encrypted messages/threads, formatting, media, moderation, both search sync paths, key recovery and chat without a call service. "
+                                 "Includes encrypted messages/threads, formatting, media, moderation, both search sync paths, key recovery, chat without a call service and generated-window model delivery/revocation. "
                                  "No OAuth, live-call interoperability or installed-app checks; this is not full acceptance.\n\n")
                 elif self.suite == "drafts-only":
                     output.write("Focused drafts-only rerun: real Synapse and an ephemeral OS Secret Service. "
@@ -1254,6 +1330,7 @@ def main():
                 formatted_passed = succeeded
         acceptance.group(("search_local-classic",), lambda: acceptance.test(
             "search_local", fixture, extra={"MORPHEUS_MATRIX_SEARCH_CLASSIC": "1"}))
+        acceptance.group((APP_TIMELINE_LABEL,), lambda: acceptance.app_timeline(fixture))
         acceptance.group((APP_RECOVERY_LABEL,), lambda: acceptance.app_recovery(fixture))
         def recovery_case():
             recovery = fixture_from_output(acceptance.script("local_matrix_env", "recovery-fixture"), root)

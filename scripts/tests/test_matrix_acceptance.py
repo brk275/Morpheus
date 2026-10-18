@@ -55,7 +55,7 @@ class FocusedSuiteTests(unittest.TestCase):
 
     def test_timeline_read_completion_requires_all_selected_checks_and_reports_partial_scope(self):
         expected = ("live_local", "formatted_local", "media_local", "moderation_local",
-                    "search_local", "search_local-classic", "recovery_local", "unsupported_transport_local")
+                    "search_local", "search_local-classic", "recovery_local", "unsupported_transport_local", "app-live-timeline")
         self.assertEqual(acceptance_module.TIMELINE_READ_CHECKS, expected)
         self.assertEqual(acceptance_module.SUITES["full"], acceptance_module.PLANNED_CHECKS)
         with tempfile.TemporaryDirectory() as folder:
@@ -87,7 +87,8 @@ class FocusedSuiteTests(unittest.TestCase):
             fixture, recovery, gate = root / "fixture.json", root / "recovery.json", root / "rtc-gate.json"
             with patch.object(runner, "test") as test, \
                     patch.object(runner, "script", side_effect=["private-recovery", "private-gate"]) as script, \
-                    patch.object(acceptance_module, "fixture_from_output", side_effect=[recovery, gate]) as read:
+                    patch.object(acceptance_module, "fixture_from_output", side_effect=[recovery, gate]) as read, \
+                    patch.object(runner, "app_timeline") as app:
                 runner.timeline_read_cases(fixture)
             self.assertEqual([call.args for call in test.call_args_list], [
                 ("live_local", fixture), ("formatted_local", fixture), ("media_local", fixture),
@@ -105,6 +106,7 @@ class FocusedSuiteTests(unittest.TestCase):
             self.assertEqual([call.args for call in read.call_args_list], [
                 ("private-recovery", root), ("private-gate", root),
             ])
+            app.assert_called_once_with(fixture)
             self.assertEqual(runner.not_run, {})
 
     def test_timeline_failed_formatting_skips_moderation_without_hiding_failure(self):
@@ -114,11 +116,13 @@ class FocusedSuiteTests(unittest.TestCase):
             failure = acceptance_module.CheckFailure("formatted_local", "test_failed")
             with patch.object(runner, "test", side_effect=[None, failure, None, None, None, None, None]) as test, \
                     patch.object(runner, "script", return_value="private-fixture"), \
-                    patch.object(acceptance_module, "fixture_from_output", return_value=root / "recovery.json"):
+                    patch.object(acceptance_module, "fixture_from_output", return_value=root / "recovery.json"), \
+                    patch.object(runner, "app_timeline") as app:
                 runner.timeline_read_cases(root / "fixture.json")
             self.assertEqual([call.args[0] for call in test.call_args_list], [
                 "live_local", "formatted_local", "media_local", "search_local", "search_local", "recovery_local", "unsupported_transport_local",
             ])
+            app.assert_called_once_with(root / "fixture.json")
             self.assertEqual(runner.not_run, {"moderation_local": "dependency_failed"})
             self.assertEqual(runner.failures, [{"check": "formatted_local", "reason": "test_failed"}])
             with self.assertRaises(RuntimeError):
@@ -169,6 +173,125 @@ class FocusedSuiteTests(unittest.TestCase):
             self.assertEqual(report["not_run"], {})
             self.assertIn("not full acceptance", summary.read_text())
             self.assertNotIn("Full suite:", summary.read_text())
+
+
+class AppTimelineEvidenceTests(unittest.TestCase):
+    @staticmethod
+    def output():
+        lines = ["running 1 test", "MORPHEUS_LIVE_TIMELINE_STAGE setup"]
+        lines.extend(f"MORPHEUS_LIVE_TIMELINE_CHECK {name}=true"
+                     for name in sorted(acceptance_module.APP_TIMELINE_CHECKS))
+        lines.extend(("MORPHEUS_LIVE_TIMELINE_STAGE complete",
+                      "test result: ok. 1 passed; 0 failed; 0 ignored;"))
+        return "\n".join(lines) + "\n"
+
+    def test_one_harness_requires_all_fifteen_observable_facts_and_cleanup(self):
+        checks = acceptance_module.app_timeline_evidence(self.output())
+        self.assertEqual(len(checks), 15)
+        self.assertEqual(set(checks), acceptance_module.APP_TIMELINE_CHECKS)
+        self.assertTrue(all(checks.values()))
+        self.assertIn("queued_callbacks_observed", checks)
+        self.assertIn("queued_room_rejected", checks)
+        self.assertIn("queued_thread_rejected", checks)
+        self.assertIn("cleanup_complete", checks)
+
+    def test_every_missing_fact_is_fatal_even_after_a_green_test_summary(self):
+        for name in acceptance_module.APP_TIMELINE_CHECKS:
+            incomplete = self.output().replace(f"MORPHEUS_LIVE_TIMELINE_CHECK {name}=true\n", "")
+            with self.subTest(missing=name), self.assertRaisesRegex(RuntimeError, "Live timeline UI evidence is incomplete"):
+                acceptance_module.app_timeline_evidence(incomplete)
+
+    def test_false_duplicate_unknown_and_malformed_records_never_pass(self):
+        line = "MORPHEUS_LIVE_TIMELINE_CHECK room_delivery=true"
+        for replacement in (line.replace("true", "false"), line + "\n" + line,
+                            "MORPHEUS_LIVE_TIMELINE_CHECK unknown=true",
+                            "MORPHEUS_LIVE_TIMELINE_CHECK room_delivery=1",
+                            line + " private-server-value", "MORPHEUS_LIVE_TIMELINE_CHECK private=secret",
+                            "MORPHEUS_LIVE_TIMELINE_CHECK"):
+            with self.subTest(value=replacement), self.assertRaises(RuntimeError) as caught:
+                acceptance_module.app_timeline_evidence(self.output().replace(line, replacement))
+            self.assertNotIn("private", str(caught.exception))
+            self.assertNotIn("secret", str(caught.exception))
+
+    def test_missing_or_repeated_lifecycle_markers_cannot_stand_in_for_completion(self):
+        setup = "MORPHEUS_LIVE_TIMELINE_STAGE setup\n"
+        complete = "MORPHEUS_LIVE_TIMELINE_STAGE complete\n"
+        outputs = (self.output().replace(setup, ""), self.output().replace(complete, ""),
+                   self.output().replace(setup, setup + setup), self.output().replace(complete, complete + complete),
+                   self.output().replace(setup, "MORPHEUS_LIVE_TIMELINE_STAGE private-secret\n"))
+        for output in outputs:
+            with self.subTest(output=output), self.assertRaises(RuntimeError):
+                acceptance_module.app_timeline_evidence(output)
+
+    def test_completion_must_follow_assertions_and_setup_must_precede_them(self):
+        setup = "MORPHEUS_LIVE_TIMELINE_STAGE setup\n"
+        complete = "MORPHEUS_LIVE_TIMELINE_STAGE complete\n"
+        outputs = (complete + self.output().replace(complete, ""),
+                   self.output().replace(setup, "") + setup)
+        for output in outputs:
+            with self.subTest(output=output), self.assertRaises(RuntimeError):
+                acceptance_module.app_timeline_evidence(output)
+
+    def test_wrong_count_or_skipped_harness_is_not_live_coverage(self):
+        summary = "test result: ok. 1 passed; 0 failed; 0 ignored;"
+        for replacement in ("test result: ok. 0 passed; 0 failed; 1 ignored;",
+                            "test result: ok. 2 passed; 0 failed; 0 ignored;", ""):
+            with self.subTest(summary=replacement), self.assertRaises(RuntimeError):
+                acceptance_module.app_timeline_evidence(self.output().replace(summary, replacement))
+
+    def test_excessive_stage_records_are_rejected_before_unbounded_proof_growth(self):
+        expanded = self.output().replace("MORPHEUS_LIVE_TIMELINE_STAGE complete",
+                                       "MORPHEUS_LIVE_TIMELINE_STAGE queued_callbacks\n" * 65
+                                       + "MORPHEUS_LIVE_TIMELINE_STAGE complete")
+        with self.assertRaises(RuntimeError):
+            acceptance_module.app_timeline_evidence(expanded)
+
+    def test_diagnostics_reveal_only_fixed_entered_and_stage_values(self):
+        output = "private-token\nMORPHEUS_LIVE_TIMELINE_STAGE setup\nMORPHEUS_LIVE_TIMELINE_STAGE queued_callbacks\nMORPHEUS_LIVE_TIMELINE_STAGE private_token\n"
+        self.assertEqual(acceptance_module.app_timeline_diagnostics(output),
+                         {"test_entered": True, "stage": "queued_callbacks"})
+        self.assertEqual(acceptance_module.app_timeline_diagnostics("private-token"), {"test_entered": False})
+
+    def test_validated_record_requires_native_test_mode_and_attaches_safe_facts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "scanner", suite="timeline-reads")
+            arguments = {"ring_case": None, "oauth_checks": None, "element_checks": None}
+            record = runner.validated_record(acceptance_module.APP_TIMELINE_LABEL, self.output(), test=True, **arguments)
+            self.assertEqual(record["passed"], 1)
+            self.assertEqual(len(record["app_timeline_checks"]), 15)
+            self.assertTrue(all(record["app_timeline_checks"].values()))
+            with self.assertRaises(RuntimeError):
+                runner.validated_record(acceptance_module.APP_TIMELINE_LABEL, self.output(), test=False, **arguments)
+            with self.assertRaises(RuntimeError):
+                runner.validated_record(acceptance_module.APP_TIMELINE_LABEL,
+                                        "test result: ok. 1 passed; 0 failed; 0 ignored;", test=True, **arguments)
+
+    def test_wrapper_uses_exact_ui_harness_fixture_and_process_containment(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="timeline-reads")
+            fixture = root / "fixture.json"
+            with patch.object(runner, "run") as run:
+                runner.app_timeline(fixture)
+            args, options = run.call_args
+            self.assertEqual(args[0], acceptance_module.APP_TIMELINE_LABEL)
+            self.assertEqual(args[1], ["cargo", "test", "--locked", "-p", "morpheus-app", "--features", "native-calls",
+                                      "--bin", "morpheus-app", acceptance_module.APP_TIMELINE_CASE,
+                                      "--", "--exact", "--nocapture", "--test-threads=1"])
+            self.assertEqual(options, {"extra": {"MORPHEUS_MATRIX_TEST_ACCOUNTS": str(fixture)},
+                                       "seconds": 420, "test": True, "pid_namespace": True})
+
+    def test_live_ui_case_remains_required_in_full_and_timeline_profiles(self):
+        for suite in ("full", "timeline-reads"):
+            with tempfile.TemporaryDirectory() as folder:
+                runner = Acceptance(Path(folder), "scanner", suite=suite)
+                self.assertIn(acceptance_module.APP_TIMELINE_LABEL, runner.planned_checks)
+                runner.results = [{"check": label} for label in runner.planned_checks
+                                  if label != acceptance_module.APP_TIMELINE_LABEL]
+                with self.subTest(suite=suite), self.assertRaises(RuntimeError):
+                    runner.finish_checks()
+        self.assertNotIn(acceptance_module.APP_TIMELINE_LABEL, acceptance_module.DRAFT_RECOVERY_CHECKS)
+        self.assertNotIn(acceptance_module.APP_TIMELINE_LABEL, acceptance_module.DRAFT_ONLY_CHECKS)
 
 
 class StartupOwnershipTests(unittest.TestCase):
