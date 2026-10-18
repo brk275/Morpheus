@@ -689,7 +689,7 @@ async fn assert_native_motion_and_preference(ui: &AppWindow, config_path: &std::
 }
 
 async fn assert_lazy_timeline_view(ui: &AppWindow) {
-    use crate::timeline_model::{projection_count, tests::fixture, update_shared};
+    use crate::timeline_model::{projection_count, tests::rich_fixture, update_shared};
     use slint::private_unstable_api::re_exports::{AccessibleStringProperty, ItemRc, WindowInner};
     use std::{ops::ControlFlow, sync::Arc};
 
@@ -711,7 +711,7 @@ async fn assert_lazy_timeline_view(ui: &AppWindow) {
     };
     ui.set_page(0);
     ui.set_font_scale_percent(100);
-    let mut rows: Vec<_> = (0..10_000).map(|i| Arc::new(fixture(i))).collect();
+    let mut rows: Vec<_> = (0..10_000).map(|i| Arc::new(rich_fixture(i))).collect();
     let original = rows[0].body.clone();
     let model = update_shared(ModelRc::default(), rows.clone());
     assert_eq!(projection_count(&model), 0);
@@ -723,6 +723,19 @@ async fn assert_lazy_timeline_view(ui: &AppWindow) {
         "the real ListView must project a bounded visible subset: {initial}"
     );
     assert!(has_label(&original));
+    // Read actual laid-out text, not the fixture's string lengths: the first
+    // two delegates must have different native heights at the same width.
+    let short = control_bounds(ui, &original);
+    let multiline = control_bounds(ui, &rows[1].body);
+    assert_eq!(short.len(), 1, "one short body is materialized");
+    assert_eq!(multiline.len(), 1, "one multiline body is materialized");
+    assert!(inside_window(ui, short[0]));
+    assert!(
+        multiline[0].bottom - multiline[0].top > short[0].bottom - short[0].top + 0.5,
+        "the rich timeline workload must exercise different native body heights: short={:?}, multiline={:?}",
+        short[0],
+        multiline[0]
+    );
 
     let edited = Arc::make_mut(&mut rows[0]);
     edited.body = "Updated visible timeline fixture".into();
@@ -740,7 +753,7 @@ async fn assert_lazy_timeline_view(ui: &AppWindow) {
         "editing one row must not format the entire history"
     );
 
-    rows.push(Arc::new(fixture(10_000)));
+    rows.push(Arc::new(rich_fixture(10_000)));
     let appended = update_shared(ui.get_messages(), rows);
     assert_eq!(appended, model);
     ui.set_messages(appended);
@@ -750,6 +763,30 @@ async fn assert_lazy_timeline_view(ui: &AppWindow) {
         projection_count(&model) - after_edit < 1_000,
         "appending must not format the entire history"
     );
+    // Exercise the real ListView's wheel path through mixed-height rows.
+    // This is a bounded virtualization regression, not a frame-time benchmark.
+    let before_scroll = projection_count(&model);
+    let position = slint::LogicalPosition::new(
+        (short[0].left + short[0].right) / 2.0,
+        (short[0].top + short[0].bottom) / 2.0,
+    );
+    for _ in 0..10 {
+        ui.window().dispatch_event(WindowEvent::PointerScrolled {
+            position,
+            delta_x: 0.0,
+            delta_y: -600.0,
+        });
+        settle(ui).await;
+    }
+    assert!(
+        !has_label("Updated visible timeline fixture"),
+        "wheel scrolling must move past the first delegate"
+    );
+    assert!(
+        projection_count(&model) - before_scroll < 1_000,
+        "a bounded wheel burst must not format all 10,000 messages"
+    );
+    assert_eq!(ui.get_messages(), model, "scrolling keeps the shared model");
     ui.set_messages(ModelRc::new(VecModel::<MessageItem>::default()));
     settle(ui).await;
     assert_eq!(ui.get_messages().row_count(), 0);
