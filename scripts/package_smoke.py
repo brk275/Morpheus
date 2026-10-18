@@ -725,6 +725,7 @@ MACOS_PASSWORD_SEMANTICS = frozenset({"unchecked", "protected", "unprotected", "
 MACOS_BRIDGE_ERRORS = frozenset({
     "bridge_error", "invalid_command", "attach_mismatch", "not_attached", "window_list_unavailable",
     "attach_application_missing", "attach_bundle_mismatch", "attach_executable_missing", "attach_executable_mismatch",
+    "attach_bundle_missing", "attach_executable_unresolved",
     "unowned_root", "invalid_id", "unowned", "element_unavailable", "invalid_key", "window_gone",
     "foreground_unowned", "input_rejected", "close_unavailable", "window_count",
 })

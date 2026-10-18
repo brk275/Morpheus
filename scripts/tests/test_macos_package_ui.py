@@ -53,14 +53,16 @@ def focused_reply(name, owned=True, present=True, truncated=False):
     return {"ok": True, "present": present, "owned": owned, "name": name, "truncated": truncated}
 
 
-def fake_bridge(diagnostics, snapshots=(), focused=(), key_replies=(), windows=(), permissions=None, close=None):
+def fake_bridge(diagnostics, snapshots=(), focused=(), key_replies=(), windows=(), permissions=None, close=None,
+                attach=()):
     """The real Bridge with only its transport replaced: call() keeps the
     production reply validation and error handling, replies are scripted."""
     bridge = object.__new__(ui.Bridge)
     bridge.process, bridge.reader, bridge.diagnostics = None, None, diagnostics
     bridge.stdin = bridge.stdout = None
     bridge.commands = []
-    bridge.scripted = {"snapshot": list(snapshots), "key": list(key_replies), "windows": list(windows)}
+    bridge.scripted = {"snapshot": list(snapshots), "key": list(key_replies), "windows": list(windows),
+                       "attach": list(attach)}
     bridge.focused_script = focused
     bridge.focused_calls = 0
     bridge.permissions_reply = permissions or {"ok": True, "accessibility": True, "post_event": True}
@@ -71,7 +73,7 @@ def fake_bridge(diagnostics, snapshots=(), focused=(), key_replies=(), windows=(
         bridge.commands.append(command)
         bridge.pending = command
 
-    def reply():
+    def reply(deadline=None):
         op = bridge.pending["op"]
         if op == "focused":
             if callable(bridge.focused_script):
@@ -80,6 +82,8 @@ def fake_bridge(diagnostics, snapshots=(), focused=(), key_replies=(), windows=(
                 value = bridge.focused_script[bridge.focused_calls]
             bridge.focused_calls += 1
             return value
+        if op == "attach" and bridge.scripted["attach"]:
+            return bridge.scripted["attach"].pop(0)
         if op in ("focus", "attach"):
             return {"ok": True}
         if op == "permissions":
@@ -989,6 +993,275 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertEqual(error.exception.code, "app_exited")
 
 
+class Clock:
+    """A monotonic clock double that advances only when told to."""
+    def __init__(self, now=64.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+def transport_bridge(diagnostics, clock, answers):
+    """The real Bridge.call and Bridge.reply over a scripted reply queue.
+
+    An answer is a reply object, (seconds, reply) for one that arrives after
+    that long, or "stall" for none. A wait that ends first advances the clock
+    by its whole timeout and raises queue.Empty, as Queue.get does.
+    """
+    bridge = object.__new__(ui.Bridge)
+    bridge.process, bridge.reader, bridge.diagnostics = None, None, diagnostics
+    bridge.stdin = bridge.stdout = None
+    bridge.commands, bridge.waits = [], []
+    script = list(answers)
+
+    def get(timeout):
+        bridge.waits.append(timeout)
+        answer = script.pop(0) if script else "stall"
+        delay, answer = answer if isinstance(answer, tuple) else (0.0, answer)
+        if answer == "stall" or delay > timeout:
+            clock.now += timeout
+            raise ui.queue.Empty
+        clock.now += delay
+        return (json.dumps(answer) + "\n").encode("utf-8")
+
+    bridge.replies = types.SimpleNamespace(get=get)
+    bridge.alive = lambda: True
+    bridge.transmit = bridge.commands.append
+    return bridge
+
+
+class AttachRegistrationTests(unittest.TestCase):
+    """The bounded wait for AppKit to register the already-owned process.
+
+    Every case runs the real Bridge.call and Bridge.reply against a scripted
+    reply queue and one controllable monotonic clock.
+    """
+    EXECUTABLE = Path("/private/var/folders/synthetic/T/Applications/Morpheus.app/Contents/MacOS/morpheus-app")
+    COMMAND = {"op": "attach", "pid": PID, "executable": str(EXECUTABLE), "bundle": smoke.IDENTIFIER}
+
+    def run_attach(self, answers, *, owned=True, status=None, seconds=ui.REGISTRATION_SECONDS, clock=None,
+                   poll=None, acceptance_left=ui.ACCEPTANCE_SECONDS):
+        clock = clock or Clock()
+        diagnostics = ui.Diagnostics({})
+        diagnostics.deadline = clock() + acceptance_left
+        bridge = transport_bridge(diagnostics, clock, answers)
+        process = Mock(pid=PID, returncode=None)
+        ownership = Mock(return_value=owned) if isinstance(owned, bool) else Mock(side_effect=owned)
+        statuses = Mock(side_effect=status) if isinstance(status, list) else Mock(return_value=status)
+        sleep = Mock(side_effect=lambda seconds: setattr(clock, "now", clock.now + seconds))
+        error = None
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(ui, "owned_mac_pid", ownership))
+            stack.enter_context(patch.object(smoke, "process_status", statuses))
+            stack.enter_context(patch.object(ui.time, "sleep", sleep))
+            stack.enter_context(patch.object(ui.time, "monotonic", clock))
+            if poll is not None:
+                stack.enter_context(patch.object(ui, "REGISTRATION_POLL_SECONDS", poll))
+            try:
+                ui.attach_owned(bridge, process, self.EXECUTABLE, smoke.IDENTIFIER, diagnostics, seconds=seconds)
+            except ui.DiagnosticFailure as failure:
+                error = failure.code
+        return error, bridge, diagnostics, ownership, sleep
+
+    @staticmethod
+    def slept(sleep):
+        return [entry.args[0] for entry in sleep.call_args_list]
+
+    def test_normal_pending_then_complete_identity_passes(self):
+        pending = [{"ok": False, "error": code} for code in sorted(ui.REGISTRATION_PENDING)]
+        error, bridge, diagnostics, ownership, sleep = self.run_attach(pending + [{"ok": True}])
+        self.assertIsNone(error)
+        self.assertEqual(bridge.commands, [self.COMMAND] * 4)
+        # The anchored process is rechecked before and after every attempt.
+        self.assertEqual(ownership.call_count, 8)
+        ownership.assert_called_with(PID, PID, self.EXECUTABLE)
+        self.assertEqual(self.slept(sleep), [ui.REGISTRATION_POLL_SECONDS] * 3)
+        # Every reply wait stayed inside the registration budget.
+        self.assertEqual(len(bridge.waits), 4)
+        self.assertTrue(all(0 < wait <= ui.REGISTRATION_SECONDS for wait in bridge.waits))
+        # Transient answers are not recorded: a passing report is unchanged.
+        self.assertEqual((diagnostics.value["bridge_error"], diagnostics.value["failure"]), ("none", "none"))
+
+    def test_positive_mismatches_fail_at_once(self):
+        for code in ("attach_bundle_mismatch", "attach_executable_mismatch", "attach_executable_unresolved",
+                     "attach_mismatch", "invalid_command", "not_attached"):
+            error, bridge, diagnostics, ownership, sleep = self.run_attach([{"ok": False, "error": code},
+                                                                            {"ok": True}])
+            with self.subTest(code=code):
+                self.assertEqual(error, "bridge_invalid")
+                self.assertEqual(diagnostics.value["bridge_error"], code)
+                self.assertEqual(bridge.commands, [self.COMMAND])
+                self.assertEqual(ownership.call_count, 2)  # The failed attempt is rechecked too.
+                sleep.assert_not_called()
+        error, _, diagnostics, _, _ = self.run_attach([{"ok": False, "error": "/Users/runner/private"}, {"ok": True}])
+        self.assertEqual((error, diagnostics.value["bridge_error"]), ("bridge_invalid", "bridge_error"))
+        # A mismatch after earlier absent answers is still never accepted.
+        error, bridge, diagnostics, _, _ = self.run_attach([{"ok": False, "error": "attach_application_missing"},
+                                                            {"ok": False, "error": "attach_executable_mismatch"},
+                                                            {"ok": True}])
+        self.assertEqual((error, diagnostics.value["bridge_error"], len(bridge.commands)),
+                         ("bridge_invalid", "attach_executable_mismatch", 2))
+
+    def test_stalled_reply_waits_only_for_the_remaining_registration_budget(self):
+        answers = [{"ok": False, "error": "attach_application_missing"}, "stall", {"ok": True}]
+        error, bridge, diagnostics, ownership, sleep = self.run_attach(answers, seconds=1.0, poll=0.25)
+        self.assertEqual(error, "wait_timeout")
+        # The second wait got only what remained (0.75 s), never the 20 s reply bound.
+        self.assertEqual(bridge.waits, [1.0, 0.75])
+        self.assertEqual(self.slept(sleep), [0.25])
+        self.assertEqual(len(bridge.commands), 2)
+        # The timed-out attempt was rechecked as well; a stall records no absent token.
+        self.assertEqual(ownership.call_count, 4)
+        self.assertEqual((diagnostics.value["bridge_error"], diagnostics.value["operation"]), ("none", "attach"))
+        # A lost anchor after a timed-out attempt takes precedence.
+        error, _, _, _, _ = self.run_attach(["stall"], owned=[True, False], seconds=1.0)
+        self.assertEqual(error, "ownership_lost")
+
+    def test_reply_deadline_is_optional_and_other_operations_keep_their_bounds(self):
+        for deadline, expected_wait, code in ((None, ui.BRIDGE_REPLY_SECONDS, "bridge_timeout"),
+                                              (64.0 + 3.0, 3.0, "wait_timeout"),
+                                              (64.0 + 60.0, ui.BRIDGE_REPLY_SECONDS, "bridge_timeout")):
+            clock = Clock()
+            diagnostics = ui.Diagnostics({})
+            diagnostics.deadline = clock() + ui.ACCEPTANCE_SECONDS
+            bridge = transport_bridge(diagnostics, clock, ["stall"])
+            with self.subTest(deadline=deadline), patch.object(ui.time, "monotonic", clock), \
+                    self.assertRaises(ui.DiagnosticFailure) as error:
+                bridge.reply(deadline)
+            self.assertEqual((bridge.waits, error.exception.code), ([expected_wait], code))
+        # Without a narrower deadline a success is accepted whenever it arrives within the bounds.
+        clock = Clock()
+        diagnostics = ui.Diagnostics({})
+        diagnostics.deadline = clock() + ui.ACCEPTANCE_SECONDS
+        bridge = transport_bridge(diagnostics, clock, [(15.0, {"ok": True, "count": 1})])
+        with patch.object(ui.time, "monotonic", clock):
+            self.assertEqual(bridge.call({"op": "windows"}), {"ok": True, "count": 1})
+        # The acceptance deadline still bounds a narrower-deadline wait and keeps its own token.
+        error, bridge, _, _, _ = self.run_attach(["stall"], seconds=10.0, acceptance_left=0.5)
+        self.assertEqual((error, bridge.waits), ("deadline", [0.5]))
+
+    def test_late_success_is_refused(self):
+        # A success that arrives exactly at the end of the budget is too late.
+        error, bridge, diagnostics, ownership, _ = self.run_attach([(1.0, {"ok": True})], seconds=1.0)
+        self.assertEqual((error, bridge.waits, len(bridge.commands)), ("wait_timeout", [1.0], 1))
+        self.assertEqual(ownership.call_count, 2)
+        self.assertEqual(diagnostics.value["bridge_error"], "none")
+        # A timely reply whose following anchor recheck ends past the budget is refused too.
+        clock = Clock()
+        checks = []
+
+        def slow_recheck(*arguments):
+            checks.append(arguments)
+            if len(checks) == 2:
+                clock.now += 1.0
+            return True
+
+        error, bridge, _, _, _ = self.run_attach([(0.5, {"ok": True})], owned=slow_recheck, seconds=1.0, clock=clock)
+        self.assertEqual((error, len(bridge.commands), len(checks)), ("wait_timeout", 1, 2))
+
+    def test_expired_budget_starts_no_further_attempt(self):
+        pending = [{"ok": False, "error": "attach_bundle_missing"}] * 5
+        error, bridge, diagnostics, _, sleep = self.run_attach(pending, seconds=0.375, poll=0.25)
+        self.assertEqual(error, "wait_timeout")
+        # The pause is clipped to what remains, and the expired clock stops a third attempt.
+        self.assertEqual(self.slept(sleep), [0.25, 0.125])
+        self.assertEqual(bridge.waits, [0.375, 0.125])
+        self.assertEqual(len(bridge.commands), 2)
+        self.assertEqual((diagnostics.value["bridge_error"], diagnostics.value["operation"]),
+                         ("attach_bundle_missing", "attach"))
+        # A pre-attempt recheck that outlasts the budget also prevents the attempt.
+        clock = Clock()
+        checks = []
+
+        def slow_before(*arguments):
+            checks.append(arguments)
+            if len(checks) == 3:
+                clock.now += 5.0
+            return True
+
+        error, bridge, diagnostics, _, _ = self.run_attach(pending, owned=slow_before, seconds=1.0, clock=clock)
+        self.assertEqual((error, len(bridge.commands), len(checks)), ("wait_timeout", 1, 3))
+        self.assertEqual(diagnostics.value["bridge_error"], "attach_bundle_missing")
+
+    def test_zero_budget_makes_no_attempt(self):
+        error, bridge, diagnostics, ownership, sleep = self.run_attach([{"ok": True}], seconds=0)
+        self.assertEqual(error, "wait_timeout")
+        self.assertEqual((bridge.commands, bridge.waits), ([], []))
+        ownership.assert_not_called()
+        sleep.assert_not_called()
+        self.assertEqual((diagnostics.value["bridge_error"], diagnostics.value["operation"]), ("none", "attach"))
+
+    def test_acceptance_deadline_ends_the_wait_before_another_attempt(self):
+        error, bridge, _, ownership, _ = self.run_attach([{"ok": True}], acceptance_left=0)
+        self.assertEqual(error, "deadline")
+        self.assertEqual(bridge.commands, [])
+        ownership.assert_not_called()
+
+    def test_process_death_stops_the_wait(self):
+        error, bridge, _, _, _ = self.run_attach([{"ok": True}], status=[0])
+        self.assertEqual((error, bridge.commands), ("app_exited", []))
+        pending = [{"ok": False, "error": "attach_application_missing"}] * 3
+        error, bridge, _, _, _ = self.run_attach(pending, status=[None, None, None, 0])
+        self.assertEqual((error, len(bridge.commands)), ("app_exited", 2))
+        # Exit during a successful attempt is still a failure, not an attachment.
+        error, bridge, _, _, _ = self.run_attach([{"ok": True}], status=[None, 0])
+        self.assertEqual((error, len(bridge.commands)), ("app_exited", 1))
+
+    def test_identity_change_around_an_attempt_fails_closed(self):
+        error, bridge, _, _, _ = self.run_attach([{"ok": True}], owned=[False])
+        self.assertEqual((error, bridge.commands), ("ownership_lost", []))
+        for reply in ({"ok": True}, {"ok": False, "error": "attach_bundle_missing"},
+                      {"ok": False, "error": "attach_bundle_mismatch"}):
+            error, bridge, diagnostics, _, sleep = self.run_attach([reply, {"ok": True}], owned=[True, False])
+            with self.subTest(reply=reply):
+                self.assertEqual((error, len(bridge.commands)), ("ownership_lost", 1))
+                self.assertEqual(diagnostics.value["operation"], "ownership")
+                self.assertEqual(diagnostics.value["bridge_error"], "none")
+                sleep.assert_not_called()
+        pending = [{"ok": False, "error": "attach_executable_missing"}, {"ok": True}]
+        error, bridge, _, _, _ = self.run_attach(pending, owned=[True, True, False])
+        self.assertEqual((error, len(bridge.commands)), ("ownership_lost", 1))
+
+    def test_only_absent_metadata_tokens_are_retryable(self):
+        attach = SWIFT.read_text(encoding="utf-8").split("func attach(")[1].split("func windows()")[0]
+        tokens = set(re.findall(r'fail\("([a-z_]+)"\)', attach))
+        self.assertEqual({token for token in tokens if token.endswith("_missing")}, set(ui.REGISTRATION_PENDING))
+        self.assertFalse({token for token in tokens if token.endswith(("_mismatch", "_unresolved"))}
+                         & ui.REGISTRATION_PENDING)
+        self.assertNotIn("invalid_command", ui.REGISTRATION_PENDING)
+        self.assertLessEqual(ui.REGISTRATION_PENDING, smoke.MACOS_BRIDGE_ERRORS)
+        self.assertTrue(0 < ui.REGISTRATION_POLL_SECONDS < ui.REGISTRATION_SECONDS <= 30)
+
+    def test_acceptance_attaches_only_after_the_ownership_proof(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = temp_home(folder)
+            roots = ui.profile_roots(home)
+            ui.PackageProfile.create(NONCE, roots, home)
+            executable = bundle(folder)
+            bridge_binary = Path(folder) / "bridge"
+            bridge_binary.write_bytes(b"binary")
+            bridge_binary.chmod(0o700)
+            process = Mock(pid=PID, returncode=None)
+            bridge = Mock()
+            trace = ui.Diagnostics({})
+            with patch.object(ui, "guard"), patch.object(smoke, "require_nonreaping_wait"), \
+                    patch.object(ui, "home_directory", return_value=home), \
+                    patch.object(ui, "Bridge", return_value=bridge), patch.object(ui, "check_permissions"), \
+                    patch.object(ui.subprocess, "Popen", return_value=process), \
+                    patch.object(ui, "owned_mac_pid", return_value=True), \
+                    patch.object(ui, "attach_owned", side_effect=ui.DiagnosticFailure("wait_timeout")) as attach, \
+                    patch.object(ui, "owned_window") as window, patch.object(ui, "stop_group"), \
+                    patch.object(smoke, "process_status", return_value=None):
+                with self.assertRaises(ui.DiagnosticFailure) as error:
+                    ui.acceptance(executable, NONCE, bridge_binary, {}, trace)
+            self.assertEqual(error.exception.code, "wait_timeout")
+            attach.assert_called_once_with(bridge, process, executable, smoke.IDENTIFIER, trace)
+            window.assert_not_called()
+            bridge.call.assert_not_called()  # Attachment goes only through the bounded wait.
+            self.assertEqual((trace.value["step"], trace.value["failure"]), ("launch", "wait_timeout"))
+
+
 class CloseAndCleanupTests(unittest.TestCase):
     executable = "/Applications/Morpheus.app/Contents/MacOS/morpheus-app"
 
@@ -1257,15 +1530,42 @@ class SwiftSourceTests(unittest.TestCase):
 
     def test_attach_and_close_verify_the_owned_process(self):
         attach = self.source.split("func attach(")[1].split("func windows()")[0]
-        self.assertIn("running.bundleIdentifier == bundle", attach)
-        self.assertIn("resolvingSymlinksInPath().path == executable", attach)
+        self.assertIn("guard let identifier = running.bundleIdentifier else", attach)
+        self.assertIn("guard identifier == bundle else", attach)
+        self.assertIn("guard let path = canonicalPath(url) else", attach)
+        self.assertIn("guard path == executable else", attach)
         self.assertIn("pidValue <= Int(Int32.max)", attach)
         self.assertLess(attach.index("target = nil"), attach.index('command["pid"]'))
         self.assertLess(attach.index("elements = []"), attach.index('command["pid"]'))
-        for token in ("attach_application_missing", "attach_bundle_mismatch",
-                      "attach_executable_missing", "attach_executable_mismatch"):
+        # The target is set only after every identity check, and once.
+        self.assertEqual(attach.count("target = Target("), 1)
+        self.assertLess(attach.index('fail("attach_executable_mismatch")'), attach.index("target = Target("))
+        for token in ("attach_application_missing", "attach_bundle_missing", "attach_bundle_mismatch",
+                      "attach_executable_missing", "attach_executable_unresolved", "attach_executable_mismatch"):
             self.assertIn('fail("' + token + '")', attach)
             self.assertIn(token, smoke.MACOS_BRIDGE_ERRORS)
+        # The bridge never waits or retries an identity itself; the driver owns the bound.
+        for forbidden in ("while", "repeat", "sleep", "usleep"):
+            self.assertNotIn(forbidden, attach)
+        # Foundation's standardization strips a leading /private, so identity
+        # compares realpath results with the driver's resolved executable.
+        self.assertNotIn("standardizedFileURL", self.source)
+        self.assertNotIn("resolvingSymlinksInPath", self.source)
+        canonical = self.source.split("func canonicalPath(")[1].split("func refreshApplicationState()")[0]
+        self.assertIn("\nimport Darwin\n", self.source)  # realpath and free come from Darwin explicitly.
+        self.assertIn("realpath(representation, nil)", canonical)
+        self.assertIn("defer { free(resolved) }", canonical)
+        self.assertIn("guard url.isFileURL else { return nil }", canonical)
+        # One bounded turn of the bridge's main run loop in a common mode,
+        # before the lookup, and nowhere else.
+        refresh = self.source.split("func refreshApplicationState()")[1].split("func attach(")[0]
+        self.assertIn("RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: runLoopTurn))", refresh)
+        self.assertIn("let runLoopTurn: TimeInterval = 0.05", self.source)
+        self.assertEqual(self.source.count("RunLoop"), 1)
+        self.assertEqual(self.source.count("refreshApplicationState()"), 2)
+        self.assertLess(attach.index("refreshApplicationState()"),
+                        attach.index("NSRunningApplication(processIdentifier: pid)"))
+        self.assertLess(attach.index('fail("invalid_command")'), attach.index("refreshApplicationState()"))
         close = self.source.split("func close()")[1].split('reply(["ready": true])')[0]
         self.assertIn("list.count == 1, owner(list[0]) == target.pid", close)
         self.assertIn("owner(button) == target.pid", close)

@@ -18,6 +18,7 @@
 import AppKit
 import ApplicationServices
 import CoreGraphics
+import Darwin
 import Foundation
 
 let maxNodes = 5000
@@ -26,6 +27,7 @@ let maxLine = 256
 let keyCodes: [String: CGKeyCode] = ["Return": 0x24, "Tab": 0x30, "Space": 0x31, "Escape": 0x35]
 let shiftCode: CGKeyCode = 0x38
 let staticTextRole = "AXStaticText"
+let runLoopTurn: TimeInterval = 0.05
 
 struct Target {
     let pid: pid_t
@@ -114,6 +116,28 @@ func permissions() {
     reply(["accessibility": AXIsProcessTrusted(), "post_event": CGPreflightPostEventAccess()])
 }
 
+// The driver sends the executable fully resolved, as libproc reports it.
+// Foundation's URL standardization and symlink resolution strip a leading
+// /private (documented for NSURL), so they cannot be compared with it;
+// realpath resolves both sides the same way.
+func canonicalPath(_ url: URL) -> String? {
+    guard url.isFileURL else { return nil }
+    return url.withUnsafeFileSystemRepresentation { representation -> String? in
+        guard let representation = representation, let resolved = realpath(representation, nil) else { return nil }
+        defer { free(resolved) }
+        return String(cString: resolved)
+    }
+}
+
+// One bounded turn of this bridge's otherwise idle main run loop. AppKit
+// documents that NSRunningApplication's time-varying properties and
+// NSWorkspace.runningApplications change only when the main run loop runs in
+// a common mode (.default is one). The turn only lets pending updates arrive;
+// it never waits for, retries or accepts an identity.
+func refreshApplicationState() {
+    _ = RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: runLoopTurn))
+}
+
 func attach(_ command: [String: Any]) {
     // A failed new attachment must never leave the previous target usable.
     target = nil
@@ -125,11 +149,18 @@ func attach(_ command: [String: Any]) {
         return
     }
     let pid = pid_t(pidValue)
+    refreshApplicationState()
+    // Absent metadata (*_missing) is reported apart from a present value that
+    // differs (*_mismatch); only the driver decides whether to ask again.
     guard let running = NSRunningApplication(processIdentifier: pid) else {
         fail("attach_application_missing")
         return
     }
-    guard running.bundleIdentifier == bundle else {
+    guard let identifier = running.bundleIdentifier else {
+        fail("attach_bundle_missing")
+        return
+    }
+    guard identifier == bundle else {
         fail("attach_bundle_mismatch")
         return
     }
@@ -137,7 +168,11 @@ func attach(_ command: [String: Any]) {
         fail("attach_executable_missing")
         return
     }
-    guard url.standardizedFileURL.resolvingSymlinksInPath().path == executable else {
+    guard let path = canonicalPath(url) else {
+        fail("attach_executable_unresolved")
+        return
+    }
+    guard path == executable else {
         fail("attach_executable_mismatch")
         return
     }
