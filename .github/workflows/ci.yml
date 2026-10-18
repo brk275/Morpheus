@@ -1,12 +1,12 @@
 # TEMPORARY focused native offline app checks. NEVER MERGE this workflow.
 name: Reviewed timeline device contracts
-run-name: Timeline device contract diagnosis - 239cb44
+run-name: Timeline device contracts - a3bed49
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: timeline-device-contract-diagnosis-239cb44
+  group: timeline-device-contracts-a3bed49
   cancel-in-progress: false
 jobs:
   contracts:
@@ -17,11 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 239cb446e82389117bfab7906e272ed1d4e7fb87
+          ref: a3bed49530cfe0ffa8a4f474a50ad9ba50f8ce6e
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact reviewed source
-        run: test "$(git rev-parse HEAD)" = 239cb446e82389117bfab7906e272ed1d4e7fb87
+        run: test "$(git rev-parse HEAD)" = a3bed49530cfe0ffa8a4f474a50ad9ba50f8ce6e
       - name: Scan source before executing reviewed native tests
         shell: bash
         run: |
@@ -134,7 +134,7 @@ jobs:
           passed=passed and contracts=={'ran':19,'failed':[],'errors':[],'skipped':0}
 
           print(json.dumps({'check':'timeline_device_supervisor_contracts','contracts':contracts,'status':'passed' if passed else 'failed',
-              'source':'239cb446e82389117bfab7906e272ed1d4e7fb87','failure':reason,
+              'source':'a3bed49530cfe0ffa8a4f474a50ad9ba50f8ce6e','failure':reason,
               'tests_passed':19 if passed else None,'raw_logs_public':False,
               'accounts_generated':False,'app_executed':False},sort_keys=True),flush=True)
           if not passed: raise SystemExit(1)
@@ -216,7 +216,7 @@ jobs:
           summaries=re.findall(r'^test result: ok\. 4 passed; 0 failed; 0 ignored; [0-9]+ measured; 1 filtered out;',output,re.MULTILINE)
           passed=reason is None and code==0 and needed==ok and len(summaries)==1
           print(json.dumps({'check':'timeline_device_rust_contracts','status':'passed' if passed else 'failed',
-              'source':'239cb446e82389117bfab7906e272ed1d4e7fb87','failure':reason,
+              'source':'a3bed49530cfe0ffa8a4f474a50ad9ba50f8ce6e','failure':reason,
               'tests_passed':4 if passed else None,'raw_logs_public':False,
               'accounts_generated':False,'app_executed':False},sort_keys=True),flush=True)
           if not passed: raise SystemExit(1)
