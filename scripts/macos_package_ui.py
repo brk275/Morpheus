@@ -60,6 +60,12 @@ ACCEPTANCE_SECONDS = 180
 BRIDGE_REPLY_SECONDS = 20
 BRIDGE_EXIT_SECONDS = 5
 OWNERSHIP_SECONDS = 5
+# Hard bound for AppKit to register the already-owned process as an
+# application; only absent-metadata answers are asked again within it.
+REGISTRATION_SECONDS = 10
+REGISTRATION_POLL_SECONDS = 0.2
+REGISTRATION_PENDING = frozenset({"attach_application_missing", "attach_bundle_missing",
+                                  "attach_executable_missing"})
 STOP_SECONDS = 5
 WAIT_SECONDS = 12
 BRIDGE_LINE_BOUND = 4 * 1024 * 1024
@@ -510,14 +516,15 @@ class Bridge:
         except (OSError, ValueError):
             raise DiagnosticFailure("bridge_exited") from None
 
-    def call(self, command, allow_error=False):
+    def call(self, command, allow_error=False, record_error=True):
         self.diagnostics.check_deadline()
         self.transmit(command)
         value = self.reply()
         if not value["ok"]:
             code = value.get("error")
             code = code if code in smoke.MACOS_BRIDGE_ERRORS else "bridge_error"
-            self.diagnostics.bridge_error(code)
+            if record_error:
+                self.diagnostics.bridge_error(code)
             if allow_error:
                 raise BridgeFailure(code)
             raise DiagnosticFailure("bridge_invalid")
@@ -805,6 +812,49 @@ def config_persisted(config, diagnostics, seconds=10):
         time.sleep(0.2)
 
 
+def require_anchored(process, executable, diagnostics):
+    """The launched leader is still our live, unreaped child leading its own
+    group and session and running the installed executable."""
+    diagnostics.operation("ownership")
+    require_ui(smoke.process_status(process) is None, "app_exited")
+    require_ui(owned_mac_pid(process.pid, process.pid, executable), "ownership_lost")
+
+
+def attach_owned(bridge, process, executable, bundle, diagnostics, seconds=REGISTRATION_SECONDS):
+    """Attach the bridge to the owned app once AppKit reports its complete identity.
+
+    libproc can show the installed executable as soon as exec completes, before
+    AppKit has registered the process as an application, so the bridge may
+    report absent metadata. Only those answers are asked again, within a hard
+    bound, and the anchored process is rechecked before and after every
+    attempt. A bundle identifier or executable that is present but different
+    fails at once, and the bridge never keeps a partial identity. Transient
+    answers are not recorded, so a successful report is unchanged.
+    """
+    command = {"op": "attach", "pid": process.pid, "executable": str(executable), "bundle": bundle}
+    deadline = time.monotonic() + seconds
+    while True:
+        diagnostics.check_deadline()
+        require_anchored(process, executable, diagnostics)
+        diagnostics.operation("attach")
+        try:
+            bridge.call(command, allow_error=True, record_error=False)
+            code = None
+        except BridgeFailure as error:
+            code = error.code
+        require_anchored(process, executable, diagnostics)
+        diagnostics.operation("attach")
+        if code is None:
+            return
+        if code not in REGISTRATION_PENDING:
+            diagnostics.bridge_error(code)
+            raise DiagnosticFailure("bridge_invalid")
+        if time.monotonic() >= deadline:
+            diagnostics.bridge_error(code)
+            raise DiagnosticFailure("wait_timeout")
+        time.sleep(REGISTRATION_POLL_SECONDS)
+
+
 def owned_window(bridge, process, diagnostics, seconds=30):
     deadline = time.monotonic() + seconds
     while True:
@@ -885,8 +935,7 @@ def acceptance(executable, nonce, bridge_binary, report, diagnostics=None):
                 require_ui(smoke.process_status(process) is None, "app_exited")
                 time.sleep(0.1)
             require_ui(owned_mac_pid(process.pid, process.pid, executable), "install_state")
-            diagnostics.operation("attach")
-            bridge.call({"op": "attach", "pid": process.pid, "executable": str(executable), "bundle": bundle})
+            attach_owned(bridge, process, executable, bundle, diagnostics)
             diagnostics.step("window")
             owned_window(bridge, process, diagnostics)
             ui = MacUI(bridge, process.pid, process, diagnostics)

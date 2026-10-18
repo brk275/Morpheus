@@ -331,7 +331,32 @@ Ownership is proven from three independent reads of the PID: group and
 non-zombie state from the kernel process table (`ps -axo pid=,pgid=,stat=`),
 the session from `getsid`, and `proc_pidpath` against the installed bundle
 executable; the bridge additionally checks the running application's bundle
-identifier and executable URL before attaching. Darwin's `ps` prints the
+identifier and executable URL before attaching.
+
+The attach step works as follows:
+
+- **Path comparison.** The bridge resolves the executable URL with `realpath`
+  and compares it with the driver's fully resolved path, which is the form
+  `proc_pidpath` reports. Foundation's URL standardization is not used: it
+  strips a leading `/private` (documented for `NSURL`), so a bundle installed
+  under `/var` or `/tmp` would never compare equal.
+- **Registration wait.** `proc_pidpath` can show the installed executable as
+  soon as `exec` completes, before AppKit has registered the process as an
+  application. So the driver asks again only while the bridge reports absent
+  metadata: no running application, no bundle identifier or no executable
+  URL.
+- **Bounds.** The wait is limited to 10 seconds, with a 0.2-second interval.
+  Before and after every attempt the driver rechecks that the anchored
+  process is alive, unreaped and still owned. Before each lookup the bridge
+  turns its otherwise idle main run loop once, for at most 0.05 seconds, in
+  the default mode.
+- **Failure.** A present identifier or executable that differs, or an
+  executable that cannot be resolved, fails at once. The bridge sets its
+  target only after every check passes. A wait that runs out fails as
+  `wait_timeout` with the last absent-metadata token. Transient answers are
+  not recorded, so a passing report is unchanged.
+
+Darwin's `ps` prints the
 session structure's kernel address under `sess` (Apple adv_cmds
 `ps/keyword.c`), never the session ID, so that column is not read. Every
 group the smoke starts on macOS (the plain 12-second launch, the bridge and

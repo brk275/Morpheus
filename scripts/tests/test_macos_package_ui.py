@@ -53,14 +53,16 @@ def focused_reply(name, owned=True, present=True, truncated=False):
     return {"ok": True, "present": present, "owned": owned, "name": name, "truncated": truncated}
 
 
-def fake_bridge(diagnostics, snapshots=(), focused=(), key_replies=(), windows=(), permissions=None, close=None):
+def fake_bridge(diagnostics, snapshots=(), focused=(), key_replies=(), windows=(), permissions=None, close=None,
+                attach=()):
     """The real Bridge with only its transport replaced: call() keeps the
     production reply validation and error handling, replies are scripted."""
     bridge = object.__new__(ui.Bridge)
     bridge.process, bridge.reader, bridge.diagnostics = None, None, diagnostics
     bridge.stdin = bridge.stdout = None
     bridge.commands = []
-    bridge.scripted = {"snapshot": list(snapshots), "key": list(key_replies), "windows": list(windows)}
+    bridge.scripted = {"snapshot": list(snapshots), "key": list(key_replies), "windows": list(windows),
+                       "attach": list(attach)}
     bridge.focused_script = focused
     bridge.focused_calls = 0
     bridge.permissions_reply = permissions or {"ok": True, "accessibility": True, "post_event": True}
@@ -80,6 +82,8 @@ def fake_bridge(diagnostics, snapshots=(), focused=(), key_replies=(), windows=(
                 value = bridge.focused_script[bridge.focused_calls]
             bridge.focused_calls += 1
             return value
+        if op == "attach" and bridge.scripted["attach"]:
+            return bridge.scripted["attach"].pop(0)
         if op in ("focus", "attach"):
             return {"ok": True}
         if op == "permissions":
@@ -989,6 +993,148 @@ class BridgeProtocolTests(unittest.TestCase):
         self.assertEqual(error.exception.code, "app_exited")
 
 
+class AttachRegistrationTests(unittest.TestCase):
+    """The bounded wait for AppKit to register the already-owned process."""
+    EXECUTABLE = Path("/private/var/folders/synthetic/T/Applications/Morpheus.app/Contents/MacOS/morpheus-app")
+
+    def run_attach(self, replies, *, owned=True, status=None, seconds=ui.REGISTRATION_SECONDS, diagnostics=None,
+                   clock=None):
+        diagnostics = diagnostics if diagnostics is not None else ui.Diagnostics({})
+        bridge = fake_bridge(diagnostics, attach=replies)
+        process = Mock(pid=PID, returncode=None)
+        ownership = Mock(side_effect=owned) if isinstance(owned, list) else Mock(return_value=owned)
+        statuses = Mock(side_effect=status) if isinstance(status, list) else Mock(return_value=status)
+        error = None
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(ui, "owned_mac_pid", ownership))
+            stack.enter_context(patch.object(smoke, "process_status", statuses))
+            sleep = stack.enter_context(patch.object(ui.time, "sleep"))
+            if clock is not None:
+                stack.enter_context(patch.object(ui.time, "monotonic", side_effect=clock))
+            try:
+                ui.attach_owned(bridge, process, self.EXECUTABLE, smoke.IDENTIFIER, diagnostics, seconds=seconds)
+            except ui.DiagnosticFailure as failure:
+                error = failure.code
+        return error, bridge, diagnostics, ownership, sleep
+
+    def test_absent_metadata_is_asked_again_until_the_complete_identity_attaches(self):
+        pending = [{"ok": False, "error": code} for code in sorted(ui.REGISTRATION_PENDING)]
+        error, bridge, diagnostics, ownership, sleep = self.run_attach(pending + [{"ok": True}])
+        self.assertIsNone(error)
+        command = {"op": "attach", "pid": PID, "executable": str(self.EXECUTABLE), "bundle": smoke.IDENTIFIER}
+        self.assertEqual(bridge.commands, [command] * 4)
+        # The anchored process is rechecked before and after every attempt.
+        self.assertEqual(ownership.call_count, 8)
+        ownership.assert_called_with(PID, PID, self.EXECUTABLE)
+        self.assertEqual(sleep.call_count, 3)
+        sleep.assert_called_with(ui.REGISTRATION_POLL_SECONDS)
+        # Transient answers are not recorded: a passing report is unchanged.
+        self.assertEqual((diagnostics.value["bridge_error"], diagnostics.value["failure"]), ("none", "none"))
+
+    def test_present_but_different_identity_fails_at_once(self):
+        for code in ("attach_bundle_mismatch", "attach_executable_mismatch", "attach_executable_unresolved",
+                     "attach_mismatch", "invalid_command", "not_attached"):
+            error, bridge, diagnostics, _, sleep = self.run_attach([{"ok": False, "error": code}, {"ok": True}])
+            with self.subTest(code=code):
+                self.assertEqual(error, "bridge_invalid")
+                self.assertEqual(diagnostics.value["bridge_error"], code)
+                self.assertEqual(len(bridge.commands), 1)
+                sleep.assert_not_called()
+        error, _, diagnostics, _, _ = self.run_attach([{"ok": False, "error": "/Users/runner/private"}, {"ok": True}])
+        self.assertEqual((error, diagnostics.value["bridge_error"]), ("bridge_invalid", "bridge_error"))
+        # A mismatch after earlier absent answers is still never accepted.
+        error, bridge, diagnostics, _, _ = self.run_attach([{"ok": False, "error": "attach_application_missing"},
+                                                            {"ok": False, "error": "attach_executable_mismatch"},
+                                                            {"ok": True}])
+        self.assertEqual((error, diagnostics.value["bridge_error"], len(bridge.commands)),
+                         ("bridge_invalid", "attach_executable_mismatch", 2))
+
+    def test_registration_wait_has_a_hard_bound(self):
+        error, bridge, diagnostics, _, sleep = self.run_attach([{"ok": False, "error": "attach_bundle_missing"}],
+                                                               seconds=0)
+        self.assertEqual(error, "wait_timeout")
+        self.assertEqual(len(bridge.commands), 1)
+        sleep.assert_not_called()
+        self.assertEqual((diagnostics.value["bridge_error"], diagnostics.value["operation"]),
+                         ("attach_bundle_missing", "attach"))
+        # Metadata that never appears ends at the bound, not when replies run out.
+        pending = [{"ok": False, "error": "attach_application_missing"}] * 200
+        error, bridge, diagnostics, _, _ = self.run_attach(pending, seconds=10, clock=list(range(1000)))
+        self.assertEqual(error, "wait_timeout")
+        self.assertLess(len(bridge.commands), 10)
+        self.assertEqual(diagnostics.value["bridge_error"], "attach_application_missing")
+
+    def test_acceptance_deadline_ends_the_wait_before_another_attempt(self):
+        diagnostics = ui.Diagnostics({})
+        diagnostics.deadline = 0
+        error, bridge, _, ownership, _ = self.run_attach([{"ok": True}], diagnostics=diagnostics)
+        self.assertEqual(error, "deadline")
+        self.assertEqual(bridge.commands, [])
+        ownership.assert_not_called()
+
+    def test_process_death_stops_the_wait(self):
+        error, bridge, _, _, _ = self.run_attach([{"ok": True}], status=[0])
+        self.assertEqual((error, bridge.commands), ("app_exited", []))
+        pending = [{"ok": False, "error": "attach_application_missing"}] * 3
+        error, bridge, _, _, _ = self.run_attach(pending, status=[None, None, None, 0])
+        self.assertEqual((error, len(bridge.commands)), ("app_exited", 2))
+        # Exit during a successful attempt is still a failure, not an attachment.
+        error, bridge, _, _, _ = self.run_attach([{"ok": True}], status=[None, 0])
+        self.assertEqual((error, len(bridge.commands)), ("app_exited", 1))
+
+    def test_identity_change_around_an_attempt_fails_closed(self):
+        error, bridge, _, _, _ = self.run_attach([{"ok": True}], owned=[False])
+        self.assertEqual((error, bridge.commands), ("ownership_lost", []))
+        for reply in ({"ok": True}, {"ok": False, "error": "attach_bundle_missing"}):
+            error, bridge, diagnostics, _, sleep = self.run_attach([reply, {"ok": True}], owned=[True, False])
+            with self.subTest(reply=reply):
+                self.assertEqual((error, len(bridge.commands)), ("ownership_lost", 1))
+                self.assertEqual(diagnostics.value["operation"], "ownership")
+                self.assertEqual(diagnostics.value["bridge_error"], "none")
+                sleep.assert_not_called()
+        pending = [{"ok": False, "error": "attach_executable_missing"}, {"ok": True}]
+        error, bridge, _, _, _ = self.run_attach(pending, owned=[True, True, False])
+        self.assertEqual((error, len(bridge.commands)), ("ownership_lost", 1))
+
+    def test_only_absent_metadata_tokens_are_retryable(self):
+        attach = SWIFT.read_text(encoding="utf-8").split("func attach(")[1].split("func windows()")[0]
+        tokens = set(re.findall(r'fail\("([a-z_]+)"\)', attach))
+        self.assertEqual({token for token in tokens if token.endswith("_missing")}, set(ui.REGISTRATION_PENDING))
+        self.assertFalse({token for token in tokens if token.endswith(("_mismatch", "_unresolved"))}
+                         & ui.REGISTRATION_PENDING)
+        self.assertNotIn("invalid_command", ui.REGISTRATION_PENDING)
+        self.assertLessEqual(ui.REGISTRATION_PENDING, smoke.MACOS_BRIDGE_ERRORS)
+        self.assertTrue(0 < ui.REGISTRATION_POLL_SECONDS < ui.REGISTRATION_SECONDS <= 30)
+
+    def test_acceptance_attaches_only_after_the_ownership_proof(self):
+        with tempfile.TemporaryDirectory() as folder:
+            home = temp_home(folder)
+            roots = ui.profile_roots(home)
+            ui.PackageProfile.create(NONCE, roots, home)
+            executable = bundle(folder)
+            bridge_binary = Path(folder) / "bridge"
+            bridge_binary.write_bytes(b"binary")
+            bridge_binary.chmod(0o700)
+            process = Mock(pid=PID, returncode=None)
+            bridge = Mock()
+            trace = ui.Diagnostics({})
+            with patch.object(ui, "guard"), patch.object(smoke, "require_nonreaping_wait"), \
+                    patch.object(ui, "home_directory", return_value=home), \
+                    patch.object(ui, "Bridge", return_value=bridge), patch.object(ui, "check_permissions"), \
+                    patch.object(ui.subprocess, "Popen", return_value=process), \
+                    patch.object(ui, "owned_mac_pid", return_value=True), \
+                    patch.object(ui, "attach_owned", side_effect=ui.DiagnosticFailure("wait_timeout")) as attach, \
+                    patch.object(ui, "owned_window") as window, patch.object(ui, "stop_group"), \
+                    patch.object(smoke, "process_status", return_value=None):
+                with self.assertRaises(ui.DiagnosticFailure) as error:
+                    ui.acceptance(executable, NONCE, bridge_binary, {}, trace)
+            self.assertEqual(error.exception.code, "wait_timeout")
+            attach.assert_called_once_with(bridge, process, executable, smoke.IDENTIFIER, trace)
+            window.assert_not_called()
+            bridge.call.assert_not_called()  # Attachment goes only through the bounded wait.
+            self.assertEqual((trace.value["step"], trace.value["failure"]), ("launch", "wait_timeout"))
+
+
 class CloseAndCleanupTests(unittest.TestCase):
     executable = "/Applications/Morpheus.app/Contents/MacOS/morpheus-app"
 
@@ -1257,15 +1403,41 @@ class SwiftSourceTests(unittest.TestCase):
 
     def test_attach_and_close_verify_the_owned_process(self):
         attach = self.source.split("func attach(")[1].split("func windows()")[0]
-        self.assertIn("running.bundleIdentifier == bundle", attach)
-        self.assertIn("resolvingSymlinksInPath().path == executable", attach)
+        self.assertIn("guard let identifier = running.bundleIdentifier else", attach)
+        self.assertIn("guard identifier == bundle else", attach)
+        self.assertIn("guard let path = canonicalPath(url) else", attach)
+        self.assertIn("guard path == executable else", attach)
         self.assertIn("pidValue <= Int(Int32.max)", attach)
         self.assertLess(attach.index("target = nil"), attach.index('command["pid"]'))
         self.assertLess(attach.index("elements = []"), attach.index('command["pid"]'))
-        for token in ("attach_application_missing", "attach_bundle_mismatch",
-                      "attach_executable_missing", "attach_executable_mismatch"):
+        # The target is set only after every identity check, and once.
+        self.assertEqual(attach.count("target = Target("), 1)
+        self.assertLess(attach.index('fail("attach_executable_mismatch")'), attach.index("target = Target("))
+        for token in ("attach_application_missing", "attach_bundle_missing", "attach_bundle_mismatch",
+                      "attach_executable_missing", "attach_executable_unresolved", "attach_executable_mismatch"):
             self.assertIn('fail("' + token + '")', attach)
             self.assertIn(token, smoke.MACOS_BRIDGE_ERRORS)
+        # The bridge never waits or retries an identity itself; the driver owns the bound.
+        for forbidden in ("while", "repeat", "sleep", "usleep"):
+            self.assertNotIn(forbidden, attach)
+        # Foundation's standardization strips a leading /private, so identity
+        # compares realpath results with the driver's resolved executable.
+        self.assertNotIn("standardizedFileURL", self.source)
+        self.assertNotIn("resolvingSymlinksInPath", self.source)
+        canonical = self.source.split("func canonicalPath(")[1].split("func refreshApplicationState()")[0]
+        self.assertIn("realpath(representation, nil)", canonical)
+        self.assertIn("defer { free(resolved) }", canonical)
+        self.assertIn("guard url.isFileURL else { return nil }", canonical)
+        # One bounded turn of the bridge's main run loop in a common mode,
+        # before the lookup, and nowhere else.
+        refresh = self.source.split("func refreshApplicationState()")[1].split("func attach(")[0]
+        self.assertIn("RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: runLoopTurn))", refresh)
+        self.assertIn("let runLoopTurn: TimeInterval = 0.05", self.source)
+        self.assertEqual(self.source.count("RunLoop"), 1)
+        self.assertEqual(self.source.count("refreshApplicationState()"), 2)
+        self.assertLess(attach.index("refreshApplicationState()"),
+                        attach.index("NSRunningApplication(processIdentifier: pid)"))
+        self.assertLess(attach.index('fail("invalid_command")'), attach.index("refreshApplicationState()"))
         close = self.source.split("func close()")[1].split('reply(["ready": true])')[0]
         self.assertIn("list.count == 1, owner(list[0]) == target.pid", close)
         self.assertIn("owner(button) == target.pid", close)
