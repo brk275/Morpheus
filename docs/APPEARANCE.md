@@ -105,9 +105,14 @@ These run first in `main`, before the screenshot preview, the updater, the
 startup session, the window, the account store, the credential vault, sync and
 media devices. They read with the bounded reader, create no folder or file and
 write nothing. `validate` exits 0 when valid, 1 when not and 2 for a usage
-error; it never prints a path. `--json` output has the format
-`morpheus-config-diagnostics` (version 1) with `file`, `code`, `message`,
-`field`, `line` and `column` per diagnostic. `schema --json` prints the field
+error. A repeated option, an unknown word or more than four arguments is a
+usage error; at most one argument beyond that limit is read, so a long
+argument list is refused rather than cut short. Output never prints a path or
+the configured theme name, which is file content: `--json` output has the
+format `morpheus-config-diagnostics` (version 1) with `valid`, a fixed `theme`
+category (`none`, `built-in`, `built-in-override` or `custom`) and `file`,
+`code`, `message`, `field`, `line` and `column` per diagnostic, and the text
+form names the same category. `schema --json` prints the field
 reference, color tokens, theme-file keys, limits and every diagnostic code from
 the registry. On Windows the release app is a GUI program: its output is
 visible only when redirected to a file or pipe; the exit status is always set.

@@ -105,14 +105,37 @@ pub struct Diagnostic {
     pub column: Option<usize>,
 }
 
+/// Where the selected theme comes from, as a fixed category. The configured
+/// theme name is file content, so it is never part of a report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeSource {
+    /// No theme pack is selected, or the configuration did not validate.
+    None,
+    /// A built-in theme, without an override file.
+    BuiltIn,
+    /// A file overriding a built-in theme.
+    BuiltInOverride,
+    /// A theme file of the user's own.
+    Custom,
+}
+
+impl ThemeSource {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::BuiltIn => "built-in",
+            Self::BuiltInOverride => "built-in-override",
+            Self::Custom => "custom",
+        }
+    }
+}
+
 /// The outcome of checking the configuration and its theme without
 /// starting anything else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
     pub diagnostics: Vec<Diagnostic>,
-    /// The theme name that was checked, when the configuration names one.
-    /// It passed validation as a plain theme name.
-    pub theme: Option<String>,
+    pub theme: ThemeSource,
 }
 
 impl Report {
@@ -129,7 +152,7 @@ pub fn check_store(store: &ConfigStore) -> Report {
         Err(error) => {
             return Report {
                 diagnostics: vec![input_diagnostic(FileKind::Config, error)],
-                theme: None,
+                theme: ThemeSource::None,
             };
         }
     };
@@ -138,36 +161,42 @@ pub fn check_store(store: &ConfigStore) -> Report {
         Err(diagnostic) => {
             return Report {
                 diagnostics: vec![diagnostic],
-                theme: None,
+                theme: ThemeSource::None,
             };
         }
     };
     let Some(name) = config.appearance.theme_pack.clone() else {
         return Report {
             diagnostics: Vec::new(),
-            theme: None,
+            theme: ThemeSource::None,
         };
     };
-    let diagnostics = match store.theme_path(&name) {
-        Err(error) => vec![semantic_diagnostic(FileKind::Config, &raw, &error)],
-        Ok(path) => check_theme_file(&path, &name).err().into_iter().collect(),
+    let (theme, diagnostic) = match store.theme_path(&name) {
+        Err(error) => (
+            ThemeSource::None,
+            Some(semantic_diagnostic(FileKind::Config, &raw, &error)),
+        ),
+        Ok(path) => check_theme_file(&path, &name),
     };
     Report {
-        diagnostics,
-        theme: Some(name),
+        diagnostics: diagnostic.into_iter().collect(),
+        theme,
     }
 }
 
-fn check_theme_file(path: &Path, name: &str) -> Result<(), Diagnostic> {
+fn check_theme_file(path: &Path, name: &str) -> (ThemeSource, Option<Diagnostic>) {
+    let built_in = BuiltInStylePreset::ALL
+        .iter()
+        .any(|preset| preset.theme_name() == name);
+    let file_source = if built_in {
+        ThemeSource::BuiltInOverride
+    } else {
+        ThemeSource::Custom
+    };
     match read_bounded(path, MAX_THEME_BYTES) {
-        Ok(raw) => check_theme_source(&raw).map(|_| ()),
-        Err(InputError::Missing) if BuiltInStylePreset::ALL
-            .iter()
-            .any(|preset| preset.theme_name() == name) =>
-        {
-            Ok(())
-        }
-        Err(error) => Err(input_diagnostic(FileKind::Theme, error)),
+        Ok(raw) => (file_source, check_theme_source(&raw).err()),
+        Err(InputError::Missing) if built_in => (ThemeSource::BuiltIn, None),
+        Err(error) => (file_source, Some(input_diagnostic(FileKind::Theme, error))),
     }
 }
 
@@ -579,13 +608,15 @@ mod tests {
         assert!(!store.path().exists(), "validation must not create the file");
         std::fs::write(store.path(), "[appearance]\ntheme_pack = \"aurora\"\n").unwrap();
         let theme = check_store(&store);
-        assert_eq!(theme.theme.as_deref(), Some("aurora"));
+        assert_eq!(theme.theme, ThemeSource::Custom);
         assert_eq!(theme.diagnostics[0].file, FileKind::Theme);
         assert_eq!(theme.diagnostics[0].code, "missing-file");
         assert!(!store.themes_dir().unwrap().exists());
         // A built-in name without an override file uses the embedded theme.
         std::fs::write(store.path(), "[appearance]\ntheme_pack = \"paper\"\n").unwrap();
-        assert!(check_store(&store).is_valid());
+        let paper = check_store(&store);
+        assert!(paper.is_valid());
+        assert_eq!(paper.theme, ThemeSource::BuiltIn);
         let oversized = format!("# {}\n", "x".repeat(MAX_CONFIG_BYTES as usize));
         std::fs::write(store.path(), oversized).unwrap();
         assert_eq!(check_store(&store).diagnostics[0].code, "file-too-large");
