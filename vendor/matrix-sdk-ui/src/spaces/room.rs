@@ -1,0 +1,504 @@
+// Copyright 2025 The Matrix.org Foundation C.I.C.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for that specific language governing permissions and
+// limitations under the License.
+
+use std::cmp::Ordering;
+
+use matrix_sdk::{Room, RoomHero, RoomHeroWithProfile, RoomState};
+use ruma::{
+    MilliSecondsSinceUnixEpoch, OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId, OwnedServerName,
+    OwnedSpaceChildOrder, RoomId,
+    events::{
+        room::{guest_access::GuestAccess, history_visibility::HistoryVisibility},
+        space::child::HierarchySpaceChildEvent,
+    },
+    room::{JoinRuleSummary, RoomSummary, RoomType},
+};
+
+/// Structure representing a room in a space and aggregated information relevant
+/// to the UI layer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpaceRoom {
+    /// The ID of the room.
+    pub room_id: OwnedRoomId,
+    /// The canonical alias of the room, if any.
+    pub canonical_alias: Option<OwnedRoomAliasId>,
+    /// The name of the room, if any.
+    pub name: Option<String>,
+    /// Calculated display name based on the room's name, aliases, and members.
+    pub display_name: String,
+    /// The topic of the room, if any.
+    pub topic: Option<String>,
+    /// The URL for the room's avatar, if one is set.
+    pub avatar_url: Option<OwnedMxcUri>,
+    /// The type of room from `m.room.create`, if any.
+    pub room_type: Option<RoomType>,
+    /// The number of members joined to the room.
+    pub num_joined_members: u64,
+    /// The join rule of the room.
+    pub join_rule: Option<JoinRuleSummary>,
+    /// Whether the room may be viewed by users without joining.
+    pub world_readable: Option<bool>,
+    /// Whether guest users may join the room and participate in it.
+    pub guest_can_join: bool,
+
+    /// Whether this room is a direct room.
+    ///
+    /// Only set if the room is known to the client otherwise we assume DMs
+    /// shouldn't be exposed publicly in spaces.
+    pub is_direct: Option<bool>,
+    /// The number of children room this has, if a space.
+    pub children_count: u64,
+    /// Whether this room is joined, left etc.
+    pub state: Option<RoomState>,
+    /// A list of room members considered to be heroes.
+    pub heroes: Option<Vec<RoomHeroWithProfile>>,
+    /// The via parameters of the room.
+    pub via: Vec<OwnedServerName>,
+    /// Whether the room is suggested by the space administrators.
+    ///
+    /// Defaults to `false` if not specified in the `m.space.child` event.
+    pub suggested: bool,
+    /// Whether this room is a DM, if known. Note this value can be calculated
+    /// following some assumptions and is not guaranteed to be accurate.
+    pub is_dm: Option<bool>,
+}
+
+impl SpaceRoom {
+    /// Build a `SpaceRoom` from a `RoomSummary` received from the /hierarchy
+    /// endpoint.
+    pub(crate) async fn new_from_summary(
+        summary: &RoomSummary,
+        known_room: Option<Room>,
+        children_count: u64,
+        via: Vec<OwnedServerName>,
+        suggested: bool,
+    ) -> Self {
+        let num_joined_service_members = if let Some(known_room) = &known_room {
+            num_joined_service_members_or_default(known_room).await
+        } else {
+            0
+        };
+
+        let heroes =
+            if let Some(known_room) = &known_room { Some(known_room.heroes().await) } else { None };
+
+        let num_joined_members: u64 = summary.num_joined_members.into();
+        let display_name = matrix_sdk_base::Room::compute_display_name_with_fields(
+            summary.name.clone(),
+            summary.canonical_alias.as_deref(),
+            heroes.iter().flatten().map(RoomHero::from).collect(),
+            num_joined_members.saturating_sub(num_joined_service_members),
+        )
+        .to_string();
+
+        Self {
+            room_id: summary.room_id.clone(),
+            canonical_alias: summary.canonical_alias.clone(),
+            name: summary.name.clone(),
+            display_name,
+            topic: summary.topic.clone(),
+            avatar_url: summary.avatar_url.clone(),
+            room_type: summary.room_type.clone(),
+            num_joined_members: summary.num_joined_members.into(),
+            join_rule: Some(summary.join_rule.clone()),
+            world_readable: Some(summary.world_readable),
+            guest_can_join: summary.guest_can_join,
+            is_direct: known_room.as_ref().map(|r| r.direct_targets_length() != 0),
+            children_count,
+            state: known_room.as_ref().map(|r| r.state()),
+            heroes,
+            via,
+            suggested,
+            is_dm: known_room.as_ref().map(|r| r.is_dm()),
+        }
+    }
+
+    /// Build a `SpaceRoom` from a room already known to this client.
+    pub(crate) async fn new_from_known(known_room: &Room, children_count: u64) -> Self {
+        let room_info = known_room.clone_info();
+
+        let name = room_info.name().map(ToOwned::to_owned);
+        let joined_service_members_count = num_joined_service_members_or_default(known_room).await;
+
+        let heroes = known_room.heroes().await;
+
+        let display_name = matrix_sdk_base::Room::compute_display_name_with_fields(
+            name.clone(),
+            room_info.canonical_alias(),
+            heroes.iter().map(RoomHero::from).collect(),
+            known_room.joined_members_count().saturating_sub(joined_service_members_count),
+        )
+        .to_string();
+
+        Self {
+            room_id: room_info.room_id().to_owned(),
+            canonical_alias: room_info.canonical_alias().map(ToOwned::to_owned),
+            name,
+            display_name,
+            topic: room_info.topic().map(ToOwned::to_owned),
+            avatar_url: room_info.avatar_url().map(ToOwned::to_owned),
+            room_type: room_info.room_type().cloned(),
+            num_joined_members: known_room.joined_members_count(),
+            join_rule: room_info.join_rule().cloned().map(Into::into),
+            world_readable: room_info
+                .history_visibility()
+                .map(|vis| *vis == HistoryVisibility::WorldReadable),
+            guest_can_join: known_room.guest_access() == GuestAccess::CanJoin,
+            is_direct: Some(known_room.direct_targets_length() != 0),
+            children_count,
+            state: Some(known_room.state()),
+            heroes: Some(heroes),
+            via: vec![],
+            suggested: false,
+            is_dm: known_room.compute_is_dm().await.ok(),
+        }
+    }
+
+    /// Sorts space rooms by various criteria as defined in
+    /// https://spec.matrix.org/latest/client-server-api/#ordering-of-children-within-a-space
+    pub(crate) fn compare_rooms(
+        a: (&RoomId, Option<&SpaceRoomChildState>),
+        b: (&RoomId, Option<&SpaceRoomChildState>),
+    ) -> Ordering {
+        let (a_room_id, a_state) = a;
+        let (b_room_id, b_state) = b;
+
+        match (a_state, b_state) {
+            (Some(a_state), Some(b_state)) => match (&a_state.order, &b_state.order) {
+                (Some(a_order), Some(b_order)) => a_order
+                    .cmp(b_order)
+                    .then(a_state.origin_server_ts.cmp(&b_state.origin_server_ts))
+                    .then(a_room_id.cmp(b_room_id)),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => a_state
+                    .origin_server_ts
+                    .cmp(&b_state.origin_server_ts)
+                    .then(a_room_id.cmp(b_room_id)),
+            },
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (None, None) => a_room_id.cmp(b_room_id),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SpaceRoomChildState {
+    pub(crate) order: Option<OwnedSpaceChildOrder>,
+    pub(crate) origin_server_ts: MilliSecondsSinceUnixEpoch,
+}
+
+impl From<&HierarchySpaceChildEvent> for SpaceRoomChildState {
+    fn from(event: &HierarchySpaceChildEvent) -> Self {
+        SpaceRoomChildState {
+            order: event.content.order.clone(),
+            origin_server_ts: event.origin_server_ts,
+        }
+    }
+}
+
+async fn num_joined_service_members_or_default(room: &Room) -> u64 {
+    match room.compute_joined_service_members().await {
+        Ok(Some(service_members)) => service_members.len() as u64,
+        // If we can't compute the joined service members count, assume all of
+        // them joined the room
+        _ => room.service_members().map(|members| members.len() as u64).unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cmp::Ordering;
+
+    use matrix_sdk_test::async_test;
+    use proptest::prelude::*;
+    use ruma::{
+        MilliSecondsSinceUnixEpoch, OwnedRoomId, RoomId, SpaceChildOrder, UInt, room_id, uint,
+    };
+
+    use crate::spaces::{SpaceRoom, room::SpaceRoomChildState};
+
+    #[async_test]
+    async fn test_room_list_sorting() {
+        // Rooms without a `m.space.child` state event should be sorted by their
+        // `room_id`
+        assert_eq!(
+            SpaceRoom::compare_rooms((room_id!("!A:a.b"), None), (room_id!("!B:a.b"), None),),
+            Ordering::Less
+        );
+
+        assert_eq!(
+            SpaceRoom::compare_rooms(
+                (room_id!("!Marțolea:a.b"), None),
+                (room_id!("!Luana:a.b"), None),
+            ),
+            Ordering::Greater
+        );
+
+        // Rooms without an order provided through the `children_state` should
+        // be sorted by their `m.space.child` `origin_server_ts`
+        assert_eq!(
+            SpaceRoom::compare_rooms(
+                (
+                    room_id!("!Luana:a.b"),
+                    Some(&SpaceRoomChildState {
+                        origin_server_ts: MilliSecondsSinceUnixEpoch(uint!(1)),
+                        order: None
+                    })
+                ),
+                (
+                    room_id!("!Marțolea:a.b"),
+                    Some(&SpaceRoomChildState {
+                        origin_server_ts: MilliSecondsSinceUnixEpoch(uint!(0)),
+                        order: None
+                    })
+                )
+            ),
+            Ordering::Greater
+        );
+
+        // The `m.space.child` `content.order` field should be used if provided
+        assert_eq!(
+            SpaceRoom::compare_rooms(
+                (
+                    room_id!("!Joiana:a.b"),
+                    Some(&SpaceRoomChildState {
+                        origin_server_ts: MilliSecondsSinceUnixEpoch(uint!(123)),
+                        order: Some(SpaceChildOrder::parse("second").unwrap())
+                    })
+                ),
+                (
+                    room_id!("!Mioara:a.b"),
+                    Some(&SpaceRoomChildState {
+                        origin_server_ts: MilliSecondsSinceUnixEpoch(uint!(234)),
+                        order: Some(SpaceChildOrder::parse("first").unwrap())
+                    })
+                ),
+            ),
+            Ordering::Greater
+        );
+
+        // The timestamp should be used when the `order` is the same
+        assert_eq!(
+            SpaceRoom::compare_rooms(
+                (
+                    room_id!("!Joiana:a.b"),
+                    Some(&SpaceRoomChildState {
+                        origin_server_ts: MilliSecondsSinceUnixEpoch(uint!(1)),
+                        order: Some(SpaceChildOrder::parse("Same pasture").unwrap())
+                    })
+                ),
+                (
+                    room_id!("!Mioara:a.b"),
+                    Some(&SpaceRoomChildState {
+                        origin_server_ts: MilliSecondsSinceUnixEpoch(uint!(0)),
+                        order: Some(SpaceChildOrder::parse("Same pasture").unwrap())
+                    })
+                ),
+            ),
+            Ordering::Greater
+        );
+
+        // And the `room_id` should be used when both the `order` and the
+        // `timestamp` are equal
+        assert_eq!(
+            SpaceRoom::compare_rooms(
+                (
+                    room_id!("!Joiana:a.b"),
+                    Some(&SpaceRoomChildState {
+                        origin_server_ts: MilliSecondsSinceUnixEpoch(uint!(0)),
+                        order: Some(SpaceChildOrder::parse("Same pasture").unwrap())
+                    })
+                ),
+                (
+                    room_id!("!Mioara:a.b"),
+                    Some(&SpaceRoomChildState {
+                        origin_server_ts: MilliSecondsSinceUnixEpoch(uint!(0)),
+                        order: Some(SpaceChildOrder::parse("Same pasture").unwrap())
+                    })
+                ),
+            ),
+            Ordering::Less
+        );
+
+        // When one of the rooms is missing `children_state` data the other one
+        // should take precedence
+        assert_eq!(
+            SpaceRoom::compare_rooms(
+                (room_id!("!Viola:a.b"), None),
+                (
+                    room_id!("!Sâmbotina:a.b"),
+                    Some(&SpaceRoomChildState {
+                        origin_server_ts: MilliSecondsSinceUnixEpoch(uint!(0)),
+                        order: None
+                    })
+                ),
+            ),
+            Ordering::Greater
+        );
+
+        // If the `order` is missing from one of the rooms but `children_state`
+        // is present then the other one should come first
+        assert_eq!(
+            SpaceRoom::compare_rooms(
+                (
+                    room_id!("!Sâmbotina:a.b"),
+                    Some(&SpaceRoomChildState {
+                        origin_server_ts: MilliSecondsSinceUnixEpoch(uint!(1)),
+                        order: None
+                    })
+                ),
+                (
+                    room_id!("!Dumana:a.b"),
+                    Some(&SpaceRoomChildState {
+                        origin_server_ts: MilliSecondsSinceUnixEpoch(uint!(1)),
+                        order: Some(SpaceChildOrder::parse("Some pasture").unwrap())
+                    })
+                ),
+            ),
+            Ordering::Greater
+        );
+    }
+
+    /// This test was written because the [`SpaceRoom::compare_rooms`] method
+    /// wasn't adhering to a total order.
+    ///
+    /// More precisely it wasn't transitive. This was because as soon as the
+    /// [SpaceRoomChildState] for one room was set to `None` we would fall back
+    /// to comparing only room IDs.
+    ///
+    /// The correct way to preserve transitivity was to only fall back to room
+    /// IDs if both rooms don't have a state.
+    #[test]
+    fn test_compare_rooms_minimal_transitive_failure() {
+        let (a_room_id, a_state) = (room_id!("!Q"), None);
+
+        let (b_room_id, b_state) = (
+            room_id!("!A"),
+            Some(SpaceRoomChildState {
+                order: None,
+                origin_server_ts: MilliSecondsSinceUnixEpoch(uint!(10)),
+            }),
+        );
+
+        let (c_room_id, c_state) = (
+            room_id!("!a"),
+            Some(SpaceRoomChildState {
+                order: None,
+                origin_server_ts: MilliSecondsSinceUnixEpoch(uint!(0)),
+            }),
+        );
+
+        let a = (a_room_id, a_state.as_ref());
+        let b = (b_room_id, b_state.as_ref());
+        let c = (c_room_id, c_state.as_ref());
+
+        let ab = SpaceRoom::compare_rooms(a, b);
+        let bc = SpaceRoom::compare_rooms(b, c);
+        let ac = SpaceRoom::compare_rooms(a, c);
+
+        assert_eq!(ab, Ordering::Greater, "a > b should hold");
+        assert_eq!(bc, Ordering::Greater, "b > c should hold");
+        assert_eq!(ac, Ordering::Greater, "therefore a > c should be true as well");
+    }
+
+    fn any_room_id_and_space_room_order()
+    -> impl Strategy<Value = (OwnedRoomId, Option<SpaceRoomChildState>)> {
+        let room_id = "[a-zA-Z]{1,5}".prop_map(|r| {
+            RoomId::new_v2(&r).expect("Any string starting with ! should be a valid room ID")
+        });
+
+        let timestamp = any::<u8>().prop_map(|t| MilliSecondsSinceUnixEpoch(UInt::from(t)));
+
+        let order = prop::option::of("[a-zA-Z]{1,5}").prop_map(|order| {
+            order.map(|o| SpaceChildOrder::parse(o).expect("Any string should be a valid order"))
+        });
+
+        let state = (order, timestamp)
+            .prop_map(|(o, t)| SpaceRoomChildState { order: o, origin_server_ts: t });
+
+        let state = prop::option::of(state);
+
+        (room_id, state)
+    }
+
+    proptest! {
+        #[test]
+        fn test_sort_space_room_children_never_panics(mut v in prop::collection::vec(any_room_id_and_space_room_order(), 0..100)) {
+            v.sort_by(|a, b| {
+                let (a_room_id, a_state) = a;
+                let (b_room_id, b_state) = b;
+
+                let a = (a_room_id.as_ref(), a_state.as_ref());
+                let b = (b_room_id.as_ref(), b_state.as_ref());
+
+                SpaceRoom::compare_rooms(a, b)
+            })
+        }
+
+        #[test]
+        fn test_compare_rooms_reflexive(a in any_room_id_and_space_room_order()) {
+            let (a_room_id, a_state) = a;
+            let a = (a_room_id.as_ref(), a_state.as_ref());
+
+            prop_assert_eq!(SpaceRoom::compare_rooms(a, a), Ordering::Equal);
+        }
+
+        #[test]
+        fn test_compare_rooms_antisymmetric(a in any_room_id_and_space_room_order(), b in any_room_id_and_space_room_order()) {
+            let (a_room_id, a_state) = a;
+            let (b_room_id, b_state) = b;
+
+            let a = (a_room_id.as_ref(), a_state.as_ref());
+            let b = (b_room_id.as_ref(), b_state.as_ref());
+
+            let ab = SpaceRoom::compare_rooms(a, b);
+            let ba = SpaceRoom::compare_rooms(b, a);
+
+            prop_assert_eq!(ab, ba.reverse());
+        }
+
+        #[test]
+        fn test_compare_rooms_transitive(
+            a in any_room_id_and_space_room_order(),
+            b in any_room_id_and_space_room_order(),
+            c in any_room_id_and_space_room_order()
+        ) {
+            let (a_room_id, a_state) = a;
+            let (b_room_id, b_state) = b;
+            let (c_room_id, c_state) = c;
+
+            let a = (a_room_id.as_ref(), a_state.as_ref());
+            let b = (b_room_id.as_ref(), b_state.as_ref());
+            let c = (c_room_id.as_ref(), c_state.as_ref());
+
+            let ab = SpaceRoom::compare_rooms(a, b);
+            let bc = SpaceRoom::compare_rooms(b, c);
+            let ac = SpaceRoom::compare_rooms(a, c);
+
+            if ab == Ordering::Less && bc == Ordering::Less {
+                prop_assert_eq!(ac, Ordering::Less);
+            }
+
+            if ab == Ordering::Equal && bc == Ordering::Equal {
+                prop_assert_eq!(ac, Ordering::Equal);
+            }
+
+            if ab == Ordering::Greater && bc == Ordering::Greater {
+                prop_assert_eq!(ac, Ordering::Greater);
+            }
+        }
+    }
+}

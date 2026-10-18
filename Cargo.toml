@@ -12,6 +12,7 @@ members = [
     "vendor/matrix-rtc-core",
     "vendor/cargo-packager-updater",
     "vendor/matrix-sdk-base",
+    "vendor/matrix-sdk-ui",
     "vendor/webrtc-sys-build",
 ]
 default-members = [
@@ -53,3 +54,5 @@ matrix-rtc-core = { path = "vendor/matrix-rtc-core" }
 [patch."https://github.com/matrix-org/matrix-rust-sdk"]
 # Preserve decrypted keyless sticky receipts without altering the keyed map.
 matrix-sdk-base = { path = "vendor/matrix-sdk-base" }
+# Keep locally consumed custom room state available through native sliding sync.
+matrix-sdk-ui = { path = "vendor/matrix-sdk-ui" }

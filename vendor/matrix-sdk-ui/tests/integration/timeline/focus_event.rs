@@ -1,0 +1,910 @@
+// Copyright 2024 The Matrix.org Foundation C.I.C.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Tests specific to a timeline focused on an event.
+
+use std::time::Duration;
+
+use assert_matches::assert_matches;
+use eyeball_im::VectorDiff;
+use futures_util::StreamExt;
+use matrix_sdk::{
+    assert_let_timeout,
+    test_utils::mocks::{
+        MatrixMockServer, RoomContextResponseTemplate, RoomMessagesResponseTemplate,
+        RoomRelationsResponseTemplate,
+    },
+};
+use matrix_sdk_test::{ALICE, BOB, JoinedRoomBuilder, async_test, event_factory::EventFactory};
+use matrix_sdk_ui::timeline::{
+    EventSendState, TimelineBuilder, TimelineEventFocusThreadMode, TimelineFocus,
+};
+use ruma::{event_id, events::room::message::RoomMessageEventContent, room_id};
+use strass::assert_let;
+use stream_assert::assert_pending;
+use tokio::time::sleep;
+
+#[async_test]
+async fn test_new_focused() {
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    let f = EventFactory::new().room(room_id);
+    let target_event = event_id!("$1");
+
+    server
+        .mock_room_event_context()
+        .room(room_id)
+        .ok(
+            // events_before are passed in reverse chronological order (newest
+            // first), as required by the /context response format.
+            RoomContextResponseTemplate::new(
+                f.text_msg("in the end").event_id(target_event).sender(*BOB).into_event(),
+            )
+            .events_before(vec![
+                f.text_msg("and got so far").sender(*ALICE).into_event(),
+                f.text_msg("i tried so hard").sender(*ALICE).into_event(),
+            ])
+            .events_after(vec![
+                f.text_msg("it doesn't even").sender(*ALICE).into_event(),
+                f.text_msg("matter").sender(*ALICE).into_event(),
+            ])
+            .start("prev1")
+            .end("next1"),
+        )
+        .mock_once()
+        .mount()
+        .await;
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let room = server.sync_joined_room(&client, room_id).await;
+    let timeline = TimelineBuilder::new(&room)
+        .with_focus(TimelineFocus::Event {
+            target: target_event.to_owned(),
+            num_context_events: 20,
+            thread_mode: TimelineEventFocusThreadMode::Automatic { hide_threaded_events: false },
+        })
+        .build()
+        .await
+        .unwrap();
+
+    assert!(
+        timeline.live_back_pagination_status().await.is_none(),
+        "there should be no live back-pagination status for a focused timeline"
+    );
+
+    let (items, mut timeline_stream) = timeline.subscribe().await;
+
+    assert_eq!(items.len(), 5 + 1); // event items + a date divider
+    assert!(items[0].is_date_divider());
+    assert_eq!(
+        items[1].as_event().unwrap().content().as_message().unwrap().body(),
+        "i tried so hard"
+    );
+    assert_eq!(
+        items[2].as_event().unwrap().content().as_message().unwrap().body(),
+        "and got so far"
+    );
+    assert_eq!(items[3].as_event().unwrap().content().as_message().unwrap().body(), "in the end");
+    assert_eq!(
+        items[4].as_event().unwrap().content().as_message().unwrap().body(),
+        "it doesn't even"
+    );
+    assert_eq!(items[5].as_event().unwrap().content().as_message().unwrap().body(), "matter");
+
+    assert_pending!(timeline_stream);
+
+    // Now trigger a backward pagination.
+    server
+        .mock_room_messages()
+        .match_from("prev1")
+        .ok(RoomMessagesResponseTemplate::default().events(vec![
+            // reversed manually here
+            f.text_msg("And even though I tried, it all fell apart")
+                .sender(*BOB)
+                .into_raw_timeline(),
+            f.text_msg("I kept everything inside").sender(*BOB).into_raw_timeline(),
+        ]))
+        .mock_once()
+        .mount()
+        .await;
+
+    let hit_start = timeline.paginate_backwards(20).await.unwrap();
+    assert!(hit_start);
+
+    assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
+    assert_eq!(timeline_updates.len(), 2);
+
+    assert_let!(VectorDiff::Insert { index: 1, value: message } = &timeline_updates[0]);
+    assert_eq!(
+        message.as_event().unwrap().content().as_message().unwrap().body(),
+        "I kept everything inside"
+    );
+
+    assert_let!(VectorDiff::Insert { index: 2, value: message } = &timeline_updates[1]);
+    assert_eq!(
+        message.as_event().unwrap().content().as_message().unwrap().body(),
+        "And even though I tried, it all fell apart"
+    );
+
+    // Now trigger a forward pagination.
+    server
+        .mock_room_messages()
+        .match_from("next1")
+        .ok(RoomMessagesResponseTemplate::default()
+            .events(vec![
+                f.text_msg("I had to fall, to lose it all").sender(*BOB).into_raw_timeline(),
+                f.text_msg("But in the end, it doesn't event matter")
+                    .sender(*BOB)
+                    .into_raw_timeline(),
+            ])
+            .end_token("next2"))
+        .mock_once()
+        .mount()
+        .await;
+
+    let hit_start = timeline.paginate_forwards(20).await.unwrap();
+    assert!(!hit_start); // because we gave it another next2 token.
+
+    assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
+    assert_eq!(timeline_updates.len(), 2);
+
+    assert_let!(VectorDiff::PushBack { value: message } = &timeline_updates[0]);
+    assert_eq!(
+        message.as_event().unwrap().content().as_message().unwrap().body(),
+        "I had to fall, to lose it all"
+    );
+
+    assert_let!(VectorDiff::PushBack { value: message } = &timeline_updates[1]);
+    assert_eq!(
+        message.as_event().unwrap().content().as_message().unwrap().body(),
+        "But in the end, it doesn't event matter"
+    );
+
+    assert_pending!(timeline_stream);
+}
+
+#[async_test]
+async fn test_live_aggregations_are_reflected_on_focused_timelines() {
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    // Start a focused timeline.
+    let f = EventFactory::new().room(room_id);
+    let target_event = event_id!("$1");
+
+    server
+        .mock_room_event_context()
+        .room(room_id)
+        .ok(RoomContextResponseTemplate::new(
+            f.text_msg("yolo").event_id(target_event).sender(*BOB).into_event(),
+        ))
+        .mock_once()
+        .mount()
+        .await;
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let room = server.sync_joined_room(&client, room_id).await;
+    let timeline = TimelineBuilder::new(&room)
+        .with_focus(TimelineFocus::Event {
+            target: target_event.to_owned(),
+            num_context_events: 20,
+            thread_mode: TimelineEventFocusThreadMode::Automatic { hide_threaded_events: false },
+        })
+        .build()
+        .await
+        .unwrap();
+
+    let (items, mut timeline_stream) = timeline.subscribe().await;
+
+    assert_eq!(items.len(), 1 + 1); // event items + a date divider
+    assert!(items[0].is_date_divider());
+
+    let event_item = items[1].as_event().unwrap();
+    assert_eq!(event_item.content().as_message().unwrap().body(), "yolo");
+    assert_eq!(event_item.reactions().len(), 0);
+
+    assert_pending!(timeline_stream);
+
+    // Now simulate a sync that returns a new message-like event, and a reaction
+    // to the $1 event.
+    server
+        .mock_sync()
+        .ok_and_run(&client, |builder| {
+            builder.add_joined_room(JoinedRoomBuilder::new(room_id).add_timeline_bulk([
+                // This event must be ignored.
+                f.text_msg("this is a sync event").sender(*ALICE).into(),
+                // This event must not be ignored.
+                f.reaction(target_event, "👍").sender(*BOB).into(),
+            ]));
+        })
+        .await;
+
+    // We only receive one updated for the reaction, from the timeline stream.
+    assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
+    assert_eq!(timeline_updates.len(), 1);
+    assert_let!(VectorDiff::Set { index: 1, value: item } = &timeline_updates[0]);
+
+    let event_item = item.as_event().unwrap();
+    assert_eq!(event_item.content().as_message().unwrap().body(), "yolo");
+    let reactions = event_item.reactions().clone();
+    assert_eq!(reactions.len(), 1);
+    let _ = reactions["👍"][*BOB];
+}
+
+#[async_test]
+async fn test_focused_timeline_local_echoes() {
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    // Start a focused timeline.
+    let f = EventFactory::new().room(room_id);
+    let target_event = event_id!("$1");
+
+    server
+        .mock_room_event_context()
+        .room(room_id)
+        .ok(RoomContextResponseTemplate::new(
+            f.text_msg("yolo").event_id(target_event).sender(*BOB).into_event(),
+        ))
+        .mock_once()
+        .mount()
+        .await;
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let room = server.sync_joined_room(&client, room_id).await;
+    let timeline = TimelineBuilder::new(&room)
+        .with_focus(TimelineFocus::Event {
+            target: target_event.to_owned(),
+            num_context_events: 20,
+            thread_mode: TimelineEventFocusThreadMode::Automatic { hide_threaded_events: false },
+        })
+        .build()
+        .await
+        .unwrap();
+
+    let (items, mut timeline_stream) = timeline.subscribe().await;
+
+    assert_eq!(items.len(), 1 + 1); // event items + a date divider
+    assert!(items[0].is_date_divider());
+
+    let event_item = items[1].as_event().unwrap();
+    assert_eq!(event_item.content().as_message().unwrap().body(), "yolo");
+    assert_eq!(event_item.reactions().len(), 0);
+
+    sleep(Duration::from_millis(100)).await;
+    assert_pending!(timeline_stream);
+
+    // Add a reaction to the focused event, which will cause a local echo to
+    // happen.
+    timeline.toggle_reaction(&event_item.identifier(), "✨").await.unwrap();
+
+    assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
+    assert_eq!(timeline_updates.len(), 1);
+
+    // We immediately get the local echo for the reaction.
+    assert_let!(VectorDiff::Set { index: 1, value: item } = &timeline_updates[0]);
+
+    let event_item = item.as_event().unwrap();
+    // Text hasn't changed.
+    assert_eq!(event_item.content().as_message().unwrap().body(), "yolo");
+    // But now there's one reaction to the event.
+    let reactions = event_item.reactions().clone();
+    assert_eq!(reactions.len(), 1);
+    assert!(reactions.get("✨").unwrap().get(client.user_id().unwrap()).is_some());
+
+    // The send isn't mocked, so it fails, which shows on the reaction.
+    assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
+    assert_eq!(timeline_updates.len(), 1);
+    assert_let!(VectorDiff::Set { index: 1, value: item } = &timeline_updates[0]);
+    let reactions = item.as_event().unwrap().reactions().clone();
+    let reaction = reactions.get("✨").unwrap().get(client.user_id().unwrap()).unwrap();
+    assert_matches!(reaction.send_state, Some(EventSendState::SendingFailed { .. }));
+
+    // And nothing more.
+    sleep(Duration::from_millis(100)).await;
+    assert_pending!(timeline_stream);
+}
+
+#[async_test]
+async fn test_focused_timeline_doesnt_show_local_echoes() {
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+
+    // Start a focused timeline.
+    let f = EventFactory::new().room(room_id);
+    let target_event = event_id!("$1");
+
+    server
+        .mock_room_event_context()
+        .room(room_id)
+        .ok(RoomContextResponseTemplate::new(
+            f.text_msg("yolo").event_id(target_event).sender(*BOB).into_event(),
+        ))
+        .mock_once()
+        .mount()
+        .await;
+
+    server.mock_room_state_encryption().plain().mount().await;
+
+    let room = server.sync_joined_room(&client, room_id).await;
+    let timeline = TimelineBuilder::new(&room)
+        .with_focus(TimelineFocus::Event {
+            target: target_event.to_owned(),
+            num_context_events: 20,
+            thread_mode: TimelineEventFocusThreadMode::Automatic { hide_threaded_events: false },
+        })
+        .build()
+        .await
+        .unwrap();
+
+    let (items, mut timeline_stream) = timeline.subscribe().await;
+
+    assert_eq!(items.len(), 1 + 1); // event items + a date divider
+    assert!(items[0].is_date_divider());
+
+    let event_item = items[1].as_event().unwrap();
+    assert_eq!(event_item.content().as_message().unwrap().body(), "yolo");
+    assert_eq!(event_item.reactions().len(), 0);
+
+    assert_pending!(timeline_stream);
+
+    // Send a message in the room, expect no local echo.
+    timeline.send(RoomMessageEventContent::text_plain("h4xx0r").into()).await.unwrap();
+
+    // Let a bit of time for the send queue to process the event.
+    sleep(Duration::from_millis(300)).await;
+
+    // And nothing more.
+    assert_pending!(timeline_stream);
+}
+
+#[async_test]
+async fn test_focused_timeline_handles_threaded_event() {
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let user_id = client.user_id().unwrap();
+
+    let prev_thread_event_id = event_id!("$prev:example.org");
+    let root_thread_id = event_id!("$root-id:example.org");
+
+    let f = EventFactory::new().room(room_id).sender(user_id);
+    let threaded_event =
+        f.text_msg("Hey").in_thread(root_thread_id, prev_thread_event_id).into_event();
+    let threaded_event_id = threaded_event.event_id().unwrap().to_owned();
+
+    // Mock the initial /context request to check if the event is in a thread.
+    let events_before = vec![
+        f.text_msg("Unrelated before 1").into_event(),
+        f.text_msg("Unrelated before 2").into_event(),
+    ];
+    let events_after = vec![
+        f.text_msg("Unrelated after 1").into_event(),
+        f.text_msg("Unrelated after 2").into_event(),
+    ];
+    server
+        .mock_room_event_context()
+        .room(room_id)
+        .ok(RoomContextResponseTemplate::new(threaded_event)
+            .events_before(events_before)
+            .events_after(events_after)
+            .start("prev_token_1")
+            .end("next_token_1"))
+        .mock_once()
+        .mount()
+        .await;
+
+    let focus = TimelineFocus::Event {
+        target: threaded_event_id,
+        num_context_events: 10,
+        thread_mode: TimelineEventFocusThreadMode::Automatic { hide_threaded_events: false },
+    };
+
+    let room = server.sync_joined_room(&client, room_id).await;
+    let timeline = TimelineBuilder::new(&room)
+        .with_focus(focus)
+        .build()
+        .await
+        .expect("Could not build focused timeline");
+
+    assert!(
+        timeline.live_back_pagination_status().await.is_none(),
+        "there should be no live back-pagination status for a focused timeline"
+    );
+
+    let (items, mut timeline_stream) = timeline.subscribe().await;
+    assert_eq!(items.len(), 2);
+    assert!(items[0].is_date_divider());
+    assert_eq!(items[1].as_event().unwrap().content().as_message().unwrap().body(), "Hey");
+
+    // We paginate back once
+    server
+        .mock_room_relations()
+        .match_from("prev_token_1")
+        .ok(RoomRelationsResponseTemplate {
+            chunk: vec![
+                f.text_msg("Prev")
+                    .sender(user_id)
+                    .in_thread(root_thread_id, prev_thread_event_id)
+                    .into_raw_timeline(),
+            ],
+            prev_batch: Some("prev_token_1".to_owned()),
+            next_batch: Some("prev_token_2".to_owned()),
+            recursion_depth: None,
+        })
+        .mock_once()
+        .mount()
+        .await;
+
+    let start_of_timeline =
+        timeline.paginate_backwards(10).await.expect("Could not paginate backwards");
+    assert!(!start_of_timeline);
+
+    assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
+    assert_eq!(timeline_updates.len(), 1);
+    // The new item loaded is inserted at the start, just after the date
+    // divider.
+    assert_let!(VectorDiff::Insert { index: 1, value: item } = &timeline_updates[0]);
+    assert_eq!(item.as_event().unwrap().content().as_message().unwrap().body(), "Prev");
+
+    // We paginate back until the start of the timeline, which will trigger an
+    // /event request for the initial item.
+    server
+        .mock_room_relations()
+        .match_from("prev_token_2")
+        .ok(RoomRelationsResponseTemplate {
+            // No items returned as the thread root is not part of the /relations response
+            chunk: vec![],
+            prev_batch: Some("prev_token_2".to_owned()),
+            next_batch: None,
+            recursion_depth: None,
+        })
+        .mock_once()
+        .mount()
+        .await;
+
+    server
+        .mock_room_event()
+        .room(room_id)
+        .ok(f.text_msg("Root").sender(user_id).event_id(root_thread_id).into_event())
+        .mock_once()
+        .mount()
+        .await;
+
+    let start_of_timeline =
+        timeline.paginate_backwards(10).await.expect("Could not paginate backwards a 2nd time");
+    assert!(start_of_timeline);
+
+    assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
+    assert_eq!(timeline_updates.len(), 1);
+    // Same as before, the previous event is inserted at the front, after the
+    // date divider.
+    assert_let!(VectorDiff::Insert { index: 1, value: item } = &timeline_updates[0]);
+    assert_eq!(item.as_event().unwrap().content().as_message().unwrap().body(), "Root");
+
+    // Then we paginate forwards
+    server
+        .mock_room_relations()
+        .match_from("next_token_1")
+        .ok(RoomRelationsResponseTemplate {
+            chunk: vec![
+                f.text_msg("Next1")
+                    .sender(user_id)
+                    .in_thread(root_thread_id, prev_thread_event_id)
+                    .into_raw_timeline(),
+            ],
+            prev_batch: Some("next_token_1".to_owned()),
+            next_batch: Some("next_token_2".to_owned()),
+            recursion_depth: None,
+        })
+        .mock_once()
+        .mount()
+        .await;
+
+    let end_of_timeline =
+        timeline.paginate_forwards(10).await.expect("Could not paginate forwards");
+    assert!(!end_of_timeline);
+
+    assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
+    assert_eq!(timeline_updates.len(), 1);
+    assert_let!(VectorDiff::PushBack { value: item } = &timeline_updates[0]);
+    assert_eq!(item.as_event().unwrap().content().as_message().unwrap().body(), "Next1");
+
+    // And we do it again until we can't
+    server
+        .mock_room_relations()
+        .match_from("next_token_2")
+        .ok(RoomRelationsResponseTemplate {
+            chunk: vec![
+                f.text_msg("Next2")
+                    .sender(user_id)
+                    .event_id(prev_thread_event_id)
+                    .in_thread(root_thread_id, prev_thread_event_id)
+                    .into_raw_timeline(),
+            ],
+            prev_batch: Some("next_token_2".to_owned()),
+            next_batch: None,
+            recursion_depth: None,
+        })
+        .mock_once()
+        .mount()
+        .await;
+
+    let end_of_timeline =
+        timeline.paginate_forwards(10).await.expect("Could not paginate forwards a 2nd time");
+    assert!(end_of_timeline);
+
+    assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
+    assert_eq!(timeline_updates.len(), 1);
+    assert_let!(VectorDiff::PushBack { value: item } = &timeline_updates[0]);
+    assert_eq!(item.as_event().unwrap().content().as_message().unwrap().body(), "Next2");
+}
+
+#[async_test]
+async fn test_focused_timeline_handles_thread_root_event_when_forcing_threaded_mode() {
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let user_id = client.user_id().unwrap();
+
+    let f = EventFactory::new().room(room_id).sender(user_id);
+    let thread_root = event_id!("$root:example.org");
+    let thread_root_event = f.text_msg("Hey").event_id(thread_root).into_event();
+
+    // Mock the initial /context request to fetch the focussed event.
+    server
+        .mock_room_event_context()
+        .match_event_id()
+        .ok(RoomContextResponseTemplate::new(thread_root_event).end("next_token_1"))
+        .mock_once()
+        .mount()
+        .await;
+
+    let focus = TimelineFocus::Event {
+        target: thread_root.to_owned(),
+        num_context_events: 0,
+        thread_mode: TimelineEventFocusThreadMode::ForceThread,
+    };
+
+    let room = server.sync_joined_room(&client, room_id).await;
+    let timeline = TimelineBuilder::new(&room)
+        .with_focus(focus)
+        .build()
+        .await
+        .expect("Could not build focused timeline");
+
+    assert!(
+        timeline.live_back_pagination_status().await.is_none(),
+        "there should be no live back-pagination status for a focused timeline"
+    );
+
+    let (items, mut timeline_stream) = timeline.subscribe().await;
+    assert_eq!(items.len(), 2);
+    assert!(items[0].is_date_divider());
+    assert_eq!(items[1].as_event().unwrap().content().as_message().unwrap().body(), "Hey");
+
+    // We cannot paginate backwards because we're already at the thread root.
+    let start_of_timeline =
+        timeline.paginate_backwards(1).await.expect("Could not paginate backwards a 2nd time");
+    assert!(start_of_timeline);
+
+    // We paginate forwards once
+    let prev_event_id = event_id!("$prev:example.org");
+    server
+        .mock_room_relations()
+        .match_from("next_token_1")
+        .ok(RoomRelationsResponseTemplate {
+            chunk: vec![
+                f.text_msg("Next1")
+                    .event_id(prev_event_id)
+                    .sender(user_id)
+                    .in_thread(thread_root, thread_root)
+                    .into_raw_timeline(),
+            ],
+            prev_batch: Some("next_token_1".to_owned()),
+            next_batch: Some("next_token_2".to_owned()),
+            recursion_depth: None,
+        })
+        .mock_once()
+        .mount()
+        .await;
+
+    let end_of_timeline =
+        timeline.paginate_forwards(10).await.expect("Could not paginate forwards");
+    assert!(!end_of_timeline);
+
+    assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
+    assert_eq!(timeline_updates.len(), 1);
+    assert_let!(VectorDiff::PushBack { value: item } = &timeline_updates[0]);
+    assert_eq!(item.as_event().unwrap().content().as_message().unwrap().body(), "Next1");
+
+    // And we do it again until we can't
+    server
+        .mock_room_relations()
+        .match_from("next_token_2")
+        .ok(RoomRelationsResponseTemplate {
+            chunk: vec![
+                f.text_msg("Next2")
+                    .sender(user_id)
+                    .in_thread(thread_root, prev_event_id)
+                    .into_raw_timeline(),
+            ],
+            prev_batch: Some("next_token_2".to_owned()),
+            next_batch: None,
+            recursion_depth: None,
+        })
+        .mock_once()
+        .mount()
+        .await;
+
+    let end_of_timeline =
+        timeline.paginate_forwards(10).await.expect("Could not paginate forwards a 2nd time");
+    assert!(end_of_timeline);
+
+    assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
+    assert_eq!(timeline_updates.len(), 1);
+    assert_let!(VectorDiff::PushBack { value: item } = &timeline_updates[0]);
+    assert_eq!(item.as_event().unwrap().content().as_message().unwrap().body(), "Next2");
+}
+
+#[async_test]
+async fn test_focused_timeline_handles_other_thread_event_when_forcing_threaded_mode() {
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let user_id = client.user_id().unwrap();
+
+    let f = EventFactory::new().room(room_id).sender(user_id);
+    let thread_root = event_id!("$root:example.org");
+    let thread_root_event = f.text_msg("Hey").event_id(thread_root).into_event();
+    let threaded_event_id = event_id!("$response:example.org");
+    let threaded_event = f
+        .text_msg("Ho")
+        .in_thread(thread_root, thread_root)
+        .event_id(threaded_event_id)
+        .into_event();
+
+    // Mock the initial /context request to fetch the focussed event.
+    server
+        .mock_room_event_context()
+        .match_event_id()
+        .ok(RoomContextResponseTemplate::new(threaded_event).start("prev_token").end("next_token"))
+        .mock_once()
+        .mount()
+        .await;
+
+    let focus = TimelineFocus::Event {
+        target: threaded_event_id.to_owned(),
+        num_context_events: 0,
+        thread_mode: TimelineEventFocusThreadMode::ForceThread,
+    };
+
+    let room = server.sync_joined_room(&client, room_id).await;
+    let timeline = TimelineBuilder::new(&room)
+        .with_focus(focus)
+        .build()
+        .await
+        .expect("Could not build focused timeline");
+
+    assert!(
+        timeline.live_back_pagination_status().await.is_none(),
+        "there should be no live back-pagination status for a focused timeline"
+    );
+
+    let (items, mut timeline_stream) = timeline.subscribe().await;
+    assert_eq!(items.len(), 2);
+    assert!(items[0].is_date_divider());
+    assert_eq!(items[1].as_event().unwrap().content().as_message().unwrap().body(), "Ho");
+
+    // We paginate backwards once and hit the start of the thread which will
+    // trigger an /event request for the thread root.
+    server
+        .mock_room_relations()
+        .match_from("prev_token")
+        .ok(RoomRelationsResponseTemplate::default())
+        .mock_once()
+        .mount()
+        .await;
+    server.mock_room_event().room(room_id).ok(thread_root_event).mock_once().mount().await;
+
+    let end_of_timeline =
+        timeline.paginate_backwards(10).await.expect("Could not paginate backwards");
+    assert!(end_of_timeline);
+
+    assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
+    assert_eq!(timeline_updates.len(), 1);
+    // The new item loaded is added at the start.
+    assert_let!(VectorDiff::Insert { index: 1, value: item } = &timeline_updates[0]);
+    assert_eq!(item.as_event().unwrap().content().as_message().unwrap().body(), "Hey");
+
+    // We paginate forwards once and hit the end of the thread.
+    let next_event_id = event_id!("$prev:example.org");
+    server
+        .mock_room_relations()
+        .match_from("next_token")
+        .ok(RoomRelationsResponseTemplate {
+            chunk: vec![
+                f.text_msg("Next")
+                    .event_id(next_event_id)
+                    .sender(user_id)
+                    .in_thread(thread_root, threaded_event_id)
+                    .into_raw_timeline(),
+            ],
+            prev_batch: Some("prev_token".to_owned()),
+            next_batch: None,
+            recursion_depth: None,
+        })
+        .mock_once()
+        .mount()
+        .await;
+
+    let end_of_timeline =
+        timeline.paginate_forwards(10).await.expect("Could not paginate forwards");
+    assert!(end_of_timeline);
+
+    assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
+    assert_eq!(timeline_updates.len(), 1);
+    assert_let!(VectorDiff::PushBack { value: item } = &timeline_updates[0]);
+    assert_eq!(item.as_event().unwrap().content().as_message().unwrap().body(), "Next");
+}
+
+#[async_test]
+async fn test_focused_timeline_filters_out_threaded_events() {
+    let room_id = room_id!("!a98sd12bjh:example.org");
+    let server = MatrixMockServer::new().await;
+    let client = server.client_builder().build().await;
+    let user_id = client.user_id().unwrap();
+
+    let prev_thread_event_id = event_id!("$prev:example.org");
+    let root_thread_id = event_id!("$root-id:example.org");
+
+    let f = EventFactory::new().room(room_id).sender(user_id);
+    let focus_event = f.text_msg("Hey").into_event();
+    let focus_event_id = focus_event.event_id().unwrap().to_owned();
+
+    // Mock the initial /context request to check if the event is in a thread.
+    let events_before = vec![
+        f.text_msg("Unrelated before 1").into_event(),
+        f.text_msg("Unrelated before 2").into_event(),
+        f.text_msg("Thread before").in_thread(root_thread_id, prev_thread_event_id).into_event(),
+    ];
+    let events_after = vec![
+        f.text_msg("Unrelated after 1").into_event(),
+        f.text_msg("Unrelated after 2").into_event(),
+        f.text_msg("Thread after").in_thread(root_thread_id, prev_thread_event_id).into_event(),
+    ];
+    server
+        .mock_room_event_context()
+        .room(room_id)
+        .ok(RoomContextResponseTemplate::new(focus_event)
+            .events_before(events_before)
+            .events_after(events_after)
+            .start("prev_token_1")
+            .end("next_token_1"))
+        .mock_once()
+        .mount()
+        .await;
+
+    let focus = TimelineFocus::Event {
+        target: focus_event_id,
+        num_context_events: 10,
+        thread_mode: TimelineEventFocusThreadMode::Automatic { hide_threaded_events: true },
+    };
+
+    let room = server.sync_joined_room(&client, room_id).await;
+    let timeline = TimelineBuilder::new(&room)
+        .with_focus(focus)
+        .build()
+        .await
+        .expect("Could not build focused timeline");
+
+    assert!(
+        timeline.live_back_pagination_status().await.is_none(),
+        "there should be no live back-pagination status for a focused timeline"
+    );
+
+    let (items, mut timeline_stream) = timeline.subscribe().await;
+    // The 2 unrelated events before + 2 after + the item + the date divider
+    assert_eq!(items.len(), 6);
+    assert!(items[0].is_date_divider());
+    assert_eq!(
+        items[1].as_event().unwrap().content().as_message().unwrap().body(),
+        "Unrelated before 2"
+    );
+    assert_eq!(
+        items[2].as_event().unwrap().content().as_message().unwrap().body(),
+        "Unrelated before 1"
+    );
+    assert_eq!(items[3].as_event().unwrap().content().as_message().unwrap().body(), "Hey");
+    assert_eq!(
+        items[4].as_event().unwrap().content().as_message().unwrap().body(),
+        "Unrelated after 1"
+    );
+    assert_eq!(
+        items[5].as_event().unwrap().content().as_message().unwrap().body(),
+        "Unrelated after 2"
+    );
+
+    // We paginate back once
+    server
+        .mock_room_messages()
+        .match_from("prev_token_1")
+        .ok(RoomMessagesResponseTemplate {
+            chunk: vec![
+                f.text_msg("Prev")
+                    .sender(user_id)
+                    .in_thread(root_thread_id, prev_thread_event_id)
+                    .into_raw_timeline(),
+                f.text_msg("Prev no thread").sender(user_id).into_raw_timeline(),
+            ],
+            start: "prev_token_1".to_owned(),
+            end: Some("prev_token_2".to_owned()),
+            state: Vec::new(),
+            delay: None,
+        })
+        .mock_once()
+        .mount()
+        .await;
+
+    let start_of_timeline =
+        timeline.paginate_backwards(10).await.expect("Could not paginate backwards");
+    assert!(!start_of_timeline);
+
+    // Only the non-threaded event is inserted at the start.
+    assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
+    assert_eq!(timeline_updates.len(), 1);
+    // The new item loaded is inserted at the start, just after the date
+    // divider.
+    assert_let!(VectorDiff::Insert { index: 1, value: item } = &timeline_updates[0]);
+    assert_eq!(item.as_event().unwrap().content().as_message().unwrap().body(), "Prev no thread");
+
+    // Then we paginate forwards
+    server
+        .mock_room_messages()
+        .match_from("next_token_1")
+        .ok(RoomMessagesResponseTemplate {
+            chunk: vec![
+                f.text_msg("Next no thread").sender(user_id).into_raw_timeline(),
+                f.text_msg("Next1")
+                    .sender(user_id)
+                    .in_thread(root_thread_id, prev_thread_event_id)
+                    .into_raw_timeline(),
+            ],
+            start: "next_token_1".to_owned(),
+            end: Some("next_token_2".to_owned()),
+            state: Vec::new(),
+            delay: None,
+        })
+        .mock_once()
+        .mount()
+        .await;
+
+    let end_of_timeline =
+        timeline.paginate_forwards(10).await.expect("Could not paginate forwards");
+    assert!(!end_of_timeline);
+
+    // Only the non-threaded event is pushed to the end.
+    assert_let_timeout!(Some(timeline_updates) = timeline_stream.next());
+    assert_eq!(timeline_updates.len(), 1);
+    assert_let!(VectorDiff::PushBack { value: item } = &timeline_updates[0]);
+    assert_eq!(item.as_event().unwrap().content().as_message().unwrap().body(), "Next no thread");
+}
