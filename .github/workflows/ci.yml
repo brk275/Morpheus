@@ -28,10 +28,12 @@ jobs:
               assert os.uname().machine == "x86_64" and os.getuid() != 0
               deadline = time.monotonic() + 30
               count, groups = 0, {}
+              def walk_error(error):
+                  raise error
               for root in ("/usr/share/doc", "/usr/share/common-licenses"):
                   info = os.lstat(root)
                   assert stat.S_ISDIR(info.st_mode) and info.st_uid == 0
-                  for directory, dirs, files in os.walk(root, followlinks=False):
+                  for directory, dirs, files in os.walk(root, followlinks=False, onerror=walk_error):
                       assert time.monotonic() < deadline
                       assert len(os.path.relpath(directory, root).split(os.sep)) <= 32
                       for name in dirs + files:
