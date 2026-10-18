@@ -2186,25 +2186,10 @@ fn control_extents(ui: &AppWindow, label: &str) -> Vec<(f32, f32)> {
 /// chain without changing focus, scrolling, callbacks or widget properties.
 /// Only numeric geometry and static compiler element names/IDs are reported.
 fn clipped_control_geometry(ui: &AppWindow, label: &str) -> Vec<String> {
-    use slint::private_unstable_api::re_exports::{
-        AccessibleStringProperty, BorderRectangle, Clip, Empty, Flickable, FocusScope, ItemRc,
-        Opacity, Rectangle, WindowInner,
-    };
-    use std::ops::ControlFlow;
+    use slint::private_unstable_api::re_exports::AccessibleStringProperty;
 
-    const NODE_LIMIT: usize = 4096;
-    const PATH_LIMIT: usize = 24;
-    let window = WindowInner::from_pub(ui.window());
-    let root = ItemRc::new_root(window.component());
-    let (width, height) = window_size(ui);
-    let mut nodes = vec![root.clone()];
-    root.visit_descendants(|item| {
-        if nodes.len() >= NODE_LIMIT {
-            return ControlFlow::Break(());
-        }
-        nodes.push(item.clone());
-        ControlFlow::Continue(())
-    });
+    let nodes = geometry_nodes(ui);
+    let (width, _) = window_size(ui);
     let target = nodes.iter().find(|item| {
         item.accessible_string_property(AccessibleStringProperty::Label)
             .as_deref()
@@ -2214,9 +2199,59 @@ fn clipped_control_geometry(ui: &AppWindow, label: &str) -> Vec<String> {
                 bounds.left < -0.5 || bounds.right > width + 0.5
             }
     });
+    geometry_trace(ui, &nodes, target)
+}
+
+/// The same failure-only trace for the control that has keyboard focus,
+/// whichever way its bounds failed.
+fn focused_control_geometry(ui: &AppWindow) -> Vec<String> {
+    use slint::private_unstable_api::re_exports::WindowInner;
+
+    let nodes = geometry_nodes(ui);
+    let focused = {
+        let window = WindowInner::from_pub(ui.window());
+        let item = window.focus_item.borrow().upgrade();
+        item
+    };
+    geometry_trace(ui, &nodes, focused.as_ref())
+}
+
+const GEOMETRY_NODE_LIMIT: usize = 4096;
+
+fn geometry_nodes(ui: &AppWindow) -> Vec<slint::private_unstable_api::re_exports::ItemRc> {
+    use slint::private_unstable_api::re_exports::{ItemRc, WindowInner};
+    use std::ops::ControlFlow;
+
+    let window = WindowInner::from_pub(ui.window());
+    let root = ItemRc::new_root(window.component());
+    let mut nodes = vec![root.clone()];
+    root.visit_descendants(|item| {
+        if nodes.len() >= GEOMETRY_NODE_LIMIT {
+            return ControlFlow::Break(());
+        }
+        nodes.push(item.clone());
+        ControlFlow::Continue(())
+    });
+    nodes
+}
+
+fn geometry_trace(
+    ui: &AppWindow,
+    nodes: &[slint::private_unstable_api::re_exports::ItemRc],
+    target: Option<&slint::private_unstable_api::re_exports::ItemRc>,
+) -> Vec<String> {
+    use slint::private_unstable_api::re_exports::{
+        BorderRectangle, Clip, Empty, Flickable, FocusScope, Opacity, Rectangle,
+    };
+    use std::ops::ControlFlow;
+
+    const NODE_LIMIT: usize = GEOMETRY_NODE_LIMIT;
+    const PATH_LIMIT: usize = 24;
+    let root = &nodes[0];
+    let (width, height) = window_size(ui);
     let mut trace = vec![format!(
         "window={width}x{height}; root={:?}; panes={}/{}/{}; scale={}; nodes={}; node_cap_reached={}",
-        item_bounds(&root),
+        item_bounds(root),
         ui.get_rail_width_px(),
         ui.get_room_list_width(),
         ui.get_details_width(),
@@ -2228,7 +2263,7 @@ fn clipped_control_geometry(ui: &AppWindow, label: &str) -> Vec<String> {
         trace.push("no matching target found".into());
         return trace;
     };
-    for node in &nodes {
+    for node in nodes {
         if trace.len() >= PATH_LIMIT {
             trace.push("ancestor trace capped".into());
             break;
@@ -2519,6 +2554,17 @@ async fn assert_sticker_picker_projection(ui: &AppWindow) {
     // TextAction's caption is a separate accessible text node with this
     // same label. Require exactly one actionable button, not a caption.
     assert_eq!(button_bounds(ui, "Allow sticker images here").len(), 1);
+    // A placed action keeps a real height: an action sized by a zero
+    // preferred height is still focusable but has no visible target.
+    for label in ["Allow sticker images here", "Cancel and close the sticker picker"] {
+        let bounds = button_bounds(ui, label);
+        assert_eq!(bounds.len(), 1, "{label}");
+        assert!(
+            bounds[0].bottom - bounds[0].top >= 31.5 && bounds[0].right > bounds[0].left,
+            "{label} has no visible target: {:?}",
+            bounds[0]
+        );
+    }
     assert!(
         control_bounds(ui, "Sticker preview: Waving fox").is_empty(),
         "no image is presented before consent"
@@ -2619,9 +2665,12 @@ async fn assert_sticker_picker_projection(ui: &AppWindow) {
             settle(ui).await;
             tab_to_control(ui, label);
             let bounds = focused_control_bounds(ui).expect("a focused sticker control");
+            // The trace is built only on failure and holds static element
+            // names and numeric geometry.
             assert!(
                 inside_window(ui, bounds),
-                "{scope}: {label} is outside the window: {bounds:?}"
+                "{scope}: {label} is outside the window: {bounds:?}; {:?}",
+                focused_control_geometry(ui)
             );
             if threaded {
                 let pane = control_bounds(ui, "Conversation details")[0];
@@ -2643,7 +2692,8 @@ async fn assert_sticker_picker_projection(ui: &AppWindow) {
         let bounds = focused_control_bounds(ui).expect("a focused Send action");
         assert!(
             inside_window(ui, bounds),
-            "{scope}: Send is outside the window"
+            "{scope}: Send is outside the window: {bounds:?}; {:?}",
+            focused_control_geometry(ui)
         );
         let sends = sent.borrow().len();
         key(ui, Key::Return);

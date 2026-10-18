@@ -924,10 +924,12 @@ component StickerConsent inherits Rectangle {
         color: root.ink; font-size: 11px * root.text-scale; wrap: word-wrap;
         accessible-live-region: polite;
     }
+    // TextAction exports its size as min-height only: its preferred height is
+    // the zero of a plain rectangle, so a placed action sizes by min-height.
     allow := TextAction {
         x: 8px; y: message.y + message.height + 6px;
         width: root.stacked ? root.width - 16px : self.preferred-width;
-        height: self.preferred-height;
+        height: self.min-height;
         wrap-caption: root.stacked;
         text: "Allow sticker images here"; ink: root.ink; muted: root.muted;
         surface: root.surface; hover-surface: root.hover; outline: root.outline; text-scale: root.text-scale;
@@ -938,7 +940,7 @@ component StickerConsent inherits Rectangle {
         x: root.stacked ? 8px : allow.x + allow.width + 8px;
         y: root.stacked ? allow.y + allow.height + 6px : allow.y;
         width: root.stacked ? root.width - 16px : self.preferred-width;
-        height: self.preferred-height;
+        height: self.min-height;
         wrap-caption: root.stacked;
         text: "Cancel"; ink: root.ink; muted: root.muted;
         surface: root.surface; hover-surface: root.hover; outline: root.outline; text-scale: root.text-scale;
