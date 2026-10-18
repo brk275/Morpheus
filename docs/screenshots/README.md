@@ -1,13 +1,14 @@
-# Native screenshots
+# Morpheus gallery
 
 Real native captures with fictional offline accounts. Each image is a
-1440 × 900 lossless PNG. These show the interface; Morpheus remains pre-alpha.
+1440 × 900 lossless PNG. Open a theme image for the full-size capture.
+These show the interface; Morpheus remains pre-alpha.
 
 ## Themes
 
 | Terminal | Nocturne | Paper |
 | --- | --- | --- |
-| ![Terminal with text navigation](terminal-sidebar.png) | ![Nocturne with stacked messages and avatars](desktop.png) | ![Paper with serif messages and light surfaces](paper.png) |
+| [![Terminal with text navigation](terminal-sidebar.png)](terminal-sidebar.png) | [![Nocturne with stacked messages and avatars](desktop.png)](desktop.png) | [![Paper with serif messages and light surfaces](paper.png)](paper.png) |
 | Monospaced text, nickname columns and square controls. | Room context, avatars and a members panel. | Warm light surfaces, serif text and compact headers. |
 
 [Customize a preset or make your own theme](../CUSTOMIZATION.md).
