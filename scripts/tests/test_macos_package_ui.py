@@ -798,7 +798,7 @@ class AccountMenuStageTests(unittest.TestCase):
                 instance = Mock()
                 instance.diagnostics = diagnostics
 
-                def operation(*arguments):
+                def operation(*arguments, **keywords):
                     diagnostics.operation("focused_element")
                     if diagnostics.value["step"] == expected:
                         raise ui.DiagnosticFailure("wait_timeout")
