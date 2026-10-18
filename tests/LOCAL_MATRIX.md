@@ -177,10 +177,18 @@ restart the records are matched only against the SDK's own queue by exact
 transaction id: matching requests are observed to their result, a request the
 queue no longer holds is shown as unconfirmed for the user to check in the
 conversation, and nothing is adopted by content or time or resent
-automatically. The same fixture now also round-trips two queued room records,
-a thread index and a metadata-only room row, and scans the raw account data
-for the encoded envelope and its marker attribute. This recovery path has not
-yet been built or run.
+automatically. Every record carries the complete typed text it was created
+from, and a row a build cannot read is quarantined with its complete original
+until the user discards it, pausing that room's queue meanwhile. The draft
+fixture round-trips two room records with their text, a thread index and a
+metadata-only row, and scans the raw account data for the encoded envelope and
+its marker attribute. A second gated scenario in the same file drives real SDK
+requests through controlled queue barriers: records durable before enqueue,
+single-use enqueue grants, stale and wrong-authority refusals, out-of-order
+cancellation, crash windows restored as unconfirmed, exact adoption of a
+persisted request across a restart and a re-selection, and a quarantined row
+pausing its room until the explicit discard. Neither scenario has yet been
+built or run.
 
 ## Test encrypted-history recovery
 

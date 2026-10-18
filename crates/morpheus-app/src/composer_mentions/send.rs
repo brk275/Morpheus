@@ -3,14 +3,16 @@
 //!
 //! Room and thread sends are recorded in the encrypted draft row before the
 //! SDK sees them and resolved only by their exact transaction id. Replies and
-//! edits have no durable draft and keep the in-session lease only.
+//! edits have no durable draft and keep the in-session lease only. Every wait
+//! on the SDK ends with the account selection, and every exit path releases
+//! the lease it held, so a paused queue or a switch cannot pin a scope.
 
 use super::{
     Scope, Target,
     ui::{ComposerUi, Submission},
 };
 use crate::{AppWindow, draft_recovery::SendScope, live::LiveUi};
-use morpheus_matrix::QueuedSendUpdate;
+use morpheus_matrix::{AccountSelection, QueuedSendUpdate};
 use slint::ComponentHandle;
 use std::sync::Arc;
 use tokio::runtime::Handle;
@@ -21,13 +23,28 @@ const MAX_PENDING_SCOPES: usize = 64;
 pub(super) struct SendLease {
     scope: Scope,
     identity: Arc<()>,
+    /// The selection the send runs under; a lease outlives it only until the
+    /// next reservation, which evicts leases of departed selections.
+    selection: Option<AccountSelection>,
 }
 #[derive(Default)]
 pub(super) struct SendLedger {
     leases: Vec<SendLease>,
 }
 impl SendLedger {
-    pub(super) fn reserve(&mut self, scope: Scope) -> Option<SendLease> {
+    pub(super) fn reserve(
+        &mut self,
+        scope: Scope,
+        selection: Option<AccountSelection>,
+    ) -> Option<SendLease> {
+        // Leases of a revoked selection can never complete; drop them so a
+        // switch or removal cannot leave a scope blocked or the ledger full.
+        self.leases.retain(|lease| {
+            lease
+                .selection
+                .as_ref()
+                .is_none_or(AccountSelection::is_current)
+        });
         if self.leases.len() >= MAX_PENDING_SCOPES
             || self.leases.iter().any(|lease| lease.scope == scope)
         {
@@ -36,6 +53,7 @@ impl SendLedger {
         let lease = SendLease {
             scope,
             identity: Arc::new(()),
+            selection,
         };
         self.leases.push(lease.clone());
         Some(lease)
@@ -97,15 +115,19 @@ impl ComposerUi {
         let scope = send_scope(&submission);
         if durable {
             let summary = live.pending_summary(&scope.account, &scope.room, scope.thread());
-            if summary.unconfirmed || summary.metadata_unreadable {
+            if summary.blocks_sends() {
                 if !threaded {
                     window.set_composer_busy(false);
                 }
-                window.set_transfer_notice("An earlier message here may not have finished sending. Check the conversation and choose before sending again.".into());
+                window.set_transfer_notice(if summary.unconfirmed {
+                    "An earlier message here may not have finished sending. Check the conversation and choose before sending again."
+                } else {
+                    "Saved send status here must be reviewed before sending."
+                }.into());
                 return;
             }
         }
-        let Some(lease) = self.reserve_send(&submission.scope) else {
+        let Some(lease) = self.reserve_send(&submission.scope, &submission.selection) else {
             if !threaded {
                 window.set_composer_busy(true);
             }
@@ -126,10 +148,7 @@ impl ComposerUi {
             return;
         }
         let revision = if durable {
-            match scope.thread() {
-                Some(root) => live.thread_draft_revision(&scope.account, &scope.room, root),
-                None => live.draft_revision(&scope.account, &scope.room),
-            }
+            live.scoped_revision(&scope.account, &scope.room, scope.thread())
         } else {
             None
         };
@@ -141,30 +160,45 @@ impl ComposerUi {
         let live = live.clone();
         let weak = window.as_weak();
         runtime.spawn(async move {
+            let selection = submission.selection.clone();
+            let fail = |message: &'static str, release: bool| {
+                let shown = submission.clone();
+                let current = live.clone();
+                let composer = owner.clone();
+                let lease = lease.clone();
+                let _ = weak.upgrade_in_event_loop(move |window| {
+                    if release {
+                        composer.release_send(&lease);
+                    }
+                    if visible(&window, &shown, operation) {
+                        if release && !threaded {
+                            window.set_composer_busy(false);
+                        }
+                        crate::draft_recovery::publish_scope(&window, &current, &send_scope(&shown));
+                        window.set_session_error(message.into());
+                    }
+                });
+            };
             // Room and thread sends are saved as pending, with the room's
-            // thread index, before the SDK assigns a transaction id.
+            // thread index, before the SDK assigns a transaction id. The core
+            // then issues the single-use enqueue grant for that record.
             let handle = if durable {
                 let Some(revision) = revision else {
-                    owner.release_send(&lease);
-                    let shown = submission.clone();
-                    let current = live.clone();
-                    let _ = weak.upgrade_in_event_loop(move |window| {
-                        if visible(&window, &shown, operation) {
-                            if !threaded { window.set_composer_busy(false); }
-                            crate::draft_recovery::publish_scope(&window, &current, &send_scope(&shown));
-                            window.set_session_error("Could not record this message's send status. It was not sent; your text is retained.".into());
-                        }
-                    });
+                    fail("Could not record this message's send status. It was not sent; your text is retained.", true);
                     return;
                 };
-                match live.prepare_pending_send(&scope.account, &scope.room, scope.thread(), &submission.text, revision).await {
+                match live
+                    .prepare_pending_send(&selection, &scope, &submission.text, revision)
+                    .await
+                {
                     Ok(handle) => Some(handle),
                     Err(error) => {
-                        owner.release_send(&lease);
                         let message = error.to_string();
                         let shown = submission.clone();
                         let current = live.clone();
+                        let composer = owner.clone();
                         let _ = weak.upgrade_in_event_loop(move |window| {
+                            composer.release_send(&lease);
                             if visible(&window, &shown, operation) {
                                 if !threaded { window.set_composer_busy(false); }
                                 crate::draft_recovery::publish_scope(&window, &current, &send_scope(&shown));
@@ -178,7 +212,7 @@ impl ComposerUi {
                 None
             };
             let result = live.send_composed(
-                submission.selection.clone(), submission.scope.room.clone(), submission.target(),
+                selection.clone(), submission.scope.room.clone(), submission.target(),
                 trimmed, submission.baseline.clone(), handle.as_ref().map(|handle| handle.nonce()),
             ).await;
             let mut queued = match result {
@@ -189,55 +223,49 @@ impl ComposerUi {
                         if uncertain {
                             // The SDK may hold the request without our id: the
                             // saved enqueuing record stays, marked for review.
-                            live.mark_pending_unconfirmed(&scope.account, &scope.room, scope.thread(), handle.nonce()).await;
+                            live.mark_pending_unconfirmed(&scope, handle.nonce()).await;
                         } else {
-                            live.abandon_pending_send(&scope.account, &scope.room, scope.thread(), handle.nonce()).await;
+                            live.abandon_pending_send(&scope, handle.nonce()).await;
                         }
                     }
                     // A durable record now guards the scope, so its lease can
-                    // go; an uncertain reply or edit keeps the in-session lease.
+                    // go; an uncertain reply or edit keeps the in-session lease
+                    // until the selection changes.
                     let release = !uncertain || handle.is_some();
-                    if release {
-                        owner.release_send(&lease);
-                    }
-                    let shown = submission.clone();
-                    let current = live.clone();
-                    let _ = weak.upgrade_in_event_loop(move |window| {
-                        if visible(&window, &shown, operation) {
-                            if release && !threaded { window.set_composer_busy(false); }
-                            crate::draft_recovery::publish_scope(&window, &current, &send_scope(&shown));
-                            window.set_session_error(if uncertain {
-                                "Send could not be confirmed; the request may still send. Your text is retained. Check the conversation, then choose."
-                            } else {
-                                "The message could not be prepared. Your text and selected mentions are retained; an edit may need to be reopened."
-                            }.into());
-                        }
-                    });
+                    fail(
+                        if uncertain {
+                            "Send could not be confirmed; the request may still send. Your text is retained. Check the conversation, then choose."
+                        } else {
+                            "The message could not be prepared. Your text and selected mentions are retained; an edit may need to be reopened."
+                        },
+                        release,
+                    );
                     return;
                 }
             };
             let transaction = queued.transaction_id().to_owned();
             // The exact transaction id is saved before any acknowledgement is
-            // acted on; an unchanged composer hides the submission as the
-            // retained copy and clears the visible input.
+            // acted on; an unchanged composer is cleared, the record holds the
+            // submitted text.
             let hidden = match &handle {
                 Some(handle) => live
-                    .record_pending_queued(&scope.account, &scope.room, scope.thread(), handle, &transaction)
+                    .record_pending_queued(&scope, handle, &transaction)
                     .await
                     .unwrap_or(false),
                 None => false,
             };
             let room_send = matches!(submission.scope.target, Target::Room);
-            if room_send {
-                // Several room messages may wait at once; the lease covered
-                // only the recording window.
-                owner.release_send(&lease);
-            }
             {
                 let shown = submission.clone();
                 let current = live.clone();
                 let composer = owner.clone();
+                let lease = lease.clone();
                 let _ = weak.upgrade_in_event_loop(move |window| {
+                    if room_send {
+                        // Several room messages may wait at once; the lease
+                        // covered only the recording window.
+                        composer.release_send(&lease);
+                    }
                     if visible(&window, &shown, operation) {
                         if hidden { composer.complete(&window, &current, &shown); }
                         if room_send { window.set_composer_busy(false); }
@@ -246,13 +274,22 @@ impl ComposerUi {
                 });
             }
             loop {
-                let update = queued.next_update().await;
-                if !submission.selection.is_current() {
+                // A paused queue may never emit again: the wait ends with the
+                // selection, and the lease goes with it.
+                let update = tokio::select! {
+                    _ = selection.revoked() => {
+                        owner.release_send(&lease);
+                        return;
+                    }
+                    update = queued.next_update() => update,
+                };
+                if !selection.is_current() {
+                    owner.release_send(&lease);
                     return;
                 }
                 let terminal = matches!(update, QueuedSendUpdate::Sent | QueuedSendUpdate::Cancelled | QueuedSendUpdate::Unknown);
                 if let Some(handle) = &handle {
-                    live.apply_pending_update(&scope, handle.nonce(), &transaction, update, &weak).await;
+                    live.apply_pending_update(&selection, &scope, handle.nonce(), &transaction, update, &weak).await;
                     if terminal && !room_send && owner.release_send(&lease) {
                         let shown = submission.clone();
                         let current = live.clone();
@@ -263,7 +300,8 @@ impl ComposerUi {
                         });
                     }
                 } else {
-                    // Replies and edits: lease only, no durable record.
+                    // Replies and edits: lease only, no durable record. An
+                    // unknown outcome keeps the lease until the selection ends.
                     if matches!(update, QueuedSendUpdate::Sent | QueuedSendUpdate::Cancelled) {
                         owner.release_send(&lease);
                     }
@@ -278,7 +316,7 @@ impl ComposerUi {
                         if matches!(update, QueuedSendUpdate::Sent | QueuedSendUpdate::Cancelled) {
                             window.set_composer_busy(false);
                         }
-                        window.set_transfer_notice(crate::draft_recovery::update_notice(update, false).into());
+                        window.set_transfer_notice(crate::draft_recovery::update_notice(update, None).into());
                     });
                 }
                 if terminal { break; }
@@ -322,17 +360,17 @@ mod tests {
     fn pending_scope_blocks_duplicates_but_not_other_accounts_or_threads() {
         let mut ledger = SendLedger::default();
         let lease = ledger
-            .reserve(scope("a", Target::Thread("$one".into())))
+            .reserve(scope("a", Target::Thread("$one".into())), None)
             .unwrap();
-        assert!(ledger.reserve(lease.scope.clone()).is_none());
+        assert!(ledger.reserve(lease.scope.clone(), None).is_none());
         assert!(
             ledger
-                .reserve(scope("b", Target::Thread("$one".into())))
+                .reserve(scope("b", Target::Thread("$one".into())), None)
                 .is_some()
         );
         assert!(
             ledger
-                .reserve(scope("a", Target::Thread("$two".into())))
+                .reserve(scope("a", Target::Thread("$two".into())), None)
                 .is_some()
         );
     }
@@ -340,27 +378,27 @@ mod tests {
     fn old_completion_cannot_release_new_same_scope_after_return() {
         let mut ledger = SendLedger::default();
         let scope = scope("a", Target::Room);
-        let old = ledger.reserve(scope.clone()).unwrap();
+        let old = ledger.reserve(scope.clone(), None).unwrap();
         assert!(ledger.release(&old));
-        let newer = ledger.reserve(scope.clone()).unwrap();
+        let newer = ledger.reserve(scope.clone(), None).unwrap();
         assert!(!ledger.release(&old));
-        assert!(ledger.reserve(scope).is_none());
+        assert!(ledger.reserve(scope, None).is_none());
         assert!(ledger.release(&newer));
     }
     #[test]
     fn uncertain_scopes_are_bounded_without_evicting_the_first() {
         let mut ledger = SendLedger::default();
-        let first = ledger.reserve(scope("a", Target::Room)).unwrap();
+        let first = ledger.reserve(scope("a", Target::Room), None).unwrap();
         for i in 1..MAX_PENDING_SCOPES {
             assert!(
                 ledger
-                    .reserve(scope("a", Target::Reply(format!("$r{i}"))))
+                    .reserve(scope("a", Target::Reply(format!("$r{i}"))), None)
                     .is_some()
             );
         }
-        assert!(ledger.reserve(scope("b", Target::Room)).is_none());
-        assert!(ledger.reserve(first.scope.clone()).is_none());
+        assert!(ledger.reserve(scope("b", Target::Room), None).is_none());
+        assert!(ledger.reserve(first.scope.clone(), None).is_none());
         assert!(ledger.release(&first));
-        assert!(ledger.reserve(scope("b", Target::Room)).is_some());
+        assert!(ledger.reserve(scope("b", Target::Room), None).is_some());
     }
 }

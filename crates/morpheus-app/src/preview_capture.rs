@@ -21,7 +21,7 @@ use super::{AppWindow, Config, apply_config, apply_state, fixtures};
 
 const WIDTH: u32 = 1440;
 const HEIGHT: u32 = 900;
-const FILES: [&str; 12] = [
+const FILES: [&str; 14] = [
     "desktop-preview.ppm",
     "account-switcher.ppm",
     "sign-in.ppm",
@@ -34,7 +34,55 @@ const FILES: [&str; 12] = [
     "sign-in-large.ppm",
     "terminal-sidebar.ppm",
     "terminal-space-labels.ppm",
+    "send-recovery.ppm",
+    "send-recovery-thread-large.ppm",
 ];
+
+/// Presentation-only rows for the saved-send status strips. The keys are
+/// fictional and no callback that could act on them is registered here.
+fn recovery_items(kept: bool) -> slint::ModelRc<super::PendingSendItem> {
+    let mut items = vec![
+        super::PendingSendItem {
+            key: "preview-waiting".into(),
+            status: "Waiting to send".into(),
+            preview: "Notes from the workshop are in the shared folder".into(),
+            can_cancel: true,
+            can_retry: false,
+            unconfirmed: false,
+            kept: false,
+        },
+        super::PendingSendItem {
+            key: "preview-paused".into(),
+            status: "Sending is paused".into(),
+            preview: "Running ten minutes late, start without me".into(),
+            can_cancel: true,
+            can_retry: true,
+            unconfirmed: false,
+            kept: false,
+        },
+        super::PendingSendItem {
+            key: "preview-unconfirmed".into(),
+            status: "May not have finished sending".into(),
+            preview: "Thanks everyone, see you next week".into(),
+            can_cancel: false,
+            can_retry: false,
+            unconfirmed: true,
+            kept: false,
+        },
+    ];
+    if kept {
+        items.push(super::PendingSendItem {
+            key: "preview-kept".into(),
+            status: "Unsent text kept".into(),
+            preview: "Draft of the agenda I decided not to send yet".into(),
+            can_cancel: false,
+            can_retry: false,
+            unconfirmed: false,
+            kept: true,
+        });
+    }
+    slint::ModelRc::new(slint::VecModel::from(items))
+}
 
 pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
@@ -261,6 +309,45 @@ pub(super) fn early_dispatch() -> Result<bool, Box<dyn std::error::Error>> {
                     reset_capture_overlays(&window);
                     apply_config(&window, &terminal_labels, Some(&terminal_theme));
                 }
+                11 => {
+                    // The room composer's saved-send strip with every record
+                    // state, in the wide layout: fictional rows, no account,
+                    // no queue and no callback behind the controls.
+                    reset_capture_overlays(&window);
+                    apply_config(&window, &nocturne, Some(&nocturne_theme));
+                    apply_state(&window, &fixtures());
+                    window.set_live_session(true);
+                    window.set_composer_text("".into());
+                    window.set_composer_pending_count(2);
+                    window.set_composer_pending_blocked(true);
+                    window.set_composer_unconfirmed(true);
+                    window.set_composer_pending_items(recovery_items(true));
+                    window.set_composer_blocked_notice("".into());
+                }
+                12 => {
+                    // The same strip in the narrow thread pane at 200% text,
+                    // where the controls must stack instead of clipping, plus
+                    // the fixed notice for saved data this version cannot read.
+                    window.set_composer_pending_items(slint::ModelRc::new(slint::VecModel::from(
+                        Vec::<super::PendingSendItem>::new(),
+                    )));
+                    window.set_composer_pending_count(0);
+                    window.set_composer_pending_blocked(false);
+                    window.set_composer_unconfirmed(false);
+                    window.set_font_scale_percent(200);
+                    window.invoke_show_thread_panel();
+                    window.set_thread_root_id("$preview-thread-root".into());
+                    window.set_thread_root_sender("@jules:example.org".into());
+                    window.set_thread_root_body("Can someone post the agenda before Thursday?".into());
+                    window.set_thread_composer_text("".into());
+                    window.set_thread_send_pending(true);
+                    window.set_thread_pending_blocked(true);
+                    window.set_thread_unconfirmed(true);
+                    window.set_thread_pending_items(recovery_items(false));
+                    window.set_thread_blocked_notice(
+                        "Saved send status here could not be read by this version. It is kept with your drafts; sending here waits until you review it.".into(),
+                    );
+                }
                 _ => {
                     *captured.borrow_mut() = Some(Ok(()));
                     let _ = slint::quit_event_loop();
@@ -293,6 +380,18 @@ fn reset_capture_overlays(ui: &AppWindow) {
     ui.set_leave_call_dialog(false);
     ui.set_quick_switcher_open(false);
     ui.set_image_preview_open(false);
+    ui.set_thread_root_id("".into());
+    ui.set_thread_send_pending(false);
+    ui.set_thread_pending_blocked(false);
+    ui.set_thread_unconfirmed(false);
+    ui.set_thread_blocked_notice("".into());
+    ui.set_thread_pending_items(slint::ModelRc::new(slint::VecModel::from(Vec::<
+        super::PendingSendItem,
+    >::new())));
+    ui.set_composer_pending_items(slint::ModelRc::new(slint::VecModel::from(Vec::<
+        super::PendingSendItem,
+    >::new())));
+    ui.set_composer_blocked_notice("".into());
     ui.set_access_current_password("".into());
     ui.set_access_new_password("".into());
     ui.set_access_confirm_password("".into());

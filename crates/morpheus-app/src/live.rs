@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 use morpheus_matrix::{
     AccountInfo, AccountManager, AccountSelection, ComposeSendTarget, ComposeText,
     DownloadedAttachment, EditBaseline, Generation, MatrixCoreError, MatrixLinkTarget,
-    MessageInfo, MessageSendState, QueuedAttachment, QueuedMessage, QueuedSendUpdate, RoomInfo,
-    RoomMemberInfo, RoomMembership, SyncBackend, SyncStatus, TextFormat,
+    MessageInfo, MessageSendState, QueuedAttachment, QueuedMessage, QueuedSendUpdate,
+    RecoveredDraft, RoomInfo, RoomMemberInfo, RoomMembership, SyncBackend, SyncStatus,
+    TextFormat,
 };
 use slint::{Color, Model, ModelRc, StyledText, VecModel, Weak};
 use tokio::{
@@ -25,7 +26,8 @@ use tokio::{
 use crate::attachments::save_download;
 use crate::draft_recovery::{self, PrepareError, SendScope};
 use crate::drafts::{
-    DraftStore, PendingHandle, PendingStatus, PendingSummary, PendingTarget, Resolution,
+    DraftStore, PendingHandle, PendingItem, PendingStatus, PendingSummary, PendingTarget,
+    Resolution,
 };
 use crate::voice_spaces::VoiceSpaces;
 use crate::{
@@ -252,23 +254,54 @@ impl LiveUi {
         self.drafts.pending_summary(account, room, thread)
     }
 
+    pub fn pending_items(&self, account: &str, room: &str, thread: Option<&str>) -> Vec<PendingItem> {
+        self.drafts.pending_items(account, room, thread)
+    }
+
+    pub fn scoped_revision(&self, account: &str, room: &str, thread: Option<&str>) -> Option<u64> {
+        self.drafts.scoped_revision(account, room, thread)
+    }
+
     pub fn thread_send_pending(&self, account: &str, room: &str, root: &str) -> bool {
         self.drafts.thread_send_pending(account, room, root)
     }
 
+    /// The current selection for an account, captured synchronously at the
+    /// user's action so every later step can be checked against it.
+    pub fn account_selection(&self, account: &str) -> Option<AccountSelection> {
+        self.manager.account_selection(account)
+    }
+
+    /// Exact ownership of one request the SDK may still hold, captured at the
+    /// user's action.
+    pub fn request_target(&self, scope: &SendScope, nonce: &Generation) -> Option<PendingTarget> {
+        self.drafts
+            .request_target(&scope.account, &scope.room, scope.thread(), nonce)
+    }
+
+    /// A copy of one record's text for the clipboard; the record is unchanged.
+    pub fn record_text(&self, scope: &SendScope, nonce: &Generation) -> Option<ComposeText> {
+        self.drafts
+            .record_text(&scope.account, &scope.room, scope.thread(), nonce)
+    }
+
     /// Record a send and write it to the encrypted draft row before the SDK
     /// sees it: the scope's text, generation and enqueuing record in one
-    /// write, then for a thread the room's thread index in a second write.
-    /// Both complete before this returns. A failure removes the record again
-    /// and leaves the composer text as it was.
+    /// write, then for a thread the room's thread index in a second write,
+    /// then the core's single-use enqueue grant for exactly this record under
+    /// exactly this selection. All complete before this returns. A failure
+    /// removes the record again and leaves the composer text as it was.
     pub async fn prepare_pending_send(
         &self,
-        account: &str,
-        room: &str,
-        thread: Option<&str>,
+        selection: &AccountSelection,
+        scope: &SendScope,
         text: &ComposeText,
         revision: u64,
     ) -> Result<PendingHandle, PrepareError> {
+        if !selection.is_current() || selection.account_id() != scope.account {
+            return Err(PrepareError::Store(MatrixCoreError::SelectedAccountChanged));
+        }
+        let (account, room, thread) = (scope.account.as_str(), scope.room.as_str(), scope.thread());
         if thread.is_some() {
             // The room row carries the index; it must be cached before it is
             // rewritten so the room's own text is never lost.
@@ -292,7 +325,7 @@ impl LiveUi {
         }
         if let Some(root) = thread {
             if let Err(error) = self.drafts.index_thread(account, room, root) {
-                self.rollback_pending(account, room, thread, handle.nonce()).await;
+                self.rollback_pending(scope, handle.nonce()).await;
                 return Err(PrepareError::Record(error));
             }
             if let Err(error) = self
@@ -300,14 +333,23 @@ impl LiveUi {
                 .persist_scoped(&self.manager, account, room, None)
                 .await
             {
-                self.rollback_pending(account, room, thread, handle.nonce()).await;
+                self.rollback_pending(scope, handle.nonce()).await;
                 return Err(PrepareError::Store(error));
             }
+        }
+        if let Err(error) = self
+            .manager
+            .grant_enqueue_for(selection, room, thread, handle.nonce())
+            .await
+        {
+            self.rollback_pending(scope, handle.nonce()).await;
+            return Err(PrepareError::Store(error));
         }
         Ok(handle)
     }
 
-    async fn rollback_pending(&self, account: &str, room: &str, thread: Option<&str>, nonce: &Generation) {
+    async fn rollback_pending(&self, scope: &SendScope, nonce: &Generation) {
+        let (account, room, thread) = (scope.account.as_str(), scope.room.as_str(), scope.thread());
         self.drafts.abandon_pending(account, room, thread, nonce);
         if let Some(root) = thread {
             self.drafts.unindex_thread_if_idle(account, room, root);
@@ -328,15 +370,14 @@ impl LiveUi {
     }
 
     /// Save the exact SDK transaction id. Returns whether the submission was
-    /// moved out of the composer (unchanged since the record was begun).
+    /// cleared from the composer (unchanged since the record was begun).
     pub async fn record_pending_queued(
         &self,
-        account: &str,
-        room: &str,
-        thread: Option<&str>,
+        scope: &SendScope,
         handle: &PendingHandle,
         transaction_id: &str,
     ) -> Option<bool> {
+        let (account, room, thread) = (scope.account.as_str(), scope.room.as_str(), scope.thread());
         let hidden = self
             .drafts
             .mark_pending_queued(account, room, thread, handle, transaction_id)?;
@@ -353,38 +394,28 @@ impl LiveUi {
     }
 
     /// Drop a record whose enqueue failed before the SDK stored anything.
-    pub async fn abandon_pending_send(&self, account: &str, room: &str, thread: Option<&str>, nonce: &Generation) {
-        if self.drafts.abandon_pending(account, room, thread, nonce) {
-            self.rollback_pending(account, room, thread, nonce).await;
+    pub async fn abandon_pending_send(&self, scope: &SendScope, nonce: &Generation) {
+        if self
+            .drafts
+            .abandon_pending(&scope.account, &scope.room, scope.thread(), nonce)
+        {
+            self.rollback_pending(scope, nonce).await;
         }
     }
 
-    pub async fn mark_pending_unconfirmed(&self, account: &str, room: &str, thread: Option<&str>, nonce: &Generation) {
-        self.drafts
-            .set_pending_status(account, room, thread, nonce, PendingStatus::Unconfirmed);
+    pub async fn mark_pending_unconfirmed(&self, scope: &SendScope, nonce: &Generation) {
+        self.drafts.set_pending_status(
+            &scope.account,
+            &scope.room,
+            scope.thread(),
+            nonce,
+            PendingStatus::Unconfirmed,
+        );
         self.queue_draft_write();
     }
 
-    /// Resolve one exact record: thread row first, then the room index, so a
-    /// crash between the two leaves at worst a stale index entry that the
-    /// next room save drops, never an unindexed record.
-    pub async fn resolve_pending_send(
-        &self,
-        account: &str,
-        room: &str,
-        thread: Option<&str>,
-        nonce: &Generation,
-        transaction_id: Option<&str>,
-        sent: bool,
-    ) -> Option<Resolution> {
-        let resolution = self
-            .drafts
-            .resolve_pending(account, room, thread, nonce, transaction_id, sent)?;
-        self.persist_scope_and_index(account, room, thread).await;
-        Some(resolution)
-    }
-
-    async fn persist_scope_and_index(&self, account: &str, room: &str, thread: Option<&str>) {
+    async fn persist_scope_and_index(&self, scope: &SendScope) {
+        let (account, room, thread) = (scope.account.as_str(), scope.room.as_str(), scope.thread());
         if self
             .drafts
             .persist_scoped(&self.manager, account, room, thread)
@@ -406,182 +437,358 @@ impl LiveUi {
         }
     }
 
-    /// The user checked the conversation: resolve every unconfirmed record in
-    /// the scope. `sent` drops the retained submission; otherwise it returns
-    /// to an empty composer. Nothing is sent either way.
-    pub async fn review_unconfirmed_sends(
+    /// Ask the core to release exactly one record (nonce plus the transaction
+    /// id the cache holds for it) under the given selection. False means the
+    /// core does not own such a record now; the cache is left untouched.
+    async fn release_record(
         &self,
-        account: &str,
-        room: &str,
-        thread: Option<&str>,
-        sent: bool,
-    ) -> Option<Resolution> {
-        let resolution = self
+        selection: &AccountSelection,
+        scope: &SendScope,
+        nonce: &Generation,
+    ) -> bool {
+        let Some(transaction_id) = self
             .drafts
-            .review_unconfirmed(account, room, thread, sent)?;
-        self.persist_scope_and_index(account, room, thread).await;
-        Some(resolution)
+            .record_transaction_id(&scope.account, &scope.room, scope.thread(), nonce)
+        else {
+            return false;
+        };
+        selection.is_current()
+            && self
+                .manager
+                .release_pending_record_for(
+                    selection,
+                    &scope.room,
+                    scope.thread(),
+                    nonce,
+                    transaction_id.as_deref(),
+                )
+                .await
+                .is_ok()
     }
 
-    pub fn restore_retained_text(&self, account: &str, room: &str, thread: Option<&str>) -> Option<ComposeText> {
-        let restored = self.drafts.restore_retained(account, room, thread)?;
-        self.queue_draft_write();
-        Some(restored)
+    fn publish_resolution(
+        self: &Arc<Self>,
+        ui: &Weak<AppWindow>,
+        selection: AccountSelection,
+        scope: SendScope,
+        resolution: Option<Resolution>,
+        notice: &'static str,
+    ) {
+        let live = self.clone();
+        let _ = ui.upgrade_in_event_loop(move |window| {
+            if !selection.is_current() || !draft_recovery::scope_visible(&window, &scope) {
+                return;
+            }
+            if let Some(resolution) = &resolution {
+                draft_recovery::apply_resolution(&window, &live, &scope, resolution);
+            }
+            draft_recovery::publish_scope(&window, &live, &scope);
+            if !notice.is_empty() {
+                window.set_transfer_notice(notice.into());
+            }
+        });
     }
 
     /// Apply one SDK update to the exact owned record and the visible UI.
-    /// Returns whether the update was terminal for that record.
+    /// Returns whether the update was terminal for that record. Nothing is
+    /// changed once the selection the observer runs under is gone.
     pub(crate) async fn apply_pending_update(
-        &self,
+        self: &Arc<Self>,
+        selection: &AccountSelection,
         scope: &SendScope,
         nonce: &Generation,
         transaction_id: &str,
         update: QueuedSendUpdate,
         ui: &Weak<AppWindow>,
     ) -> bool {
-        let (terminal, restored) = match update {
-            QueuedSendUpdate::Sent => {
-                let resolution = self
-                    .resolve_pending_send(&scope.account, &scope.room, scope.thread(), nonce, Some(transaction_id), true)
-                    .await;
-                (true, resolution.and_then(|resolution| resolution.restored))
-            }
-            QueuedSendUpdate::Cancelled => {
-                let resolution = self
-                    .resolve_pending_send(&scope.account, &scope.room, scope.thread(), nonce, Some(transaction_id), false)
-                    .await;
-                (true, resolution.and_then(|resolution| resolution.restored))
+        if !selection.is_current() {
+            return true;
+        }
+        let (account, room, thread) = (scope.account.as_str(), scope.room.as_str(), scope.thread());
+        let (terminal, resolution) = match update {
+            QueuedSendUpdate::Sent | QueuedSendUpdate::Cancelled => {
+                let sent = update == QueuedSendUpdate::Sent;
+                if !self
+                    .manager
+                    .release_pending_record_for(selection, room, thread, nonce, Some(transaction_id))
+                    .await
+                    .is_ok()
+                {
+                    // The core does not own this record any more (selection
+                    // changed, or the row was resolved another way): leave the
+                    // cache for review instead of guessing.
+                    self.mark_pending_unconfirmed(scope, nonce).await;
+                    self.publish_resolution(ui, selection.clone(), scope.clone(), None, draft_recovery::update_notice(QueuedSendUpdate::Unknown, None));
+                    return true;
+                }
+                let resolution = self.drafts.resolve_pending(
+                    account,
+                    room,
+                    thread,
+                    nonce,
+                    Some(transaction_id),
+                    sent,
+                );
+                self.persist_scope_and_index(scope).await;
+                (true, resolution)
             }
             QueuedSendUpdate::Retained { recoverable } => {
                 self.drafts.set_pending_status(
-                    &scope.account,
-                    &scope.room,
-                    scope.thread(),
+                    account,
+                    room,
+                    thread,
                     nonce,
                     PendingStatus::Paused { recoverable },
                 );
                 (false, None)
             }
             QueuedSendUpdate::Unknown => {
-                self.mark_pending_unconfirmed(&scope.account, &scope.room, scope.thread(), nonce)
-                    .await;
+                self.mark_pending_unconfirmed(scope, nonce).await;
                 (true, None)
             }
         };
-        let scope = scope.clone();
-        let drafts = self.drafts.clone();
-        let _ = ui.upgrade_in_event_loop(move |window| {
-            if !draft_recovery::scope_visible(&window, &scope) {
-                return;
-            }
-            if let Some(text) = &restored {
-                // Only an empty composer receives the retained text; a newer
-                // edit is never overwritten.
-                let threaded = scope.thread.is_some();
-                let current = if threaded { window.get_thread_composer_text() } else { window.get_composer_text() };
-                if current.is_empty() {
-                    if threaded {
-                        window.set_thread_composer_text(text.body.clone().into());
-                        window.set_thread_markdown(text.format == TextFormat::Markdown);
-                    } else {
-                        window.set_composer_text(text.body.clone().into());
-                        window.set_composer_markdown(text.format == TextFormat::Markdown);
-                    }
-                }
-            }
-            let summary = drafts.pending_summary(&scope.account, &scope.room, scope.thread());
-            if scope.thread.is_some() {
-                draft_recovery::publish_thread(&window, &summary);
-            } else {
-                draft_recovery::publish_room(&window, &summary);
-            }
-            window.set_transfer_notice(draft_recovery::update_notice(update, restored.is_some()).into());
-        });
+        let notice = draft_recovery::update_notice(update, resolution.as_ref());
+        self.publish_resolution(ui, selection.clone(), scope.clone(), resolution, notice);
         terminal
     }
 
-    /// Cancel the most recent request still waiting in the scope. Ownership is
-    /// the exact saved record; the SDK reports whether it could still abort.
-    pub async fn cancel_pending_send(self: &Arc<Self>, scope: SendScope, ui: Weak<AppWindow>) {
-        let notice = match self.drafts.cancellable_target(&scope.account, &scope.room, scope.thread()) {
-            None => "No message is waiting to send here.",
-            Some(PendingTarget { nonce, transaction_id }) => {
-                match self.manager.account_selection(&scope.account) {
-                    None => "This account is not active.",
-                    Some(selection) => match self
-                        .manager
-                        .cancel_pending_send_for(&selection, &scope.room, scope.thread(), &nonce, &transaction_id)
-                        .await
-                    {
-                        Ok(true) => "Cancelling. A message that already reached the server stays sent.",
-                        Ok(false) => "This message was already sent and cannot be cancelled.",
-                        Err(MatrixCoreError::PendingSendUnavailable) => {
-                            self.mark_pending_unconfirmed(&scope.account, &scope.room, scope.thread(), &nonce).await;
-                            "This message is no longer waiting here. Check the conversation, then choose."
-                        }
-                        Err(MatrixCoreError::SelectedAccountChanged) => "The account changed; nothing was cancelled.",
-                        Err(_) => "Could not cancel right now. The message stays queued.",
-                    },
-                }
+    /// Cancel exactly the request the user clicked (captured target), under
+    /// the selection they clicked in. The SDK reports whether it could still
+    /// abort; a message that already reached the server stays sent.
+    pub(crate) async fn cancel_pending_send(
+        self: &Arc<Self>,
+        selection: AccountSelection,
+        scope: SendScope,
+        target: PendingTarget,
+        ui: Weak<AppWindow>,
+    ) {
+        let notice = match self
+            .manager
+            .cancel_pending_send_for(&selection, &scope.room, scope.thread(), &target.nonce, &target.transaction_id)
+            .await
+        {
+            Ok(true) => "Cancelling. A message that already reached the server stays sent.",
+            Ok(false) => "This message was already sent and cannot be cancelled.",
+            Err(MatrixCoreError::PendingSendUnavailable) => {
+                self.mark_pending_unconfirmed(&scope, &target.nonce).await;
+                "This message is no longer waiting here. Check the conversation, then choose."
             }
+            Err(MatrixCoreError::SelectedAccountChanged) => return,
+            Err(MatrixCoreError::RecoveryIncomplete) => "Saved send status for this room is still being checked. Try again in a moment.",
+            Err(_) => "Could not cancel right now. The message stays queued.",
         };
-        let drafts = self.drafts.clone();
-        let _ = ui.upgrade_in_event_loop(move |window| {
-            if draft_recovery::scope_visible(&window, &scope) {
-                let summary = drafts.pending_summary(&scope.account, &scope.room, scope.thread());
-                if scope.thread.is_some() { draft_recovery::publish_thread(&window, &summary); } else { draft_recovery::publish_room(&window, &summary); }
-                window.set_transfer_notice(notice.into());
-            }
-        });
+        self.publish_resolution(&ui, selection, scope, None, notice);
     }
 
-    /// Resume every paused request in the scope. No new request is created.
-    pub async fn retry_pending_send(self: &Arc<Self>, scope: SendScope, ui: Weak<AppWindow>) {
-        let targets = self.drafts.paused_targets(&scope.account, &scope.room, scope.thread());
-        let mut notice = if targets.is_empty() { "Nothing is paused here." } else { "Retrying." };
-        if let Some(selection) = self.manager.account_selection(&scope.account) {
-            for target in &targets {
-                match self
-                    .manager
-                    .retry_pending_send_for(&selection, &scope.room, scope.thread(), &target.nonce, &target.transaction_id)
-                    .await
-                {
-                    Ok(()) => {
-                        self.drafts.set_pending_status(&scope.account, &scope.room, scope.thread(), &target.nonce, PendingStatus::Queued);
-                    }
-                    Err(MatrixCoreError::PendingSendUnavailable) => {
-                        self.mark_pending_unconfirmed(&scope.account, &scope.room, scope.thread(), &target.nonce).await;
-                        notice = "A paused message is no longer waiting here. Check the conversation, then choose.";
-                    }
-                    Err(_) => notice = "Could not retry right now. The message stays queued.",
-                }
+    /// Resume exactly the paused request the user clicked. No new request is
+    /// created.
+    pub(crate) async fn retry_pending_send(
+        self: &Arc<Self>,
+        selection: AccountSelection,
+        scope: SendScope,
+        target: PendingTarget,
+        ui: Weak<AppWindow>,
+    ) {
+        let notice = match self
+            .manager
+            .retry_pending_send_for(&selection, &scope.room, scope.thread(), &target.nonce, &target.transaction_id)
+            .await
+        {
+            Ok(()) => {
+                self.drafts.set_pending_status(&scope.account, &scope.room, scope.thread(), &target.nonce, PendingStatus::Queued);
+                "Retrying."
             }
-        } else if !targets.is_empty() {
-            notice = "This account is not active.";
+            Err(MatrixCoreError::PendingSendUnavailable) => {
+                self.mark_pending_unconfirmed(&scope, &target.nonce).await;
+                "This message is no longer waiting here. Check the conversation, then choose."
+            }
+            Err(MatrixCoreError::SelectedAccountChanged) => return,
+            Err(MatrixCoreError::RecoveryIncomplete) => "Saved send status for this room is still being checked. Try again in a moment.",
+            Err(_) => "Could not retry right now. The message stays queued.",
+        };
+        self.publish_resolution(&ui, selection, scope, None, notice);
+    }
+
+    /// The user checked the conversation and decided for exactly one
+    /// unconfirmed record. `sent` drops it with its text; otherwise its text
+    /// returns to the empty composer or is kept beside newer text. Nothing is
+    /// sent either way.
+    pub(crate) async fn review_unconfirmed_send(
+        self: &Arc<Self>,
+        selection: AccountSelection,
+        scope: SendScope,
+        nonce: Generation,
+        sent: bool,
+        ui: Weak<AppWindow>,
+    ) {
+        if self.drafts.record_status(&scope.account, &scope.room, scope.thread(), &nonce)
+            != Some(PendingStatus::Unconfirmed)
+        {
+            return;
         }
-        let drafts = self.drafts.clone();
-        let _ = ui.upgrade_in_event_loop(move |window| {
-            if draft_recovery::scope_visible(&window, &scope) {
-                let summary = drafts.pending_summary(&scope.account, &scope.room, scope.thread());
-                if scope.thread.is_some() { draft_recovery::publish_thread(&window, &summary); } else { draft_recovery::publish_room(&window, &summary); }
-                window.set_transfer_notice(notice.into());
+        if !self.release_record(&selection, &scope, &nonce).await {
+            self.publish_resolution(&ui, selection, scope, None, "Could not update this message's saved status right now.");
+            return;
+        }
+        let resolution = self
+            .drafts
+            .review_unconfirmed(&scope.account, &scope.room, scope.thread(), &nonce, sent);
+        if resolution.is_none() {
+            return;
+        }
+        self.persist_scope_and_index(&scope).await;
+        let notice = match &resolution {
+            _ if sent => "Marked as sent. Nothing was resent.",
+            Some(resolution) if resolution.restored.is_some() => {
+                "Marked as not sent; its text is back in the composer. Nothing was resent."
             }
-        });
+            _ => "Marked as not sent; its text is kept below the composer. Nothing was resent.",
+        };
+        self.publish_resolution(&ui, selection, scope, resolution, notice);
+    }
+
+    /// Put exactly one record's text into the composer the user was looking
+    /// at, provided it is still empty at the same edit revision. Kept text is
+    /// consumed (released in the core first); an awaiting record keeps its
+    /// copy because its message may still send.
+    pub(crate) async fn restore_record_text(
+        self: &Arc<Self>,
+        selection: AccountSelection,
+        scope: SendScope,
+        nonce: Generation,
+        expected_revision: u64,
+        ui: Weak<AppWindow>,
+    ) {
+        let kept = self.drafts.record_status(&scope.account, &scope.room, scope.thread(), &nonce)
+            == Some(PendingStatus::Kept);
+        if kept && !self.release_record(&selection, &scope, &nonce).await {
+            self.publish_resolution(&ui, selection, scope, None, "Could not update this message's saved status right now.");
+            return;
+        }
+        let resolution = self.drafts.restore_record_text(
+            &scope.account,
+            &scope.room,
+            scope.thread(),
+            &nonce,
+            expected_revision,
+        );
+        let notice = match &resolution {
+            Some(_) if kept => "Kept text restored to the composer.",
+            Some(_) => "Text restored to the composer. The queued message may still send.",
+            None => "The composer changed; nothing was restored.",
+        };
+        if resolution.is_some() {
+            self.persist_scope_and_index(&scope).await;
+        }
+        self.publish_resolution(&ui, selection, scope, resolution, notice);
+    }
+
+    /// Explicitly discard exactly one kept text.
+    pub(crate) async fn discard_kept_text(
+        self: &Arc<Self>,
+        selection: AccountSelection,
+        scope: SendScope,
+        nonce: Generation,
+        ui: Weak<AppWindow>,
+    ) {
+        if self.drafts.record_status(&scope.account, &scope.room, scope.thread(), &nonce)
+            != Some(PendingStatus::Kept)
+            || !self.release_record(&selection, &scope, &nonce).await
+        {
+            return;
+        }
+        if self
+            .drafts
+            .discard_kept(&scope.account, &scope.room, scope.thread(), &nonce)
+        {
+            self.persist_scope_and_index(&scope).await;
+        }
+        self.publish_resolution(&ui, selection, scope, None, "Kept text discarded.");
+    }
+
+    /// Explicitly discard saved data this version could not read in one
+    /// scope. The core releases the row first; the next save replaces it.
+    pub(crate) async fn discard_unreadable_status(
+        self: &Arc<Self>,
+        selection: AccountSelection,
+        scope: SendScope,
+        ui: Weak<AppWindow>,
+    ) {
+        if !selection.is_current()
+            || self
+                .manager
+                .discard_quarantine_for(&selection, &scope.room, scope.thread())
+                .await
+                .is_err()
+        {
+            return;
+        }
+        if self
+            .drafts
+            .discard_quarantine(&scope.account, &scope.room, scope.thread())
+        {
+            self.persist_scope_and_index(&scope).await;
+        }
+        self.publish_resolution(&ui, selection, scope, None, "Unreadable saved status discarded. Sending here is available again.");
     }
 
     /// Seed the cache with every draft scope the core found at selection and
-    /// start exact observers for the requests the SDK still holds.
-    pub(crate) async fn adopt_recovered_sends(self: &Arc<Self>, ui: Weak<AppWindow>) {
-        let Some(account) = self.manager.active_account().await else {
-            return;
-        };
-        let Some(selection) = self.manager.account_selection(&account.id) else {
-            return;
-        };
+    /// start exact observers for the requests the SDK still holds. The epoch
+    /// is read before waiting on the core; a removal or switch in between
+    /// leaves the erased cache alone and starts no observer.
+    pub(crate) async fn adopt_recovered_sends(
+        self: &Arc<Self>,
+        selection: AccountSelection,
+        ui: Weak<AppWindow>,
+    ) {
+        let epoch = self.drafts.account_epoch(selection.account_id());
         let Ok(recovered) = self.manager.take_recovered_drafts(&selection).await else {
             return;
         };
+        self.seed_and_observe(&selection, epoch, recovered, &ui);
+    }
+
+    /// A room the selection-time discovery could not cover is scanned when
+    /// opened; until then its send queue stays paused and sends are refused.
+    pub(crate) async fn complete_room_recovery(
+        self: &Arc<Self>,
+        selection: AccountSelection,
+        room_id: String,
+        ui: Weak<AppWindow>,
+    ) {
+        let epoch = self.drafts.account_epoch(selection.account_id());
+        match self.manager.room_recovery_incomplete(&selection, &room_id).await {
+            Ok(true) => {}
+            _ => return,
+        }
+        let notice = match self.manager.recover_room_for(&selection, &room_id).await {
+            Ok(recovered) => {
+                self.seed_and_observe(&selection, epoch, recovered, &ui);
+                ""
+            }
+            Err(MatrixCoreError::SelectedAccountChanged) => return,
+            Err(_) => "Saved send status for this room could not be read; sending here stays paused until it can be.",
+        };
+        let scope = SendScope {
+            account: selection.account_id().to_owned(),
+            room: room_id,
+            thread: None,
+        };
+        self.publish_resolution(&ui, selection, scope, None, notice);
+    }
+
+    fn seed_and_observe(
+        self: &Arc<Self>,
+        selection: &AccountSelection,
+        epoch: u64,
+        recovered: Vec<RecoveredDraft>,
+        ui: &Weak<AppWindow>,
+    ) {
+        let account = selection.account_id().to_owned();
         for draft in recovered {
+            if !selection.is_current() || self.drafts.account_epoch(&account) != epoch {
+                return;
+            }
             let attached: Vec<Generation> = draft
                 .sends
                 .iter()
@@ -589,12 +796,18 @@ impl LiveUi {
                 .map(|send| send.nonce.clone())
                 .collect();
             let scope = SendScope {
-                account: account.id.clone(),
+                account: account.clone(),
                 room: draft.room_id,
                 thread: draft.thread_root,
             };
-            self.drafts
-                .seed_recovered(&scope.account, &scope.room, scope.thread(), draft.restored, &attached);
+            self.drafts.seed_recovered(
+                &scope.account,
+                &scope.room,
+                scope.thread(),
+                draft.restored,
+                &attached,
+                epoch,
+            );
             for send in draft.sends {
                 if let (Some(queued), Some(transaction_id)) = (send.queued, send.transaction_id) {
                     draft_recovery::spawn_observer(
@@ -609,6 +822,20 @@ impl LiveUi {
                 }
             }
         }
+        let live = self.clone();
+        let selection = selection.clone();
+        let _ = ui.upgrade_in_event_loop(move |window| {
+            if !selection.is_current() {
+                return;
+            }
+            for threaded in [false, true] {
+                if let Some(scope) = draft_recovery::current_scope(&window, threaded)
+                    && scope.account == selection.account_id()
+                {
+                    draft_recovery::publish_scope(&window, &live, &scope);
+                }
+            }
+        });
     }
 
     pub fn forget_account_drafts(&self, account_id: &str) {
@@ -627,9 +854,11 @@ impl LiveUi {
 
     pub async fn restore(self: &Arc<Self>, ui: Weak<AppWindow>) {
         match self.manager.restore_last_active().await {
-            Ok(Some(_)) => {
+            Ok(Some(account)) => {
                 self.is_live.store(true, Ordering::Release);
-                self.adopt_recovered_sends(ui.clone()).await;
+                if let Some(selection) = self.manager.account_selection(&account.id) {
+                    self.adopt_recovered_sends(selection, ui.clone()).await;
+                }
                 if let Err(error) = self.refresh(ui.clone()).await {
                     crate::show_login_error(&ui, error.to_string());
                 } else {
@@ -655,7 +884,14 @@ impl LiveUi {
         self.invalidate_space_scan().await;
         self.space_children.lock().await.clear();
         self.is_live.store(true, Ordering::Release);
-        self.adopt_recovered_sends(ui.clone()).await;
+        if let Some(selection) = self
+            .manager
+            .active_account()
+            .await
+            .and_then(|account| self.manager.account_selection(&account.id))
+        {
+            self.adopt_recovered_sends(selection, ui.clone()).await;
+        }
         if let Err(error) = self.refresh(ui.clone()).await {
             self.manager.stop().await;
             self.account_detached(ui).await;
@@ -728,7 +964,7 @@ impl LiveUi {
             ui.set_thread_root_rich_body(Default::default());
             ui.set_thread_root_rich_accessible_body("".into());
             ui.set_thread_composer_text("".into());
-            draft_recovery::publish_thread(&ui, &PendingSummary::default());
+            draft_recovery::clear_recovery_ui(&ui);
             ui.set_room_actions_open(false);
             ui.set_member_confirm_open(false);
             ui.set_quick_switcher_open(false);
@@ -772,7 +1008,9 @@ impl LiveUi {
         self.invalidate_space_scan().await;
         self.space_children.lock().await.clear();
         self.is_live.store(true, Ordering::Release);
-        self.adopt_recovered_sends(ui.clone()).await;
+        if let Some(selection) = self.manager.account_selection(&account.id) {
+            self.adopt_recovered_sends(selection, ui.clone()).await;
+        }
         self.refresh(ui.clone()).await?;
         tokio::spawn(self.clone().scan_spaces(ui));
         Ok(true)
@@ -981,7 +1219,13 @@ impl LiveUi {
         if !self.navigation_is_current(navigation_epoch) {
             return Ok(false);
         }
-        self.refresh(ui).await?;
+        self.refresh(ui.clone()).await?;
+        if let Some(selection) = self.manager.account_selection(account_id) {
+            let room_id = self.selected_room.lock().await.clone();
+            if let Some(room_id) = room_id {
+                self.complete_room_recovery(selection, room_id, ui).await;
+            }
+        }
         Ok(true)
     }
 
@@ -1585,6 +1829,7 @@ impl LiveUi {
                 draft_recovery::publish_thread(
                     &ui,
                     &restore_drafts.pending_summary(&restore_account, &restore_room, Some(&restore_root)),
+                    &restore_drafts.pending_items(&restore_account, &restore_room, Some(&restore_root)),
                 );
                 if restore_drafts.take_rich_recovery_notice(&restore_account, &restore_room, Some(&restore_root)) {
                     ui.set_transfer_notice("Draft text restored; unsupported saved formatting and mention selections were discarded.".into());
@@ -1875,7 +2120,18 @@ impl LiveUi {
                             if self.is_live.load(Ordering::Acquire) {
                                 self.clear_feed().await;
                                 *self.selected_room.lock().await = None;
-                                self.adopt_recovered_sends(ui.clone()).await;
+                                // Adoption under the transition lock, with the
+                                // selection it belongs to.
+                                let _transition = self.account_transition.lock().await;
+                                if let Some(selection) = self
+                                    .manager
+                                    .active_account()
+                                    .await
+                                    .and_then(|account| self.manager.account_selection(&account.id))
+                                {
+                                    self.adopt_recovered_sends(selection, ui.clone()).await;
+                                }
+                                drop(_transition);
                                 if let Err(error) = self.refresh(ui.clone()).await {
                                     show_error(&ui, error.to_string());
                                 } else {
@@ -2004,13 +2260,17 @@ fn apply_snapshot(
         ui.set_composer_target_label("".into());
         ui.set_composer_saved_draft("".into());
         ui.set_composer_busy(false);
-        draft_recovery::publish_room(ui, &drafts.pending_summary(&view.active.id, next_room_id, None));
+        draft_recovery::publish_room(
+            ui,
+            &drafts.pending_summary(&view.active.id, next_room_id, None),
+            &drafts.pending_items(&view.active.id, next_room_id, None),
+        );
         ui.set_composer_operation(ui.get_composer_operation().wrapping_add(1));
         ui.set_thread_root_id("".into());
         ui.set_thread_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new())));
         ui.set_thread_composer_text("".into());
         ui.set_thread_markdown(false);
-        draft_recovery::publish_thread(ui, &PendingSummary::default());
+        draft_recovery::publish_thread(ui, &PendingSummary::default(), &[]);
     }
     apply_account_menu(ui, &view.accounts, &view.active);
     let active_space_name = view

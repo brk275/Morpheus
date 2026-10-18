@@ -4,33 +4,86 @@
 //! persistence path that serializes through the store cipher. Morpheus owns
 //! that row's HTML representation, so the recovery envelope travels as one
 //! attribute of the canonical draft span and is written atomically with the
-//! draft text in a single `INSERT OR REPLACE`. Nothing here is ever placed in
-//! an outbound Matrix event: `ComposeText::encode_draft` is used only by the
-//! draft store, while outbound formatting goes through `formatting`.
+//! live draft text in a single `INSERT OR REPLACE`. Nothing here is ever placed
+//! in an outbound Matrix event: `ComposeText::encode_draft` is used only by
+//! the draft store, while outbound formatting goes through `formatting`.
+//!
+//! Every pending record carries the complete typed content it was created
+//! from (body, format and explicit mentions), so the text of a failed,
+//! cancelled or unconfirmed send survives later edits, later submissions and
+//! restarts, and can be reviewed, copied or restored one record at a time
+//! without touching the newer live text. A record never adopts the live
+//! generation; acknowledged text is dropped with its record and not restored.
 //!
 //! Encoding is strict and bounded: lowercase hex of canonical `serde_json`
 //! output, re-encoded on read and compared byte for byte, unknown fields
-//! rejected, every identifier validated. Unreadable metadata is carried
-//! forward verbatim (bounded) and never silently dropped, so an explicit user
-//! choice can discard it later without losing the saved text.
+//! rejected, every identifier validated. All size limits are derived below
+//! from the supported message size before any allocation. A row this build
+//! recognizes as Morpheus-written but cannot interpret is quarantined: the
+//! complete original row is carried verbatim (bounded) until the user
+//! explicitly discards it, or the scope stays read-only when it is too large
+//! to carry. Quarantined state is never normalized into an ordinary envelope.
 
-use std::fmt;
+use std::{collections::HashSet, fmt};
 
 use matrix_sdk::ruma::EventId;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Envelope schema version written by this build.
-pub const ENVELOPE_VERSION: u32 = 1;
-/// Queued room sends tracked per draft scope.
+use crate::{
+    TextFormat,
+    compose::{
+        ComposeText, MAX_COMPOSE_BYTES, MAX_MENTION_SPANS, MentionSpan, MentionTarget,
+        RestoredCompose,
+    },
+};
+
+/// Envelope schema version written by this build. Version 1 was never
+/// released; rows claiming it are quarantined like any unknown version.
+pub const ENVELOPE_VERSION: u32 = 2;
+/// Pending send records tracked per draft scope, including kept text.
 pub const MAX_PENDING_RECORDS: usize = 8;
 /// Thread roots a room draft indexes for recovery discovery.
 pub const MAX_THREAD_INDEX: usize = 32;
-/// Upper bound of the hex envelope attribute, including carried unreadable data.
-pub const MAX_ENVELOPE_HEX_BYTES: usize = 16 * 1024;
 const MAX_TRANSACTION_ID_BYTES: usize = 64;
+/// Longest Matrix identifier accepted in a record mention or thread index.
+const MAX_MATRIX_ID_BYTES: usize = 255;
+/// Worst-case JSON string expansion: every input byte escaped as `\u00XX`.
+const JSON_ESCAPE_FACTOR: usize = 6;
+/// Keys, kind and two decimal offsets of one serialized mention.
+const MENTION_FIXED_JSON_BYTES: usize = 128;
+/// Keys, two opaque ids, state, transaction id, format and punctuation.
+const RECORD_FIXED_JSON_BYTES: usize = 512;
+/// Serialized size ceiling of one record's text: a full supported body and
+/// the maximum number of mentions with the longest valid user ids.
+pub const MAX_RECORD_TEXT_JSON_BYTES: usize = MAX_COMPOSE_BYTES * JSON_ESCAPE_FACTOR
+    + MAX_MENTION_SPANS * (MAX_MATRIX_ID_BYTES * JSON_ESCAPE_FACTOR + MENTION_FIXED_JSON_BYTES);
+pub const MAX_RECORD_JSON_BYTES: usize = RECORD_FIXED_JSON_BYTES + MAX_RECORD_TEXT_JSON_BYTES;
+const THREAD_INDEX_JSON_BYTES: usize =
+    MAX_THREAD_INDEX * (MAX_MATRIX_ID_BYTES * JSON_ESCAPE_FACTOR + 8);
+/// Largest original row carried in quarantine. Larger rows stay read-only in
+/// place. A row of this size holds a full live text plus a full envelope
+/// without its own carry, so one level of nesting is always carried.
+pub const MAX_QUARANTINE_HTML_BYTES: usize = 2 * 1024 * 1024;
+/// The carried row is hex (exactly twice its bytes) plus its reason and keys.
+const QUARANTINE_JSON_BYTES: usize = 256 + 2 * MAX_QUARANTINE_HTML_BYTES;
+const ENVELOPE_FIXED_JSON_BYTES: usize = 256;
+pub const MAX_ENVELOPE_JSON_BYTES: usize = ENVELOPE_FIXED_JSON_BYTES
+    + MAX_PENDING_RECORDS * MAX_RECORD_JSON_BYTES
+    + THREAD_INDEX_JSON_BYTES
+    + QUARANTINE_JSON_BYTES;
+/// Upper bound of the hex envelope attribute; checked before any allocation.
+pub const MAX_ENVELOPE_HEX_BYTES: usize = 2 * MAX_ENVELOPE_JSON_BYTES;
+
 const STATE_ENQUEUING: &str = "enqueuing";
 const STATE_QUEUED: &str = "queued";
+/// Text the user chose to keep after a send was cancelled or judged unsent
+/// while the composer already held newer text. No request belongs to it.
+const STATE_KEPT: &str = "kept";
+const FORMAT_PLAIN: &str = "plain";
+const FORMAT_MARKDOWN: &str = "markdown";
+const MENTION_USER: &str = "user";
+const MENTION_ROOM: &str = "room";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RecoveryCodecError {
@@ -47,12 +100,54 @@ pub enum RecoveryCodecError {
 /// Bounded pending-send limits, worded for the user.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PendingLimitError {
-    #[error("Too many messages are already waiting to send in this conversation.")]
+    #[error("Too many messages are already waiting or kept in this conversation.")]
     TooManyPending,
     #[error("A reply in this thread is still waiting to send.")]
     ThreadBusy,
     #[error("Too many threads in this room have replies waiting to send.")]
     ThreadIndexFull,
+    #[error("This message could not be recorded for sending. Your text is retained.")]
+    InvalidText,
+}
+
+/// Why a saved row was quarantined. Shown to the user as fixed wording only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuarantineReason {
+    /// Written by a Morpheus version this build does not understand.
+    UnsupportedVersion,
+    /// Recognized as Morpheus-written but not in a valid canonical shape.
+    Malformed,
+    /// Larger than this build reads; the row stays untouched in place.
+    TooLarge,
+}
+
+impl QuarantineReason {
+    fn code(self) -> &'static str {
+        match self {
+            Self::UnsupportedVersion => "version",
+            Self::Malformed => "malformed",
+            Self::TooLarge => "too-large",
+        }
+    }
+
+    fn parse(code: &str) -> Option<Self> {
+        Some(match code {
+            "version" => Self::UnsupportedVersion,
+            "malformed" => Self::Malformed,
+            "too-large" => Self::TooLarge,
+            _ => return None,
+        })
+    }
+}
+
+impl From<RecoveryCodecError> for QuarantineReason {
+    fn from(error: RecoveryCodecError) -> Self {
+        match error {
+            RecoveryCodecError::TooLarge => Self::TooLarge,
+            RecoveryCodecError::UnsupportedVersion => Self::UnsupportedVersion,
+            RecoveryCodecError::Malformed | RecoveryCodecError::NonCanonical => Self::Malformed,
+        }
+    }
 }
 
 /// Opaque draft generation and record ownership nonce.
@@ -67,6 +162,18 @@ pub struct Generation(String);
 impl Generation {
     pub fn fresh() -> Self {
         Self(Uuid::new_v4().simple().to_string())
+    }
+
+    /// Re-admit an opaque value handed out through `as_key`; anything else
+    /// is rejected. Used only to route a native control back to its record.
+    pub fn from_key(key: &str) -> Option<Self> {
+        let candidate = Self(key.to_owned());
+        candidate.is_valid().then_some(candidate)
+    }
+
+    /// The opaque value for routing within the process. Never shown as text.
+    pub fn as_key(&self) -> &str {
+        &self.0
     }
 
     fn is_valid(&self) -> bool {
@@ -92,11 +199,114 @@ pub fn valid_transaction_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
 }
 
-/// One send the user asked for in a draft scope.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordMention {
+    start: usize,
+    end: usize,
+    kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+}
+
+/// The complete typed content of one record: body, format and explicit
+/// mentions, exactly as submitted. Validated through `ComposeText` on both
+/// encode and decode so a record can never restore an invalid composition.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordText {
+    format: String,
+    body: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    mentions: Vec<RecordMention>,
+}
+
+impl RecordText {
+    pub fn from_compose(text: &ComposeText) -> Result<Self, RecoveryCodecError> {
+        text.validate().map_err(|_| RecoveryCodecError::Malformed)?;
+        Ok(Self {
+            format: match text.format {
+                TextFormat::Plain => FORMAT_PLAIN,
+                TextFormat::Markdown => FORMAT_MARKDOWN,
+            }
+            .to_owned(),
+            body: text.body.clone(),
+            mentions: text
+                .mentions
+                .iter()
+                .map(|span| RecordMention {
+                    start: span.range.start,
+                    end: span.range.end,
+                    kind: match span.target {
+                        MentionTarget::User(_) => MENTION_USER,
+                        MentionTarget::Room => MENTION_ROOM,
+                    }
+                    .to_owned(),
+                    id: match &span.target {
+                        MentionTarget::User(id) => Some(id.clone()),
+                        MentionTarget::Room => None,
+                    },
+                })
+                .collect(),
+        })
+    }
+
+    pub fn to_compose(&self) -> Result<ComposeText, RecoveryCodecError> {
+        let format = match self.format.as_str() {
+            FORMAT_PLAIN => TextFormat::Plain,
+            FORMAT_MARKDOWN => TextFormat::Markdown,
+            _ => return Err(RecoveryCodecError::Malformed),
+        };
+        if self.body.len() > MAX_COMPOSE_BYTES || self.mentions.len() > MAX_MENTION_SPANS {
+            return Err(RecoveryCodecError::TooLarge);
+        }
+        let mut mentions = Vec::with_capacity(self.mentions.len());
+        for mention in &self.mentions {
+            let target = match (mention.kind.as_str(), &mention.id) {
+                (MENTION_USER, Some(id)) if id.len() <= MAX_MATRIX_ID_BYTES => {
+                    MentionTarget::User(id.clone())
+                }
+                (MENTION_ROOM, None) => MentionTarget::Room,
+                _ => return Err(RecoveryCodecError::Malformed),
+            };
+            mentions.push(MentionSpan {
+                range: mention.start..mention.end,
+                target,
+            });
+        }
+        let text = ComposeText {
+            body: self.body.clone(),
+            format,
+            mentions,
+        };
+        text.validate().map_err(|_| RecoveryCodecError::Malformed)?;
+        Ok(text)
+    }
+
+    pub fn body_len(&self) -> usize {
+        self.body.len()
+    }
+
+    fn is_valid(&self) -> bool {
+        self.to_compose().is_ok()
+    }
+}
+
+impl fmt::Debug for RecordText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RecordText")
+            .field("bytes", &self.body.len())
+            .field("mentions", &self.mentions.len())
+            .finish()
+    }
+}
+
+/// One send the user asked for in a draft scope, with its complete text.
 ///
 /// `Enqueuing` is written before the SDK assigns a transaction id; `Queued`
-/// after the exact handle returned. A record found after restart without an
-/// exact SDK echo is unconfirmed, never adopted or treated as sent.
+/// after the exact handle returned; `Kept` holds text the user chose to keep
+/// after the request ended without evidence of delivery. A record found after
+/// restart without an exact SDK echo is unconfirmed, never adopted or sent.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PendingRecord {
@@ -105,15 +315,17 @@ pub struct PendingRecord {
     state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transaction_id: Option<String>,
+    text: RecordText,
 }
 
 impl PendingRecord {
-    pub fn enqueuing(nonce: Generation, generation: Generation) -> Self {
+    pub fn enqueuing(nonce: Generation, generation: Generation, text: RecordText) -> Self {
         Self {
             nonce,
             generation,
             state: STATE_ENQUEUING.to_owned(),
             transaction_id: None,
+            text,
         }
     }
 
@@ -121,6 +333,7 @@ impl PendingRecord {
         nonce: Generation,
         generation: Generation,
         transaction_id: &str,
+        text: RecordText,
     ) -> Result<Self, RecoveryCodecError> {
         if !valid_transaction_id(transaction_id) {
             return Err(RecoveryCodecError::Malformed);
@@ -130,7 +343,18 @@ impl PendingRecord {
             generation,
             state: STATE_QUEUED.to_owned(),
             transaction_id: Some(transaction_id.to_owned()),
+            text,
         })
+    }
+
+    pub fn kept(nonce: Generation, generation: Generation, text: RecordText) -> Self {
+        Self {
+            nonce,
+            generation,
+            state: STATE_KEPT.to_owned(),
+            transaction_id: None,
+            text,
+        }
     }
 
     pub fn nonce(&self) -> &Generation {
@@ -145,15 +369,29 @@ impl PendingRecord {
         self.transaction_id.as_deref()
     }
 
+    pub fn text(&self) -> &RecordText {
+        &self.text
+    }
+
     pub fn is_queued(&self) -> bool {
         self.state == STATE_QUEUED
+    }
+
+    pub fn is_kept(&self) -> bool {
+        self.state == STATE_KEPT
+    }
+
+    /// A record that still represents a send the SDK may hold or complete.
+    pub fn awaits_send(&self) -> bool {
+        !self.is_kept()
     }
 
     fn is_valid(&self) -> bool {
         self.nonce.is_valid()
             && self.generation.is_valid()
+            && self.text.is_valid()
             && match self.state.as_str() {
-                STATE_ENQUEUING => self.transaction_id.is_none(),
+                STATE_ENQUEUING | STATE_KEPT => self.transaction_id.is_none(),
                 STATE_QUEUED => self
                     .transaction_id
                     .as_deref()
@@ -168,41 +406,85 @@ impl fmt::Debug for PendingRecord {
         f.debug_struct("PendingRecord")
             .field("state", &self.state)
             .field("has_transaction", &self.transaction_id.is_some())
+            .field("text", &self.text)
             .finish()
     }
 }
 
-/// Metadata saved atomically with a draft scope's text.
+/// A complete original row this build could not interpret, carried verbatim
+/// so no newer build or explicit export loses it. Hex keeps the bound exact.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuarantinedRow {
+    reason: String,
+    html: String,
+}
+
+impl QuarantinedRow {
+    /// `None` when the row is too large to carry; the caller keeps the scope
+    /// read-only instead so the row stays untouched in the store.
+    pub fn new(reason: QuarantineReason, html: &str) -> Option<Self> {
+        if html.is_empty() || html.len() > MAX_QUARANTINE_HTML_BYTES {
+            return None;
+        }
+        Some(Self {
+            reason: reason.code().to_owned(),
+            html: to_hex(html.as_bytes()),
+        })
+    }
+
+    pub fn reason(&self) -> QuarantineReason {
+        QuarantineReason::parse(&self.reason).unwrap_or(QuarantineReason::Malformed)
+    }
+
+    /// The verbatim original row.
+    pub fn original_html(&self) -> Option<String> {
+        String::from_utf8(from_hex(&self.html)?).ok()
+    }
+
+    fn is_valid(&self) -> bool {
+        QuarantineReason::parse(&self.reason).is_some()
+            && !self.html.is_empty()
+            && self.html.len() <= 2 * MAX_QUARANTINE_HTML_BYTES
+            && is_lower_hex(&self.html)
+    }
+}
+
+impl fmt::Debug for QuarantinedRow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QuarantinedRow")
+            .field("reason", &self.reason)
+            .field("bytes", &(self.html.len() / 2))
+            .finish()
+    }
+}
+
+/// Metadata saved atomically with a draft scope's live text.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DraftEnvelope {
     #[serde(rename = "v")]
     version: u32,
     generation: Generation,
-    /// The saved text is the retained submission of this record and is hidden
-    /// from the composer until the record resolves.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    retained_for: Option<Generation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending: Vec<PendingRecord>,
-    /// Room-level index of thread roots whose own draft rows hold pending
-    /// records, so discovery never has to enumerate hashed thread keys.
+    /// Room-level index of thread roots whose own draft rows hold records,
+    /// so discovery never has to enumerate hashed thread keys.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     threads: Vec<String>,
-    /// Metadata an earlier read could not interpret, carried verbatim until
-    /// the user explicitly discards it.
+    /// A complete earlier row this build could not read, carried until the
+    /// user explicitly discards it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    unreadable: Option<String>,
+    quarantine: Option<QuarantinedRow>,
 }
 
 impl fmt::Debug for DraftEnvelope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DraftEnvelope")
             .field("version", &self.version)
-            .field("retained", &self.retained_for.is_some())
             .field("pending", &self.pending.len())
             .field("threads", &self.threads.len())
-            .field("unreadable", &self.unreadable.is_some())
+            .field("quarantine", &self.quarantine.is_some())
             .finish()
     }
 }
@@ -212,10 +494,9 @@ impl DraftEnvelope {
         Self {
             version: ENVELOPE_VERSION,
             generation,
-            retained_for: None,
             pending: Vec::new(),
             threads: Vec::new(),
-            unreadable: None,
+            quarantine: None,
         }
     }
 
@@ -223,22 +504,19 @@ impl DraftEnvelope {
         Self::new(Generation::fresh())
     }
 
-    /// Rebuild an envelope from cached parts; every bound and identifier is
-    /// validated so a cache can never persist what the decoder would reject.
+    /// Rebuild an envelope from cached parts; rejected unless valid.
     pub fn restore(
         generation: Generation,
-        retained_for: Option<Generation>,
         pending: Vec<PendingRecord>,
         threads: Vec<String>,
-        unreadable: Option<String>,
+        quarantine: Option<QuarantinedRow>,
     ) -> Result<Self, RecoveryCodecError> {
         let envelope = Self {
             version: ENVELOPE_VERSION,
             generation,
-            retained_for,
             pending,
             threads,
-            unreadable,
+            quarantine,
         };
         envelope.validate()?;
         Ok(envelope)
@@ -252,10 +530,6 @@ impl DraftEnvelope {
         self.generation = generation;
     }
 
-    pub fn retained_for(&self) -> Option<&Generation> {
-        self.retained_for.as_ref()
-    }
-
     pub fn pending(&self) -> &[PendingRecord] {
         &self.pending
     }
@@ -264,36 +538,42 @@ impl DraftEnvelope {
         &self.threads
     }
 
-    pub fn unreadable(&self) -> Option<&str> {
-        self.unreadable.as_deref()
+    pub fn quarantine(&self) -> Option<&QuarantinedRow> {
+        self.quarantine.as_ref()
     }
 
-    /// Keep metadata this build cannot read. Oversized data cannot be ours and
-    /// is not kept; the caller still reports it as unreadable.
-    pub fn carry_unreadable(&mut self, raw: &str) -> bool {
-        if raw.len() > MAX_ENVELOPE_HEX_BYTES {
-            return false;
-        }
-        self.unreadable = Some(raw.to_owned());
-        true
+    pub fn set_quarantine(&mut self, row: Option<QuarantinedRow>) {
+        self.quarantine = row;
     }
 
-    /// True when the row holds nothing but text: no pending send, no thread
-    /// index, no retained submission and no carried unreadable data.
+    /// Explicit user discard of carried unreadable data.
+    pub fn clear_quarantine(&mut self) -> bool {
+        self.quarantine.take().is_some()
+    }
+
+    /// True when the row holds nothing but live text: no record of any
+    /// state, no thread index and no quarantined original.
     pub fn is_empty(&self) -> bool {
-        self.pending.is_empty()
-            && self.threads.is_empty()
-            && self.retained_for.is_none()
-            && self.unreadable.is_none()
+        self.pending.is_empty() && self.threads.is_empty() && self.quarantine.is_none()
     }
 
+    pub fn awaiting(&self) -> usize {
+        self.pending
+            .iter()
+            .filter(|record| record.awaits_send())
+            .count()
+    }
+
+    /// Record a send with its complete typed text before the SDK sees it.
+    /// A thread scope accepts one awaiting reply; kept text does not block.
     pub fn begin_pending(
         &mut self,
         nonce: Generation,
         generation: Generation,
+        text: &ComposeText,
         thread_scope: bool,
     ) -> Result<(), PendingLimitError> {
-        if thread_scope && !self.pending.is_empty() {
+        if thread_scope && self.awaiting() > 0 {
             return Err(PendingLimitError::ThreadBusy);
         }
         if self.pending.len() >= MAX_PENDING_RECORDS
@@ -301,11 +581,13 @@ impl DraftEnvelope {
         {
             return Err(PendingLimitError::TooManyPending);
         }
+        let text = RecordText::from_compose(text).map_err(|_| PendingLimitError::InvalidText)?;
         self.pending
-            .push(PendingRecord::enqueuing(nonce, generation));
+            .push(PendingRecord::enqueuing(nonce, generation, text));
         Ok(())
     }
 
+    /// Attach the exact SDK transaction id to an enqueuing record.
     pub fn mark_queued(&mut self, nonce: &Generation, transaction_id: &str) -> bool {
         if !valid_transaction_id(transaction_id)
             || self
@@ -318,7 +600,7 @@ impl DraftEnvelope {
         let Some(record) = self
             .pending
             .iter_mut()
-            .find(|record| record.nonce == *nonce && !record.is_queued())
+            .find(|record| record.nonce == *nonce && record.state == STATE_ENQUEUING)
         else {
             return false;
         };
@@ -331,8 +613,8 @@ impl DraftEnvelope {
         self.pending.iter().find(|record| record.nonce == *nonce)
     }
 
-    /// Remove exactly one owned record. A queued record requires its exact
-    /// transaction id; an enqueuing record requires that none is claimed.
+    /// Remove exactly one record by nonce and exact transaction id (`None`
+    /// for a record that never received one). Its text leaves with it.
     pub fn remove_pending(
         &mut self,
         nonce: &Generation,
@@ -341,19 +623,26 @@ impl DraftEnvelope {
         let index = self.pending.iter().position(|record| {
             record.nonce == *nonce && record.transaction_id.as_deref() == transaction_id
         })?;
-        let record = self.pending.remove(index);
-        if self.retained_for.as_ref() == Some(nonce) {
-            self.retained_for = None;
-        }
-        Some(record)
+        Some(self.pending.remove(index))
     }
 
-    pub fn set_retained_for(&mut self, nonce: Option<Generation>) {
-        self.retained_for = nonce;
+    /// Turn an awaiting record into kept text: its request is over without
+    /// evidence of delivery and the composer already holds newer text.
+    pub fn keep_pending(&mut self, nonce: &Generation) -> bool {
+        let Some(record) = self
+            .pending
+            .iter_mut()
+            .find(|record| record.nonce == *nonce && record.awaits_send())
+        else {
+            return false;
+        };
+        record.state = STATE_KEPT.to_owned();
+        record.transaction_id = None;
+        true
     }
 
     pub fn index_thread(&mut self, root: &str) -> Result<bool, PendingLimitError> {
-        if EventId::parse(root).is_err() {
+        if root.len() > MAX_MATRIX_ID_BYTES || EventId::parse(root).is_err() {
             return Err(PendingLimitError::ThreadIndexFull);
         }
         if self.threads.iter().any(|known| known == root) {
@@ -372,19 +661,11 @@ impl DraftEnvelope {
         self.threads.len() != before
     }
 
-    pub fn clear_unreadable(&mut self) -> bool {
-        self.unreadable.take().is_some()
-    }
-
     fn validate(&self) -> Result<(), RecoveryCodecError> {
         if self.version != ENVELOPE_VERSION {
             return Err(RecoveryCodecError::UnsupportedVersion);
         }
         if !self.generation.is_valid()
-            || self
-                .retained_for
-                .as_ref()
-                .is_some_and(|nonce| !nonce.is_valid())
             || self.pending.len() > MAX_PENDING_RECORDS
             || self.threads.len() > MAX_THREAD_INDEX
         {
@@ -401,20 +682,18 @@ impl DraftEnvelope {
                 return Err(RecoveryCodecError::Malformed);
             }
         }
-        if let Some(nonce) = &self.retained_for
-            && !self.pending.iter().any(|record| record.nonce == *nonce)
-        {
-            return Err(RecoveryCodecError::Malformed);
-        }
         for (index, root) in self.threads.iter().enumerate() {
-            if EventId::parse(root).is_err() || self.threads[..index].contains(root) {
+            if root.len() > MAX_MATRIX_ID_BYTES
+                || EventId::parse(root).is_err()
+                || self.threads[..index].contains(root)
+            {
                 return Err(RecoveryCodecError::Malformed);
             }
         }
-        if let Some(unreadable) = &self.unreadable
-            && (unreadable.is_empty()
-                || unreadable.len() > MAX_ENVELOPE_HEX_BYTES
-                || !is_lower_hex(unreadable))
+        if self
+            .quarantine
+            .as_ref()
+            .is_some_and(|row| !row.is_valid())
         {
             return Err(RecoveryCodecError::Malformed);
         }
@@ -425,16 +704,15 @@ impl DraftEnvelope {
     pub fn encode(&self) -> Result<String, RecoveryCodecError> {
         self.validate()?;
         let json = serde_json::to_vec(self).map_err(|_| RecoveryCodecError::Malformed)?;
-        let hex = to_hex(&json);
-        if hex.len() > MAX_ENVELOPE_HEX_BYTES {
+        if json.len() > MAX_ENVELOPE_JSON_BYTES {
             return Err(RecoveryCodecError::TooLarge);
         }
-        Ok(hex)
+        Ok(to_hex(&json))
     }
 
     /// Strict inverse of `encode`: bounded before allocation, lowercase hex
-    /// only, unknown fields rejected, every identifier validated, and the
-    /// result must re-encode to exactly the input.
+    /// only, unknown fields rejected, every identifier and text validated,
+    /// and the result must re-encode to exactly the input.
     pub fn decode(hex: &str) -> Result<Self, RecoveryCodecError> {
         if hex.len() > MAX_ENVELOPE_HEX_BYTES {
             return Err(RecoveryCodecError::TooLarge);
@@ -450,6 +728,240 @@ impl DraftEnvelope {
             return Err(RecoveryCodecError::NonCanonical);
         }
         Ok(envelope)
+    }
+}
+
+/// Why a scope refuses new sends and, when read-only, saves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScopeBlock {
+    /// Saved data this build cannot read is carried in the row.
+    Quarantined,
+    /// The saved row is too large to carry; it is never written.
+    ReadOnly,
+}
+
+/// Why a save was refused: it would have erased or rewritten metadata the
+/// caller did not own. The row keeps its last valid data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SaveRejected {
+    ReadOnly,
+    QuarantineDropped,
+    RecordDropped,
+    RecordRegressed,
+    RecordReplayed,
+}
+
+/// Authoritative per-scope recovery state, mirrored from the last encrypted
+/// row read or written. Every save is checked against it: a record leaves or
+/// changes state only through an exact, authorized operation of this process,
+/// never through a stale snapshot or a replayed restored record.
+#[derive(Clone, Default)]
+pub struct ScopeRecovery {
+    records: Vec<PendingRecord>,
+    block: Option<ScopeBlock>,
+    /// Records an exact resolution released; the next save may drop or keep
+    /// them. Pruned once they leave the row.
+    released: HashSet<Generation>,
+    /// Records created by this process. Only these may receive a transaction
+    /// id or be abandoned without a resolution; restored records never can.
+    fresh: HashSet<Generation>,
+    /// Single-use enqueue capabilities for fresh records, consumed atomically
+    /// at the SDK boundary.
+    grants: HashSet<Generation>,
+    /// The user explicitly discarded the carried or read-only original.
+    quarantine_released: bool,
+}
+
+impl fmt::Debug for ScopeRecovery {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ScopeRecovery")
+            .field("records", &self.records.len())
+            .field("block", &self.block)
+            .field("released", &self.released.len())
+            .field("fresh", &self.fresh.len())
+            .field("grants", &self.grants.len())
+            .finish()
+    }
+}
+
+impl ScopeRecovery {
+    pub fn from_restored(restored: &RestoredCompose) -> Self {
+        let mut scope = Self::default();
+        scope.apply_loaded(restored);
+        scope
+    }
+
+    pub fn records(&self) -> &[PendingRecord] {
+        &self.records
+    }
+
+    pub fn block(&self) -> Option<ScopeBlock> {
+        self.block
+    }
+
+    pub fn find(&self, nonce: &Generation) -> Option<&PendingRecord> {
+        self.records.iter().find(|record| record.nonce == *nonce)
+    }
+
+    pub fn awaiting(&self) -> usize {
+        self.records
+            .iter()
+            .filter(|record| record.awaits_send())
+            .count()
+    }
+
+    /// Nothing worth keeping in the registry: no record and no block.
+    pub fn is_idle(&self) -> bool {
+        self.records.is_empty() && self.block.is_none()
+    }
+
+    /// The row was read: it is the truth for records and block. Process-local
+    /// ownership survives only for records still present.
+    pub fn apply_loaded(&mut self, restored: &RestoredCompose) {
+        self.records = restored.envelope.pending().to_vec();
+        self.block = match restored.blocked() {
+            None => None,
+            Some(_) if restored.read_only.is_some() => Some(ScopeBlock::ReadOnly),
+            Some(_) => Some(ScopeBlock::Quarantined),
+        };
+        self.quarantine_released = false;
+        self.prune();
+    }
+
+    /// Would writing `incoming` over the current row erase or rewrite
+    /// anything the caller does not own?
+    pub fn check_save(&self, incoming: &DraftEnvelope) -> Result<(), SaveRejected> {
+        match self.block {
+            Some(ScopeBlock::ReadOnly) if !self.quarantine_released => {
+                return Err(SaveRejected::ReadOnly);
+            }
+            Some(ScopeBlock::Quarantined)
+                if incoming.quarantine().is_none() && !self.quarantine_released =>
+            {
+                return Err(SaveRejected::QuarantineDropped);
+            }
+            _ => {}
+        }
+        for current in &self.records {
+            let Some(next) = incoming.find(&current.nonce) else {
+                let abandoned_fresh = !current.is_queued()
+                    && !current.is_kept()
+                    && self.fresh.contains(&current.nonce);
+                if self.released.contains(&current.nonce) || abandoned_fresh {
+                    continue;
+                }
+                return Err(SaveRejected::RecordDropped);
+            };
+            if next.text != current.text || next.generation != current.generation {
+                return Err(SaveRejected::RecordRegressed);
+            }
+            let same_state = next.state == current.state;
+            let same_transaction = next.transaction_id == current.transaction_id;
+            if same_state && same_transaction {
+                continue;
+            }
+            if current.is_kept() {
+                return Err(SaveRejected::RecordRegressed);
+            }
+            if next.is_kept() {
+                if self.released.contains(&current.nonce) {
+                    continue;
+                }
+                return Err(SaveRejected::RecordDropped);
+            }
+            if !current.is_queued() && next.is_queued() {
+                if self.fresh.contains(&current.nonce) {
+                    continue;
+                }
+                return Err(SaveRejected::RecordReplayed);
+            }
+            return Err(SaveRejected::RecordRegressed);
+        }
+        for next in incoming.pending() {
+            if self.find(&next.nonce).is_none() && (next.is_queued() || next.is_kept()) {
+                return Err(SaveRejected::RecordReplayed);
+            }
+        }
+        Ok(())
+    }
+
+    /// The row was written with `incoming` after `check_save` passed.
+    pub fn apply_saved(&mut self, incoming: &DraftEnvelope) {
+        for next in incoming.pending() {
+            if self.find(&next.nonce).is_none() {
+                self.fresh.insert(next.nonce.clone());
+            }
+        }
+        self.records = incoming.pending().to_vec();
+        self.block = incoming.quarantine().map(|_| ScopeBlock::Quarantined);
+        self.quarantine_released = false;
+        self.prune();
+    }
+
+    /// The row was deleted.
+    pub fn apply_cleared(&mut self) {
+        self.records.clear();
+        self.block = None;
+        self.quarantine_released = false;
+        self.prune();
+    }
+
+    /// An exact, authorized resolution: the record may now leave the row or
+    /// become kept text. Exact nonce and transaction id (none for a record
+    /// that never received one) are both required.
+    pub fn release(&mut self, nonce: &Generation, transaction_id: Option<&str>) -> bool {
+        let owned = self
+            .find(nonce)
+            .is_some_and(|record| record.transaction_id.as_deref() == transaction_id);
+        if owned {
+            self.released.insert(nonce.clone());
+        }
+        owned
+    }
+
+    /// The user explicitly discarded saved data this build could not read.
+    pub fn release_quarantine(&mut self) -> bool {
+        if self.block.is_none() {
+            return false;
+        }
+        self.quarantine_released = true;
+        true
+    }
+
+    /// Issue the single-use enqueue capability for a record this process
+    /// created and already saved as enqueuing. Restored records never qualify.
+    pub fn grant(&mut self, nonce: &Generation) -> bool {
+        let eligible = self.fresh.contains(nonce)
+            && self
+                .find(nonce)
+                .is_some_and(|record| !record.is_queued() && !record.is_kept());
+        if eligible {
+            self.grants.insert(nonce.clone());
+        }
+        eligible
+    }
+
+    /// Consume the capability at the SDK boundary. False means no fresh
+    /// intent owns this enqueue: a restored or already used record.
+    pub fn consume_grant(&mut self, nonce: &Generation) -> bool {
+        self.grants.remove(nonce)
+    }
+
+    /// A new selection epoch: capabilities issued under the old one die.
+    pub fn clear_grants(&mut self) {
+        self.grants.clear();
+    }
+
+    fn prune(&mut self) {
+        let present: HashSet<Generation> =
+            self.records.iter().map(|record| record.nonce.clone()).collect();
+        self.released.retain(|nonce| present.contains(nonce));
+        self.fresh.retain(|nonce| present.contains(nonce));
+        self.grants.retain(|nonce| {
+            self.records
+                .iter()
+                .any(|record| record.nonce == *nonce && !record.is_queued() && !record.is_kept())
+        });
     }
 }
 
@@ -492,14 +1004,27 @@ fn from_hex(value: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    const TXN: &str = "0123456789abcdef0123456789abcdef";
+
+    fn typed(body: &str) -> ComposeText {
+        ComposeText::plain(body)
+    }
+
+    fn mentioned() -> ComposeText {
+        ComposeText::plain("ping @casey:example.org now")
+            .insert_mention(5..23, MentionTarget::User("@casey:example.org".into()))
+            .unwrap()
+            .0
+            .with_format(TextFormat::Markdown)
+    }
+
     fn queued_envelope() -> (DraftEnvelope, Generation) {
         let mut envelope = DraftEnvelope::fresh();
         let nonce = Generation::fresh();
         envelope
-            .begin_pending(nonce.clone(), envelope.generation().clone(), false)
+            .begin_pending(nonce.clone(), envelope.generation().clone(), &mentioned(), false)
             .unwrap();
-        assert!(envelope.mark_queued(&nonce, "0123456789abcdef0123456789abcdef"));
-        envelope.set_retained_for(Some(nonce.clone()));
+        assert!(envelope.mark_queued(&nonce, TXN));
         (envelope, nonce)
     }
 
@@ -510,8 +1035,9 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.is_valid());
         assert_eq!(format!("{first:?}"), "Generation([opaque])");
-        assert!(!Generation("ABCDEF".repeat(5) + "ab").is_valid());
-        assert!(!Generation("0".repeat(31)).is_valid());
+        assert_eq!(Generation::from_key(first.as_key()), Some(first));
+        assert!(Generation::from_key(&"ABCDEF".repeat(5)).is_none());
+        assert!(Generation::from_key(&"0".repeat(31)).is_none());
     }
 
     #[test]
@@ -528,28 +1054,87 @@ mod tests {
             DraftEnvelope::decode(&hex[..hex.len() - 1]),
             Err(RecoveryCodecError::Malformed)
         );
-        // Same JSON with a trailing space is valid JSON but not canonical.
         let mut json = from_hex(&hex).unwrap();
         json.push(b' ');
         assert_eq!(
             DraftEnvelope::decode(&to_hex(&json)),
             Err(RecoveryCodecError::NonCanonical)
         );
-        let unknown = to_hex(br#"{"v":1,"generation":"00000000000000000000000000000000","extra":1}"#);
-        assert_eq!(
-            DraftEnvelope::decode(&unknown),
-            Err(RecoveryCodecError::Malformed)
-        );
-        let future = to_hex(br#"{"v":2,"generation":"00000000000000000000000000000000"}"#);
-        assert_eq!(
-            DraftEnvelope::decode(&future),
-            Err(RecoveryCodecError::UnsupportedVersion)
-        );
+        let unknown = to_hex(br#"{"v":2,"generation":"00000000000000000000000000000000","extra":1}"#);
+        assert_eq!(DraftEnvelope::decode(&unknown), Err(RecoveryCodecError::Malformed));
+        for version in [1, 3] {
+            let other = to_hex(
+                format!(r#"{{"v":{version},"generation":"00000000000000000000000000000000"}}"#)
+                    .as_bytes(),
+            );
+            assert_eq!(
+                DraftEnvelope::decode(&other),
+                Err(RecoveryCodecError::UnsupportedVersion)
+            );
+        }
         let oversized = "00".repeat(MAX_ENVELOPE_HEX_BYTES / 2 + 1);
-        assert_eq!(
-            DraftEnvelope::decode(&oversized),
-            Err(RecoveryCodecError::TooLarge)
+        assert_eq!(DraftEnvelope::decode(&oversized), Err(RecoveryCodecError::TooLarge));
+        // A record whose text would not validate as a composition is rejected
+        // even when the JSON is well formed.
+        let bad_mention = to_hex(
+            format!(
+                r#"{{"v":2,"generation":"{g}","pending":[{{"nonce":"{g}","generation":"{g}","state":"kept","text":{{"format":"plain","body":"hi","mentions":[{{"start":0,"end":9,"kind":"user","id":"@a:b.c"}}]}}}}]}}"#,
+                g = "0".repeat(32)
+            )
+            .as_bytes(),
         );
+        assert_eq!(DraftEnvelope::decode(&bad_mention), Err(RecoveryCodecError::Malformed));
+    }
+
+    #[test]
+    fn every_record_keeps_its_own_typed_text_through_later_records_and_decoding() {
+        let mut envelope = DraftEnvelope::fresh();
+        let first = Generation::fresh();
+        let second = Generation::fresh();
+        let first_generation = envelope.generation().clone();
+        envelope
+            .begin_pending(first.clone(), first_generation.clone(), &mentioned(), false)
+            .unwrap();
+        assert!(envelope.mark_queued(&first, TXN));
+        // A later edit to the same text is a new generation; the record keeps
+        // the generation and text it was created from.
+        envelope.set_generation(Generation::fresh());
+        envelope
+            .begin_pending(second.clone(), envelope.generation().clone(), &typed("second"), false)
+            .unwrap();
+        let decoded = DraftEnvelope::decode(&envelope.encode().unwrap()).unwrap();
+        let records = decoded.pending();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].text().to_compose().unwrap(), mentioned());
+        assert_eq!(records[0].generation(), &first_generation);
+        assert_ne!(records[0].generation(), decoded.generation());
+        assert_eq!(records[1].text().to_compose().unwrap(), typed("second"));
+        // Out-of-order resolution: the newer record leaves first; the older
+        // one, with its text, stays and can become kept text.
+        let mut decoded = decoded;
+        assert!(decoded.remove_pending(&second, None).is_some());
+        assert!(decoded.remove_pending(&first, None).is_none());
+        assert!(decoded.keep_pending(&first));
+        assert!(!decoded.keep_pending(&first), "kept text is not a send");
+        let kept = decoded.find(&first).unwrap();
+        assert!(kept.is_kept() && !kept.awaits_send() && kept.transaction_id().is_none());
+        assert_eq!(kept.text().to_compose().unwrap(), mentioned());
+        assert_eq!(decoded.awaiting(), 0);
+        // Kept text does not block a thread's one awaiting reply.
+        let mut thread = DraftEnvelope::fresh();
+        let reply = Generation::fresh();
+        thread
+            .begin_pending(reply.clone(), thread.generation().clone(), &typed("a"), true)
+            .unwrap();
+        assert_eq!(
+            thread.begin_pending(Generation::fresh(), thread.generation().clone(), &typed("b"), true),
+            Err(PendingLimitError::ThreadBusy)
+        );
+        assert!(thread.keep_pending(&reply));
+        thread
+            .begin_pending(Generation::fresh(), thread.generation().clone(), &typed("b"), true)
+            .unwrap();
+        assert_eq!(DraftEnvelope::decode(&thread.encode().unwrap()).unwrap(), thread);
     }
 
     #[test]
@@ -557,15 +1142,15 @@ mod tests {
         let mut envelope = DraftEnvelope::fresh();
         let generation = envelope.generation().clone();
         let mut nonces = Vec::new();
-        for _ in 0..MAX_PENDING_RECORDS {
+        for index in 0..MAX_PENDING_RECORDS {
             let nonce = Generation::fresh();
             envelope
-                .begin_pending(nonce.clone(), generation.clone(), false)
+                .begin_pending(nonce.clone(), generation.clone(), &typed(&format!("m{index}")), false)
                 .unwrap();
             nonces.push(nonce);
         }
         assert_eq!(
-            envelope.begin_pending(Generation::fresh(), generation.clone(), false),
+            envelope.begin_pending(Generation::fresh(), generation.clone(), &typed("x"), false),
             Err(PendingLimitError::TooManyPending)
         );
         assert!(envelope.mark_queued(&nonces[0], "aaaa"));
@@ -578,14 +1163,68 @@ mod tests {
         assert!(envelope.remove_pending(&nonces[0], Some("aaaa")).is_some());
         assert!(envelope.remove_pending(&nonces[1], None).is_some());
         assert_eq!(envelope.pending().len(), MAX_PENDING_RECORDS - 2);
-        let mut thread = DraftEnvelope::fresh();
-        thread
-            .begin_pending(Generation::fresh(), generation.clone(), true)
-            .unwrap();
+        let oversized = ComposeText::plain("x".repeat(MAX_COMPOSE_BYTES + 1));
         assert_eq!(
-            thread.begin_pending(Generation::fresh(), generation, true),
-            Err(PendingLimitError::ThreadBusy)
+            envelope.begin_pending(Generation::fresh(), generation, &oversized, false),
+            Err(PendingLimitError::InvalidText)
         );
+    }
+
+    #[test]
+    fn size_limits_are_derived_from_the_supported_message_and_hold_at_the_extremes() {
+        // Largest record: a full body whose every byte expands sixfold in
+        // JSON, plus the maximum number of mentions with the longest user ids.
+        let user = format!("@{}:example.org", "a".repeat(MAX_MATRIX_ID_BYTES - 13));
+        assert_eq!(user.len(), MAX_MATRIX_ID_BYTES);
+        let mut body = String::new();
+        let mut spans = Vec::new();
+        for _ in 0..MAX_MENTION_SPANS {
+            let start = body.len();
+            body.push_str(&user);
+            spans.push(start..body.len());
+            body.push('\n');
+        }
+        while body.len() < MAX_COMPOSE_BYTES {
+            body.push('\u{1}');
+        }
+        let mut text = ComposeText::plain(body);
+        for range in spans {
+            text = text
+                .insert_mention(range, MentionTarget::User(user.clone()))
+                .unwrap()
+                .0;
+        }
+        assert_eq!(text.body.len(), MAX_COMPOSE_BYTES);
+        let record = RecordText::from_compose(&text).unwrap();
+        let encoded = serde_json::to_vec(&PendingRecord::kept(
+            Generation::fresh(),
+            Generation::fresh(),
+            record,
+        ))
+        .unwrap();
+        assert!(encoded.len() <= MAX_RECORD_JSON_BYTES, "{}", encoded.len());
+        // Largest envelope: every record at that size, a full thread index and
+        // the largest carried quarantine still encode within the bounds.
+        let mut envelope = DraftEnvelope::fresh();
+        for _ in 0..MAX_PENDING_RECORDS {
+            envelope
+                .begin_pending(Generation::fresh(), envelope.generation().clone(), &text, false)
+                .unwrap();
+        }
+        for index in 0..MAX_THREAD_INDEX {
+            let suffix = format!("{index:02}:example.org");
+            let root = format!("${}{suffix}", "r".repeat(MAX_MATRIX_ID_BYTES - 1 - suffix.len()));
+            assert_eq!(root.len(), MAX_MATRIX_ID_BYTES);
+            envelope.index_thread(&root).unwrap();
+        }
+        let carried = "\u{1}".repeat(MAX_QUARANTINE_HTML_BYTES);
+        envelope.set_quarantine(QuarantinedRow::new(QuarantineReason::Malformed, &carried));
+        assert!(envelope.quarantine().is_some());
+        let hex = envelope.encode().unwrap();
+        assert!(hex.len() <= MAX_ENVELOPE_HEX_BYTES, "{}", hex.len());
+        assert_eq!(DraftEnvelope::decode(&hex).unwrap(), envelope);
+        let too_big = "x".repeat(MAX_QUARANTINE_HTML_BYTES + 1);
+        assert!(QuarantinedRow::new(QuarantineReason::TooLarge, &too_big).is_none());
     }
 
     #[test]
@@ -614,38 +1253,200 @@ mod tests {
     }
 
     #[test]
-    fn retained_text_requires_its_record_and_unreadable_data_is_carried_bounded() {
-        let (mut envelope, nonce) = queued_envelope();
-        assert!(!envelope.is_empty());
-        envelope.remove_pending(&nonce, Some("0123456789abcdef0123456789abcdef"));
-        assert!(envelope.retained_for().is_none());
-        assert!(envelope.is_empty());
-        let dangling = DraftEnvelope::restore(
-            Generation::fresh(),
-            Some(Generation::fresh()),
-            Vec::new(),
-            Vec::new(),
-            None,
-        );
-        assert_eq!(dangling, Err(RecoveryCodecError::Malformed));
-        assert!(envelope.carry_unreadable("abcd"));
+    fn quarantined_rows_are_carried_verbatim_and_cleared_only_explicitly() {
+        let original = "<span data-morpheus-compose=\"7\" data-format=\"plain\">kept \u{1F600} text</span>";
+        let row = QuarantinedRow::new(QuarantineReason::UnsupportedVersion, original).unwrap();
+        assert_eq!(row.reason(), QuarantineReason::UnsupportedVersion);
+        assert_eq!(row.original_html().as_deref(), Some(original));
+        let mut envelope = DraftEnvelope::fresh();
+        envelope.set_quarantine(Some(row.clone()));
         assert!(!envelope.is_empty());
         let hex = envelope.encode().unwrap();
-        assert_eq!(DraftEnvelope::decode(&hex).unwrap().unreadable(), Some("abcd"));
-        assert!(!envelope.carry_unreadable(&"ab".repeat(MAX_ENVELOPE_HEX_BYTES)));
-        assert!(envelope.clear_unreadable());
-        assert!(envelope.is_empty());
-        assert!(
-            DraftEnvelope::restore(Generation::fresh(), None, Vec::new(), Vec::new(), Some("xyz".into()))
-                .is_err()
+        let decoded = DraftEnvelope::decode(&hex).unwrap();
+        assert_eq!(decoded.quarantine(), Some(&row));
+        assert_eq!(decoded.quarantine().unwrap().original_html().as_deref(), Some(original));
+        // Records and the index coexist with the carry; a later generation
+        // keeps it.
+        let mut decoded = decoded;
+        decoded.set_generation(Generation::fresh());
+        decoded
+            .begin_pending(Generation::fresh(), decoded.generation().clone(), &typed("new"), false)
+            .unwrap();
+        let again = DraftEnvelope::decode(&decoded.encode().unwrap()).unwrap();
+        assert_eq!(again.quarantine(), Some(&row));
+        assert!(decoded.clear_quarantine());
+        assert!(!decoded.clear_quarantine());
+        // Invalid carries never pass validation.
+        assert!(QuarantinedRow::new(QuarantineReason::Malformed, "").is_none());
+        let forged = to_hex(
+            format!(
+                r#"{{"v":2,"generation":"{g}","quarantine":{{"reason":"other","html":"ab"}}}}"#,
+                g = "0".repeat(32)
+            )
+            .as_bytes(),
         );
+        assert_eq!(DraftEnvelope::decode(&forged), Err(RecoveryCodecError::Malformed));
+        let odd_hex = to_hex(
+            format!(
+                r#"{{"v":2,"generation":"{g}","quarantine":{{"reason":"malformed","html":"abc"}}}}"#,
+                g = "0".repeat(32)
+            )
+            .as_bytes(),
+        );
+        assert_eq!(DraftEnvelope::decode(&odd_hex), Err(RecoveryCodecError::Malformed));
+    }
+
+    fn restored_with(envelope: DraftEnvelope, read_only: Option<QuarantineReason>) -> RestoredCompose {
+        RestoredCompose {
+            text: typed("live"),
+            discarded_rich_intent: false,
+            envelope,
+            read_only,
+        }
     }
 
     #[test]
-    fn debug_output_carries_no_identifiers() {
+    fn saves_cannot_drop_or_rewrite_records_without_an_exact_resolution() {
+        // A row from an earlier process: one queued and one enqueuing record.
+        let mut row = DraftEnvelope::fresh();
+        let queued = Generation::fresh();
+        let lost = Generation::fresh();
+        row.begin_pending(queued.clone(), row.generation().clone(), &typed("q"), false).unwrap();
+        assert!(row.mark_queued(&queued, TXN));
+        row.begin_pending(lost.clone(), row.generation().clone(), &typed("l"), false).unwrap();
+        let mut scope = ScopeRecovery::from_restored(&restored_with(row.clone(), None));
+        // A plain text save or clear that keeps every record is fine.
+        let mut edited = row.clone();
+        edited.set_generation(Generation::fresh());
+        assert_eq!(scope.check_save(&edited), Ok(()));
+        // A stale snapshot without the queued record is refused.
+        let mut stale = row.clone();
+        assert!(stale.remove_pending(&queued, Some(TXN)).is_some());
+        assert_eq!(scope.check_save(&stale), Err(SaveRejected::RecordDropped));
+        // Dropping a restored enqueuing record is refused too: it is not fresh.
+        let mut dropped = row.clone();
+        assert!(dropped.remove_pending(&lost, None).is_some());
+        assert_eq!(scope.check_save(&dropped), Err(SaveRejected::RecordDropped));
+        // A restored enqueuing record can never be given a transaction id.
+        let mut replay = row.clone();
+        assert!(replay.mark_queued(&lost, "ffff"));
+        assert_eq!(scope.check_save(&replay), Err(SaveRejected::RecordReplayed));
+        assert!(!scope.grant(&lost), "restored records get no enqueue grant");
+        // Keeping a record is a resolution and needs the release as well.
+        let mut kept = row.clone();
+        assert!(kept.keep_pending(&queued));
+        assert_eq!(scope.check_save(&kept), Err(SaveRejected::RecordDropped));
+        // A release needs the exact transaction id.
+        assert!(!scope.release(&queued, None));
+        assert!(!scope.release(&queued, Some("other")));
+        assert!(scope.release(&queued, Some(TXN)));
+        assert_eq!(scope.check_save(&kept), Ok(()));
+        assert_eq!(scope.check_save(&stale), Ok(()));
+        // Text and generation of an existing record are immutable.
+        let mut rewritten = DraftEnvelope::fresh();
+        rewritten.begin_pending(queued.clone(), Generation::fresh(), &typed("q"), false).unwrap();
+        assert!(rewritten.mark_queued(&queued, TXN));
+        rewritten.begin_pending(lost.clone(), row.pending()[1].generation().clone(), &typed("l"), false).unwrap();
+        assert_eq!(scope.check_save(&rewritten), Err(SaveRejected::RecordRegressed));
+        // After the save the released record is gone and the release pruned.
+        scope.apply_saved(&stale);
+        assert_eq!(scope.records().len(), 1);
+        assert!(!scope.release(&queued, Some(TXN)));
+        // Kept text never goes back to a send.
+        let mut kept_scope = ScopeRecovery::from_restored(&restored_with(kept.clone(), None));
+        let mut revived = kept.clone();
+        revived.remove_pending(&queued, None);
+        revived.begin_pending(queued.clone(), kept.pending()[0].generation().clone(), &typed("q"), false).unwrap();
+        assert_eq!(kept_scope.check_save(&revived), Err(SaveRejected::RecordRegressed));
+        assert!(kept_scope.release(&queued, None), "kept text releases with no transaction");
+        let mut gone = kept.clone();
+        gone.remove_pending(&queued, None);
+        assert_eq!(kept_scope.check_save(&gone), Ok(()));
+    }
+
+    #[test]
+    fn fresh_records_follow_the_grant_lifecycle_and_restored_ones_cannot_replay() {
+        let mut scope = ScopeRecovery::default();
+        let mut row = DraftEnvelope::fresh();
+        let nonce = Generation::fresh();
+        row.begin_pending(nonce.clone(), row.generation().clone(), &typed("new"), false).unwrap();
+        // A new enqueuing record is a fresh intent; a new queued or kept one
+        // appearing from nowhere is not.
+        assert_eq!(scope.check_save(&row), Ok(()));
+        let mut forged = DraftEnvelope::fresh();
+        forged.begin_pending(Generation::fresh(), forged.generation().clone(), &typed("x"), false).unwrap();
+        let forged_nonce = forged.pending()[0].nonce().clone();
+        assert!(forged.mark_queued(&forged_nonce, "aaaa"));
+        assert_eq!(scope.check_save(&forged), Err(SaveRejected::RecordReplayed));
+        scope.apply_saved(&row);
+        assert!(!scope.consume_grant(&nonce), "no grant before it is issued");
+        assert!(scope.grant(&nonce));
+        assert!(scope.consume_grant(&nonce));
+        assert!(!scope.consume_grant(&nonce), "single use");
+        // The fresh record may now take its transaction id, once.
+        let mut queued = row.clone();
+        assert!(queued.mark_queued(&nonce, TXN));
+        assert_eq!(scope.check_save(&queued), Ok(()));
+        scope.apply_saved(&queued);
+        assert!(!scope.grant(&nonce), "a queued record needs no grant");
+        assert_eq!(scope.check_save(&row), Err(SaveRejected::RecordRegressed), "a queued record cannot go back to enqueuing");
+        // Abandoning is allowed only while the fresh record never got an id.
+        let mut again = ScopeRecovery::default();
+        again.apply_saved(&row);
+        let empty = DraftEnvelope::fresh();
+        assert_eq!(again.check_save(&empty), Ok(()));
+        assert_eq!(scope.check_save(&empty), Err(SaveRejected::RecordDropped));
+        // A restart turns the same row into restored records: no fresh
+        // ownership, no grants, no abandonment without resolution.
+        let restored = ScopeRecovery::from_restored(&restored_with(queued.clone(), None));
+        assert_eq!(restored.check_save(&empty), Err(SaveRejected::RecordDropped));
+        let mut restored = restored;
+        assert!(!restored.grant(&nonce));
+        assert!(!restored.consume_grant(&nonce));
+    }
+
+    #[test]
+    fn quarantine_and_read_only_blocks_hold_until_the_explicit_release() {
+        let original = "<span data-morpheus-compose=\"9\" data-format=\"plain\">x</span>";
+        let mut carried = DraftEnvelope::fresh();
+        carried.set_quarantine(QuarantinedRow::new(QuarantineReason::UnsupportedVersion, original));
+        let mut scope = ScopeRecovery::from_restored(&restored_with(carried.clone(), None));
+        assert_eq!(scope.block(), Some(ScopeBlock::Quarantined));
+        let mut edit = carried.clone();
+        edit.set_generation(Generation::fresh());
+        assert_eq!(scope.check_save(&edit), Ok(()), "edits that keep the carry are fine");
+        let plain = DraftEnvelope::fresh();
+        assert_eq!(scope.check_save(&plain), Err(SaveRejected::QuarantineDropped));
+        assert!(scope.release_quarantine());
+        assert_eq!(scope.check_save(&plain), Ok(()));
+        scope.apply_saved(&plain);
+        assert_eq!(scope.block(), None);
+        assert!(!scope.release_quarantine(), "nothing left to release");
+        // Read-only: no save at all until released, then the first save wins.
+        let mut frozen = ScopeRecovery::from_restored(&restored_with(
+            DraftEnvelope::fresh(),
+            Some(QuarantineReason::TooLarge),
+        ));
+        assert_eq!(frozen.block(), Some(ScopeBlock::ReadOnly));
+        assert_eq!(frozen.check_save(&plain), Err(SaveRejected::ReadOnly));
+        assert_eq!(frozen.check_save(&carried), Err(SaveRejected::ReadOnly));
+        assert!(frozen.release_quarantine());
+        assert_eq!(frozen.check_save(&plain), Ok(()));
+        // Reloading the row re-arms the block; it was not normalized away.
+        frozen.apply_loaded(&restored_with(carried.clone(), None));
+        assert_eq!(frozen.block(), Some(ScopeBlock::Quarantined));
+        assert_eq!(frozen.check_save(&plain), Err(SaveRejected::QuarantineDropped));
+        assert!(!format!("{frozen:?}").contains("data-morpheus"));
+    }
+
+    #[test]
+    fn debug_output_carries_no_identifiers_or_text() {
         let (envelope, _) = queued_envelope();
         let rendered = format!("{envelope:?} {:?}", envelope.pending()[0]);
-        assert!(!rendered.contains("0123456789abcdef"));
-        assert!(!rendered.contains(&envelope.generation().0));
+        assert!(!rendered.contains(TXN));
+        assert!(!rendered.contains(envelope.generation().as_key()));
+        assert!(!rendered.contains("casey"));
+        let row = QuarantinedRow::new(QuarantineReason::Malformed, "<b>secret</b>").unwrap();
+        assert!(!format!("{row:?}").contains("secret"));
     }
 }

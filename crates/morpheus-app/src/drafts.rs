@@ -4,14 +4,21 @@
 //! The UI cache makes room switches immediate. Persistence uses the Matrix
 //! client's encrypted SQLite state store through the typed composer-draft
 //! row; no draft body or send record is written to the application config, a
-//! plaintext file or a raw store value. Text, generation, pending records and
-//! the room's thread index are one snapshot and one encrypted write.
+//! plaintext file or a raw store value. Live text, generation, every pending
+//! record with its complete typed text, and the room's thread index are one
+//! snapshot and one encrypted write.
 //!
 //! Generations are opaque: every user edit, including an edit back to the same
 //! text, gets a fresh one, so a send acknowledgement can only clear the exact
-//! submission it belongs to. Pending records are owned by nonce and exact SDK
-//! transaction id; nothing is adopted by content or time, and an unconfirmed
-//! record waits for the user's review instead of being resent or discarded.
+//! submission it belongs to. Each record keeps the text it was created from,
+//! so the message of a failed, cancelled or unconfirmed send survives later
+//! edits and submissions and can be reviewed, copied or restored one record
+//! at a time without touching newer live text. Pending records are owned by
+//! nonce and exact SDK transaction id; nothing is adopted by content or time,
+//! and an unconfirmed record waits for the user's review instead of being
+//! resent or discarded. A row this build cannot read is quarantined with its
+//! complete original and blocks sends (and, when too large to carry, saves)
+//! in that scope until the user explicitly discards it.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -21,11 +28,15 @@ use std::{
 
 use morpheus_matrix::{
     AccountManager, ComposeError, ComposeText, DraftEnvelope, Generation, MatrixCoreError,
-    PendingLimitError, PendingRecord, RestoredCompose,
+    PendingLimitError, PendingRecord, QuarantineReason, QuarantinedRow, RecordText,
+    RestoredCompose,
 };
 use tokio::sync::Mutex as AsyncMutex;
 
 pub type DraftKey = (String, String, Option<String>);
+
+/// Characters of a record's text shown beside its status.
+const PREVIEW_CHARS: usize = 48;
 
 fn key(account: &str, room: &str, thread: Option<&str>) -> DraftKey {
     (
@@ -47,15 +58,20 @@ pub enum PendingStatus {
     /// No SDK request and no acknowledgement are known for this record. Only
     /// the user's review resolves it.
     Unconfirmed,
+    /// Text kept after its request ended without evidence of delivery while
+    /// the composer held newer text. No request belongs to it.
+    Kept,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PendingError {
     /// The composer text or revision changed before the record was created.
     Mismatch,
-    /// Earlier send status in this scope could not be read; it must be
+    /// Saved data in this scope could not be read by this build; it must be
     /// reviewed before another send is recorded here.
     Unreadable,
+    /// An earlier send here is unconfirmed and must be reviewed first.
+    Unconfirmed,
     Limit(PendingLimitError),
 }
 
@@ -64,7 +80,10 @@ impl fmt::Display for PendingError {
         match self {
             Self::Mismatch => f.write_str("The message changed before it could be sent. Try again."),
             Self::Unreadable => f.write_str(
-                "Earlier send status for this conversation could not be read. Review it before sending again.",
+                "Saved send status for this conversation could not be read by this version. Review it before sending again.",
+            ),
+            Self::Unconfirmed => f.write_str(
+                "An earlier message here may not have finished sending. Check the conversation and choose before sending again.",
             ),
             Self::Limit(limit) => write!(f, "{limit}"),
         }
@@ -94,11 +113,32 @@ impl PendingHandle {
 /// Fixed facts for the composer status strip; no identifiers or text.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PendingSummary {
+    /// Records that still represent a send (not kept text).
     pub count: usize,
+    pub kept: usize,
     pub blocked: bool,
     pub unconfirmed: bool,
-    pub retained_available: bool,
-    pub metadata_unreadable: bool,
+    /// Saved data this build cannot read is carried; sends are refused.
+    pub quarantined: bool,
+    /// The saved row is too large to carry; nothing is written here.
+    pub read_only: bool,
+}
+
+impl PendingSummary {
+    pub fn blocks_sends(&self) -> bool {
+        self.unconfirmed || self.quarantined || self.read_only
+    }
+}
+
+/// One record as shown in the status strip.
+#[derive(Clone, Debug)]
+pub struct PendingItem {
+    pub nonce: Generation,
+    pub status: PendingStatus,
+    /// Leading characters of the record's text, for recognition only.
+    pub preview: String,
+    /// The SDK may still hold this request (cancel is meaningful).
+    pub has_request: bool,
 }
 
 /// Exact ownership needed to cancel or retry one queued request.
@@ -108,9 +148,17 @@ pub struct PendingTarget {
     pub transaction_id: String,
 }
 
+/// What happened to a record's text when its send ended without delivery.
+#[derive(Debug)]
 pub struct Resolution {
-    /// Retained submission text put back into the empty composer.
+    /// The record's text was put back into the empty composer.
     pub restored: Option<ComposeText>,
+    /// The composer held newer text, so the record's text is kept for the
+    /// user to restore, copy or discard.
+    pub kept: bool,
+    /// The scope's edit revision after this mutation. UI text may be applied
+    /// only while the revision is still this one.
+    pub revision: u64,
 }
 
 #[derive(Default)]
@@ -126,15 +174,25 @@ struct PendingDraft {
     generation: Generation,
     transaction_id: Option<String>,
     status: PendingStatus,
-}
-
-struct RetainedText {
-    nonce: Generation,
+    /// The complete typed text this record was created from.
     text: ComposeText,
 }
 
+impl PendingDraft {
+    fn awaits_send(&self) -> bool {
+        self.status != PendingStatus::Kept
+    }
+}
+
+enum Quarantine {
+    /// The complete original row rides in the envelope of every save.
+    Carried(QuarantinedRow),
+    /// The original row is too large to carry; the scope is never written.
+    ReadOnly(QuarantineReason),
+}
+
 struct CachedDraft {
-    /// Live composer text; empty while a submission is retained.
+    /// Live composer text.
     text: ComposeText,
     /// In-session edit counter used by UI completions.
     revision: u64,
@@ -144,11 +202,9 @@ struct CachedDraft {
     serial: u64,
     dirty: bool,
     pending: Vec<PendingDraft>,
-    retained: Option<RetainedText>,
-    /// Room scope only: thread roots whose rows hold pending records.
+    /// Room scope only: thread roots whose rows hold records.
     threads: Vec<String>,
-    /// Saved metadata this build could not read, carried until reviewed.
-    unreadable: Option<String>,
+    quarantine: Option<Quarantine>,
 }
 
 impl Default for CachedDraft {
@@ -160,11 +216,18 @@ impl Default for CachedDraft {
             serial: 0,
             dirty: false,
             pending: Vec::new(),
-            retained: None,
             threads: Vec::new(),
-            unreadable: None,
+            quarantine: None,
         }
     }
+}
+
+fn preview(text: &ComposeText) -> String {
+    let mut out: String = text.body.chars().take(PREVIEW_CHARS).collect();
+    if text.body.chars().nth(PREVIEW_CHARS).is_some() {
+        out.push('…');
+    }
+    out
 }
 
 impl CachedDraft {
@@ -176,56 +239,58 @@ impl CachedDraft {
         self.changed();
     }
 
-    /// A metadata or hide/restore change; the text generation is unchanged.
+    /// A metadata change; the text generation is unchanged.
     fn changed(&mut self) {
         self.serial = self.serial.wrapping_add(1);
         self.dirty = true;
     }
 
+    fn read_only(&self) -> bool {
+        matches!(self.quarantine, Some(Quarantine::ReadOnly(_)))
+    }
+
     fn envelope(&self) -> Result<DraftEnvelope, ComposeError> {
         let mut records = Vec::with_capacity(self.pending.len());
         for pending in &self.pending {
-            records.push(match &pending.transaction_id {
-                None => PendingRecord::enqueuing(pending.nonce.clone(), pending.generation.clone()),
-                Some(transaction_id) => PendingRecord::queued(
+            let text = RecordText::from_compose(&pending.text)
+                .map_err(|_| ComposeError::InvalidRecovery)?;
+            records.push(match (&pending.transaction_id, pending.status) {
+                (_, PendingStatus::Kept) => {
+                    PendingRecord::kept(pending.nonce.clone(), pending.generation.clone(), text)
+                }
+                (None, _) => {
+                    PendingRecord::enqueuing(pending.nonce.clone(), pending.generation.clone(), text)
+                }
+                (Some(transaction_id), _) => PendingRecord::queued(
                     pending.nonce.clone(),
                     pending.generation.clone(),
                     transaction_id,
+                    text,
                 )
                 .map_err(|_| ComposeError::InvalidRecovery)?,
             });
         }
-        let retained_for = self
-            .retained
-            .as_ref()
-            .filter(|_| self.text.body.is_empty())
-            .filter(|retained| self.pending.iter().any(|pending| pending.nonce == retained.nonce))
-            .map(|retained| retained.nonce.clone());
+        let quarantine = match &self.quarantine {
+            Some(Quarantine::Carried(row)) => Some(row.clone()),
+            _ => None,
+        };
         DraftEnvelope::restore(
             self.generation.clone(),
-            retained_for,
             records,
             self.threads.clone(),
-            self.unreadable.clone(),
+            quarantine,
         )
         .map_err(|_| ComposeError::InvalidRecovery)
     }
 
-    /// The text saved in the row: the live text, or the retained submission
-    /// while the composer is empty.
-    fn persisted_text(&self) -> ComposeText {
-        if self.text.body.is_empty()
-            && let Some(retained) = &self.retained
-            && self.pending.iter().any(|pending| pending.nonce == retained.nonce)
-        {
-            return retained.text.clone();
-        }
-        self.text.clone()
-    }
-
     fn summary(&self) -> PendingSummary {
         PendingSummary {
-            count: self.pending.len(),
+            count: self.pending.iter().filter(|pending| pending.awaits_send()).count(),
+            kept: self
+                .pending
+                .iter()
+                .filter(|pending| pending.status == PendingStatus::Kept)
+                .count(),
             blocked: self
                 .pending
                 .iter()
@@ -234,62 +299,125 @@ impl CachedDraft {
                 .pending
                 .iter()
                 .any(|pending| pending.status == PendingStatus::Unconfirmed),
-            retained_available: self.text.body.is_empty() && self.retained.is_some(),
-            metadata_unreadable: self.unreadable.is_some(),
+            quarantined: matches!(self.quarantine, Some(Quarantine::Carried(_))),
+            read_only: self.read_only(),
         }
     }
 
-    /// Put the retained submission back into an empty composer.
-    fn restore_retained(&mut self) -> Option<ComposeText> {
-        if !self.text.body.is_empty() {
+    fn items(&self) -> Vec<PendingItem> {
+        self.pending
+            .iter()
+            .map(|pending| PendingItem {
+                nonce: pending.nonce.clone(),
+                status: pending.status,
+                preview: preview(&pending.text),
+                has_request: pending.transaction_id.is_some()
+                    && matches!(
+                        pending.status,
+                        PendingStatus::Queued | PendingStatus::Paused { .. }
+                    ),
+            })
+            .collect()
+    }
+
+    /// Put a record's text into the empty composer, provided no edit happened
+    /// since the user asked (`expected_revision`). A kept record is consumed;
+    /// an awaiting record keeps its copy because its message may still send.
+    fn restore_record(&mut self, nonce: &Generation, expected_revision: u64) -> Option<Resolution> {
+        if !self.text.body.is_empty() || self.revision != expected_revision {
             return None;
         }
-        let retained = self.retained.take()?;
-        self.text = retained.text.clone();
+        let index = self.pending.iter().position(|pending| pending.nonce == *nonce)?;
+        let text = self.pending[index].text.clone();
+        if self.pending[index].status == PendingStatus::Kept {
+            self.pending.remove(index);
+        }
+        self.text = text.clone();
         self.edited();
-        Some(retained.text)
+        Some(Resolution {
+            restored: Some(text),
+            kept: false,
+            revision: self.revision,
+        })
+    }
+
+    /// The record's send is over without evidence of delivery: restore its
+    /// text into an empty composer, otherwise keep it beside the newer text.
+    fn end_without_delivery(&mut self, index: usize) -> Resolution {
+        if self.text.body.is_empty() {
+            let record = self.pending.remove(index);
+            self.text = record.text.clone();
+            self.edited();
+            Resolution {
+                restored: Some(record.text),
+                kept: false,
+                revision: self.revision,
+            }
+        } else {
+            let record = &mut self.pending[index];
+            record.status = PendingStatus::Kept;
+            record.transaction_id = None;
+            self.changed();
+            Resolution {
+                restored: None,
+                kept: true,
+                revision: self.revision,
+            }
+        }
+    }
+
+    fn resolved_sent(&mut self, index: usize) -> Resolution {
+        self.pending.remove(index);
+        self.changed();
+        Resolution {
+            restored: None,
+            kept: false,
+            revision: self.revision,
+        }
     }
 
     fn from_restored(restored: RestoredCompose, attached: Option<&[Generation]>) -> Self {
+        let read_only = restored.read_only;
         let envelope = restored.envelope;
-        let pending: Vec<PendingDraft> = envelope
-            .pending()
-            .iter()
-            .map(|record| PendingDraft {
+        let mut pending = Vec::with_capacity(envelope.pending().len());
+        for record in envelope.pending() {
+            // A record whose text cannot be rebuilt would have failed the
+            // envelope's own validation; this cannot drop a valid record.
+            let Ok(text) = record.text().to_compose() else {
+                continue;
+            };
+            pending.push(PendingDraft {
                 nonce: record.nonce().clone(),
                 generation: record.generation().clone(),
                 transaction_id: record.transaction_id().map(str::to_owned),
                 // A record from an earlier process is unconfirmed unless the
                 // selection-time discovery attached an exact SDK observer.
-                status: if record.is_queued()
+                status: if record.is_kept() {
+                    PendingStatus::Kept
+                } else if record.is_queued()
                     && attached.is_some_and(|attached| attached.contains(record.nonce()))
                 {
                     PendingStatus::Queued
                 } else {
                     PendingStatus::Unconfirmed
                 },
-            })
-            .collect();
-        let (text, retained) = match envelope.retained_for() {
-            Some(nonce) if pending.iter().any(|record| record.nonce == *nonce) => (
-                ComposeText::new(String::new(), restored.text.format),
-                Some(RetainedText {
-                    nonce: nonce.clone(),
-                    text: restored.text,
-                }),
-            ),
-            _ => (restored.text, None),
+                text,
+            });
+        }
+        let quarantine = match (read_only, envelope.quarantine()) {
+            (Some(reason), _) => Some(Quarantine::ReadOnly(reason)),
+            (None, Some(row)) => Some(Quarantine::Carried(row.clone())),
+            (None, None) => None,
         };
         Self {
-            text,
+            text: restored.text,
             revision: 0,
             generation: envelope.generation().clone(),
             serial: 0,
             dirty: false,
             pending,
-            retained,
             threads: envelope.threads().to_vec(),
-            unreadable: envelope.unreadable().map(str::to_owned),
+            quarantine,
         }
     }
 }
@@ -350,10 +478,6 @@ impl DraftStore {
         let draft = drafts
             .entry(key(account, room, thread))
             .or_insert_with(CachedDraft::default);
-        if !text.body.is_empty() {
-            // New text gives up the retained copy of an earlier submission.
-            draft.retained = None;
-        }
         draft.text = text;
         draft.edited();
         Ok(())
@@ -393,9 +517,6 @@ impl DraftStore {
         // `set` is called only for a user edit. Even an edit that ends with
         // the same text must prevent an old failed send from restoring over it.
         entry.text = entry.text.rebase_body(body.to_owned());
-        if !body.is_empty() {
-            entry.retained = None;
-        }
         entry.edited();
     }
 
@@ -429,10 +550,11 @@ impl DraftStore {
             .map(|draft| draft.revision)
     }
 
-    /// Record a send before the SDK sees it. The composer text and revision
-    /// must still match the submission; a thread accepts one waiting reply,
-    /// a room a bounded number. Unreadable earlier status blocks new records
-    /// until the user reviews it. The caller must persist before enqueueing.
+    /// Record a send, with its complete typed text, before the SDK sees it.
+    /// The composer text and revision must still match the submission; a
+    /// thread accepts one awaiting reply, a room a bounded number of records.
+    /// Quarantined or unconfirmed earlier status blocks new records until the
+    /// user reviews it. The caller must persist before enqueueing.
     pub fn begin_pending(
         &self,
         account: &str,
@@ -448,22 +570,25 @@ impl DraftStore {
         if draft.text != *submitted || draft.revision != revision {
             return Err(PendingError::Mismatch);
         }
-        if draft.unreadable.is_some()
-            || draft
-                .pending
-                .iter()
-                .any(|pending| pending.status == PendingStatus::Unconfirmed)
-        {
+        if draft.quarantine.is_some() {
             return Err(PendingError::Unreadable);
+        }
+        if draft
+            .pending
+            .iter()
+            .any(|pending| pending.status == PendingStatus::Unconfirmed)
+        {
+            return Err(PendingError::Unconfirmed);
         }
         let mut envelope = draft.envelope().map_err(|_| PendingError::Mismatch)?;
         let nonce = Generation::fresh();
-        envelope.begin_pending(nonce.clone(), draft.generation.clone(), thread.is_some())?;
+        envelope.begin_pending(nonce.clone(), draft.generation.clone(), submitted, thread.is_some())?;
         draft.pending.push(PendingDraft {
             nonce: nonce.clone(),
             generation: draft.generation.clone(),
             transaction_id: None,
             status: PendingStatus::Enqueuing,
+            text: submitted.clone(),
         });
         draft.changed();
         Ok(PendingHandle { nonce, revision })
@@ -482,11 +607,11 @@ impl DraftStore {
         let Some(draft) = drafts.get_mut(&key(account, room, thread)) else {
             return false;
         };
-        let Some(index) = draft
-            .pending
-            .iter()
-            .position(|pending| pending.nonce == *nonce && pending.transaction_id.is_none())
-        else {
+        let Some(index) = draft.pending.iter().position(|pending| {
+            pending.nonce == *nonce
+                && pending.transaction_id.is_none()
+                && pending.status == PendingStatus::Enqueuing
+        }) else {
             return false;
         };
         draft.pending.remove(index);
@@ -495,8 +620,8 @@ impl DraftStore {
     }
 
     /// Record the exact SDK transaction id. Returns whether the submission was
-    /// moved out of the composer into the retained copy, which happens only
-    /// when the composer is unchanged since `begin_pending`.
+    /// cleared from the composer, which happens only when the composer is
+    /// unchanged since `begin_pending`; the record keeps the text either way.
     pub fn mark_pending_queued(
         &self,
         account: &str,
@@ -515,22 +640,19 @@ impl DraftStore {
         {
             return None;
         }
-        let pending = draft
-            .pending
-            .iter_mut()
-            .find(|pending| pending.nonce == handle.nonce && pending.transaction_id.is_none())?;
+        let pending = draft.pending.iter_mut().find(|pending| {
+            pending.nonce == handle.nonce
+                && pending.transaction_id.is_none()
+                && pending.status == PendingStatus::Enqueuing
+        })?;
         pending.transaction_id = Some(transaction_id.to_owned());
         pending.status = PendingStatus::Queued;
         let hidden = draft.revision == handle.revision && !draft.text.body.is_empty();
         if hidden {
             let format = draft.text.format;
-            let submitted = std::mem::replace(&mut draft.text, ComposeText::new(String::new(), format));
-            draft.retained = Some(RetainedText {
-                nonce: handle.nonce.clone(),
-                text: submitted,
-            });
-            // Hiding is not a user edit: the generation stays with the retained
-            // submission so a later acknowledgement can match it exactly.
+            draft.text = ComposeText::new(String::new(), format);
+            // Clearing the sent submission is not a user edit: the generation
+            // stays so an acknowledgement for it still matches exactly.
             draft.revision = draft.revision.wrapping_add(1);
         }
         draft.changed();
@@ -549,20 +671,24 @@ impl DraftStore {
         let Some(draft) = drafts.get_mut(&key(account, room, thread)) else {
             return false;
         };
-        let Some(pending) = draft.pending.iter_mut().find(|pending| pending.nonce == *nonce) else {
+        let Some(pending) = draft
+            .pending
+            .iter_mut()
+            .find(|pending| pending.nonce == *nonce && pending.awaits_send())
+        else {
             return false;
         };
-        if pending.status == status {
-            return true;
+        if status == PendingStatus::Kept {
+            return false;
         }
         pending.status = status;
         // Statuses are in-session facts; the row is unchanged.
         true
     }
 
-    /// Resolve exactly one owned record. A sent record drops its retained
-    /// submission and never touches live text; a cancelled record puts the
-    /// retained submission back only into an empty composer.
+    /// Resolve exactly one owned record. A sent record leaves with its text;
+    /// a record that ended without delivery restores its text into an empty
+    /// composer or stays as kept text beside newer text.
     pub fn resolve_pending(
         &self,
         account: &str,
@@ -575,26 +701,14 @@ impl DraftStore {
         let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
         let draft = drafts.get_mut(&key(account, room, thread))?;
         let index = draft.pending.iter().position(|pending| {
-            pending.nonce == *nonce && pending.transaction_id.as_deref() == transaction_id
+            pending.nonce == *nonce
+                && pending.awaits_send()
+                && pending.transaction_id.as_deref() == transaction_id
         })?;
-        draft.pending.remove(index);
-        draft.changed();
-        let mut restored = None;
-        if draft
-            .retained
-            .as_ref()
-            .is_some_and(|retained| retained.nonce == *nonce)
-        {
-            if sent {
-                draft.retained = None;
-            } else {
-                restored = draft.restore_retained();
-                if restored.is_none() {
-                    draft.retained = None;
-                }
-            }
+        if sent {
+            return Some(draft.resolved_sent(index));
         }
-        Some(Resolution { restored })
+        Some(draft.end_without_delivery(index))
     }
 
     pub fn pending_summary(&self, account: &str, room: &str, thread: Option<&str>) -> PendingSummary {
@@ -606,16 +720,26 @@ impl DraftStore {
             .unwrap_or_default()
     }
 
+    pub fn pending_items(&self, account: &str, room: &str, thread: Option<&str>) -> Vec<PendingItem> {
+        self.by_room
+            .lock()
+            .expect("draft mutex poisoned")
+            .get(&key(account, room, thread))
+            .map(CachedDraft::items)
+            .unwrap_or_default()
+    }
+
     pub fn thread_send_pending(&self, account: &str, room: &str, root: &str) -> bool {
         self.pending_summary(account, room, Some(root)).count > 0
     }
 
-    /// The most recent request that can still be cancelled or retried.
-    pub fn cancellable_target(
+    /// Exact ownership of one request the SDK may still hold.
+    pub fn request_target(
         &self,
         account: &str,
         room: &str,
         thread: Option<&str>,
+        nonce: &Generation,
     ) -> Option<PendingTarget> {
         self.by_room
             .lock()
@@ -623,8 +747,8 @@ impl DraftStore {
             .get(&key(account, room, thread))?
             .pending
             .iter()
-            .rev()
-            .find_map(|pending| match (&pending.transaction_id, pending.status) {
+            .find(|pending| pending.nonce == *nonce)
+            .and_then(|pending| match (&pending.transaction_id, pending.status) {
                 (Some(transaction_id), PendingStatus::Queued | PendingStatus::Paused { .. }) => {
                     Some(PendingTarget {
                         nonce: pending.nonce.clone(),
@@ -656,63 +780,136 @@ impl DraftStore {
             .unwrap_or_default()
     }
 
-    /// The user checked the conversation and decided for every unconfirmed
-    /// record in the scope. `sent` drops the retained submission; otherwise
-    /// the retained text returns to an empty composer. Carried unreadable
-    /// status is discarded by the same review. Queued records that still have
-    /// an observer are untouched.
+    /// The user checked the conversation and decided for one unconfirmed
+    /// record. `sent` drops it with its text; otherwise the text returns to an
+    /// empty composer or is kept beside newer text. Nothing is sent.
     pub fn review_unconfirmed(
         &self,
         account: &str,
         room: &str,
         thread: Option<&str>,
+        nonce: &Generation,
         sent: bool,
     ) -> Option<Resolution> {
         let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
         let draft = drafts.get_mut(&key(account, room, thread))?;
-        let before = draft.pending.len();
-        let mut reviewed = Vec::new();
-        draft.pending.retain(|pending| {
-            if pending.status == PendingStatus::Unconfirmed {
-                reviewed.push(pending.nonce.clone());
-                false
-            } else {
-                true
-            }
-        });
-        let unreadable = draft.unreadable.take().is_some();
-        if draft.pending.len() == before && !unreadable {
-            return None;
+        let index = draft.pending.iter().position(|pending| {
+            pending.nonce == *nonce && pending.status == PendingStatus::Unconfirmed
+        })?;
+        if sent {
+            return Some(draft.resolved_sent(index));
         }
-        let mut restored = None;
-        if draft
-            .retained
-            .as_ref()
-            .is_some_and(|retained| reviewed.contains(&retained.nonce))
-        {
-            if sent {
-                draft.retained = None;
-            } else {
-                restored = draft.restore_retained();
-                if restored.is_none() {
-                    draft.retained = None;
-                }
-            }
-        }
-        draft.changed();
-        Some(Resolution { restored })
+        Some(draft.end_without_delivery(index))
     }
 
-    /// Put retained submission text back into an empty composer without
-    /// resolving its record; the message may still send.
-    pub fn restore_retained(
+    /// Put one record's text back into an empty composer whose revision is
+    /// still `expected_revision`. Kept text is consumed; an awaiting record
+    /// keeps its copy since it may still send.
+    pub fn restore_record_text(
         &self,
         account: &str,
         room: &str,
         thread: Option<&str>,
-    ) -> Option<ComposeText> {
+        nonce: &Generation,
+        expected_revision: u64,
+    ) -> Option<Resolution> {
         let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
-        drafts.get_mut(&key(account, room, thread))?.restore_retained()
+        drafts
+            .get_mut(&key(account, room, thread))?
+            .restore_record(nonce, expected_revision)
+    }
+
+    /// The exact transaction id saved for one record (`Some(None)` for a
+    /// record that never received one), as the core release requires.
+    pub fn record_transaction_id(
+        &self,
+        account: &str,
+        room: &str,
+        thread: Option<&str>,
+        nonce: &Generation,
+    ) -> Option<Option<String>> {
+        self.by_room
+            .lock()
+            .expect("draft mutex poisoned")
+            .get(&key(account, room, thread))?
+            .pending
+            .iter()
+            .find(|pending| pending.nonce == *nonce)
+            .map(|pending| pending.transaction_id.clone())
+    }
+
+    pub fn record_status(
+        &self,
+        account: &str,
+        room: &str,
+        thread: Option<&str>,
+        nonce: &Generation,
+    ) -> Option<PendingStatus> {
+        self.by_room
+            .lock()
+            .expect("draft mutex poisoned")
+            .get(&key(account, room, thread))?
+            .pending
+            .iter()
+            .find(|pending| pending.nonce == *nonce)
+            .map(|pending| pending.status)
+    }
+
+    /// A copy of one record's text, for the clipboard. The record is unchanged.
+    pub fn record_text(
+        &self,
+        account: &str,
+        room: &str,
+        thread: Option<&str>,
+        nonce: &Generation,
+    ) -> Option<ComposeText> {
+        self.by_room
+            .lock()
+            .expect("draft mutex poisoned")
+            .get(&key(account, room, thread))?
+            .pending
+            .iter()
+            .find(|pending| pending.nonce == *nonce)
+            .map(|pending| pending.text.clone())
+    }
+
+    /// Explicitly discard kept text. Only kept records can be discarded; a
+    /// record that still represents a send is resolved by its outcome.
+    pub fn discard_kept(
+        &self,
+        account: &str,
+        room: &str,
+        thread: Option<&str>,
+        nonce: &Generation,
+    ) -> bool {
+        let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
+        let Some(draft) = drafts.get_mut(&key(account, room, thread)) else {
+            return false;
+        };
+        let Some(index) = draft
+            .pending
+            .iter()
+            .position(|pending| pending.nonce == *nonce && pending.status == PendingStatus::Kept)
+        else {
+            return false;
+        };
+        draft.pending.remove(index);
+        draft.changed();
+        true
+    }
+
+    /// Explicit user discard of saved data this build could not read. The
+    /// scope becomes writable; the next save replaces the original row.
+    pub fn discard_quarantine(&self, account: &str, room: &str, thread: Option<&str>) -> bool {
+        let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
+        let Some(draft) = drafts.get_mut(&key(account, room, thread)) else {
+            return false;
+        };
+        if draft.quarantine.take().is_none() {
+            return false;
+        }
+        draft.changed();
+        true
     }
 
     /// Add a thread root to the room's discovery index. The room scope must be
@@ -722,6 +919,9 @@ impl DraftStore {
         let draft = drafts
             .get_mut(&key(account, room, None))
             .ok_or(PendingError::Mismatch)?;
+        if draft.read_only() {
+            return Err(PendingError::Unreadable);
+        }
         let mut envelope = draft.envelope().map_err(|_| PendingError::Mismatch)?;
         if envelope.index_thread(root)? {
             draft.threads.push(root.to_owned());
@@ -731,12 +931,12 @@ impl DraftStore {
     }
 
     /// Drop a thread root from the room index once that thread's cached scope
-    /// holds no record. Returns whether the room row changed.
+    /// holds no record of any kind. Returns whether the room row changed.
     pub fn unindex_thread_if_idle(&self, account: &str, room: &str, root: &str) -> bool {
         let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
         let idle = drafts
             .get(&key(account, room, Some(root)))
-            .is_some_and(|thread| thread.pending.is_empty());
+            .is_some_and(|thread| thread.pending.is_empty() && thread.quarantine.is_none());
         if !idle {
             return false;
         }
@@ -811,6 +1011,10 @@ impl DraftStore {
     /// queued records are re-checked against the discovery: a request the SDK
     /// no longer holds (it may have completed while this account was not
     /// selected and its observers had ended) becomes unconfirmed.
+    ///
+    /// `epoch` is the account epoch the caller read before it started waiting
+    /// for discovery: if the account was forgotten in between, nothing is
+    /// inserted, so erased plaintext never returns to the cache.
     pub fn seed_recovered(
         &self,
         account_id: &str,
@@ -818,8 +1022,8 @@ impl DraftStore {
         thread: Option<&str>,
         restored: RestoredCompose,
         attached: &[Generation],
+        epoch: u64,
     ) {
-        let epoch = self.account_epoch(account_id);
         self.insert_restored_if_missing(key(account_id, room_id, thread), restored, epoch, Some(attached));
     }
 
@@ -838,7 +1042,7 @@ impl DraftStore {
             text,
             discarded_rich_intent: false,
             envelope: DraftEnvelope::fresh(),
-            metadata_unreadable: false,
+            read_only: None,
         };
         self.insert_restored_if_missing(key, restored, epoch, None);
     }
@@ -874,7 +1078,7 @@ impl DraftStore {
                     return;
                 };
                 for pending in &mut entry.get_mut().pending {
-                    if pending.transaction_id.is_none() {
+                    if pending.transaction_id.is_none() || !pending.awaits_send() {
                         continue;
                     }
                     pending.status = if attached.contains(&pending.nonce) {
@@ -897,8 +1101,10 @@ impl DraftStore {
             .await
     }
 
-    /// Write one scope's text, generation, records and index as a single
-    /// encrypted row; delete the row only when nothing at all remains.
+    /// Write one scope's live text, generation, records and index as a single
+    /// encrypted row; delete the row only when nothing at all remains. A
+    /// read-only scope is never written: its original row stays in place and
+    /// the cache simply stops reporting it dirty.
     pub async fn persist_scoped(
         &self,
         manager: &AccountManager,
@@ -910,16 +1116,18 @@ impl DraftStore {
         // successful send clears the draft.
         let _write = self.write_lock.lock().await;
         let key = key(account_id, room_id, thread);
-        let Some((text, envelope, serial)) = self
-            .by_room
-            .lock()
-            .expect("draft mutex poisoned")
-            .get(&key)
-            .filter(|draft| draft.dirty)
-            .map(|draft| (draft.persisted_text(), draft.envelope(), draft.serial))
-        else {
-            return Ok(());
+        let snapshot = {
+            let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
+            let Some(draft) = drafts.get_mut(&key).filter(|draft| draft.dirty) else {
+                return Ok(());
+            };
+            if draft.read_only() {
+                draft.dirty = false;
+                return Ok(());
+            }
+            (draft.text.clone(), draft.envelope(), draft.serial)
         };
+        let (text, envelope, serial) = snapshot;
         let envelope = envelope?;
         manager
             .save_composed_draft_for(account_id, room_id, thread, &text, &envelope)
@@ -965,7 +1173,29 @@ impl DraftStore {
             .lock()
             .expect("draft mutex poisoned")
             .get(&key(account, room, thread))
-            .map(|draft| (draft.persisted_text(), draft.envelope().unwrap()))
+            .map(|draft| (draft.text.clone(), draft.envelope().unwrap()))
+    }
+
+    #[cfg(test)]
+    fn is_dirty(&self, account: &str, room: &str, thread: Option<&str>) -> bool {
+        self.by_room
+            .lock()
+            .expect("draft mutex poisoned")
+            .get(&key(account, room, thread))
+            .is_some_and(|draft| draft.dirty)
+    }
+
+    #[cfg(test)]
+    fn clear_dirty_like_a_write_would(&self, account: &str, room: &str, thread: Option<&str>) -> bool {
+        // Mirrors `persist_scoped` without a manager: read-only scopes drop
+        // the dirty flag without producing anything to write.
+        let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
+        let Some(draft) = drafts.get_mut(&key(account, room, thread)) else {
+            return false;
+        };
+        let writes = draft.dirty && !draft.read_only();
+        draft.dirty = false;
+        writes
     }
 }
 
@@ -977,56 +1207,29 @@ mod tests {
     const TXN_ONE: &str = "11111111111111111111111111111111";
     const TXN_TWO: &str = "22222222222222222222222222222222";
 
-    #[test]
-    fn reselection_rechecks_cached_queued_records_against_the_sdk_queue() {
-        let drafts = DraftStore::default();
-        drafts.insert_loaded_if_missing(key("a", "room", None), text(""), 0);
-        drafts.set("a", "room", "first");
-        let first = drafts
-            .begin_pending("a", "room", None, &text("first"), drafts.revision("a", "room").unwrap())
-            .unwrap();
-        assert_eq!(drafts.mark_pending_queued("a", "room", None, &first, TXN_ONE), Some(true));
-        drafts.set("a", "room", "second");
-        let second = drafts
-            .begin_pending("a", "room", None, &text("second"), drafts.revision("a", "room").unwrap())
-            .unwrap();
-        assert_eq!(drafts.mark_pending_queued("a", "room", None, &second, TXN_TWO), Some(true));
-        // Account switched away and back: the SDK still holds only the second
-        // request. The cached text and records stay; the first becomes
-        // unconfirmed and is never treated as sent.
-        let restored = RestoredCompose {
-            text: text("ignored"),
-            discarded_rich_intent: false,
-            envelope: DraftEnvelope::fresh(),
-            metadata_unreadable: false,
-        };
-        drafts.seed_recovered("a", "room", None, restored, &[second.nonce().clone()]);
-        let summary = drafts.pending_summary("a", "room", None);
-        assert_eq!((summary.count, summary.unconfirmed), (2, true));
-        assert!(drafts.cancellable_target("a", "room", None).is_some_and(|target| target.transaction_id == TXN_TWO));
-        assert!(drafts.begin_pending("a", "room", None, &text(""), drafts.revision("a", "room").unwrap()).is_err());
-        // Review keeps the queued second record and restores nothing: the
-        // retained copy belongs to the second submission.
-        let resolution = drafts.review_unconfirmed("a", "room", None, false).unwrap();
-        assert!(resolution.restored.is_none());
-        assert_eq!(drafts.pending_summary("a", "room", None).count, 1);
-        assert_eq!(drafts.get("a", "room"), "");
-        // A loaded-but-not-discovered scope is left alone by a plain load.
-        drafts.insert_loaded_if_missing(key("a", "room", None), text("late"), 0);
-        assert_eq!(drafts.get("a", "room"), "");
-    }
-
     fn text(body: &str) -> ComposeText {
         ComposeText::plain(body)
     }
 
+    fn typed() -> ComposeText {
+        ComposeText::plain("@casey:example.org look")
+            .insert_mention(0..18, morpheus_matrix::MentionTarget::User("@casey:example.org".into()))
+            .unwrap()
+            .0
+            .with_format(TextFormat::Markdown)
+    }
+
     fn begin(drafts: &DraftStore, account: &str, room: &str, thread: Option<&str>, body: &str) -> PendingHandle {
+        begin_typed(drafts, account, room, thread, text(body))
+    }
+
+    fn begin_typed(drafts: &DraftStore, account: &str, room: &str, thread: Option<&str>, value: ComposeText) -> PendingHandle {
         drafts
-            .set_composed_scoped(account, room, thread, text(body))
+            .set_composed_scoped(account, room, thread, value.clone())
             .unwrap();
         let revision = drafts.scoped_revision(account, room, thread).unwrap();
         drafts
-            .begin_pending(account, room, thread, &text(body), revision)
+            .begin_pending(account, room, thread, &value, revision)
             .unwrap()
     }
 
@@ -1036,8 +1239,23 @@ mod tests {
         let html = saved.encode_draft(&envelope).unwrap();
         let restored = ComposeText::restore_draft(saved.body.clone(), Some(&html));
         let fresh = DraftStore::default();
-        fresh.seed_recovered(account, room, thread, restored, attached);
+        fresh.seed_recovered(account, room, thread, restored, attached, fresh.account_epoch(account));
         fresh
+    }
+
+    fn restore(drafts: &DraftStore, account: &str, room: &str, thread: Option<&str>, nonce: &Generation) -> Option<ComposeText> {
+        let revision = drafts.scoped_revision(account, room, thread).unwrap();
+        drafts
+            .restore_record_text(account, room, thread, nonce, revision)
+            .and_then(|resolution| resolution.restored)
+    }
+
+    fn statuses(drafts: &DraftStore, account: &str, room: &str, thread: Option<&str>) -> Vec<PendingStatus> {
+        drafts
+            .pending_items(account, room, thread)
+            .iter()
+            .map(|item| item.status)
+            .collect()
     }
 
     #[test]
@@ -1066,63 +1284,105 @@ mod tests {
         assert_eq!(saved.body, "hello");
         assert_eq!(envelope.pending().len(), 1);
         assert!(!envelope.pending()[0].is_queued());
-        assert!(envelope.retained_for().is_none());
+        assert_eq!(envelope.pending()[0].text().to_compose().unwrap(), text("hello"));
         assert_eq!(drafts.mark_pending_queued("a", "room", None, &handle, TXN_ONE), Some(true));
-        assert_eq!(drafts.get("a", "room"), "");
+        assert_eq!(drafts.get("a", "room"), "", "the submission leaves the composer");
         let (saved, envelope) = drafts.snapshot("a", "room", None).unwrap();
-        assert_eq!(saved.body, "hello", "the submission stays retained in the row");
-        assert_eq!(envelope.retained_for(), Some(handle.nonce()));
+        assert_eq!(saved.body, "", "the live text is empty; the record holds the submission");
         assert_eq!(envelope.pending()[0].transaction_id(), Some(TXN_ONE));
-        // A same-text edit after queueing is a new generation: the row text
-        // becomes the live text and the retained copy is given up.
+        assert_eq!(envelope.pending()[0].text().to_compose().unwrap(), text("hello"));
+        // A same-text edit after queueing is a new generation; the record keeps
+        // the generation and text it was created from.
         drafts.set("a", "room", "hello");
         let (saved, envelope) = drafts.snapshot("a", "room", None).unwrap();
         assert_eq!(saved.body, "hello");
-        assert!(envelope.retained_for().is_none());
         assert_ne!(envelope.generation(), envelope.pending()[0].generation());
         assert!(drafts.resolve_pending("a", "room", None, handle.nonce(), Some(TXN_ONE), true).is_some());
         assert_eq!(drafts.get("a", "room"), "hello", "sent evidence never clears a later edit");
-        assert!(drafts.snapshot("a", "room", None).unwrap().1.is_empty());
+        assert!(drafts.snapshot("a", "room", None).unwrap().1.is_empty(), "acknowledged text is not kept");
     }
 
     #[test]
-    fn two_room_sends_resolve_independently_and_out_of_order() {
+    fn two_room_sends_keep_their_own_text_and_resolve_out_of_order() {
         let drafts = DraftStore::default();
-        let first = begin(&drafts, "a", "room", None, "first");
+        let first = begin_typed(&drafts, "a", "room", None, typed());
         assert_eq!(drafts.mark_pending_queued("a", "room", None, &first, TXN_ONE), Some(true));
         let second = begin(&drafts, "a", "room", None, "second");
         assert_eq!(drafts.mark_pending_queued("a", "room", None, &second, TXN_TWO), Some(true));
         assert_eq!(drafts.pending_summary("a", "room", None).count, 2);
+        assert_eq!(drafts.record_text("a", "room", None, first.nonce()).unwrap(), typed());
+        assert_eq!(drafts.record_text("a", "room", None, second.nonce()).unwrap().body, "second");
         // Wrong transaction for a nonce never resolves anything.
         assert!(drafts.resolve_pending("a", "room", None, first.nonce(), Some(TXN_TWO), true).is_none());
         assert!(drafts.resolve_pending("a", "room", None, first.nonce(), None, true).is_none());
-        // The later one is acknowledged first; the earlier record survives.
+        // The later one is acknowledged first; the earlier record and its
+        // typed text survive.
         assert!(drafts.resolve_pending("a", "room", None, second.nonce(), Some(TXN_TWO), true).is_some());
         assert_eq!(drafts.pending_summary("a", "room", None).count, 1);
-        assert_eq!(drafts.cancellable_target("a", "room", None).unwrap().transaction_id, TXN_ONE);
-        // Cancelling the first restores nothing: its retained copy was replaced by the second submission.
+        assert_eq!(drafts.request_target("a", "room", None, first.nonce()).unwrap().transaction_id, TXN_ONE);
+        // Cancelling the first with an empty composer restores its exact text.
         let resolution = drafts.resolve_pending("a", "room", None, first.nonce(), Some(TXN_ONE), false).unwrap();
-        assert!(resolution.restored.is_none());
-        assert_eq!(drafts.get("a", "room"), "");
+        assert_eq!(resolution.restored.unwrap(), typed());
+        assert!(!resolution.kept);
+        assert_eq!(drafts.get_composed_scoped("a", "room", None), typed());
         assert_eq!(drafts.pending_summary("a", "room", None), PendingSummary::default());
     }
 
     #[test]
-    fn cancellation_restores_retained_text_only_into_an_empty_composer() {
+    fn a_failed_send_keeps_its_text_beside_newer_text_until_the_user_decides() {
+        let drafts = DraftStore::default();
+        let first = begin_typed(&drafts, "a", "room", None, typed());
+        drafts.mark_pending_queued("a", "room", None, &first, TXN_ONE);
+        drafts.set("a", "room", "typed meanwhile");
+        // Cancelled while the composer holds newer text: nothing is overwritten
+        // and nothing is lost; the first text is kept.
+        let resolution = drafts.resolve_pending("a", "room", None, first.nonce(), Some(TXN_ONE), false).unwrap();
+        assert!(resolution.restored.is_none() && resolution.kept);
+        assert_eq!(drafts.get("a", "room"), "typed meanwhile");
+        let summary = drafts.pending_summary("a", "room", None);
+        assert_eq!((summary.count, summary.kept), (0, 1));
+        assert!(!drafts.thread_send_pending("a", "room", "unused") && !summary.blocks_sends());
+        assert_eq!(drafts.record_text("a", "room", None, first.nonce()).unwrap(), typed());
+        assert!(drafts.request_target("a", "room", None, first.nonce()).is_none(), "kept text owns no request");
+        // Kept text survives restart and further edits, including the same text.
+        drafts.set("a", "room", "typed meanwhile");
+        let after = reload(&drafts, "a", "room", None, &[]);
+        assert_eq!(statuses(&after, "a", "room", None), [PendingStatus::Kept]);
+        assert_eq!(after.record_text("a", "room", None, first.nonce()).unwrap(), typed());
+        assert_eq!(after.get("a", "room"), "typed meanwhile");
+        // Restoring never overwrites the composer; it works once it is empty
+        // and consumes the kept record.
+        assert!(restore(&after, "a", "room", None, first.nonce()).is_none());
+        after.set("a", "room", "");
+        // A stale revision (an edit happened since the click) is refused too.
+        let stale = after.revision("a", "room").unwrap().wrapping_sub(1);
+        assert!(after.restore_record_text("a", "room", None, first.nonce(), stale).is_none());
+        assert_eq!(restore(&after, "a", "room", None, first.nonce()).unwrap(), typed());
+        assert_eq!(after.get_composed_scoped("a", "room", None), typed());
+        assert!(after.snapshot("a", "room", None).unwrap().1.is_empty());
+        // Explicit discard is the only other way kept text leaves.
+        let other = reload(&drafts, "a", "room", None, &[]);
+        assert!(!other.discard_kept("a", "room", None, &Generation::fresh()));
+        assert!(other.discard_kept("a", "room", None, first.nonce()));
+        assert!(other.snapshot("a", "room", None).unwrap().1.is_empty());
+    }
+
+    #[test]
+    fn cancellation_restores_text_only_into_an_empty_composer() {
         let drafts = DraftStore::default();
         let handle = begin(&drafts, "a", "room", None, "unsent");
         drafts.mark_pending_queued("a", "room", None, &handle, TXN_ONE);
-        assert!(drafts.pending_summary("a", "room", None).retained_available);
         let resolution = drafts.resolve_pending("a", "room", None, handle.nonce(), Some(TXN_ONE), false).unwrap();
         assert_eq!(resolution.restored.unwrap().body, "unsent");
         assert_eq!(drafts.get("a", "room"), "unsent");
+        // A record whose request may still complete can be restored for
+        // editing without losing the record; the copy stays with it.
         let handle = begin(&drafts, "a", "room", None, "unsent");
-        drafts.mark_pending_queued("a", "room", None, &handle, TXN_TWO);
-        drafts.set("a", "room", "typed meanwhile");
-        assert!(!drafts.pending_summary("a", "room", None).retained_available);
-        let resolution = drafts.resolve_pending("a", "room", None, handle.nonce(), Some(TXN_TWO), false).unwrap();
-        assert!(resolution.restored.is_none());
-        assert_eq!(drafts.get("a", "room"), "typed meanwhile");
+        drafts.mark_pending_queued("a", "room", None, &handle, TXN_ONE);
+        assert_eq!(restore(&drafts, "a", "room", None, handle.nonce()).unwrap().body, "unsent");
+        assert_eq!(drafts.pending_summary("a", "room", None).count, 1);
+        assert!(drafts.resolve_pending("a", "room", None, handle.nonce(), Some(TXN_ONE), true).is_some());
+        assert_eq!(drafts.get("a", "room"), "unsent", "the restored copy is the user's now");
     }
 
     #[test]
@@ -1143,10 +1403,16 @@ mod tests {
         assert_eq!(saved.body, "");
         assert_eq!(envelope.threads().len(), 1);
         assert!(!envelope.is_empty());
-        // The index is dropped only once the thread holds no record.
+        // The index is dropped only once the thread holds no record at all,
+        // kept text included.
         assert!(!drafts.unindex_thread_if_idle("a", "room", "$root:example.org"));
         drafts.mark_pending_queued("a", "room", Some("$root:example.org"), &handle, TXN_ONE);
-        drafts.resolve_pending("a", "room", Some("$root:example.org"), handle.nonce(), Some(TXN_ONE), true);
+        drafts.set_scoped("a", "room", Some("$root:example.org"), "newer reply");
+        let resolution = drafts.resolve_pending("a", "room", Some("$root:example.org"), handle.nonce(), Some(TXN_ONE), false).unwrap();
+        assert!(resolution.kept);
+        assert!(!drafts.thread_send_pending("a", "room", "$root:example.org"), "kept text does not block the thread");
+        assert!(!drafts.unindex_thread_if_idle("a", "room", "$root:example.org"));
+        assert!(drafts.discard_kept("a", "room", Some("$root:example.org"), handle.nonce()));
         assert!(drafts.unindex_thread_if_idle("a", "room", "$root:example.org"));
         assert!(drafts.snapshot("a", "room", None).unwrap().1.is_empty());
         assert!(drafts.index_thread("a", "other-room", "$root:example.org").is_err(), "room scope must be loaded first");
@@ -1160,52 +1426,147 @@ mod tests {
         drafts.mark_pending_queued("a", "room", None, &queued, TXN_ONE);
         // Discovery found TXN_ONE in the SDK queue.
         let after = reload(&drafts, "a", "room", None, &[queued.nonce().clone()]);
-        let summary = after.pending_summary("a", "room", None);
-        assert_eq!(summary.count, 2);
-        assert!(summary.unconfirmed, "the enqueuing record is unconfirmed");
-        assert!(summary.retained_available);
-        assert_eq!(after.get("a", "room"), "", "retained submission stays hidden");
-        assert!(after.cancellable_target("a", "room", None).is_some());
+        assert_eq!(
+            statuses(&after, "a", "room", None),
+            [PendingStatus::Unconfirmed, PendingStatus::Queued]
+        );
+        assert_eq!(after.get("a", "room"), "", "the composer stays as it was");
+        assert_eq!(after.record_text("a", "room", None, enqueuing.nonce()).unwrap().body, "lost before id");
+        assert_eq!(after.record_text("a", "room", None, queued.nonce()).unwrap().body, "queued");
+        assert!(after.request_target("a", "room", None, queued.nonce()).is_some());
         // A new send is refused until the unconfirmed record is reviewed.
         assert!(matches!(
             after.begin_pending("a", "room", None, &text(""), after.revision("a", "room").unwrap()),
-            Err(PendingError::Unreadable)
+            Err(PendingError::Unconfirmed)
         ));
         // Nothing attached: queue absence is unknown, never success.
         let cold = reload(&drafts, "a", "room", None, &[]);
-        let summary = cold.pending_summary("a", "room", None);
-        assert!(summary.unconfirmed && summary.count == 2);
-        assert!(cold.cancellable_target("a", "room", None).is_none());
-        assert!(cold.resolve_pending("a", "room", None, enqueuing.nonce(), None, true).is_some());
-        // Review restores the retained text only into the empty composer and never sends.
-        let resolution = cold.review_unconfirmed("a", "room", None, false).unwrap();
+        assert_eq!(
+            statuses(&cold, "a", "room", None),
+            [PendingStatus::Unconfirmed, PendingStatus::Unconfirmed]
+        );
+        assert!(cold.request_target("a", "room", None, queued.nonce()).is_none());
+        // Review is per record. "It was sent" drops only that record; "not
+        // sent" puts its exact text back into the empty composer; the next
+        // "not sent" finds the composer occupied and keeps its text instead.
+        assert!(cold.review_unconfirmed("a", "room", None, enqueuing.nonce(), true).is_some());
+        assert!(cold.review_unconfirmed("a", "room", None, enqueuing.nonce(), true).is_none());
+        assert_eq!(cold.pending_summary("a", "room", None).count, 1);
+        let resolution = cold.review_unconfirmed("a", "room", None, queued.nonce(), false).unwrap();
         assert_eq!(resolution.restored.unwrap().body, "queued");
         assert_eq!(cold.pending_summary("a", "room", None), PendingSummary::default());
         assert_eq!(cold.get("a", "room"), "queued");
+        let busy = reload(&drafts, "a", "room", None, &[]);
+        busy.set("a", "room", "writing something else");
+        let resolution = busy.review_unconfirmed("a", "room", None, queued.nonce(), false).unwrap();
+        assert!(resolution.kept);
+        assert_eq!(busy.get("a", "room"), "writing something else");
+        assert_eq!(busy.record_text("a", "room", None, queued.nonce()).unwrap().body, "queued");
     }
 
     #[test]
-    fn unreadable_metadata_is_carried_blocks_new_sends_and_clears_only_on_review() {
+    fn reselection_rechecks_cached_queued_records_against_the_sdk_queue() {
+        let drafts = DraftStore::default();
+        drafts.insert_loaded_if_missing(key("a", "room", None), text(""), 0);
+        drafts.set("a", "room", "first");
+        let first = drafts
+            .begin_pending("a", "room", None, &text("first"), drafts.revision("a", "room").unwrap())
+            .unwrap();
+        assert_eq!(drafts.mark_pending_queued("a", "room", None, &first, TXN_ONE), Some(true));
+        drafts.set("a", "room", "second");
+        let second = drafts
+            .begin_pending("a", "room", None, &text("second"), drafts.revision("a", "room").unwrap())
+            .unwrap();
+        assert_eq!(drafts.mark_pending_queued("a", "room", None, &second, TXN_TWO), Some(true));
+        // Account switched away and back: the SDK still holds only the second
+        // request. The cached text and records stay; the first becomes
+        // unconfirmed and is never treated as sent.
+        let restored = RestoredCompose {
+            text: text("ignored"),
+            discarded_rich_intent: false,
+            envelope: DraftEnvelope::fresh(),
+            read_only: None,
+        };
+        drafts.seed_recovered("a", "room", None, restored, &[second.nonce().clone()], drafts.account_epoch("a"));
+        assert_eq!(
+            statuses(&drafts, "a", "room", None),
+            [PendingStatus::Unconfirmed, PendingStatus::Queued]
+        );
+        assert!(drafts.request_target("a", "room", None, second.nonce()).is_some());
+        assert!(drafts.begin_pending("a", "room", None, &text(""), drafts.revision("a", "room").unwrap()).is_err());
+        // Reviewing the first as not sent restores its own text; the second
+        // record is untouched.
+        let resolution = drafts.review_unconfirmed("a", "room", None, first.nonce(), false).unwrap();
+        assert_eq!(resolution.restored.unwrap().body, "first");
+        assert_eq!(statuses(&drafts, "a", "room", None), [PendingStatus::Queued]);
+        assert_eq!(drafts.get("a", "room"), "first");
+        // A loaded-but-not-discovered scope is left alone by a plain load.
+        drafts.insert_loaded_if_missing(key("a", "room", None), text("late"), 0);
+        assert_eq!(drafts.get("a", "room"), "first");
+    }
+
+    #[test]
+    fn quarantined_rows_block_sends_persist_through_edits_and_clear_only_on_explicit_discard() {
         let drafts = DraftStore::default();
         drafts.set("a", "room", "typed");
         let (saved, envelope) = drafts.snapshot("a", "room", None).unwrap();
-        let html = saved.encode_draft(&envelope).unwrap().replace("data-morpheus-meta=\"", "data-morpheus-meta=\"ff");
-        let restored = ComposeText::restore_draft(saved.body.clone(), Some(&html));
-        assert!(restored.metadata_unreadable);
+        let broken = saved.encode_draft(&envelope).unwrap().replace("data-morpheus-meta=\"", "data-morpheus-meta=\"ff");
+        let restored = ComposeText::restore_draft(saved.body.clone(), Some(&broken));
+        assert_eq!(restored.blocked(), Some(QuarantineReason::Malformed));
         let fresh = DraftStore::default();
-        fresh.seed_recovered("a", "room", None, restored, &[]);
+        fresh.seed_recovered("a", "room", None, restored, &[], fresh.account_epoch("a"));
         assert_eq!(fresh.get("a", "room"), "typed");
-        assert!(fresh.pending_summary("a", "room", None).metadata_unreadable);
+        let summary = fresh.pending_summary("a", "room", None);
+        assert!(summary.quarantined && !summary.read_only && summary.blocks_sends());
         assert!(matches!(
             fresh.begin_pending("a", "room", None, &text("typed"), fresh.revision("a", "room").unwrap()),
             Err(PendingError::Unreadable)
         ));
-        // Edits persist and keep carrying the unreadable data.
+        // Edits persist and keep carrying the complete original row, through
+        // another restart as well.
         fresh.set("a", "room", "typed more");
-        assert!(fresh.snapshot("a", "room", None).unwrap().1.unreadable().is_some());
-        assert!(fresh.review_unconfirmed("a", "room", None, true).is_some());
-        assert!(!fresh.pending_summary("a", "room", None).metadata_unreadable);
-        assert!(fresh.snapshot("a", "room", None).unwrap().1.is_empty());
+        let (_, envelope) = fresh.snapshot("a", "room", None).unwrap();
+        assert_eq!(envelope.quarantine().unwrap().original_html().as_deref(), Some(broken.as_str()));
+        let again = reload(&fresh, "a", "room", None, &[]);
+        assert_eq!(again.get("a", "room"), "typed more");
+        assert!(again.pending_summary("a", "room", None).quarantined);
+        assert_eq!(
+            again.snapshot("a", "room", None).unwrap().1.quarantine().unwrap().original_html().as_deref(),
+            Some(broken.as_str())
+        );
+        // Only the explicit discard clears it; reviewing records does not.
+        assert!(again.review_unconfirmed("a", "room", None, &Generation::fresh(), true).is_none());
+        assert!(again.pending_summary("a", "room", None).quarantined);
+        assert!(again.discard_quarantine("a", "room", None));
+        assert!(!again.discard_quarantine("a", "room", None));
+        assert!(!again.pending_summary("a", "room", None).blocks_sends());
+        assert!(again.snapshot("a", "room", None).unwrap().1.is_empty());
+        assert!(again.is_dirty("a", "room", None));
+    }
+
+    #[test]
+    fn read_only_rows_are_never_written_until_explicitly_discarded() {
+        let restored = RestoredCompose {
+            text: text("shown but frozen"),
+            discarded_rich_intent: false,
+            envelope: DraftEnvelope::fresh(),
+            read_only: Some(QuarantineReason::TooLarge),
+        };
+        let drafts = DraftStore::default();
+        drafts.seed_recovered("a", "room", None, restored, &[], drafts.account_epoch("a"));
+        let summary = drafts.pending_summary("a", "room", None);
+        assert!(summary.read_only && summary.blocks_sends());
+        drafts.set("a", "room", "edited anyway");
+        assert!(drafts.is_dirty("a", "room", None));
+        assert!(!drafts.clear_dirty_like_a_write_would("a", "room", None), "no write is produced");
+        assert!(matches!(
+            drafts.begin_pending("a", "room", None, &text("edited anyway"), drafts.revision("a", "room").unwrap()),
+            Err(PendingError::Unreadable)
+        ));
+        assert!(drafts.index_thread("a", "room", "$root:example.org").is_err());
+        assert!(drafts.discard_quarantine("a", "room", None));
+        assert!(drafts.clear_dirty_like_a_write_would("a", "room", None), "writes resume after the explicit discard");
+        assert!(!drafts.pending_summary("a", "room", None).blocks_sends());
     }
 
     #[test]
@@ -1229,6 +1590,8 @@ mod tests {
         let queued = begin(&other, "a", "room", None, "never enqueued");
         other.mark_pending_queued("a", "room", None, &queued, TXN_ONE);
         assert!(!other.abandon_pending("a", "room", None, queued.nonce()), "a queued record is never abandoned");
+        drafts.set("a", "room", "");
+        assert!(drafts.resolve_pending("a", "room", None, &Generation::fresh(), Some(TXN_ONE), false).is_none());
     }
 
     #[test]
@@ -1238,7 +1601,7 @@ mod tests {
         drafts.set("a", "room", "edited during enqueue");
         assert_eq!(drafts.mark_pending_queued("a", "room", None, &handle, TXN_ONE), Some(false));
         assert_eq!(drafts.get("a", "room"), "edited during enqueue");
-        assert!(!drafts.pending_summary("a", "room", None).retained_available);
+        assert_eq!(drafts.record_text("a", "room", None, handle.nonce()).unwrap().body, "draft");
         assert!(drafts.mark_pending_queued("a", "room", None, &handle, TXN_TWO).is_none(), "already queued");
         let second = begin(&drafts, "a", "room", None, "edited during enqueue");
         assert!(drafts.mark_pending_queued("a", "room", None, &second, TXN_ONE).is_none(), "duplicate transaction");
@@ -1247,6 +1610,7 @@ mod tests {
             drafts.begin_pending("a", "room", None, &text("other"), drafts.revision("a", "room").unwrap()),
             Err(PendingError::Mismatch)
         ));
+        assert!(!drafts.set_pending_status("a", "room", None, handle.nonce(), PendingStatus::Kept), "kept is an outcome, not a status");
     }
 
     #[test]
@@ -1296,24 +1660,59 @@ mod tests {
     }
 
     #[test]
-    fn markdown_intent_and_mentions_survive_the_recovery_row_round_trip() {
+    fn markdown_intent_and_mentions_survive_the_recovery_row_round_trip_per_record() {
         let drafts = DraftStore::default();
-        let typed = ComposeText::plain("@casey:example.org")
-            .insert_mention(0..18, morpheus_matrix::MentionTarget::User("@casey:example.org".into()))
-            .unwrap()
-            .0
-            .with_format(TextFormat::Markdown);
-        drafts.set_composed_scoped("a", "room", None, typed.clone()).unwrap();
-        let handle = begin(&drafts, "a", "room", None, &typed.body);
-        // begin() rebuilt plain text; use the typed submission for the record instead.
-        assert!(drafts.abandon_pending("a", "room", None, handle.nonce()));
-        drafts.set_composed_scoped("a", "room", None, typed.clone()).unwrap();
-        let revision = drafts.revision("a", "room").unwrap();
-        let handle = drafts.begin_pending("a", "room", None, &typed, revision).unwrap();
+        let handle = begin_typed(&drafts, "a", "room", None, typed());
         drafts.mark_pending_queued("a", "room", None, &handle, TXN_ONE);
+        // The user types a plain follow-up that replaces the live text.
+        drafts.set_composed_scoped("a", "room", None, text("plain follow-up")).unwrap();
         let after = reload(&drafts, "a", "room", None, &[handle.nonce().clone()]);
+        assert_eq!(after.get_composed_scoped("a", "room", None), text("plain follow-up"));
+        assert_eq!(after.record_text("a", "room", None, handle.nonce()).unwrap(), typed());
         let resolution = after.resolve_pending("a", "room", None, handle.nonce(), Some(TXN_ONE), false).unwrap();
-        assert_eq!(resolution.restored.unwrap(), typed);
-        assert_eq!(after.get_composed_scoped("a", "room", None), typed);
+        assert!(resolution.kept);
+        after.set("a", "room", "");
+        assert_eq!(restore(&after, "a", "room", None, handle.nonce()).unwrap(), typed());
+        assert_eq!(after.get_composed_scoped("a", "room", None), typed());
+    }
+
+    #[test]
+    fn adoption_after_forget_cannot_repopulate_the_erased_cache() {
+        // The real adoption path reads the epoch before it waits for the core,
+        // then seeds with that epoch. A removal in between must win.
+        let drafts = DraftStore::default();
+        let handle = begin(&drafts, "a", "room", None, "private");
+        drafts.mark_pending_queued("a", "room", None, &handle, TXN_ONE);
+        let (saved, envelope) = drafts.snapshot("a", "room", None).unwrap();
+        let restored = ComposeText::restore_draft(saved.body.clone(), Some(&saved.encode_draft(&envelope).unwrap()));
+        let epoch_before_wait = drafts.account_epoch("a");
+        drafts.forget_account("a");
+        drafts.seed_recovered("a", "room", None, restored, &[handle.nonce().clone()], epoch_before_wait);
+        assert_eq!(drafts.pending_summary("a", "room", None), PendingSummary::default());
+        assert_eq!(drafts.get("a", "room"), "");
+        assert!(drafts.record_text("a", "room", None, handle.nonce()).is_none());
+        // With the current epoch the same seed is accepted: the check is the
+        // epoch, not the data.
+        let again = DraftStore::default();
+        let (saved, envelope) = (saved, envelope);
+        let restored = ComposeText::restore_draft(saved.body.clone(), Some(&saved.encode_draft(&envelope).unwrap()));
+        again.seed_recovered("a", "room", None, restored, &[handle.nonce().clone()], again.account_epoch("a"));
+        assert_eq!(again.pending_summary("a", "room", None).count, 1);
+    }
+
+    #[test]
+    fn previews_are_short_and_items_carry_exact_ownership() {
+        let drafts = DraftStore::default();
+        let long = "x".repeat(200);
+        let handle = begin(&drafts, "a", "room", None, &long);
+        drafts.mark_pending_queued("a", "room", None, &handle, TXN_ONE);
+        let items = drafts.pending_items("a", "room", None);
+        assert_eq!(items.len(), 1);
+        assert_eq!(&items[0].nonce, handle.nonce());
+        assert_eq!(items[0].preview.chars().count(), PREVIEW_CHARS + 1);
+        assert!(items[0].has_request && items[0].status == PendingStatus::Queued);
+        assert!(drafts.set_pending_status("a", "room", None, handle.nonce(), PendingStatus::Paused { recoverable: false }));
+        assert_eq!(drafts.paused_targets("a", "room", None).len(), 1);
+        assert!(drafts.pending_summary("a", "room", None).blocked);
     }
 }

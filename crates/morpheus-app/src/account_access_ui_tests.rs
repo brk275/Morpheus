@@ -944,9 +944,20 @@ async fn exercise_account_ui(runtime: Handle) {
     ui.set_attachment_status("private upload name".into());
     ui.set_security_recovery_input("synthetic recovery input".into());
     ui.set_security_recovery_key("synthetic recovery output".into());
+    assert_recovery_strip_projection(&ui).await;
     live.account_detached(ui.as_weak()).await;
     settle(&ui).await;
     assert!(!ui.get_live_session());
+    // Both saved-send strips are cleared by the real detach path; no departed
+    // scope's records, flags or notices survive.
+    assert_eq!(ui.get_composer_pending_items().row_count(), 0);
+    assert_eq!(ui.get_thread_pending_items().row_count(), 0);
+    assert!(!ui.get_thread_send_pending());
+    assert!(!ui.get_composer_unconfirmed() && !ui.get_thread_unconfirmed());
+    assert!(!ui.get_composer_pending_blocked() && !ui.get_thread_pending_blocked());
+    assert_eq!(ui.get_composer_pending_count(), 0);
+    assert!(ui.get_composer_blocked_notice().is_empty());
+    assert!(ui.get_thread_blocked_notice().is_empty());
     assert!(ui.get_show_sign_in());
     assert!(ui.get_active_account_local_id().is_empty());
     assert!(ui.get_active_account_handle().is_empty());
@@ -996,4 +1007,193 @@ async fn exercise_account_ui(runtime: Handle) {
     .expect("draft worker must release the profile before cleanup");
     drop(manager);
     directory.close().unwrap();
+}
+
+/// Where the real generated controls with a given accessible label sit, as
+/// window-relative left and right edges. Empty when none is instantiated.
+fn control_extents(ui: &AppWindow, label: &str) -> Vec<(f32, f32)> {
+    use slint::private_unstable_api::re_exports::{
+        AccessibleStringProperty, ItemRc, LogicalPoint, WindowInner,
+    };
+    use std::ops::ControlFlow;
+
+    let window = WindowInner::from_pub(ui.window());
+    let root = ItemRc::new_root(window.component());
+    let mut extents = Vec::new();
+    let _ = root.visit_descendants(|item| {
+        if item
+            .accessible_string_property(AccessibleStringProperty::Label)
+            .as_deref()
+            == Some(label)
+        {
+            let origin = item.map_to_window(LogicalPoint::default());
+            let size = item.geometry().size;
+            extents.push((origin.x, origin.x + size.width));
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    extents
+}
+
+const CANCEL_LABEL: &str =
+    "Cancel sending this message; a message that already reached the server stays sent";
+const KEEP_LABEL: &str = "Not sent: keep this message's text";
+const SENT_LABEL: &str = "It was sent: drop this saved message without resending";
+const RESTORE_LABEL: &str = "Restore this message's text into the empty composer";
+const COPY_LABEL: &str = "Copy this message's text to the system clipboard";
+const DISCARD_UNREADABLE_LABEL: &str =
+    "Discard saved send status this version cannot read; your typed text stays";
+
+/// The per-record saved-send surface in the real generated window: one block
+/// per record with its own exact controls, keyboard reachable, routing the
+/// record's opaque key and never another record's; the narrow thread pane at
+/// 200% text stacks the controls inside the window instead of clipping them.
+async fn assert_recovery_strip_projection(ui: &AppWindow) {
+    use crate::draft_recovery;
+    use crate::drafts::{PendingItem, PendingStatus, PendingSummary};
+    use morpheus_matrix::Generation;
+    use std::{cell::RefCell, rc::Rc};
+
+    let previous_scale = ui.get_font_scale_percent();
+    ui.set_live_session(true);
+    ui.set_show_side_panel(true);
+    ui.set_active_account_local_id("presentation-only".into());
+    ui.set_active_room_id("!presentation:example.org".into());
+    ui.set_composer_text("".into());
+    let waiting = Generation::fresh();
+    let unconfirmed = Generation::fresh();
+    let kept = Generation::fresh();
+    let items = vec![
+        PendingItem {
+            nonce: waiting.clone(),
+            status: PendingStatus::Queued,
+            preview: "first fictional message".into(),
+            has_request: true,
+        },
+        PendingItem {
+            nonce: unconfirmed.clone(),
+            status: PendingStatus::Unconfirmed,
+            preview: "second fictional message".into(),
+            has_request: false,
+        },
+        PendingItem {
+            nonce: kept.clone(),
+            status: PendingStatus::Kept,
+            preview: "third fictional message".into(),
+            has_request: false,
+        },
+    ];
+    let summary = PendingSummary {
+        count: 2,
+        kept: 1,
+        blocked: false,
+        unconfirmed: true,
+        quarantined: false,
+        read_only: false,
+    };
+    draft_recovery::publish_room(ui, &summary, &items);
+    settle(ui).await;
+    assert_eq!(ui.get_composer_pending_items().row_count(), 3);
+    assert!(ui.get_composer_unconfirmed());
+    // Exactly one record offers Cancel, exactly one offers the review pair,
+    // every record offers Copy, and Restore appears only for an empty composer.
+    assert_eq!(control_extents(ui, CANCEL_LABEL).len(), 1);
+    assert_eq!(control_extents(ui, KEEP_LABEL).len(), 1);
+    assert_eq!(control_extents(ui, SENT_LABEL).len(), 1);
+    assert_eq!(control_extents(ui, COPY_LABEL).len(), 3);
+    assert_eq!(control_extents(ui, RESTORE_LABEL).len(), 3);
+    assert!(control_extents(ui, DISCARD_UNREADABLE_LABEL).is_empty());
+    ui.set_composer_text("typing something newer".into());
+    settle(ui).await;
+    assert!(control_extents(ui, RESTORE_LABEL).is_empty(), "restore never offers to overwrite typed text");
+    ui.set_composer_text("".into());
+    settle(ui).await;
+
+    // Controls route the exact record key of the block they belong to.
+    let cancelled: Rc<RefCell<Vec<(bool, String)>>> = Rc::default();
+    let reviewed: Rc<RefCell<Vec<(bool, String, bool)>>> = Rc::default();
+    let sink = cancelled.clone();
+    ui.on_cancel_pending_send(move |threaded, key| sink.borrow_mut().push((threaded, key.to_string())));
+    let sink = reviewed.clone();
+    ui.on_review_unconfirmed_send(move |threaded, key, sent| {
+        sink.borrow_mut().push((threaded, key.to_string(), sent))
+    });
+    tab_to_control(ui, CANCEL_LABEL);
+    key(ui, Key::Return);
+    assert_eq!(cancelled.borrow().as_slice(), [(false, waiting.as_key().to_owned())]);
+    tab_to_control(ui, KEEP_LABEL);
+    key(ui, Key::Return);
+    assert_eq!(
+        reviewed.borrow().as_slice(),
+        [(false, unconfirmed.as_key().to_owned(), false)]
+    );
+    assert_eq!(cancelled.borrow().len(), 1, "the review control never cancels");
+
+    // The fixed notice for unreadable saved data offers only the explicit discard.
+    let blocked = PendingSummary {
+        quarantined: true,
+        ..PendingSummary::default()
+    };
+    draft_recovery::publish_room(ui, &blocked, &[]);
+    settle(ui).await;
+    assert!(!ui.get_composer_blocked_notice().is_empty());
+    assert_eq!(control_extents(ui, DISCARD_UNREADABLE_LABEL).len(), 1);
+    assert!(control_extents(ui, CANCEL_LABEL).is_empty());
+    let discards: Rc<RefCell<Vec<bool>>> = Rc::default();
+    let sink = discards.clone();
+    ui.on_discard_unreadable_status(move |threaded| sink.borrow_mut().push(threaded));
+    tab_to_control(ui, DISCARD_UNREADABLE_LABEL);
+    key(ui, Key::Return);
+    assert_eq!(discards.borrow().as_slice(), [false]);
+    draft_recovery::publish_room(ui, &PendingSummary::default(), &[]);
+    settle(ui).await;
+    assert!(ui.get_composer_blocked_notice().is_empty());
+
+    // Narrow thread pane at 200% text: the same records, stacked controls,
+    // every control inside the window and still keyboard reachable.
+    ui.set_font_scale_percent(200);
+    ui.set_thread_root_id("$presentation-root:example.org".into());
+    ui.set_thread_root_body("Fictional thread root".into());
+    ui.set_thread_composer_text("".into());
+    tab_to_control(ui, "Show thread");
+    key(ui, Key::Return);
+    let thread_summary = PendingSummary {
+        count: 1,
+        kept: 1,
+        blocked: false,
+        unconfirmed: true,
+        quarantined: false,
+        read_only: false,
+    };
+    draft_recovery::publish_thread(ui, &thread_summary, &items[1..]);
+    settle(ui).await;
+    assert_eq!(ui.get_thread_pending_items().row_count(), 2);
+    assert!(ui.get_thread_send_pending());
+    let window_width = ui.window().size().to_logical(ui.window().scale_factor()).width;
+    let mut seen = 0;
+    for label in [KEEP_LABEL, SENT_LABEL, COPY_LABEL, RESTORE_LABEL] {
+        let extents = control_extents(ui, label);
+        assert!(!extents.is_empty(), "{label} must be instantiated in the thread pane");
+        for (left, right) in extents {
+            assert!(right > left, "{label} has no width");
+            assert!(left >= 0.0 && right <= window_width + 0.5, "{label} is clipped: {left}..{right} of {window_width}");
+            seen += 1;
+        }
+    }
+    assert!(seen >= 6);
+    // Only the first keep-control appears for the only unconfirmed record.
+    assert_eq!(control_extents(ui, KEEP_LABEL).len(), 1);
+    let thread_reviews: Rc<RefCell<Vec<(bool, String, bool)>>> = Rc::default();
+    let sink = thread_reviews.clone();
+    ui.on_review_unconfirmed_send(move |threaded, key, sent| {
+        sink.borrow_mut().push((threaded, key.to_string(), sent))
+    });
+    tab_to_control(ui, SENT_LABEL);
+    key(ui, Key::Return);
+    assert_eq!(
+        thread_reviews.borrow().as_slice(),
+        [(true, unconfirmed.as_key().to_owned(), true)]
+    );
+    ui.set_font_scale_percent(previous_scale);
+    settle(ui).await;
 }

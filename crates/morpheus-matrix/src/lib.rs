@@ -28,8 +28,10 @@ pub use compose::{ComposeError, ComposeText, MentionSpan, MentionTarget, Restore
 mod draft_recovery;
 pub use draft_recovery::{
     DraftEnvelope, Generation, MAX_PENDING_RECORDS, MAX_THREAD_INDEX, PendingLimitError,
-    PendingRecord, RecoveryCodecError, valid_transaction_id,
+    PendingRecord, QuarantineReason, QuarantinedRow, RecordText, RecoveryCodecError, ScopeBlock,
+    valid_transaction_id,
 };
+use draft_recovery::ScopeRecovery;
 mod account_access;
 mod account_selection;
 pub use account_access::{
@@ -161,6 +163,12 @@ pub enum MatrixCoreError {
     PendingSendUnknown,
     #[error("This message is no longer waiting to send. Check the conversation.")]
     PendingSendUnavailable,
+    #[error("Saved send status for this room is still being checked. Try again in a moment.")]
+    RecoveryIncomplete,
+    #[error("Saved send status here must be reviewed before sending.")]
+    RecoveryBlocked,
+    #[error("The saved draft changed underneath this edit; it will be saved again.")]
+    StaleDraftSnapshot,
     #[error("room not found: {0}")]
     RoomNotFound(String),
     #[error("invalid room ID: {0}")]
@@ -458,6 +466,23 @@ pub struct RecoveredDraft {
 
 type PendingScope = (String, Option<String>);
 
+/// Discovery progress for one loaded account. The SDK send queue is enabled
+/// only once discovery has run; rooms it could not read stay disabled until
+/// they are scanned on demand.
+#[derive(Default)]
+struct RecoveryGate {
+    /// Incremented by every `start_sync`; a scan from an earlier epoch may
+    /// not enable anything.
+    epoch: u64,
+    complete: bool,
+    unscanned: HashSet<String>,
+    /// Rooms with a quarantined or read-only scope. Their persisted requests
+    /// cannot be matched to saved records, so their queues stay paused until
+    /// the user discards the unreadable data.
+    blocked: HashSet<String>,
+    scan: Option<JoinHandle<()>>,
+}
+
 impl QueuedMessage {
     pub fn transaction_id(&self) -> &str {
         &self.transaction_id
@@ -647,13 +672,17 @@ struct LoadedAccount {
     client: Client,
     timelines: Mutex<HashMap<String, Arc<Timeline>>>,
     composed_edits: Mutex<HashMap<(String, String), composed_adapter::PendingEdit>>,
-    /// Pending send records per draft scope, mirrored from the last encrypted
-    /// row written or read. Enqueue, cancel and retry are authorized against
-    /// this map, never against UI state.
-    pending_sends: Mutex<HashMap<PendingScope, Vec<PendingRecord>>>,
+    /// Authoritative recovery state per draft scope, mirrored from the last
+    /// encrypted row written or read. Every save is checked against it, and
+    /// enqueue, cancel and retry are authorized against it, never against UI
+    /// state.
+    pending_sends: Mutex<HashMap<PendingScope, ScopeRecovery>>,
     /// Draft scopes with recovery metadata discovered before this account's
     /// send queue was enabled, taken once by the controller after selection.
     recovered: Mutex<Vec<RecoveredDraft>>,
+    recovery_gate: Mutex<RecoveryGate>,
+    /// True once discovery for the current selection has finished.
+    recovery_ready: watch::Sender<bool>,
     incoming_verification_tx: watch::Sender<Vec<VerificationInfo>>,
     token_task: Mutex<Option<SyncTask>>,
     notification_handler_registered: Mutex<bool>,
@@ -992,7 +1021,9 @@ impl AccountManager {
             // Re-selecting the active account is an explicit retry of any
             // room queue paused by a recoverable send error. No new message
             // is enqueued, so this cannot duplicate a transaction.
-            if let Some(loaded) = state.loaded.get(id) {
+            if let Some(loaded) = state.loaded.get(id)
+                && *loaded.recovery_ready.borrow()
+            {
                 loaded.client.send_queue().set_enabled(true).await;
             }
             return Ok(account);
@@ -1614,30 +1645,24 @@ impl AccountManager {
         let parsed_root = thread_root.map(parse_event_id).transpose()?;
         let state = self.state.lock().await;
         let room = account_room(&state, account_id, room_id)?;
-        let draft = room
-            .load_composer_draft(parsed_root.as_deref())
-            .await
-            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
-        let restored = draft.map_or_else(
-            || ComposeText::restore_draft(String::new(), None),
-            |draft| ComposeText::restore_draft(draft.plain_text, draft.html_text.as_deref()),
-        );
+        let restored = load_draft_row(&room, parsed_root.as_deref()).await?;
         if let Some(loaded) = state.loaded.get(account_id) {
             let scope = (room_id.to_owned(), thread_root.map(str::to_owned));
             let mut registry = loaded.pending_sends.lock().await;
-            if restored.envelope.pending().is_empty() {
+            let entry = registry.entry(scope.clone()).or_default();
+            entry.apply_loaded(&restored);
+            if entry.is_idle() {
                 registry.remove(&scope);
-            } else {
-                registry.insert(scope, restored.envelope.pending().to_vec());
             }
         }
         Ok(restored)
     }
 
     /// Save or clear a plain room draft, keeping whatever recovery metadata the
-    /// row already holds. This read-then-write pair is for callers without a
-    /// cached envelope; the controller's cache path writes text and metadata
-    /// from one snapshot through `save_composed_draft_for`.
+    /// row already holds. The read and the write happen under one account
+    /// lock, so no other core writer can slip between them; the controller's
+    /// cache path writes text and metadata from one snapshot through
+    /// `save_composed_draft_for`.
     pub async fn save_composer_draft_for(
         &self,
         account_id: &str,
@@ -1655,16 +1680,28 @@ impl AccountManager {
         thread_root: Option<&str>,
         body: &str,
     ) -> Result<()> {
-        let mut envelope = self
-            .load_composed_draft_for(account_id, room_id, thread_root)
-            .await?
-            .envelope;
+        let parsed_root = thread_root.map(parse_event_id).transpose()?;
+        let state = self.state.lock().await;
+        let room = account_room(&state, account_id, room_id)?;
+        let loaded = state
+            .loaded
+            .get(account_id)
+            .ok_or_else(|| MatrixCoreError::AccountNotFound(account_id.into()))?;
+        let restored = load_draft_row(&room, parsed_root.as_deref()).await?;
+        if restored.blocked().is_some() {
+            // Quarantined or read-only rows are only changed by the controller
+            // after the user's explicit review.
+            return Err(MatrixCoreError::RecoveryBlocked);
+        }
+        let mut envelope = restored.envelope;
         // A plain save is a user edit: fresh generation, metadata retained.
         envelope.set_generation(Generation::fresh());
-        self.save_composed_draft_for(
-            account_id,
+        save_draft_row(
+            loaded,
+            &room,
             room_id,
             thread_root,
+            parsed_root.as_deref(),
             &ComposeText::plain(body),
             &envelope,
         )
@@ -1674,8 +1711,11 @@ impl AccountManager {
     /// Save text and recovery metadata as one encrypted row write, or delete
     /// the row when neither text nor metadata remains. Holding the account
     /// lock excludes logout while the write runs; a delayed write cannot
-    /// recreate data after an account is removed. The pending registry used to
-    /// authorize enqueue, cancel and retry mirrors the row just written.
+    /// recreate data after an account is removed. The write is checked against
+    /// the authoritative scope state first: a snapshot that would drop or
+    /// rewrite a record without an exact resolution, or touch a quarantined or
+    /// read-only row the user has not discarded, is refused and the row keeps
+    /// its last valid data.
     pub async fn save_composed_draft_for(
         &self,
         account_id: &str,
@@ -1691,44 +1731,183 @@ impl AccountManager {
             .loaded
             .get(account_id)
             .ok_or_else(|| MatrixCoreError::AccountNotFound(account_id.into()))?;
-        let scope = (room_id.to_owned(), thread_root.map(str::to_owned));
-        if text.body.is_empty() && envelope.is_empty() {
-            room.clear_composer_draft(parsed_root.as_deref())
-                .await
-                .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
-            loaded.pending_sends.lock().await.remove(&scope);
-            return Ok(());
-        }
-        let html = text.encode_draft(envelope)?;
-        room.save_composer_draft(
-            ComposerDraft {
-                plain_text: text.body.clone(),
-                html_text: Some(html),
-                draft_type: ComposerDraftType::NewMessage,
-                attachments: Vec::new(),
-            },
+        save_draft_row(
+            loaded,
+            &room,
+            room_id,
+            thread_root,
             parsed_root.as_deref(),
+            text,
+            envelope,
         )
         .await
-        .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
-        let mut registry = loaded.pending_sends.lock().await;
-        if envelope.pending().is_empty() {
-            registry.remove(&scope);
-        } else {
-            registry.insert(scope, envelope.pending().to_vec());
+    }
+
+    /// Issue the single-use enqueue capability for a record this process just
+    /// saved as enqueuing. Only a current selection may ask, and only for a
+    /// fresh record; restored records are never granted.
+    pub async fn grant_enqueue_for(
+        &self,
+        selection: &AccountSelection,
+        room_id: &str,
+        thread_root: Option<&str>,
+        nonce: &Generation,
+    ) -> Result<()> {
+        let state = self.state.lock().await;
+        let loaded = selected_loaded_for(&state, selection.account_id())?;
+        if !selection.is_current() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
         }
-        Ok(())
+        let mut registry = loaded.pending_sends.lock().await;
+        let granted = registry
+            .get_mut(&(room_id.to_owned(), thread_root.map(str::to_owned)))
+            .is_some_and(|scope| scope.grant(nonce));
+        if granted {
+            Ok(())
+        } else {
+            Err(MatrixCoreError::PendingSendUnknown)
+        }
+    }
+
+    /// Authorize exactly one record to leave the row or become kept text. The
+    /// nonce and transaction id (none for a record that never received one)
+    /// must both match; the next save may then drop or keep that record.
+    pub async fn release_pending_record_for(
+        &self,
+        selection: &AccountSelection,
+        room_id: &str,
+        thread_root: Option<&str>,
+        nonce: &Generation,
+        transaction_id: Option<&str>,
+    ) -> Result<()> {
+        let state = self.state.lock().await;
+        let loaded = selected_loaded_for(&state, selection.account_id())?;
+        if !selection.is_current() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        let mut registry = loaded.pending_sends.lock().await;
+        let released = registry
+            .get_mut(&(room_id.to_owned(), thread_root.map(str::to_owned)))
+            .is_some_and(|scope| scope.release(nonce, transaction_id));
+        if released {
+            Ok(())
+        } else {
+            Err(MatrixCoreError::PendingSendUnknown)
+        }
+    }
+
+    /// The user explicitly discarded saved data this build could not read in
+    /// one scope. The next save may replace the quarantined or read-only row.
+    pub async fn discard_quarantine_for(
+        &self,
+        selection: &AccountSelection,
+        room_id: &str,
+        thread_root: Option<&str>,
+    ) -> Result<()> {
+        let state = self.state.lock().await;
+        let loaded = selected_loaded_for(&state, selection.account_id())?;
+        if !selection.is_current() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        let mut registry = loaded.pending_sends.lock().await;
+        let released = registry
+            .get_mut(&(room_id.to_owned(), thread_root.map(str::to_owned)))
+            .is_some_and(|scope| scope.release_quarantine());
+        if released {
+            Ok(())
+        } else {
+            Err(MatrixCoreError::PendingSendUnknown)
+        }
+    }
+
+    /// Whether discovery for this room did not run or failed, so its send
+    /// queue is still disabled and sends there are refused until
+    /// `recover_room_for` succeeds.
+    pub async fn room_recovery_incomplete(
+        &self,
+        selection: &AccountSelection,
+        room_id: &str,
+    ) -> Result<bool> {
+        let loaded = {
+            let state = self.state.lock().await;
+            selected_loaded_for(&state, selection.account_id())?.clone()
+        };
+        if !selection.is_current() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        let gate = loaded.recovery_gate.lock().await;
+        Ok(!gate.complete || gate.unscanned.contains(room_id))
+    }
+
+    /// Scan one room the selection-time discovery left out, then enable its
+    /// send queue. Returns that room's recovered scopes for the controller.
+    pub async fn recover_room_for(
+        &self,
+        selection: &AccountSelection,
+        room_id: &str,
+    ) -> Result<Vec<RecoveredDraft>> {
+        let (loaded, room) = {
+            let state = self.state.lock().await;
+            let loaded = selected_loaded_for(&state, selection.account_id())?.clone();
+            let room = account_room(&state, selection.account_id(), room_id)?;
+            (loaded, room)
+        };
+        if !selection.is_current() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        {
+            let gate = loaded.recovery_gate.lock().await;
+            if !gate.complete {
+                return Err(MatrixCoreError::RecoveryIncomplete);
+            }
+            if !gate.unscanned.contains(room_id) {
+                return Ok(Vec::new());
+            }
+        }
+        let mut budget = ScanBudget::default();
+        let drafts = scan_room(&room, &mut budget)
+            .await
+            .map_err(|_| MatrixCoreError::RecoveryIncomplete)?;
+        let mut gate = loaded.recovery_gate.lock().await;
+        if !selection.is_current() || !gate.complete {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        {
+            let mut registry = loaded.pending_sends.lock().await;
+            for draft in &drafts {
+                registry
+                    .entry((draft.room_id.clone(), draft.thread_root.clone()))
+                    .or_insert_with(|| ScopeRecovery::from_restored(&draft.restored));
+            }
+        }
+        gate.unscanned.remove(room_id);
+        if drafts.iter().any(|draft| draft.restored.blocked().is_some()) {
+            gate.blocked.insert(room_id.to_owned());
+        } else {
+            room.send_queue().set_enabled(true);
+        }
+        Ok(drafts)
     }
 
     /// Draft scopes with recovery metadata found when this account was
-    /// selected, with exact observers for requests the SDK still holds. Each
-    /// discovery is handed out once; the selection must still be current.
+    /// selected, with exact observers for requests the SDK still holds. Waits
+    /// for discovery to finish (it runs outside the account lock) and ends
+    /// early when the selection is revoked. Each discovery is handed out once.
     pub async fn take_recovered_drafts(
         &self,
         selection: &AccountSelection,
     ) -> Result<Vec<RecoveredDraft>> {
-        let state = self.state.lock().await;
-        let loaded = selected_loaded_for(&state, selection.account_id())?;
+        let loaded = {
+            let state = self.state.lock().await;
+            selected_loaded_for(&state, selection.account_id())?.clone()
+        };
+        let mut ready = loaded.recovery_ready.subscribe();
+        tokio::select! {
+            _ = selection.revoked() => return Err(MatrixCoreError::SelectedAccountChanged),
+            waited = ready.wait_for(|ready| *ready) => {
+                waited.map_err(|_| MatrixCoreError::SelectedAccountChanged)?;
+            }
+        }
         if !selection.is_current() {
             return Err(MatrixCoreError::SelectedAccountChanged);
         }
@@ -2509,12 +2688,30 @@ impl AccountManager {
         let queue = client.send_queue();
         let errors = queue.subscribe_errors();
         let updates = queue.subscribe();
-        // Discover saved pending-send records and attach exact observers while
-        // the queue is still disabled, so no acknowledgement can be emitted
-        // before an observer exists. The controller takes the result after
-        // selection; an absent SDK request is reported as unknown, never as sent.
-        recover_pending_sends(loaded).await;
-        queue.set_enabled(true).await;
+        // Discovery of saved pending-send records runs outside the account
+        // lock. The queue stays disabled until it finishes: observers exist
+        // before any acknowledgement can be emitted, rooms whose rows could
+        // not be read stay disabled, and an absent SDK request is reported as
+        // unknown, never as sent. Stale grants from an earlier selection die.
+        {
+            let mut gate = loaded.recovery_gate.lock().await;
+            if let Some(previous) = gate.scan.take() {
+                previous.abort();
+            }
+            gate.epoch = gate.epoch.wrapping_add(1);
+            gate.complete = false;
+            gate.unscanned.clear();
+            gate.blocked.clear();
+            loaded.recovery_ready.send_replace(false);
+            for scope in loaded.pending_sends.lock().await.values_mut() {
+                scope.clear_grants();
+            }
+            let epoch = gate.epoch;
+            let scan_loaded = loaded.clone();
+            gate.scan = Some(tokio::spawn(async move {
+                recover_pending_sends(scan_loaded, epoch).await;
+            }));
+        }
         state.queue_recovery_task = Some(tokio::spawn(recover_room_queues(
             client.clone(),
             errors,
@@ -2686,6 +2883,8 @@ impl LoadedAccount {
             composed_edits: Mutex::new(HashMap::new()),
             pending_sends: Mutex::new(HashMap::new()),
             recovered: Mutex::new(Vec::new()),
+            recovery_gate: Mutex::new(RecoveryGate::default()),
+            recovery_ready: watch::channel(false).0,
             incoming_verification_tx,
             notification_handler_registered: Mutex::new(false),
             token_task: Mutex::new(Some(SyncTask {
@@ -2841,53 +3040,164 @@ fn parse_event_id(raw: &str) -> Result<matrix_sdk::ruma::OwnedEventId> {
     EventId::parse(raw).map_err(|e| MatrixCoreError::InvalidEventId(e.to_string()))
 }
 
-/// Authorize a send-queue action against the saved pending records of a scope.
+/// Authorize a send-queue action against the authoritative scope state.
 ///
-/// With `owner` absent, the scope must hold no record at all for a thread
-/// (one waiting reply per thread) and anything for a room. With an owner, the
-/// record must exist with that nonce; an enqueue (`None` transaction) needs
-/// the record still enqueuing and, for a thread, alone in its scope; a
-/// cancel or retry needs the exact queued transaction id.
+/// Every action first needs discovery to have covered the room: before the
+/// selection-time scan finishes, or for a room it could not read, nothing is
+/// authorized. A blocked scope (quarantined or read-only saved data) refuses
+/// everything until the user reviews it. With `owner` absent, a thread must
+/// hold no awaiting record (one waiting reply per thread; kept text does not
+/// count) and a room anything. With an owner, the record must exist with that
+/// nonce; an enqueue (`None` transaction) consumes that record's single-use
+/// grant, so only a fresh intent of this process can enqueue and a restored
+/// record can never be replayed; a cancel or retry needs the exact queued
+/// transaction id.
 async fn require_pending_owner(
     loaded: &LoadedAccount,
     room_id: &str,
     thread_root: Option<&str>,
     owner: Option<(&Generation, Option<&str>)>,
 ) -> Result<()> {
-    let registry = loaded.pending_sends.lock().await;
-    let records = registry
-        .get(&(room_id.to_owned(), thread_root.map(str::to_owned)))
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
+    {
+        let gate = loaded.recovery_gate.lock().await;
+        if !gate.complete || gate.unscanned.contains(room_id) {
+            return Err(MatrixCoreError::RecoveryIncomplete);
+        }
+    }
+    let mut registry = loaded.pending_sends.lock().await;
+    let key = (room_id.to_owned(), thread_root.map(str::to_owned));
+    let Some(scope) = registry.get_mut(&key) else {
+        return match owner {
+            None => Ok(()),
+            Some(_) => Err(MatrixCoreError::PendingSendUnknown),
+        };
+    };
+    if scope.block().is_some() {
+        return Err(MatrixCoreError::RecoveryBlocked);
+    }
+    let awaiting = scope.awaiting();
     let Some((nonce, transaction_id)) = owner else {
-        if thread_root.is_some() && !records.is_empty() {
+        if thread_root.is_some() && awaiting > 0 {
             return Err(PendingLimitError::ThreadBusy.into());
         }
         return Ok(());
     };
-    let record = records
-        .iter()
-        .find(|record| record.nonce() == nonce)
-        .ok_or(MatrixCoreError::PendingSendUnknown)?;
+    let (enqueuing, owns_transaction) = {
+        let record = scope
+            .find(nonce)
+            .ok_or(MatrixCoreError::PendingSendUnknown)?;
+        (
+            !record.is_queued() && !record.is_kept(),
+            record.transaction_id() == transaction_id,
+        )
+    };
     match transaction_id {
         None => {
-            if record.is_queued() {
+            if !enqueuing {
                 return Err(MatrixCoreError::PendingSendUnknown);
             }
-            if thread_root.is_some() && records.len() != 1 {
+            if thread_root.is_some() && awaiting != 1 {
                 return Err(PendingLimitError::ThreadBusy.into());
             }
-            if records.len() > MAX_PENDING_RECORDS {
-                return Err(PendingLimitError::TooManyPending.into());
+            if !scope.consume_grant(nonce) {
+                return Err(MatrixCoreError::PendingSendUnknown);
             }
         }
-        Some(transaction_id) => {
-            if record.transaction_id() != Some(transaction_id) {
+        Some(_) => {
+            if !owns_transaction {
                 return Err(MatrixCoreError::PendingSendUnknown);
             }
         }
     }
     Ok(())
+}
+
+async fn load_draft_row(
+    room: &Room,
+    parsed_root: Option<&EventId>,
+) -> Result<RestoredCompose> {
+    let draft = room
+        .load_composer_draft(parsed_root)
+        .await
+        .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
+    Ok(draft.map_or_else(
+        || ComposeText::restore_draft(String::new(), None),
+        |draft| ComposeText::restore_draft(draft.plain_text, draft.html_text.as_deref()),
+    ))
+}
+
+/// Checked read-modify-write of one draft row. The scope's authoritative
+/// state is read from the row the first time this process touches it, every
+/// write is checked against that state, and the state mirrors the row after
+/// the write. Rows are never partially written: one typed value per save.
+async fn save_draft_row(
+    loaded: &LoadedAccount,
+    room: &Room,
+    room_id: &str,
+    thread_root: Option<&str>,
+    parsed_root: Option<&EventId>,
+    text: &ComposeText,
+    envelope: &DraftEnvelope,
+) -> Result<()> {
+    let scope = (room_id.to_owned(), thread_root.map(str::to_owned));
+    let mut registry = loaded.pending_sends.lock().await;
+    if !registry.contains_key(&scope) {
+        let restored = load_draft_row(room, parsed_root).await?;
+        registry.insert(scope.clone(), ScopeRecovery::from_restored(&restored));
+    }
+    let entry = registry
+        .get_mut(&scope)
+        .ok_or(MatrixCoreError::StaleDraftSnapshot)?;
+    entry
+        .check_save(envelope)
+        .map_err(|_| MatrixCoreError::StaleDraftSnapshot)?;
+    if text.body.is_empty() && envelope.is_empty() {
+        room.clear_composer_draft(parsed_root)
+            .await
+            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
+        entry.apply_cleared();
+        if entry.is_idle() {
+            registry.remove(&scope);
+        }
+        let still_blocked = registry
+            .iter()
+            .any(|(key, scope)| key.0 == room_id && scope.block().is_some());
+        drop(registry);
+        unblock_room_queue(loaded, room, still_blocked).await;
+        return Ok(());
+    }
+    let html = text.encode_draft(envelope)?;
+    room.save_composer_draft(
+        ComposerDraft {
+            plain_text: text.body.clone(),
+            html_text: Some(html),
+            draft_type: ComposerDraftType::NewMessage,
+            attachments: Vec::new(),
+        },
+        parsed_root,
+    )
+    .await
+    .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
+    entry.apply_saved(envelope);
+    let still_blocked = registry
+        .iter()
+        .any(|(key, scope)| key.0 == room_id && scope.block().is_some());
+    drop(registry);
+    unblock_room_queue(loaded, room, still_blocked).await;
+    Ok(())
+}
+
+/// After an explicit discard removed the last quarantined scope of a room,
+/// its paused queue resumes; discovery must have covered the room first.
+async fn unblock_room_queue(loaded: &LoadedAccount, room: &Room, still_blocked: bool) {
+    if still_blocked {
+        return;
+    }
+    let mut gate = loaded.recovery_gate.lock().await;
+    let room_id = room.room_id().as_str();
+    if gate.blocked.remove(room_id) && gate.complete && !gate.unscanned.contains(room_id) {
+        room.send_queue().set_enabled(true);
+    }
 }
 
 fn echo_handle(
@@ -2904,97 +3214,193 @@ fn echo_handle(
     })
 }
 
-/// Rooms scanned for saved recovery metadata at account selection.
+/// Rooms whose rows the selection-time discovery reads; the rest stay
+/// disabled until opened.
 const MAX_RECOVERY_ROOMS: usize = 4096;
+/// Room and thread rows one discovery keeps in memory.
+const MAX_RECOVERY_SCOPES: usize = 8192;
+/// Bytes of draft rows one discovery reads; rows carry their records' text.
+const MAX_RECOVERY_BYTES: usize = 64 * 1024 * 1024;
 
-/// Read every known room's draft row, follow each room's thread index, and
-/// attach an observer to each saved queued transaction the SDK still holds.
-/// Runs while the account's send queue is disabled. Text is never changed,
-/// nothing is resent, and a record without an exact SDK request stays unknown.
-async fn recover_pending_sends(loaded: &Arc<LoadedAccount>) {
+#[derive(Default)]
+struct ScanBudget {
+    scopes: usize,
+    bytes: usize,
+}
+
+impl ScanBudget {
+    fn charge(&mut self, bytes: usize) -> Result<(), ScanError> {
+        self.scopes += 1;
+        self.bytes = self.bytes.saturating_add(bytes);
+        if self.scopes > MAX_RECOVERY_SCOPES || self.bytes > MAX_RECOVERY_BYTES {
+            return Err(ScanError::Budget);
+        }
+        Ok(())
+    }
+}
+
+enum ScanError {
+    /// A row or the room queue could not be read; the room stays disabled.
+    Read,
+    /// The aggregate budget is spent; this and later rooms stay disabled.
+    Budget,
+}
+
+/// Read one room's draft row and the thread rows its index names, and attach
+/// an observer to each saved queued transaction the SDK still holds. Any
+/// failure leaves the room unscanned; nothing is enabled, changed or resent.
+async fn scan_room(room: &Room, budget: &mut ScanBudget) -> Result<Vec<RecoveredDraft>, ScanError> {
+    let room_draft = match room.load_composer_draft(None).await {
+        Ok(Some(draft)) => draft,
+        Ok(None) => return Ok(Vec::new()),
+        Err(error) => {
+            warn!(error = %error, "could not read a room draft during send recovery");
+            return Err(ScanError::Read);
+        }
+    };
+    budget.charge(
+        room_draft.plain_text.len() + room_draft.html_text.as_ref().map_or(0, String::len),
+    )?;
+    let room_restored =
+        ComposeText::restore_draft(room_draft.plain_text, room_draft.html_text.as_deref());
+    if room_restored.envelope.is_empty() && room_restored.read_only.is_none() {
+        return Ok(Vec::new());
+    }
+    let room_id = room.room_id().to_string();
+    let mut scopes = Vec::with_capacity(1 + room_restored.envelope.threads().len());
+    for root in room_restored.envelope.threads() {
+        let Ok(root_id) = EventId::parse(root) else { continue };
+        match room.load_composer_draft(Some(&root_id)).await {
+            Ok(Some(draft)) => {
+                budget.charge(
+                    draft.plain_text.len() + draft.html_text.as_ref().map_or(0, String::len),
+                )?;
+                scopes.push((
+                    Some(root.clone()),
+                    ComposeText::restore_draft(draft.plain_text, draft.html_text.as_deref()),
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(error = %error, "could not read a thread draft during send recovery");
+                return Err(ScanError::Read);
+            }
+        }
+    }
+    scopes.push((None, room_restored));
+    let mut subscription = None;
+    let mut recovered = Vec::with_capacity(scopes.len());
+    for (thread_root, restored) in scopes {
+        let mut sends = Vec::new();
+        for record in restored.envelope.pending() {
+            let queued = match record.transaction_id() {
+                Some(transaction_id) => {
+                    if subscription.is_none() {
+                        subscription = match room.send_queue().subscribe().await {
+                            Ok(value) => Some(value),
+                            Err(error) => {
+                                warn!(error = %error, "could not read a room send queue during send recovery");
+                                return Err(ScanError::Read);
+                            }
+                        };
+                    }
+                    subscription.as_ref().and_then(|(echoes, updates)| {
+                        echo_handle(echoes, transaction_id).map(|handle| QueuedMessage {
+                            transaction_id: transaction_id.to_owned(),
+                            handle,
+                            updates: updates.resubscribe(),
+                            finished: false,
+                        })
+                    })
+                }
+                None => None,
+            };
+            sends.push(RecoveredSend {
+                nonce: record.nonce().clone(),
+                transaction_id: record.transaction_id().map(str::to_owned),
+                queued,
+            });
+        }
+        recovered.push(RecoveredDraft {
+            room_id: room_id.clone(),
+            thread_root,
+            restored,
+            sends,
+        });
+    }
+    Ok(recovered)
+}
+
+/// Selection-time discovery. Runs outside the account lock while the SDK
+/// queue is disabled. Rooms it cannot read, and every room past the budget,
+/// stay disabled with their rows untouched until they are opened and scanned;
+/// scanned rooms are enabled together with the global queue. A scan from an
+/// earlier `start_sync` epoch enables nothing.
+async fn recover_pending_sends(loaded: Arc<LoadedAccount>, epoch: u64) {
+    let rooms = loaded.client.rooms();
+    let mut budget = ScanBudget::default();
+    let mut unscanned: HashSet<String> = HashSet::new();
+    let mut blocked: HashSet<String> = HashSet::new();
     let mut recovered = Vec::new();
-    let mut registry: HashMap<PendingScope, Vec<PendingRecord>> = HashMap::new();
-    for room in loaded.client.rooms().into_iter().take(MAX_RECOVERY_ROOMS) {
+    let mut over_budget = false;
+    for (index, room) in rooms.iter().enumerate() {
         if matches!(room.state(), RoomState::Left | RoomState::Banned) {
             continue;
         }
-        let room_draft = match room.load_composer_draft(None).await {
-            Ok(Some(draft)) => draft,
-            Ok(None) => continue,
-            Err(error) => {
-                warn!(error = %error, "could not read a room draft during send recovery");
-                continue;
-            }
-        };
-        let room_restored =
-            ComposeText::restore_draft(room_draft.plain_text, room_draft.html_text.as_deref());
-        if room_restored.envelope.is_empty() && !room_restored.metadata_unreadable {
+        let room_id = room.room_id().to_string();
+        if over_budget || index >= MAX_RECOVERY_ROOMS {
+            unscanned.insert(room_id);
             continue;
         }
-        let room_id = room.room_id().to_string();
-        let mut scopes = Vec::with_capacity(1 + room_restored.envelope.threads().len());
-        for root in room_restored.envelope.threads() {
-            let Ok(root_id) = EventId::parse(root) else { continue };
-            match room.load_composer_draft(Some(&root_id)).await {
-                Ok(Some(draft)) => scopes.push((
-                    Some(root.clone()),
-                    ComposeText::restore_draft(draft.plain_text, draft.html_text.as_deref()),
-                )),
-                Ok(None) => {}
-                Err(error) => {
-                    warn!(error = %error, "could not read a thread draft during send recovery");
+        match scan_room(room, &mut budget).await {
+            Ok(drafts) => {
+                if drafts.iter().any(|draft| draft.restored.blocked().is_some()) {
+                    blocked.insert(room_id);
                 }
+                recovered.extend(drafts);
             }
-        }
-        scopes.push((None, room_restored));
-        let mut subscription = None;
-        for (thread_root, restored) in scopes {
-            let mut sends = Vec::new();
-            for record in restored.envelope.pending() {
-                let queued = match record.transaction_id() {
-                    Some(transaction_id) => {
-                        if subscription.is_none() {
-                            subscription = match room.send_queue().subscribe().await {
-                                Ok(value) => Some(value),
-                                Err(error) => {
-                                    warn!(error = %error, "could not read a room send queue during send recovery");
-                                    None
-                                }
-                            };
-                        }
-                        subscription.as_ref().and_then(|(echoes, updates)| {
-                            echo_handle(echoes, transaction_id).map(|handle| QueuedMessage {
-                                transaction_id: transaction_id.to_owned(),
-                                handle,
-                                updates: updates.resubscribe(),
-                                finished: false,
-                            })
-                        })
-                    }
-                    None => None,
-                };
-                sends.push(RecoveredSend {
-                    nonce: record.nonce().clone(),
-                    transaction_id: record.transaction_id().map(str::to_owned),
-                    queued,
-                });
+            Err(ScanError::Budget) => {
+                over_budget = true;
+                unscanned.insert(room_id);
             }
-            if !restored.envelope.pending().is_empty() {
-                registry.insert(
-                    (room_id.clone(), thread_root.clone()),
-                    restored.envelope.pending().to_vec(),
-                );
+            Err(ScanError::Read) => {
+                unscanned.insert(room_id);
             }
-            recovered.push(RecoveredDraft {
-                room_id: room_id.clone(),
-                thread_root,
-                restored,
-                sends,
-            });
         }
     }
-    *loaded.pending_sends.lock().await = registry;
+    let mut gate = loaded.recovery_gate.lock().await;
+    if gate.epoch != epoch {
+        return;
+    }
+    {
+        let mut registry = loaded.pending_sends.lock().await;
+        for draft in &recovered {
+            registry
+                .entry((draft.room_id.clone(), draft.thread_root.clone()))
+                .or_insert_with(|| ScopeRecovery::from_restored(&draft.restored));
+        }
+    }
+    // Disable unscanned and blocked rooms before the global queue resumes, so
+    // their persisted requests stay held until their rows have been read or
+    // the user has discarded data this build cannot read.
+    for room in &rooms {
+        if matches!(room.state(), RoomState::Left | RoomState::Banned) {
+            continue;
+        }
+        let room_id = room.room_id().as_str();
+        room.send_queue()
+            .set_enabled(!unscanned.contains(room_id) && !blocked.contains(room_id));
+    }
+    if !unscanned.is_empty() {
+        warn!(rooms = unscanned.len(), "send recovery left rooms unscanned; their queues stay paused");
+    }
     *loaded.recovered.lock().await = recovered;
+    gate.unscanned = unscanned;
+    gate.blocked = blocked;
+    gate.complete = true;
+    gate.scan = None;
+    loaded.client.send_queue().set_enabled(true).await;
+    loaded.recovery_ready.send_replace(true);
 }
 
 fn parse_user_id(raw: &str) -> Result<matrix_sdk::ruma::OwnedUserId> {
@@ -3201,6 +3607,12 @@ async fn stop_sync(state: &mut State) {
         .as_ref()
         .and_then(|id| state.loaded.get(id))
     {
+        // Discovery must not enable the queue after this pause.
+        let scan = loaded.recovery_gate.lock().await.scan.take();
+        if let Some(scan) = scan {
+            scan.abort();
+            let _ = scan.await;
+        }
         // The SDK lets an already in-flight request finish, then holds all
         // later queued requests. This is the closest safe pause boundary.
         loaded.client.send_queue().set_enabled(false).await;
@@ -4447,6 +4859,24 @@ mod composed_adapter {
             }
             let enqueue_entered = std::sync::atomic::AtomicBool::new(false);
             tokio::time::timeout(Duration::from_secs(20), async {
+                if owner.is_some() {
+                    // A recorded send waits for discovery rather than failing
+                    // during the short window after selection; the wait ends
+                    // with the selection or the outer timeout.
+                    let ready = {
+                        let state = self.state.lock().await;
+                        selected_loaded_for(&state, selection.account_id())?
+                            .recovery_ready
+                            .subscribe()
+                    };
+                    let mut ready = ready;
+                    tokio::select! {
+                        _ = selection.revoked() => return Err(MatrixCoreError::SelectedAccountChanged),
+                        waited = ready.wait_for(|ready| *ready) => {
+                            waited.map_err(|_| MatrixCoreError::SelectedAccountChanged)?;
+                        }
+                    }
+                }
                 let state = self.state.lock().await;
                 let loaded = selected_loaded_for(&state, selection.account_id())?;
                 let room = account_room(&state, selection.account_id(), room_id)?;

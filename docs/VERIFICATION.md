@@ -2705,44 +2705,86 @@ remain open.
 
 ## 2026-10-17 durable draft-send recovery (source only, unverified)
 
-Room and thread sends now carry durable recovery metadata inside the existing
+Room and thread sends carry durable recovery metadata inside the existing
 encrypted `ComposerDraft` HTML envelope: the canonical draft span gains a
 version `2` form with a bounded lowercase-hex JSON attribute holding the draft
-generation, a bounded list of pending send records (opaque nonce, generation,
-state and exact transaction id), the room's thread index and an optional
-retained-text marker. Text and metadata are one atomic SDK draft write; no raw
-state-store custom values, no new dependency and no metadata in outbound
-message HTML. Unknown or malformed metadata fails closed: the text is still
-restored, the row is marked unreadable, sends from that scope are refused until
-the user reviews it, and nothing is inferred from it.
+generation, a bounded list of pending send records and the room's thread index.
+Every record stores the complete typed content it was created from (body,
+format and explicit mentions, up to the supported 64 KiB and 32 mentions), so a
+failed, cancelled or unconfirmed message survives later edits, later
+submissions and restarts and can be reviewed, copied or restored one record at
+a time without touching newer live text. Records never take the live
+generation; acknowledged text leaves with its record and is not restored. All
+size limits are derived from the supported message size before any allocation
+(per record, per envelope, per row), and text plus metadata remain one atomic
+SDK draft write with no raw state-store values, no new dependency and no
+metadata in outbound message HTML.
 
-The send path records the enqueuing state, and for threads the room index,
-before the SDK assigns a transaction id, then saves the exact id once known.
-Several room sends may wait independently; one send per thread may wait. At
-account selection the core scans the client's rooms and their thread indexes
-before enabling the send queue, subscribes to each room's queue while it is
-still disabled and attaches observers only to requests whose transaction id
-matches a saved record; records the queue no longer holds become explicit
-unconfirmed entries. Native strips offer Retry, Cancel sending, Restore text and
-the two unconfirmed choices (It was sent / Not sent, keep my text) with plain
-wording; cancel is never described as preventing delivery. Account switch and
-removal end observers through the selection guard, and every write checks the
-record nonce and generation so a later edit, including identical text, is never
-cleared by an earlier send's result.
+A Morpheus-written row this build cannot read (future version, missing or
+extra attributes, non-hex, non-canonical or oversized metadata, a foreign
+element carrying the marker) is quarantined, never normalized: its typed text
+still restores, the complete original row is carried verbatim inside every
+later save until the user explicitly discards it, and when the row is too large
+to carry the scope stays read-only in place. Quarantined scopes refuse sends,
+and their room's SDK queue stays paused, so a persisted request whose record
+cannot be read is neither resumed nor dropped until the user decides. Genuine
+version `1` rows migrate; non-Morpheus HTML still falls back to the plain body.
 
-Prepared regressions: six core codec/envelope tests, one canonical-draft
-round-trip test, thirteen draft-cache tests (atomic same-text edits, two queued
-room sends resolved out of order, restart as unconfirmed versus attached,
-unreadable carry, bounds, thread-index order and re-selection re-checks), two
-wording tests, and an
-extended `drafts_local` fixture covering two queued records, a thread index, a
-metadata-only row, exact-id removal and raw-byte scans for the encoded envelope.
-None of these has been compiled or run; no formatting, Clippy, build, native
-UI, live homeserver or CI check was executed for this change. Known limits:
-only the most recent pending record in a scope keeps a restorable copy of its
-text; rooms the client does not know at selection are not scanned; legacy
-untracked send paths carry no record; an unconfirmed send always requires the
-user's judgement after checking the conversation.
+The core is the authority. Each scope's state (records, block, process-local
+fresh records, single-use enqueue grants, exact releases) is mirrored from the
+row and every save is checked against it: a snapshot that would drop or
+rewrite a record without an exact release, give a restored record a
+transaction id, or drop a carried original, is refused and the row keeps its
+last valid data. The plain draft save is a read-modify-write under one account
+lock. Discovery runs outside the account lock while the SDK queue is disabled,
+within a bounded room, scope and byte budget; rooms it cannot read or does not
+reach stay paused and are scanned when opened, and only a current selection's
+fresh record can consume its one enqueue grant at the SDK boundary.
+
+Controllers capture the selection, the exact record (nonce and transaction id)
+and the edit revision at the user's action, re-check them after every await,
+and apply restored text only while the scope is still shown at that revision.
+Observers wait with the selection's revocation, so a paused queue cannot pin a
+task and an account switch or removal ends normal and restored observers
+without another SDK event; composer leases are evicted with their selection.
+Adoption of discovered scopes reads the account epoch before waiting on the
+core, so a removal in between repopulates nothing. Detach clears both the room
+and the thread strip. The strips show one block per record with its own
+controls (It was sent / Not sent, keep my text / Retry / Cancel sending /
+Restore text / Copy text / Discard text) and a fixed notice with an explicit
+discard for unreadable saved data; layouts derive their height from content and
+stack controls in narrow panes or at large text sizes.
+
+Prepared regressions, none compiled or run: nine core codec, envelope and
+scope-registry tests (per-record text, exact release, grants, stale and
+replayed saves, quarantine and read-only blocks, derived size extremes), two
+compose tests (round trip, quarantine shapes), fifteen draft-cache tests (kept
+text, per-record restore and discard, stale revisions, epoch-checked adoption,
+quarantine persistence, read-only scopes, re-selection re-checks), three glue
+wording tests, three lease tests, one generated-Slint scenario inside the
+existing real-window account test (per-record controls route exact keys, the
+unreadable-data notice, the narrow thread pane at 200% text with every control
+inside the window, and detach clearing both strips), two presentation-only
+capture frames (`send-recovery.ppm`, `send-recovery-thread-large.ppm`), and two
+gated `drafts_local` scenarios: the original one aligned with the core's
+release discipline, and a new one driving real SDK requests through controlled
+queue barriers (record durable before enqueue, single-use grant, stale and
+wrong-authority refusals, out-of-order cancel keeping the first typed
+submission, enqueue-before-id and SDK-removal-before-acknowledgement crash
+windows restored as unconfirmed, exact adoption of a persisted request before
+the queue resumes, revocation ending waits and controls, re-selection
+rediscovery, and a quarantined row pausing its room until the explicit
+discard). No formatting, Clippy, build, native UI, live homeserver or CI check
+was executed for this change.
+
+Known limits and open points: rooms discovery does not reach are scanned only
+when opened; discovery failures caused by a store read error cannot be forced by
+the fixture and are covered by unit tests of the registry only; legacy
+untracked send paths carry no record and are not gated; an unconfirmed send
+always requires the user's judgement after checking the conversation; the
+pinned SDK's room send queue keeps its broadcast sender while the room lives,
+and no strong client or SQLite handle leak has been shown from this path, so
+Windows file cleanup after these observers end is simply untested here.
 
 ## Native outgoing video GUI acceptance (partial)
 
