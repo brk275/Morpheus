@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Stop'
 # The same disposable hosted-runner conditions as the Python launcher. A
 # mismatch exits without output; the launcher reports the fixed driver failure.
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or
-    $env:RUNNER_OS -ne 'Windows' -or $env:ImageOS -ne 'win25') { exit 2 }
+    $env:RUNNER_OS -ne 'Windows' -or (@('win25', 'win25-vs2026') -notcontains $env:ImageOS)) { exit 2 }
 if (-not [Environment]::UserInteractive) { exit 3 }
 if ($ProcessId -le 0 -or $WindowHandle -le 0) { exit 4 }
 

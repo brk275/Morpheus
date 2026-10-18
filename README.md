@@ -1,38 +1,59 @@
-# Morpheus
+<p align="center">
+  <img src="assets/icon.png" width="80" height="80" alt="Morpheus icon">
+</p>
 
-A native Matrix client for macOS, Linux and Windows, built in Rust.
-Multiple accounts. Live themes. A workspace you control.
+<h1 align="center">Morpheus</h1>
 
-[Customization](docs/CUSTOMIZATION.md) · [Screenshots](docs/screenshots/README.md) · [Documentation](docs/README.md)
+<p align="center">
+  <strong>A native Matrix client. Your accounts. Your setup.</strong><br>
+  Built in Rust for macOS, Linux and Windows.
+</p>
 
-![Morpheus: Terminal preset with text navigation and nickname-column messages](docs/screenshots/terminal-sidebar.png)
+<p align="center">
+  <a href="docs/CUSTOMIZATION.md">Customization</a> ·
+  <a href="docs/screenshots/README.md">Screenshots</a> ·
+  <a href="docs/README.md">Documentation</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
+
+![Morpheus with the Terminal preset, text sidebar and nickname-column messages](docs/screenshots/terminal-sidebar.png)
+
+<p align="center"><sub>Terminal preset · Native app capture · Fictional accounts</sub></p>
 
 ## Make it yours
 
-Start with **Nocturne**, **Terminal** or **Paper**, then adjust:
+Choose **Nocturne**, **Terminal** or **Paper**, then tune the details:
 
-- **Type:** separate fonts for the interface, messages and code.
-- **Messages:** stacked, compact or nickname columns; spacing and avatars.
-- **Layout:** icon rail or text sidebar, pane widths, headers and room ordering.
-- **Color:** theme files for surfaces, text, senders, unread messages and focus.
+- **Typography** — independent fonts for the interface, messages and code.
+- **Messages** — stacked, compact or nickname-column layouts, with adjustable avatars and spacing.
+- **Navigation** — an icon rail or text sidebar, Space labels and room ordering.
+- **Geometry** — pane widths, headers, density and corner radius.
+- **Color** — TOML palettes for surfaces, text, sender names, unread messages and focus.
 
-Settings and `config.toml` edit the same preferences. Changes reload live.
-Invalid edits keep the last working configuration and show what needs fixing.
+Settings and `config.toml` control the same preferences. Changes reload live;
+invalid edits show an error and keep the last working configuration.
 
-## Keep your accounts together
+[Explore customization →](docs/CUSTOMIZATION.md)
 
-Switch Matrix accounts from the bottom-left profile menu. Each account keeps
-its own session, encryption store, drafts and credential-vault entry. Inactive
-accounts pause by default.
+## All your accounts, close at hand
 
-An optional local app password protects switching and startup restore.
-Remove accounts and retry incomplete cleanup in **Manage accounts**.
-[Read about account controls →](docs/ACCOUNT_ACCESS.md)
+Use multiple Matrix accounts for different aliases, and switch from the
+bottom-left profile menu. Each account has its own session, encryption store,
+drafts and credential-vault entry. Inactive accounts pause by default.
 
-## Run from source
+One optional local app password protects account switching and startup restore.
+**Manage accounts** provides direct removal and a retry for incomplete cleanup.
 
-**Pre-alpha · No installer release yet.** Check the [feature status](docs/FEATURE_MATRIX.md)
-and [release checklist](docs/RELEASE_CHECKLIST.md) before relying on Morpheus.
+[Account controls →](docs/ACCOUNT_ACCESS.md)
+
+## Development status
+
+**Pre-alpha.** Source is available; installer releases are still pending the
+platform and security checks. The [feature matrix](docs/FEATURE_MATRIX.md)
+tracks implementation and the [release checklist](docs/RELEASE_CHECKLIST.md)
+tracks readiness.
+
+### Run from source
 
 Install the [native build dependencies](docs/PACKAGING.md) and pinned Rust toolchain:
 
@@ -41,13 +62,14 @@ cargo run --locked -p morpheus-app
 ```
 
 Sign in with a Matrix account or explore the offline preview. Calls require a
-compatible MatrixRTC service. Screenshots are native captures with fictional accounts.
+compatible MatrixRTC service.
 
-## Get involved
+## Contribute
 
-[Contributing](CONTRIBUTING.md) · [Issues](https://github.com/brk275/Morpheus/issues) · [Build policy](AGENTS.md) · [Private security reports](SECURITY.md)
+[Contribution guide](CONTRIBUTING.md) · [Issues](https://github.com/brk275/Morpheus/issues) · [Build policy](AGENTS.md) · [Private security reports](SECURITY.md)
 
 ## License
 
-[AGPL-3.0-or-later](LICENSE). See [third-party notices](vendor/README.md) for
-dependency licenses. Required UI framework attribution is included in About.
+[AGPL-3.0-or-later](LICENSE). Dependency licenses and provenance are recorded in
+the [third-party notices](vendor/README.md). Required UI framework attribution
+is included in About.
