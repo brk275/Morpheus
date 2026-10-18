@@ -28,11 +28,13 @@ pub enum ConfigError {
     MissingConfigDirectory,
     #[error("configuration file I/O failed: {0}")]
     Io(#[from] std::io::Error),
-    #[error("invalid TOML configuration: {0}")]
-    Decode(#[from] toml::de::Error),
+    /// A parse or schema-shape error, reduced to fixed text: the TOML
+    /// parser's own message can quote the file, so it is never shown.
+    #[error("invalid TOML: {0}")]
+    Decode(diagnostics::DecodeError),
     #[error("could not encode TOML configuration: {0}")]
     Encode(#[from] toml::ser::Error),
-    #[error("unsupported configuration schema version {0}")]
+    #[error("unsupported configuration schema version; this version reads schema_version = 1")]
     Version(u32),
     #[error("invalid configuration: {0}")]
     Invalid(String),
@@ -121,6 +123,19 @@ impl std::fmt::Display for Problem {
             Self::ShortcutConflict => formatter.write_str("conflicts with another shortcut"),
         }
     }
+}
+
+/// Parse TOML text, keeping only a sanitized error. Every runtime load, theme
+/// load, reload and Settings save, and the offline validator, parse here.
+pub(crate) fn parse_toml<T: serde::de::DeserializeOwned>(
+    raw: &str,
+    file: diagnostics::FileKind,
+) -> Result<T, ConfigError> {
+    toml::from_str(raw).map_err(|error| ConfigError::Decode(diagnostics::decode_error(file, raw, &error)))
+}
+
+pub(crate) fn is_room_id(value: &str) -> bool {
+    validate_room_id(value).is_ok()
 }
 
 fn field_error(field: impl Into<String>, problem: Problem) -> ConfigError {
@@ -243,8 +258,9 @@ impl Config {
                 ("element_call_matrix_2_0_rooms", &overrides.element_call_matrix_2_0_rooms),
             ] {
                 if rooms.iter().any(|room_id| validate_room_id(room_id).is_err()) {
+                    // The account ID is never part of a field path.
                     return Err(field_error(
-                        format!("account_overrides.{field}"),
+                        format!("account_overrides.<account>.{field}"),
                         Problem::RoomId,
                     ));
                 }
@@ -255,7 +271,7 @@ impl Config {
                 .any(|room_id| overrides.legacy_element_call_rooms.contains(room_id))
             {
                 return Err(field_error(
-                    "account_overrides.element_call_matrix_2_0_rooms",
+                    "account_overrides.<account>.element_call_matrix_2_0_rooms",
                     Problem::CallModeConflict,
                 ));
             }
@@ -795,7 +811,7 @@ impl BuiltInStylePreset {
     }
 
     pub fn theme(self) -> Result<ThemePack, ConfigError> {
-        let theme: ThemePack = toml::from_str(self.theme_source())?;
+        let theme: ThemePack = parse_toml(self.theme_source(), diagnostics::FileKind::Theme)?;
         theme.validate()?;
         Ok(theme)
     }
@@ -1251,7 +1267,7 @@ impl ConfigStore {
             }
             Err(error) => return Err(error.into()),
         };
-        let theme: ThemePack = toml::from_str(&raw)?;
+        let theme: ThemePack = parse_toml(&raw, diagnostics::FileKind::Theme)?;
         theme.validate()?;
         Ok(Some(theme))
     }
@@ -1267,7 +1283,7 @@ impl ConfigStore {
 
     pub fn load(&self) -> Result<Config, ConfigError> {
         let raw = read_bounded(&self.path, MAX_CONFIG_BYTES)?;
-        let config: Config = toml::from_str(&raw)?;
+        let config: Config = parse_toml(&raw, diagnostics::FileKind::Config)?;
         config.validate()?;
         Ok(config)
     }
@@ -2968,5 +2984,184 @@ mod tests {
         config.media.microphone_device = Some("secret device".into());
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("media.microphone_device") && !error.contains("secret"));
+    }
+
+    /// Every runtime path that shows an error (load, theme load, reload and
+    /// Settings saves, which call `load` first) shows sanitized text only.
+    #[test]
+    fn runtime_store_errors_never_repeat_file_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        for raw in [
+            "[geometry]\ncorner_radius = \"secret-type\"\n",
+            "[chat]\nlayout = \"secret-variant\"\n",
+            "secret-syntax = [\n",
+            "secret_unknown_key = 1\n",
+            "[account_overrides.secretaccount]\ntheme = \"secret-mode\"\n",
+            "[account_overrides.secretaccount]\nlocal_voice_rooms = [\"secret room\"]\n",
+            "[colors]\nlink = \"secret\"\n",
+            "[shortcuts]\nsearch = \"Mod+secret\"\n",
+            "schema_version = 777\n",
+        ] {
+            fs::write(store.path(), raw).unwrap();
+            let error = store.load().unwrap_err();
+            let shown = format!("{error} {error:?}");
+            assert!(!shown.contains("secret") && !shown.contains("777"), "{raw}: {shown}");
+        }
+
+        // A theme file's content never reaches its error either.
+        let mut config = Config::default();
+        config.appearance.theme_pack = Some("custom".into());
+        store.save(&config).unwrap();
+        fs::create_dir_all(store.themes_dir().unwrap()).unwrap();
+        let theme_path = store.theme_path("custom").unwrap();
+        for raw in [
+            "secret-theme-syntax = [\n",
+            "schema_version = 1\nname = \"x\"\nsecret_key = 1\n",
+            "schema_version = 1\nname = 7\n",
+        ] {
+            fs::write(&theme_path, raw).unwrap();
+            let error = store.load_theme(&config).unwrap_err();
+            let shown = format!("{error} {error:?}");
+            assert!(!shown.contains("secret") && !shown.contains("7"), "{raw}: {shown}");
+            assert!(matches!(error, ConfigError::Decode(_)));
+        }
+
+        // The reload path reports the same sanitized error.
+        fs::write(&theme_path, "secret-theme-syntax = [\n").unwrap();
+        let updates = store.watch_with_theme(Duration::from_millis(10));
+        let error = updates
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+        assert!(!format!("{error} {error:?}").contains("secret"));
+    }
+
+    /// `registry::FIELDS` is what the schema output and documentation print,
+    /// so it must not drift from the real schema and validator.
+    #[test]
+    fn the_field_reference_agrees_with_the_real_schema() {
+        use registry::{FIELDS, FieldKind};
+        use std::collections::BTreeSet;
+
+        fn leaves(value: &toml::Value, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+            match value {
+                toml::Value::Table(table) => {
+                    for (key, value) in table {
+                        path.push(key.clone());
+                        leaves(value, path, out);
+                        path.pop();
+                    }
+                }
+                _ => out.push(path.clone()),
+            }
+        }
+        // Dynamic keys are written as the placeholders FIELDS documents.
+        fn pattern(path: &[String]) -> String {
+            match path.first().map(String::as_str) {
+                Some("colors") => "colors.<token>".into(),
+                Some("shortcuts") => "shortcuts.<action>".into(),
+                Some("account_overrides") => format!("account_overrides.<account>.{}", path[2..].join(".")),
+                _ => path.join("."),
+            }
+        }
+
+        // Every optional and dynamic field present.
+        let mut full = Config::default();
+        full.appearance.theme_pack = Some("paper".into());
+        full.typography.message_font_family = Some("serif".into());
+        full.typography.sender_weight = Some(600);
+        full.media.microphone_device = Some("alsa:microphone".into());
+        full.media.speaker_device = Some("alsa:speaker".into());
+        full.media.camera_device = Some("camera".into());
+        full.colors.insert("link".into(), "#123456".into());
+        full.account_overrides.insert(
+            "account".into(),
+            AccountOverrides {
+                notifications_enabled: Some(true),
+                theme: Some(ThemeMode::Light),
+                local_voice_rooms: vec!["!a:example.org".into()],
+                legacy_element_call_rooms: vec!["!b:example.org".into()],
+                element_call_matrix_2_0_rooms: vec!["!c:example.org".into()],
+            },
+        );
+        full.validate().unwrap();
+        let mut found = Vec::new();
+        leaves(&toml::Value::try_from(&full).unwrap(), &mut Vec::new(), &mut found);
+        let found: BTreeSet<String> = found.iter().map(|path| pattern(path)).collect();
+        let documented: BTreeSet<String> = FIELDS.iter().map(|field| field.key.to_owned()).collect();
+        assert_eq!(found, documented, "FIELDS and the schema differ");
+
+        // Defaults match Config::default(); "(none)" fields are omitted.
+        let defaults = toml::Value::try_from(Config::default()).unwrap();
+        for field in FIELDS.iter().filter(|field| !field.key.contains('<')) {
+            let actual = field
+                .key
+                .split('.')
+                .try_fold(&defaults, |value, key| value.get(key));
+            if field.default == "(none)" {
+                assert!(actual.is_none(), "{} has a default", field.key);
+            } else {
+                let expected: toml::Table = toml::from_str(&format!("v = {}", field.default)).unwrap();
+                assert_eq!(actual, expected.get("v"), "default of {}", field.key);
+            }
+        }
+        for action in default_shortcuts().keys() {
+            assert!(ShortcutAction::parse(action).is_some());
+        }
+
+        // Every documented range and option agrees with validation.
+        fn document(key: &str, name: &str, value: &str) -> String {
+            let key = key.replace("<account>", "account").replace("<token>", name).replace("<action>", name);
+            match key.rsplit_once('.') {
+                Some((table, leaf)) => format!("[{table}]\n{leaf} = {value}\n"),
+                None => format!("{key} = {value}\n"),
+            }
+        }
+        let accepts = |text: &str| {
+            toml::from_str::<Config>(text).is_ok_and(|config| config.validate().is_ok())
+        };
+        for field in FIELDS {
+            let names: Vec<&str> = if field.key.contains("<token>") {
+                registry::COLOR_TOKENS.iter().map(|token| token.id).collect()
+            } else if field.key.contains("<action>") {
+                ShortcutAction::ALL.iter().map(|action| action.name()).collect()
+            } else {
+                vec![""]
+            };
+            for name in names {
+                let check = |value: &str| accepts(&document(field.key, name, value));
+                let (good, bad): (Vec<String>, Vec<String>) = match field.kind {
+                    FieldKind::Integer { minimum, maximum } => (
+                        vec![minimum.to_string(), maximum.to_string()],
+                        vec![(minimum - 1).to_string(), (maximum + 1).to_string()],
+                    ),
+                    FieldKind::Enum(values) => (
+                        values.iter().map(|value| format!("\"{value}\"")).collect(),
+                        vec!["\"not_an_option\"".into()],
+                    ),
+                    FieldKind::Bool => (vec!["true".into(), "false".into()], vec!["\"yes\"".into()]),
+                    FieldKind::FontFamily => (vec!["\"Inter\"".into()], vec!["\"\"".into()]),
+                    FieldKind::ThemeName => (vec!["\"paper\"".into()], vec!["\"../paper\"".into()]),
+                    FieldKind::Color => (
+                        vec!["\"#123456\"".into(), "\"#12345678\"".into()],
+                        vec!["\"#12345\"".into()],
+                    ),
+                    FieldKind::DeviceId => (vec!["\"alsa:device\"".into()], vec!["\"no-host\"".into()]),
+                    FieldKind::Text => (vec!["\"anything\"".into()], vec!["5".into()]),
+                    FieldKind::TextList => (vec!["[\"word\"]".into()], vec!["5".into()]),
+                    FieldKind::RoomIdList => {
+                        (vec!["[\"!a:example.org\"]".into()], vec!["[\"not a room\"]".into()])
+                    }
+                    FieldKind::Table => (vec!["\"Mod+J\"".into()], vec!["\"Tab\"".into()]),
+                };
+                for value in &good {
+                    assert!(check(value), "{} {name} should accept {value}", field.key);
+                }
+                for value in &bad {
+                    assert!(!check(value), "{} {name} should reject {value}", field.key);
+                }
+            }
+        }
     }
 }

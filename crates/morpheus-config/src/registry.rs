@@ -263,6 +263,8 @@ pub enum FieldKind {
     Color,
     /// A host-qualified audio device ID.
     DeviceId,
+    /// Free text that is stored without validation.
+    Text,
     TextList,
     RoomIdList,
     /// A table keyed by documented names; see the field's description.
@@ -305,8 +307,11 @@ use FieldKind::{Bool, Integer};
 
 const THEME_MODES: &[&str] = &["dark", "light", "high_contrast", "system"];
 
-/// Every field of `config.toml` schema version 1. Tests compare this table
-/// with the real schema, so it cannot silently drift from the validator.
+/// Every field of `config.toml` schema version 1. A test in this crate
+/// (`the_field_reference_agrees_with_the_real_schema`) checks that a fully
+/// populated configuration uses exactly these keys, that defaults match
+/// `Config::default()`, and that every range and option agrees with
+/// validation.
 pub const FIELDS: &[FieldSpec] = &[
     field("schema_version", Integer { minimum: 1, maximum: 1 }, "1", "Configuration schema version."),
     field("appearance.theme", FieldKind::Enum(THEME_MODES), "\"dark\"", "Base palette for all accounts."),
@@ -347,7 +352,7 @@ pub const FIELDS: &[FieldSpec] = &[
     field("notifications.highlight_words", FieldKind::TextList, "[]", "Local highlight words and phrases; Settings accepts up to 32 of at most 64 characters."),
     field("media.microphone_device", FieldKind::DeviceId, "(none)", "Microphone for the next call; omitted follows the system default."),
     field("media.speaker_device", FieldKind::DeviceId, "(none)", "Speaker for the next call; omitted follows the system default."),
-    inactive(field("media.camera_device", FieldKind::DeviceId, "(none)", "Saved camera; not used yet.")),
+    inactive(field("media.camera_device", FieldKind::Text, "(none)", "Saved camera; not used yet.")),
     inactive(field("media.noise_suppression", Bool, "true", "Noise suppression; not used yet.")),
     inactive(field("media.autoplay_animated_media", Bool, "false", "Animated media autoplay; not used yet.")),
     field("media.previews_in_encrypted_rooms", Bool, "false", "Image previews in encrypted rooms."),

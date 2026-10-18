@@ -1,6 +1,6 @@
 # Appearance contract, color tokens and Settings search
 
-**Status: source checkpoint 1, not built, formatted or executed.** This page
+**Status: source checkpoint 2, not built, formatted or executed.** This page
 records the contract, the token and search-target inventory and the native
 transparency choice that the code on this branch implements. The sections
 marked *Remaining* list what is not done yet; nothing here claims coverage of
@@ -8,8 +8,13 @@ marked *Remaining* list what is not done yet; nothing here claims coverage of
 
 The single source of truth is `crates/morpheus-config/src/registry.rs`:
 `COLOR_TOKENS`, `FIELDS` and `SETTING_TARGETS`. The validator, the Appearance
-workspace, Settings search and (planned) the offline schema command read those
-tables; the tables below are a copy for reading.
+workspace, Settings search, the diagnostics allowlist and `morpheus config
+schema` read those tables; the tables below are a copy for reading. A test
+(`the_field_reference_agrees_with_the_real_schema`) requires a fully populated
+configuration to use exactly the `FIELDS` keys, every default to match
+`Config::default()`, and every documented range and option to agree with
+validation, including the dynamic `colors`, `shortcuts` and
+`account_overrides` keys.
 
 ## One declarative contract
 
@@ -58,8 +63,8 @@ an older build that only knew `#RRGGBB` rejects a file containing alpha.
 ### Validation and last-valid behavior
 
 Unknown keys, unknown token IDs, malformed colors and out-of-range numbers
-reject the whole edit. Live reload, Settings saves and (planned) the offline
-validator share one bounded reader:
+reject the whole edit. Live reload, Settings saves and the offline validator
+share one bounded reader:
 
 | File | Limit |
 | --- | --- |
@@ -79,10 +84,37 @@ an atomic rename, which replaces a symbolic link rather than writing through
 it. Nothing writes theme files. Theme names are ASCII letters, digits, `-` and
 `_`, at most 64 characters, so they cannot name a path.
 
-Validation errors carry a field path and a fixed problem code; they never
-repeat the rejected value. The diagnostics module (`morpheus_config::diagnostics`)
-adds a line and column from the TOML spans, shows only plain identifier keys
-(others become `<key>`) and never prints raw TOML.
+Every error the app shows (initial load, theme load, live reload and Settings
+saves) and every offline diagnostic uses the same sanitized form: a fixed code
+and message, a field path and a line and column. The TOML parser's own message
+can quote the file, so it is classified and dropped; validation errors carry a
+field and a fixed problem and never repeat the rejected value; the schema
+version message does not repeat the number. Field paths are built only from
+registry names: a key the schema does not know becomes `<unknown>`, and every
+local account ID becomes `<account>`. An error in an account list points at
+the failing entry of the failing account, in the validator's account order.
+
+### Offline validation
+
+```text
+morpheus config validate [--json] [--file CONFIG.toml]
+morpheus config schema [--json]
+```
+
+These run first in `main`, before the screenshot preview, the updater, the
+startup session, the window, the account store, the credential vault, sync and
+media devices. They read with the bounded reader, create no folder or file and
+write nothing. `validate` exits 0 when valid, 1 when not and 2 for a usage
+error; it never prints a path. `--json` output has the format
+`morpheus-config-diagnostics` (version 1) with `file`, `code`, `message`,
+`field`, `line` and `column` per diagnostic. `schema --json` prints the field
+reference, color tokens, theme-file keys, limits and every diagnostic code from
+the registry. On Windows the release app is a GUI program: its output is
+visible only when redirected to a file or pipe; the exit status is always set.
+
+Safe incremental edits: change one key, run `config validate`, and let the
+running app reload it (about once a second); an invalid edit keeps the last
+valid appearance and shows a fixed error. Settings writes the same keys.
 
 ## Color tokens
 
@@ -173,15 +205,23 @@ Pinned sources checked: Slint 1.18.1 (`i-slint-backend-winit`,
 So the app needs no new dependency, Cargo feature, `unsafe` code or native
 window accessor: it paints a translucent `Window` background and translucent
 pane surfaces. `[window] opacity_percent` (0–100, default 100) scales the alpha
-of the rail, room list, conversation canvas and details panel. Below 100 the
-`Window` background is cleared and each of those panes paints its own scaled
-color, so panes do not compound. Children that used to repaint their pane's
-color are transparent, which looks identical at 100.
+of the rail, room list, conversation canvas and details panel. Below 100, or
+whenever one of those pane colors has its own alpha, the `Window` background is
+cleared and each pane paints its own color once, so panes never compound, at
+100 or 99 alike. Children that used to repaint their pane's color are
+transparent, which looks identical when opaque.
 
-Text, icons, inputs, cards, popups, dialogs, the sign-in page and recovery keep
-their own colors, so they stay opaque unless a color token itself is given
-alpha. There is no blur and no whole-content fade. At 100 the window is
-painted exactly as before, so macOS keeps its opaque window path.
+Text, icons, inputs, cards and popups keep their own colors, so they stay
+opaque unless a color token itself is given alpha. Dialogs, the sign-in page,
+account unlock and recovery always paint opaque versions of their colors,
+whatever alpha a token or the window setting has. There is no blur and no
+whole-content fade. With opaque colors at 100 the window is painted exactly as
+before, so macOS keeps its opaque window path.
+
+The slider previews while it moves. A pointer or key release saves at once;
+keyboard, accessibility and number edits also save once the value has settled
+for 400 ms. A rejected save, for example because `config.toml` became invalid,
+restores the last valid value in the window and in both controls.
 
 ### Platform status
 
@@ -219,10 +259,28 @@ breadcrumb. Queries are at most 64 characters and return at most 8 results;
 every word must match. Up and Down move the highlighted result, Enter reveals
 it and Escape clears the query. Choosing a result scrolls to the control,
 computed from the live layout, and focuses it; the focus ring is the
-highlight. Account results open Manage accounts and focus Add account, the app
-password control or the dialog's close action; removal is never focused, and
-every action still needs its own activation and confirmation. Search never
-changes a setting. Security & recovery is offered only while signed in.
+highlight. A reveal reports its target only when that control actually took
+focus. When the control is unavailable (update checks without a configured
+feed, audio devices that are off or busy, a busy security refresh) its
+read-only status line is focused and reported as `<target>:status` instead.
+Results scroll inside a bounded region below the pinned field; Up and Down
+keep the highlighted row visible while the field keeps focus. Account results
+open Manage accounts and focus Add account, the app password control or the
+dialog's close action; removal is never focused, and every action still needs
+its own activation and confirmation. Search never changes a setting or runs
+an action. Security & recovery is offered only while signed in.
+
+## Appearance workspace
+
+Settings → Appearance → Colors and window holds one bounded, scrolling list of
+groups and tokens beside (or, at narrow widths and large text, above) one
+selected-token editor: swatch, label, description, where the color comes from,
+the hex field, Reset and Undo, and the advanced `[colors]` key. Choosing a
+token moves focus to its hex field; Slint scrolls a focused control into view
+in the list and in the page. A complete valid value applies and saves at once;
+partial input only shows an inline hint. Reset all asks for a second
+activation and can then restore what it removed. The Window group holds the
+transparency slider with its numeric entry.
 
 Targets (33): appearance presets, colors, window transparency, base palette,
 reduce motion, fonts, message size, sender weight, room header, conversation
@@ -232,19 +290,15 @@ sounds, previews, highlight words; add/open accounts, remove an account, app
 password; security & recovery; image previews, audio devices; shortcuts;
 settings file; updates.
 
-## Remaining in this checkpoint
+## Remaining
 
-- **Not wired yet:** the Rust controllers behind the color workspace and the
-  search field. Their Slint callbacks exist and do nothing until the
-  controllers land, so the workspace and search are inert in this checkpoint.
-- **Not written yet:** the offline `config validate` / `config schema`
-  command, which will dispatch before the preview, updater, startup session,
-  window, account store, credential vault, sync or devices start.
-- **Tests pending:** generated-window scenarios for hex apply/reset/invalid
-  retention, search keyboard behavior and every target's reachability; the
-  registry, diagnostics, bounded-read and config tests are written.
-- Typography line height and body weight, icon sizing, avatar shape, pane
-  order and visibility beyond the existing panel toggle, animation durations,
-  and shortcut actions beyond the four existing ones are not editable yet.
+- Typography line height and body weight, icon sizing and colors, avatar
+  shape and the avatar/account palettes, pane order and visibility beyond the
+  existing panel toggle, animation durations, the sender palette in the
+  workspace, separate input, button, composer and icon tokens, per-account
+  color overrides and shortcut actions beyond the four existing ones are part
+  of the objective and not editable yet.
+- Native transparency has not been verified on any platform; see the plan
+  above.
 - Formatting has not been run; expect `rustfmt` changes, especially in the
-  long registry tables.
+  long registry tables, and Slint indentation fixes.

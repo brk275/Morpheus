@@ -331,6 +331,7 @@ component IconAction inherits Rectangle {
     in property <bool> reveal-full-control: true;
     // Reveal the associated value row as well as a small settings action.
     in property <length> reveal-height: root.height;
+    out property <bool> has-focus: keyboard-focus.has-focus;
     property <bool> vector-icon: icon == "S" || icon == "C" || icon == "P" || icon == "⌂" || icon == "+" || icon == "↓" || icon == "F" || icon == "↩" || icon == "♥" || icon == "⌫" || icon == "✎" || icon == "☷";
     opacity: !quiet || context-hover || area.has-hover || keyboard-focus.has-focus ? 1 : 0;
     callback activated();
@@ -922,6 +923,7 @@ component ShortcutSetting inherits Rectangle {
     height: 52px;
     background: transparent;
     forward-focus: shortcut-input;
+    out property <bool> has-focus: shortcut-input.has-focus;
     HorizontalLayout {
         spacing: 12px;
         Text { text: root.label; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; }
@@ -951,6 +953,11 @@ component StyleNumberSetting inherits Rectangle {
     in property <color> hover-surface;
     in property <float> text-scale: 1;
     callback changed-value(int);
+    out property <bool> has-focus: decrease.has-focus || increase.has-focus;
+    // At its minimum the decrease action is disabled; focus the other one.
+    public function focus-control() {
+        if root.value > root.minimum { decrease.focus(); } else { increase.focus(); }
+    }
     height: max(58px, 34px * root.text-scale + 20px);
     background: surface; border-radius: StyleTokens.radius;
     forward-focus: decrease;
@@ -961,7 +968,7 @@ component StyleNumberSetting inherits Rectangle {
         Text { text: root.value + " px"; color: root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; }
         decrease := IconAction { icon: "−"; label: "Decrease " + root.label; ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
             enabled: root.value > root.minimum; activated => { root.changed-value(max(root.minimum, root.value - root.step)); } }
-        IconAction { icon: "+"; label: "Increase " + root.label; ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
+        increase := IconAction { icon: "+"; label: "Increase " + root.label; ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
             enabled: root.value < root.maximum; activated => { root.changed-value(min(root.maximum, root.value + root.step)); } }
     }
 }
@@ -975,6 +982,7 @@ component StyleFontSetting inherits Rectangle {
     in property <float> text-scale: 1;
     height: 74px * root.text-scale;
     forward-focus: input;
+    out property <bool> has-focus: input.has-focus;
     VerticalLayout {
         spacing: 7px;
         Text { text: root.label; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; }
@@ -1006,6 +1014,9 @@ component SettingsSearchBar inherits VerticalLayout {
     in property <color> accent;
     in property <color> outline;
     in property <float> text-scale: 1;
+    // Results scroll inside this height, so the field and Settings below
+    // stay reachable at large text and small windows.
+    in property <length> max-results-height: 240px;
     callback search(string);
     callback choose(string);
     property <bool> open: root.query != "" && !root.dismissed;
@@ -1067,9 +1078,25 @@ component SettingsSearchBar inherits VerticalLayout {
         color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
         accessible-live-region: polite;
     }
-    if root.open : VerticalLayout {
+    if root.open && root.results.length > 0 : results-scroll := ScrollView {
+        height: min(results-content.preferred-height, root.max-results-height);
+        horizontal-scrollbar-policy: always-off;
+        // Keep the highlighted row inside the visible part of the list.
+        function reveal-row(top: length, height: length) {
+            if top < -self.content-y {
+                self.content-y = -top;
+            } else if top + height > -self.content-y + self.visible-height {
+                self.content-y = -(top + height - self.visible-height);
+            }
+        }
+        results-content := VerticalLayout {
+        width: results-scroll.visible-width;
         spacing: 2px; alignment: start;
         for result[i] in root.results : ActionRect {
+            property <bool> highlighted: i == root.index;
+            changed highlighted => {
+                if self.highlighted { results-scroll.reveal-row(self.y, self.height); }
+            }
             min-height: max(44px, label-text.preferred-height + trail-text.preferred-height + 14px);
             label: result.label + ", " + result.breadcrumb + ". " + result.description;
             background: i == root.index || self.has-hover ? root.hover-surface : transparent;
@@ -1083,6 +1110,7 @@ component SettingsSearchBar inherits VerticalLayout {
                 label-text := Text { text: result.label; color: root.ink; font-size: 12px * root.text-scale; font-weight: 650; wrap: word-wrap; }
                 trail-text := Text { text: result.breadcrumb; color: root.muted; font-size: 10px * root.text-scale; wrap: word-wrap; }
             }
+        }
         }
     }
 }
@@ -1102,6 +1130,10 @@ component ColorTokenList inherits VerticalLayout {
     in property <color> accent;
     in property <color> outline;
     in property <float> text-scale: 1;
+    // The groups and tokens scroll inside this height, so the editor stays
+    // close to the list at narrow widths and large text.
+    in property <length> max-list-height: 320px;
+    out property <bool> has-focus: filter-input.has-focus;
     pure callback color-of(string) -> color;
     callback filter-edited(string);
     callback group-chosen(int);
@@ -1127,6 +1159,16 @@ component ColorTokenList inherits VerticalLayout {
             edited => { root.filter-edited(self.text); }
         }
     }
+    list-scroll := ScrollView {
+        height: min(list-content.preferred-height, root.max-list-height);
+        horizontal-scrollbar-policy: always-off;
+        accessible-role: list;
+        accessible-label: "Colors to edit";
+        // A row that takes keyboard focus is scrolled into view by Slint in
+        // this list and in the Settings page alike.
+        list-content := VerticalLayout {
+    width: list-scroll.visible-width;
+    spacing: 2px; alignment: start;
     if root.filter == "" : VerticalLayout {
         spacing: 2px; alignment: start;
         for group[index] in root.groups : ActionRect {
@@ -1177,6 +1219,8 @@ component ColorTokenList inherits VerticalLayout {
             if token.overridden : Text { text: "edited"; color: root.muted; font-size: 10px * root.text-scale; vertical-alignment: center; }
         }
     }
+        }
+    }
 }
 
 // The one selected color. A valid #RRGGBB or #RRGGBBAA value applies and
@@ -1200,6 +1244,7 @@ component ColorTokenEditor inherits VerticalLayout {
     callback reset();
     callback undo();
     callback reset-all();
+    out property <bool> has-focus: hex-input.has-focus;
     forward-focus: hex-input;
     spacing: 8px;
     alignment: start;
@@ -1276,15 +1321,27 @@ component ColorTokenEditor inherits VerticalLayout {
 // on release; the number saves when edited. Both edit the same value.
 component WindowOpacitySetting inherits VerticalLayout {
     in property <int> value;
+    // Bumped after every save attempt so both controls show the saved value,
+    // including after a rejected save restored the previous one.
+    in property <int> revision;
     in property <string> status;
     in property <color> ink;
     in property <color> muted;
     in property <float> text-scale: 1;
+    // A value to preview now and save shortly; keyboard and accessibility
+    // changes arrive here too.
+    callback previewed(int);
+    // A value to save now, such as on pointer or key release.
     callback changed-value(int);
+    out property <bool> has-focus: slider.has-focus;
     forward-focus: slider;
     spacing: 6px;
     alignment: start;
     changed value => {
+        slider.value = root.value;
+        number.value = root.value;
+    }
+    changed revision => {
         slider.value = root.value;
         number.value = root.value;
     }
@@ -1299,14 +1356,14 @@ component WindowOpacitySetting inherits VerticalLayout {
             horizontal-stretch: 1; minimum: 0; maximum: 100; step: 1;
             value: root.value;
             accessible-label: "Window background opacity, percent";
-            changed(value) => { StyleTokens.window-opacity = value / 100; }
+            changed(value) => { root.previewed(round(value)); }
             released(value) => { root.changed-value(round(value)); }
         }
         number := SpinBox {
             width: max(96px, 80px * root.text-scale);
             minimum: 0; maximum: 100; value: root.value;
             accessible-label: "Window background opacity, percent, as a number";
-            edited(value) => { root.changed-value(value); }
+            edited(value) => { root.previewed(value); }
         }
         Text { text: "%"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; }
     }
@@ -1571,7 +1628,9 @@ export component AppWindow inherits Window {
     callback color-undo();
     callback color-reset-all();
     in-out property <int> window-opacity-percent: 100;
+    in-out property <int> window-opacity-revision: 0;
     in-out property <string> window-transparency-status;
+    callback preview-window-opacity(int);
     callback set-window-opacity(int);
 
     // Empty alternate clocks identify delivery status or a row with no clock.
@@ -2191,11 +2250,20 @@ export component AppWindow inherits Window {
             || id == "success_ink" || id == "destructive" || id == "destructive_ink"
             || id == "presence_online" || id == "voice" || id == "avatar_ink";
     }
-    property <bool> window-translucent: StyleTokens.window-opacity < 1;
+    // Any pane color with its own alpha also clears the window background, so
+    // each pane is painted exactly once at every opacity, including 100%.
+    property <bool> window-translucent: StyleTokens.window-opacity < 1 || root.rail.alpha < 255
+        || root.sidebar.alpha < 255 || root.canvas.alpha < 255 || root.panel.alpha < 255;
+    // Whether the native window background is cleared for translucent panes.
+    out property <bool> window-background-cleared: root.window-translucent;
     property <color> window-rail: root.rail.transparentize(1 - StyleTokens.window-opacity);
     property <color> window-sidebar: root.sidebar.transparentize(1 - StyleTokens.window-opacity);
     property <color> window-canvas: root.canvas.transparentize(1 - StyleTokens.window-opacity);
     property <color> window-panel: root.panel.transparentize(1 - StyleTokens.window-opacity);
+    // Dialogs, sign-in, account unlock and recovery paint opaque versions of
+    // their colors, whatever alpha a token or the window setting has.
+    property <color> dialog-surface: root.canvas.with-alpha(1);
+    property <color> sign-in-surface: root.rail.with-alpha(1);
     default-font-family: root.ui-font-family;
     background: root.window-translucent ? transparent : canvas;
 
@@ -3583,6 +3651,7 @@ export component AppWindow inherits Window {
                         dismissed: root.settings-search-dismissed;
                         ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
                         accent: root.accent; outline: root.divider; text-scale: root.text-scale;
+                        max-results-height: max(96px, root.height * 0.35);
                         search(query) => { root.settings-search(query); }
                         choose(id) => { root.settings-search-choose(id); }
                     }
@@ -3609,7 +3678,7 @@ export component AppWindow inherits Window {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                     self.focus();
-                                    root.settings-revealed-id = "appearance.presets";
+                                    if self.has-focus { root.settings-revealed-id = "appearance.presets"; }
                                 }
                             }
                             height: 66px * root.text-scale;
@@ -3631,7 +3700,7 @@ export component AppWindow inherits Window {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                     self.focus();
-                                    root.settings-revealed-id = "appearance.reduce_motion";
+                                    if self.has-focus { root.settings-revealed-id = "appearance.reduce_motion"; }
                                 }
                             }
                             label: "Reduce motion" + (StyleTokens.reduced-motion ? ", on" : ", off");
@@ -3665,7 +3734,7 @@ export component AppWindow inherits Window {
                                     if self.reveal-request > 0 {
                                         settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                         self.focus();
-                                        root.settings-revealed-id = "appearance.colors";
+                                        if self.has-focus { root.settings-revealed-id = "appearance.colors"; }
                                     }
                                 }
                                 x: 12px; y: 12px;
@@ -3675,6 +3744,7 @@ export component AppWindow inherits Window {
                                 filter <=> root.color-filter;
                                 ink: root.ink; muted: root.muted; surface: root.canvas; hover-surface: root.hover;
                                 accent: root.accent; outline: root.divider; text-scale: root.text-scale;
+                                max-list-height: parent.wide ? max(240px, root.height * 0.5) : max(140px, root.height * 0.24);
                                 color-of(id) => { return root.token-color(id); }
                                 filter-edited(text) => { root.color-filter-changed(text); }
                                 group-chosen(index) => { root.color-group-chosen(index); }
@@ -3708,13 +3778,15 @@ export component AppWindow inherits Window {
                                     if self.reveal-request > 0 {
                                         settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                         self.focus();
-                                        root.settings-revealed-id = "appearance.window_opacity";
+                                        if self.has-focus { root.settings-revealed-id = "appearance.window_opacity"; }
                                     }
                                 }
                                 x: 12px; y: 12px; width: parent.width - 24px;
                                 value: root.window-opacity-percent;
+                                revision: root.window-opacity-revision;
                                 status: root.window-transparency-status;
                                 ink: root.ink; muted: root.muted; text-scale: root.text-scale;
+                                previewed(value) => { root.preview-window-opacity(value); }
                                 changed-value(value) => { root.set-window-opacity(value); }
                             }
                         }
@@ -3725,7 +3797,7 @@ export component AppWindow inherits Window {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                     self.focus();
-                                    root.settings-revealed-id = "appearance.fonts";
+                                    if self.has-focus { root.settings-revealed-id = "appearance.fonts"; }
                                 }
                             }
                             ink: root.ink; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; }
@@ -3743,8 +3815,8 @@ export component AppWindow inherits Window {
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
-                                    self.focus();
-                                    root.settings-revealed-id = "appearance.message_size";
+                                    self.focus-control();
+                                    if self.has-focus { root.settings-revealed-id = "appearance.message_size"; }
                                 }
                             }
                             label: "Message font size"; value: root.message-font-size; minimum: 10; maximum: 32;
@@ -3755,8 +3827,8 @@ export component AppWindow inherits Window {
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
-                                    self.focus();
-                                    root.settings-revealed-id = "appearance.sender_weight";
+                                    self.focus-control();
+                                    if self.has-focus { root.settings-revealed-id = "appearance.sender_weight"; }
                                 }
                             }
                             label: "Sender font weight"; value: root.sender-font-weight > 0 ? root.sender-font-weight : 650; minimum: 100; maximum: 900; step: 50;
@@ -3777,7 +3849,7 @@ export component AppWindow inherits Window {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                     self.focus();
-                                    root.settings-revealed-id = "appearance.room_header";
+                                    if self.has-focus { root.settings-revealed-id = "appearance.room_header"; }
                                 }
                             }
                             height: 40px * root.text-scale;
@@ -3808,7 +3880,7 @@ export component AppWindow inherits Window {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                     self.focus();
-                                    root.settings-revealed-id = "appearance.message_layout";
+                                    if self.has-focus { root.settings-revealed-id = "appearance.message_layout"; }
                                 }
                             }
                             height: 40px * root.text-scale;
@@ -3827,7 +3899,7 @@ export component AppWindow inherits Window {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                     self.focus();
-                                    root.settings-revealed-id = "appearance.message_details";
+                                    if self.has-focus { root.settings-revealed-id = "appearance.message_details"; }
                                 }
                             }
                             property <bool> selected: index == 0 ? root.show-message-avatars : index == 1 ? root.show-message-timestamps : root.color-message-senders;
@@ -3847,7 +3919,7 @@ export component AppWindow inherits Window {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                     self.focus();
-                                    root.settings-revealed-id = "appearance.timestamps";
+                                    if self.has-focus { root.settings-revealed-id = "appearance.timestamps"; }
                                 }
                             }
                             height: 40px * root.text-scale;
@@ -3905,8 +3977,8 @@ export component AppWindow inherits Window {
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
-                                    self.focus();
-                                    root.settings-revealed-id = "appearance.geometry";
+                                    self.focus-control();
+                                    if self.has-focus { root.settings-revealed-id = "appearance.geometry"; }
                                 }
                             }
                             label: "Corner radius"; value: root.corner-radius-px; minimum: 0; maximum: 24;
@@ -3917,8 +3989,8 @@ export component AppWindow inherits Window {
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
-                                    self.focus();
-                                    root.settings-revealed-id = "appearance.spacing";
+                                    self.focus-control();
+                                    if self.has-focus { root.settings-revealed-id = "appearance.spacing"; }
                                 }
                             }
                             label: "Message spacing"; value: root.message-gap-px; minimum: 0; maximum: 32;
@@ -3932,8 +4004,8 @@ export component AppWindow inherits Window {
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
-                                    self.focus();
-                                    root.settings-revealed-id = "appearance.rail_width";
+                                    self.focus-control();
+                                    if self.has-focus { root.settings-revealed-id = "appearance.rail_width"; }
                                 }
                             }
                             label: "Space rail width"; value: root.rail-width-px; minimum: 44; maximum: 100; step: 2;
@@ -3952,7 +4024,7 @@ export component AppWindow inherits Window {
                                     if self.reveal-request > 0 {
                                         settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                         self.focus();
-                                        root.settings-revealed-id = "appearance.base_palette";
+                                        if self.has-focus { root.settings-revealed-id = "appearance.base_palette"; }
                                     }
                                 }
                                 width: 128px;
@@ -4010,7 +4082,7 @@ export component AppWindow inherits Window {
                                     if self.reveal-request > 0 {
                                         settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                         self.focus();
-                                        root.settings-revealed-id = "appearance.font_scale";
+                                        if self.has-focus { root.settings-revealed-id = "appearance.font_scale"; }
                                     }
                                 }
                                 x: increase-font-scale.x - self.width - 9px;
@@ -4036,7 +4108,7 @@ export component AppWindow inherits Window {
                                     if self.reveal-request > 0 {
                                         settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                         self.focus();
-                                        root.settings-revealed-id = "appearance.density";
+                                        if self.has-focus { root.settings-revealed-id = "appearance.density"; }
                                     }
                                 }
                                 width: 142px; height: 40px; border-radius: StyleTokens.radius * 0.9;
@@ -4060,7 +4132,7 @@ export component AppWindow inherits Window {
                                     if self.reveal-request > 0 {
                                         settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                         self.focus();
-                                        root.settings-revealed-id = "layout.navigation";
+                                        if self.has-focus { root.settings-revealed-id = "layout.navigation"; }
                                     }
                                 }
                                 height: 36px * root.text-scale; vertical-stretch: 0;
@@ -4104,7 +4176,7 @@ export component AppWindow inherits Window {
                                         if self.reveal-request > 0 {
                                             settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                             self.focus();
-                                            root.settings-revealed-id = "layout.panes";
+                                            if self.has-focus { root.settings-revealed-id = "layout.panes"; }
                                         }
                                     }
                                     label: root.show-side-panel ? "Hide side panel" : "Show side panel";
@@ -4153,7 +4225,7 @@ export component AppWindow inherits Window {
                                         if self.reveal-request > 0 {
                                             settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                             self.focus();
-                                            root.settings-revealed-id = "layout.unread_first";
+                                            if self.has-focus { root.settings-revealed-id = "layout.unread_first"; }
                                         }
                                     }
                                     label: root.sort-unread-first ? "Turn off unread first sorting" : "Turn on unread first sorting";
@@ -4188,7 +4260,7 @@ export component AppWindow inherits Window {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                     self.focus();
-                                    root.settings-revealed-id = "notifications.desktop";
+                                    if self.has-focus { root.settings-revealed-id = "notifications.desktop"; }
                                 }
                             }
                             label: "Desktop notifications";
@@ -4210,7 +4282,7 @@ export component AppWindow inherits Window {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                     self.focus();
-                                    root.settings-revealed-id = "notifications.sounds";
+                                    if self.has-focus { root.settings-revealed-id = "notifications.sounds"; }
                                 }
                             }
                             label: "Notification sounds";
@@ -4232,7 +4304,7 @@ export component AppWindow inherits Window {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                     self.focus();
-                                    root.settings-revealed-id = "notifications.previews";
+                                    if self.has-focus { root.settings-revealed-id = "notifications.previews"; }
                                 }
                             }
                             label: "Show message previews in desktop notifications";
@@ -4262,7 +4334,7 @@ export component AppWindow inherits Window {
                                         if self.reveal-request > 0 {
                                             settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                             self.focus();
-                                            root.settings-revealed-id = "notifications.highlights";
+                                            if self.has-focus { root.settings-revealed-id = "notifications.highlights"; }
                                         }
                                     }
                                     accessible-label: "New highlight word or phrase";
@@ -4311,13 +4383,25 @@ export component AppWindow inherits Window {
                                             changed reveal-request => {
                                                 if self.reveal-request > 0 {
                                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
-                                                    self.focus();
-                                                    root.settings-revealed-id = "security.recovery";
+                                                    if self.enabled {
+                                                        self.focus();
+                                                        if self.has-focus { root.settings-revealed-id = "security.recovery"; }
+                                                    } else {
+                                                        // Unavailable now: focus the status that explains why, and
+                                                        // report that rather than the disabled control.
+                                                        security-status-field.focus();
+                                                        if security-status-field.has-focus { root.settings-revealed-id = "security.recovery:status"; }
+                                                    }
                                                 }
                                             }
                                             text: root.security-loading ? "Loading…" : "Refresh"; enabled: !root.security-loading && !root.security-busy; accessible-label: "Refresh account security status"; clicked => { root.refresh-security(); } }
                                     }
-                                    Text { text: "This device: " + root.security-device-status; color: root.muted; font-size: 12px * root.text-scale; accessible-live-region: polite; }
+                                    // Read-only and focusable, so search can reveal it while Refresh is busy.
+                                    security-status-field := ThemedTextInput {
+                                        text: "This device: " + root.security-device-status; read-only: true; single-line: false; wrap: word-wrap;
+                                        color: root.muted; font-size: 12px * root.text-scale;
+                                        accessible-label: "Device security status: " + root.security-device-status;
+                                    }
                                     Text { text: "Recovery: " + root.security-recovery-status + "  ·  Key backup: " + root.security-backup-status; color: root.muted; font-size: 12px * root.text-scale; accessible-live-region: polite; }
                                 }
                             }
@@ -4494,7 +4578,7 @@ export component AppWindow inherits Window {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                     self.focus();
-                                    root.settings-revealed-id = "media.image_previews";
+                                    if self.has-focus { root.settings-revealed-id = "media.image_previews"; }
                                 }
                             }
                             label: "Allow image previews in encrypted rooms";
@@ -4514,8 +4598,15 @@ export component AppWindow inherits Window {
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
-                                    self.focus();
-                                    root.settings-revealed-id = "media.audio_devices";
+                                    if self.enabled {
+                                        self.focus();
+                                        if self.has-focus { root.settings-revealed-id = "media.audio_devices"; }
+                                    } else {
+                                        // Unavailable now: focus the status that explains why, and
+                                        // report that rather than the disabled control.
+                                        audio-status-field.focus();
+                                        if audio-status-field.has-focus { root.settings-revealed-id = "media.audio_devices:status"; }
+                                    }
                                 }
                             }
                             accessible-label: "Microphone for the next call";
@@ -4530,7 +4621,13 @@ export component AppWindow inherits Window {
                             selected(value) => { root.select-audio-speaker(value); }
                         }
                         Button { text: root.audio-devices-busy ? "Finding devices…" : "Refresh audio devices"; enabled: root.audio-devices-enabled && !root.audio-devices-busy; clicked => { root.refresh-audio-devices(); } }
-                        Text { text: root.audio-device-notice; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-label: "Audio device status: " + root.audio-device-notice; accessible-live-region: polite; }
+                        // Read-only and focusable, so search can reveal it while devices are unavailable.
+                        audio-status-field := ThemedTextInput {
+                            text: root.audio-device-notice != "" ? root.audio-device-notice : "Choose Refresh audio devices to list devices.";
+                            read-only: true; single-line: false; wrap: word-wrap;
+                            color: root.muted; font-size: 12px * root.text-scale;
+                            accessible-label: "Audio device status: " + self.text;
+                        }
                         Rectangle { height: 1px; background: root.divider; }
                         Text { text: "Keyboard shortcuts"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text {
@@ -4543,7 +4640,7 @@ export component AppWindow inherits Window {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                     self.focus();
-                                    root.settings-revealed-id = "shortcuts";
+                                    if self.has-focus { root.settings-revealed-id = "shortcuts"; }
                                 }
                             }
                             label: "Switch room"; binding <=> root.shortcut-edit-quick-switcher; ink: root.ink; muted: root.muted; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; edited => { root.shortcuts-edited(); } }
@@ -4571,7 +4668,7 @@ export component AppWindow inherits Window {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                     self.focus();
-                                    root.settings-revealed-id = "advanced.config_file";
+                                    if self.has-focus { root.settings-revealed-id = "advanced.config_file"; }
                                 }
                             }
                             text: root.config-path; read-only: true; wrap: word-wrap;
@@ -4582,7 +4679,13 @@ export component AppWindow inherits Window {
                         Text { text: "Application updates"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Updates are checked only when you ask. Downloading verifies the application signature; restarting installs the update. Leave any call and finish recovery before restarting."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         if root.update-version != "" : Text { text: "Available version: " + root.update-version; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; }
-                        Text { text: root.update-status; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-label: "Application update status: " + root.update-status; accessible-live-region: polite; }
+                        // Read-only and focusable, so search can reveal it when checking is unavailable.
+                        update-status-field := ThemedTextInput {
+                            text: root.update-status != "" ? root.update-status : "No update status yet.";
+                            read-only: true; single-line: false; wrap: word-wrap;
+                            color: root.muted; font-size: 12px * root.text-scale;
+                            accessible-label: "Application update status: " + self.text;
+                        }
                         HorizontalLayout {
                             spacing: 10px;
                             Button {
@@ -4590,8 +4693,15 @@ export component AppWindow inherits Window {
                                 changed reveal-request => {
                                     if self.reveal-request > 0 {
                                         settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
-                                        self.focus();
-                                        root.settings-revealed-id = "updates";
+                                        if self.enabled {
+                                            self.focus();
+                                            if self.has-focus { root.settings-revealed-id = "updates"; }
+                                        } else {
+                                            // Unavailable now: focus the status that explains why, and
+                                            // report that rather than the disabled control.
+                                            update-status-field.focus();
+                                            if update-status-field.has-focus { root.settings-revealed-id = "updates:status"; }
+                                        }
                                     }
                                 }
                                 text: "Check for updates"; enabled: root.update-can-check; clicked => { root.check-for-updates(); } }
@@ -5535,7 +5645,7 @@ export component AppWindow inherits Window {
             Rectangle {
                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
                 width: min(980px, parent.width - 48px); height: min(760px, parent.height - 48px);
-                border-radius: 14px; border-width: 1px; border-color: root.accent; background: root.canvas;
+                border-radius: 14px; border-width: 1px; border-color: root.accent; background: root.dialog-surface;
                 accessible-role: region; accessible-label: "Image preview " + root.image-preview-title;
                 VerticalLayout {
                     padding: 16px; spacing: 12px;
@@ -5585,7 +5695,7 @@ export component AppWindow inherits Window {
             Rectangle {
                 x: (parent.width - 530px) / 2;
                 y: (parent.height - self.height) / 2;
-                width: 530px; height: min(580px, parent.height - 40px); background: root.canvas;
+                width: 530px; height: min(580px, parent.height - 40px); background: root.dialog-surface;
                 border-radius: 14px; border-color: root.accent; border-width: 1px;
                 accessible-role: region;
                 accessible-label: "Switch room in " + root.active-space-name;
@@ -5670,7 +5780,7 @@ export component AppWindow inherits Window {
                 border-radius: 14px;
                 border-color: root.divider;
                 border-width: 1px;
-                background: root.canvas;
+                background: root.dialog-surface;
                 accessible-role: region;
                 accessible-label: "Create or join a Matrix room";
                 VerticalLayout {
@@ -5784,7 +5894,7 @@ export component AppWindow inherits Window {
                 height: min(820px, parent.height - 40px);
                 x: (parent.width - self.width) / 2;
                 y: (parent.height - self.height) / 2;
-                background: root.canvas; border-color: root.divider; border-width: 1px; border-radius: 14px;
+                background: root.dialog-surface; border-color: root.divider; border-width: 1px; border-radius: 14px;
                 accessible-role: region;
                 accessible-label: "Room settings";
                 VerticalLayout {
@@ -6024,7 +6134,7 @@ export component AppWindow inherits Window {
                 y: (parent.height - (root.room-admin-mode == 2 ? 325px : 430px)) / 2;
                 width: 480px;
                 height: root.room-admin-mode == 2 ? 325px : 430px;
-                background: root.canvas;
+                background: root.dialog-surface;
                 border-color: root.divider;
                 border-width: 1px;
                 border-radius: 14px;
@@ -6189,7 +6299,7 @@ export component AppWindow inherits Window {
                 height: 452px;
                 x: (parent.width - 486px) / 2;
                 y: (parent.height - 452px) / 2;
-                background: root.canvas;
+                background: root.dialog-surface;
                 border-color: root.divider;
                 border-width: 1px;
                 border-radius: 14px;
@@ -6416,7 +6526,7 @@ export component AppWindow inherits Window {
             } else { reject }
         }
         Rectangle {
-        background: root.rail;
+        background: root.sign-in-surface;
         // The sign-in surface stays inside the window at every text scale.
         // Its fields and actions scroll together; focused actions reveal their
         // complete bounds without allowing Tab into the covered conversation.
@@ -6428,7 +6538,7 @@ export component AppWindow inherits Window {
             border-radius: StyleTokens.radius * 1.8;
             border-color: root.divider;
             border-width: 1px;
-            background: root.canvas;
+            background: root.dialog-surface;
             accessible-role: form;
             accessible-label: "Sign in to Matrix";
             login-body-scroll := ScrollView {
@@ -6559,7 +6669,7 @@ export component AppWindow inherits Window {
                 x: (parent.width - 520px) / 2;
                 y: (parent.height - 348px) / 2;
                 width: 520px; height: 348px;
-                background: root.canvas; border-color: root.accent; border-width: 1px; border-radius: 14px;
+                background: root.dialog-surface; border-color: root.accent; border-width: 1px; border-radius: 14px;
                 accessible-role: region;
                 accessible-label: "One-time Matrix recovery key";
                 VerticalLayout {
@@ -6636,7 +6746,7 @@ export component AppWindow inherits Window {
                 width: min(620px * root.text-scale, parent.width - 32px);
                 height: min(680px * root.text-scale, parent.height - 32px);
                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-                background: root.canvas; border-radius: StyleTokens.radius * 1.4; border-width: 1px; border-color: root.divider;
+                background: root.dialog-surface; border-radius: StyleTokens.radius * 1.4; border-width: 1px; border-color: root.divider;
                 accessible-role: region; accessible-label: "Manage saved Matrix accounts";
                 VerticalLayout {
                     padding: 20px; spacing: 12px;
@@ -6750,7 +6860,7 @@ export component AppWindow inherits Window {
                 width: min(540px * root.text-scale, parent.width - 32px);
                 height: min(610px * root.text-scale, parent.height - 32px);
                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-                background: root.canvas; border-radius: StyleTokens.radius * 1.4; border-width: 1px; border-color: root.divider;
+                background: root.dialog-surface; border-radius: StyleTokens.radius * 1.4; border-width: 1px; border-color: root.divider;
                 accessible-role: form; accessible-label: root.access-mode == 4 ? "Remove saved account" : "Local app password";
                 VerticalLayout {
                     padding: 22px; spacing: 12px;
