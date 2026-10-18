@@ -961,15 +961,33 @@ fn save_config_change(
     store: &ConfigStore,
     change: impl FnOnce(&mut Config),
 ) -> Option<Config> {
+    save_config_edit(ui, store, |config| {
+        change(config);
+        true
+    })
+}
+
+/// `save_config_change` for a change decided on the file as re-read: when
+/// `change` returns false, nothing is written or applied and `None` is
+/// returned without an error, so the caller tells a declined change from a
+/// failed save by what its closure recorded.
+fn save_config_edit(
+    ui: &AppWindow,
+    store: &ConfigStore,
+    change: impl FnOnce(&mut Config) -> bool,
+) -> Option<Config> {
     // Read from disk first so an invalid external edit is never overwritten by a UI action.
     let result = (|| {
         let mut config = store.load()?;
-        change(&mut config);
+        if !change(&mut config) {
+            return Ok(None);
+        }
         store.save(&config)?;
-        Ok::<_, morpheus_config::ConfigError>(config)
+        Ok::<_, morpheus_config::ConfigError>(Some(config))
     })();
     match result {
-        Ok(config) => {
+        Ok(None) => None,
+        Ok(Some(config)) => {
             // A missing or malformed theme should leave the last valid
             // appearance active, but it must not hold back notification
             // privacy changes from a successfully saved config.

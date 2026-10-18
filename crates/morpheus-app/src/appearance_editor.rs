@@ -6,6 +6,12 @@
 //! first, so an invalid hand edit is never overwritten. Partial or invalid
 //! input only shows a hint; the last valid appearance stays applied. Undo is
 //! presentation state of this window; the file remains the record.
+//!
+//! The applied configuration can lag the file by up to one watcher poll, so
+//! every write is decided on the re-read file: each undo step and the Reset
+//! all snapshot are taken there, inside the save, and kept only once the save
+//! succeeded. Undo applies only while the color still holds the value this
+//! window saved, so it never overwrites a later edit made elsewhere.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -16,10 +22,13 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use super::{
     AppWindow, ColorEditorState, ColorGroupItem, ColorTokenItem, StyleTokens, save_config_change,
+    save_config_edit,
 };
 
 const HEX_HINT: &str = "Use #RRGGBB or #RRGGBBAA, with alpha last. The last valid color stays applied.";
 const EMPTY_HINT: &str = "Type a color, or use Reset to return to the theme or built-in color.";
+const STALE_UNDO_HINT: &str =
+    "This color was changed outside this window after your change; nothing was undone.";
 const MAX_FILTER_CHARS: usize = 64;
 /// The group-list entry after the color groups: the window settings.
 const WINDOW_GROUP: usize = TokenGroup::ALL.len();
@@ -34,10 +43,16 @@ enum ResetAll {
     Removed(BTreeMap<String, String>),
 }
 
+/// One token's last change in this window, as found in and written to the file.
+struct UndoStep {
+    before: Option<String>,
+    after: Option<String>,
+}
+
 #[derive(Default)]
 struct Session {
-    /// The override each token had before its last change in this window.
-    previous: HashMap<&'static str, Option<String>>,
+    /// The last change of each token in this window.
+    previous: HashMap<&'static str, UndoStep>,
     hint: String,
     reset_all: ResetAll,
     /// The configuration and theme last applied, for projecting selection
@@ -99,17 +114,16 @@ pub(super) fn register(ui: &AppWindow, store: &ConfigStore) {
             return;
         };
         clear_hint();
-        let value = registry::format_hex_color(rgba);
-        let unchanged = current_config(|config| {
-            let current = config.colors.get(token.id).and_then(|value| registry::parse_hex_color(value));
-            // Typing the color already shown, without an override, saves nothing.
-            current == Some(rgba) || (current.is_none() && effective_rgba(&ui, token.id) == rgba)
-        });
-        if unchanged.unwrap_or(false) {
+        // Typing the color already shown saves nothing, so an inherited color
+        // does not become an override. This only ever skips a write, so a
+        // view older than the file cannot overwrite it.
+        if effective_rgba(&ui, token.id) == rgba {
             reproject(&ui, false);
             return;
         }
-        save_override(&ui, &save_store, token.id, Some(value));
+        save_override(&ui, &save_store, token.id, Some(registry::format_hex_color(rgba)));
+        // The save projected the new file before its undo step was recorded.
+        reproject(&ui, false);
     });
     let weak = ui.as_weak();
     let reset_store = store.clone();
@@ -130,20 +144,27 @@ pub(super) fn register(ui: &AppWindow, store: &ConfigStore) {
         let Some(token) = registry::color_token(ui.get_color_selected_id().as_str()) else {
             return;
         };
-        let previous = SESSION.with(|session| session.borrow_mut().previous.remove(token.id));
-        let Some(previous) = previous else { return };
+        let step = SESSION.with(|session| session.borrow_mut().previous.remove(token.id));
+        let Some(step) = step else { return };
         clear_hint();
-        let saved = save_config_change(&ui, &undo_store, |config| match &previous {
-            Some(value) => {
-                config.colors.insert(token.id.into(), value.clone());
+        let mut superseded = false;
+        let saved = save_config_edit(&ui, &undo_store, |config| {
+            // Undo only the change this window made, not a later one.
+            if !same_color(config.colors.get(token.id), step.after.as_ref()) {
+                superseded = true;
+                return false;
             }
-            None => {
-                config.colors.remove(token.id);
-            }
+            match &step.before {
+                Some(value) => config.colors.insert(token.id.into(), value.clone()),
+                None => config.colors.remove(token.id),
+            };
+            true
         });
-        if saved.is_none() {
+        if superseded {
+            set_hint(STALE_UNDO_HINT);
+        } else if saved.is_none() {
             // Keep the undo step when the file could not be changed.
-            SESSION.with(|session| session.borrow_mut().previous.insert(token.id, previous));
+            SESSION.with(|session| session.borrow_mut().previous.insert(token.id, step));
         }
         reproject(&ui, true);
     });
@@ -152,29 +173,55 @@ pub(super) fn register(ui: &AppWindow, store: &ConfigStore) {
     ui.on_color_reset_all(move || {
         let Some(ui) = weak.upgrade() else { return };
         let state = SESSION.with(|session| std::mem::take(&mut session.borrow_mut().reset_all));
+        // Whether the file changed, which ends every single-color undo step.
+        let mut written = false;
         let next = match state {
             ResetAll::Idle => ResetAll::Confirm,
             ResetAll::Confirm => {
-                let removed = current_config(|config| config.colors.clone()).unwrap_or_default();
-                let saved = save_config_change(&ui, &all_store, |config| config.colors.clear());
-                match saved {
-                    Some(_) => ResetAll::Removed(removed),
-                    None => ResetAll::Idle,
+                // The overrides the file holds now, not the ones last applied.
+                let mut removed = BTreeMap::new();
+                let saved = save_config_edit(&ui, &all_store, |config| {
+                    removed = std::mem::take(&mut config.colors);
+                    !removed.is_empty()
+                });
+                written = saved.is_some();
+                if written {
+                    ResetAll::Removed(removed)
+                } else {
+                    ResetAll::Idle
                 }
             }
             ResetAll::Removed(removed) => {
-                save_config_change(&ui, &all_store, |config| {
+                // `None` until the file was read; then whether anything is
+                // left to restore. A color set again since is kept.
+                let mut restorable = None;
+                let saved = save_config_edit(&ui, &all_store, |config| {
+                    let mut any = false;
                     for (id, value) in &removed {
-                        config.colors.entry(id.clone()).or_insert_with(|| value.clone());
+                        if !config.colors.contains_key(id) {
+                            config.colors.insert(id.clone(), value.clone());
+                            any = true;
+                        }
                     }
+                    restorable = Some(any);
+                    any
                 });
-                ResetAll::Idle
+                written = saved.is_some();
+                if written || restorable == Some(false) {
+                    ResetAll::Idle
+                } else {
+                    // The file could not be read or written: keep the snapshot
+                    // so the restore can be tried again.
+                    ResetAll::Removed(removed)
+                }
             }
         };
         SESSION.with(|session| {
             let mut session = session.borrow_mut();
             session.reset_all = next;
-            session.previous.clear();
+            if written {
+                session.previous.clear();
+            }
         });
         reproject(&ui, true);
     });
@@ -240,10 +287,14 @@ pub(super) fn project(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>
     SESSION.with(|session| {
         let mut session = session.borrow_mut();
         session.source = Some((config.clone(), theme.cloned()));
-        // An edit made elsewhere ends a pending Reset all confirmation.
+        // An edit made elsewhere ends a pending Reset all confirmation and
+        // the undo step of every color it changed.
         if matches!(session.reset_all, ResetAll::Confirm) {
             session.reset_all = ResetAll::Idle;
         }
+        session
+            .previous
+            .retain(|id, step| same_color(config.colors.get(*id), step.after.as_ref()));
     });
     reproject(ui, false);
 }
@@ -263,27 +314,35 @@ fn clear_hint() {
     set_hint("");
 }
 
-/// Save one override (or remove it with `None`), keeping one undo step.
+/// Save one override (or remove it with `None`), keeping one undo step. The
+/// step's prior value is the one in the re-read file, and nothing is written
+/// when the file already holds the requested color.
 fn save_override(ui: &AppWindow, store: &ConfigStore, id: &'static str, value: Option<String>) {
-    let before = current_config(|config| config.colors.get(id).cloned()).flatten();
-    if before == value {
-        return;
-    }
-    let saved = save_config_change(ui, store, |config| match &value {
-        Some(value) => {
-            config.colors.insert(id.into(), value.clone());
+    let mut before = None;
+    let saved = save_config_edit(ui, store, |config| {
+        if same_color(config.colors.get(id), value.as_ref()) {
+            return false;
         }
-        None => {
-            config.colors.remove(id);
-        }
+        before = Some(match &value {
+            Some(value) => config.colors.insert(id.into(), value.clone()),
+            None => config.colors.remove(id),
+        });
+        true
     });
-    if saved.is_some() {
+    if let (Some(_), Some(before)) = (saved, before) {
         SESSION.with(|session| {
             let mut session = session.borrow_mut();
-            session.previous.insert(id, before);
+            session.previous.insert(id, UndoStep { before, after: value });
             session.reset_all = ResetAll::Idle;
         });
     }
+}
+
+/// Whether two optional override values name the same color; spelling and
+/// case do not matter. Values in a loaded configuration are always valid.
+fn same_color(left: Option<&String>, right: Option<&String>) -> bool {
+    left.map(|value| registry::parse_hex_color(value))
+        == right.map(|value| registry::parse_hex_color(value))
 }
 
 fn group_items() -> Vec<ColorGroupItem> {

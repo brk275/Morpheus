@@ -1695,6 +1695,84 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
     ui.invoke_color_reset();
     settle(ui).await;
 
+    // This test runs no watcher, so a valid edit written straight to the file
+    // stays undelivered until the editor's own next save. The undo step takes
+    // its prior value from the re-read file, never from the applied view, and
+    // the save keeps the other edit.
+    let colors = || store.load().unwrap().colors;
+    let color = |id: &str| colors().get(id).cloned();
+    ui.invoke_color_hex_edited("#112233".into());
+    settle(ui).await;
+    assert_eq!(canvas().as_deref(), Some("#112233"));
+    let mut external = store.load().unwrap();
+    external.colors.insert("canvas".into(), "#445566".into());
+    external.colors.insert("link".into(), "#778899".into());
+    store.save(&external).unwrap();
+    ui.invoke_color_hex_edited("#ABCDEF".into());
+    settle(ui).await;
+    assert_eq!(canvas().as_deref(), Some("#ABCDEF"));
+    assert_eq!(color("link").as_deref(), Some("#778899"), "an undelivered edit was overwritten");
+    ui.invoke_color_undo();
+    settle(ui).await;
+    assert_eq!(canvas().as_deref(), Some("#445566"), "undo restored the stale applied value");
+    assert_eq!(color("link").as_deref(), Some("#778899"));
+    // Undo never overwrites a later edit made elsewhere: the step is dropped
+    // with a hint and the file is left as it is.
+    ui.invoke_color_hex_edited("#123456".into());
+    settle(ui).await;
+    assert!(ui.get_color_editor().can_undo);
+    let mut external = store.load().unwrap();
+    external.colors.insert("canvas".into(), "#654321".into());
+    store.save(&external).unwrap();
+    let superseded = std::fs::read_to_string(store.path()).unwrap();
+    ui.invoke_color_undo();
+    settle(ui).await;
+    assert_eq!(std::fs::read_to_string(store.path()).unwrap(), superseded);
+    assert!(!ui.get_color_editor().can_undo);
+    assert!(!ui.get_color_editor().hint.is_empty());
+
+    // Arming Reset all keeps single-color undo; the removal takes the
+    // overrides the file holds then, including an undelivered one.
+    ui.invoke_color_token_chosen("link".into());
+    settle(ui).await;
+    ui.invoke_color_hex_edited("#010203".into());
+    settle(ui).await;
+    ui.invoke_color_reset_all();
+    settle(ui).await;
+    assert!(!ui.get_color_reset_all_notice().is_empty());
+    assert!(ui.get_color_editor().can_undo, "arming Reset all dropped undo");
+    let mut external = store.load().unwrap();
+    external.colors.insert("accent".into(), "#0A0B0C".into());
+    store.save(&external).unwrap();
+    let expected = store.load().unwrap().colors;
+    assert_eq!(expected.len(), 3);
+    ui.invoke_color_reset_all();
+    settle(ui).await;
+    assert!(colors().is_empty());
+    assert_eq!(ui.get_color_reset_all_notice(), "Restore the 3 removed colors");
+    assert!(!ui.get_color_editor().can_undo);
+    // A failed restore leaves the file alone and keeps the snapshot, so the
+    // restore can be tried again once the file is valid.
+    let cleared = std::fs::read_to_string(store.path()).unwrap();
+    std::fs::write(store.path(), "not = [valid\n").unwrap();
+    ui.invoke_color_reset_all();
+    settle(ui).await;
+    assert_eq!(std::fs::read_to_string(store.path()).unwrap(), "not = [valid\n");
+    assert!(!ui.get_config_error().is_empty());
+    assert_eq!(ui.get_color_reset_all_notice(), "Restore the 3 removed colors");
+    std::fs::write(store.path(), &cleared).unwrap();
+    ui.invoke_color_reset_all();
+    settle(ui).await;
+    assert_eq!(colors(), expected);
+    assert!(ui.get_color_reset_all_notice().is_empty());
+    // Back to no overrides, as applied, for the checks below.
+    let mut plain = store.load().unwrap();
+    plain.colors.clear();
+    store.save(&plain).unwrap();
+    apply_config(ui, &plain, None);
+    ui.invoke_color_token_chosen("canvas".into());
+    settle(ui).await;
+
     // A rejected opacity save rolls the preview back to the last valid value.
     let tokens = ui.global::<crate::StyleTokens>();
     ui.invoke_preview_window_opacity(30);

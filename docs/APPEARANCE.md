@@ -287,6 +287,15 @@ partial input only shows an inline hint. Reset all asks for a second
 activation and can then restore what it removed. The Window group holds the
 transparency slider with its numeric entry.
 
+The applied colors can lag the file by up to one reload poll, so every write
+is decided on the file as re-read for that save. An undo step records the
+color the file held, and Reset all removes and remembers the overrides the
+file holds then; both are kept only once the save succeeded. Undo applies only
+while the color still holds the value this window saved: after a later edit
+made elsewhere it changes nothing and says so. A restore that cannot read or
+write the file keeps its snapshot so it can be tried again; a color set again
+since the removal is kept.
+
 Targets (33): appearance presets, colors, window transparency, base palette,
 reduce motion, fonts, message size, sender weight, room header, conversation
 style, message details, timestamps, corner radius, spacing, rail width, font
