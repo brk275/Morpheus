@@ -17,6 +17,8 @@ use matrix_sdk::{
     ComposerDraft, ComposerDraftType, DraftAttachment, DraftAttachmentContent, RoomState,
     ruma::{
         EventId, RoomId,
+        api::client::state::get_state_event_for_key,
+        events::StateEventType,
         events::room::{
             join_rules::{JoinRule, RoomJoinRulesEventContent},
             message::RoomMessageEventContent,
@@ -2469,13 +2471,31 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
             .save_composed_draft_for(&a_account.id, &new_room, None, &empty, &new_envelope)
             .await
             .unwrap();
-        // Leave with a persisted request and an unreadable row behind. The
-        // room is made joinable first (written through the SDK the way any
-        // client would) so this single account can come back to it.
+        // Leave with a persisted request and an unreadable row behind. Keep
+        // a different fixture user joined so the room remains hosted while the
+        // tested account is away. Its public join rule permits that account to
+        // return without an invitation changing the Left-state assertions.
         sdk_new_room
             .send_state_event(RoomJoinRulesEventContent::new(JoinRule::Public))
             .await
             .expect("Cannot open the room's join rule");
+        let keeper_identity = fixture.account("a_second_device");
+        assert_ne!(keeper_identity.user_id, alice.user_id);
+        assert_eq!(keeper_identity.homeserver_url, alice.homeserver_url);
+        let keeper = AccountManager::open(root.join("room-keeper"))
+            .expect("Cannot open the separate keeper profile");
+        let keeper_account = keeper
+            .add_password_account(
+                &keeper_identity.homeserver_url,
+                &keeper_identity.username,
+                &keeper_identity.password,
+            )
+            .await
+            .expect("Cannot sign in the fixture room keeper");
+        keeper
+            .join_room(&new_room)
+            .await
+            .expect("Cannot join the fixture room keeper");
         // The hold works in an encrypted room too: the oversize event is
         // encrypted and still refused, or fails to encrypt, either way
         // permanently; a delivered hold fails this fixture.
@@ -2600,6 +2620,23 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
             .room_recovery_incomplete(&selection, &new_room)
             .await
             .unwrap());
+        // Confirm on the homeserver, under the independent keeper account,
+        // that another user remains joined after the tested account left.
+        // No invite or queue action changes the tested account's Left state.
+        let keeper_client = keeper.active_client().await.expect("Keeper client missing");
+        let membership = keeper_client
+            .send(get_state_event_for_key::v3::Request::new(
+                RoomId::parse(&new_room).unwrap(),
+                StateEventType::RoomMember,
+                keeper_identity.user_id.clone(),
+            ))
+            .await
+            .expect("Cannot fetch the keeper membership");
+        let membership: serde_json::Value =
+            serde_json::from_str(membership.event_or_content.get()).unwrap();
+        assert_eq!(membership["membership"], "join");
+        assert_eq!(sdk_new_room.state(), RoomState::Left);
+        drop(keeper_client);
         // Joined again: still not covered until the on-demand scan, which
         // finds the unreadable row and keeps the room paused.
         manager
@@ -2709,6 +2746,16 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
             .logout_account(&b_account.id)
             .await
             .expect("Cannot remove second account");
+        keeper
+            .leave_room(&new_room)
+            .await
+            .expect("Cannot leave the fixture keeper room");
+        keeper
+            .logout_account(&keeper_account.id)
+            .await
+            .expect("Cannot remove the fixture keeper account");
+        keeper.stop().await;
+        drop(keeper);
         phase!(recovery_stop);
         manager.stop().await;
     });
