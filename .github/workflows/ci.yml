@@ -1,12 +1,12 @@
 # TEMPORARY focused helper contracts. NEVER MERGE this workflow.
 name: macOS menu diagnostic contracts
-run-name: macOS menu stages b49121b - helper contracts only
+run-name: macOS menu stages 99645a6 - helper contracts only
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: macos-menu-contracts-b49121b
+  group: macos-menu-contracts-99645a6
   cancel-in-progress: false
 jobs:
   contracts:
@@ -17,11 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: b49121b2fb98bf8c2c50c717dfb0aa43aa0d6527
+          ref: 99645a6ced931b06e44399404a58378a296bcce0
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact reviewed source
-        run: test "$(git rev-parse HEAD)" = b49121b2fb98bf8c2c50c717dfb0aa43aa0d6527
+        run: test "$(git rev-parse HEAD)" = 99645a6ced931b06e44399404a58378a296bcce0
       - name: Scan source before executing reviewed mocked contracts
         shell: bash
         run: |
@@ -110,8 +110,9 @@ jobs:
           count=re.findall(r'^Ran ([0-9]+) tests in ',output,re.MULTILINE)
           passed=reason is None and code==0 and needed<=ok and len(count)==1 and int(count[0])==174 and '\nOK\n' in output
           print(json.dumps({'check':'macos_menu_stage_contracts','status':'passed' if passed else 'failed',
-              'source':'b49121b2fb98bf8c2c50c717dfb0aa43aa0d6527','failure':reason,
-              'tests_run':int(count[0]) if len(count)==1 else None,
+              'source':'99645a6ced931b06e44399404a58378a296bcce0','failure':reason,
+              'tests_run':int(count[0]) if len(count)==1 else None,'exit_code':code,
+              'failing_tests':sorted(set(re.findall(r'^(?:FAIL|ERROR): ([A-Za-z0-9_]+) ',output,re.MULTILINE))),
               'required_tests':{name:name in ok for name in sorted(needed)},
               'raw_logs_public':False,'native_app_executed':False},sort_keys=True),flush=True)
           if not passed: raise SystemExit(1)
