@@ -104,12 +104,93 @@ ownership before and after queries. A different class, extra style bit or owner
 keeps the window as a candidate. Two candidates remain an error; enumeration order
 never chooses one. An event target alone keeps the driver waiting for the app.
 
-Diagnostics expose only candidate and ignored-target counts, each saturating at
-two, alongside the existing fixed fields. Successful interaction requires an
-exact candidate count of one. Raw names, coordinates, handles and process IDs
-are never published. A vanished window can be retried; a live metadata failure
-or foreign handle fails the check.
+Diagnostics expose candidate and ignored-target counts, each saturating at
+two, and the window inventory below, alongside the existing fixed fields.
+Successful interaction requires an exact candidate count of one. Raw names,
+titles, coordinates, handles and process IDs are never published. A vanished
+window can be retried; a live metadata failure or foreign handle fails the
+check.
 
 This selector change still requires installed-package verification. The tiny
 default-feature subject does not establish the complete
 window set of an installed native-calls build.
+
+## Installed window inventory
+
+[Package run 39150595802](https://github.com/brk275/Morpheus/actions/runs/39150595802)
+built `e7031d5bf80595f021feb266288d326d9d110158`. Its installed launch,
+NSIS install and registration passed, then the keyboard driver failed at
+`step=window` with `window_count`, `window_candidates=2`,
+`event_targets_ignored=0` and `owned_window_seen=false`.
+
+### What the sources establish
+
+- The driver picks a window only through `owned_window`. Each poll calls
+  `keyboard_window_candidates`, which takes `package_smoke.visible_windows`
+  (same process, `IsWindowVisible`) and classifies each handle with
+  `keyboard_window_kind`. The first poll with any candidate decides: exactly
+  one is selected, otherwise `window_count`. The driver and this probe share
+  the read-only `windows_window_probe.Win32` queries, which mask style words
+  to 32 bits. The plain launch smoke only waits for a visible window.
+- `event_targets_ignored` is the maximum over every poll. A value of 0 means
+  that no visible window matched the event target's complete expected
+  signature in any poll. Pinned winit 0.30.13 creates that window, visible,
+  when the event loop is built, so the expected match never happened.
+- Morpheus calls `AppWindow::new()` and `show()` near the start of `main`, but
+  Slint 1.18.1 creates the native window only once `run()` starts the event
+  loop, after the rest of startup. A mismatched event target visible alone
+  for a whole poll would have been selected as the only candidate. The
+  failure means the first poll with any candidate already had two.
+- The matcher's words `0x90000000` and `0x080800a0` come from winit's
+  requested values. The window is created as `WS_OVERLAPPED` and then given
+  `WS_VISIBLE | WS_POPUP` through `SetWindowLongPtr`. No hosted run has
+  recorded the resulting raw words. This probe reports only named flags, and
+  its tables omit bits such as `WS_CLIPSIBLINGS` (`0x04000000`) and
+  `WS_EX_WINDOWEDGE` (`0x00000100`). Its nonzero event-target area is
+  consistent with the overlapped creation's minimum tracking size.
+- The installed build differs from the probe subject by the `native-calls`
+  feature. That feature adds no window creation to Morpheus's own startup:
+  the `morpheus_rtc::install_crypto_provider()` call only selects a TLS
+  provider, and audio device discovery runs only on request. The app defines
+  one Slint window and no popup window, menu bar or tray. glutin's WGL dummy
+  window is created hidden.
+
+### Hypotheses, not findings
+
+- Windows may keep `WS_CLIPSIBLINGS` when the style word of a top-level window
+  is replaced. Wine's reimplementation does so explicitly. If Windows does
+  too, the event target reports `0x94000000` and stays a candidate next to
+  the real window. This is the leading explanation. It is unverified.
+- Alternatively, an extended-style bit differs, or a window not visible in the
+  default-feature probe appears in the installed native-calls build.
+
+The selector stays unchanged until raw evidence decides between these.
+
+### Diagnostic
+
+When `owned_window` decides (one candidate, `window_count` or `wait_timeout`),
+it records `window_inventory` for the handles that same poll enumerated. The
+inventory only reports. It never selects, excludes or retries a window, and
+any error inside it becomes `status=failed` without changing the outcome.
+
+For each handle the inventory does the following:
+
+- It requires the task-owned process before and after the queries. A vanished
+  or reused handle keeps no facts and only increments `discarded`, which
+  saturates at 2.
+- It publishes at most eight entries, sorted so enumeration order is not
+  reported. More entries set `truncated`.
+
+Each entry has:
+
+- `family`: `winit_window`, `winit_event_target`, `ime`, `text_services`,
+  `ole` or `other`. The raw class name is never kept.
+- `style` and `exstyle`: the complete 32-bit words as integers.
+- `visible`, `cloaked` (DWM), and `owner`: `none`, `same_process` or
+  `other_process`.
+- `width` and `height`: clamped to 0–32767. Positions are never reported.
+
+A fact whose query failed on a live owned window is `null`. The smoke
+validates every key, token and range before printing the record. Titles,
+handles, process IDs, positions, paths, environment, application logs and
+screenshots are never read into it.

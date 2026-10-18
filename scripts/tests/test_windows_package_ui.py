@@ -19,6 +19,22 @@ SOURCE = Path(__file__).resolve().parents[1] / "windows_package_ui.py"
 NONCE = "0123456789abcdef0123456789abcdef"
 
 
+def fact(**changes):
+    """One published inventory entry: the synthetic main window by default."""
+    return {"family": "winit_window", "style": 0x16CF0000, "exstyle": 0x00040100, "visible": True,
+            "owner": "none", "cloaked": False, "width": 480, "height": 320, **changes}
+
+
+def event_target_fact(**changes):
+    return fact(**{"family": "winit_event_target", "style": 0x90000000, "exstyle": 0x080800A0,
+                   "width": 0, "height": 0, **changes})
+
+
+def inventory(*windows, **overrides):
+    return {"status": "collected", "windows": sorted(windows, key=lambda item: json.dumps(item, sort_keys=True)),
+            "truncated": False, "discarded": 0, **overrides}
+
+
 def diagnostic(**overrides):
     return {"step": "complete", "operation": "none", "failure": "none", "bridge_error": "none",
             "owned_window_seen": True, "uia_root_seen": True, "homeserver_seen": True,
@@ -26,6 +42,7 @@ def diagnostic(**overrides):
             "selector_matches": 1, "incomplete_passes": 0, "foreground_recoveries": 0,
             "bounded_snapshots": 0, "password_semantics": "protected",
             "window_candidates": 1, "event_targets_ignored": 0,
+            "window_inventory": inventory(fact(), event_target_fact()),
             "traversed_node_matched": False, "cleanup": "passed", "profile_owned": True, **overrides}
 
 
@@ -38,11 +55,12 @@ def report(**overrides):
 
 def window_record(**changes):
     return {"pid": 77, "class": "Window Class", "style": 0x16CF0000, "exstyle": 0x00040100,
-            "owner": None, "rect": (10, 20, 490, 340), "visible": True, **changes}
+            "owner": None, "rect": (10, 20, 490, 340), "visible": True, "cloaked": False, **changes}
 
 
 class WindowQuery:
-    """Read-only provider double: no Win32 call, process, focus or keyboard."""
+    """Read-only provider double: no Win32 call, process, focus or keyboard.
+    A handle that is not (or no longer) present fails like a destroyed window."""
     def __init__(self):
         self.windows = {
             65538: window_record(),
@@ -50,23 +68,31 @@ class WindowQuery:
                                 "exstyle": 0x080800A0, "rect": (0, 0, 0, 0)}),
         }
 
+    def record(self, window):
+        if window not in self.windows:
+            raise ui.window_probe.ApiError()
+        return self.windows[window]
+
     def process_of(self, window):
-        return self.windows[window]["pid"]
+        return self.record(window)["pid"]
 
     def class_name(self, window):
-        return self.windows[window]["class"]
+        return self.record(window)["class"]
 
     def long(self, window, index):
-        return self.windows[window]["style" if index == ui.window_probe.GWL_STYLE else "exstyle"]
+        return self.record(window)["style" if index == ui.window_probe.GWL_STYLE else "exstyle"]
 
     def owner(self, window):
-        return self.windows[window]["owner"]
+        return self.record(window)["owner"]
 
     def rect(self, window):
-        return self.windows[window]["rect"]
+        return self.record(window)["rect"]
 
     def is_visible(self, window):
-        return self.windows[window]["visible"]
+        return self.record(window)["visible"]
+
+    def cloaked(self, window):
+        return self.windows[window]["cloaked"] if window in self.windows else None
 
     def is_window(self, window):
         return window in self.windows
@@ -1203,6 +1229,156 @@ class DiagnosticsAndReportTests(unittest.TestCase):
             ui.keyboard_window_candidates(77, ui.Diagnostics({}), api)
         self.assertEqual(error.exception.code, "window_bound")
 
+    def parse_failed_window_report(self, record):
+        """Run a driver record through the smoke's validating parser."""
+        record.update(check=ui.CHECK, status="failed", phase="setup", sign_in_semantics=False,
+                      account_menu_keyboard=False, appearance_config=False, normal_window_close=False,
+                      app_log_public=False, screen_reader_acceptance=False)
+        return smoke.keyboard_report(json.dumps(record).encode(), check=ui.CHECK,
+                                     validate=smoke.validate_windows_keyboard_diagnostic)
+
+    def test_window_count_inventory_publishes_complete_words_for_the_deciding_poll(self):
+        # A synthetic event target whose style word carries one extra bit
+        # (WS_CLIPSIBLINGS) reproduces the hosted failure tokens; the inventory
+        # then shows which complete word differs. The selector is unchanged.
+        api = WindowQuery()
+        api.windows[2].update(style=0x94000000, rect=(0, 0, 136, 39))
+        job = Mock()
+        job.kernel.WaitForSingleObject.return_value = 258
+        record = {}
+        trace = ui.Diagnostics(record)
+        with (patch.object(smoke, "visible_windows", return_value=[2, 65538]),
+              self.assertRaises(ui.DiagnosticFailure) as error):
+            ui.owned_window(job, 20, 77, trace, api=api)
+        self.assertEqual(error.exception.code, "window_count")
+        self.assertEqual((trace.value["window_candidates"], trace.value["event_targets_ignored"],
+                          trace.value["owned_window_seen"]), (2, 0, False))
+        self.assertEqual(trace.value["window_inventory"],
+                         inventory(fact(), event_target_fact(style=0x94000000, width=136, height=39)))
+        trace.step("window")
+        trace.failed(error.exception)
+        parsed = self.parse_failed_window_report(record)
+        self.assertEqual(parsed["diagnostic"]["window_inventory"], trace.value["window_inventory"])
+        published = json.dumps(parsed)
+        for private in ("Window Class", "Winit Thread Event Target", "65538", '"pid"', '"rect"', '"class"'):
+            self.assertNotIn(private, published)
+
+    def test_inventory_is_recorded_on_success_and_does_not_depend_on_enumeration_order(self):
+        job = Mock()
+        job.kernel.WaitForSingleObject.return_value = 258
+        inventories = []
+        for windows in ([65538, 2], [2, 65538]):
+            trace = ui.Diagnostics({})
+            with self.subTest(windows=windows), patch.object(smoke, "visible_windows", return_value=windows):
+                self.assertEqual(ui.owned_window(job, 20, 77, trace, api=WindowQuery()), 65538)
+            inventories.append(trace.value["window_inventory"])
+        self.assertEqual(inventories, [inventory(fact(), event_target_fact())] * 2)
+
+    def test_wait_timeout_records_the_last_poll(self):
+        job = Mock()
+        job.kernel.WaitForSingleObject.return_value = 258
+        trace = ui.Diagnostics({})
+        with (patch.object(smoke, "visible_windows", return_value=[2]),
+              self.assertRaises(ui.DiagnosticFailure) as error):
+            ui.owned_window(job, 20, 77, trace, seconds=0, api=WindowQuery())
+        self.assertEqual(error.exception.code, "wait_timeout")
+        self.assertEqual(trace.value["window_inventory"], inventory(event_target_fact()))
+        trace = ui.Diagnostics({})
+        with (patch.object(smoke, "visible_windows", return_value=[]),
+              self.assertRaises(ui.DiagnosticFailure)):
+            ui.owned_window(job, 20, 77, trace, seconds=0, api=WindowQuery())
+        self.assertEqual(trace.value["window_inventory"], inventory())
+
+    def test_inventory_reduces_unknown_classes_to_a_closed_family(self):
+        api = WindowQuery()
+        api.windows[3] = window_record(**{"class": "PRIVATE native helper", "style": 0x94000000})
+        trace = ui.Diagnostics({})
+        ui.record_window_inventory(api, [3, 65538], 77, trace)
+        self.assertEqual(trace.value["window_inventory"], inventory(fact(), fact(family="other", style=0x94000000)))
+        self.assertNotIn("PRIVATE", json.dumps(trace.value))
+
+    def test_inventory_keeps_no_facts_for_vanished_or_reused_handles(self):
+        api = WindowQuery()
+        trace = ui.Diagnostics({})
+        ui.record_window_inventory(api, [2, 65538, 3], 77, trace)  # Handle 3 was destroyed.
+        self.assertEqual(trace.value["window_inventory"], inventory(fact(), event_target_fact(), discarded=1))
+        for owners in ([99], [77, 99]):
+            # Foreign before the queries, or reused by another process before the recheck.
+            api = WindowQuery()
+            sequence = iter(owners)
+            original = api.process_of
+            trace = ui.Diagnostics({})
+            with (self.subTest(owners=owners),
+                  patch.object(api, "process_of",
+                               side_effect=lambda window: next(sequence, None) if window == 2 else original(window))):
+                ui.record_window_inventory(api, [2, 65538], 77, trace)
+            self.assertEqual(trace.value["window_inventory"], inventory(fact(), discarded=1))
+
+    def test_failed_queries_on_live_owned_windows_publish_only_unavailable(self):
+        api = WindowQuery()
+        api.windows[65538].update(owner=4, cloaked=None)
+        trace = ui.Diagnostics({})
+        with (patch.object(api, "rect", side_effect=ui.window_probe.ApiError),
+              patch.object(api, "class_name", side_effect=ui.window_probe.ApiError),
+              patch.object(api, "long", side_effect=ui.window_probe.ApiError),
+              patch.object(api, "is_visible", side_effect=ui.window_probe.ApiError)):
+            ui.record_window_inventory(api, [65538], 77, trace)
+        self.assertEqual(trace.value["window_inventory"],
+                         inventory(fact(family=None, style=None, exstyle=None, visible=None, owner=None,
+                                        cloaked=None, width=None, height=None)))
+        api = WindowQuery()
+        api.windows[65538]["owner"] = 2
+        api.windows[2]["pid"] = 99
+        api.windows[65538]["rect"] = (-40000, 0, 40000, 10)
+        trace = ui.Diagnostics({})
+        ui.record_window_inventory(api, [65538], 77, trace)
+        self.assertEqual(trace.value["window_inventory"],
+                         inventory(fact(owner="other_process", width=smoke.WINDOWS_WINDOW_EXTENT, height=10)))
+        self.assertTrue(smoke.valid_windows_inventory(trace.value["window_inventory"]))
+
+    def test_inventory_errors_never_change_the_selection_outcome(self):
+        job = Mock()
+        job.kernel.WaitForSingleObject.return_value = 258
+        for windows, outcome in (([65538], 65538), ([65538, 1], "window_count")):
+            api = WindowQuery()
+            api.windows[1] = window_record()
+            trace = ui.Diagnostics({})
+            with (self.subTest(windows=windows), patch.object(smoke, "visible_windows", return_value=windows),
+                  patch.object(ui, "window_facts", side_effect=RuntimeError("PRIVATE"))):
+                if outcome == "window_count":
+                    with self.assertRaises(ui.DiagnosticFailure) as error:
+                        ui.owned_window(job, 20, 77, trace, api=api)
+                    self.assertEqual(error.exception.code, outcome)
+                else:
+                    self.assertEqual(ui.owned_window(job, 20, 77, trace, api=api), outcome)
+            self.assertEqual(trace.value["window_inventory"], inventory(status="failed"))
+            self.assertNotIn("PRIVATE", json.dumps(trace.value))
+        trace = ui.Diagnostics({})
+        trace.deadline = 0
+        ui.record_window_inventory(WindowQuery(), [2, 65538], 77, trace)
+        self.assertEqual(trace.value["window_inventory"], inventory(status="incomplete"))
+
+    def test_inventory_is_bounded_sorted_and_flags_truncation(self):
+        api = WindowQuery()
+        handles = list(range(100, 112))
+        for index, window in enumerate(handles):
+            api.windows[window] = window_record(style=0x10000000 + index)
+        published = []
+        for order in (handles, list(reversed(handles))):
+            trace = ui.Diagnostics({})
+            ui.record_window_inventory(api, order, 77, trace)
+            published.append(trace.value["window_inventory"])
+        self.assertEqual(published[0], published[1])
+        self.assertEqual(len(published[0]["windows"]), smoke.WINDOWS_INVENTORY_BOUND)
+        self.assertTrue(published[0]["truncated"])
+        self.assertTrue(smoke.valid_windows_inventory(published[0]))
+
+    def test_inventory_vocabulary_matches_the_probe_and_the_initial_record_validates(self):
+        self.assertEqual(smoke.WINDOWS_WINDOW_FAMILIES, frozenset(ui.window_probe.FAMILIES.values()) | {"other"})
+        initial = ui.Diagnostics({}).value["window_inventory"]
+        self.assertEqual(initial, {"status": "not_collected", "windows": [], "truncated": False, "discarded": 0})
+        self.assertTrue(smoke.valid_windows_inventory(initial))
+
     def test_main_publishes_only_the_fixed_report_and_requires_the_nonce_argument(self):
         captured = io.StringIO()
         with patch.object(ui.sys, "argv", ["driver", "/synthetic/morpheus-app.exe", NONCE]), \
@@ -1230,9 +1406,33 @@ class DiagnosticsAndReportTests(unittest.TestCase):
                diagnostic(window_candidates=3), diagnostic(event_targets_ignored=True),
                diagnostic(event_targets_ignored=-1),
                diagnostic(profile_removed=True)]
+        bad_windows = [fact(family="Window Class"), fact(family="PRIVATE"), fact(style=-1), fact(style=0x100000000),
+                       fact(style=True), fact(exstyle="0x080800a0"), fact(style=1.5), fact(visible=1),
+                       fact(owner="PRIVATE"), fact(cloaked="no"), fact(width=smoke.WINDOWS_WINDOW_EXTENT + 1),
+                       fact(height=-1), fact(class_name="Window Class"), fact(title="PRIVATE"), fact(handle=65538),
+                       fact(pid=77), fact(left=10), {**fact(), "rect": [10, 20, 490, 340]}, "PRIVATE", None]
+        bad_inventories = [inventory(window) for window in bad_windows] + [
+            inventory(status="PRIVATE"), inventory(truncated="no"), inventory(discarded=3),
+            inventory(discarded=True), inventory(*[fact(style=index) for index in range(9)]),
+            inventory(fact(), status="not_collected"), inventory(fact(), status="failed"),
+            inventory(status="failed", discarded=1), inventory(status="not_collected", truncated=True),
+            {**inventory(), "private": "PRIVATE"}, {"status": "collected", "windows": []},
+            [fact()], None]
+        bad += [diagnostic(window_inventory=value) for value in bad_inventories]
         for value in bad:
             with self.subTest(value=value), self.assertRaises(RuntimeError):
                 parse(report(diagnostic=value))
+        good_inventories = [inventory(), inventory(status="not_collected"), inventory(status="failed"),
+                            inventory(status="incomplete"),
+                            inventory(fact(family=None, style=None, exstyle=None, visible=None, owner=None,
+                                           cloaked=None, width=None, height=None)),
+                            inventory(*[fact(style=index) for index in range(8)], truncated=True, discarded=2),
+                            inventory(fact(owner="other_process", style=0xFFFFFFFF, exstyle=0, width=0,
+                                           height=smoke.WINDOWS_WINDOW_EXTENT))]
+        for value in good_inventories:
+            with self.subTest(value=value):
+                accepted = report(diagnostic=diagnostic(window_inventory=value))
+                self.assertEqual(parse(accepted), accepted)
         incomplete = [diagnostic(password_semantics="unchecked"), diagnostic(cleanup="failed"),
                       diagnostic(profile_owned=False), diagnostic(uia_root_seen=False),
                       diagnostic(bridge_error="unowned"), diagnostic(step="appearance"),

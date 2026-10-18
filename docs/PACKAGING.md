@@ -266,9 +266,13 @@ focus. Then:
 The whole driver and bridge stream stays private; only the fixed JSON record
 with reviewed phase tokens, booleans and bounded counts (`selector_matches`,
 `incomplete_passes`, `foreground_recoveries`, `bounded_snapshots`) is printed
-and validated by the smoke before it is accepted. Names, values, handles,
-process identifiers, paths and raw PowerShell or application output are never
-published. It has a 180-second deadline inside the smoke's 360-second launcher
+and validated by the smoke before it is accepted. It also carries the bounded
+`window_inventory` of the poll that decided window selection. That inventory
+holds closed class families, complete numeric style words, visibility, owner,
+cloaking and clamped size, as described in
+[the window probe notes](WINDOWS_WINDOW_PROBE.md#installed-window-inventory).
+Names, titles, values, handles, process identifiers, positions, paths and raw
+PowerShell or application output are never published. It has a 180-second deadline inside the smoke's 360-second launcher
 bound.
 
 This is focused UI Automation/keyboard coverage, **not Narrator acceptance**,

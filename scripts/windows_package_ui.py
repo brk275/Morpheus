@@ -85,6 +85,7 @@ class Diagnostics:
             "selector_matches": 0, "incomplete_passes": 0, "foreground_recoveries": 0,
             "bounded_snapshots": 0, "password_semantics": "unchecked",
             "window_candidates": 0, "event_targets_ignored": 0,
+            "window_inventory": {"status": "not_collected", "windows": [], "truncated": False, "discarded": 0},
             "traversed_node_matched": False, "cleanup": "not_started", "profile_owned": False,
         }
         self.deadline = time.monotonic() + ACCEPTANCE_SECONDS
@@ -709,15 +710,19 @@ def keyboard_window_kind(api, window, pid):
     return "candidate"
 
 
-def keyboard_window_candidates(pid, diagnostics, api):
+def keyboard_window_candidates(pid, diagnostics, api, *, seen=None):
     """Ignore only the pinned Winit event target's complete fixed signature.
 
     Every other owned visible window remains a candidate. Unknown windows and
     a second real window are never silently discarded or selected by order.
     The shared read-only provider rechecks handle ownership around queries.
+    The optional seen list receives the bounded handles of this poll for the
+    diagnostic inventory only; it never takes part in selection.
     """
     windows = smoke.visible_windows(pid)
     require_ui(len(windows) <= window_probe.WINDOW_BOUND, "window_bound")
+    if seen is not None:
+        seen.extend(windows)
     candidates = []
     ignored = 0
     for window in windows:
@@ -737,6 +742,88 @@ def keyboard_window_candidates(pid, diagnostics, api):
     return candidates
 
 
+def window_facts(api, window, pid):
+    """Publishable facts for one borrowed handle of the task-owned process.
+
+    Returns None, keeping no facts, unless the handle belongs to pid before
+    and after every query. A query that fails on a live owned window yields
+    None for that fact only. The class name is reduced to a closed family
+    here and never kept; titles, handles, process IDs and positions are never
+    read into the result.
+    """
+    def query(call, *arguments):
+        try:
+            return call(*arguments)
+        except window_probe.ApiError:
+            return None
+
+    def word(value):
+        return value & 0xFFFFFFFF if type(value) is int else None
+
+    def extent(low, high):
+        return min(max(int(high) - int(low), 0), smoke.WINDOWS_WINDOW_EXTENT)
+
+    if query(api.process_of, window) != pid:
+        return None
+    name = query(api.class_name, window)
+    style = query(api.long, window, window_probe.GWL_STYLE)
+    exstyle = query(api.long, window, window_probe.GWL_EXSTYLE)
+    visible = query(api.is_visible, window)
+    try:
+        owner = api.owner(window)
+        owner_pid = query(api.process_of, owner) if owner else None
+        owner_kind = ("none" if not owner else None if owner_pid is None
+                      else "same_process" if owner_pid == pid else "other_process")
+    except window_probe.ApiError:
+        owner_kind = None
+    rect = query(api.rect, window)
+    cloaked = query(api.cloaked, window)
+    # A destroyed and reused handle must not supply another process's facts.
+    if not api.is_window(window) or query(api.process_of, window) != pid:
+        return None
+    family = window_probe.family(name) if name is not None else None
+    return {
+        "family": family if family is None or family in smoke.WINDOWS_WINDOW_FAMILIES else "other",
+        "style": word(style),
+        "exstyle": word(exstyle),
+        "visible": None if visible is None else bool(visible),
+        "owner": owner_kind,
+        "cloaked": None if cloaked is None else bool(cloaked),
+        "width": None if rect is None else extent(rect[0], rect[2]),
+        "height": None if rect is None else extent(rect[1], rect[3]),
+    }
+
+
+def record_window_inventory(api, windows, pid, diagnostics):
+    """Diagnostic facts for the windows of the poll the selector decided on.
+
+    Runs only after the unchanged selector has decided and never selects,
+    excludes or retries a window: any error here becomes the fixed status
+    "failed" instead of changing the selection outcome. Entries are sorted so
+    enumeration order is not reported, and at most a fixed number are kept.
+    """
+    entries, discarded, status = [], 0, "collected"
+    try:
+        for window in windows[:window_probe.WINDOW_BOUND]:
+            if time.monotonic() >= diagnostics.deadline:
+                status = "incomplete"
+                break
+            facts = window_facts(api, window, pid)
+            if facts is None:
+                discarded += 1
+            else:
+                entries.append(facts)
+    except Exception:  # noqa: BLE001 - diagnostics must not change the outcome
+        entries, discarded, status = [], 0, "failed"
+    entries.sort(key=lambda item: json.dumps(item, sort_keys=True))
+    diagnostics.value["window_inventory"] = {
+        "status": status,
+        "windows": entries[:smoke.WINDOWS_INVENTORY_BOUND],
+        "truncated": len(entries) > smoke.WINDOWS_INVENTORY_BOUND,
+        "discarded": min(discarded, 2),
+    }
+
+
 def owned_window(job, handle, pid, diagnostics, seconds=30, *, api=None):
     deadline = time.monotonic() + seconds
     if api is None:
@@ -749,12 +836,17 @@ def owned_window(job, handle, pid, diagnostics, seconds=30, *, api=None):
         diagnostics.operation("process_status")
         require_ui(job.kernel.WaitForSingleObject(handle, 0) == 258, "app_exited")
         diagnostics.operation("window_enumeration")
-        windows = keyboard_window_candidates(pid, diagnostics, api)
+        seen = []
+        windows = keyboard_window_candidates(pid, diagnostics, api, seen=seen)
         if windows:
+            # Facts for the deciding poll are recorded after the decision.
+            record_window_inventory(api, seen, pid, diagnostics)
             require_ui(len(windows) == 1, "window_count")
             diagnostics.value["owned_window_seen"] = True
             return int(windows[0])
-        require_ui(time.monotonic() < deadline, "wait_timeout")
+        if time.monotonic() >= deadline:
+            record_window_inventory(api, seen, pid, diagnostics)
+            raise DiagnosticFailure("wait_timeout")
         time.sleep(0.25)
 
 
