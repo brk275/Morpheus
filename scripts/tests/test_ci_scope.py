@@ -3,10 +3,36 @@ import unittest
 from unittest.mock import patch
 
 from scripts.ci_scope import (MACOS, PLATFORMS, WAYLAND_UNRELATED_NATIVE_INPUTS,
-                              WAYLAND_UNRELATED_THEME_INPUTS, changed_paths, classify)
+                              WAYLAND_UNRELATED_THEME_INPUTS,
+                              WAYLAND_UNRELATED_MATRIX_DIAGNOSTIC_INPUTS, changed_paths, classify)
 
 
 class ScopeTests(unittest.TestCase):
+    def test_matrix_diagnostics_preserve_native_scope_without_unrelated_portal(self):
+        reviewed = {"crates/morpheus-matrix/tests/drafts_local.rs",
+                    "scripts/run_matrix_acceptance.py", "scripts/tests/test_matrix_acceptance.py"}
+        self.assertEqual(WAYLAND_UNRELATED_MATRIX_DIAGNOSTIC_INPUTS, reviewed)
+        expected = {
+            "crates/morpheus-matrix/tests/drafts_local.rs": list(PLATFORMS),
+            "scripts/run_matrix_acceptance.py": ["ubuntu-24.04"],
+            "scripts/tests/test_matrix_acceptance.py": [],
+        }
+        for path, platforms in expected.items():
+            with self.subTest(path=path):
+                selected = classify([path])
+                self.assertEqual(selected["native_matrix"]["os"], platforms)
+                self.assertFalse(selected["wayland"])
+                self.assertTrue(classify([path], force_all=True)["wayland"])
+        combined = sorted(reviewed | WAYLAND_UNRELATED_NATIVE_INPUTS)
+        self.assertEqual(classify(combined)["native_matrix"]["os"], list(PLATFORMS))
+        self.assertFalse(classify(combined)["wayland"])
+        for shared in ("Cargo.lock", "crates/morpheus-matrix/src/lib.rs",
+                       "crates/morpheus-matrix/Cargo.toml", "scripts/element_process_namespace.py",
+                       "scripts/run_wayland_acceptance.py", "crates/morpheus-matrix/tests/new.rs",
+                       "crates/morpheus-rtc/tests/wayland_capture.rs", "scripts/unknown.py"):
+            with self.subTest(shared=shared):
+                self.assertTrue(classify(combined + [shared])["wayland"])
+
     def test_reviewed_presentation_inputs_keep_full_native_without_system_wayland(self):
         reviewed = {"crates/morpheus-app/src/account_access_ui_tests.rs", "crates/morpheus-app/src/appearance.rs",
                     "crates/morpheus-app/src/live.rs", "crates/morpheus-app/src/main.rs",
