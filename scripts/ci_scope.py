@@ -20,6 +20,7 @@ WAYLAND_UNRELATED_NATIVE_INPUTS = {
     "crates/morpheus-app/src/appearance.rs",
     "crates/morpheus-app/src/live.rs",
     "crates/morpheus-app/src/main.rs",
+    "crates/morpheus-app/src/timeline_model.rs",
     "crates/morpheus-app/ui/app-window.slint",
     "crates/morpheus-config/src/lib.rs",
 }
