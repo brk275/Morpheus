@@ -2,10 +2,11 @@
 
 Real-filesystem cases run on Linux only, against a temporary tree each test
 creates and owns, with the expected owner set to the test's own uid; no system
-path is ever changed. Other owners, replaced entries and mounts are simulated
-by patching os.stat or os.fstat. Only HostedNoticeTreeTests reads the real
-notice trees, read-only and unprivileged, and only on a fresh GitHub-hosted
-Ubuntu 24.04 runner.
+path is ever changed. Hard links in those trees are real. Other owners,
+replaced entries, mounts and changes seen after fchmod are simulated by
+patching os.stat, os.fstat or os.fchmod. Only HostedNoticeTreeTests reads
+the real notice trees, read-only and unprivileged, and only on a fresh
+GitHub-hosted Ubuntu 24.04 runner.
 """
 
 import ast
@@ -38,21 +39,26 @@ RELEASE = {"ID": "ubuntu", "VERSION_ID": "24.04"}
 
 # A synthetic host below a temporary folder. / and /usr are safe; the notice
 # trees and an unrelated /usr/share directory are group- or world-writable.
+# Every regular file is independent; hard links are added only by the tests
+# that are about them. Tree depths: doc 1, libc6 and nested 2, deeper 3.
 DIRECTORIES = {"usr/share": 0o777, "usr/share/doc": 0o777, "usr/share/doc/libc6": 0o777,
                "usr/share/doc/nested": 0o775, "usr/share/doc/nested/deeper": 0o777,
                "usr/share/common-licenses": 0o777, "usr/share/unrelated": 0o777}
 FILES = {"usr/share/doc/libc6/copyright": 0o666, "usr/share/doc/nested/deeper/README": 0o777,
          "usr/share/common-licenses/GPL-2": 0o646, "usr/share/unrelated/data": 0o666}
-HARD_LINK = ("usr/share/doc/libc6/copyright", "usr/share/doc/libc6/copyright-link")
+COPYRIGHT = "usr/share/doc/libc6/copyright"
 LINKS = {"usr/share/doc/libc6-alias": "libc6", "usr/share/common-licenses/GPL": "GPL-2",
          "usr/share/doc/libc6/outside-dir": "../../unrelated",
          "usr/share/doc/libc6/outside-file": "../../unrelated/data"}
 # Only group and world write bits go; execute bits and everything else stay.
 HARDENED = {"usr/share": 0o755, "usr/share/doc": 0o755, "usr/share/doc/libc6": 0o755,
             "usr/share/doc/nested": 0o755, "usr/share/doc/nested/deeper": 0o755,
-            "usr/share/common-licenses": 0o755, "usr/share/doc/libc6/copyright": 0o644,
-            "usr/share/doc/libc6/copyright-link": 0o644,
+            "usr/share/common-licenses": 0o755, COPYRIGHT: 0o644,
             "usr/share/doc/nested/deeper/README": 0o755, "usr/share/common-licenses/GPL-2": 0o644}
+# The fixture's counts: share, both tree roots and three subdirectories; three
+# notice files; four symlinks. GPL-2 is not group-writable, nested not
+# world-writable.
+FIXTURE = {"directories": 6, "files": 3, "symlinks": 4}
 STAT_FIELDS = ("st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size",
                "st_atime", "st_mtime", "st_ctime")
 
@@ -67,7 +73,6 @@ def build_host(folder):
         (root / name).mkdir(parents=True)
     for name in FILES:
         (root / name).write_bytes(("synthetic " + name + "\n").encode())
-    os.link(root / HARD_LINK[0], root / HARD_LINK[1])
     for name, target in LINKS.items():
         os.symlink(target, root / name)
     for name, mode in {**DIRECTORIES, **FILES}.items():
@@ -148,6 +153,36 @@ def recorded_opens():
         yield opens
 
 
+@contextlib.contextmanager
+def recorded_fchmods():
+    """The inode of each entry whose mode is changed."""
+    real_fchmod, real_fstat = os.fchmod, os.fstat
+    inodes = []
+
+    def fake(handle, value):
+        inodes.append(real_fstat(handle).st_ino)
+        return real_fchmod(handle, value)
+    with mock.patch("os.fchmod", side_effect=fake):
+        yield inodes
+
+
+@contextlib.contextmanager
+def after_fchmod(inode, change):
+    """os.fstat reports change(value) for inode only once its mode was changed."""
+    real_fchmod, real_fstat = os.fchmod, os.fstat
+    done = set()
+
+    def fchmod(handle, value):
+        real_fchmod(handle, value)
+        done.add(real_fstat(handle).st_ino)
+
+    def fstat(handle):
+        value = real_fstat(handle)
+        return change(value) if value.st_ino == inode and inode in done else value
+    with mock.patch("os.fchmod", side_effect=fchmod), mock.patch("os.fstat", side_effect=fstat):
+        yield
+
+
 @unittest.skipUnless(sys.platform == "linux", "descriptor-relative walks are checked on Linux")
 class SyntheticTreeTests(unittest.TestCase):
     def setUp(self):
@@ -176,8 +211,7 @@ class SyntheticTreeTests(unittest.TestCase):
         with recorded_opens() as opens:
             report = self.walk()
         self.assertEqual(report, H.result("hardened", "complete", None, counts(
-            directories=6, files=4, symlinks=4, linked_files=2,
-            group_writable=8, world_writable=8, tightened=9)))
+            **FIXTURE, group_writable=8, world_writable=8, tightened=9)))
         self.assertTrue(opens)
         self.assertTrue(all(flags & os.O_NOFOLLOW for _, flags in opens))
         self.assertFalse({name for name, _ in opens} & {Path(name).name for name in LINKS})
@@ -199,18 +233,61 @@ class SyntheticTreeTests(unittest.TestCase):
         hardened = snapshot(self.root)
         self.assertEqual(self.walk()["tightened"], 0)
         self.assertEqual(snapshot(self.root), hardened)
-        self.assertEqual(self.walk(fix=False), H.result("surveyed", "complete", None, counts(
-            directories=6, files=4, symlinks=4, linked_files=2)))
+        self.assertEqual(self.walk(fix=False), H.result("surveyed", "complete", None, counts(**FIXTURE)))
 
     def test_survey_is_read_only_and_opens_only_directories(self):
         before = snapshot(self.root)
-        with recorded_opens() as opens:
+        with recorded_opens() as opens, recorded_fchmods() as changes:
+            report = self.walk(fix=False)
+        self.assertEqual(report, H.result("surveyed", "complete", None, counts(
+            **FIXTURE, group_writable=8, world_writable=8)))
+        self.assertEqual(snapshot(self.root), before)
+        self.assertEqual(changes, [])
+        self.assertTrue(opens)
+        self.assertTrue(all(flags & os.O_DIRECTORY and flags & os.O_NOFOLLOW for _, flags in opens))
+
+    def test_writable_hard_link_fails_closed_and_keeps_every_alias(self):
+        # One alias outside both trees, one inside the same tree: either way
+        # the shared mode must not change, through any name.
+        for alias in ("usr/share/unrelated/copyright-alias", "usr/share/doc/libc6/copyright-alias"):
+            with self.subTest(alias=alias):
+                root = self.host()
+                os.link(root / COPYRIGHT, root / alias)
+                inode = os.stat(root / COPYRIGHT).st_ino
+                before = snapshot(root)
+                with recorded_fchmods() as changes:
+                    report = self.walk(root)
+                self.assert_failed(report, "doc", "hardlink")
+                self.assertNotIn(inode, changes)
+                for name in (COPYRIGHT, alias):
+                    self.assertEqual(snapshot(root)[name], before[name])
+                    self.assertEqual(mode(root, name), 0o666)
+                self.assertEqual(mode(root, "usr/share/unrelated"), 0o777)
+
+    def test_already_tight_hard_link_is_left_untouched(self):
+        os.chmod(self.root / COPYRIGHT, 0o644)
+        alias = self.root / "usr/share/unrelated/copyright-alias"
+        os.link(self.root / COPYRIGHT, alias)
+        before = os.stat(alias)
+        with recorded_fchmods() as changes:
+            report = self.walk()
+        # Only the in-tree name is walked; it is counted but never changed.
+        self.assertEqual(report, H.result("hardened", "complete", None, counts(
+            **FIXTURE, linked_files=1, group_writable=7, world_writable=7, tightened=8)))
+        self.assertNotIn(before.st_ino, changes)
+        after = os.stat(alias)
+        self.assertEqual((after.st_mode, after.st_nlink, after.st_ctime_ns),
+                         (before.st_mode, before.st_nlink, before.st_ctime_ns))
+
+    def test_survey_counts_writable_hard_links_without_failing_or_changing(self):
+        os.link(self.root / COPYRIGHT, self.root / "usr/share/doc/libc6/copyright-alias")
+        before = snapshot(self.root)
+        with recorded_fchmods() as changes:
             report = self.walk(fix=False)
         self.assertEqual(report, H.result("surveyed", "complete", None, counts(
             directories=6, files=4, symlinks=4, linked_files=2, group_writable=9, world_writable=9)))
+        self.assertEqual(changes, [])
         self.assertEqual(snapshot(self.root), before)
-        self.assertTrue(opens)
-        self.assertTrue(all(flags & os.O_DIRECTORY and flags & os.O_NOFOLLOW for _, flags in opens))
 
     def test_symlink_swapped_in_after_its_check_is_never_followed(self):
         # The check sees exactly the outside target, so only O_NOFOLLOW stops
@@ -306,8 +383,27 @@ class SyntheticTreeTests(unittest.TestCase):
         self.assert_failed(report, "doc", "type")
         self.assertNotIn("pipe", {name for name, _ in opens})
 
-    def test_depth_entry_and_time_bounds(self):
-        self.assert_failed(self.walk(self.host(), depth=1), "doc", "depth")
+    def test_depth_counts_each_tree_root_as_one_at_the_exact_boundary(self):
+        # deeper is at depth 3: allowed with a bound of 3.
+        self.assertEqual(self.walk(self.host(), depth=3)["status"], "hardened")
+        # With a bound of 2 it is refused before it is opened or changed.
+        root = self.host()
+        with recorded_opens() as opens:
+            report = self.walk(root, depth=2)
+        self.assert_failed(report, "doc", "depth")
+        self.assertNotIn("deeper", {name for name, _ in opens})
+        self.assertEqual(mode(root, "usr/share/doc/nested/deeper"), 0o777)
+        self.assertEqual(mode(root, "usr/share/doc/nested/deeper/README"), 0o777)
+        # With a bound of 1 neither depth-2 directory is opened or changed.
+        root = self.host()
+        with recorded_opens() as opens:
+            report = self.walk(root, depth=1)
+        self.assert_failed(report, "doc", "depth")
+        self.assertFalse({name for name, _ in opens} & {"libc6", "nested"})
+        self.assertEqual(mode(root, "usr/share/doc/libc6"), 0o777)
+        self.assertEqual(mode(root, "usr/share/doc/nested"), 0o775)
+
+    def test_entry_and_time_bounds(self):
         root = self.host()
         # The bound applies while listing, before any child changes.
         self.assert_failed(self.walk(root, entries=2), "doc", "count")
@@ -315,11 +411,39 @@ class SyntheticTreeTests(unittest.TestCase):
         report = self.walk(self.host(), seconds=5, clock=itertools.count().__next__)
         self.assertEqual((report["status"], report["reason"]), ("failed", "time"))
 
+    def test_expired_deadline_changes_nothing(self):
+        before = snapshot(self.root)
+        clock = itertools.chain([0.0], itertools.repeat(100.0)).__next__
+        with recorded_fchmods() as changes:
+            report = self.walk(seconds=5, clock=clock)
+        self.assertEqual(report, H.result("failed", "share", "time"))
+        self.assertEqual(changes, [])
+        self.assertEqual(snapshot(self.root), before)
+
     def test_mode_change_is_confirmed(self):
         with mock.patch("os.fchmod"):
             report = self.walk()
         self.assert_failed(report, "share", "verify")
         self.assertEqual(mode(self.root, "usr/share"), 0o777)
+
+    def test_identity_owner_and_links_are_rechecked_after_each_change(self):
+        cases = (("usr/share", "share", lambda value: changed(value, st_uid=self.uid + 1)),
+                 ("usr/share", "share", lambda value: changed(value, st_ino=value.st_ino + 1)),
+                 ("usr/share", "share", lambda value: changed(value, st_dev=value.st_dev + 1)),
+                 ("usr/share", "share",
+                  lambda value: changed(value, st_mode=stat.S_IFREG | stat.S_IMODE(value.st_mode))),
+                 ("usr/share/doc/nested/deeper/README", "doc", lambda value: changed(value, st_nlink=2)))
+        for target, stage, change in cases:
+            with self.subTest(target=target, stage=stage):
+                root = self.host()
+                with after_fchmod(os.stat(root / target).st_ino, change):
+                    report = self.walk(root)
+                self.assert_failed(report, stage, "verify")
+                if stage == "share":
+                    # Nothing beyond the failed entry is changed or counted as tightened.
+                    self.assertEqual(report, H.result("failed", "share", "verify", counts(
+                        directories=1, group_writable=1, world_writable=1)))
+                    self.assertEqual(mode(root, "usr/share/doc"), 0o777)
 
     def test_errors_close_every_descriptor_and_keep_only_fixed_reasons(self):
         real_open = os.open
@@ -391,7 +515,8 @@ class MainTests(unittest.TestCase):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
             code = H.main(list(argv))
-        return code, json.loads(output.getvalue())
+        self.printed = output.getvalue()
+        return code, json.loads(self.printed)
 
     def test_refusal_happens_before_any_walk(self):
         for reason in H.GUARD_REASONS[1:]:
@@ -416,17 +541,57 @@ class MainTests(unittest.TestCase):
         walk.assert_called_once_with(True)
 
     def test_failed_or_malformed_reports_exit_nonzero_with_fixed_output(self):
-        failed = H.result("failed", "doc", "owner")
-        malformed = dict(H.result("hardened", "complete", None), path="/usr/share/doc/private")
-        unknown = H.result("failed", "doc", "Permission denied: /usr/share/doc/private")
-        negative = H.result("hardened", "complete", None, counts(files=-1))
-        for walked, printed in ((failed, failed), (malformed, H.FALLBACK),
-                                (unknown, H.FALLBACK), (negative, H.FALLBACK)):
+        limit = H.MAX_COUNT
+        failed = H.result("failed", "doc", "hardlink", counts(directories=2, files=1, linked_files=1))
+        malformed = [
+            dict(H.result("hardened", "complete", None), path="/usr/share/doc/private"),
+            {**H.result("hardened", "complete", None), "check": "private"},
+            H.result("failed", "doc", "Permission denied: /usr/share/doc/private"),
+            H.result("private", "complete", None),
+            H.result("failed", "/usr/share/doc/private", "owner"),
+            # Success only at completion and without a reason; a survey changes nothing.
+            H.result("hardened", "doc", None), H.result("surveyed", "share", None),
+            H.result("hardened", "complete", "owner"), H.result("failed", "complete", "owner"),
+            H.result("surveyed", "complete", None, counts(directories=1, tightened=1)),
+            # Refusals and guard failures carry a guard-stage token and no counts.
+            H.result("refused", "doc", "hosted"), H.result("refused", "guard", "owner"),
+            H.result("refused", "guard", "hosted", counts(files=1)),
+            H.result("failed", "guard", "owner"), H.result("failed", "doc", "hosted"),
+            H.result("failed", "guard", "internal", counts(directories=1)),
+            # Counts are integers within the production bound, and consistent.
+            H.result("hardened", "complete", None, counts(files=-1)),
+            H.result("hardened", "complete", None, counts(files=True)),
+            H.result("hardened", "complete", None, counts(files=1.0)),
+            H.result("hardened", "complete", None, counts(files=limit + 1)),
+            H.result("hardened", "complete", None, counts(directories=limit, symlinks=1)),
+            H.result("hardened", "complete", None, counts(files=1, linked_files=2)),
+            H.result("hardened", "complete", None, counts(directories=1, tightened=2)),
+            H.result("hardened", "complete", None, counts(files=1, group_writable=2)),
+        ]
+        for walked, printed in [(failed, failed)] + [(value, H.FALLBACK) for value in malformed]:
             with self.subTest(walked=walked), \
                     mock.patch.object(H, "guard_reason", return_value=None), \
                     mock.patch.object(H, "Walk") as walk:
                 walk.return_value.report.return_value = walked
                 self.assertEqual(self.run_main(), (1, printed))
+                self.assertNotIn("private", self.printed)
+
+    def test_refusal_with_an_unknown_guard_token_prints_only_the_fallback(self):
+        with mock.patch.object(H, "guard_reason", return_value="owner"), \
+                mock.patch.object(H, "Walk") as walk:
+            self.assertEqual(self.run_main(), (1, H.FALLBACK))
+        walk.assert_not_called()
+
+    def test_bounded_consistent_reports_are_public(self):
+        limit = H.MAX_COUNT
+        for report in (H.result("hardened", "complete", None, counts(directories=limit, tightened=limit)),
+                       H.result("surveyed", "complete", None, counts(files=3, linked_files=3, world_writable=3)),
+                       H.result("refused", "guard", "root"), H.result("failed", "guard", "internal"),
+                       H.result("failed", "share", "time"),
+                       H.result("failed", "doc", "hardlink", counts(
+                           directories=2, files=1, linked_files=1, world_writable=3))):
+            with self.subTest(report=report):
+                self.assertTrue(H.public(report))
 
     def test_guard_exception_is_a_fixed_failure(self):
         with mock.patch.object(H, "guard_reason", side_effect=RuntimeError("private detail")), \

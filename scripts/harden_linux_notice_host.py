@@ -16,7 +16,11 @@ Every entry, owner, content and other mode bit stays. Each step opens one name
 beneath an already open directory with O_NOFOLLOW and checks the descriptor
 with fstat before fchmod, so no symlink is ever followed or changed. It refuses
 an entry owned by another user, any other file type, a mount crossing or an
-entry replaced while it runs, within fixed time, depth and entry bounds.
+entry replaced while it runs, within fixed time, depth and entry bounds. It
+also refuses a writable regular file with more than one hard link before
+changing it, since its mode is shared with aliases that may lie outside these
+trees; an already tight one is left alone. After each fchmod it rechecks the
+descriptor's identity, owner, link count and exact mode.
 Output is one JSON line of fixed tokens and counts, never a name or path.
 
 This trusts the official hosted image as it is before candidate code runs.
@@ -43,19 +47,23 @@ ROOT = "/"
 # Fixed names beneath /usr/share and the stage each one reports.
 TREES = (("doc", "doc"), ("common-licenses", "common_licenses"))
 WRITE_BITS = stat.S_IWGRP | stat.S_IWOTH
+# Directory levels in each tree, counting the tree root itself as 1.
 MAX_DEPTH = 32
 MAX_ENTRIES = 250_000
 MAX_SECONDS = 90.0
+# Listed entries plus /usr/share and the two tree roots, which are not listed.
+MAX_COUNT = MAX_ENTRIES + 3
 
-STATUSES = ("hardened", "surveyed", "refused", "failed")
+# Statuses are hardened, surveyed, refused (guard only) and failed.
 STAGES = ("guard", "ancestors", "share", "doc", "common_licenses", "complete")
 GUARD_REASONS = ("arguments", "platform", "hosted", "image", "arch", "release", "root")
-PATH_REASONS = ("missing", "symlink", "type", "owner", "mode", "mount", "replaced",
+PATH_REASONS = ("missing", "symlink", "type", "owner", "mode", "mount", "replaced", "hardlink",
                 "depth", "count", "time", "access", "io", "verify", "internal")
-REASONS = GUARD_REASONS + PATH_REASONS
 # Counts cover /usr/share and both trees; symlinks are counted, never opened.
 COUNTS = ("directories", "files", "symlinks", "linked_files",
           "group_writable", "world_writable", "tightened")
+# Each of these counts at most one per directory or regular file.
+PER_ENTRY = ("group_writable", "world_writable", "tightened")
 KEYS = frozenset(("check", "status", "stage", "reason", *COUNTS))
 FALLBACK = {"check": CHECK, "status": "failed"}
 ERRNO_REASONS = {errno.ENOENT: "missing", errno.ELOOP: "replaced", errno.ENOTDIR: "replaced",
@@ -117,10 +125,13 @@ def _flags(directory):
     return (base | os.O_DIRECTORY) if directory else (base | os.O_NONBLOCK | os.O_NOCTTY)
 
 
+def _identity(info):
+    return info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode)
+
+
 def _same(before, after):
     """The opened descriptor is still the entry its name was checked as."""
-    if (before.st_dev, before.st_ino, stat.S_IFMT(before.st_mode)) != (
-            after.st_dev, after.st_ino, stat.S_IFMT(after.st_mode)):
+    if _identity(before) != _identity(after):
         raise Failure("replaced")
 
 
@@ -228,7 +239,11 @@ class Walk:
         return found
 
     def descend(self, parent, depth):
-        """Each entry of an open directory, depth first; with fix it is already tight."""
+        """Each entry of an open directory at depth (a tree root is 1), depth first.
+
+        With fix the directory is already tight. A child directory beyond the
+        depth bound is refused before it is opened or changed.
+        """
         for name in self.names(parent):
             self.tick()
             before = os.stat(name, dir_fd=parent, follow_symlinks=False)
@@ -242,7 +257,7 @@ class Walk:
             directory = stat.S_ISDIR(before.st_mode)
             if not directory and not stat.S_ISREG(before.st_mode):
                 raise Failure("type")
-            if directory and depth > self.depth:
+            if directory and depth + 1 > self.depth:
                 raise Failure("depth")
             if not directory and not self.fix:
                 self.settle(None, before)
@@ -260,18 +275,30 @@ class Walk:
                 os.close(handle)
 
     def settle(self, handle, info):
-        """Count the entry and its write bits; with fix, remove and confirm them."""
-        kind = "directories" if stat.S_ISDIR(info.st_mode) else "files"
-        self.counts[kind] += 1
-        if kind == "files" and info.st_nlink > 1:
+        """Count the entry and its write bits; with fix, remove and confirm them.
+
+        The deadline is checked before every change, so an expired budget
+        changes nothing. A writable regular file with another hard link is
+        refused unchanged: its mode is shared with every alias.
+        """
+        self.tick()
+        regular = stat.S_ISREG(info.st_mode)
+        self.counts["files" if regular else "directories"] += 1
+        if regular and info.st_nlink > 1:
             self.counts["linked_files"] += 1
         mode = stat.S_IMODE(info.st_mode)
         self.counts["group_writable"] += 1 if mode & stat.S_IWGRP else 0
         self.counts["world_writable"] += 1 if mode & stat.S_IWOTH else 0
         if not self.fix or not mode & WRITE_BITS:
             return
-        os.fchmod(handle, mode & ~WRITE_BITS)
-        if stat.S_IMODE(os.fstat(handle).st_mode) != mode & ~WRITE_BITS:
+        if regular and info.st_nlink > 1:
+            raise Failure("hardlink")
+        wanted = mode & ~WRITE_BITS
+        os.fchmod(handle, wanted)
+        after = os.fstat(handle)
+        if (_identity(after) != _identity(info) or after.st_uid != self.owner
+                or stat.S_IMODE(after.st_mode) != wanted
+                or (regular and after.st_nlink != 1)):
             raise Failure("verify")
         self.counts["tightened"] += 1
 
@@ -282,12 +309,27 @@ def survey(**options):
 
 
 def public(report):
-    """Only fixed keys, tokens and non-negative counts are ever printed."""
-    return (type(report) is dict and set(report) == KEYS and report["check"] == CHECK
-            and report["status"] in STATUSES and report["stage"] in STAGES
-            and (report["reason"] in REASONS if report["status"] in ("refused", "failed")
-                 else report["reason"] is None)
-            and all(type(report[name]) is int and report[name] >= 0 for name in COUNTS))
+    """Only a consistent report of fixed keys, tokens and bounded counts is printed."""
+    if type(report) is not dict or set(report) != KEYS or report["check"] != CHECK:
+        return False
+    counts = {name: report[name] for name in COUNTS}
+    if not all(type(value) is int and 0 <= value <= MAX_COUNT for value in counts.values()):
+        return False
+    entries = counts["directories"] + counts["files"]
+    if (entries + counts["symlinks"] > MAX_COUNT or counts["linked_files"] > counts["files"]
+            or any(counts[name] > entries for name in PER_ENTRY)):
+        return False
+    status, stage, reason = report["status"], report["stage"], report["reason"]
+    if status in ("hardened", "surveyed"):
+        return (stage == "complete" and reason is None
+                and (status == "hardened" or counts["tightened"] == 0))
+    if status == "refused":
+        return stage == "guard" and reason in GUARD_REASONS and not any(counts.values())
+    if status == "failed":
+        if stage == "guard":
+            return reason == "internal" and not any(counts.values())
+        return stage in STAGES and stage != "complete" and reason in PATH_REASONS
+    return False
 
 
 def main(argv=None):
