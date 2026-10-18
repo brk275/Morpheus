@@ -252,6 +252,38 @@ class FlowTests(RunnerTest):
         failure = runner.StepFailure("measure", "sliding", "Permission denied: /home/runner/x", "a b")
         self.assertEqual((failure.reason, failure.stage), ("invalid", None))
 
+    def test_lowercase_private_text_is_not_public_diagnostic_vocabulary(self):
+        for private in ("privatepassword", "private_account", [], {"private": True}):
+            failure = runner.StepFailure(private, private, private, private)
+            self.assertEqual(failure.summary(), {
+                "check": runner.CHECK, "status": "failed", "step": "setup", "adapter": None,
+                "stage": None, "failure": "invalid"})
+            self.assertNotIn("private", str(failure))
+
+    def test_failed_summary_extracts_only_one_exact_closed_record(self):
+        value = runner.StepFailure("enroll", "sliding", "first_render", "first_render").summary()
+        record = runner.SUMMARY_PREFIX + json.dumps(value)
+        self.assertEqual(runner.failed_summary("private raw output\n" + record + "\n"), value)
+        for text in ("", record + "\n" + record, runner.SUMMARY_PREFIX + "not json",
+                     runner.SUMMARY_PREFIX + "[]", runner.SUMMARY_PREFIX + ("[" * 2000),
+                     runner.SUMMARY_PREFIX + ("x" * 4097)):
+            with self.subTest(text=text[:60]):
+                self.assertIsNone(runner.failed_summary(text))
+        with patch.object(runner, "MAX_LOG_BYTES", 8):
+            self.assertIsNone(runner.failed_summary(record))
+
+    def test_failed_summary_refuses_open_fields_wrong_context_and_success(self):
+        value = runner.StepFailure("enroll", "sliding", "first_render", "first_render").summary()
+        for change in ({"stage": "private_account"}, {"failure": "privatepassword"},
+                       {"step": "private_step"}, {"adapter": "private_adapter"},
+                       {"private": "extra"}, {"status": "passed"}, {"check": "other"},
+                       {"adapter": None}, {"step": "seed"}, {"stage": []}):
+            with self.subTest(change=change):
+                self.assertIsNone(runner.failed_summary(runner.SUMMARY_PREFIX + json.dumps(value | change)))
+        for step in ("setup", "seed"):
+            fixed = runner.StepFailure(step, None, "timeout").summary()
+            self.assertEqual(runner.failed_summary(runner.SUMMARY_PREFIX + json.dumps(fixed)), fixed)
+
     def test_setup_refuses_other_binaries_and_reused_work(self):
         other = self.folder / "other-app"
         other.write_text("")

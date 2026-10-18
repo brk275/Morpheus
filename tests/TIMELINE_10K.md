@@ -54,8 +54,20 @@ be used as a claim that the full beta performance gate has passed.
 
 ## Real-room acceptance harness
 
-This harness exists in source but **has not been run**: it has produced no
-evidence yet, and nothing here changes the open gate above.
+The optimized instrumented app compiled in
+[run 39155273734](https://github.com/brk275/Morpheus/actions/runs/39155273734)
+at source `92fc431ab7bd71e0b7021540ae4a710e68d1b085`, but the live workload
+failed. The outer fixture runner withheld the inner failure summary along
+with its private log, so this run does not establish the failing stage or any
+performance result. The real-room performance gate remains open.
+
+Failure summaries now use explicit vocabulary for every published field.
+`failed_summary` accepts one exact failed record after a caller scans its
+private log; arbitrary lowercase strings, extra fields, duplicate records,
+oversized records and success claims are refused. A hosted wrapper must forward
+this validated failure separately when its outer command raises, while keeping
+raw logs private. This parser alone does not prove that forwarding or the live
+workload succeeds.
 
 ### Instrumented build
 
