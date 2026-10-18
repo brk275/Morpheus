@@ -2150,6 +2150,9 @@ export component AppWindow inherits Window {
         // Conversation, settings, and call stage share the main canvas.
         Rectangle {
             horizontal-stretch: 1;
+            // Match the independent conversation minimum used by the Window.
+            // Long room content must not push the fixed details pane offscreen.
+            min-width: 360px;
             background: root.canvas;
             VerticalLayout {
                 spacing: 0px;
@@ -2174,6 +2177,9 @@ export component AppWindow inherits Window {
                             font-size: 16px * root.text-scale;
                             font-weight: 750;
                             vertical-alignment: center;
+                            min-width: 0px;
+                            overflow: elide;
+                            accessible-label: root.page == 0 ? "Current room: " + root.active-room-name : self.text;
                         }
                         if root.page == 0 && root.conversation-header-mode == 2 : Text {
                             text: root.active-room-name;
@@ -2193,6 +2199,7 @@ export component AppWindow inherits Window {
                             font-size: 12px * root.text-scale;
                             vertical-alignment: center;
                             horizontal-stretch: 1;
+                            min-width: 0px;
                             overflow: elide;
                         }
                         if root.page == 0 : VerticalLayout {
@@ -2362,8 +2369,13 @@ export component AppWindow inherits Window {
                             padding-top: root.message-layout == 0 ? 23px : 8px;
                             padding-bottom: root.message-layout == 0 ? 20px : 8px;
                             spacing: 8px;
-                            if root.message-layout == 0 : Text { text: "Welcome to #" + root.active-room-name; color: root.ink; font-size: 24px * root.text-scale; font-weight: 780; }
-                            Text { text: root.active-room-topic; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                            if root.message-layout == 0 : Text {
+                                text: "Welcome to #" + root.active-room-name;
+                                color: root.ink; font-size: 24px * root.text-scale; font-weight: 780;
+                                min-width: 0px; overflow: elide;
+                                accessible-label: self.text;
+                            }
+                            Text { text: root.active-room-topic; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; min-width: 0px; }
                         }
                     }
                     if root.live-session && root.active-room-id != "" : HorizontalLayout {
@@ -2769,6 +2781,7 @@ export component AppWindow inherits Window {
                                 }
                                 Rectangle {
                                     horizontal-stretch: 1;
+                                    min-width: 0px;
                                     clip: true;
                                     if root.composer-text == "" : Text {
                                         x: 3px;
@@ -4054,6 +4067,8 @@ export component AppWindow inherits Window {
             background: root.panel;
             border-color: root.divider;
             border-width: 1px;
+            accessible-role: region;
+            accessible-label: "Conversation details";
             VerticalLayout {
                 spacing: 0px;
                 Rectangle {

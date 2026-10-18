@@ -2163,6 +2163,17 @@ fn inside_window(ui: &AppWindow, bounds: Bounds) -> bool {
         && bounds.bottom <= height + 0.5
 }
 
+fn assert_details_pane_inside_window(ui: &AppWindow) {
+    let bounds = control_bounds(ui, "Conversation details");
+    assert_eq!(bounds.len(), 1, "one visible details pane");
+    assert!(
+        inside_window(ui, bounds[0]),
+        "the complete details pane must fit: {:?}; path={:?}",
+        bounds[0],
+        clipped_control_geometry(ui, "Conversation details")
+    );
+}
+
 /// Walk the real tab order to a saved-send control with a budget sized for a
 /// strip of eight records. The account and appearance walks keep their own
 /// `tab_to_control` budget; this helper does not change it.
@@ -2327,6 +2338,7 @@ async fn assert_recovery_strip_projection(ui: &AppWindow) {
     settle(ui).await;
     assert_eq!(ui.get_thread_pending_items().row_count(), 2);
     assert!(ui.get_thread_send_pending());
+    assert_details_pane_inside_window(ui);
     let window_width = ui
         .window()
         .size()
@@ -2364,6 +2376,20 @@ async fn assert_recovery_strip_projection(ui: &AppWindow) {
         [(true, unconfirmed.as_key().to_owned(), true)]
     );
     assert_bounded_strip_with_eight_records(ui).await;
+    // The layout must honor the supported window minimum with the same
+    // large text and saved pane widths; content cannot move the pane outside it.
+    let previous_size = ui.window().size();
+    let rail = if ui.get_navigation_mode() == 0 {
+        ui.get_rail_width_px()
+    } else {
+        0
+    };
+    let minimum_width = (rail + ui.get_room_list_width() + ui.get_details_width() + 360).max(940);
+    ui.window()
+        .set_size(slint::PhysicalSize::new(minimum_width as u32, 620));
+    settle(ui).await;
+    assert_details_pane_inside_window(ui);
+    ui.window().set_size(previous_size);
     ui.set_font_scale_percent(previous_scale);
     settle(ui).await;
 }
