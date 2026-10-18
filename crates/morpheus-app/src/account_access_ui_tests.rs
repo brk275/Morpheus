@@ -524,6 +524,7 @@ async fn assert_accessible_action_focus_and_first_click(ui: &AppWindow) {
     settle(ui).await;
 }
 
+#[track_caller]
 fn tab_to_control(ui: &AppWindow, label: &str) {
     use slint::private_unstable_api::re_exports::{FocusScope, TextInput, WindowInner};
 
@@ -1848,9 +1849,13 @@ async fn exercise_account_ui(runtime: Handle) {
     ui.set_member_confirm_name("Jordan".into());
     ui.set_room_admin_topic_input("private topic".into());
     ui.set_attachment_status("private upload name".into());
+    assert_recovery_strip_projection(&ui).await;
+    // Exercise chat controls before opening the one-time-key modal. Then
+    // render that private surface as well before testing the real detach.
     ui.set_security_recovery_input("synthetic recovery input".into());
     ui.set_security_recovery_key("synthetic recovery output".into());
-    assert_recovery_strip_projection(&ui).await;
+    settle(&ui).await;
+    assert_eq!(control_bounds(&ui, "One-time Matrix recovery key").len(), 1);
     live.account_detached(ui.as_weak()).await;
     settle(&ui).await;
     assert!(!ui.get_live_session());
@@ -2069,6 +2074,10 @@ async fn assert_recovery_strip_projection(ui: &AppWindow) {
     use std::{cell::RefCell, rc::Rc};
 
     let previous_scale = ui.get_font_scale_percent();
+    // Earlier account scenarios leave the sign-in surface open. This fixture
+    // represents a selected room, not keyboard navigation behind a dialog.
+    ui.set_show_sign_in(false);
+    ui.set_page(0);
     ui.set_live_session(true);
     ui.set_show_side_panel(true);
     ui.set_active_account_local_id("presentation-only".into());
