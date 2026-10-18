@@ -1,19 +1,17 @@
-name: CI
+# TEMPORARY renderer capability check. NEVER MERGE this workflow into main.
+# This probe is not timeline-performance, package or beta release acceptance.
+name: Native frame capability preflight
+run-name: Native frame capability ef92843 - release gates open
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  # Manual dispatch always checks the complete supported native matrix.
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: native-diagnostic-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_BUILD_JOBS: "2"
@@ -23,29 +21,17 @@ env:
 
 jobs:
   scope:
-    name: Security and change scope
+    name: Reviewed source history scan
     # Hosted validation is disabled while private to prevent unauthorized paid builds.
-    if: github.event.repository.private == false
+    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    outputs:
-      native: ${{ steps.scope.outputs.native }}
-      native_matrix: ${{ steps.scope.outputs.native_matrix }}
-      config: ${{ steps.scope.outputs.config }}
-      wayland: ${{ steps.scope.outputs.wayland }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ef928438e8dfa75f900e46c722e85bec75e29a70
           path: candidate
           fetch-depth: 0
-          persist-credentials: false
-      - name: Check out reviewed validation inputs
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          # PR input is read as data; classification code comes from its base.
-          # Push uses reviewed main; dispatch uses its owner-selected revision.
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
-          path: trusted
           persist-credentials: false
       - name: Scan committed history for credentials
         working-directory: candidate
@@ -67,352 +53,278 @@ jobs:
             --config "$RUNNER_TEMP/morpheus-gitleaks-default.toml" \
             --gitleaks-ignore-path "$RUNNER_TEMP/morpheus-gitleaks-empty.ignore" \
             --log-opts=--all .
-      - name: Select checks from changed inputs using reviewed classifier
-        id: scope
-        working-directory: candidate
-        # Isolated mode excludes the candidate working directory and Python
-        # environment hooks from import lookup. The classifier uses stdlib only.
-        run: python3 -I ../trusted/scripts/ci_scope.py --github-event
-
-  helpers:
-    name: Validation helper tests
+  preflight:
+    name: Linux native frame capability and rejection guards
     needs: scope
-    if: github.event.repository.private == false
+    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - name: Check scope and packaging helpers
-        run: |
-          python3 -m unittest discover -s scripts/tests -v
-          python3 -m unittest discover -s scripts -p 'test_*.py' -v
-          python3 -m compileall -q scripts
-          node --check scripts/element_call_peer.mjs
-          node --check scripts/element_call_stock_peer.mjs
-          python3 scripts/package.py --check
-
-  config:
-    name: Theme configuration tests
-    needs: [scope, helpers]
-    if: github.event.repository.private == false && needs.scope.outputs.config == 'true'
-    runs-on: ubuntu-24.04
+    timeout-minutes: 45
     concurrency:
-      group: native-${{ github.sha }}-ubuntu-24.04
+      group: native-ef928438e8dfa75f900e46c722e85bec75e29a70-ubuntu-24.04
       cancel-in-progress: false
-    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ef928438e8dfa75f900e46c722e85bec75e29a70
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action, pinned compiler below
-        with:
-          toolchain: 1.99.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
-      - run: cargo test --locked -p morpheus-config
-
-  compile:
-    name: Check and test (${{ matrix.os }})
-    needs: [scope, helpers]
-    if: github.event.repository.private == false && needs.scope.outputs.native == 'true'
-    runs-on: ${{ matrix.os }}
-    concurrency:
-      group: native-${{ github.sha }}-${{ matrix.os }}
-      cancel-in-progress: false
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.scope.outputs.native_matrix) }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - name: Linux native dependencies
-        if: runner.os == 'Linux'
+      - name: Verify exact reviewed source
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = ef928438e8dfa75f900e46c722e85bec75e29a70
+      - name: Install example renderer build prerequisites
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libasound2-dev libclang-dev libdbus-1-dev libdrm-dev libegl-dev \
-            libfontconfig1-dev libgbm-dev libglib2.0-dev libinih-dev libpipewire-0.3-dev libssl-dev libsystemd-dev libudev-dev \
-            libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev \
-            libxkbcommon-dev libxkbcommon-x11-dev libxi6 libxrandr-dev meson ninja-build pkg-config wayland-protocols xvfb xdotool \
-            dbus-x11 gnome-keyring libsecret-tools libglib2.0-bin \
-            sway swaybg pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-wlr
-          # Ubuntu 24.04 Chromium dependencies from pinned Playwright 1.62.1.
-          # Install before the peer drops privileges inside its PID namespace.
-          sudo apt-get install -y \
-            libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
-            libcairo2 libcups2t64 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0t64 \
-            libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 \
-            libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 \
-            fonts-noto-color-emoji fonts-unifont libfontconfig1 libfreetype6 \
-            xfonts-cyrillic xfonts-scalable fonts-liberation fonts-ipafont-gothic \
-            fonts-wqy-zenhei fonts-tlwg-loma-otf fonts-freefont-ttf
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action
+            libfontconfig1-dev libgbm-dev libglib2.0-dev libinih-dev libpipewire-0.3-dev \
+            libssl-dev libsystemd-dev libudev-dev libwayland-dev libx11-dev \
+            libx11-xcb-dev libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxcursor-dev libxkbcommon-dev libxkbcommon-x11-dev libxi6 libxrandr-dev \
+            meson ninja-build pkg-config wayland-protocols dbus-x11 \
+            libglib2.0-bin libgl1-mesa-dri libegl1 xvfb xauth
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249
         with:
           toolchain: 1.99.0
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+          components: rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
         with:
-          # Preserve compiled dependencies when a later acceptance check fails.
-          # The save guard still makes untrusted/PR executions restore-only.
-          # Older SDK extractions lack the verified downloader's receipt.
-          # The key separates both primary and fallback cache namespaces.
           key: verified-sdk-archives-v1
-          cache-on-failure: true
-          save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
-      - name: Check formatting
-        if: runner.os == 'Linux'
+          save-if: "false"
+      - name: Check workspace formatting
         run: cargo fmt --all -- --check
-      - name: Check native interface compilation before desktop dependencies
-        run: cargo check --locked -p morpheus-ui-check
-      - name: Test configuration, Matrix, and RTC protocol models
-        id: model-tests
-        # Still fail the job below, but collect independent desktop/device
-        # results on this candidate instead of paying the compilation cost
-        # again merely because an authentication fixture failed first.
-        continue-on-error: true
-        run: cargo test --locked --no-fail-fast -p morpheus-config -p morpheus-matrix -p morpheus-rtc
-      - name: Check desktop and Matrix crates
-        run: cargo check --locked -p morpheus-app -p morpheus-matrix
-      - name: Build desktop with native call and device adapters
-        run: cargo build --locked -p morpheus-app --features native-calls
-      - name: Capture actual native preview screens
-        id: preview-capture
-        if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && (github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push'))
-        continue-on-error: true
-        timeout-minutes: 2
-        env:
-          SLINT_SCALE_FACTOR: "1"
-          SLINT_BACKEND: winit-software
+      - name: Require the reviewed renderer feature graph
+        shell: bash
+        run: |
+          python3 - <<'FRAME_FEATURES'
+          import os, subprocess
+          result = subprocess.run(
+              ["cargo", "tree", "--locked", "-p", "morpheus-app", "--edges", "normal,dev",
+               "--prefix", "none", "--format", "{p}"],
+              env=os.environ | {"CARGO_TERM_COLOR": "never"}, capture_output=True, timeout=120)
+          if result.returncode or len(result.stdout) > 2 * 1024 * 1024:
+              raise SystemExit("Renderer feature graph unavailable.")
+          nodes = {line.split()[0] for line in result.stdout.decode("utf-8").splitlines() if line.strip()}
+          if "i-slint-renderer-femtovg" not in nodes or "i-slint-renderer-skia" in nodes:
+              raise SystemExit("Unreviewed renderer feature graph.")
+          print("MORPHEUS_FRAME_FEATURES femtovg=true skia=false")
+          FRAME_FEATURES
+      - name: Build only the account-free debug example
+        run: cargo build --locked -p morpheus-app --example frame_probe
+      - name: Validate native frame callbacks and rejected configurations
+        timeout-minutes: 5
         shell: bash
         run: |
           set -euo pipefail
           umask 077
-          preview_root="$RUNNER_TEMP/morpheus-preview-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          mkdir "$preview_root"
-          # This debug-only early CLI renders fictional fixtures before any
-          # account/config store or network service initialization. Native
-          # logs and raw frames stay private and are never uploaded.
-          # Reviewed PRs capture their tested merge tree before integration;
-          # their PNGs remain untrusted until visual/privacy review.
-          if ! timeout --kill-after=5s 30s xvfb-run -a -s '-screen 0 1440x900x24' \
-            sh -c 'xdotool mousemove 1 1 && exec "$@"' sh \
-            target/debug/morpheus-app --morpheus-capture-preview "$preview_root/raw" \
-            >"$preview_root/native.log" 2>&1; then
-            echo "Native preview capture failed; private output was not published."
-            exit 1
-          fi
-          python3 scripts/encode_preview_pngs.py \
-            --input-dir "$preview_root/raw" --output-dir "$preview_root/png" \
-            --source-commit "$GITHUB_SHA" --binary target/debug/morpheus-app \
-            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
-      - name: Upload native preview PNGs and provenance only
-        id: preview-upload
-        if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && (github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push')) && steps.preview-capture.outcome == 'success'
-        continue-on-error: true
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: native-preview-${{ github.sha }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/desktop-preview.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/account-switcher.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/sign-in.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/incoming-call.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/room-settings.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/paper-preview.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/manage-accounts.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/account-password.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/account-password-large.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/sign-in-large.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/terminal-sidebar.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/terminal-space-labels.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/send-recovery.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/send-recovery-thread-large.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/provenance.json
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
-          include-hidden-files: false
-      - name: Smoke test Linux desktop startup under Xvfb
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set +e
-          timeout 12s xvfb-run -a -s '-screen 0 1280x800x24' target/debug/morpheus-app
-          result=$?
-          if [ "$result" -ne 124 ]; then
-            echo "Morpheus exited before the Linux desktop smoke window (status $result)"
-            exit 1
-          fi
-      - name: Test desktop controller and call guards
-        id: desktop-tests
-        # The independently built app can still exercise disposable fixtures
-        # after a unit assertion fails. Keep that evidence and reject the
-        # candidate at the final gate instead of rebuilding just to reach it.
-        continue-on-error: true
-        run: cargo test --locked -p morpheus-app --features native-calls --bin morpheus-app
-      - name: Test native device and call guards
-        run: cargo test --locked -p morpheus-rtc --features native-devices --lib
-      - name: Test Windows capture of an owned synthetic window and display
-        id: windows-capture-tests
-        if: runner.os == 'Windows'
-        continue-on-error: true
-        timeout-minutes: 15
-        env:
-          MORPHEUS_WINDOWS_CAPTURE_ACCEPTANCE: "1"
-        run: python scripts/run_windows_capture_acceptance.py
-      - name: Test real Wayland portal streaming, source loss, and cancellation
-        id: wayland-tests
-        # Missing/malformed selection is fail-closed; the result gate below
-        # rejects it even if the fixture happens to pass.
-        if: runner.os == 'Linux' && needs.scope.outputs.wayland != 'false'
-        # Collect independent Matrix/OAuth/RTC evidence even if this desktop
-        # fixture fails. The final outcome gate still rejects the candidate.
-        continue-on-error: true
-        timeout-minutes: 15
-        run: python3 scripts/run_wayland_acceptance.py
-      - name: Test vendored security fixes
-        id: vendor-tests
-        # Keep independent SDK and live checks on the already-built app.
-        # The final gate still rejects any failed vendor regression command.
-        continue-on-error: true
-        shell: bash
-        run: |
-          cargo test --locked -p lru --lib test_pop_panicking_key_drop_keeps_list_consistent
-          cargo test --locked -p livekit-api --lib --features signal-client-tokio,rustls-tls-native-roots
-          cargo test --locked -p matrix-rtc-livekit --lib
-          cargo test --locked -p matrix-rtc-core --features testing --lib --test key_rotation
-          cargo test --locked -p cargo-packager-updater --lib
-          cargo test --locked -p webrtc-sys-build --lib
-      - name: Test pinned SDK sticky receipt and redaction regressions
-        id: sdk-receipt-tests
-        # Keep collecting the independently built app's live acceptance. The
-        # final outcome gate still rejects failed SDK unit regressions.
-        continue-on-error: true
-        shell: bash
-        run: cargo test --locked -p matrix-sdk-base --no-default-features --features e2e-encryption,unstable-msc4354 --lib sticky
-      - name: Test real Matrix accounts, recovery, moderation, and encrypted RTC
-        if: runner.os == 'Linux'
-        # Four fresh invitation cases each have a bounded 300-second command.
-        # Preserve room for the existing checks and their service cleanup.
-        timeout-minutes: 55
-        shell: bash
-        run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
+          archive="$RUNNER_TEMP/frame-scanner.tar.gz"
           curl --fail --silent --show-error --location \
             https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
             --output "$archive"
           echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
-          mkdir -p "$RUNNER_TEMP/gitleaks"
-          tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
-          dbus-run-session -- python3 scripts/run_matrix_acceptance.py \
-            --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks"
-      - name: Require the selected Wayland result
-        if: ${{ !cancelled() && runner.os == 'Linux' }}
-        env:
-          WAYLAND_SELECTED: ${{ needs.scope.outputs.wayland }}
-          WAYLAND_OUTCOME: ${{ steps.wayland-tests.outcome }}
-        shell: bash
-        run: |
-          python3 - <<'PY_WAYLAND_ACCEPTANCE'
-          import os
-          import sys
-
-          def wayland_error(selected, outcome):
-              if selected not in ("true", "false"):
-                  return "Wayland selection is missing or malformed."
-              expected = "success" if selected == "true" else "skipped"
-              if outcome != expected:
-                  return "The selected Wayland check failed, was cancelled, or did not run."
-              return None
-
-          error = wayland_error(os.environ.get("WAYLAND_SELECTED"), os.environ.get("WAYLAND_OUTCOME"))
-          if error:
-              print(error, file=sys.stderr)
-              raise SystemExit(1)
-          if os.environ["WAYLAND_SELECTED"] == "false":
-              print("System Wayland was outside this change's inputs; its existing release gate remains open.")
-          PY_WAYLAND_ACCEPTANCE
-      - name: Enforce collected acceptance results
-        if: ${{ !cancelled() && (steps.model-tests.outcome == 'failure' || steps.preview-capture.outcome == 'failure' || steps.preview-upload.outcome == 'failure' || steps.desktop-tests.outcome == 'failure' || steps.wayland-tests.outcome == 'failure' || steps.windows-capture-tests.outcome == 'failure' || steps.sdk-receipt-tests.outcome == 'failure' || steps.vendor-tests.outcome == 'failure') }}
-        shell: bash
-        run: |
-          echo "Protocol model, native preview, desktop controller, native capture, SDK receipt, or vendor regression tests failed; this candidate is not verified."
-          exit 1
-
-  acceptance:
-    name: CI acceptance
-    needs: [scope, helpers, config, compile]
-    # Run after failed/skipped dependencies too. A selected check may never
-    # disappear behind a skipped aggregate that branch protection accepts.
-    if: always() && github.event.repository.private == false
-    runs-on: ubuntu-24.04
-    permissions: {}
-    timeout-minutes: 2
-    steps:
-      # No checkout, dependency/cache restore, artifacts, or submitted code.
-      # This combines job conclusions; source/workflow review remains required.
-      - name: Require every selected check to succeed
-        env:
-          CHECK_RESULTS: ${{ toJSON(needs) }}
-        shell: bash
-        run: |
-          python3 - <<'PY_ACCEPTANCE'
+          mkdir "$RUNNER_TEMP/frame-scanner"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/frame-scanner" gitleaks
+          export FRAME_PROBE_SCANNER="$RUNNER_TEMP/frame-scanner/gitleaks"
+          cat > "$RUNNER_TEMP/frame-validation.py" <<'FRAME_VALIDATION'
+          """Owner-authored fresh-hosted validator; never run on the owner's computer."""
+          from pathlib import Path
+          import hashlib
           import json
           import os
-          import sys
+          import resource
+          import selectors
+          import signal
+          import socket
+          import subprocess
+          import time
 
-          def acceptance_error(needs):
-              if not isinstance(needs, dict) or set(needs) != {"scope", "helpers", "config", "compile"}:
-                  return "Missing dependency conclusions."
-              if any(not isinstance(value, dict) for value in needs.values()):
-                  return "Malformed dependency conclusions."
-              if needs["scope"].get("result") != "success":
-                  return "Security and change scope did not succeed."
-              if needs["helpers"].get("result") != "success":
-                  return "Validation helper tests did not succeed."
-              outputs = needs["scope"].get("outputs")
-              if not isinstance(outputs, dict):
-                  return "Scope outputs are missing."
-              native, config, wayland = outputs.get("native"), outputs.get("config"), outputs.get("wayland")
-              if any(flag not in ("true", "false") for flag in (native, config, wayland)):
-                  return "Scope flags are missing or malformed."
-              if native == config == "true":
-                  return "Native checks already include configuration tests."
-              try:
-                  matrix = json.loads(outputs.get("native_matrix", ""))
-              except (TypeError, ValueError):
-                  return "Native matrix is missing or malformed."
-              if not isinstance(matrix, dict) or set(matrix) != {"os"}:
-                  return "Native matrix must contain only standard operating systems."
-              platforms = matrix["os"]
-              allowed = {"macos-15", "macos-15-intel", "ubuntu-24.04", "windows-2025"}
-              if (not isinstance(platforms, list)
-                      or any(not isinstance(item, str) or item not in allowed for item in platforms)
-                      or len(platforms) != len(set(platforms))
-                      or bool(platforms) != (native == "true")):
-                  return "Native matrix disagrees with the selected standard checks."
-              if wayland == "true" and "ubuntu-24.04" not in platforms:
-                  return "Selected Wayland acceptance requires the Linux native job."
-              for job, selected in (("config", config), ("compile", native)):
-                  expected = "success" if selected == "true" else "skipped"
-                  if needs[job].get("result") != expected:
-                      return "A selected check failed, was cancelled, or did not run."
-              return None
+          os.umask(0o077)
+          if os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_OS") != "Linux":
+              raise SystemExit("Fresh hosted Linux validation required.")
+          root = Path(os.environ["RUNNER_TEMP"]) / (
+              "morpheus-frame-probe-" + os.environ["GITHUB_RUN_ID"] + "-" + os.environ["GITHUB_RUN_ATTEMPT"]
+          )
+          root.mkdir(mode=0o700)
+          raw = root / "raw"
+          raw.mkdir(mode=0o700)
+          binary = Path.cwd() / "target/debug/examples/frame_probe"
+          scanner = Path(os.environ["FRAME_PROBE_SCANNER"])
+          facts = {}
+          positive = None
+          failure = None
+          active_case = "setup"
+          process_exits = {}
+          native_errors = {}
+          known_errors = {
+              "unsupported_platform", "backend_not_winit_femtovg", "software_gl_not_requested",
+              "x11_display_missing", "x11_display_not_local", "wayland_display_present",
+              "backend_unavailable", "window_unavailable", "window_show_failed", "event_loop_failed",
+              "renderer_not_opengl", "notifier_unavailable", "graphics_api_not_native_opengl",
+              "lifecycle_invalid", "frame_outside_lifecycle", "unknown_rendering_state",
+              "unpaired_frame", "insufficient_frames", "close_failed", "probe_panicked",
+              "watchdog_unavailable", "watchdog_failed", "watchdog_expired",
+          }
+
+
+          def require(condition, reason):
+              if not condition:
+                  raise RuntimeError(reason)
+
+
+          def no_threads():
+              resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
+
+
+          def invoke(label, changes, limit_threads=False):
+              global active_case
+              active_case = label
+              env = os.environ.copy()
+              for name in ("WAYLAND_DISPLAY", "WAYLAND_SOCKET", "WINIT_UNIX_BACKEND"):
+                  env.pop(name, None)
+              env.update(SLINT_BACKEND="winit-femtovg", LIBGL_ALWAYS_SOFTWARE="1",
+                         MESA_SHADER_CACHE_DISABLE="true", RUST_BACKTRACE="0")
+              env.update(changes)
+              sizes = {"out": 0, "err": 0}
+              deadline = time.monotonic() + 25
+              with (raw / (label + ".stdout")).open("wb") as out, (
+                  raw / (label + ".stderr")
+              ).open("wb") as err:
+                  child = subprocess.Popen(
+                      [str(binary)], env=env, stdin=subprocess.DEVNULL,
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+                      preexec_fn=no_threads if limit_threads else None,
+                  )
+                  selector = selectors.DefaultSelector()
+                  selector.register(child.stdout, selectors.EVENT_READ, ("out", out))
+                  selector.register(child.stderr, selectors.EVENT_READ, ("err", err))
+                  try:
+                      while selector.get_map():
+                          remaining = deadline - time.monotonic()
+                          require(remaining > 0, "child_timeout")
+                          events = selector.select(remaining)
+                          require(bool(events), "child_timeout")
+                          for key, _ in events:
+                              block = os.read(key.fd, 16384)
+                              if not block:
+                                  selector.unregister(key.fileobj)
+                                  key.fileobj.close()
+                                  continue
+                              name, target = key.data
+                              sizes[name] += len(block)
+                              require(sizes[name] <= 65536, "child_output_limit")
+                              target.write(block)
+                      code = child.wait(timeout=max(0.1, deadline - time.monotonic()))
+                      process_exits[label] = code
+                  finally:
+                      if child.poll() is None:
+                          os.killpg(child.pid, signal.SIGKILL)
+                          child.wait()
+                      selector.close()
+                      for pipe in (child.stdout, child.stderr):
+                          if not pipe.closed:
+                              pipe.close()
+              data = (raw / (label + ".stdout")).read_bytes()
+              require(len(data) <= 4096 and len(data.splitlines()) == 1, "invalid_output_shape")
+              result = json.loads(data)
+              require(type(result) is dict, "invalid_output_shape")
+              if (code in (1, 3) and set(result) == {"probe", "result", "reason"}
+                      and result["probe"] == "morpheus_frame_timing" and result["result"] == "error"
+                      and type(result["reason"]) is str and result["reason"] in known_errors):
+                  native_errors[label] = result["reason"]
+              return code, result
+
+
+          def error_result(code, result, reason):
+              return code == 1 and result == {
+                  "probe": "morpheus_frame_timing", "result": "error", "reason": reason
+              }
+
+
+          def percentile_shape(value):
+              return (type(value) is dict and set(value) == {"p50", "p95", "max"}
+                      and all(type(x) is int and 0 <= x <= 20_000_000 for x in value.values())
+                      and value["p50"] <= value["p95"] <= value["max"])
+
 
           try:
-              error = acceptance_error(json.loads(os.environ["CHECK_RESULTS"]))
-          except (KeyError, ValueError):
-              error = "Dependency conclusions are missing or malformed."
-          if error:
-              print(error, file=sys.stderr)
+              require(binary.is_file() and not binary.is_symlink(), "binary_unavailable")
+              require(os.geteuid() != 0, "nonroot_runner_required")
+              code, report = invoke("native", {})
+              expected = {
+                  "probe", "result", "backend", "graphics_api", "software_gl_requested", "measure",
+                  "warmup_frames", "samples", "render_callback_us", "frame_start_interval_us",
+                  "teardown_observed",
+              }
+              require(code == 0 and set(report) == expected, "native_probe_failed")
+              require(report["probe"] == "morpheus_frame_timing" and report["result"] == "pass"
+                      and report["backend"] == "winit-femtovg" and report["graphics_api"] == "native_opengl"
+                      and report["software_gl_requested"] is True
+                      and report["measure"] == "cpu_render_callback_before_presentation"
+                      and type(report["warmup_frames"]) is int and report["warmup_frames"] == 10
+                      and type(report["samples"]) is int and report["samples"] == 120
+                      and type(report["teardown_observed"]) is bool
+                      and percentile_shape(report["render_callback_us"])
+                      and percentile_shape(report["frame_start_interval_us"]), "invalid_native_result")
+              positive = report
+              facts["native_callback_pairs"] = True
+              listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+              try:
+                  for display in range(7100, 7116):
+                      try:
+                          listener.bind(("127.0.0.1", 6000 + display))
+                          break
+                      except OSError:
+                          continue
+                  else:
+                      raise RuntimeError("remote_listener_unavailable")
+                  listener.listen(1)
+                  listener.setblocking(False)
+                  code, result = invoke("remote-display", {"DISPLAY": f"127.0.0.1:{display}"})
+                  require(error_result(code, result, "x11_display_not_local"), "remote_display_not_rejected")
+                  try:
+                      connection, _ = listener.accept()
+                  except BlockingIOError:
+                      facts["remote_display_no_connection"] = True
+                  else:
+                      connection.close()
+                      raise RuntimeError("remote_display_contacted")
+                  facts["remote_display_rejected"] = True
+              finally:
+                  listener.close()
+              code, result = invoke("wrong-backend", {"SLINT_BACKEND": "winit-software"})
+              require(error_result(code, result, "backend_not_winit_femtovg"), "wrong_backend_not_rejected")
+              facts["wrong_backend_rejected"] = True
+              code, result = invoke("wayland-selector", {"WAYLAND_SOCKET": "0"})
+              require(error_result(code, result, "wayland_display_present"), "wayland_selector_not_rejected")
+              facts["wayland_selector_rejected"] = True
+              code, result = invoke("watchdog-start", {}, limit_threads=True)
+              require(error_result(code, result, "watchdog_unavailable"), "watchdog_start_not_controlled")
+              facts["watchdog_start_failure_controlled"] = True
+          except Exception as error:
+              # Do not reflect exception text, child output, paths or environment values.
+              failure = "acceptance_check_failed"
+
+          (root / "scanner.toml").write_text("[extend]\nuseDefault = true\n")
+          (root / "scanner.ignore").write_text("")
+          with (root / "scanner.log").open("wb") as output:
+              scan = subprocess.run(
+                  [str(scanner), "dir", str(raw), "--config", str(root / "scanner.toml"),
+                   "--gitleaks-ignore-path", str(root / "scanner.ignore"), "--ignore-gitleaks-allow",
+                   "--redact=100", "--no-banner", "--max-target-megabytes", "0",
+                   "--report-format", "json", "--report-path", str(root / "scan.json")],
+                  stdout=output, stderr=subprocess.STDOUT, timeout=45,
+              )
+          require(scan.returncode == 0 and json.loads((root / "scan.json").read_text()) == [],
+                  "private_output_scan_failed")
+          if failure is not None:
+              print(json.dumps({"probe": "native_frame_acceptance", "result": "error",
+                                "reason": failure, "case": active_case, "process_exits": process_exits,
+                                "native_errors": native_errors, "completed_facts": sorted(facts)}))
               raise SystemExit(1)
-          print("Security checks and every selected validation job succeeded.")
-          PY_ACCEPTANCE
+          require(len(facts) == 6 and all(facts.values()), "missing_acceptance_facts")
+          print(json.dumps({
+              "probe": "native_frame_acceptance", "result": "pass", "profile": "debug",
+              "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+              "facts": facts, "native": positive, "private_output_secret_findings": 0,
+          }))
+          FRAME_VALIDATION
+          dbus-run-session -- env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u WINIT_UNIX_BACKEND \
+            xvfb-run -a -s '-screen 0 1280x800x24' python3 -I -B "$RUNNER_TEMP/frame-validation.py"
