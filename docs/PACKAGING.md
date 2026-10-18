@@ -82,11 +82,15 @@ Ubuntu 24.04 x86-64 runner with real and effective root. It confirms that `/`
 and `/usr` are root-owned and not group- or world-writable. It then removes only
 the group and world write bits from `/usr/share` and from each directory and
 regular file in those two trees. It never follows a symlink, crosses a mount,
-changes an owner or removes anything. An entry owned by another user fails the
-job, as does a writable file with another hard link, whose mode would change
-through every alias; an already tight one is left alone. It prints only fixed
-reasons and counts. It trusts the official image as it is before candidate code
-runs. Tightening permissions is not a repair for a tampered host, and the
+changes an owner or removes anything, and an entry owned by another user fails
+the job. A writable file with more than one hard link shares its mode with every
+alias, so it is changed only after every directory of both trees is tight and a
+read-only census of both trees finds exactly as many names for it as its link
+count. Each such file is then rechecked against the census before the change.
+An alias outside the two trees, one the census cannot find, or one that changes
+while the step runs fails the job with the file unchanged; an already tight
+linked file is left alone. It prints only fixed reasons and counts. It trusts
+the official image as it is before candidate code runs. Tightening permissions is not a repair for a tampered host, and the
 inventory's ownership, mode, symlink and provenance checks are unchanged.
 
 For a local package, use `python3 scripts/package.py --formats deb,appimage`,
