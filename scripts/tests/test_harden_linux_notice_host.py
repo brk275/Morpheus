@@ -47,6 +47,11 @@ DIRECTORIES = {"usr/share": 0o777, "usr/share/doc": 0o777, "usr/share/doc/libc6"
 FILES = {"usr/share/doc/libc6/copyright": 0o666, "usr/share/doc/nested/deeper/README": 0o777,
          "usr/share/common-licenses/GPL-2": 0o646, "usr/share/unrelated/data": 0o666}
 COPYRIGHT = "usr/share/doc/libc6/copyright"
+# Extra names a test may give the copyright file: one in each tree, and one
+# outside both trees.
+DOC_ALIAS = "usr/share/doc/nested/copyright-copy"
+LICENSE_ALIAS = "usr/share/common-licenses/copyright-copy"
+OUTSIDE_ALIAS = "usr/share/unrelated/copyright-alias"
 LINKS = {"usr/share/doc/libc6-alias": "libc6", "usr/share/common-licenses/GPL": "GPL-2",
          "usr/share/doc/libc6/outside-dir": "../../unrelated",
          "usr/share/doc/libc6/outside-file": "../../unrelated/data"}
@@ -183,6 +188,25 @@ def after_fchmod(inode, change):
         yield
 
 
+def phase_clock(phase, action=None, expire=False):
+    """A Walk clock that acts when the run first ticks in phase.
+
+    The walk ticks before listing each directory's first name, so action runs
+    before that pass looks at any entry. Set state["walk"] to the Walk.
+    """
+    state = {"walk": None, "done": False}
+
+    def clock():
+        walk = state["walk"]
+        if walk is None or walk.phase != phase:
+            return 0.0
+        if action is not None and not state["done"]:
+            state["done"] = True
+            action()
+        return 1000.0 if expire else 0.0
+    return state, clock
+
+
 @unittest.skipUnless(sys.platform == "linux", "descriptor-relative walks are checked on Linux")
 class SyntheticTreeTests(unittest.TestCase):
     def setUp(self):
@@ -195,10 +219,13 @@ class SyntheticTreeTests(unittest.TestCase):
     def host(self):
         return build_host(tempfile.mkdtemp(dir=self.folder))
 
-    def walk(self, root=None, fix=True, **options):
+    def walk(self, root=None, fix=True, state=None, **options):
         options.setdefault("owner", self.uid)
         before = descriptors()
-        report = H.Walk(fix, root=str(self.root if root is None else root), **options).report()
+        walk = H.Walk(fix, root=str(self.root if root is None else root), **options)
+        if state is not None:
+            state["walk"] = walk
+        report = walk.report()
         self.assertEqual(descriptors(), before, "a descriptor stayed open")
         self.assertTrue(H.public(report))
         return report
@@ -246,23 +273,157 @@ class SyntheticTreeTests(unittest.TestCase):
         self.assertTrue(opens)
         self.assertTrue(all(flags & os.O_DIRECTORY and flags & os.O_NOFOLLOW for _, flags in opens))
 
-    def test_writable_hard_link_fails_closed_and_keeps_every_alias(self):
-        # One alias outside both trees, one inside the same tree: either way
-        # the shared mode must not change, through any name.
-        for alias in ("usr/share/unrelated/copyright-alias", "usr/share/doc/libc6/copyright-alias"):
-            with self.subTest(alias=alias):
+    def link(self, root, *aliases):
+        """Give the copyright file extra names; returns its inode."""
+        for alias in aliases:
+            os.link(root / COPYRIGHT, root / alias)
+        return os.stat(root / COPYRIGHT).st_ino
+
+    def test_aliases_contained_in_both_trees_are_tightened_once_after_the_census(self):
+        inode = self.link(self.root, DOC_ALIAS, LICENSE_ALIAS)
+        before = snapshot(self.root)
+        state = {"walk": None}
+        phases = []
+        real_fchmod = os.fchmod
+
+        def fchmod(handle, value):
+            if os.fstat(handle).st_ino == inode:
+                phases.append(state["walk"].phase)
+            return real_fchmod(handle, value)
+        with mock.patch("os.fchmod", side_effect=fchmod):
+            report = self.walk(state=state)
+        # Every name is counted in the first pass; the file changes once, in
+        # the links pass, after the census found all three of its names.
+        self.assertEqual(report, H.result("hardened", "complete", None, counts(
+            directories=6, files=5, symlinks=4, linked_files=3, linked_writable=1,
+            group_writable=10, world_writable=10, tightened=9)))
+        self.assertEqual(phases, ["links"])
+        after = snapshot(self.root)
+        self.assertEqual(set(after), set(before))
+        for name in (COPYRIGHT, DOC_ALIAS, LICENSE_ALIAS):
+            self.assertEqual(after[name], ("file", 0o644, before[name][2]))
+        self.assertEqual(self.walk(fix=False), H.result("surveyed", "complete", None, counts(
+            directories=6, files=5, symlinks=4, linked_files=3)))
+
+    def test_outside_or_uncounted_aliases_fail_the_census_with_every_alias_unchanged(self):
+        # Outside both trees, outside /usr/share altogether, and one alias in
+        # a tree plus one outside: the census finds fewer names than links.
+        for aliases in ((OUTSIDE_ALIAS,), ("usr/copyright-alias",), (LICENSE_ALIAS, OUTSIDE_ALIAS)):
+            with self.subTest(aliases=aliases):
                 root = self.host()
-                os.link(root / COPYRIGHT, root / alias)
-                inode = os.stat(root / COPYRIGHT).st_ino
+                inode = self.link(root, *aliases)
                 before = snapshot(root)
                 with recorded_fchmods() as changes:
                     report = self.walk(root)
-                self.assert_failed(report, "doc", "hardlink")
+                self.assert_failed(report, "census", "hardlink")
+                self.assertEqual(report["linked_writable"], 1)
                 self.assertNotIn(inode, changes)
-                for name in (COPYRIGHT, alias):
-                    self.assertEqual(snapshot(root)[name], before[name])
+                after = snapshot(root)
+                for name in (COPYRIGHT, *aliases):
+                    self.assertEqual(after[name], before[name])
                     self.assertEqual(mode(root, name), 0o666)
+                # The first pass still tightened the singly linked entries.
+                self.assertEqual(mode(root, "usr/share/doc/nested/deeper/README"), 0o755)
                 self.assertEqual(mode(root, "usr/share/unrelated"), 0o777)
+
+    def test_one_outside_group_prevents_changes_to_every_deferred_group(self):
+        # A valid contained group must not be changed before another group's
+        # outside alias is discovered. The complete census is a prerequisite.
+        contained = self.link(self.root, LICENSE_ALIAS)
+        gpl = self.root / "usr/share/common-licenses/GPL-2"
+        outside = self.root / "usr/share/unrelated/gpl-copy"
+        os.link(gpl, outside)
+        rejected = os.stat(gpl).st_ino
+        with recorded_fchmods() as changes:
+            report = self.walk()
+        self.assert_failed(report, "census", "hardlink")
+        self.assertEqual(report["linked_writable"], 2)
+        self.assertNotIn(contained, changes)
+        self.assertNotIn(rejected, changes)
+        self.assertEqual(mode(self.root, COPYRIGHT), 0o666)
+        self.assertEqual(mode(self.root, LICENSE_ALIAS), 0o666)
+        self.assertEqual(mode(self.root, "usr/share/common-licenses/GPL-2"), 0o646)
+        self.assertEqual(mode(self.root, "usr/share/unrelated/gpl-copy"), 0o646)
+
+    def test_alias_churn_after_the_first_pass_fails_with_linked_files_unchanged(self):
+        # (setup aliases, phase, action, failing stage, reason, copyright mode after)
+        def tighten_gpl(root):
+            os.chmod(root / "usr/share/common-licenses/GPL-2", 0o644)
+            os.link(root / "usr/share/common-licenses/GPL-2", root / "usr/share/doc/nested/GPL-2-copy")
+        cases = (
+            # An outside alias appears after the census: rechecked before fchmod.
+            (None, "links", lambda root: os.link(root / COPYRIGHT, root / OUTSIDE_ALIAS),
+             "links", "link_churn", 0o666),
+            # An in-tree alias disappears before the census.
+            (None, "census", lambda root: os.unlink(root / LICENSE_ALIAS), "census", "link_churn", 0o666),
+            # An outside alias appears before the census.
+            (None, "census", lambda root: os.link(root / COPYRIGHT, root / OUTSIDE_ALIAS),
+             "census", "hardlink", 0o666),
+            # Another linked file becomes writable after the first pass.
+            (tighten_gpl, "census",
+             lambda root: os.chmod(root / "usr/share/common-licenses/GPL-2", 0o666),
+             "census", "link_churn", 0o666),
+            # The deferred file's mode changes between the census and the links pass.
+            (None, "links", lambda root: os.chmod(root / COPYRIGHT, 0o664), "links", "link_churn", 0o664),
+        )
+        for setup, phase, action, stage, reason, kept in cases:
+            with self.subTest(phase=phase, stage=stage, reason=reason, kept=kept):
+                root = self.host()
+                inode = self.link(root, LICENSE_ALIAS)
+                if setup is not None:
+                    setup(root)
+                state, clock = phase_clock(phase, lambda root=root, action=action: action(root))
+                with recorded_fchmods() as changes:
+                    report = self.walk(root, state=state, clock=clock)
+                self.assert_failed(report, stage, reason)
+                self.assertNotIn(inode, changes)
+                self.assertEqual(mode(root, COPYRIGHT), kept)
+
+    def test_alias_added_during_the_change_is_reported(self):
+        # The link count is rechecked after fchmod too; this race can only be
+        # reported, not prevented.
+        inode = self.link(self.root, LICENSE_ALIAS)
+        state = {"walk": None}
+        real_fchmod = os.fchmod
+
+        def fchmod(handle, value):
+            if os.fstat(handle).st_ino == inode and state["walk"].phase == "links":
+                os.link(self.root / COPYRIGHT, self.root / OUTSIDE_ALIAS)
+            return real_fchmod(handle, value)
+        with mock.patch("os.fchmod", side_effect=fchmod):
+            report = self.walk(state=state)
+        self.assert_failed(report, "links", "verify")
+
+    def test_census_and_links_passes_keep_every_bound(self):
+        for phase in ("census", "links"):
+            with self.subTest(phase=phase):
+                root = self.host()
+                inode = self.link(root, LICENSE_ALIAS)
+                state, clock = phase_clock(phase, expire=True)
+                with recorded_fchmods() as changes:
+                    report = self.walk(root, state=state, clock=clock)
+                self.assert_failed(report, phase, "time")
+                self.assertNotIn(inode, changes)
+                self.assertEqual(mode(root, COPYRIGHT), 0o666)
+        # Each pass lists the same eleven names and has the whole entry bound.
+        root = self.host()
+        self.link(root, LICENSE_ALIAS)
+        self.assertEqual(self.walk(root, entries=11)["status"], "hardened")
+        root = self.host()
+        self.link(root, LICENSE_ALIAS)
+        self.assert_failed(self.walk(root, entries=10), "common_licenses", "count")
+        self.assertEqual(mode(root, COPYRIGHT), 0o666)
+
+    def test_a_directory_seen_twice_in_one_pass_is_refused(self):
+        # As through a same-device bind mount, which st_dev cannot reveal.
+        libc6 = os.stat(self.root / "usr/share/doc/libc6").st_ino
+        deeper = os.stat(self.root / "usr/share/doc/nested/deeper").st_ino
+
+        def as_libc6(value):
+            return changed(value, st_ino=libc6)
+        with patched_stat({"deeper": as_libc6}), patched_fstat(deeper, as_libc6):
+            report = self.walk()
+        self.assert_failed(report, "doc", "mount")
 
     def test_already_tight_hard_link_is_left_untouched(self):
         os.chmod(self.root / COPYRIGHT, 0o644)
@@ -285,7 +446,8 @@ class SyntheticTreeTests(unittest.TestCase):
         with recorded_fchmods() as changes:
             report = self.walk(fix=False)
         self.assertEqual(report, H.result("surveyed", "complete", None, counts(
-            directories=6, files=4, symlinks=4, linked_files=2, group_writable=9, world_writable=9)))
+            directories=6, files=4, symlinks=4, linked_files=2, linked_writable=1,
+            group_writable=9, world_writable=9)))
         self.assertEqual(changes, [])
         self.assertEqual(snapshot(self.root), before)
 
@@ -542,7 +704,8 @@ class MainTests(unittest.TestCase):
 
     def test_failed_or_malformed_reports_exit_nonzero_with_fixed_output(self):
         limit = H.MAX_COUNT
-        failed = H.result("failed", "doc", "hardlink", counts(directories=2, files=1, linked_files=1))
+        failed = H.result("failed", "census", "hardlink", counts(
+            directories=2, files=1, linked_files=1, linked_writable=1))
         malformed = [
             dict(H.result("hardened", "complete", None), path="/usr/share/doc/private"),
             {**H.result("hardened", "complete", None), "check": "private"},
@@ -567,6 +730,8 @@ class MainTests(unittest.TestCase):
             H.result("hardened", "complete", None, counts(files=1, linked_files=2)),
             H.result("hardened", "complete", None, counts(directories=1, tightened=2)),
             H.result("hardened", "complete", None, counts(files=1, group_writable=2)),
+            H.result("hardened", "complete", None, counts(files=2, linked_files=1, linked_writable=2)),
+            H.result("hardened", "links", None), H.result("surveyed", "census", None),
         ]
         for walked, printed in [(failed, failed)] + [(value, H.FALLBACK) for value in malformed]:
             with self.subTest(walked=walked), \
@@ -588,8 +753,10 @@ class MainTests(unittest.TestCase):
                        H.result("surveyed", "complete", None, counts(files=3, linked_files=3, world_writable=3)),
                        H.result("refused", "guard", "root"), H.result("failed", "guard", "internal"),
                        H.result("failed", "share", "time"),
-                       H.result("failed", "doc", "hardlink", counts(
-                           directories=2, files=1, linked_files=1, world_writable=3))):
+                       H.result("failed", "census", "hardlink", counts(
+                           directories=2, files=1, linked_files=1, linked_writable=1, world_writable=3)),
+                       H.result("failed", "links", "link_churn", counts(
+                           directories=6, files=5, linked_files=3, linked_writable=1, tightened=8))):
             with self.subTest(report=report):
                 self.assertTrue(H.public(report))
 
