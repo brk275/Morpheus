@@ -2017,6 +2017,128 @@ fn control_extents(ui: &AppWindow, label: &str) -> Vec<(f32, f32)> {
         .collect()
 }
 
+/// Failure-only, bounded geometry diagnostics. Read the target's ancestor
+/// chain without changing focus, scrolling, callbacks or widget properties.
+/// Only numeric geometry and static compiler element names/IDs are reported.
+fn clipped_control_geometry(ui: &AppWindow, label: &str) -> Vec<String> {
+    use slint::private_unstable_api::re_exports::{
+        AccessibleStringProperty, BorderRectangle, Clip, Empty, Flickable, FocusScope, ItemRc,
+        Opacity, Rectangle, WindowInner,
+    };
+    use std::ops::ControlFlow;
+
+    const NODE_LIMIT: usize = 4096;
+    const PATH_LIMIT: usize = 24;
+    let window = WindowInner::from_pub(ui.window());
+    let root = ItemRc::new_root(window.component());
+    let (width, height) = window_size(ui);
+    let mut nodes = vec![root.clone()];
+    root.visit_descendants(|item| {
+        if nodes.len() >= NODE_LIMIT {
+            return ControlFlow::Break(());
+        }
+        nodes.push(item.clone());
+        ControlFlow::Continue(())
+    });
+    let target = nodes.iter().find(|item| {
+        item.accessible_string_property(AccessibleStringProperty::Label)
+            .as_deref()
+            == Some(label)
+            && {
+                let bounds = item_bounds(item);
+                bounds.left < -0.5 || bounds.right > width + 0.5
+            }
+    });
+    let mut trace = vec![format!(
+        "window={width}x{height}; root={:?}; panes={}/{}/{}; scale={}; nodes={}; node_cap_reached={}",
+        item_bounds(&root),
+        ui.get_rail_width_px(),
+        ui.get_room_list_width(),
+        ui.get_details_width(),
+        ui.get_font_scale_percent(),
+        nodes.len(),
+        nodes.len() >= NODE_LIMIT
+    )];
+    let Some(target) = target else {
+        trace.push("no horizontally clipped target found".into());
+        return trace;
+    };
+    for node in &nodes {
+        if trace.len() >= PATH_LIMIT {
+            trace.push("ancestor trace capped".into());
+            break;
+        }
+        let mut contains = node == target;
+        if !contains {
+            let mut visited = 0;
+            node.visit_descendants(|child| {
+                visited += 1;
+                if child == target {
+                    contains = true;
+                    return ControlFlow::Break(());
+                }
+                if visited >= NODE_LIMIT {
+                    return ControlFlow::Break(());
+                }
+                ControlFlow::Continue(())
+            });
+        }
+        if contains {
+            let role = if node.downcast::<Flickable>().is_some() {
+                "flickable"
+            } else if node.downcast::<FocusScope>().is_some() {
+                "focus"
+            } else if node.downcast::<Clip>().is_some() {
+                "clip"
+            } else if node.downcast::<BorderRectangle>().is_some() {
+                "border"
+            } else if node.downcast::<Rectangle>().is_some() {
+                "rectangle"
+            } else if node.downcast::<Opacity>().is_some() {
+                "opacity"
+            } else if node.downcast::<Empty>().is_some() {
+                "empty"
+            } else {
+                "other"
+            };
+            let names: Vec<_> = node
+                .element_type_names_and_ids(0)
+                .unwrap_or_default()
+                .into_iter()
+                .take(2)
+                .map(|(kind, id)| {
+                    format!(
+                        "{}:{}",
+                        kind.chars().take(32).collect::<String>(),
+                        id.chars().take(32).collect::<String>()
+                    )
+                })
+                .collect();
+            let geometry = node.geometry();
+            trace.push(format!(
+                "{role} {:?}; local=({},{},{},{}); window={:?}",
+                names,
+                geometry.origin.x,
+                geometry.origin.y,
+                geometry.size.width,
+                geometry.size.height,
+                item_bounds(node)
+            ));
+            if let Some(flickable) = node.downcast::<Flickable>() {
+                let flickable = flickable.as_pin_ref();
+                trace.push(format!(
+                    "canvas=({},{},{},{})",
+                    flickable.content_x().0,
+                    flickable.content_y().0,
+                    flickable.content_width().0,
+                    flickable.content_height().0
+                ));
+            }
+        }
+    }
+    trace
+}
+
 /// Bounds of the control that currently has keyboard focus, if any.
 fn focused_control_bounds(ui: &AppWindow) -> Option<Bounds> {
     use slint::private_unstable_api::re_exports::WindowInner;
@@ -2221,7 +2343,8 @@ async fn assert_recovery_strip_projection(ui: &AppWindow) {
             assert!(right > left, "{label} has no width");
             assert!(
                 left >= 0.0 && right <= window_width + 0.5,
-                "{label} is clipped: {left}..{right} of {window_width}"
+                "{label} is clipped: {left}..{right} of {window_width}; path={:?}",
+                clipped_control_geometry(ui, label)
             );
             seen += 1;
         }
