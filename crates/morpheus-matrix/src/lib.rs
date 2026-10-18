@@ -2162,7 +2162,15 @@ impl AccountManager {
         if !selection.is_current() {
             return Err(MatrixCoreError::SelectedAccountChanged);
         }
-        Ok(std::mem::take(&mut *loaded.recovered.lock().await))
+        // The hand-off is decided under the lock: a caller that passed the
+        // check above and then waited behind this lock across A -> B -> A must
+        // not drain the discovery the renewed selection is owed. A refused
+        // take leaves the vector in place.
+        let mut recovered = loaded.recovered.lock().await;
+        if !selection.is_current() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        Ok(std::mem::take(&mut *recovered))
     }
 
     /// Abort one queued request this account owns. Ownership is the exact
@@ -4638,6 +4646,89 @@ mod tests {
         assert!(budget.charge(row_bytes(&many)).is_ok());
         assert_eq!(budget.bytes, many_bytes);
         assert!(matches!(budget.charge(None), Err(ScanError::Budget)));
+    }
+
+    /// A caller of `take_recovered_drafts` that passed its selection check and
+    /// then waited behind the recovered lock across A -> B -> A must not drain
+    /// the renewed selection's discovery: the stale take fails without
+    /// consuming, and the fresh take receives the result exactly once.
+    #[test]
+    fn a_stale_recovered_take_waiting_behind_the_lock_consumes_nothing() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let root = std::env::temp_dir().join(format!("morpheus-handoff-{}", Uuid::new_v4()));
+            let manager = Arc::new(AccountManager::open(&root).unwrap());
+            let homeserver = "http://127.0.0.1:9";
+            let first = AccountInfo {
+                id: Uuid::new_v4().to_string(),
+                user_id: "@first:localhost".into(),
+                device_id: "FIRST".into(),
+                homeserver: homeserver.into(),
+            };
+            let second = AccountInfo {
+                id: Uuid::new_v4().to_string(),
+                user_id: "@second:localhost".into(),
+                device_id: "SECOND".into(),
+                homeserver: homeserver.into(),
+            };
+            let client_a = Client::builder().homeserver_url(homeserver).build().await.unwrap();
+            let loaded_a = Arc::new(LoadedAccount::new(
+                client_a,
+                first.id.clone(),
+                String::new(),
+                manager._access_lock.clone(),
+            ));
+            {
+                let mut state = manager.state.lock().await;
+                state.registry.accounts = vec![first.clone(), second.clone()];
+                state.active_account_id = Some(first.id.clone());
+                state.loaded.insert(first.id.clone(), loaded_a.clone());
+            }
+            manager.selections.replace(Some(&first.id));
+            // Discovery for this selection has finished; nothing waits on it.
+            loaded_a.recovery_ready.send_replace(true);
+            let stale_selection = manager.account_selection(&first.id).unwrap();
+
+            // Hold the recovered vector, then start the take: it passes its
+            // selection check and blocks behind the lock.
+            let mut held = loaded_a.recovered.lock().await;
+            let stale_manager = manager.clone();
+            let stale = stale_selection.clone();
+            let stale_take = tokio::spawn(async move { stale_manager.take_recovered_drafts(&stale).await });
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert!(!stale_take.is_finished(), "the take waits behind the recovered lock");
+            // A -> B -> A: the old selection is revoked and a fresh one issued
+            // for the same account, whose discovery result is placed under the
+            // held lock.
+            manager.selections.replace(Some(&second.id));
+            manager.selections.replace(Some(&first.id));
+            assert!(!stale_selection.is_current());
+            let fresh_selection = manager.account_selection(&first.id).unwrap();
+            *held = vec![RecoveredDraft {
+                room_id: "!handoff:example.org".into(),
+                thread_root: None,
+                restored: ComposeText::restore_draft("handed off".into(), None),
+                sends: Vec::new(),
+            }];
+            drop(held);
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(5), stale_take).await.unwrap().unwrap(),
+                Err(MatrixCoreError::SelectedAccountChanged)
+            ), "the stale take is refused");
+            let fresh = manager.take_recovered_drafts(&fresh_selection).await.unwrap();
+            assert_eq!(fresh.len(), 1, "the fresh selection receives the discovery it is owed");
+            assert_eq!(fresh[0].room_id, "!handoff:example.org");
+            assert_eq!(fresh[0].restored.text.body, "handed off");
+            assert!(manager.take_recovered_drafts(&fresh_selection).await.unwrap().is_empty(), "handed out once");
+            manager.selections.replace(None);
+            drop(manager);
+            fs::remove_dir_all(root).unwrap();
+        });
     }
 
     #[test]
