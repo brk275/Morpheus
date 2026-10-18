@@ -274,16 +274,12 @@ component IconAction inherits Rectangle {
         icon: root.icon;
         ink: root.selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink;
     }
-    area := TouchArea {
-        enabled: root.enabled;
-        mouse-cursor: pointer;
-        clicked => { root.activated(); }
-    }
     keyboard-focus := FocusScope {
         x: 0px;
         width: root.reveal-full-control ? root.width : 0px;
         height: root.reveal-full-control ? root.height : 0px;
-        focus-on-click: !root.reveal-full-control;
+        // Slint's accessibility bridge requests focus with PointerClick.
+        focus-on-click: true;
         enabled: root.enabled;
         focus-gained(reason) => { root.focus-state-changed(true); }
         focus-lost(reason) => { root.focus-state-changed(false); }
@@ -293,6 +289,13 @@ component IconAction inherits Rectangle {
                 accept
             } else { reject }
         }
+    }
+    // Keep pointer handling above the focus area so an unfocused button
+    // activates on the first click, then retain its keyboard focus.
+    area := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { keyboard-focus.focus(); root.activated(); }
     }
     if keyboard-focus.has-focus : Rectangle {
         border-radius: parent.border-radius;
@@ -324,17 +327,12 @@ component ActionRect inherits Rectangle {
     accessible-enabled: enabled;
     accessible-action-default => { if root.enabled { root.activated(); } }
     @children
-    hit := TouchArea {
-        enabled: root.enabled;
-        mouse-cursor: pointer;
-        clicked => { root.activated(); }
-    }
     keyboard-focus := FocusScope {
         x: 0px;
         width: root.reveal-full-control ? root.width : 0px;
         height: root.reveal-full-control ? root.height : 0px;
-        // A full-size scope must not consume the press before the TouchArea.
-        focus-on-click: !root.reveal-full-control;
+        // Accessible focus uses the same reason as a pointer focus request.
+        focus-on-click: true;
         enabled: root.enabled;
         focus-gained(reason) => { root.focus-state-changed(true); }
         focus-lost(reason) => { root.focus-state-changed(false); }
@@ -353,6 +351,11 @@ component ActionRect inherits Rectangle {
                 accept
             } else { reject }
         }
+    }
+    hit := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { keyboard-focus.focus(); root.activated(); }
     }
     if keyboard-focus.has-focus : Rectangle {
         border-radius: parent.border-radius;

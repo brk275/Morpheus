@@ -388,6 +388,143 @@ fn focused_control_has_label(ui: &AppWindow, expected: &str) -> bool {
     .is_some()
 }
 
+fn control_with_label(
+    ui: &AppWindow,
+    label: &str,
+) -> slint::private_unstable_api::re_exports::ItemRc {
+    use slint::private_unstable_api::re_exports::{AccessibleStringProperty, ItemRc, WindowInner};
+    use std::ops::ControlFlow;
+
+    let window = WindowInner::from_pub(ui.window());
+    let root = ItemRc::new_root(window.component());
+    let mut matches = Vec::new();
+    root.visit_descendants(|item| {
+        if item
+            .accessible_string_property(AccessibleStringProperty::Label)
+            .as_deref()
+            == Some(label)
+        {
+            matches.push(item.clone());
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    assert_eq!(matches.len(), 1, "the requested control must be unique");
+    matches.pop().unwrap()
+}
+
+fn request_bridge_focus(ui: &AppWindow, label: &str) {
+    use slint::private_unstable_api::re_exports::{FocusReason, FocusScope, WindowInner};
+
+    // This is the exact pinned AccessKit SetFocus path, including its reason.
+    // Calling the generated component's .focus() would use Programmatic and
+    // miss the installed AT-SPI regression.
+    let target = control_with_label(ui, label);
+    let window = WindowInner::from_pub(ui.window());
+    window.set_focus_item(&target, true, FocusReason::PointerClick);
+    assert!(
+        focused_control_has_label(ui, label),
+        "accessible focus did not reach the requested control: {label}"
+    );
+    let focused = window.focus_item.borrow().upgrade().unwrap();
+    let scope = focused
+        .downcast::<FocusScope>()
+        .expect("a live action scope");
+    assert!(scope.as_pin_ref().has_focus());
+    assert!(focused.is_visible());
+    assert!(focused.geometry().size.width > 0.0 && focused.geometry().size.height > 0.0);
+    assert_eq!(focused.geometry().size, target.geometry().size);
+}
+
+fn click_control_once(ui: &AppWindow, label: &str) {
+    use slint::private_unstable_api::re_exports::LogicalPoint;
+
+    let target = control_with_label(ui, label);
+    let origin = target.map_to_window(LogicalPoint::default());
+    let size = target.geometry().size;
+    let position =
+        slint::LogicalPosition::new(origin.x + size.width / 2.0, origin.y + size.height / 2.0);
+    let window_size = ui.window().size().to_logical(ui.window().scale_factor());
+    assert!(position.x > 0.0 && position.x < window_size.width);
+    assert!(position.y > 0.0 && position.y < window_size.height);
+    assert!(
+        !focused_control_has_label(ui, label),
+        "click an unfocused action"
+    );
+    ui.window()
+        .dispatch_event(WindowEvent::PointerMoved { position });
+    ui.window().dispatch_event(WindowEvent::PointerPressed {
+        position,
+        button: slint::platform::PointerEventButton::Left,
+    });
+    ui.window().dispatch_event(WindowEvent::PointerReleased {
+        position,
+        button: slint::platform::PointerEventButton::Left,
+    });
+}
+
+async fn assert_accessible_action_focus_and_first_click(ui: &AppWindow) {
+    use std::{cell::Cell, rc::Rc};
+
+    let settings = Rc::new(Cell::new(0));
+    let observed = settings.clone();
+    ui.on_open_security(move || observed.set(observed.get() + 1));
+    let profile = format!(
+        "Account menu for {}, {}",
+        ui.get_active_account_name(),
+        ui.get_active_account_handle()
+    );
+    for scale in [100, 200] {
+        ui.set_font_scale_percent(scale);
+        ui.set_page(0);
+        settle(ui).await;
+        ui.invoke_focus_composer(false);
+        settle(ui).await;
+        assert!(!focused_control_has_label(ui, &profile));
+        request_bridge_focus(ui, &profile);
+        key(ui, Key::Return);
+        assert!(
+            ui.get_account_menu_open(),
+            "accessible focus must support Return"
+        );
+        ui.set_account_menu_open(false);
+        settle(ui).await;
+        ui.invoke_focus_composer(false);
+        settle(ui).await;
+        click_control_once(ui, &profile);
+        assert!(
+            ui.get_account_menu_open(),
+            "one click must open the account menu"
+        );
+        ui.set_account_menu_open(false);
+        settle(ui).await;
+
+        // IconAction uses the same focus reason and hit-testing contract.
+        ui.invoke_focus_composer(false);
+        settle(ui).await;
+        request_bridge_focus(ui, "Open settings");
+        let before = settings.get();
+        key(ui, Key::Space);
+        assert_eq!(settings.get(), before + 1);
+        assert_eq!(ui.get_page(), 1);
+        ui.set_page(0);
+        settle(ui).await;
+        ui.invoke_focus_composer(false);
+        settle(ui).await;
+        let before = settings.get();
+        click_control_once(ui, "Open settings");
+        assert_eq!(
+            settings.get(),
+            before + 1,
+            "one click must activate exactly once"
+        );
+        assert_eq!(ui.get_page(), 1);
+    }
+    ui.on_open_security(|| {});
+    ui.set_font_scale_percent(100);
+    ui.set_page(0);
+    settle(ui).await;
+}
+
 fn tab_to_control(ui: &AppWindow, label: &str) {
     use slint::private_unstable_api::re_exports::{FocusScope, TextInput, WindowInner};
 
@@ -1151,6 +1288,7 @@ async fn exercise_account_ui(runtime: Handle) {
     assert_sign_in_keyboard(&ui).await;
     settle(&ui).await;
     assert_navigation_projection_and_focus(&ui).await;
+    assert_accessible_action_focus_and_first_click(&ui).await;
     assert_palette_and_density_keyboard(&ui).await;
     assert_scale_keyboard_and_focus_bounds(&ui).await;
     assert_message_role_precedence_and_thread_metadata(&ui).await;
