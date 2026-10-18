@@ -1,59 +1,65 @@
 <p align="center">
-  <img src="assets/icon.png" width="80" height="80" alt="Morpheus icon">
+  <img src="assets/icon.png" width="64" height="64" alt="Morpheus icon">
 </p>
 
 <h1 align="center">Morpheus</h1>
 
 <p align="center">
-  <strong>A native Matrix client. Your accounts. Your setup.</strong><br>
-  Built in Rust for macOS, Linux and Windows.
+  <strong>Native Matrix for macOS, Linux and Windows.</strong><br>
+  Built in Rust. Multiple accounts. Live customization.
 </p>
 
 <p align="center">
   <a href="docs/CUSTOMIZATION.md">Customization</a> ·
-  <a href="docs/screenshots/README.md">Screenshots</a> ·
+  <a href="docs/screenshots/README.md">Gallery</a> ·
   <a href="docs/README.md">Documentation</a> ·
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
 
 ![Morpheus with the Terminal preset, text sidebar and nickname-column messages](docs/screenshots/terminal-sidebar.png)
 
-<p align="center"><sub>Terminal preset · Native app capture · Fictional accounts</sub></p>
+<p align="center"><sub>Terminal preset · Real native capture · Fictional accounts</sub></p>
 
-## Make it yours
+**Pre-alpha.** Source builds are available; installer releases are pending
+[release checks](docs/RELEASE_CHECKLIST.md). [See current status →](docs/FEATURE_MATRIX.md)
 
-Choose **Nocturne**, **Terminal** or **Paper**, then tune the details:
+## Shape your workspace
 
-- **Typography** — independent fonts for the interface, messages and code.
-- **Messages** — stacked, compact or nickname-column layouts, with adjustable avatars and spacing.
-- **Navigation** — an icon rail or text sidebar, Space labels and room ordering.
-- **Geometry** — pane widths, headers, density and corner radius.
-- **Color** — TOML palettes for surfaces, text, sender names, unread messages and focus.
+Start with **Nocturne**, **Terminal** or **Paper**. Change the fonts, colors,
+message layout and geometry independently:
 
-Settings and `config.toml` control the same preferences. Changes reload live;
-invalid edits show an error and keep the last working configuration.
+- Stacked, compact or nickname-column messages; optional avatars and timestamps.
+- An icon rail or text sidebar; grouped or combined room and DM lists.
+- Separate interface, message and code fonts; adjustable density and pane widths.
+- TOML themes with semantic colors for senders, unread messages, links and focus.
 
-[Explore customization →](docs/CUSTOMIZATION.md)
+Settings and `config.toml` edit the same preferences. Changes reload live.
+Invalid edits show an error and keep the last working setup.
 
-## All your accounts, close at hand
+| Nocturne | Paper |
+| --- | --- |
+| [![Nocturne: dark surfaces, stacked messages and member panel](docs/screenshots/desktop.png)](docs/screenshots/desktop.png) | [![Paper: light surfaces, serif messages and compact headers](docs/screenshots/paper.png)](docs/screenshots/paper.png) |
 
-Use multiple Matrix accounts for different aliases, and switch from the
-bottom-left profile menu. Each account has its own session, encryption store,
-drafts and credential-vault entry. Inactive accounts pause by default.
+[Customization guide](docs/CUSTOMIZATION.md) · [Theme files](themes/README.md) · [Full-size gallery](docs/screenshots/README.md)
 
-One optional local app password protects account switching and startup restore.
-**Manage accounts** provides direct removal and a retry for incomplete cleanup.
+## Multiple accounts
 
-[Account controls →](docs/ACCOUNT_ACCESS.md)
+Keep separate Matrix aliases in one app and switch from the bottom-left profile
+menu. Each account has its own session, encryption store, drafts and
+credential-vault entry. Inactive accounts pause by default.
 
-## Development status
+One optional local app password protects switching and startup restore.
+Remove saved accounts directly from **Manage accounts**, with a retry if local
+cleanup is incomplete. [Account controls →](docs/ACCOUNT_ACCESS.md)
 
-**Pre-alpha.** Source is available; installer releases are still pending the
-platform and security checks. The [feature matrix](docs/FEATURE_MATRIX.md)
-tracks implementation and the [release checklist](docs/RELEASE_CHECKLIST.md)
-tracks readiness.
+## Conversations
 
-### Run from source
+DMs, rooms and Spaces, with threads, replies, edits, reactions, attachments and
+per-conversation drafts. Search uses an account-scoped encrypted local index.
+Native voice, video and screen sharing are experimental and require a compatible
+MatrixRTC service. [Feature status and current limits →](docs/FEATURE_MATRIX.md)
+
+## Build from source
 
 Install the [native build dependencies](docs/PACKAGING.md) and pinned Rust toolchain:
 
@@ -61,8 +67,8 @@ Install the [native build dependencies](docs/PACKAGING.md) and pinned Rust toolc
 cargo run --locked -p morpheus-app
 ```
 
-Sign in with a Matrix account or explore the offline preview. Calls require a
-compatible MatrixRTC service.
+Sign in with a Matrix account or explore the offline preview. Native-call build
+options are documented in the [packaging guide](docs/PACKAGING.md).
 
 ## Contribute
 
