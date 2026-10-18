@@ -108,6 +108,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          # Bind workers directly; do not depend on diagnostic commit depth.
+          ref: 4208ae38dd93c3235399eb6eebea5fb0b68a5ae8
           fetch-depth: 2
           persist-credentials: false
       - name: Restore exact reviewed workflow source for contract checks
@@ -142,6 +144,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          # Bind workers directly; do not depend on diagnostic commit depth.
+          ref: 4208ae38dd93c3235399eb6eebea5fb0b68a5ae8
           fetch-depth: 2
           persist-credentials: false
       - name: Restore exact reviewed workflow source for contract checks
@@ -178,6 +182,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          # Bind workers directly; do not depend on diagnostic commit depth.
+          ref: 4208ae38dd93c3235399eb6eebea5fb0b68a5ae8
           fetch-depth: 2
           persist-credentials: false
       - name: Restore exact reviewed workflow source for contract checks
