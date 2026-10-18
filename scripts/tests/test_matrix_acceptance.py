@@ -55,7 +55,7 @@ class FocusedSuiteTests(unittest.TestCase):
 
     def test_timeline_read_completion_requires_all_selected_checks_and_reports_partial_scope(self):
         expected = ("live_local", "formatted_local", "media_local", "moderation_local",
-                    "search_local", "search_local-classic", "recovery_local")
+                    "search_local", "search_local-classic", "recovery_local", "unsupported_transport_local")
         self.assertEqual(acceptance_module.TIMELINE_READ_CHECKS, expected)
         self.assertEqual(acceptance_module.SUITES["full"], acceptance_module.PLANNED_CHECKS)
         with tempfile.TemporaryDirectory() as folder:
@@ -84,22 +84,27 @@ class FocusedSuiteTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             runner = Acceptance(root, "scanner", suite="timeline-reads")
-            fixture, recovery = root / "fixture.json", root / "recovery.json"
+            fixture, recovery, gate = root / "fixture.json", root / "recovery.json", root / "rtc-gate.json"
             with patch.object(runner, "test") as test, \
-                    patch.object(runner, "script", return_value="private-fixture") as script, \
-                    patch.object(acceptance_module, "fixture_from_output", return_value=recovery) as read:
+                    patch.object(runner, "script", side_effect=["private-recovery", "private-gate"]) as script, \
+                    patch.object(acceptance_module, "fixture_from_output", side_effect=[recovery, gate]) as read:
                 runner.timeline_read_cases(fixture)
             self.assertEqual([call.args for call in test.call_args_list], [
                 ("live_local", fixture), ("formatted_local", fixture), ("media_local", fixture),
                 ("moderation_local", fixture), ("search_local", fixture),
-                ("search_local", fixture), ("recovery_local", recovery),
+                ("search_local", fixture), ("recovery_local", recovery), ("unsupported_transport_local", gate),
             ])
             self.assertEqual([call.kwargs for call in test.call_args_list], [
                 {}, {}, {}, {}, {}, {"extra": {"MORPHEUS_MATRIX_SEARCH_CLASSIC": "1"}},
                 {"extra": {"MORPHEUS_MATRIX_TEST_RECOVERY": "1"}},
+                {"rtc": True, "extra": {"MORPHEUS_MATRIX_RTC_GATE_TEST_ACCOUNTS": str(gate)}},
             ])
-            script.assert_called_once_with("local_matrix_env", "recovery-fixture")
-            read.assert_called_once_with("private-fixture", root)
+            self.assertEqual([call.args for call in script.call_args_list], [
+                ("local_matrix_env", "recovery-fixture"), ("local_matrix_env", "rtc-gate-fixture"),
+            ])
+            self.assertEqual([call.args for call in read.call_args_list], [
+                ("private-recovery", root), ("private-gate", root),
+            ])
             self.assertEqual(runner.not_run, {})
 
     def test_timeline_failed_formatting_skips_moderation_without_hiding_failure(self):
@@ -107,12 +112,12 @@ class FocusedSuiteTests(unittest.TestCase):
             root = Path(folder)
             runner = Acceptance(root, "scanner", suite="timeline-reads")
             failure = acceptance_module.CheckFailure("formatted_local", "test_failed")
-            with patch.object(runner, "test", side_effect=[None, failure, None, None, None, None]) as test, \
+            with patch.object(runner, "test", side_effect=[None, failure, None, None, None, None, None]) as test, \
                     patch.object(runner, "script", return_value="private-fixture"), \
                     patch.object(acceptance_module, "fixture_from_output", return_value=root / "recovery.json"):
                 runner.timeline_read_cases(root / "fixture.json")
             self.assertEqual([call.args[0] for call in test.call_args_list], [
-                "live_local", "formatted_local", "media_local", "search_local", "search_local", "recovery_local",
+                "live_local", "formatted_local", "media_local", "search_local", "search_local", "recovery_local", "unsupported_transport_local",
             ])
             self.assertEqual(runner.not_run, {"moderation_local": "dependency_failed"})
             self.assertEqual(runner.failures, [{"check": "formatted_local", "reason": "test_failed"}])

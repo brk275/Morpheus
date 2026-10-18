@@ -337,7 +337,7 @@ DRAFT_ONLY_CHECKS = ("drafts_local",)
 # These fixtures call snapshot/room/thread feed reads. Preserve the formatting
 # prerequisite for moderation, both search sync paths and real key recovery.
 TIMELINE_READ_TESTS = ("live_local", "formatted_local", "media_local", "moderation_local", "search_local")
-TIMELINE_READ_CHECKS = (*TIMELINE_READ_TESTS, "search_local-classic", "recovery_local")
+TIMELINE_READ_CHECKS = (*TIMELINE_READ_TESTS, "search_local-classic", "recovery_local", "unsupported_transport_local")
 SUITES = {"full": PLANNED_CHECKS, "draft-recovery": DRAFT_RECOVERY_CHECKS,
           "drafts-only": DRAFT_ONLY_CHECKS, "timeline-reads": TIMELINE_READ_CHECKS}
 # Leave a full minute before the workflow's 55-minute hard kill. Work stops
@@ -997,6 +997,14 @@ class Acceptance:
             self.test("recovery_local", recovery, extra={"MORPHEUS_MATRIX_TEST_RECOVERY": "1"})
         self.group(("recovery_local",), recovery_case)
 
+        # This existing RTC service gate also reads message snapshots. It uses
+        # Synapse B without a call service; no SFU or browser peer is needed.
+        def unsupported_case():
+            gate = fixture_from_output(self.script("local_matrix_env", "rtc-gate-fixture"), self.root)
+            self.test("unsupported_transport_local", gate, rtc=True,
+                      extra={"MORPHEUS_MATRIX_RTC_GATE_TEST_ACCOUNTS": str(gate)})
+        self.group(("unsupported_transport_local",), unsupported_case)
+
     def rtc_cases(self):
         # Every run gets different users/room: existing devices and keys would
         # hide a regression in either encrypted sticky membership dialect.
@@ -1137,8 +1145,8 @@ class Acceptance:
                                  "synthetic call media and OAuth browser-form protocol automation.\n\n")
                 elif self.suite == "timeline-reads":
                     output.write("Focused timeline-read checks: real Synapse and an ephemeral OS Secret Service. "
-                                 "Includes encrypted messages/threads, formatting, media, moderation, both search sync paths and key recovery. "
-                                 "No OAuth, RTC or installed-app checks; this is not full acceptance.\n\n")
+                                 "Includes encrypted messages/threads, formatting, media, moderation, both search sync paths, key recovery and chat without a call service. "
+                                 "No OAuth, live-call interoperability or installed-app checks; this is not full acceptance.\n\n")
                 elif self.suite == "drafts-only":
                     output.write("Focused drafts-only rerun: real Synapse and an ephemeral OS Secret Service. "
                                  "Only the draft persistence/recovery cases ran. "
