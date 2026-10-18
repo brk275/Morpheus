@@ -3,6 +3,9 @@
 //! printed by this test.
 #![recursion_limit = "512"]
 
+#[path = "support/opened_room.rs"]
+mod opened_room;
+
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -177,6 +180,9 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
             .expect("First login failed");
         phase!(room_alice);
         wait_for_room(&manager, a_room).await;
+        opened_room::scan(&manager, a_room)
+            .await
+            .expect("Opened fixture room must be scanned");
         phase!(drafts_alice);
         manager
             .save_composed_draft_for(
@@ -393,6 +399,9 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
             .expect("Second login failed");
         phase!(room_carol);
         wait_for_room(&manager, b_room).await;
+        opened_room::scan(&manager, b_room)
+            .await
+            .expect("Opened fixture room must be scanned");
         phase!(drafts_carol);
         assert_eq!(
             manager
@@ -1112,6 +1121,9 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
             .await
             .expect("First login failed");
         wait_for_room(&manager, a_room).await;
+        opened_room::scan(&manager, a_room)
+            .await
+            .expect("Opened fixture room must be scanned");
         let selection = manager
             .account_selection(&a_account.id)
             .expect("Selection missing");
@@ -1602,6 +1614,9 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
             .await
             .expect("Second login failed");
         wait_for_room(&manager, b_room).await;
+        opened_room::scan(&manager, b_room)
+            .await
+            .expect("Opened fixture room must be scanned");
         assert!(!old_selection.is_current());
         assert!(
             matches!(

@@ -28,6 +28,14 @@ tests; the servers remain bound to loopback.
 
 ## Test the Rust account manager
 
+Positive send fixtures open each joined room through the account manager's
+bounded recovery scan before enqueueing. Sync visibility alone does not cover
+a room: its queue remains paused until discovery or `recover_room_for` has
+checked the saved state. The shared `tests/support/opened_room.rs` helper mirrors
+that room-open step using a current account selection. Negative recovery tests
+deliberately leave newly joined rooms unscanned and still require sends there
+to be refused. Fixtures do not enable the SDK queue globally or bypass grants.
+
 Set `MORPHEUS_MATRIX_TEST_ACCOUNTS` to the **path** printed by `up`, then run:
 
 ```sh

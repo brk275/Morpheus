@@ -1,6 +1,10 @@
 //! Thin presentation adapter between the account-scoped Matrix core and Slint.
 //! All Matrix work runs on Tokio; UI models are created on Slint's event loop.
 
+#[cfg(test)]
+#[path = "../../morpheus-matrix/tests/support/opened_room.rs"]
+mod opened_room;
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{
@@ -3645,6 +3649,9 @@ mod stale_observer_tests {
                 .iter()
                 .any(|room| room.room_id == room_id)
             {
+                opened_room::scan(manager, room_id)
+                    .await
+                    .expect("Opened fixture room must be scanned");
                 return;
             }
             assert!(Instant::now() < deadline, "Timed out waiting for room");

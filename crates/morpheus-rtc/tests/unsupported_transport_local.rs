@@ -4,6 +4,9 @@
 #![cfg(feature = "native-rtc")]
 #![recursion_limit = "512"]
 
+#[path = "../../morpheus-matrix/tests/support/opened_room.rs"]
+mod opened_room;
+
 use std::{fs, path::PathBuf, time::Duration};
 
 use matrix_sdk::{
@@ -76,6 +79,9 @@ async fn wait_for_room(manager: &AccountManager, room_id: &str) {
             .find(|room| room.room_id == room_id)
             .map(|room| room.membership);
         if membership == Some(RoomMembership::Joined) {
+            opened_room::scan(manager, room_id)
+                .await
+                .expect("Opened fixture room must be scanned");
             return;
         }
         assert!(

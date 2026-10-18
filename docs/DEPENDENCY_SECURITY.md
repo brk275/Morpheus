@@ -13,6 +13,8 @@ A fresh [OSV query](https://google.github.io/osv.dev/post-v1-querybatch/) covere
 all 1,126 locked registry versions, three pinned Git revisions and nine local
 crates' upstream version references. Version queries do not establish the safety
 of local patches or unreported issues; Git results depend on database coverage.
+The local SDK build-helper patch below subsequently moves one of those registry
+entries to local source while retaining its upstream version.
 
 The candidate updates **Rustls 0.23.45 to 0.23.46** for
 [session-secret debug redaction](https://rustsec.org/advisories/RUSTSEC-2026-0346.html),
