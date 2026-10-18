@@ -252,6 +252,19 @@ fn font_family_with_resolver(
         .unwrap_or_else(|| requested.to_owned())
 }
 
+#[cfg(test)]
+thread_local! {
+    static MOTION_PROBE: std::cell::Cell<(u32, bool, bool)> =
+        const { std::cell::Cell::new((0, false, false)) };
+}
+
+/// Test-only facts: callback count, last requested value and save success.
+/// No paths, errors, accounts or preference values from an owner profile.
+#[cfg(test)]
+pub(super) fn take_motion_probe() -> (u32, bool, bool) {
+    MOTION_PROBE.with(|probe| probe.replace((0, false, false)))
+}
+
 pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
     ui.global::<StyleTokens>()
         .set_reduced_motion(config.appearance.reduce_motion);
@@ -326,8 +339,13 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
     let store_for_motion = store.clone();
     ui.on_set_reduce_motion(move |reduced| {
         if let Some(ui) = weak.upgrade() {
-            let _ = save_config_change(&ui, &store_for_motion, |config| {
+            let _saved = save_config_change(&ui, &store_for_motion, |config| {
                 config.appearance.reduce_motion = reduced;
+            });
+            #[cfg(test)]
+            MOTION_PROBE.with(|probe| {
+                let (count, _, _) = probe.get();
+                probe.set((count.saturating_add(1), reduced, _saved.is_some()));
             });
         }
     });

@@ -661,8 +661,31 @@ async fn assert_native_motion_and_preference(ui: &AppWindow, config_path: &std::
         ui.set_page(1);
         settle(ui).await;
         tab_to_control(ui, "Reduce motion, off");
+        let _ = crate::appearance::take_motion_probe();
+        let focus_before = focused_control_has_label(ui, "Reduce motion, off");
+        let bounds_before = focused_control_bounds(ui);
         key(ui, Key::Space);
-        assert!(store.load().unwrap().appearance.reduce_motion);
+        let persisted = store.load().unwrap().appearance.reduce_motion;
+        if !persisted {
+            let (calls, requested, saved) = crate::appearance::take_motion_probe();
+            let numeric = |bounds: Option<Bounds>| {
+                bounds.map(|bounds| [bounds.left, bounds.top, bounds.right, bounds.bottom])
+            };
+            eprintln!(
+                "\nMORPHEUS_MOTION_FAILURE {}",
+                serde_json::json!({
+                    "scale": scale, "calls": calls, "requested": requested, "saved": saved,
+                    "focus_before": focus_before,
+                    "focus_after": focused_control_has_label(ui, "Reduce motion, off"),
+                    "bounds_before": numeric(bounds_before),
+                    "bounds_after": numeric(focused_control_bounds(ui)),
+                    "window": window_size(ui), "page": ui.get_page(),
+                    "config_error_present": !ui.get_config_error().is_empty(),
+                    "presentation": ui.global::<crate::StyleTokens>().get_reduced_motion(),
+                })
+            );
+        }
+        assert!(persisted);
         assert!(ui.global::<crate::StyleTokens>().get_reduced_motion());
         assert_eq!(
             ui.global::<crate::StyleTokens>().get_interaction_duration(),
