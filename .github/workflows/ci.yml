@@ -89,8 +89,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git show b976bf4da98451112f96be5b94766de19947f67b:.github/workflows/ci.yml > "$RUNNER_TEMP/reviewed-native-ci.yml"
-          echo "df7218b7d027e6ad437ca9743595237fff64c80712cdfaa2d5522e3f25451ac8  $RUNNER_TEMP/reviewed-native-ci.yml" | sha256sum --check --status
+          git show a8b0e7c6a626e6915db526f1ec211d215e14559e:.github/workflows/ci.yml > "$RUNNER_TEMP/reviewed-native-ci.yml"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            python3 -I -B -c 'from pathlib import Path; import hashlib, sys; assert hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest() == "df7218b7d027e6ad437ca9743595237fff64c80712cdfaa2d5522e3f25451ac8"' "$RUNNER_TEMP/reviewed-native-ci.yml"
+          else
+            echo "df7218b7d027e6ad437ca9743595237fff64c80712cdfaa2d5522e3f25451ac8  $RUNNER_TEMP/reviewed-native-ci.yml" | sha256sum --check --status
+          fi
           cp "$RUNNER_TEMP/reviewed-native-ci.yml" .github/workflows/ci.yml
       - name: Check scope and packaging helpers
         run: |
@@ -119,8 +123,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git show b976bf4da98451112f96be5b94766de19947f67b:.github/workflows/ci.yml > "$RUNNER_TEMP/reviewed-native-ci.yml"
-          echo "df7218b7d027e6ad437ca9743595237fff64c80712cdfaa2d5522e3f25451ac8  $RUNNER_TEMP/reviewed-native-ci.yml" | sha256sum --check --status
+          git show a8b0e7c6a626e6915db526f1ec211d215e14559e:.github/workflows/ci.yml > "$RUNNER_TEMP/reviewed-native-ci.yml"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            python3 -I -B -c 'from pathlib import Path; import hashlib, sys; assert hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest() == "df7218b7d027e6ad437ca9743595237fff64c80712cdfaa2d5522e3f25451ac8"' "$RUNNER_TEMP/reviewed-native-ci.yml"
+          else
+            echo "df7218b7d027e6ad437ca9743595237fff64c80712cdfaa2d5522e3f25451ac8  $RUNNER_TEMP/reviewed-native-ci.yml" | sha256sum --check --status
+          fi
           cp "$RUNNER_TEMP/reviewed-native-ci.yml" .github/workflows/ci.yml
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action, pinned compiler below
         with:
@@ -151,8 +159,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git show b976bf4da98451112f96be5b94766de19947f67b:.github/workflows/ci.yml > "$RUNNER_TEMP/reviewed-native-ci.yml"
-          echo "df7218b7d027e6ad437ca9743595237fff64c80712cdfaa2d5522e3f25451ac8  $RUNNER_TEMP/reviewed-native-ci.yml" | sha256sum --check --status
+          git show a8b0e7c6a626e6915db526f1ec211d215e14559e:.github/workflows/ci.yml > "$RUNNER_TEMP/reviewed-native-ci.yml"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            python3 -I -B -c 'from pathlib import Path; import hashlib, sys; assert hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest() == "df7218b7d027e6ad437ca9743595237fff64c80712cdfaa2d5522e3f25451ac8"' "$RUNNER_TEMP/reviewed-native-ci.yml"
+          else
+            echo "df7218b7d027e6ad437ca9743595237fff64c80712cdfaa2d5522e3f25451ac8  $RUNNER_TEMP/reviewed-native-ci.yml" | sha256sum --check --status
+          fi
           cp "$RUNNER_TEMP/reviewed-native-ci.yml" .github/workflows/ci.yml
       - name: Linux native dependencies
         if: runner.os == 'Linux'

@@ -50,6 +50,7 @@ MANUAL_LINUX_PACKAGE_INPUTS = {
     "packaging/linux/appimage_capture.py",
     "packaging/linux/appimage_capture_worker.py",
     "packaging/linux/appimage_diagnostics.py",
+    "packaging/linux/appimage_notices.py",
     "packaging/linux/appimage_process.py",
 }
 # The isolated OS-vault fixture is ignored by ordinary CI. Its exact manual

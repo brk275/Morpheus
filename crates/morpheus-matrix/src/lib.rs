@@ -3626,7 +3626,7 @@ struct ScanBudget {
 impl ScanBudget {
     /// Charge one complete row (`row_bytes`); a row whose size overflows
     /// spends the whole budget.
-    fn charge(&mut self, bytes: Option<usize>) -> Result<(), ScanError> {
+    fn charge(&mut self, bytes: Option<usize>) -> std::result::Result<(), ScanError> {
         self.scopes = self.scopes.saturating_add(1);
         self.bytes = bytes
             .and_then(|bytes| self.bytes.checked_add(bytes))
@@ -3692,7 +3692,10 @@ async fn adopt_scanned(loaded: &LoadedAccount, scanned: Vec<ScannedRoom>) -> Vec
 /// Read one room's draft row and the thread rows its index names, and attach
 /// an observer to each saved queued transaction the SDK still holds. Any
 /// failure leaves the room uncovered; nothing is enabled, changed or resent.
-async fn scan_room(room: &Room, budget: &mut ScanBudget) -> Result<ScannedRoom, ScanError> {
+async fn scan_room(
+    room: &Room,
+    budget: &mut ScanBudget,
+) -> std::result::Result<ScannedRoom, ScanError> {
     let empty = || ScannedRoom {
         drafts: Vec::new(),
         originals: Vec::new(),
