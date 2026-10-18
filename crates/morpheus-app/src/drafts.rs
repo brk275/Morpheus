@@ -1779,6 +1779,59 @@ mod tests {
         let _ = enqueuing;
     }
 
+    /// The controller indexes a thread in the room row before it creates the
+    /// thread's record, because the background writer may persist any dirty
+    /// scope at any moment. At the cache level that order means: after
+    /// indexing, only the room scope is dirty and a writer's snapshot of the
+    /// thread scope holds no record; the record exists only after the room
+    /// write returned, and a room that refuses the index yields no record.
+    #[test]
+    fn a_writer_snapshot_before_the_room_index_is_durable_never_sees_a_thread_record() {
+        let drafts = DraftStore::default();
+        let root = "$root:example.org";
+        drafts.set("a", "room", "room text");
+        drafts.set_scoped("a", "room", Some(root), "reply");
+        drafts.clear_dirty_like_a_write_would("a", "room", None);
+        drafts.clear_dirty_like_a_write_would("a", "room", Some(root));
+        // Step one: index. Only the room is dirty; a writer taking the thread
+        // scope now finds nothing pending and nothing to write.
+        assert_eq!(drafts.index_thread("a", "room", root), Ok(true));
+        assert_eq!(drafts.dirty_keys(), vec![key("a", "room", None)]);
+        assert!(drafts.snapshot("a", "room", Some(root)).unwrap().1.pending().is_empty());
+        assert!(!drafts.clear_dirty_like_a_write_would("a", "room", Some(root)), "a forced thread write has nothing new");
+        // The room write (by the writer or the controller) carries the index.
+        assert!(drafts.clear_dirty_like_a_write_would("a", "room", None));
+        assert_eq!(drafts.snapshot("a", "room", None).unwrap().1.threads(), [root]);
+        // Step two, only now: the record. The thread becomes dirty with its
+        // record while the room row already anchors it.
+        let handle = begin(&drafts, "a", "room", Some(root), "reply");
+        assert_eq!(drafts.dirty_keys(), vec![key("a", "room", Some(root))]);
+        assert_eq!(drafts.snapshot("a", "room", Some(root)).unwrap().1.pending().len(), 1);
+        let _ = handle;
+        // A room that refuses the index (read-only) stops the preparation
+        // before any record exists.
+        let frozen = DraftStore::default();
+        frozen.seed_recovered(
+            "a",
+            "frozen",
+            None,
+            RestoredCompose {
+                text: text("frozen"),
+                discarded_rich_intent: false,
+                envelope: DraftEnvelope::fresh(),
+                read_only: Some(ReadOnlyRow {
+                    reason: morpheus_matrix::QuarantineReason::TooLarge,
+                }),
+                revision: Some(RowRevision::fresh()),
+            },
+            &[],
+            frozen.account_epoch("a"),
+        );
+        frozen.set_scoped("a", "frozen", Some(root), "reply");
+        assert!(matches!(frozen.index_thread("a", "frozen", root), Err(PendingError::Unreadable)));
+        assert!(frozen.snapshot("a", "frozen", Some(root)).unwrap().1.pending().is_empty());
+    }
+
     #[test]
     fn uncommitted_steps_are_dropped_without_scheduling_a_write() {
         let drafts = DraftStore::default();

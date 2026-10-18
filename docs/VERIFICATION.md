@@ -2927,10 +2927,18 @@ account-bound flush writes a cached entry the row still lacks), makes no
 write and schedules no flush; while the selection is current it re-checks
 ownership after every write before the next write or the scheduled flush. For
 a thread send the durable order is now room index, then thread record, then
-grant, so a crash leaves at most an empty index entry and never an unindexed
-record; the cache reports whether indexing added the root so only an added
-entry is ever undone. `persist_scope_and_index` re-checks before touching the
-room index and before scheduling a retry. Re-seeding
+grant, and the record is created in the shared cache only after the room row
+holds the root, so neither a crash nor the background writer (which may
+persist any dirty scope at any moment) can put an unindexed record in the
+store; a crash leaves at most an empty index entry. The cache reports whether
+indexing added the root so only an added entry is ever undone. A committed
+pre-enqueue record is removed from the cache only after the core granted its
+exact release (nonce, no transaction id) and ownership was re-checked, so a
+revocation during the rollback write cannot leave the cache without a record
+the row keeps: the release, not fresh ownership, authorizes the drop, the
+account-bound flush completes a failed write, and a refused release leaves
+cache and row alike for discovery. `persist_scope_and_index` re-checks before
+touching the room index and before scheduling a retry. Re-seeding
 a scope the cache kept across an account switch marks every awaiting record
 restored (queued only where discovery attached the exact request, otherwise
 unconfirmed, including records that never received an id; kept text stays
@@ -2966,8 +2974,10 @@ an oversize event permanently, which the fixture verifies at run time rather
 than assumes; the interrupted-preparation regression replays the stale
 rollback directly after a complete preparation (room and thread scopes),
 because the interruption cannot be injected mid-await without a hook, which
-this branch does not add, so it does not cover revocation during an awaited
-rollback write; an uncovered room is scanned only when it is
+this branch does not add; a further opt-in regression races the owned
+rollback of a committed record against the real account switch and switch
+back and asserts cache and row agree afterwards whatever the interleaving,
+which exercises the real awaits without fixing the point of revocation; an uncovered room is scanned only when it is
 opened or a scan is requested for it; discovery failures caused by a store read
 error cannot be forced by the fixture and are covered by unit tests of the
 registry only; a persisted SDK request whose record never received its id
