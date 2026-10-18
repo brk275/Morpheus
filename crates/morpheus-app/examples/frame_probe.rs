@@ -201,8 +201,7 @@ fn check_environment() -> Result<(), &'static str> {
         _ => return Err("x11_display_not_local"),
     }
     // winit prefers Wayland when either variable is set.
-    if std::env::var_os("WAYLAND_DISPLAY").is_some()
-        || std::env::var_os("WAYLAND_SOCKET").is_some()
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("WAYLAND_SOCKET").is_some()
     {
         return Err("wayland_display_present");
     }
@@ -273,7 +272,10 @@ fn probe() -> Result<serde_json::Value, &'static str> {
 }
 
 fn print_error(reason: &'static str) {
-    println!("{}", serde_json::json!({ "probe": PROBE, "result": "error", "reason": reason }));
+    println!(
+        "{}",
+        serde_json::json!({ "probe": PROBE, "result": "error", "reason": reason })
+    );
 }
 
 fn fail(reason: &'static str) -> ExitCode {
@@ -291,7 +293,10 @@ fn main() -> ExitCode {
     let spawned = thread::Builder::new()
         .name("frame-probe-watchdog".into())
         .spawn(move || {
-            if matches!(finished.recv_timeout(WATCHDOG), Err(mpsc::RecvTimeoutError::Timeout)) {
+            if matches!(
+                finished.recv_timeout(WATCHDOG),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ) {
                 print_error("watchdog_expired");
                 std::process::exit(3);
             }

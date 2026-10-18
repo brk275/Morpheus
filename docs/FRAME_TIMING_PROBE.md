@@ -23,9 +23,9 @@ encrypted history, through both sync adapters.
   four ASCII digits and an optional one- or two-digit screen. A host name, IP
   address, `unix` prefix, empty or malformed value fails with
   `x11_display_not_local` before Slint starts, so no connection is attempted,
-  and the value is never printed. An accepted `:N` names the local socket.
-  libxcb may retry the same display number on loopback TCP if that socket is
-  unavailable, so a run should start its own Xvfb first.
+  and the value is never printed. Start an owned Xvfb first and use its
+  `DISPLAY`: the syntax guard does not establish ownership of a display or
+  disable every connection mechanism in the graphics libraries.
 - `BackendSelector` names both the winit backend and the FemtoVG renderer.
   Winit can still fall back to another renderer if FemtoVG cannot be created.
   The only other renderer compiled into this package is the software renderer,
