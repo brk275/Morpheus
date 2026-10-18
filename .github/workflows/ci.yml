@@ -1,16 +1,16 @@
 # TEMPORARY focused helper contracts. NEVER MERGE this workflow.
-name: Encrypted sticker media verification
-run-name: Incoming room and thread stickers 6d8f09e - Linux development verification
+name: Sticker fixture compilation diagnostic
+run-name: Sticker fixture compile 6d8f09e - no live accounts
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: sticker-media-linux-6d8f09e
+  group: sticker-fixture-compile-6d8f09e
   cancel-in-progress: false
 jobs:
   contracts:
-    name: Matrix receiver and encrypted sticker integration
+    name: Compile exact reviewed encrypted-media fixture
     if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 150
@@ -67,11 +67,6 @@ jobs:
         with:
           key: verified-sdk-archives-v1
           save-if: false
-      - name: Test current Matrix library including incoming sticker guards
+      - name: Compile only the exact fixture before any generated accounts exist
         timeout-minutes: 80
-        run: cargo test --locked -p morpheus-matrix --lib
-      - name: Verify real encrypted attachments and room and thread stickers
-        timeout-minutes: 55
-        run: >-
-          dbus-run-session -- python3 scripts/run_matrix_acceptance.py
-          --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks" --suite media-only
+        run: cargo test --locked -p morpheus-matrix --test media_local --no-run
