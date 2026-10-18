@@ -1,27 +1,27 @@
 # TEMPORARY focused native offline app checks. NEVER MERGE this workflow.
 name: Reviewed sticker native checks
-run-name: Reviewed sticker integration b49121b - Linux only
+run-name: Reviewed sticker app 9ef44f5 - affected Linux checks
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: sticker-native-checks-b49121b
+  group: sticker-native-checks-9ef44f5
   cancel-in-progress: false
 jobs:
   contracts:
-    name: Reviewed sticker core, native UI and encrypted media tests
+    name: Reviewed native sticker UI and encrypted media tests
     if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: b49121b2fb98bf8c2c50c717dfb0aa43aa0d6527
+          ref: 9ef44f5a5f75918b3fbe70467c142b13876efcb3
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact reviewed source
-        run: test "$(git rev-parse HEAD)" = b49121b2fb98bf8c2c50c717dfb0aa43aa0d6527
+        run: test "$(git rev-parse HEAD)" = 9ef44f5a5f75918b3fbe70467c142b13876efcb3
       - name: Scan source before executing reviewed native tests
         shell: bash
         run: |
@@ -50,93 +50,6 @@ jobs:
         with:
           key: verified-sdk-archives-v1
           save-if: false
-      - name: Test sticker catalogs and queue loss boundaries with private bounded logs
-        timeout-minutes: 105
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CARGO_INCREMENTAL: "0"
-          CARGO_PROFILE_DEV_DEBUG: "0"
-          CARGO_PROFILE_TEST_DEBUG: "0"
-          CARGO_TERM_COLOR: never
-        shell: bash
-        run: |
-          set -euo pipefail
-          umask 077
-          python3 -I -B - <<'PY'
-          import json, os, pathlib, re, select, signal, subprocess, tempfile, time
-          assert os.environ.get('GITHUB_ACTIONS') == 'true'
-          assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
-          assert os.environ.get('ImageOS') == 'ubuntu24'
-          names = ('PATH','HOME','LANG','LC_ALL','TMPDIR','CARGO_HOME','RUSTUP_HOME','RUSTUP_TOOLCHAIN',
-              'PKG_CONFIG_PATH','LD_LIBRARY_PATH','SSL_CERT_FILE','SSL_CERT_DIR','CARGO_BUILD_JOBS',
-              'CARGO_INCREMENTAL','CARGO_PROFILE_DEV_DEBUG','CARGO_PROFILE_TEST_DEBUG','CARGO_TERM_COLOR',
-              'GITHUB_ACTIONS','RUNNER_ENVIRONMENT','RUNNER_OS','ImageOS','RUNNER_TEMP','RUNNER_TRACKING_ID')
-          environment = {name:os.environ[name] for name in names if name in os.environ}
-          root = pathlib.Path(tempfile.mkdtemp(prefix='morpheus-offline-app-',dir=os.environ['RUNNER_TEMP']))
-          root.chmod(0o700)
-          logs = root/'logs'; logs.mkdir(mode=0o700)
-          log = logs/'cargo.log'
-          reason = None
-          code = None
-          with log.open('xb') as output:
-              child = subprocess.Popen(['cargo','test','--locked','-p','morpheus-matrix','--lib','--','--test-threads=1'],
-                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                  env=environment, start_new_session=True)
-              deadline = time.monotonic()+95*60
-              size = 0
-              try:
-                  while True:
-                      remaining = deadline-time.monotonic()
-                      if remaining<=0:
-                          reason='deadline'; break
-                      ready,_,_=select.select([child.stdout],[],[],remaining)
-                      if not ready:
-                          reason='deadline'; break
-                      block=os.read(child.stdout.fileno(),65536)
-                      if not block: break
-                      size+=len(block)
-                      if size>50*1024*1024:
-                          reason='output_limit'; break
-                      output.write(block)
-                  if reason is None:
-                      code=child.wait(timeout=10)
-              except (OSError,subprocess.SubprocessError):
-                  reason='process_error'
-              finally:
-                  # Never signal an already-reaped PID/group. Timeout and
-                  # overflow keep our child anchored until after group kill.
-                  if child.returncode is None:
-                      try: os.killpg(child.pid,signal.SIGKILL)
-                      except ProcessLookupError: pass
-                      child.wait(timeout=10)
-                  child.stdout.close()
-          with (root/'scan.log').open('wb') as output:
-              scan=subprocess.run([os.environ['RUNNER_TEMP']+'/gitleaks/gitleaks','dir',str(logs),
-                  '--redact=100','--ignore-gitleaks-allow','--no-banner','--max-target-megabytes','0',
-                  '--config',os.environ['RUNNER_TEMP']+'/default.toml',
-                  '--gitleaks-ignore-path',os.environ['RUNNER_TEMP']+'/empty.ignore'],
-                  stdout=output,stderr=subprocess.STDOUT,timeout=60)
-          if scan.returncode!=0:
-              print('OFFLINE_NATIVE_LOG_WITHHELD',flush=True); raise SystemExit(1)
-          output=log.read_text(errors='replace')
-          ok=set(re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. ok$',output,re.MULTILINE))
-          needed={'image_packs::tests::an_exact_lookup_compares_every_queued_transaction',
-              'image_packs::tests::queued_stickers_are_read_newest_first_within_the_bound',
-              'tests::a_lagged_observer_reports_a_lost_outcome_only_when_asked'}
-          summaries=re.findall(r'^test result: ok\. ([0-9]+) passed; 0 failed; ([0-9]+) ignored;',output,re.MULTILINE)
-          passed=reason is None and code==0 and needed<=ok and len(summaries)==1 and int(summaries[0][0])>=3
-          print(json.dumps({'check':'sticker_core_boundaries','status':'passed' if passed else 'failed',
-              'source':'b49121b2fb98bf8c2c50c717dfb0aa43aa0d6527','failure':reason,
-              'tests_passed':int(summaries[0][0]) if len(summaries)==1 else None,
-              'ignored':int(summaries[0][1]) if len(summaries)==1 else None,
-              'required_tests':{name:name in ok for name in sorted(needed)},
-              'error_codes':sorted(set(re.findall(r'error\[(E[0-9]{4})\]',output))),
-              'rust_locations':sorted(set(re.findall(r'(?:crates/[A-Za-z0-9_./-]+\.rs:[0-9]+:[0-9]+)',output))),
-              'failed_tests':sorted(set(re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. FAILED$',output,re.MULTILINE))),
-              'raw_logs_public':False,'real_accounts':False,'physical_devices':False,
-              'native_installed_app':False},sort_keys=True),flush=True)
-          if not passed: raise SystemExit(1)
-          PY
       - name: Compile and test the native app offline with private bounded logs
         timeout-minutes: 105
         env:
@@ -216,7 +129,7 @@ jobs:
           summaries=re.findall(r'^test result: ok\. ([0-9]+) passed; 0 failed; ([0-9]+) ignored;',output,re.MULTILINE)
           passed=reason is None and code==0 and needed<=ok and len(summaries)==1 and int(summaries[0][0])>=303
           print(json.dumps({'check':'beta_offline_native_app','status':'passed' if passed else 'failed',
-              'source':'b49121b2fb98bf8c2c50c717dfb0aa43aa0d6527','failure':reason,
+              'source':'9ef44f5a5f75918b3fbe70467c142b13876efcb3','failure':reason,
               'tests_passed':int(summaries[0][0]) if len(summaries)==1 else None,
               'ignored':int(summaries[0][1]) if len(summaries)==1 else None,
               'required_tests':{name:name in ok for name in sorted(needed)},
