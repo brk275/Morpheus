@@ -19,7 +19,10 @@
 //! accounts in a generated profile and an ephemeral hosted-runner vault.
 //!
 //! The report is one closed JSON file: fixed keys, tokens and numbers, never
-//! IDs, names, credentials or message text. Rendering numbers come from
+//! IDs, names, credentials or message text. Enrollment also writes the
+//! measured account's own device ID to a separate new owner-only file the run
+//! file names; only the runner and the seeder read it, so the seeder can wait
+//! for exactly that device's keys. Rendering numbers come from
 //! Slint's rendering notifier: `AfterRendering` fires once the scene is
 //! rendered but before the back buffer is presented, so they are CPU-side
 //! frame-hook timings, never GPU time, presentation or display refresh.
@@ -151,6 +154,10 @@ struct RunFile {
     #[serde(default)]
     room: Option<PathBuf>,
     report: PathBuf,
+    /// Enrollment only: a new private file for the measured account's own
+    /// device ID, so the seeder can wait for exactly that device's keys.
+    #[serde(default)]
+    device: Option<PathBuf>,
 }
 
 /// Written by the seeder: the 10,000-event room.
@@ -182,6 +189,7 @@ struct Run {
     adapter: Adapter,
     profile: PathBuf,
     report: PathBuf,
+    device: Option<PathBuf>,
     measured: FixtureAccount,
     switch: FixtureAccount,
     measured_enroll_room: String,
@@ -272,6 +280,25 @@ fn outside(path: &Path, checkout: &Path) -> Result<PathBuf, Refusal> {
         return Err("path_in_checkout");
     }
     Ok(resolved)
+}
+
+/// The path of a file still to be created, in a folder outside the checkout.
+fn new_file_path(path: &Path, checkout: &Path, invalid: Refusal) -> Result<PathBuf, Refusal> {
+    if !path.is_absolute() || path.exists() {
+        return Err(invalid);
+    }
+    let parent = path.parent().ok_or(invalid)?;
+    let parent = outside(parent, checkout)?;
+    let name = path.file_name().ok_or(invalid)?;
+    Ok(parent.join(name))
+}
+
+/// The same opaque-ID shape the runner and the seeder accept.
+fn plausible_device_id(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.=+/".contains(&byte))
 }
 
 fn read_small(path: &Path, checkout: &Path) -> Result<Vec<u8>, Refusal> {
@@ -377,17 +404,24 @@ impl Run {
             (Mode::Enroll, None) => None,
             _ => return Err("room_file_mode"),
         };
-        if !file.report.is_absolute() || file.report.exists() {
-            return Err("report_path_invalid");
-        }
-        let parent = file.report.parent().ok_or("report_path_invalid")?;
-        let parent = outside(parent, checkout)?;
-        let name = file.report.file_name().ok_or("report_path_invalid")?;
+        let report = new_file_path(&file.report, checkout, "report_path_invalid")?;
+        let device = match (mode, &file.device) {
+            (Mode::Enroll, Some(path)) => {
+                let path = new_file_path(path, checkout, "device_path_invalid")?;
+                if path == report {
+                    return Err("device_path_invalid");
+                }
+                Some(path)
+            }
+            (Mode::Measure, None) => None,
+            _ => return Err("device_file_mode"),
+        };
         Ok(Self {
             mode,
             adapter,
             profile,
-            report: parent.join(name),
+            report,
+            device,
             measured_enroll_room: fixture_room(&fixture, MEASURED_ROOM)?,
             switch_enroll_room: fixture_room(&fixture, SWITCH_ROOM)?,
             measured,
@@ -871,16 +905,19 @@ impl Context {
         if !existing.is_empty() {
             return Err("profile_not_fresh");
         }
-        for (account, room, stage) in [
+        let mut measured_device = None;
+        for (account, room, stage, measured) in [
             (
                 &run.switch,
                 &run.switch_enroll_room,
                 "enroll_switch_account",
+                false,
             ),
             (
                 &run.measured,
                 &run.measured_enroll_room,
                 "enroll_measured_account",
+                true,
             ),
         ] {
             self.enter(stage);
@@ -898,12 +935,24 @@ impl Context {
             if added.user_id != account.user_id {
                 return Err("account_mismatch");
             }
-            // Its own room synced, so the client ran a sync and published its
-            // device keys. The seeder still waits for every enrolled device.
+            if measured {
+                measured_device = Some(added.device_id);
+            }
+            // Its own room synced, so the client ran a sync. Whether it also
+            // published its device keys is checked by the seeder, for exactly
+            // this device.
             self.rooms_include(room).await?;
         }
         let backend = self.observed_backend()?;
         self.rendering()?;
+        // Only the runner and the seeder read this private file; the report
+        // stays closed.
+        self.enter("enroll_device_record");
+        let device = measured_device
+            .filter(|id| plausible_device_id(id))
+            .ok_or("device_record")?;
+        let path = run.device.as_deref().ok_or("device_record")?;
+        write_report(path, &json!({ "device_id": device })).map_err(|_| "device_record")?;
         let mut value = base(run, "passed");
         value.insert("accounts".into(), 2.into());
         value.insert("observed_backend".into(), backend_token(backend).into());
@@ -1403,6 +1452,7 @@ mod tests {
                 fixture: self.path("fixture.json"),
                 room: room.map(|name| self.path(name)),
                 report: self.path("out").join("report.json"),
+                device: (mode == "enroll").then(|| self.path("out").join("device.json")),
             }
         }
     }
@@ -1503,6 +1553,33 @@ mod tests {
         let mut run = files.run("enroll", None);
         run.adapter = "auto".into();
         assert_eq!(validate(run).err(), Some("adapter_invalid"));
+    }
+
+    #[test]
+    fn only_enrollment_records_its_device_in_a_new_private_file() {
+        let files = Files::new();
+        let run = validate(files.run("enroll", None)).unwrap();
+        assert_eq!(run.device, Some(files.path("out").canonicalize().unwrap().join("device.json")));
+        let mut without = files.run("enroll", None);
+        without.device = None;
+        assert_eq!(validate(without).err(), Some("device_file_mode"));
+        let mut same = files.run("enroll", None);
+        same.device = Some(same.report.clone());
+        assert_eq!(validate(same).err(), Some("device_path_invalid"));
+        files.write("out/device.json", "{}");
+        assert_eq!(
+            validate(files.run("enroll", None)).err(),
+            Some("device_path_invalid")
+        );
+        fs::create_dir(files.path("profile/data")).unwrap();
+        let mut measure = files.run("measure", Some("room.json"));
+        measure.device = Some(files.path("out").join("other.json"));
+        assert_eq!(validate(measure).err(), Some("device_file_mode"));
+        assert!(plausible_device_id("ABCDEFGHIJ"));
+        let long = "A".repeat(65);
+        for id in ["", "two words", "quote\"d", long.as_str()] {
+            assert!(!plausible_device_id(id), "{id}");
+        }
     }
 
     #[test]

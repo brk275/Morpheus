@@ -5,19 +5,22 @@
 //! Only the loopback fixture from scripts/local_matrix_env.py is accepted.
 //! Alice creates a new private encrypted room through the pinned SDK, invites
 //! Bob, and Bob joins from a disposable seeder device. Before any message is
-//! sent, Alice must see at least MORPHEUS_TIMELINE_10K_BOB_DEVICES of Bob's
-//! devices, so every acceptance profile enrolled beforehand receives the room
-//! keys for the full history. Alice then sends exactly 10,000 variable-height
-//! messages, paced under the fixture's unchanged limit of 10 messages per
-//! second. The room ID and event count go to a new owner-only file outside the
-//! checkout. Credentials, IDs and message text are never printed; failures
-//! report a fixed stage only.
+//! sent, Alice must see Bob's join and hold device keys for exactly the
+//! enrolled devices named in the private MORPHEUS_TIMELINE_10K_BOB_DEVICE_IDS
+//! file, plus the seeder device, so every acceptance profile enrolled
+//! beforehand receives the room keys for the full history. A device count is
+//! not enough: other devices of Bob's could meet it. Alice then sends exactly
+//! 10,000 variable-height messages, paced under the fixture's unchanged limit
+//! of 10 messages per second. The room ID and event count go to a new
+//! owner-only file outside the checkout. Credentials, IDs and message text are
+//! never printed; failures report a fixed stage only.
 
 #![recursion_limit = "512"]
 
 use std::{
+    collections::HashSet,
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -26,11 +29,14 @@ use matrix_sdk::{
     Client, RoomState,
     config::SyncSettings,
     ruma::{
-        OwnedRoomId, OwnedUserId, UserId,
+        DeviceId, OwnedDeviceId, OwnedRoomId, OwnedUserId, UserId,
         api::client::room::create_room,
         events::{
             InitialStateEvent,
-            room::{encryption::RoomEncryptionEventContent, message::RoomMessageEventContent},
+            room::{
+                encryption::RoomEncryptionEventContent, member::MembershipState,
+                message::RoomMessageEventContent,
+            },
         },
     },
 };
@@ -47,10 +53,85 @@ const SEND_INTERVAL: Duration = Duration::from_millis(110);
 const SEED_LIMIT: Duration = Duration::from_secs(45 * 60);
 const WAIT_LIMIT: Duration = Duration::from_secs(120);
 const FILLER: &str = "Timeline acceptance filler text that wraps across the row width. ";
+/// The runner's record of the enrolled profiles' own device IDs.
+const DEVICE_IDS_ENV: &str = "MORPHEUS_TIMELINE_10K_BOB_DEVICE_IDS";
+const MAX_DEVICE_IDS_BYTES: u64 = 4 * 1024;
 
 #[derive(Deserialize)]
 struct Fixture {
     accounts: Vec<TestAccount>,
+}
+
+/// Written by the runner from each enrolled profile's own device record.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnrolledDevices {
+    device_ids: Vec<String>,
+}
+
+/// The same opaque-ID shape the app writes and the runner accepts.
+fn plausible_device_id(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.=+/".contains(&byte))
+}
+
+/// Two to eight distinct, plausible device IDs; anything else is refused.
+fn enrolled_devices(raw: &[u8]) -> Option<Vec<OwnedDeviceId>> {
+    let file: EnrolledDevices = serde_json::from_slice(raw).ok()?;
+    let distinct: HashSet<&str> = file.device_ids.iter().map(String::as_str).collect();
+    let valid = (2..=8).contains(&file.device_ids.len())
+        && distinct.len() == file.device_ids.len()
+        && file.device_ids.iter().all(|id| plausible_device_id(id));
+    valid.then(|| {
+        file.device_ids
+            .iter()
+            .map(|id| OwnedDeviceId::from(id.as_str()))
+            .collect()
+    })
+}
+
+/// What Alice holds for one of Bob's devices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Seen {
+    /// Not among the devices Alice holds keys for.
+    Absent,
+    /// Known, but deleted or missing its identity or Olm key.
+    Incomplete,
+    /// Known with both keys, so it receives the room keys.
+    Ready,
+}
+
+/// The first unmet condition before sending, in a fixed order, as a closed
+/// stage; `None` once Bob has joined and every required device is ready.
+fn unmet(joined: bool, seeder: Seen, enrolled: &[Seen]) -> Option<&'static str> {
+    if !joined {
+        return Some("bob_join");
+    }
+    match seeder {
+        Seen::Absent => return Some("seeder_device_absent"),
+        Seen::Incomplete => return Some("seeder_device_keys"),
+        Seen::Ready => {}
+    }
+    if enrolled.contains(&Seen::Absent) {
+        return Some("enrolled_device_absent");
+    }
+    if enrolled.contains(&Seen::Incomplete) {
+        return Some("enrolled_device_keys");
+    }
+    None
+}
+
+fn read_device_ids(path: &Path) -> Vec<u8> {
+    let file = ok(fs::File::open(path), "bob_device_ids");
+    let mut raw = Vec::new();
+    ok(
+        file.take(MAX_DEVICE_IDS_BYTES + 1).read_to_end(&mut raw),
+        "bob_device_ids",
+    );
+    require(raw.len() as u64 <= MAX_DEVICE_IDS_BYTES, "bob_device_ids");
+    raw
 }
 
 #[derive(Deserialize)]
@@ -207,13 +288,11 @@ async fn seed_ten_thousand_event_encrypted_room() {
         );
         return;
     };
-    let expected_devices: usize = ok(
-        std::env::var("MORPHEUS_TIMELINE_10K_BOB_DEVICES")
-            .map_err(|_| ())
-            .and_then(|value| value.parse().map_err(|_| ())),
-        "bob_devices",
-    );
-    require((2..=8).contains(&expected_devices), "bob_devices");
+    let enrolled = {
+        let path = ok(std::env::var_os(DEVICE_IDS_ENV).ok_or(()), "bob_device_ids");
+        let raw = read_device_ids(Path::new(&path));
+        ok(enrolled_devices(&raw).ok_or(()), "bob_device_ids")
+    };
     let output = output_path(PathBuf::from(output));
     let fixture: Fixture = ok(
         serde_json::from_slice(&ok(fs::read(fixture_path), "fixture")),
@@ -267,19 +346,39 @@ async fn seed_ten_thousand_event_encrypted_room() {
         }
         ok(bob_client.join_room_by_id(&room_id).await, "join");
 
-        // Every enrolled device must be known before the first message, or
-        // its profile could not decrypt the full history.
+        // Every enrolled device must hold keys before the first message, or
+        // its profile could not decrypt the full history. The join is read
+        // from Bob's member state: classic /sync without lazy-loaded members
+        // carries no room summary, so the room's joined count never changes.
+        let seeder_device = ok(
+            bob_client.device_id().map(ToOwned::to_owned).ok_or(()),
+            "seeder_device",
+        );
         let deadline = Instant::now() + WAIT_LIMIT;
         loop {
             sync(&alice_client).await;
+            let member = ok(room.get_member_no_sync(&bob_id).await, "member_query");
+            let joined = member.is_some_and(|member| *member.membership() == MembershipState::Join);
             let devices = ok(
                 alice_client.encryption().get_user_devices(&bob_id).await,
-                "devices",
+                "devices_query",
             );
-            if room.joined_members_count() >= 2 && devices.devices().count() >= expected_devices {
+            let seen = |id: &DeviceId| match devices.get(id) {
+                None => Seen::Absent,
+                Some(device)
+                    if device.is_deleted()
+                        || device.curve25519_key().is_none()
+                        || device.ed25519_key().is_none() =>
+                {
+                    Seen::Incomplete
+                }
+                Some(_) => Seen::Ready,
+            };
+            let enrolled_seen: Vec<Seen> = enrolled.iter().map(|id| seen(id)).collect();
+            let Some(stage) = unmet(joined, seen(&seeder_device), &enrolled_seen) else {
                 break;
-            }
-            require(Instant::now() < deadline, "devices");
+            };
+            require(Instant::now() < deadline, stage);
             sleep(Duration::from_millis(300)).await;
         }
 
@@ -338,4 +437,38 @@ fn every_message_carries_one_marker_and_heights_vary() {
         kinds.insert((text.body.lines().count(), text.formatted.is_some()));
     }
     assert!(kinds.len() >= 4, "fixture heights must vary");
+}
+
+#[test]
+fn only_distinct_plausible_enrolled_device_ids_are_accepted() {
+    let parsed = enrolled_devices(br#"{"device_ids": ["ABCDEFGHIJ", "KLMNOPQRST"]}"#).unwrap();
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(parsed[0].as_str(), "ABCDEFGHIJ");
+    let nine: Vec<String> = (0..9).map(|index| format!("DEVICE{index}")).collect();
+    for raw in [
+        r#"{"device_ids": ["ABCDEFGHIJ"]}"#.to_owned(),
+        r#"{"device_ids": ["ABCDEFGHIJ", "ABCDEFGHIJ"]}"#.to_owned(),
+        r#"{"device_ids": ["ABCDEFGHIJ", "two words"]}"#.to_owned(),
+        r#"{"device_ids": ["ABCDEFGHIJ", ""]}"#.to_owned(),
+        format!(r#"{{"device_ids": ["ABCDEFGHIJ", "{}"]}}"#, "A".repeat(65)),
+        serde_json::json!({ "device_ids": nine }).to_string(),
+        r#"{"device_ids": ["ABCDEFGHIJ", "KLMNOPQRST"], "count": 3}"#.to_owned(),
+        r#"["ABCDEFGHIJ", "KLMNOPQRST"]"#.to_owned(),
+    ] {
+        assert!(enrolled_devices(raw.as_bytes()).is_none(), "{raw}");
+    }
+}
+
+#[test]
+fn sending_waits_for_the_join_and_the_exact_devices_in_a_fixed_order() {
+    use Seen::{Absent, Incomplete, Ready};
+    assert_eq!(unmet(true, Ready, &[Ready, Ready]), None);
+    assert_eq!(unmet(false, Ready, &[Ready, Ready]), Some("bob_join"));
+    assert_eq!(unmet(true, Absent, &[Ready, Ready]), Some("seeder_device_absent"));
+    assert_eq!(unmet(true, Incomplete, &[Ready, Ready]), Some("seeder_device_keys"));
+    // Any number of other ready devices cannot stand in for an enrolled one.
+    assert_eq!(unmet(true, Ready, &[Ready, Absent]), Some("enrolled_device_absent"));
+    assert_eq!(unmet(true, Ready, &[Incomplete, Ready]), Some("enrolled_device_keys"));
+    assert_eq!(unmet(true, Ready, &[Incomplete, Absent]), Some("enrolled_device_absent"));
+    assert_eq!(unmet(false, Absent, &[Absent, Absent]), Some("bob_join"));
 }

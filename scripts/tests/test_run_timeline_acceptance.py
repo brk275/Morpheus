@@ -30,6 +30,7 @@ HOSTED = {
     "HOME": "/home/runner",
 }
 ROOM_ID = "!privateroom:morpheus-a.test"
+DEVICES = {"sliding": "SLIDINGDEV", "classic": "CLASSICDEV"}
 
 
 def build():
@@ -82,18 +83,19 @@ def measure_report(adapter):
 class FakeRunner:
     """Writes what the instrumented app and seeder would write."""
 
-    def __init__(self, failing=None, seed_log=None):
+    def __init__(self, failing=None, seed_log=None, device_records=None):
         self.calls = []
         self.environments = []
         self.failing = failing
         self.seed_log = seed_log
+        self.device_records = device_records or {}
 
     def __call__(self, command, environment, timeout, log):
         self.environments.append(environment)
         if command[0] == "cargo":
             self.calls.append(("seed", None))
             log.write_text(self.seed_log if self.seed_log is not None else
-                           f"{runner.SEED_COMPLETE}\ntest result: ok. 2 passed; 0 failed; 0 ignored;\n")
+                           f"{runner.SEED_COMPLETE}\ntest result: ok. 4 passed; 0 failed; 0 ignored;\n")
             if self.seed_log is None:
                 Path(environment["MORPHEUS_TIMELINE_10K_SEED"]).write_text(
                     json.dumps({"room_id": ROOM_ID, "events": 10_000}))
@@ -107,6 +109,8 @@ class FakeRunner:
                       "adapter": run["adapter"], "stage": "history_complete", "failure": "history_incomplete"}
         elif run["mode"] == "enroll":
             Path(run["profile"], "data").mkdir()
+            record = self.device_records.get(run["adapter"], {"device_id": DEVICES[run["adapter"]]})
+            Path(run["device"]).write_text(json.dumps(record))
             report = enroll_report(run["adapter"])
         else:
             report = measure_report(run["adapter"])
@@ -214,15 +218,43 @@ class FlowTests(RunnerTest):
             self.assertNotIn("GITHUB_TOKEN", environment)
             self.assertNotIn("MORPHEUS_TIMELINE_ACCEPTANCE_BUILD", environment)
         seed = fake.environments[2]
-        self.assertEqual(seed["MORPHEUS_TIMELINE_10K_BOB_DEVICES"], str(runner.BOB_DEVICES))
+        self.assertNotIn("MORPHEUS_TIMELINE_10K_BOB_DEVICES", seed)
+        devices = Path(seed["MORPHEUS_TIMELINE_10K_BOB_DEVICE_IDS"])
+        self.assertEqual(json.loads(devices.read_text()),
+                         {"device_ids": [DEVICES["sliding"], DEVICES["classic"]]})
+        self.assertEqual(stat.S_IMODE(devices.stat().st_mode), 0o600)
+        for adapter in runner.ADAPTERS:
+            run = json.loads((self.folder / "work" / f"run-measure-{adapter}.json").read_text())
+            self.assertNotIn("device", run)
         work = self.folder / "work"
         for path in work.glob("run-*.json"):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         for path in work.glob("profile-*"):
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
         printed = json.dumps(result)
-        for private in (ROOM_ID, str(work), str(self.fixture)):
+        for private in (ROOM_ID, str(work), str(self.fixture), *DEVICES.values()):
             self.assertNotIn(private, printed)
+
+    def test_enrollment_must_record_one_distinct_plausible_device(self):
+        for index, records in enumerate((
+            {"classic": {"device_id": DEVICES["sliding"]}},
+            {"sliding": {"device_id": "two words"}},
+            {"sliding": {"device_id": ""}},
+            {"sliding": {"device_id": "A" * 65}},
+            {"sliding": {"device_id": 7}},
+            {"sliding": {"device_id": DEVICES["sliding"], "count": 3}},
+            {"sliding": ["SLIDINGDEV"]},
+        )):
+            with self.subTest(records=records):
+                fake = FakeRunner(device_records=records)
+                work = self.folder / f"work-device-{index}"
+                acceptance = runner.Acceptance(self.fixture, self.app, work, fake, HOSTED)
+                with self.assertRaises(runner.StepFailure) as raised:
+                    acceptance.run()
+                self.assertEqual((raised.exception.step, raised.exception.reason),
+                                 ("enroll", "device_record_invalid"))
+                self.assertNotIn(("seed", None), fake.calls)
+                self.assertNotIn("SLIDINGDEV", str(raised.exception.summary()))
 
     def test_a_failed_step_stops_the_run_with_closed_tokens_only(self):
         fake = FakeRunner(failing=("measure", "sliding"))
@@ -235,8 +267,10 @@ class FlowTests(RunnerTest):
 
     def test_seed_failures_report_only_their_fixed_stage(self):
         for log, stage, reason in (
-            ("thread panicked at tests/x.rs:\nMORPHEUS_TIMELINE_SEED_FAILURE devices\n", "devices", "seed_failed"),
-            ("test result: ok. 2 passed; 0 failed;\n", None, "seed_incomplete"),
+            ("thread panicked at tests/x.rs:\nMORPHEUS_TIMELINE_SEED_FAILURE enrolled_device_absent\n",
+             "enrolled_device_absent", "seed_failed"),
+            ("thread panicked at tests/x.rs:\nMORPHEUS_TIMELINE_SEED_FAILURE bob_join\n", "bob_join", "seed_failed"),
+            ("test result: ok. 4 passed; 0 failed;\n", None, "seed_incomplete"),
         ):
             with self.subTest(reason=reason):
                 fake = FakeRunner(seed_log=log)
