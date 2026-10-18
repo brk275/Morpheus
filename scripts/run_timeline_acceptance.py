@@ -89,7 +89,7 @@ STEPS = ("setup", "enroll", "seed", "measure")
 SUMMARY_PREFIX = "MORPHEUS_TIMELINE_10K_SUMMARY "
 SEED_FAILURE = re.compile(r"MORPHEUS_TIMELINE_SEED_FAILURE ([a-z_]{1,48})$", re.MULTILINE)
 SEED_COMPLETE = f"MORPHEUS_TIMELINE_SEED_COMPLETE events={EVENTS}"
-SEED_RESULT = re.compile(r"^test result: ok\. 4 passed; 0 failed;", re.MULTILINE)
+SEED_RESULT = re.compile(r"^test result: ok\. 5 passed; 0 failed;", re.MULTILINE)
 
 BUILD = {
     "variant": ("const", "instrumented_release"),

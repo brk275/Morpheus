@@ -113,7 +113,10 @@ printed or uploaded.
    then Bob, so startup restores Bob. Each enrollment writes Bob's own device
    ID for that profile to a new owner-only file the run file names, separate
    from its closed report. The runner accepts one plausible, distinct ID per
-   profile and hands both to the seeder in another private file.
+   profile and hands both to the seeder in another private file. The Unix
+   seeder opens it without following final symlinks or blocking on special
+   files, and requires a private regular file of at most 4 KiB outside the
+   checkout. Directory aliases into the checkout are rejected.
 2. **Seed once.**
    [`timeline_10k_local`](../crates/morpheus-matrix/tests/timeline_10k_local.rs)
    uses the pinned SDK:

@@ -123,15 +123,48 @@ fn unmet(joined: bool, seeder: Seen, enrolled: &[Seen]) -> Option<&'static str> 
     None
 }
 
-fn read_device_ids(path: &Path) -> Vec<u8> {
-    let file = ok(fs::File::open(path), "bob_device_ids");
+/// The acceptance harness runs on Unix hosted runners. Open without following
+/// a final symlink or blocking on a FIFO, then check the opened inode itself.
+#[cfg(unix)]
+fn read_device_ids_checked(path: &Path, checkout: &Path) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let invalid = || std::io::Error::from(std::io::ErrorKind::InvalidData);
+    if !path.is_absolute() {
+        return Err(invalid());
+    }
+    let parent = path.parent().ok_or_else(invalid)?.canonicalize()?;
+    let checkout = checkout.canonicalize()?;
+    if parent.starts_with(&checkout) {
+        return Err(invalid());
+    }
+    let path = parent.join(path.file_name().ok_or_else(invalid)?);
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let info = file.metadata()?;
+    if !info.is_file()
+        || info.len() > MAX_DEVICE_IDS_BYTES
+        || info.permissions().mode() & 0o077 != 0
+    {
+        return Err(invalid());
+    }
     let mut raw = Vec::new();
-    ok(
-        file.take(MAX_DEVICE_IDS_BYTES + 1).read_to_end(&mut raw),
-        "bob_device_ids",
-    );
-    require(raw.len() as u64 <= MAX_DEVICE_IDS_BYTES, "bob_device_ids");
-    raw
+    file.take(MAX_DEVICE_IDS_BYTES + 1).read_to_end(&mut raw)?;
+    if raw.len() as u64 > MAX_DEVICE_IDS_BYTES {
+        return Err(invalid());
+    }
+    Ok(raw)
+}
+
+#[cfg(not(unix))]
+fn read_device_ids_checked(_: &Path, _: &Path) -> std::io::Result<Vec<u8>> {
+    // No weaker fallback on platforms this hosted fixture does not support.
+    Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+}
+
+fn read_device_ids(path: &Path) -> Vec<u8> {
+    ok(read_device_ids_checked(path, &checkout()), "bob_device_ids")
 }
 
 #[derive(Deserialize)]
@@ -464,11 +497,77 @@ fn sending_waits_for_the_join_and_the_exact_devices_in_a_fixed_order() {
     use Seen::{Absent, Incomplete, Ready};
     assert_eq!(unmet(true, Ready, &[Ready, Ready]), None);
     assert_eq!(unmet(false, Ready, &[Ready, Ready]), Some("bob_join"));
-    assert_eq!(unmet(true, Absent, &[Ready, Ready]), Some("seeder_device_absent"));
-    assert_eq!(unmet(true, Incomplete, &[Ready, Ready]), Some("seeder_device_keys"));
+    assert_eq!(
+        unmet(true, Absent, &[Ready, Ready]),
+        Some("seeder_device_absent")
+    );
+    assert_eq!(
+        unmet(true, Incomplete, &[Ready, Ready]),
+        Some("seeder_device_keys")
+    );
     // Any number of other ready devices cannot stand in for an enrolled one.
-    assert_eq!(unmet(true, Ready, &[Ready, Absent]), Some("enrolled_device_absent"));
-    assert_eq!(unmet(true, Ready, &[Incomplete, Ready]), Some("enrolled_device_keys"));
-    assert_eq!(unmet(true, Ready, &[Incomplete, Absent]), Some("enrolled_device_absent"));
+    assert_eq!(
+        unmet(true, Ready, &[Ready, Absent]),
+        Some("enrolled_device_absent")
+    );
+    assert_eq!(
+        unmet(true, Ready, &[Incomplete, Ready]),
+        Some("enrolled_device_keys")
+    );
+    assert_eq!(
+        unmet(true, Ready, &[Incomplete, Absent]),
+        Some("enrolled_device_absent")
+    );
     assert_eq!(unmet(false, Absent, &[Absent, Absent]), Some("bob_join"));
+}
+
+#[cfg(unix)]
+#[test]
+fn enrolled_device_records_are_private_bounded_regular_files_outside_checkout() {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt, symlink};
+    let root = std::env::temp_dir().join(format!("morpheus-device-reader-{}", Uuid::new_v4()));
+    fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    let _cleanup = Stores(root.clone());
+    let checkout = root.join("checkout");
+    fs::create_dir(&checkout).unwrap();
+    let path = root.join("devices.json");
+    let raw = br#"{"device_ids":["SLIDINGDEV","CLASSICDEV"]}"#;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap()
+        .write_all(raw)
+        .unwrap();
+    assert_eq!(read_device_ids_checked(&path, &checkout).unwrap(), raw);
+    assert!(read_device_ids_checked(Path::new("devices.json"), &checkout).is_err());
+    assert!(read_device_ids_checked(&root, &checkout).is_err());
+    // Canonical directory aliases must not hide an in-checkout input.
+    let inside = checkout.join("devices.json");
+    fs::copy(&path, &inside).unwrap();
+    assert!(read_device_ids_checked(&inside, &checkout).is_err());
+    let alias = root.join("checkout-alias");
+    symlink(&checkout, &alias).unwrap();
+    assert!(read_device_ids_checked(&alias.join("devices.json"), &checkout).is_err());
+    let link = root.join("link.json");
+    symlink(&path, &link).unwrap();
+    assert!(read_device_ids_checked(&link, &checkout).is_err());
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(read_device_ids_checked(&path, &checkout).is_err());
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(&path, vec![b'x'; MAX_DEVICE_IDS_BYTES as usize + 1]).unwrap();
+    assert!(read_device_ids_checked(&path, &checkout).is_err());
+    // No writer exists: an accidentally blocking FIFO open would hang here.
+    let fifo = root.join("fifo");
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg("-m")
+            .arg("600")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(read_device_ids_checked(&fifo, &checkout).is_err());
 }

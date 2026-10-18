@@ -41,3 +41,7 @@ libsqlite3-sys = { version = "=0.38.2", features = ["bundled-windows"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { version = "=3.6.3", default-features = false, features = ["sync-secret-service", "crypto-rust"] }
+
+# Existing locked transitive dependency; only Unix acceptance-file open flags.
+[target.'cfg(unix)'.dev-dependencies]
+libc = "=0.2.190"

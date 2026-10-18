@@ -95,7 +95,7 @@ class FakeRunner:
         if command[0] == "cargo":
             self.calls.append(("seed", None))
             log.write_text(self.seed_log if self.seed_log is not None else
-                           f"{runner.SEED_COMPLETE}\ntest result: ok. 4 passed; 0 failed; 0 ignored;\n")
+                           f"{runner.SEED_COMPLETE}\ntest result: ok. 5 passed; 0 failed; 0 ignored;\n")
             if self.seed_log is None:
                 Path(environment["MORPHEUS_TIMELINE_10K_SEED"]).write_text(
                     json.dumps({"room_id": ROOM_ID, "events": 10_000}))
@@ -270,7 +270,7 @@ class FlowTests(RunnerTest):
             ("thread panicked at tests/x.rs:\nMORPHEUS_TIMELINE_SEED_FAILURE enrolled_device_absent\n",
              "enrolled_device_absent", "seed_failed"),
             ("thread panicked at tests/x.rs:\nMORPHEUS_TIMELINE_SEED_FAILURE bob_join\n", "bob_join", "seed_failed"),
-            ("test result: ok. 4 passed; 0 failed;\n", None, "seed_incomplete"),
+            ("test result: ok. 5 passed; 0 failed;\n", None, "seed_incomplete"),
         ):
             with self.subTest(reason=reason):
                 fake = FakeRunner(seed_log=log)
