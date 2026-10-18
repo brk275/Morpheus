@@ -569,7 +569,7 @@ impl LiveUi {
         {
             Ok(true) => "Cancelling. A message that already reached the server stays sent.",
             Ok(false) => "This message was already sent and cannot be cancelled.",
-            Err(MatrixCoreError::PendingSendUnavailable) => {
+            Err(MatrixCoreError::PendingSendUnavailable) if selection.is_current() => {
                 self.mark_pending_unconfirmed(&scope, &target.nonce).await;
                 "This message is no longer waiting here. Check the conversation, then choose."
             }
@@ -594,11 +594,12 @@ impl LiveUi {
             .retry_pending_send_for(&selection, &scope.room, scope.thread(), &target.nonce, &target.transaction_id)
             .await
         {
-            Ok(()) => {
+            Ok(()) if selection.is_current() => {
                 self.drafts.set_pending_status(&scope.account, &scope.room, scope.thread(), &target.nonce, PendingStatus::Queued);
                 "Retrying."
             }
-            Err(MatrixCoreError::PendingSendUnavailable) => {
+            Ok(()) => return,
+            Err(MatrixCoreError::PendingSendUnavailable) if selection.is_current() => {
                 self.mark_pending_unconfirmed(&scope, &target.nonce).await;
                 "This message is no longer waiting here. Check the conversation, then choose."
             }
@@ -621,13 +622,17 @@ impl LiveUi {
         sent: bool,
         ui: Weak<AppWindow>,
     ) {
-        if self.drafts.record_status(&scope.account, &scope.room, scope.thread(), &nonce)
-            != Some(PendingStatus::Unconfirmed)
+        if !selection.is_current()
+            || self.drafts.record_status(&scope.account, &scope.room, scope.thread(), &nonce)
+                != Some(PendingStatus::Unconfirmed)
         {
             return;
         }
         if !self.release_record(&selection, &scope, &nonce).await {
             self.publish_resolution(&ui, selection, scope, None, "Could not update this message's saved status right now.");
+            return;
+        }
+        if !selection.is_current() {
             return;
         }
         let resolution = self
@@ -659,10 +664,18 @@ impl LiveUi {
         expected_revision: u64,
         ui: Weak<AppWindow>,
     ) {
+        if !selection.is_current() || selection.account_id() != scope.account {
+            return;
+        }
         let kept = self.drafts.record_status(&scope.account, &scope.room, scope.thread(), &nonce)
             == Some(PendingStatus::Kept);
         if kept && !self.release_record(&selection, &scope, &nonce).await {
             self.publish_resolution(&ui, selection, scope, None, "Could not update this message's saved status right now.");
+            return;
+        }
+        // The cache is mutated only under the original selection; a delayed
+        // click after a switch (or A->B->A) changes nothing.
+        if !selection.is_current() {
             return;
         }
         let resolution = self.drafts.restore_record_text(
@@ -691,9 +704,11 @@ impl LiveUi {
         nonce: Generation,
         ui: Weak<AppWindow>,
     ) {
-        if self.drafts.record_status(&scope.account, &scope.room, scope.thread(), &nonce)
-            != Some(PendingStatus::Kept)
+        if !selection.is_current()
+            || self.drafts.record_status(&scope.account, &scope.room, scope.thread(), &nonce)
+                != Some(PendingStatus::Kept)
             || !self.release_record(&selection, &scope, &nonce).await
+            || !selection.is_current()
         {
             return;
         }
@@ -714,18 +729,27 @@ impl LiveUi {
         scope: SendScope,
         ui: Weak<AppWindow>,
     ) {
+        // The discard applies to exactly the original the user reviewed: the
+        // cache's fingerprint is checked by the core and again at the cache.
+        let Some(fingerprint) = self
+            .drafts
+            .quarantine_fingerprint(&scope.account, &scope.room, scope.thread())
+        else {
+            return;
+        };
         if !selection.is_current()
             || self
                 .manager
-                .discard_quarantine_for(&selection, &scope.room, scope.thread())
+                .discard_quarantine_for(&selection, &scope.room, scope.thread(), fingerprint)
                 .await
                 .is_err()
+            || !selection.is_current()
         {
             return;
         }
         if self
             .drafts
-            .discard_quarantine(&scope.account, &scope.room, scope.thread())
+            .discard_quarantine(&scope.account, &scope.room, scope.thread(), fingerprint)
         {
             self.persist_scope_and_index(&scope).await;
         }

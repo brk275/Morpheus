@@ -2832,14 +2832,51 @@ rediscovery, and a quarantined row pausing its room until the explicit
 discard). No formatting, Clippy, build, native UI, live homeserver or CI check
 was executed for this change.
 
+Second source-review round (same branch, still unrun). The pinned SDK's
+client-wide `set_enabled(true)` re-enables every room queue, so Morpheus no
+longer enables the client-wide queue at all: room queues start paused and
+every enqueue path (recorded sends, legacy text, replies, edits, reactions,
+thread replies, attachments) resumes its room through one gate that refuses
+rooms discovery has not covered or that hold unreadable saved data; the
+error-retry worker and the explicit re-selection resume through the same gate
+and the worker no longer exits before discovery finishes. Enqueue grants are
+issued once per prepared record under the selection epoch and die with it, so
+A to B to A can neither regrant nor abandon an old enqueuing record. A room
+snapshot may drop a thread from its index only after the core proved that
+thread's row holds no record, kept text or unreadable data. Unreadable rows are
+carried with both stored columns and the draft kind, identified by a
+fingerprint; a save may ride only the exact carried original and a discard
+names exactly the reviewed original. Automatic restoration after a cancelled or
+reviewed send requires the record to still own the draft generation; a draft
+emptied by a later edit keeps the text as its own record instead, and every
+control validates its original selection at the cache mutation. The record
+strip is a bounded scroll view (at most a third of the window) that keeps every
+record and action reachable by keyboard.
+
+Added coverage, also unrun: registry tests for consume-then-regrant, the
+selection-epoch revocation, dropped index entries, exact-carry and exact
+discard checks; a selection test proving a guarded wait with no further event
+ends on revocation and releases its hold; cache tests for generation-owned
+restoration and fingerprint-bound discard; the real-window scenario now walks
+eight records in the room composer and the narrow thread pane at 200% text,
+asserting each focused control and the composer inputs fully inside the window
+on both axes; the real-SDK fixture now covers a request persisted while the row
+still says enqueuing, a stale room snapshot that would orphan an indexed
+thread, both stored columns surviving an edit of a quarantined scope and a
+discard that names the wrong original.
+
 Known limits and open points: rooms discovery does not reach are scanned only
 when opened; discovery failures caused by a store read error cannot be forced by
-the fixture and are covered by unit tests of the registry only; legacy
-untracked send paths carry no record and are not gated; an unconfirmed send
-always requires the user's judgement after checking the conversation; the
-pinned SDK's room send queue keeps its broadcast sender while the room lives,
-and no strong client or SQLite handle leak has been shown from this path, so
-Windows file cleanup after these observers end is simply untested here.
+the fixture and are covered by unit tests of the registry only; a persisted SDK
+request whose record never received its id sends on its own once its room
+resumes, and its record stays unconfirmed for the user's review; the
+app-level observer and lease lifetime is exercised through the core's guarded
+wait, since the app's tests cannot mint an account selection without a core
+account; an unconfirmed send always requires the user's judgement after
+checking the conversation; the pinned SDK's room send queue keeps its broadcast
+sender while the room lives, and no strong client or SQLite handle leak has
+been shown from this path, so Windows file cleanup after these observers end
+is simply untested here.
 
 ## Native outgoing video GUI acceptance (partial)
 

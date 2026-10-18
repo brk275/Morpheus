@@ -52,6 +52,20 @@ impl AccountSelection {
             notified.await;
         }
     }
+
+    /// Run one wait under this selection. Returns `None` the moment the
+    /// selection is revoked, whether or not the wait would ever complete, so
+    /// observers of a queue that never emits again end with their account and
+    /// release what they hold. A completed wait is still reported as `None`
+    /// when the selection was revoked meanwhile; callers never act on a result
+    /// for a departed selection.
+    pub async fn guard<F: std::future::Future>(&self, wait: F) -> Option<F::Output> {
+        let output = tokio::select! {
+            _ = self.revoked() => return None,
+            output = wait => output,
+        };
+        self.is_current().then_some(output)
+    }
 }
 
 #[derive(Default)]
@@ -91,6 +105,43 @@ impl Drop for Selections {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn guarded_waits_end_on_revocation_without_another_event_and_release_their_hold() {
+        runtime().block_on(async {
+            let selections = Selections::default();
+            selections.replace(Some("a"));
+            let selection = selections.for_account("a").unwrap();
+            // A hold such as a composer lease or an observed request handle.
+            let hold = Arc::new(());
+            let held = hold.clone();
+            let task = tokio::spawn(async move {
+                let _held = held;
+                // Nothing will ever complete this wait: a paused queue that
+                // never emits again.
+                selection.guard(std::future::pending::<()>()).await
+            });
+            tokio::task::yield_now().await;
+            assert_eq!(Arc::strong_count(&hold), 2, "the task holds its resource while waiting");
+            // Switching the account revokes the selection: the task ends and
+            // drops what it held without any queue event.
+            selections.replace(Some("b"));
+            let outcome = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .expect("the guarded wait must end on revocation")
+                .unwrap();
+            assert_eq!(outcome, None);
+            assert_eq!(Arc::strong_count(&hold), 1, "the hold is released with the task");
+            // A wait that completes after revocation is not reported either.
+            let stale = selections.for_account("b").unwrap();
+            selections.replace(None);
+            assert_eq!(stale.guard(async { 7 }).await, None);
+            // A wait under a live selection completes normally.
+            selections.replace(Some("c"));
+            let live = selections.for_account("c").unwrap();
+            assert_eq!(live.guard(async { 7 }).await, Some(7));
+        });
+    }
 
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()

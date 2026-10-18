@@ -61,7 +61,7 @@ use std::{
 use eyeball_im::Vector;
 use futures_util::StreamExt;
 use matrix_sdk::{
-    Client, ComposerDraft, ComposerDraftType, RoomState,
+    Client, ComposerDraft, ComposerDraftType, RoomState, StateStore,
     authentication::matrix::MatrixSession,
     config::SyncSettings,
     encryption::{
@@ -1020,11 +1020,10 @@ impl AccountManager {
         {
             // Re-selecting the active account is an explicit retry of any
             // room queue paused by a recoverable send error. No new message
-            // is enqueued, so this cannot duplicate a transaction.
-            if let Some(loaded) = state.loaded.get(id)
-                && *loaded.recovery_ready.borrow()
-            {
-                loaded.client.send_queue().set_enabled(true).await;
+            // is enqueued, so this cannot duplicate a transaction; rooms that
+            // discovery has not cleared stay paused.
+            if let Some(loaded) = state.loaded.get(id) {
+                resume_persisted_rooms(loaded).await;
             }
             return Ok(account);
         }
@@ -1404,6 +1403,7 @@ impl AccountManager {
     ) -> Result<()> {
         let state = self.state.lock().await;
         let loaded = selected_loaded_for(&state, expected_account_id)?;
+        gate_room_send(loaded, room_id).await?;
         let timeline = loaded.timeline(room_id).await?;
         let event_id = parse_event_id(reply_to)?;
         timeline
@@ -1470,6 +1470,7 @@ impl AccountManager {
             .subscribe()
             .await
             .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
+        gate_room_send(loaded, room_id).await?;
         let timeline = loaded.thread_timeline(room_id, root_event_id).await?;
         let handle = timeline
             .send(formatting::room_text(body.into(), format).into())
@@ -1510,6 +1511,7 @@ impl AccountManager {
     ) -> Result<()> {
         let state = self.state.lock().await;
         let loaded = selected_loaded_for(&state, expected_account_id)?;
+        gate_room_send(loaded, room_id).await?;
         let timeline = loaded.timeline(room_id).await?;
         let item_id = TimelineEventItemId::EventId(parse_event_id(event_id)?);
         timeline
@@ -1530,6 +1532,7 @@ impl AccountManager {
     ) -> Result<bool> {
         let state = self.state.lock().await;
         let loaded = selected_loaded_for(&state, expected_account_id)?;
+        gate_room_send(loaded, room_id).await?;
         let timeline = loaded.timeline(room_id).await?;
         let item_id = TimelineEventItemId::EventId(parse_event_id(event_id)?);
         timeline
@@ -1602,6 +1605,7 @@ impl AccountManager {
             .subscribe()
             .await
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
+        gate_room_send(loaded, room_id).await?;
         let timeline = loaded.timeline(room_id).await?;
         let handle = timeline
             .send(formatting::room_text(body.into(), format).into())
@@ -1758,10 +1762,11 @@ impl AccountManager {
         if !selection.is_current() {
             return Err(MatrixCoreError::SelectedAccountChanged);
         }
+        let epoch = loaded.recovery_gate.lock().await.epoch;
         let mut registry = loaded.pending_sends.lock().await;
         let granted = registry
             .get_mut(&(room_id.to_owned(), thread_root.map(str::to_owned)))
-            .is_some_and(|scope| scope.grant(nonce));
+            .is_some_and(|scope| scope.grant(nonce, epoch));
         if granted {
             Ok(())
         } else {
@@ -1797,12 +1802,15 @@ impl AccountManager {
     }
 
     /// The user explicitly discarded saved data this build could not read in
-    /// one scope. The next save may replace the quarantined or read-only row.
+    /// one scope, identified by the fingerprint of exactly the original they
+    /// reviewed. The next save may then replace the quarantined or read-only
+    /// row; a different or later original is left alone.
     pub async fn discard_quarantine_for(
         &self,
         selection: &AccountSelection,
         room_id: &str,
         thread_root: Option<&str>,
+        fingerprint: u64,
     ) -> Result<()> {
         let state = self.state.lock().await;
         let loaded = selected_loaded_for(&state, selection.account_id())?;
@@ -1812,7 +1820,7 @@ impl AccountManager {
         let mut registry = loaded.pending_sends.lock().await;
         let released = registry
             .get_mut(&(room_id.to_owned(), thread_root.map(str::to_owned)))
-            .is_some_and(|scope| scope.release_quarantine());
+            .is_some_and(|scope| scope.release_quarantine(fingerprint));
         if released {
             Ok(())
         } else {
@@ -1974,8 +1982,7 @@ impl AccountManager {
             .unwedge()
             .await
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
-        room.send_queue().set_enabled(true);
-        Ok(())
+        resume_room_queue(loaded, &room).await
     }
 
     pub async fn send_reply(
@@ -1986,6 +1993,7 @@ impl AccountManager {
     ) -> Result<()> {
         let state = self.state.lock().await;
         let loaded = selected_loaded(&state)?;
+        gate_room_send(loaded, room_id).await?;
         let timeline = loaded.timeline(room_id).await?;
         let event_id = parse_event_id(reply_to)?;
         timeline
@@ -2006,6 +2014,7 @@ impl AccountManager {
     ) -> Result<()> {
         let state = self.state.lock().await;
         let loaded = selected_loaded(&state)?;
+        gate_room_send(loaded, room_id).await?;
         let timeline = loaded.thread_timeline(room_id, root_event_id).await?;
         timeline
             .send(RoomMessageEventContent::text_plain(body.into()).into())
@@ -2022,6 +2031,7 @@ impl AccountManager {
     ) -> Result<()> {
         let state = self.state.lock().await;
         let loaded = selected_loaded(&state)?;
+        gate_room_send(loaded, room_id).await?;
         let timeline = loaded.timeline(room_id).await?;
         let item_id = TimelineEventItemId::EventId(parse_event_id(event_id)?);
         timeline
@@ -2044,6 +2054,7 @@ impl AccountManager {
     ) -> Result<bool> {
         let state = self.state.lock().await;
         let loaded = selected_loaded(&state)?;
+        gate_room_send(loaded, room_id).await?;
         let timeline = loaded.timeline(room_id).await?;
         let item_id = TimelineEventItemId::EventId(parse_event_id(event_id)?);
         timeline
@@ -2704,7 +2715,7 @@ impl AccountManager {
             gate.blocked.clear();
             loaded.recovery_ready.send_replace(false);
             for scope in loaded.pending_sends.lock().await.values_mut() {
-                scope.clear_grants();
+                scope.revoke_process_ownership();
             }
             let epoch = gate.epoch;
             let scan_loaded = loaded.clone();
@@ -2713,7 +2724,7 @@ impl AccountManager {
             }));
         }
         state.queue_recovery_task = Some(tokio::spawn(recover_room_queues(
-            client.clone(),
+            loaded.clone(),
             errors,
             updates,
         )));
@@ -3058,12 +3069,13 @@ async fn require_pending_owner(
     thread_root: Option<&str>,
     owner: Option<(&Generation, Option<&str>)>,
 ) -> Result<()> {
-    {
+    let epoch = {
         let gate = loaded.recovery_gate.lock().await;
         if !gate.complete || gate.unscanned.contains(room_id) {
             return Err(MatrixCoreError::RecoveryIncomplete);
         }
-    }
+        gate.epoch
+    };
     let mut registry = loaded.pending_sends.lock().await;
     let key = (room_id.to_owned(), thread_root.map(str::to_owned));
     let Some(scope) = registry.get_mut(&key) else {
@@ -3099,7 +3111,7 @@ async fn require_pending_owner(
             if thread_root.is_some() && awaiting != 1 {
                 return Err(PendingLimitError::ThreadBusy.into());
             }
-            if !scope.consume_grant(nonce) {
+            if !scope.consume_grant(nonce, epoch) {
                 return Err(MatrixCoreError::PendingSendUnknown);
             }
         }
@@ -3122,8 +3134,73 @@ async fn load_draft_row(
         .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
     Ok(draft.map_or_else(
         || ComposeText::restore_draft(String::new(), None),
-        |draft| ComposeText::restore_draft(draft.plain_text, draft.html_text.as_deref()),
+        restore_stored_row,
     ))
+}
+
+/// The stored draft kind as carried with an unreadable row.
+fn draft_kind(draft_type: &ComposerDraftType) -> String {
+    match draft_type {
+        ComposerDraftType::NewMessage => "new".to_owned(),
+        ComposerDraftType::Reply { event_id } => format!("reply:{event_id}"),
+        ComposerDraftType::Edit { event_id } => format!("edit:{event_id}"),
+    }
+}
+
+/// Restore a complete stored row so an unreadable one is preserved whole:
+/// both text columns, its kind and whether attachments ride with it.
+fn restore_stored_row(draft: ComposerDraft) -> RestoredCompose {
+    ComposeText::restore_stored_draft(
+        draft.plain_text,
+        draft.html_text.as_deref(),
+        &draft_kind(&draft.draft_type),
+        !draft.attachments.is_empty(),
+    )
+}
+
+/// Every path that hands a request to a room's SDK queue resumes that queue
+/// here first, under the discovery gate: never before discovery covered the
+/// room, never while the room holds saved data this build cannot read. The
+/// client-wide queue is never enabled, because the pinned SDK's global enable
+/// re-enables every room queue; room queues start paused and only this gate
+/// resumes them.
+async fn resume_room_queue(loaded: &LoadedAccount, room: &Room) -> Result<()> {
+    let gate = loaded.recovery_gate.lock().await;
+    let room_id = room.room_id().as_str();
+    if !gate.complete || gate.unscanned.contains(room_id) {
+        return Err(MatrixCoreError::RecoveryIncomplete);
+    }
+    if gate.blocked.contains(room_id) {
+        return Err(MatrixCoreError::RecoveryBlocked);
+    }
+    room.send_queue().set_enabled(true);
+    Ok(())
+}
+
+async fn gate_room_send(loaded: &LoadedAccount, room_id: &str) -> Result<()> {
+    let id = RoomId::parse(room_id).map_err(|e| MatrixCoreError::InvalidRoomId(e.to_string()))?;
+    let room = loaded
+        .client
+        .get_room(&id)
+        .ok_or_else(|| MatrixCoreError::RoomNotFound(room_id.into()))?;
+    resume_room_queue(loaded, &room).await
+}
+
+/// Resume the queues of rooms the SDK store still holds requests for, where
+/// discovery allows it. Used after discovery and on an explicit re-selection.
+async fn resume_persisted_rooms(loaded: &LoadedAccount) {
+    let rooms = match loaded.client.state_store().load_rooms_with_unsent_requests().await {
+        Ok(rooms) => rooms,
+        Err(error) => {
+            warn!(error = %error, "could not list rooms with persisted requests");
+            return;
+        }
+    };
+    for room_id in rooms {
+        if let Some(room) = loaded.client.get_room(&room_id) {
+            let _ = resume_room_queue(loaded, &room).await;
+        }
+    }
 }
 
 /// Checked read-modify-write of one draft row. The scope's authoritative
@@ -3140,17 +3217,46 @@ async fn save_draft_row(
     envelope: &DraftEnvelope,
 ) -> Result<()> {
     let scope = (room_id.to_owned(), thread_root.map(str::to_owned));
+    let epoch = loaded.recovery_gate.lock().await.epoch;
     let mut registry = loaded.pending_sends.lock().await;
     if !registry.contains_key(&scope) {
         let restored = load_draft_row(room, parsed_root).await?;
         registry.insert(scope.clone(), ScopeRecovery::from_restored(&restored));
     }
+    let dropped_threads = {
+        let entry = registry
+            .get(&scope)
+            .ok_or(MatrixCoreError::StaleDraftSnapshot)?;
+        entry
+            .check_save(envelope)
+            .map_err(|_| MatrixCoreError::StaleDraftSnapshot)?;
+        entry.dropped_threads(envelope)
+    };
+    // A room snapshot may drop a thread from the index only when that
+    // thread's row holds nothing: no record, no kept text, no unreadable data.
+    // Otherwise a stale snapshot would orphan the thread from discovery.
+    for root in dropped_threads {
+        let thread_key = (room_id.to_owned(), Some(root.clone()));
+        let idle = match registry.get(&thread_key) {
+            Some(thread) => thread.is_idle(),
+            None => {
+                let parsed = parse_event_id(&root)?;
+                let restored = load_draft_row(room, Some(&parsed)).await?;
+                let thread = ScopeRecovery::from_restored(&restored);
+                let idle = thread.is_idle();
+                if !idle {
+                    registry.insert(thread_key, thread);
+                }
+                idle
+            }
+        };
+        if !idle {
+            return Err(MatrixCoreError::StaleDraftSnapshot);
+        }
+    }
     let entry = registry
         .get_mut(&scope)
         .ok_or(MatrixCoreError::StaleDraftSnapshot)?;
-    entry
-        .check_save(envelope)
-        .map_err(|_| MatrixCoreError::StaleDraftSnapshot)?;
     if text.body.is_empty() && envelope.is_empty() {
         room.clear_composer_draft(parsed_root)
             .await
@@ -3178,7 +3284,7 @@ async fn save_draft_row(
     )
     .await
     .map_err(|e| MatrixCoreError::Sdk(e.to_string()))?;
-    entry.apply_saved(envelope);
+    entry.apply_saved(envelope, epoch);
     let still_blocked = registry
         .iter()
         .any(|(key, scope)| key.0 == room_id && scope.block().is_some());
@@ -3261,8 +3367,7 @@ async fn scan_room(room: &Room, budget: &mut ScanBudget) -> Result<Vec<Recovered
     budget.charge(
         room_draft.plain_text.len() + room_draft.html_text.as_ref().map_or(0, String::len),
     )?;
-    let room_restored =
-        ComposeText::restore_draft(room_draft.plain_text, room_draft.html_text.as_deref());
+    let room_restored = restore_stored_row(room_draft);
     if room_restored.envelope.is_empty() && room_restored.read_only.is_none() {
         return Ok(Vec::new());
     }
@@ -3275,10 +3380,7 @@ async fn scan_room(room: &Room, budget: &mut ScanBudget) -> Result<Vec<Recovered
                 budget.charge(
                     draft.plain_text.len() + draft.html_text.as_ref().map_or(0, String::len),
                 )?;
-                scopes.push((
-                    Some(root.clone()),
-                    ComposeText::restore_draft(draft.plain_text, draft.html_text.as_deref()),
-                ));
+                scopes.push((Some(root.clone()), restore_stored_row(draft)));
             }
             Ok(None) => {}
             Err(error) => {
@@ -3380,26 +3482,33 @@ async fn recover_pending_sends(loaded: Arc<LoadedAccount>, epoch: u64) {
                 .or_insert_with(|| ScopeRecovery::from_restored(&draft.restored));
         }
     }
-    // Disable unscanned and blocked rooms before the global queue resumes, so
-    // their persisted requests stay held until their rows have been read or
-    // the user has discarded data this build cannot read.
-    for room in &rooms {
-        if matches!(room.state(), RoomState::Left | RoomState::Banned) {
-            continue;
-        }
-        let room_id = room.room_id().as_str();
-        room.send_queue()
-            .set_enabled(!unscanned.contains(room_id) && !blocked.contains(room_id));
-    }
     if !unscanned.is_empty() {
         warn!(rooms = unscanned.len(), "send recovery left rooms unscanned; their queues stay paused");
     }
+    // Room queues start paused (the client-wide queue is never enabled, since
+    // the pinned SDK's global enable would resume every room). Only rooms the
+    // store still holds requests for and that discovery cleared resume now;
+    // every other allowed room resumes on its first send through the gate.
+    let persisted = match loaded.client.state_store().load_rooms_with_unsent_requests().await {
+        Ok(rooms) => rooms,
+        Err(error) => {
+            warn!(error = %error, "could not list rooms with persisted requests");
+            Vec::new()
+        }
+    };
     *loaded.recovered.lock().await = recovered;
     gate.unscanned = unscanned;
     gate.blocked = blocked;
     gate.complete = true;
     gate.scan = None;
-    loaded.client.send_queue().set_enabled(true).await;
+    for room_id in persisted {
+        if gate.unscanned.contains(room_id.as_str()) || gate.blocked.contains(room_id.as_str()) {
+            continue;
+        }
+        if let Some(room) = loaded.client.get_room(&room_id) {
+            room.send_queue().set_enabled(true);
+        }
+    }
     loaded.recovery_ready.send_replace(true);
 }
 
@@ -3633,7 +3742,7 @@ async fn stop_sync(state: &mut State) {
 /// retained requests with bounded backoff while their account stays selected.
 /// Unrecoverable errors stay wedged for an explicit retry or cancellation.
 async fn recover_room_queues(
-    client: Client,
+    loaded: Arc<LoadedAccount>,
     mut errors: broadcast::Receiver<matrix_sdk::send_queue::SendQueueRoomError>,
     mut updates: broadcast::Receiver<matrix_sdk::send_queue::SendQueueUpdate>,
 ) {
@@ -3663,8 +3772,10 @@ async fn recover_room_queues(
                 Err(broadcast::error::RecvError::Closed) => break,
             },
             _ = tick.tick() => {
-                if !client.send_queue().is_enabled() {
-                    break;
+                // Discovery readiness only defers retries; the worker itself
+                // ends when stop_sync aborts it with its selection.
+                if !*loaded.recovery_ready.borrow() {
+                    continue;
                 }
                 let now = Instant::now();
                 let ready: Vec<_> = due.iter()
@@ -3672,11 +3783,13 @@ async fn recover_room_queues(
                     .map(|(room_id, _)| room_id.clone())
                     .collect();
                 for room_id in ready {
+                    due.remove(&room_id);
                     if let Ok(parsed) = RoomId::parse(&room_id)
-                        && let Some(room) = client.get_room(&parsed)
+                        && let Some(room) = loaded.client.get_room(&parsed)
                     {
-                        room.send_queue().set_enabled(true);
-                        due.remove(&room_id);
+                        // A room the gate refuses stays paused; its discard or
+                        // scan path resumes it later.
+                        let _ = resume_room_queue(&loaded, &room).await;
                     }
                 }
             }
@@ -4155,31 +4268,47 @@ mod tests {
                     )),
                 );
             }
-            assert!(client_a.send_queue().is_enabled());
+            // The client-wide queue is never enabled: room queues resume one
+            // by one through the discovery gate. Readiness of the gate marks
+            // the selected account.
+            assert!(!client_a.send_queue().is_enabled());
             assert!(!client_b.send_queue().is_enabled());
 
             manager.switch_to(&second.id).await.unwrap();
             assert!(!client_a.send_queue().is_enabled());
-            assert!(client_b.send_queue().is_enabled());
+            assert!(!client_b.send_queue().is_enabled());
             let previous_selection = manager.account_selection(&second.id).unwrap();
             assert!(previous_selection.is_current());
+            assert!(manager.take_recovered_drafts(&previous_selection).await.unwrap().is_empty());
 
             // Re-selecting an active account is a manual recovery path for
-            // a queue paused after a transient error.
+            // room queues paused after a transient error; it still never
+            // enables the client-wide queue.
             client_b.send_queue().set_enabled(false).await;
             manager.switch_to(&second.id).await.unwrap();
-            assert!(client_b.send_queue().is_enabled());
+            assert!(!client_b.send_queue().is_enabled());
+            assert!(manager.take_recovered_drafts(&previous_selection).await.unwrap().is_empty());
 
             manager.switch_to(&first.id).await.unwrap();
-            assert!(client_a.send_queue().is_enabled());
+            assert!(!client_a.send_queue().is_enabled());
             assert!(!client_b.send_queue().is_enabled());
             assert!(!previous_selection.is_current());
+            assert!(matches!(
+                manager.take_recovered_drafts(&previous_selection).await,
+                Err(MatrixCoreError::SelectedAccountChanged)
+            ));
+            assert!(manager
+                .take_recovered_drafts(&manager.account_selection(&first.id).unwrap())
+                .await
+                .unwrap()
+                .is_empty());
             let first_selection = manager.account_selection(&first.id).unwrap();
             manager.switch_to(&second.id).await.unwrap();
             assert!(!first_selection.is_current());
             assert!(!previous_selection.is_current());
             let current_selection = manager.account_selection(&second.id).unwrap();
             assert!(current_selection.is_current());
+            assert!(manager.take_recovered_drafts(&current_selection).await.unwrap().is_empty());
 
             manager.stop().await;
             assert!(!current_selection.is_current());
@@ -4882,6 +5011,7 @@ mod composed_adapter {
                 let room = account_room(&state, selection.account_id(), room_id)?;
                 context(selection, &room)?;
                 validate_mentions(selection, &room, &text).await?;
+                resume_room_queue(loaded, &room).await?;
                 let queue = room.send_queue();
                 let (_, updates) = queue.subscribe().await.map_err(|_| mention_unavailable())?;
                 context(selection, &room)?;

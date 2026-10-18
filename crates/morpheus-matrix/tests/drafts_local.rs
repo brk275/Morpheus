@@ -244,6 +244,16 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
             )
             .await
             .expect("Cannot persist pending thread row");
+        // A room snapshot from before the thread was indexed (same records,
+        // no index) would orphan the thread row from discovery: refused.
+        let mut without_index = pending_room_envelope.clone();
+        assert!(without_index.unindex_thread(pending_thread));
+        assert!(matches!(
+            manager
+                .save_composed_draft_for(&a_account.id, a_room, None, &pending_room_text, &without_index)
+                .await,
+            Err(MatrixCoreError::StaleDraftSnapshot)
+        ), "dropping an indexed thread that holds a record is refused");
         manager
             .save_composed_draft_for(
                 &a_account.id,
@@ -1082,9 +1092,94 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
         assert!(done.remove_pending(&sixth, Some(&sixth_txn)).is_some());
         manager.save_composed_draft_for(&a_account.id, a_room, None, &empty, &done).await.unwrap();
 
-        // 7. A row this build cannot read pauses its room's queue, keeps the
-        // request and the complete original, restores the typed body, and
-        // resumes only after the explicit discard.
+        // 7. Enqueue before the id is persisted: the SDK holds the request,
+        // the row still says enqueuing. After restart the record is reviewed,
+        // never matched by body or time and never enqueued again; the SDK's
+        // own persisted request is what sends once the room resumes.
+        let client = manager.active_client().await.unwrap();
+        let room = client.get_room(&RoomId::parse(a_room).unwrap()).unwrap();
+        client.send_queue().set_enabled(false).await;
+        let seventh = Generation::fresh();
+        let seventh_text = ComposeText::plain(format!("recovery-seventh-{marker}"));
+        let mut envelope = DraftEnvelope::fresh();
+        envelope
+            .begin_pending(seventh.clone(), envelope.generation().clone(), &seventh_text, false)
+            .unwrap();
+        manager
+            .save_composed_draft_for(&a_account.id, a_room, None, &seventh_text, &envelope)
+            .await
+            .unwrap();
+        manager.grant_enqueue_for(&selection, a_room, None, &seventh).await.unwrap();
+        let queued_seventh = manager
+            .send_composed_owned_for(&selection, a_room, ComposeSendTarget::Room, &seventh_text, None, Some(&seventh))
+            .await
+            .unwrap();
+        let seventh_txn = queued_seventh.transaction_id().to_owned();
+        assert_eq!(persisted_requests(&room).await, HashSet::from([seventh_txn.clone()]));
+        // The process stops before the id reaches the row.
+        drop(queued_seventh);
+        drop(room);
+        drop(client);
+        manager.stop().await;
+        drop(manager);
+        let manager = AccountManager::open(&root).unwrap();
+        manager.restore_last_active().await.unwrap().expect("No restored account");
+        let selection = manager.account_selection(&a_account.id).unwrap();
+        let client = manager.active_client().await.unwrap();
+        let room = client.get_room(&RoomId::parse(a_room).unwrap()).unwrap();
+        // Subscribe before taking discovery's result: the room resumes as
+        // part of discovery and the persisted request sends on its own.
+        let (echoes_now, mut seventh_updates) = room.send_queue().subscribe().await.unwrap();
+        let recovered = manager.take_recovered_drafts(&selection).await.unwrap();
+        let scope = recovered
+            .iter()
+            .find(|draft| draft.room_id == a_room && draft.thread_root.is_none())
+            .expect("The room scope was discovered");
+        let send = scope.sends.iter().find(|send| send.nonce == seventh).unwrap();
+        assert!(send.transaction_id.is_none() && send.queued.is_none(), "an enqueuing record is unconfirmed, never matched by body");
+        assert_eq!(scope.restored.envelope.find(&seventh).unwrap().text().to_compose().unwrap(), seventh_text);
+        if echoes_now.iter().any(|echo| echo.transaction_id.as_str() == seventh_txn) {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    match seventh_updates.recv().await {
+                        Ok(RoomSendQueueUpdate::SentEvent { transaction_id: sent, .. })
+                            if sent.as_str() == seventh_txn => return,
+                        Ok(_) => {}
+                        Err(error) => panic!("Send queue observation ended: {error}"),
+                    }
+                }
+            })
+            .await
+            .expect("Timed out waiting for the SDK's own persisted request");
+        }
+        assert!(persisted_requests(&room).await.is_empty());
+        // Nothing of ours can replay it: no grant, no enqueue, no cancel.
+        assert!(matches!(
+            manager.grant_enqueue_for(&selection, a_room, None, &seventh).await,
+            Err(MatrixCoreError::PendingSendUnknown)
+        ));
+        assert!(matches!(
+            manager
+                .send_composed_owned_for(&selection, a_room, ComposeSendTarget::Room, &seventh_text, None, Some(&seventh))
+                .await,
+            Err(MatrixCoreError::PendingSendUnknown)
+        ));
+        assert!(matches!(
+            manager.cancel_pending_send_for(&selection, a_room, None, &seventh, &seventh_txn).await,
+            Err(MatrixCoreError::PendingSendUnknown)
+        ), "a record without an id owns no request, even the one that sent");
+        // Only the explicit review resolves it; the same row is written once.
+        manager.release_pending_record_for(&selection, a_room, None, &seventh, None).await.unwrap();
+        let mut reviewed = scope.restored.envelope.clone();
+        assert!(reviewed.remove_pending(&seventh, None).is_some());
+        manager.save_composed_draft_for(&a_account.id, a_room, None, &empty, &reviewed).await.unwrap();
+        assert!(manager.load_composed_draft_for(&a_account.id, a_room, None).await.unwrap().envelope.is_empty());
+        drop(room);
+        drop(client);
+
+        // 8. A row this build cannot read pauses its room's queue, keeps the
+        // request and the complete original, restores the stored plain
+        // column, and resumes only after the explicit discard of exactly it.
         let client = manager.active_client().await.unwrap();
         let room = client.get_room(&RoomId::parse(a_room).unwrap()).unwrap();
         client.send_queue().set_enabled(false).await;
@@ -1099,9 +1194,10 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
             .clone()
             .expect("Row has no envelope")
             .replace("data-morpheus-compose=\"2\"", "data-morpheus-compose=\"9\"");
+        let plain_column = format!("{} (plain column differs)", row.plain_text);
         room.save_composer_draft(
             ComposerDraft {
-                plain_text: row.plain_text.clone(),
+                plain_text: plain_column.clone(),
                 html_text: Some(broken.clone()),
                 draft_type: ComposerDraftType::NewMessage,
                 attachments: Vec::new(),
@@ -1123,7 +1219,7 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
             .find(|draft| draft.room_id == a_room && draft.thread_root.is_none())
             .expect("The quarantined scope was discovered");
         assert_eq!(scope.restored.blocked(), Some(QuarantineReason::UnsupportedVersion));
-        assert_eq!(scope.restored.text.body, fifth_text.body, "the typed body still restores");
+        assert_eq!(scope.restored.text.body, plain_column, "the stored plain column is what restores");
         assert!(scope.sends.is_empty(), "nothing is inferred from unreadable metadata");
         assert_eq!(
             scope.restored.envelope.quarantine().unwrap().original_html().as_deref(),
@@ -1131,9 +1227,15 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
         );
         let client = manager.active_client().await.unwrap();
         let room = client.get_room(&RoomId::parse(a_room).unwrap()).unwrap();
-        assert!(client.send_queue().is_enabled(), "other rooms are not held hostage");
+        assert!(!client.send_queue().is_enabled(), "the client-wide queue is never enabled; rooms resume one by one");
         assert!(!room.send_queue().is_enabled(), "the affected room stays paused");
         assert_eq!(persisted_requests(&room).await, HashSet::from([fifth_txn.clone()]));
+        // Both stored columns and the kind are carried, so the plain column
+        // that differs from the HTML survives an edit of the live draft.
+        let carried = scope.restored.envelope.quarantine().unwrap();
+        assert_eq!(carried.original_plain().as_deref(), Some(plain_column.as_str()));
+        assert_eq!(carried.original_kind(), "new");
+        let fingerprint = carried.fingerprint();
         assert!(matches!(
             manager.save_composer_draft_for(&a_account.id, a_room, "typed anyway").await,
             Err(MatrixCoreError::RecoveryBlocked)
@@ -1155,8 +1257,41 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
             manager.save_composed_draft_for(&a_account.id, a_room, None, &empty, &DraftEnvelope::fresh()).await,
             Err(MatrixCoreError::StaleDraftSnapshot)
         ), "an ordinary save cannot drop the carried original");
+        // An edit of the live draft keeps the exact carry; both columns are
+        // still there after the write and another restart.
+        let mut edited_envelope = scope.restored.envelope.clone();
+        edited_envelope.set_generation(Generation::fresh());
+        manager
+            .save_composed_draft_for(&a_account.id, a_room, None, &ComposeText::plain("edited while unreadable"), &edited_envelope)
+            .await
+            .unwrap();
+        let reloaded = manager.load_composed_draft_for(&a_account.id, a_room, None).await.unwrap();
+        assert_eq!(reloaded.text.body, "edited while unreadable");
+        let reloaded_carry = reloaded.envelope.quarantine().unwrap();
+        assert_eq!(reloaded_carry.original_plain().as_deref(), Some(plain_column.as_str()));
+        assert_eq!(reloaded_carry.original_html().as_deref(), Some(broken.as_str()));
+        assert_eq!(reloaded_carry.fingerprint(), fingerprint);
+        // A different carry cannot replace the original, and a discard must
+        // name exactly this original.
+        let mut swapped = edited_envelope.clone();
+        swapped.set_quarantine(morpheus_matrix::QuarantinedRow::new(
+            QuarantineReason::Malformed,
+            "someone else's original",
+            None,
+            "new",
+            false,
+        ));
+        assert!(matches!(
+            manager.save_composed_draft_for(&a_account.id, a_room, None, &empty, &swapped).await,
+            Err(MatrixCoreError::StaleDraftSnapshot)
+        ));
+        assert!(matches!(
+            manager.discard_quarantine_for(&selection, a_room, None, fingerprint ^ 1).await,
+            Err(MatrixCoreError::PendingSendUnknown)
+        ), "a stale discard names another original");
+        assert!(!room.send_queue().is_enabled());
         let (_, resumed) = room.send_queue().subscribe().await.unwrap();
-        manager.discard_quarantine_for(&selection, a_room, None).await.unwrap();
+        manager.discard_quarantine_for(&selection, a_room, None, fingerprint).await.unwrap();
         manager
             .save_composed_draft_for(&a_account.id, a_room, None, &empty, &DraftEnvelope::fresh())
             .await

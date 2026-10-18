@@ -218,7 +218,14 @@ impl ComposerUi {
             let mut queued = match result {
                 Ok(queued) => queued,
                 Err(error) => {
-                    let uncertain = matches!(error, morpheus_matrix::MatrixCoreError::ComposedSendUncertain);
+                    // A selection that ended mid-send cannot tell whether the
+                    // request was stored; its record also outlives this
+                    // process's ownership, so it is reviewed, not abandoned.
+                    let uncertain = matches!(
+                        error,
+                        morpheus_matrix::MatrixCoreError::ComposedSendUncertain
+                            | morpheus_matrix::MatrixCoreError::SelectedAccountChanged
+                    );
                     if let Some(handle) = &handle {
                         if uncertain {
                             // The SDK may hold the request without our id: the

@@ -24,7 +24,10 @@
 //! explicitly discards it, or the scope stays read-only when it is too large
 //! to carry. Quarantined state is never normalized into an ordinary envelope.
 
-use std::{collections::HashSet, fmt};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+};
 
 use matrix_sdk::ruma::EventId;
 use serde::{Deserialize, Serialize};
@@ -61,12 +64,17 @@ pub const MAX_RECORD_TEXT_JSON_BYTES: usize = MAX_COMPOSE_BYTES * JSON_ESCAPE_FA
 pub const MAX_RECORD_JSON_BYTES: usize = RECORD_FIXED_JSON_BYTES + MAX_RECORD_TEXT_JSON_BYTES;
 const THREAD_INDEX_JSON_BYTES: usize =
     MAX_THREAD_INDEX * (MAX_MATRIX_ID_BYTES * JSON_ESCAPE_FACTOR + 8);
-/// Largest original row carried in quarantine. Larger rows stay read-only in
-/// place. A row of this size holds a full live text plus a full envelope
-/// without its own carry, so one level of nesting is always carried.
+/// Largest original row (plain column plus HTML column) carried in
+/// quarantine. Larger rows stay read-only in place. A row of this size holds
+/// a full live text plus a full envelope without its own carry, so one level
+/// of nesting is always carried.
 pub const MAX_QUARANTINE_HTML_BYTES: usize = 2 * 1024 * 1024;
-/// The carried row is hex (exactly twice its bytes) plus its reason and keys.
-const QUARANTINE_JSON_BYTES: usize = 256 + 2 * MAX_QUARANTINE_HTML_BYTES;
+/// Longest draft kind code: `edit:` or `reply:` plus an event id.
+const MAX_QUARANTINE_KIND_BYTES: usize = 6 + MAX_MATRIX_ID_BYTES;
+/// The carried columns are hex (exactly twice their bytes) plus reason, kind,
+/// fingerprint and keys.
+const QUARANTINE_JSON_BYTES: usize =
+    512 + MAX_QUARANTINE_KIND_BYTES + 2 * MAX_QUARANTINE_HTML_BYTES;
 const ENVELOPE_FIXED_JSON_BYTES: usize = 256;
 pub const MAX_ENVELOPE_JSON_BYTES: usize = ENVELOPE_FIXED_JSON_BYTES
     + MAX_PENDING_RECORDS * MAX_RECORD_JSON_BYTES
@@ -411,25 +419,79 @@ impl fmt::Debug for PendingRecord {
     }
 }
 
-/// A complete original row this build could not interpret, carried verbatim
-/// so no newer build or explicit export loses it. Hex keeps the bound exact.
+/// Identity of one stored row: a 64-bit FNV-1a over its plain column, HTML
+/// column and draft kind. It binds a carried or read-only original to the
+/// exact row the user saw, so a discard or replacement can never apply to a
+/// different or later original.
+pub fn row_fingerprint(plain: &str, html: Option<&str>, kind: &str) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = OFFSET;
+    let mut feed = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(PRIME);
+    };
+    feed(plain.as_bytes());
+    feed(html.unwrap_or("").as_bytes());
+    feed(&[u8::from(html.is_some())]);
+    feed(kind.as_bytes());
+    hash
+}
+
+/// A row this build cannot read and will not rewrite: too large to carry, it
+/// stays untouched in the store until the user discards exactly this row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadOnlyRow {
+    pub reason: QuarantineReason,
+    pub fingerprint: u64,
+}
+
+/// The complete original stored draft this build could not interpret, carried
+/// verbatim: both text columns, the draft kind (new message, reply or edit
+/// target) and its fingerprint. Hex keeps the bound exact. Rows with
+/// attachments are not carried; they stay read-only in place.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuarantinedRow {
     reason: String,
-    html: String,
+    plain: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    html: Option<String>,
+    kind: String,
+    fingerprint: u64,
 }
 
 impl QuarantinedRow {
-    /// `None` when the row is too large to carry; the caller keeps the scope
-    /// read-only instead so the row stays untouched in the store.
-    pub fn new(reason: QuarantineReason, html: &str) -> Option<Self> {
-        if html.is_empty() || html.len() > MAX_QUARANTINE_HTML_BYTES {
+    /// `None` when the row cannot be carried completely (too large, or it
+    /// holds attachments); the caller keeps the scope read-only instead so the
+    /// row stays untouched in the store.
+    pub fn new(
+        reason: QuarantineReason,
+        plain: &str,
+        html: Option<&str>,
+        kind: &str,
+        has_attachments: bool,
+    ) -> Option<Self> {
+        let bytes = plain.len() + html.map_or(0, str::len);
+        if has_attachments
+            || bytes == 0
+            || bytes > MAX_QUARANTINE_HTML_BYTES
+            || kind.is_empty()
+            || kind.len() > MAX_QUARANTINE_KIND_BYTES
+            || !kind.is_ascii()
+        {
             return None;
         }
         Some(Self {
             reason: reason.code().to_owned(),
-            html: to_hex(html.as_bytes()),
+            plain: to_hex(plain.as_bytes()),
+            html: html.map(|html| to_hex(html.as_bytes())),
+            kind: kind.to_owned(),
+            fingerprint: row_fingerprint(plain, html, kind),
         })
     }
 
@@ -437,16 +499,44 @@ impl QuarantinedRow {
         QuarantineReason::parse(&self.reason).unwrap_or(QuarantineReason::Malformed)
     }
 
-    /// The verbatim original row.
+    pub fn fingerprint(&self) -> u64 {
+        self.fingerprint
+    }
+
+    /// The verbatim original plain-text column.
+    pub fn original_plain(&self) -> Option<String> {
+        String::from_utf8(from_hex(&self.plain)?).ok()
+    }
+
+    /// The verbatim original HTML column, when the row had one.
     pub fn original_html(&self) -> Option<String> {
-        String::from_utf8(from_hex(&self.html)?).ok()
+        String::from_utf8(from_hex(self.html.as_deref()?)?).ok()
+    }
+
+    /// The original draft kind: `new`, `reply:<event id>` or `edit:<event id>`.
+    pub fn original_kind(&self) -> &str {
+        &self.kind
     }
 
     fn is_valid(&self) -> bool {
-        QuarantineReason::parse(&self.reason).is_some()
-            && !self.html.is_empty()
-            && self.html.len() <= 2 * MAX_QUARANTINE_HTML_BYTES
-            && is_lower_hex(&self.html)
+        if QuarantineReason::parse(&self.reason).is_none()
+            || self.kind.is_empty()
+            || self.kind.len() > MAX_QUARANTINE_KIND_BYTES
+            || !self.kind.is_ascii()
+            || !is_lower_hex(&self.plain)
+            || !self.html.as_deref().is_none_or(is_lower_hex)
+            || self.plain.len() + self.html.as_deref().map_or(0, str::len)
+                > 2 * MAX_QUARANTINE_HTML_BYTES
+        {
+            return false;
+        }
+        let (Some(plain), html) = (self.original_plain(), self.original_html()) else {
+            return false;
+        };
+        if self.html.is_some() != html.is_some() || plain.is_empty() && html.is_none() {
+            return false;
+        }
+        self.fingerprint == row_fingerprint(&plain, html.as_deref(), &self.kind)
     }
 }
 
@@ -454,7 +544,7 @@ impl fmt::Debug for QuarantinedRow {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("QuarantinedRow")
             .field("reason", &self.reason)
-            .field("bytes", &(self.html.len() / 2))
+            .field("bytes", &((self.plain.len() + self.html.as_deref().map_or(0, str::len)) / 2))
             .finish()
     }
 }
@@ -731,13 +821,22 @@ impl DraftEnvelope {
     }
 }
 
-/// Why a scope refuses new sends and, when read-only, saves.
+/// Why a scope refuses new sends and, when read-only, saves. The fingerprint
+/// names the exact original row so a discard applies to that row only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScopeBlock {
     /// Saved data this build cannot read is carried in the row.
-    Quarantined,
+    Quarantined { fingerprint: u64 },
     /// The saved row is too large to carry; it is never written.
-    ReadOnly,
+    ReadOnly { fingerprint: u64 },
+}
+
+impl ScopeBlock {
+    pub fn fingerprint(self) -> u64 {
+        match self {
+            Self::Quarantined { fingerprint } | Self::ReadOnly { fingerprint } => fingerprint,
+        }
+    }
 }
 
 /// Why a save was refused: it would have erased or rewritten metadata the
@@ -751,22 +850,34 @@ pub enum SaveRejected {
     RecordReplayed,
 }
 
+/// A record this process created: the selection epoch it belongs to and
+/// whether its one enqueue capability has been issued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FreshIntent {
+    epoch: u64,
+    issued: bool,
+}
+
 /// Authoritative per-scope recovery state, mirrored from the last encrypted
 /// row read or written. Every save is checked against it: a record leaves or
 /// changes state only through an exact, authorized operation of this process,
-/// never through a stale snapshot or a replayed restored record.
+/// never through a stale snapshot or a replayed restored record; a carried
+/// original is replaced only by the exact same original or after the user
+/// discarded exactly it.
 #[derive(Clone, Default)]
 pub struct ScopeRecovery {
     records: Vec<PendingRecord>,
+    threads: Vec<String>,
+    quarantine: Option<QuarantinedRow>,
     block: Option<ScopeBlock>,
     /// Records an exact resolution released; the next save may drop or keep
     /// them. Pruned once they leave the row.
     released: HashSet<Generation>,
-    /// Records created by this process. Only these may receive a transaction
-    /// id or be abandoned without a resolution; restored records never can.
-    fresh: HashSet<Generation>,
-    /// Single-use enqueue capabilities for fresh records, consumed atomically
-    /// at the SDK boundary.
+    /// Records created by this process under a selection epoch. Only these
+    /// may receive a transaction id or be abandoned without a resolution, and
+    /// each gets exactly one enqueue capability; restored records never do.
+    fresh: HashMap<Generation, FreshIntent>,
+    /// Issued, not yet consumed enqueue capabilities.
     grants: HashSet<Generation>,
     /// The user explicitly discarded the carried or read-only original.
     quarantine_released: bool,
@@ -776,6 +887,7 @@ impl fmt::Debug for ScopeRecovery {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ScopeRecovery")
             .field("records", &self.records.len())
+            .field("threads", &self.threads.len())
             .field("block", &self.block)
             .field("released", &self.released.len())
             .field("fresh", &self.fresh.len())
@@ -795,6 +907,10 @@ impl ScopeRecovery {
         &self.records
     }
 
+    pub fn threads(&self) -> &[String] {
+        &self.threads
+    }
+
     pub fn block(&self) -> Option<ScopeBlock> {
         self.block
     }
@@ -810,34 +926,57 @@ impl ScopeRecovery {
             .count()
     }
 
-    /// Nothing worth keeping in the registry: no record and no block.
+    /// Nothing worth keeping in the registry: no record, no index, no block.
     pub fn is_idle(&self) -> bool {
-        self.records.is_empty() && self.block.is_none()
+        self.records.is_empty() && self.threads.is_empty() && self.block.is_none()
     }
 
-    /// The row was read: it is the truth for records and block. Process-local
-    /// ownership survives only for records still present.
+    /// The row was read: it is the truth for records, index, carry and block.
+    /// Process-local ownership survives only for records still present.
     pub fn apply_loaded(&mut self, restored: &RestoredCompose) {
         self.records = restored.envelope.pending().to_vec();
-        self.block = match restored.blocked() {
-            None => None,
-            Some(_) if restored.read_only.is_some() => Some(ScopeBlock::ReadOnly),
-            Some(_) => Some(ScopeBlock::Quarantined),
+        self.threads = restored.envelope.threads().to_vec();
+        self.quarantine = restored.envelope.quarantine().cloned();
+        self.block = match (restored.read_only, &self.quarantine) {
+            (Some(row), _) => Some(ScopeBlock::ReadOnly {
+                fingerprint: row.fingerprint,
+            }),
+            (None, Some(row)) => Some(ScopeBlock::Quarantined {
+                fingerprint: row.fingerprint,
+            }),
+            (None, None) => None,
         };
         self.quarantine_released = false;
         self.prune();
+    }
+
+    /// Thread roots the incoming snapshot would drop from the room index. The
+    /// caller must prove each dropped thread holds no record, kept text or
+    /// unreadable data before writing; otherwise the thread row is orphaned
+    /// from restart discovery.
+    pub fn dropped_threads(&self, incoming: &DraftEnvelope) -> Vec<String> {
+        self.threads
+            .iter()
+            .filter(|root| !incoming.threads().contains(root))
+            .cloned()
+            .collect()
     }
 
     /// Would writing `incoming` over the current row erase or rewrite
     /// anything the caller does not own?
     pub fn check_save(&self, incoming: &DraftEnvelope) -> Result<(), SaveRejected> {
         match self.block {
-            Some(ScopeBlock::ReadOnly) if !self.quarantine_released => {
+            Some(ScopeBlock::ReadOnly { .. }) if !self.quarantine_released => {
                 return Err(SaveRejected::ReadOnly);
             }
-            Some(ScopeBlock::Quarantined)
-                if incoming.quarantine().is_none() && !self.quarantine_released =>
+            Some(ScopeBlock::Quarantined { .. })
+                if !self.quarantine_released && incoming.quarantine() != self.quarantine.as_ref() =>
             {
+                // Only the exact carried original may ride along; a different
+                // or stale carry would replace unreadable data unreviewed.
+                return Err(SaveRejected::QuarantineDropped);
+            }
+            None if incoming.quarantine().is_some() => {
                 return Err(SaveRejected::QuarantineDropped);
             }
             _ => {}
@@ -846,7 +985,7 @@ impl ScopeRecovery {
             let Some(next) = incoming.find(&current.nonce) else {
                 let abandoned_fresh = !current.is_queued()
                     && !current.is_kept()
-                    && self.fresh.contains(&current.nonce);
+                    && self.fresh.contains_key(&current.nonce);
                 if self.released.contains(&current.nonce) || abandoned_fresh {
                     continue;
                 }
@@ -870,7 +1009,7 @@ impl ScopeRecovery {
                 return Err(SaveRejected::RecordDropped);
             }
             if !current.is_queued() && next.is_queued() {
-                if self.fresh.contains(&current.nonce) {
+                if self.fresh.contains_key(&current.nonce) {
                     continue;
                 }
                 return Err(SaveRejected::RecordReplayed);
@@ -885,15 +1024,29 @@ impl ScopeRecovery {
         Ok(())
     }
 
-    /// The row was written with `incoming` after `check_save` passed.
-    pub fn apply_saved(&mut self, incoming: &DraftEnvelope) {
+    /// The row was written with `incoming` after `check_save` passed, under
+    /// the given selection epoch.
+    pub fn apply_saved(&mut self, incoming: &DraftEnvelope, epoch: u64) {
         for next in incoming.pending() {
             if self.find(&next.nonce).is_none() {
-                self.fresh.insert(next.nonce.clone());
+                self.fresh.insert(
+                    next.nonce.clone(),
+                    FreshIntent {
+                        epoch,
+                        issued: false,
+                    },
+                );
             }
         }
         self.records = incoming.pending().to_vec();
-        self.block = incoming.quarantine().map(|_| ScopeBlock::Quarantined);
+        self.threads = incoming.threads().to_vec();
+        self.quarantine = incoming.quarantine().cloned();
+        self.block = self
+            .quarantine
+            .as_ref()
+            .map(|row| ScopeBlock::Quarantined {
+                fingerprint: row.fingerprint,
+            });
         self.quarantine_released = false;
         self.prune();
     }
@@ -901,6 +1054,8 @@ impl ScopeRecovery {
     /// The row was deleted.
     pub fn apply_cleared(&mut self) {
         self.records.clear();
+        self.threads.clear();
+        self.quarantine = None;
         self.block = None;
         self.quarantine_released = false;
         self.prune();
@@ -919,44 +1074,54 @@ impl ScopeRecovery {
         owned
     }
 
-    /// The user explicitly discarded saved data this build could not read.
-    pub fn release_quarantine(&mut self) -> bool {
-        if self.block.is_none() {
+    /// The user explicitly discarded exactly this original (by fingerprint).
+    pub fn release_quarantine(&mut self, fingerprint: u64) -> bool {
+        if self.block.map(ScopeBlock::fingerprint) != Some(fingerprint) {
             return false;
         }
         self.quarantine_released = true;
         true
     }
 
-    /// Issue the single-use enqueue capability for a record this process
-    /// created and already saved as enqueuing. Restored records never qualify.
-    pub fn grant(&mut self, nonce: &Generation) -> bool {
-        let eligible = self.fresh.contains(nonce)
-            && self
-                .find(nonce)
-                .is_some_and(|record| !record.is_queued() && !record.is_kept());
-        if eligible {
-            self.grants.insert(nonce.clone());
+    /// Issue the single enqueue capability for a record this process created
+    /// under the same selection epoch and already saved as enqueuing. It is
+    /// issued once; restored records and other epochs never qualify.
+    pub fn grant(&mut self, nonce: &Generation, epoch: u64) -> bool {
+        let enqueuing = self
+            .find(nonce)
+            .is_some_and(|record| !record.is_queued() && !record.is_kept());
+        let Some(intent) = self.fresh.get_mut(nonce) else {
+            return false;
+        };
+        if !enqueuing || intent.epoch != epoch || intent.issued {
+            return false;
         }
-        eligible
+        intent.issued = true;
+        self.grants.insert(nonce.clone());
+        true
     }
 
-    /// Consume the capability at the SDK boundary. False means no fresh
-    /// intent owns this enqueue: a restored or already used record.
-    pub fn consume_grant(&mut self, nonce: &Generation) -> bool {
+    /// Consume the capability at the SDK boundary under the same selection
+    /// epoch. False means no fresh intent of this selection owns this enqueue.
+    pub fn consume_grant(&mut self, nonce: &Generation, epoch: u64) -> bool {
+        if self.fresh.get(nonce).is_none_or(|intent| intent.epoch != epoch) {
+            return false;
+        }
         self.grants.remove(nonce)
     }
 
-    /// A new selection epoch: capabilities issued under the old one die.
-    pub fn clear_grants(&mut self) {
+    /// A new selection epoch: every capability and every fresh ownership of
+    /// the old one dies. Its records stay as restored records would.
+    pub fn revoke_process_ownership(&mut self) {
         self.grants.clear();
+        self.fresh.clear();
     }
 
     fn prune(&mut self) {
         let present: HashSet<Generation> =
             self.records.iter().map(|record| record.nonce.clone()).collect();
         self.released.retain(|nonce| present.contains(nonce));
-        self.fresh.retain(|nonce| present.contains(nonce));
+        self.fresh.retain(|nonce, _| present.contains(nonce));
         self.grants.retain(|nonce| {
             self.records
                 .iter()
@@ -1217,14 +1382,21 @@ mod tests {
             assert_eq!(root.len(), MAX_MATRIX_ID_BYTES);
             envelope.index_thread(&root).unwrap();
         }
-        let carried = "\u{1}".repeat(MAX_QUARANTINE_HTML_BYTES);
-        envelope.set_quarantine(QuarantinedRow::new(QuarantineReason::Malformed, &carried));
+        let carried = "\u{1}".repeat(MAX_QUARANTINE_HTML_BYTES / 2);
+        let kind = format!("reply:${}:example.org", "e".repeat(MAX_MATRIX_ID_BYTES - 13));
+        envelope.set_quarantine(QuarantinedRow::new(
+            QuarantineReason::Malformed,
+            &carried,
+            Some(&carried),
+            &kind,
+            false,
+        ));
         assert!(envelope.quarantine().is_some());
         let hex = envelope.encode().unwrap();
         assert!(hex.len() <= MAX_ENVELOPE_HEX_BYTES, "{}", hex.len());
         assert_eq!(DraftEnvelope::decode(&hex).unwrap(), envelope);
         let too_big = "x".repeat(MAX_QUARANTINE_HTML_BYTES + 1);
-        assert!(QuarantinedRow::new(QuarantineReason::TooLarge, &too_big).is_none());
+        assert!(QuarantinedRow::new(QuarantineReason::TooLarge, &too_big, None, "new", false).is_none());
     }
 
     #[test]
@@ -1255,9 +1427,10 @@ mod tests {
     #[test]
     fn quarantined_rows_are_carried_verbatim_and_cleared_only_explicitly() {
         let original = "<span data-morpheus-compose=\"7\" data-format=\"plain\">kept \u{1F600} text</span>";
-        let row = QuarantinedRow::new(QuarantineReason::UnsupportedVersion, original).unwrap();
+        let row = QuarantinedRow::new(QuarantineReason::UnsupportedVersion, "kept text", Some(original), "new", false).unwrap();
         assert_eq!(row.reason(), QuarantineReason::UnsupportedVersion);
         assert_eq!(row.original_html().as_deref(), Some(original));
+        assert_eq!(row.original_plain().as_deref(), Some("kept text"));
         let mut envelope = DraftEnvelope::fresh();
         envelope.set_quarantine(Some(row.clone()));
         assert!(!envelope.is_empty());
@@ -1277,10 +1450,9 @@ mod tests {
         assert!(decoded.clear_quarantine());
         assert!(!decoded.clear_quarantine());
         // Invalid carries never pass validation.
-        assert!(QuarantinedRow::new(QuarantineReason::Malformed, "").is_none());
         let forged = to_hex(
             format!(
-                r#"{{"v":2,"generation":"{g}","quarantine":{{"reason":"other","html":"ab"}}}}"#,
+                r#"{{"v":2,"generation":"{g}","quarantine":{{"reason":"other","plain":"ab","kind":"new","fingerprint":1}}}}"#,
                 g = "0".repeat(32)
             )
             .as_bytes(),
@@ -1288,7 +1460,7 @@ mod tests {
         assert_eq!(DraftEnvelope::decode(&forged), Err(RecoveryCodecError::Malformed));
         let odd_hex = to_hex(
             format!(
-                r#"{{"v":2,"generation":"{g}","quarantine":{{"reason":"malformed","html":"abc"}}}}"#,
+                r#"{{"v":2,"generation":"{g}","quarantine":{{"reason":"malformed","plain":"abc","kind":"new","fingerprint":1}}}}"#,
                 g = "0".repeat(32)
             )
             .as_bytes(),
@@ -1296,7 +1468,7 @@ mod tests {
         assert_eq!(DraftEnvelope::decode(&odd_hex), Err(RecoveryCodecError::Malformed));
     }
 
-    fn restored_with(envelope: DraftEnvelope, read_only: Option<QuarantineReason>) -> RestoredCompose {
+    fn restored_with(envelope: DraftEnvelope, read_only: Option<ReadOnlyRow>) -> RestoredCompose {
         RestoredCompose {
             text: typed("live"),
             discarded_rich_intent: false,
@@ -1304,6 +1476,8 @@ mod tests {
             read_only,
         }
     }
+
+    const EPOCH: u64 = 7;
 
     #[test]
     fn saves_cannot_drop_or_rewrite_records_without_an_exact_resolution() {
@@ -1331,7 +1505,7 @@ mod tests {
         let mut replay = row.clone();
         assert!(replay.mark_queued(&lost, "ffff"));
         assert_eq!(scope.check_save(&replay), Err(SaveRejected::RecordReplayed));
-        assert!(!scope.grant(&lost), "restored records get no enqueue grant");
+        assert!(!scope.grant(&lost, EPOCH), "restored records get no enqueue grant");
         // Keeping a record is a resolution and needs the release as well.
         let mut kept = row.clone();
         assert!(kept.keep_pending(&queued));
@@ -1349,7 +1523,7 @@ mod tests {
         rewritten.begin_pending(lost.clone(), row.pending()[1].generation().clone(), &typed("l"), false).unwrap();
         assert_eq!(scope.check_save(&rewritten), Err(SaveRejected::RecordRegressed));
         // After the save the released record is gone and the release pruned.
-        scope.apply_saved(&stale);
+        scope.apply_saved(&stale, EPOCH);
         assert_eq!(scope.records().len(), 1);
         assert!(!scope.release(&queued, Some(TXN)));
         // Kept text never goes back to a send.
@@ -1365,7 +1539,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_records_follow_the_grant_lifecycle_and_restored_ones_cannot_replay() {
+    fn fresh_records_follow_the_one_use_grant_lifecycle_bound_to_the_selection_epoch() {
         let mut scope = ScopeRecovery::default();
         let mut row = DraftEnvelope::fresh();
         let nonce = Generation::fresh();
@@ -1378,65 +1552,141 @@ mod tests {
         let forged_nonce = forged.pending()[0].nonce().clone();
         assert!(forged.mark_queued(&forged_nonce, "aaaa"));
         assert_eq!(scope.check_save(&forged), Err(SaveRejected::RecordReplayed));
-        scope.apply_saved(&row);
-        assert!(!scope.consume_grant(&nonce), "no grant before it is issued");
-        assert!(scope.grant(&nonce));
-        assert!(scope.consume_grant(&nonce));
-        assert!(!scope.consume_grant(&nonce), "single use");
+        scope.apply_saved(&row, EPOCH);
+        assert!(!scope.consume_grant(&nonce, EPOCH), "no grant before it is issued");
+        assert!(!scope.grant(&nonce, EPOCH + 1), "another selection epoch cannot ask");
+        assert!(scope.grant(&nonce, EPOCH));
+        assert!(!scope.grant(&nonce, EPOCH), "issued once");
+        assert!(!scope.consume_grant(&nonce, EPOCH + 1), "another epoch cannot consume");
+        assert!(scope.consume_grant(&nonce, EPOCH));
+        assert!(!scope.consume_grant(&nonce, EPOCH), "single use");
+        // Consumed is consumed: the record is still enqueuing (the id is not
+        // yet persisted) and still cannot be granted again.
+        assert!(!scope.grant(&nonce, EPOCH), "no regrant while the record stays enqueuing");
         // The fresh record may now take its transaction id, once.
         let mut queued = row.clone();
         assert!(queued.mark_queued(&nonce, TXN));
         assert_eq!(scope.check_save(&queued), Ok(()));
-        scope.apply_saved(&queued);
-        assert!(!scope.grant(&nonce), "a queued record needs no grant");
+        scope.apply_saved(&queued, EPOCH);
+        assert!(!scope.grant(&nonce, EPOCH), "a queued record needs no grant");
         assert_eq!(scope.check_save(&row), Err(SaveRejected::RecordRegressed), "a queued record cannot go back to enqueuing");
         // Abandoning is allowed only while the fresh record never got an id.
         let mut again = ScopeRecovery::default();
-        again.apply_saved(&row);
+        again.apply_saved(&row, EPOCH);
         let empty = DraftEnvelope::fresh();
         assert_eq!(again.check_save(&empty), Ok(()));
         assert_eq!(scope.check_save(&empty), Err(SaveRejected::RecordDropped));
+        // Account A -> B -> A: the new selection epoch revokes the old fresh
+        // ownership. The old enqueuing record can be neither granted nor
+        // abandoned; it is now a restored record awaiting review.
+        let mut aba = ScopeRecovery::default();
+        aba.apply_saved(&row, EPOCH);
+        assert!(aba.grant(&nonce, EPOCH));
+        aba.revoke_process_ownership();
+        assert!(!aba.consume_grant(&nonce, EPOCH));
+        assert!(!aba.grant(&nonce, EPOCH));
+        assert!(!aba.grant(&nonce, EPOCH + 1));
+        assert_eq!(aba.check_save(&empty), Err(SaveRejected::RecordDropped));
+        assert_eq!(aba.check_save(&queued), Err(SaveRejected::RecordReplayed));
         // A restart turns the same row into restored records: no fresh
         // ownership, no grants, no abandonment without resolution.
         let restored = ScopeRecovery::from_restored(&restored_with(queued.clone(), None));
         assert_eq!(restored.check_save(&empty), Err(SaveRejected::RecordDropped));
         let mut restored = restored;
-        assert!(!restored.grant(&nonce));
-        assert!(!restored.consume_grant(&nonce));
+        assert!(!restored.grant(&nonce, EPOCH));
+        assert!(!restored.consume_grant(&nonce, EPOCH));
     }
 
     #[test]
-    fn quarantine_and_read_only_blocks_hold_until_the_explicit_release() {
-        let original = "<span data-morpheus-compose=\"9\" data-format=\"plain\">x</span>";
+    fn dropped_thread_index_entries_are_named_for_the_caller_to_prove_idle() {
+        let mut row = DraftEnvelope::fresh();
+        row.index_thread("$one:example.org").unwrap();
+        row.index_thread("$two:example.org").unwrap();
+        let mut scope = ScopeRecovery::from_restored(&restored_with(row.clone(), None));
+        assert!(!scope.is_idle(), "an index alone keeps the scope alive");
+        // A stale snapshot taken before the index existed drops both roots.
+        let stale = DraftEnvelope::fresh();
+        assert_eq!(scope.dropped_threads(&stale), vec!["$one:example.org", "$two:example.org"]);
+        let mut partial = row.clone();
+        assert!(partial.unindex_thread("$two:example.org"));
+        assert_eq!(scope.dropped_threads(&partial), vec!["$two:example.org"]);
+        let mut grown = row.clone();
+        grown.index_thread("$three:example.org").unwrap();
+        assert!(scope.dropped_threads(&grown).is_empty());
+        scope.apply_saved(&partial, EPOCH);
+        assert_eq!(scope.threads(), ["$one:example.org"]);
+        scope.apply_cleared();
+        assert!(scope.is_idle());
+    }
+
+    #[test]
+    fn quarantine_and_read_only_blocks_hold_until_the_exact_explicit_release() {
+        let original_html = "<span data-morpheus-compose=\"9\" data-format=\"plain\">x</span>";
+        let row = QuarantinedRow::new(
+            QuarantineReason::UnsupportedVersion,
+            "plain column differs",
+            Some(original_html),
+            "reply:$target:example.org",
+            false,
+        )
+        .unwrap();
+        assert_eq!(row.original_plain().as_deref(), Some("plain column differs"));
+        assert_eq!(row.original_html().as_deref(), Some(original_html));
+        assert_eq!(row.original_kind(), "reply:$target:example.org");
+        assert_eq!(
+            row.fingerprint(),
+            row_fingerprint("plain column differs", Some(original_html), "reply:$target:example.org")
+        );
         let mut carried = DraftEnvelope::fresh();
-        carried.set_quarantine(QuarantinedRow::new(QuarantineReason::UnsupportedVersion, original));
+        carried.set_quarantine(Some(row.clone()));
         let mut scope = ScopeRecovery::from_restored(&restored_with(carried.clone(), None));
-        assert_eq!(scope.block(), Some(ScopeBlock::Quarantined));
+        assert_eq!(scope.block(), Some(ScopeBlock::Quarantined { fingerprint: row.fingerprint() }));
         let mut edit = carried.clone();
         edit.set_generation(Generation::fresh());
-        assert_eq!(scope.check_save(&edit), Ok(()), "edits that keep the carry are fine");
+        assert_eq!(scope.check_save(&edit), Ok(()), "edits that keep the exact carry are fine");
         let plain = DraftEnvelope::fresh();
         assert_eq!(scope.check_save(&plain), Err(SaveRejected::QuarantineDropped));
-        assert!(scope.release_quarantine());
+        // A different or stale carry cannot replace the unreadable original.
+        let other = QuarantinedRow::new(QuarantineReason::Malformed, "other", None, "new", false).unwrap();
+        let mut swapped = carried.clone();
+        swapped.set_quarantine(Some(other.clone()));
+        assert_eq!(scope.check_save(&swapped), Err(SaveRejected::QuarantineDropped));
+        // A discard names the exact original; a stale fingerprint is refused.
+        assert!(!scope.release_quarantine(other.fingerprint()));
+        assert!(scope.release_quarantine(row.fingerprint()));
         assert_eq!(scope.check_save(&plain), Ok(()));
-        scope.apply_saved(&plain);
+        scope.apply_saved(&plain, EPOCH);
         assert_eq!(scope.block(), None);
-        assert!(!scope.release_quarantine(), "nothing left to release");
+        assert!(!scope.release_quarantine(row.fingerprint()), "nothing left to release");
+        // Without a block, nothing may introduce a carry out of nowhere.
+        assert_eq!(scope.check_save(&swapped), Err(SaveRejected::QuarantineDropped));
         // Read-only: no save at all until released, then the first save wins.
-        let mut frozen = ScopeRecovery::from_restored(&restored_with(
-            DraftEnvelope::fresh(),
-            Some(QuarantineReason::TooLarge),
-        ));
-        assert_eq!(frozen.block(), Some(ScopeBlock::ReadOnly));
+        let frozen_row = ReadOnlyRow {
+            reason: QuarantineReason::TooLarge,
+            fingerprint: 42,
+        };
+        let mut frozen = ScopeRecovery::from_restored(&restored_with(DraftEnvelope::fresh(), Some(frozen_row)));
+        assert_eq!(frozen.block(), Some(ScopeBlock::ReadOnly { fingerprint: 42 }));
         assert_eq!(frozen.check_save(&plain), Err(SaveRejected::ReadOnly));
         assert_eq!(frozen.check_save(&carried), Err(SaveRejected::ReadOnly));
-        assert!(frozen.release_quarantine());
+        assert!(!frozen.release_quarantine(41));
+        assert!(frozen.release_quarantine(42));
         assert_eq!(frozen.check_save(&plain), Ok(()));
         // Reloading the row re-arms the block; it was not normalized away.
         frozen.apply_loaded(&restored_with(carried.clone(), None));
-        assert_eq!(frozen.block(), Some(ScopeBlock::Quarantined));
+        assert_eq!(frozen.block(), Some(ScopeBlock::Quarantined { fingerprint: row.fingerprint() }));
         assert_eq!(frozen.check_save(&plain), Err(SaveRejected::QuarantineDropped));
         assert!(!format!("{frozen:?}").contains("data-morpheus"));
+        // Rows with attachments or nothing to carry are not carried.
+        assert!(QuarantinedRow::new(QuarantineReason::Malformed, "x", None, "new", true).is_none());
+        assert!(QuarantinedRow::new(QuarantineReason::Malformed, "", None, "new", false).is_none());
+        // A tampered carry (fingerprint not matching its columns) is invalid.
+        let mut tampered = DraftEnvelope::fresh();
+        tampered.set_quarantine(Some(row.clone()));
+        let hex = tampered.encode().unwrap();
+        let json = String::from_utf8(from_hex(&hex).unwrap()).unwrap();
+        let forged = json.replace(&row.fingerprint().to_string(), &(row.fingerprint() ^ 1).to_string());
+        assert_eq!(DraftEnvelope::decode(&to_hex(forged.as_bytes())), Err(RecoveryCodecError::Malformed));
     }
 
     #[test]
@@ -1446,7 +1696,7 @@ mod tests {
         assert!(!rendered.contains(TXN));
         assert!(!rendered.contains(envelope.generation().as_key()));
         assert!(!rendered.contains("casey"));
-        let row = QuarantinedRow::new(QuarantineReason::Malformed, "<b>secret</b>").unwrap();
+        let row = QuarantinedRow::new(QuarantineReason::Malformed, "secret", Some("<b>secret</b>"), "new", false).unwrap();
         assert!(!format!("{row:?}").contains("secret"));
     }
 }

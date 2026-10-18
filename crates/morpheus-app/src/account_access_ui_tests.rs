@@ -1563,9 +1563,19 @@ async fn exercise_account_ui(runtime: Handle) {
     directory.close().unwrap();
 }
 
+/// Window-relative bounds of one real generated control: left, top, right,
+/// bottom.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Bounds {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
 /// Where the real generated controls with a given accessible label sit, as
-/// window-relative left and right edges. Empty when none is instantiated.
-fn control_extents(ui: &AppWindow, label: &str) -> Vec<(f32, f32)> {
+/// window-relative bounds. Empty when none is instantiated.
+fn control_bounds(ui: &AppWindow, label: &str) -> Vec<Bounds> {
     use slint::private_unstable_api::re_exports::{
         AccessibleStringProperty, ItemRc, LogicalPoint, WindowInner,
     };
@@ -1573,7 +1583,7 @@ fn control_extents(ui: &AppWindow, label: &str) -> Vec<(f32, f32)> {
 
     let window = WindowInner::from_pub(ui.window());
     let root = ItemRc::new_root(window.component());
-    let mut extents = Vec::new();
+    let mut bounds = Vec::new();
     let _ = root.visit_descendants(|item| {
         if item
             .accessible_string_property(AccessibleStringProperty::Label)
@@ -1582,11 +1592,68 @@ fn control_extents(ui: &AppWindow, label: &str) -> Vec<(f32, f32)> {
         {
             let origin = item.map_to_window(LogicalPoint::default());
             let size = item.geometry().size;
-            extents.push((origin.x, origin.x + size.width));
+            bounds.push(Bounds {
+                left: origin.x,
+                top: origin.y,
+                right: origin.x + size.width,
+                bottom: origin.y + size.height,
+            });
         }
         ControlFlow::<()>::Continue(())
     });
-    extents
+    bounds
+}
+
+/// Left and right edges only, for callers that check the horizontal axis.
+fn control_extents(ui: &AppWindow, label: &str) -> Vec<(f32, f32)> {
+    control_bounds(ui, label)
+        .into_iter()
+        .map(|bounds| (bounds.left, bounds.right))
+        .collect()
+}
+
+/// Bounds of the control that currently has keyboard focus, if any.
+fn focused_control_bounds(ui: &AppWindow) -> Option<Bounds> {
+    use slint::private_unstable_api::re_exports::{LogicalPoint, WindowInner};
+
+    let window = WindowInner::from_pub(ui.window());
+    let focused = window.focus_item.borrow().upgrade()?;
+    let origin = focused.map_to_window(LogicalPoint::default());
+    let size = focused.geometry().size;
+    Some(Bounds {
+        left: origin.x,
+        top: origin.y,
+        right: origin.x + size.width,
+        bottom: origin.y + size.height,
+    })
+}
+
+fn window_size(ui: &AppWindow) -> (f32, f32) {
+    let size = ui.window().size().to_logical(ui.window().scale_factor());
+    (size.width, size.height)
+}
+
+fn inside_window(ui: &AppWindow, bounds: Bounds) -> bool {
+    let (width, height) = window_size(ui);
+    bounds.right > bounds.left
+        && bounds.bottom > bounds.top
+        && bounds.left >= -0.5
+        && bounds.top >= -0.5
+        && bounds.right <= width + 0.5
+        && bounds.bottom <= height + 0.5
+}
+
+/// Walk the real tab order to a saved-send control with a budget sized for a
+/// strip of eight records. The account and appearance walks keep their own
+/// `tab_to_control` budget; this helper does not change it.
+fn tab_to_record_control(ui: &AppWindow, label: &str) {
+    for _ in 0..400 {
+        if focused_control_has_label(ui, label) {
+            return;
+        }
+        key(ui, Key::Tab);
+    }
+    panic!("Saved-send control is not keyboard reachable: {label}");
 }
 
 const CANCEL_LABEL: &str =
@@ -1707,6 +1774,7 @@ async fn assert_recovery_strip_projection(ui: &AppWindow) {
     // every control inside the window and still keyboard reachable.
     ui.set_font_scale_percent(200);
     ui.set_thread_root_id("$presentation-root:example.org".into());
+    ui.set_thread_root_sender("@jules:example.org".into());
     ui.set_thread_root_body("Fictional thread root".into());
     ui.set_thread_composer_text("".into());
     tab_to_control(ui, "Show thread");
@@ -1748,6 +1816,135 @@ async fn assert_recovery_strip_projection(ui: &AppWindow) {
         thread_reviews.borrow().as_slice(),
         [(true, unconfirmed.as_key().to_owned(), true)]
     );
+    assert_bounded_strip_with_eight_records(ui).await;
     ui.set_font_scale_percent(previous_scale);
+    settle(ui).await;
+}
+
+/// The strip is a bounded viewport: with the maximum eight records at 200%
+/// text, in the wide room composer and in the narrow thread pane, every
+/// record and action is retained, the composer input and the conversation
+/// keep their space, and each control is scrolled fully into the window on
+/// both axes when it receives keyboard focus.
+async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
+    use crate::draft_recovery;
+    use crate::drafts::{PendingItem, PendingStatus, PendingSummary};
+    use morpheus_matrix::Generation;
+
+    let (window_width, window_height) = window_size(ui);
+    let records: Vec<PendingItem> = (0..morpheus_matrix::MAX_PENDING_RECORDS)
+        .map(|index| PendingItem {
+            nonce: Generation::fresh(),
+            status: match index % 4 {
+                0 => PendingStatus::Queued,
+                1 => PendingStatus::Paused { recoverable: false },
+                2 => PendingStatus::Unconfirmed,
+                _ => PendingStatus::Kept,
+            },
+            preview: format!("fictional record {index} with a long enough preview to wrap"),
+            has_request: index % 4 < 2,
+        })
+        .collect();
+    let summary = PendingSummary {
+        count: 6,
+        kept: 2,
+        blocked: true,
+        unconfirmed: true,
+        quarantined: false,
+        read_only: false,
+    };
+    assert_eq!(ui.get_font_scale_percent(), 200);
+
+    // Room composer, wide layout.
+    ui.set_composer_text("".into());
+    let composer_label = format!("Message composer for {}", ui.get_active_room_name());
+    draft_recovery::publish_room(ui, &summary, &records);
+    settle(ui).await;
+    assert_eq!(ui.get_composer_pending_items().row_count(), 8);
+    // Every record keeps its actions: eight Copy controls exist in the tree.
+    assert_eq!(control_bounds(ui, COPY_LABEL).len(), 8 + 2, "room and thread strips both hold their records");
+    // The viewport is bounded: the composer input is still fully visible,
+    // leaving conversation space above the strip.
+    let composer = control_bounds(ui, &composer_label);
+    assert_eq!(composer.len(), 1, "the room composer input is instantiated once");
+    assert!(inside_window(ui, composer[0]), "composer input clipped: {:?}", composer[0]);
+    assert!(
+        composer[0].top > window_height / 3.0,
+        "the strip must not push the composer out of the lower part of the window: {:?}",
+        composer[0]
+    );
+    // Focus walks every control of all eight records down to the composer
+    // input; each strip control is scrolled fully into view on both axes
+    // when it receives focus, so the deepest record is reachable by keyboard
+    // alone. Without a bounded viewport the lower records would sit below the
+    // window.
+    let cancels = control_bounds(ui, CANCEL_LABEL);
+    assert_eq!(cancels.len(), 4 + 1, "four room records and one thread record still own a request");
+    let strip_labels = [
+        KEEP_LABEL,
+        SENT_LABEL,
+        CANCEL_LABEL,
+        COPY_LABEL,
+        RESTORE_LABEL,
+        "Retry sending this message",
+        "Discard this kept text",
+    ];
+    tab_to_record_control(ui, CANCEL_LABEL);
+    let mut room_strip_controls = 0;
+    for _ in 0..400 {
+        if focused_control_has_label(ui, &composer_label) {
+            break;
+        }
+        for label in strip_labels {
+            if focused_control_has_label(ui, label) {
+                let focused = focused_control_bounds(ui).expect("a focused saved-send control");
+                assert!(inside_window(ui, focused), "{label} clipped in the room strip: {focused:?}");
+                assert!(focused.left < window_width / 2.0, "{label} must sit in the room composer: {focused:?}");
+                room_strip_controls += 1;
+            }
+        }
+        key(ui, Key::Tab);
+    }
+    assert!(room_strip_controls >= 28, "the walk must traverse all eight room records, saw {room_strip_controls}");
+    assert!(
+        focused_control_has_label(ui, &composer_label),
+        "the tab walk must leave the strip and reach the composer input"
+    );
+    let focused = focused_control_bounds(ui).unwrap();
+    assert!(inside_window(ui, focused), "composer input not revealed: {focused:?}");
+
+    // Narrow thread pane at 200%: the same eight records, stacked controls,
+    // bounded viewport, thread input still visible.
+    ui.set_thread_composer_text("".into());
+    let thread_label = format!("Reply in thread started by {}", ui.get_thread_root_sender());
+    draft_recovery::publish_thread(ui, &summary, &records);
+    settle(ui).await;
+    assert_eq!(ui.get_thread_pending_items().row_count(), 8);
+    let thread_input = control_bounds(ui, &thread_label);
+    assert_eq!(thread_input.len(), 1, "the thread input is instantiated once");
+    assert!(inside_window(ui, thread_input[0]), "thread input clipped: {:?}", thread_input[0]);
+    assert!(thread_input[0].top > window_height / 3.0, "the thread strip must leave room above: {:?}", thread_input[0]);
+    // Walk from the thread tab into the thread strip: every focused control
+    // is fully inside the window on both axes, including stacked ones.
+    tab_to_control(ui, "Show thread");
+    let mut seen_strip_controls = 0;
+    for _ in 0..400 {
+        key(ui, Key::Tab);
+        if focused_control_has_label(ui, &thread_label) {
+            break;
+        }
+        for label in strip_labels {
+            if focused_control_has_label(ui, label) {
+                let focused = focused_control_bounds(ui).unwrap();
+                assert!(inside_window(ui, focused), "{label} clipped in the thread pane: {focused:?}");
+                assert!(focused.left >= window_width / 2.0, "{label} must sit in the side pane: {focused:?}");
+                seen_strip_controls += 1;
+            }
+        }
+    }
+    assert!(seen_strip_controls >= 28, "the walk must traverse all eight thread records, saw {seen_strip_controls}");
+    assert!(focused_control_has_label(ui, &thread_label), "the walk must end at the thread input");
+    draft_recovery::publish_thread(ui, &PendingSummary::default(), &[]);
+    draft_recovery::publish_room(ui, &PendingSummary::default(), &[]);
     settle(ui).await;
 }

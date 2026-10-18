@@ -28,8 +28,7 @@ use std::{
 
 use morpheus_matrix::{
     AccountManager, ComposeError, ComposeText, DraftEnvelope, Generation, MatrixCoreError,
-    PendingLimitError, PendingRecord, QuarantineReason, QuarantinedRow, RecordText,
-    RestoredCompose,
+    PendingLimitError, PendingRecord, QuarantinedRow, ReadOnlyRow, RecordText, RestoredCompose,
 };
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -187,8 +186,18 @@ impl PendingDraft {
 enum Quarantine {
     /// The complete original row rides in the envelope of every save.
     Carried(QuarantinedRow),
-    /// The original row is too large to carry; the scope is never written.
-    ReadOnly(QuarantineReason),
+    /// The original row cannot be carried completely; the scope is never
+    /// written. Identified exactly so a discard applies to that row only.
+    ReadOnly(ReadOnlyRow),
+}
+
+impl Quarantine {
+    fn fingerprint(&self) -> u64 {
+        match self {
+            Self::Carried(row) => row.fingerprint(),
+            Self::ReadOnly(row) => row.fingerprint,
+        }
+    }
 }
 
 struct CachedDraft {
@@ -341,10 +350,13 @@ impl CachedDraft {
         })
     }
 
-    /// The record's send is over without evidence of delivery: restore its
-    /// text into an empty composer, otherwise keep it beside the newer text.
+    /// The record's send is over without evidence of delivery. Its text goes
+    /// back into the composer only while the record still owns the draft
+    /// generation (queue acceptance cleared the text without changing it); any
+    /// later edit, including one that left the composer empty again, is a
+    /// newer draft and the text is kept as its own record instead.
     fn end_without_delivery(&mut self, index: usize) -> Resolution {
-        if self.text.body.is_empty() {
+        if self.text.body.is_empty() && self.pending[index].generation == self.generation {
             let record = self.pending.remove(index);
             self.text = record.text.clone();
             self.edited();
@@ -405,7 +417,7 @@ impl CachedDraft {
             });
         }
         let quarantine = match (read_only, envelope.quarantine()) {
-            (Some(reason), _) => Some(Quarantine::ReadOnly(reason)),
+            (Some(row), _) => Some(Quarantine::ReadOnly(row)),
             (None, Some(row)) => Some(Quarantine::Carried(row.clone())),
             (None, None) => None,
         };
@@ -898,16 +910,30 @@ impl DraftStore {
         true
     }
 
-    /// Explicit user discard of saved data this build could not read. The
-    /// scope becomes writable; the next save replaces the original row.
-    pub fn discard_quarantine(&self, account: &str, room: &str, thread: Option<&str>) -> bool {
+    /// Identity of the unreadable original this scope carries or freezes on,
+    /// as the core's discard requires.
+    pub fn quarantine_fingerprint(&self, account: &str, room: &str, thread: Option<&str>) -> Option<u64> {
+        self.by_room
+            .lock()
+            .expect("draft mutex poisoned")
+            .get(&key(account, room, thread))?
+            .quarantine
+            .as_ref()
+            .map(Quarantine::fingerprint)
+    }
+
+    /// Explicit user discard of exactly the unreadable original they reviewed.
+    /// The scope becomes writable; the next save replaces the original row. A
+    /// different original (changed underneath the review) is left alone.
+    pub fn discard_quarantine(&self, account: &str, room: &str, thread: Option<&str>, fingerprint: u64) -> bool {
         let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
         let Some(draft) = drafts.get_mut(&key(account, room, thread)) else {
             return false;
         };
-        if draft.quarantine.take().is_none() {
+        if draft.quarantine.as_ref().map(Quarantine::fingerprint) != Some(fingerprint) {
             return false;
         }
+        draft.quarantine = None;
         draft.changed();
         true
     }
@@ -1368,6 +1394,48 @@ mod tests {
     }
 
     #[test]
+    fn automatic_restore_requires_the_record_to_still_own_the_draft_generation() {
+        let drafts = DraftStore::default();
+        let handle = begin(&drafts, "a", "room", None, "unsent");
+        drafts.mark_pending_queued("a", "room", None, &handle, TXN_ONE);
+        // Queue acceptance cleared the text without changing the generation,
+        // so a cancellation puts the record's text straight back.
+        let same_generation = drafts.generation_of("a", "room", None).unwrap();
+        assert_eq!(drafts.get("a", "room"), "");
+        let resolution = drafts.resolve_pending("a", "room", None, handle.nonce(), Some(TXN_ONE), false).unwrap();
+        assert_eq!(resolution.restored.as_ref().unwrap().body, "unsent");
+        assert!(!resolution.kept);
+        assert_eq!(drafts.get("a", "room"), "unsent");
+        assert_ne!(drafts.generation_of("a", "room", None).unwrap(), same_generation, "the restore is an edit");
+        // The user types something newer and clears it again: the composer is
+        // empty but belongs to a newer generation. A later cancellation keeps
+        // the record's text as its own record instead of restoring it.
+        drafts.set("a", "room", "");
+        let second = begin(&drafts, "a", "room", None, "second try");
+        drafts.mark_pending_queued("a", "room", None, &second, TXN_TWO);
+        drafts.set("a", "room", "something newer");
+        drafts.set("a", "room", "");
+        assert_eq!(drafts.get("a", "room"), "");
+        let resolution = drafts.resolve_pending("a", "room", None, second.nonce(), Some(TXN_TWO), false).unwrap();
+        assert!(resolution.restored.is_none() && resolution.kept);
+        assert_eq!(drafts.get("a", "room"), "", "the newer empty draft is left alone");
+        assert_eq!(statuses(&drafts, "a", "room", None), [PendingStatus::Kept]);
+        assert_eq!(drafts.record_text("a", "room", None, second.nonce()).unwrap().body, "second try");
+        let (saved, envelope) = drafts.snapshot("a", "room", None).unwrap();
+        assert_eq!(saved.body, "");
+        assert!(envelope.pending()[0].is_kept(), "the kept record is what the row persists");
+        // The same holds for an unconfirmed review marked not sent.
+        let third = begin(&drafts, "a", "room", None, "third try");
+        drafts.set_pending_status("a", "room", None, third.nonce(), PendingStatus::Unconfirmed);
+        drafts.set("a", "room", "typed and cleared");
+        drafts.set("a", "room", "");
+        let resolution = drafts.review_unconfirmed("a", "room", None, third.nonce(), false).unwrap();
+        assert!(resolution.kept && drafts.get("a", "room").is_empty());
+        // Explicit restore still works at the exact click revision.
+        assert_eq!(restore(&drafts, "a", "room", None, third.nonce()).unwrap().body, "third try");
+    }
+
+    #[test]
     fn cancellation_restores_text_only_into_an_empty_composer() {
         let drafts = DraftStore::default();
         let handle = begin(&drafts, "a", "room", None, "unsent");
@@ -1512,7 +1580,7 @@ mod tests {
         let (saved, envelope) = drafts.snapshot("a", "room", None).unwrap();
         let broken = saved.encode_draft(&envelope).unwrap().replace("data-morpheus-meta=\"", "data-morpheus-meta=\"ff");
         let restored = ComposeText::restore_draft(saved.body.clone(), Some(&broken));
-        assert_eq!(restored.blocked(), Some(QuarantineReason::Malformed));
+        assert_eq!(restored.blocked(), Some(morpheus_matrix::QuarantineReason::Malformed));
         let fresh = DraftStore::default();
         fresh.seed_recovered("a", "room", None, restored, &[], fresh.account_epoch("a"));
         assert_eq!(fresh.get("a", "room"), "typed");
@@ -1534,11 +1602,15 @@ mod tests {
             again.snapshot("a", "room", None).unwrap().1.quarantine().unwrap().original_html().as_deref(),
             Some(broken.as_str())
         );
-        // Only the explicit discard clears it; reviewing records does not.
+        // Only the explicit discard of exactly this original clears it;
+        // reviewing records or naming another original does not.
         assert!(again.review_unconfirmed("a", "room", None, &Generation::fresh(), true).is_none());
         assert!(again.pending_summary("a", "room", None).quarantined);
-        assert!(again.discard_quarantine("a", "room", None));
-        assert!(!again.discard_quarantine("a", "room", None));
+        let fingerprint = again.quarantine_fingerprint("a", "room", None).unwrap();
+        assert!(!again.discard_quarantine("a", "room", None, fingerprint ^ 1));
+        assert!(again.pending_summary("a", "room", None).quarantined);
+        assert!(again.discard_quarantine("a", "room", None, fingerprint));
+        assert!(!again.discard_quarantine("a", "room", None, fingerprint));
         assert!(!again.pending_summary("a", "room", None).blocks_sends());
         assert!(again.snapshot("a", "room", None).unwrap().1.is_empty());
         assert!(again.is_dirty("a", "room", None));
@@ -1550,7 +1622,10 @@ mod tests {
             text: text("shown but frozen"),
             discarded_rich_intent: false,
             envelope: DraftEnvelope::fresh(),
-            read_only: Some(QuarantineReason::TooLarge),
+            read_only: Some(ReadOnlyRow {
+                reason: morpheus_matrix::QuarantineReason::TooLarge,
+                fingerprint: 99,
+            }),
         };
         let drafts = DraftStore::default();
         drafts.seed_recovered("a", "room", None, restored, &[], drafts.account_epoch("a"));
@@ -1564,7 +1639,9 @@ mod tests {
             Err(PendingError::Unreadable)
         ));
         assert!(drafts.index_thread("a", "room", "$root:example.org").is_err());
-        assert!(drafts.discard_quarantine("a", "room", None));
+        assert_eq!(drafts.quarantine_fingerprint("a", "room", None), Some(99));
+        assert!(!drafts.discard_quarantine("a", "room", None, 98), "a different original is not discarded");
+        assert!(drafts.discard_quarantine("a", "room", None, 99));
         assert!(drafts.clear_dirty_like_a_write_would("a", "room", None), "writes resume after the explicit discard");
         assert!(!drafts.pending_summary("a", "room", None).blocks_sends());
     }

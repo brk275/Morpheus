@@ -10,7 +10,8 @@ use ruma::html::{Html, NodeData, NodeRef};
 
 use crate::TextFormat;
 use crate::draft_recovery::{
-    DraftEnvelope, MAX_ENVELOPE_HEX_BYTES, QuarantineReason, QuarantinedRow,
+    DraftEnvelope, MAX_ENVELOPE_HEX_BYTES, QuarantineReason, QuarantinedRow, ReadOnlyRow,
+    row_fingerprint,
 };
 
 pub const MAX_COMPOSE_BYTES: usize = 64 * 1024;
@@ -129,17 +130,26 @@ pub struct RestoredCompose {
     /// rows. For a quarantined row that fits the carry bound the envelope
     /// holds the complete original row in `quarantine()`.
     pub envelope: DraftEnvelope,
-    /// The row is Morpheus-written but too large to carry: it stays untouched
-    /// in the store and nothing may be written to this scope until the user
-    /// explicitly discards it.
-    pub read_only: Option<QuarantineReason>,
+    /// The row is Morpheus-written but cannot be carried completely (too
+    /// large, or it holds attachments): it stays untouched in the store and
+    /// nothing may be written to this scope until the user explicitly discards
+    /// exactly that row.
+    pub read_only: Option<ReadOnlyRow>,
 }
 
 impl RestoredCompose {
     /// Why this scope refuses new sends and, when read-only, saves.
     pub fn blocked(&self) -> Option<QuarantineReason> {
         self.read_only
+            .map(|row| row.reason)
             .or_else(|| self.envelope.quarantine().map(QuarantinedRow::reason))
+    }
+
+    /// Identity of the unreadable original, carried or read-only.
+    pub fn blocked_fingerprint(&self) -> Option<u64> {
+        self.read_only
+            .map(|row| row.fingerprint)
+            .or_else(|| self.envelope.quarantine().map(QuarantinedRow::fingerprint))
     }
 }
 
@@ -479,7 +489,22 @@ impl ComposeText {
         Ok(html)
     }
 
+    /// Restore a stored row whose draft kind is a new message without
+    /// attachments; `restore_stored_draft` takes the complete stored row.
     pub fn restore_draft(body: String, html: Option<&str>) -> RestoredCompose {
+        Self::restore_stored_draft(body, html, "new", false)
+    }
+
+    /// Restore a complete stored row. `kind` names the stored draft kind
+    /// (`new`, `reply:<event id>` or `edit:<event id>`) and
+    /// `has_attachments` whether the row carries attachments; both decide how
+    /// an unreadable row is preserved, never how a readable one is shown.
+    pub fn restore_stored_draft(
+        body: String,
+        html: Option<&str>,
+        kind: &str,
+        has_attachments: bool,
+    ) -> RestoredCompose {
         let plain = |body: String| RestoredCompose {
             text: Self::plain(body),
             discarded_rich_intent: false,
@@ -501,10 +526,13 @@ impl ComposeText {
                 ..plain(body)
             },
             Decoded::Quarantine { reason, text } => {
+                // The complete original row (both columns and its kind)
+                // travels with the scope until the user discards exactly it;
+                // a row that cannot be carried completely stays read-only.
+                let fingerprint = row_fingerprint(&body, Some(html), kind);
+                let carried = QuarantinedRow::new(reason, &body, Some(html), kind, has_attachments);
                 let text = text.unwrap_or_else(|| Self::plain(body));
-                // The complete original row travels with the scope until the
-                // user discards it; a row too large to carry stays read-only.
-                match QuarantinedRow::new(reason, html) {
+                match carried {
                     Some(row) => {
                         let mut envelope = DraftEnvelope::fresh();
                         envelope.set_quarantine(Some(row));
@@ -519,7 +547,10 @@ impl ComposeText {
                         text,
                         discarded_rich_intent: false,
                         envelope: DraftEnvelope::fresh(),
-                        read_only: Some(reason),
+                        read_only: Some(ReadOnlyRow {
+                            reason,
+                            fingerprint,
+                        }),
                     },
                 }
             }
@@ -852,11 +883,30 @@ mod tests {
         // Malformed metadata with canonical text: the typed text and intent
         // restore, no pending send is inferred, the full row is carried.
         let broken = html.replace("data-morpheus-meta=\"", "data-morpheus-meta=\"ff");
-        let restored = ComposeText::restore_draft(value.body.clone(), Some(&broken));
-        assert_eq!(restored.text, value);
+        // The stored plain column may differ from the HTML's text; both
+        // columns and the stored kind are carried, so a later edit of the live
+        // draft destroys neither.
+        let plain_column = format!("{} (plain column differs)", value.body);
+        let restored = ComposeText::restore_stored_draft(
+            plain_column.clone(),
+            Some(&broken),
+            "reply:$target:example.org",
+            false,
+        );
+        assert_eq!(restored.text.body, plain_column, "the plain column is what the user sees");
         assert!(!restored.discarded_rich_intent && restored.read_only.is_none());
         assert_eq!(restored.blocked(), Some(QuarantineReason::Malformed));
         assert!(restored.envelope.pending().is_empty());
+        let carried_row = restored.envelope.quarantine().unwrap();
+        assert_eq!(carried_row.original_html().as_deref(), Some(broken.as_str()));
+        assert_eq!(carried_row.original_plain().as_deref(), Some(plain_column.as_str()));
+        assert_eq!(carried_row.original_kind(), "reply:$target:example.org");
+        assert_eq!(
+            Some(carried_row.fingerprint()),
+            restored.blocked_fingerprint()
+        );
+        let restored = ComposeText::restore_draft(value.body.clone(), Some(&broken));
+        assert_eq!(restored.text, value, "a canonical span still yields the typed text");
         assert_eq!(
             restored.envelope.quarantine().unwrap().original_html().as_deref(),
             Some(broken.as_str())
@@ -940,10 +990,24 @@ mod tests {
             "0".repeat(MAX_DRAFT_HTML_BYTES)
         );
         let restored = ComposeText::restore_draft("x".into(), Some(&huge));
-        assert_eq!(restored.read_only, Some(QuarantineReason::TooLarge));
+        assert_eq!(restored.read_only.map(|row| row.reason), Some(QuarantineReason::TooLarge));
         assert_eq!(restored.blocked(), Some(QuarantineReason::TooLarge));
+        assert_eq!(
+            restored.blocked_fingerprint(),
+            Some(row_fingerprint("x", Some(&huge), "new")),
+            "a read-only row is identified exactly"
+        );
         assert!(restored.envelope.is_empty());
         assert_eq!(restored.text.body, "x");
+        // A row with attachments cannot be carried completely either.
+        let with_attachments = ComposeText::restore_stored_draft(
+            value.body.clone(),
+            Some(&broken),
+            "reply:$target:example.org",
+            true,
+        );
+        assert_eq!(with_attachments.read_only.map(|row| row.reason), Some(QuarantineReason::Malformed));
+        assert!(with_attachments.envelope.quarantine().is_none());
         // The same size without our marker is just foreign HTML.
         let foreign = format!("<b>{}</b>", "0".repeat(MAX_DRAFT_HTML_BYTES));
         let restored = ComposeText::restore_draft("x".into(), Some(&foreign));

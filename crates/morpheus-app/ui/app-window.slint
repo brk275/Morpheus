@@ -590,9 +590,12 @@ component PendingRecordActions inherits VerticalLayout {
 }
 
 // Saved send status for one composer scope: a quiet notice when saved data
-// needs review, then one block per record with its own exact controls. Height
-// follows content; the parent reads `preferred-height`.
-component PendingSendStrip inherits VerticalLayout {
+// needs review, then one block per record with its own exact controls. The
+// content keeps every record and action; the parent bounds the viewport with
+// `viewport-cap` and reads `content-height` to size itself. Focused controls are
+// scrolled into view by the ScrollView, so every action stays keyboard
+// reachable in a narrow pane or at large text sizes.
+component PendingSendStrip inherits ScrollView {
     in property <[PendingSendItem]> items;
     in property <string> blocked-notice;
     in property <bool> composer-empty;
@@ -602,6 +605,8 @@ component PendingSendStrip inherits VerticalLayout {
     in property <color> hover-surface;
     in property <color> outline;
     in property <float> text-scale: 1;
+    in property <length> viewport-cap: 240px;
+    out property <length> content-height: content.preferred-height;
     callback cancel(string);
     callback retry(string);
     callback review(string, bool);
@@ -610,6 +615,10 @@ component PendingSendStrip inherits VerticalLayout {
     callback discard(string);
     callback discard-unreadable();
     property <bool> narrow: self.width < 620px * root.text-scale;
+    height: min(root.viewport-cap, root.content-height);
+    horizontal-scrollbar-policy: always-off;
+    content := VerticalLayout {
+    width: root.width - 12px;
     spacing: 8px;
     if root.blocked-notice != "" : VerticalLayout {
         spacing: 4px;
@@ -645,6 +654,7 @@ component PendingSendStrip inherits VerticalLayout {
             copy => { root.copy(item.key); }
             discard => { root.discard(item.key); }
         }
+    }
     }
 }
 
@@ -2594,12 +2604,13 @@ export component AppWindow inherits Window {
                         }
                     }
                     Rectangle {
-                        property <length> status-height: root.composer-status-visible ? composer-status.preferred-height + 10px : 0px;
+                        property <length> status-height: root.composer-status-visible ? composer-status.height + 10px : 0px;
                         height: (root.composer-mode == 0 ? max(78px, 1.5 * root.message-font-px + 48px) : max(109px, 1.5 * root.message-font-px + 79px)) + (root.attachment-busy ? 29px : 0px) + self.status-height;
                         background: root.canvas;
                         composer-status := PendingSendStrip {
                             x: 22px; y: (root.composer-mode == 0 ? 2px : 33px) + (root.attachment-busy ? 29px : 0px);
                             width: parent.width - 44px;
+                            viewport-cap: max(96px, root.height / 3);
                             items: root.composer-pending-items; blocked-notice: root.composer-blocked-notice;
                             composer-empty: root.composer-text == "";
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
@@ -4306,10 +4317,11 @@ export component AppWindow inherits Window {
                         }
                     }
                     if root.thread-root-id != "" : Rectangle {
-                        property <length> status-height: root.thread-status-visible ? thread-status.preferred-height + 12px : 0px;
+                        property <length> status-height: root.thread-status-visible ? thread-status.height + 12px : 0px;
                         height: max(64px, 1.5 * root.message-font-px + 24px) + self.status-height; background: root.panel;
                         thread-status := PendingSendStrip {
                             x: 10px; y: 6px; width: parent.width - 20px;
+                            viewport-cap: max(96px, root.height / 3);
                             items: root.thread-pending-items; blocked-notice: root.thread-blocked-notice;
                             composer-empty: root.thread-composer-text == "";
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
