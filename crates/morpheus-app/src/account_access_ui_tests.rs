@@ -902,7 +902,7 @@ async fn assert_nickname_controls_keyboard(ui: &AppWindow) {
 }
 
 /// A scrolled Settings action needs a nonzero focus rectangle matching the
-/// visible button, so Slint can reveal it when reached with the keyboard.
+/// complete value row, so Slint reveals the setting as well as the button.
 /// This checks generated geometry; installed accessibility remains a separate
 /// check against the actual packaged application.
 async fn assert_scale_keyboard_and_focus_bounds(ui: &AppWindow) {
@@ -946,8 +946,27 @@ async fn assert_scale_keyboard_and_focus_bounds(ui: &AppWindow) {
             assert_eq!(controls.len(), 1, "unique scale action");
             assert!(focused_control_has_label(ui, label));
             assert!(focused.geometry().size.width > 0.0 && focused.geometry().size.height > 0.0);
-            assert_eq!(focused.geometry().size, controls[0].geometry().size);
+            assert_eq!(
+                focused.geometry().size.width,
+                controls[0].geometry().size.width
+            );
+            assert!(focused.geometry().size.height > controls[0].geometry().size.height);
             assert!(focused.is_visible() && controls[0].is_visible());
+            // The installed failure occurred after the button was reached:
+            // its smaller focus band left this sibling value below the clip.
+            let value_label = format!("{}% · text throughout the app", ui.get_font_scale_percent());
+            let values = control_bounds(ui, &value_label);
+            assert_eq!(values.len(), 1, "unique scale value");
+            let reveal = item_bounds(&focused);
+            assert!(
+                inside_window(ui, reveal),
+                "scale row must be revealed: {reveal:?}"
+            );
+            assert!(
+                values[0].top >= reveal.top - 0.5 && values[0].bottom <= reveal.bottom + 0.5,
+                "scale value must fit inside the revealed row: {:?} vs {reveal:?}",
+                values[0]
+            );
             let expected = ui.get_font_scale_percent() + delta;
             let before = requests.borrow().len();
             key(ui, activation);

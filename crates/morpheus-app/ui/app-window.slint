@@ -258,6 +258,8 @@ component IconAction inherits Rectangle {
     in property <bool> context-hover: false;
     // Match the visible button so keyboard reveal keeps a nonzero focus target.
     in property <bool> reveal-full-control: true;
+    // Reveal the associated value row as well as a small settings action.
+    in property <length> reveal-height: root.height;
     property <bool> vector-icon: icon == "S" || icon == "C" || icon == "P" || icon == "⌂" || icon == "+" || icon == "↓" || icon == "F" || icon == "↩" || icon == "♥" || icon == "⌫" || icon == "✎" || icon == "☷";
     opacity: !quiet || context-hover || area.has-hover || keyboard-focus.has-focus ? 1 : 0;
     callback activated();
@@ -295,7 +297,7 @@ component IconAction inherits Rectangle {
     keyboard-focus := FocusScope {
         x: 0px;
         width: root.reveal-full-control ? root.width : 0px;
-        height: root.reveal-full-control ? root.height : 0px;
+        height: root.reveal-full-control ? max(root.height, root.reveal-height) : 0px;
         // Slint's accessibility bridge requests focus with PointerClick.
         focus-on-click: true;
         enabled: root.enabled;
@@ -2962,16 +2964,20 @@ export component AppWindow inherits Window {
                             text: root.account-theme-notice; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
                             accessible-role: text; accessible-label: root.account-theme-notice;
                         }
-                        Rectangle {
+                        font-scale-row := Rectangle {
                             height: 70px; border-radius: StyleTokens.radius * 1; background: root.elevated;
                             HorizontalLayout {
                                 padding-left: 16px; padding-right: 16px; spacing: 9px;
                                 VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 3px;
                                     Text { text: "Font scale"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
-                                    Text { text: root.font-scale-percent + "% · text throughout the app"; color: root.muted; font-size: 11px * root.text-scale; }
+                                    Text {
+                                        text: root.font-scale-percent + "% · text throughout the app";
+                                        color: root.muted; font-size: 11px * root.text-scale;
+                                        accessible-role: text; accessible-label: self.text;
+                                    }
                                 }
-                                IconAction { icon: "−"; label: "Decrease font scale"; reveal-full-control: true; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-font-scale(root.font-scale-percent - 10); } }
-                                IconAction { icon: "+"; label: "Increase font scale"; reveal-full-control: true; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-font-scale(root.font-scale-percent + 10); } }
+                                IconAction { icon: "−"; label: "Decrease font scale"; reveal-full-control: true; reveal-height: font-scale-row.height; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-font-scale(root.font-scale-percent - 10); } }
+                                IconAction { icon: "+"; label: "Increase font scale"; reveal-full-control: true; reveal-height: font-scale-row.height; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-font-scale(root.font-scale-percent + 10); } }
                             }
                         }
                         Text { text: "Density"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
