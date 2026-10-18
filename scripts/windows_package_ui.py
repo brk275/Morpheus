@@ -28,9 +28,11 @@ from pathlib import Path, PureWindowsPath
 if __package__:
     from . import package_smoke as smoke
     from . import run_windows_capture_acceptance as capture
+    from . import windows_window_probe as window_probe
 else:
     import package_smoke as smoke
     import run_windows_capture_acceptance as capture
+    import windows_window_probe as window_probe
 
 CHECK = "installed_windows_keyboard_uia"
 # Both are the standard x64 Windows Server2025 family; Visual Studio packaging
@@ -82,6 +84,7 @@ class Diagnostics:
             "username_seen": False, "password_seen": False,
             "selector_matches": 0, "incomplete_passes": 0, "foreground_recoveries": 0,
             "bounded_snapshots": 0, "password_semantics": "unchecked",
+            "window_candidates": 0, "event_targets_ignored": 0,
             "traversed_node_matched": False, "cleanup": "not_started", "profile_owned": False,
         }
         self.deadline = time.monotonic() + ACCEPTANCE_SECONDS
@@ -680,14 +683,74 @@ def config_persisted(config, diagnostics, seconds=10):
         time.sleep(0.2)
 
 
-def owned_window(job, handle, pid, diagnostics, seconds=30):
+def keyboard_window_kind(api, window, pid):
+    """Query a borrowed handle without reading titles or retaining raw names."""
+    try:
+        require_ui(api.process_of(window) == pid, "window_unowned")
+        name = api.class_name(window)
+        style = api.long(window, window_probe.GWL_STYLE)
+        exstyle = api.long(window, window_probe.GWL_EXSTYLE)
+        owner = api.owner(window)
+        left, top, right, bottom = api.rect(window)
+        visible = api.is_visible(window)
+        require_ui(api.process_of(window) == pid, "window_unowned")
+    except window_probe.ApiError:
+        if not api.is_window(window):
+            return "vanished"
+        raise DiagnosticFailure("window_facts") from None
+    if not visible:
+        return "hidden"
+    # Pinned winit 0.30.13 create_event_target_window. Compare complete raw
+    # style words, not the probe's projection of named flags. An added bit,
+    # owner, dimension or different class keeps this window as a candidate.
+    if (name == "Winit Thread Event Target" and style == 0x90000000
+            and exstyle == 0x080800A0 and not owner
+            and left == right and top == bottom):
+        return "event_target"
+    return "candidate"
+
+
+def keyboard_window_candidates(pid, diagnostics, api):
+    """Ignore only the pinned Winit event target's complete fixed signature.
+
+    Every other owned visible window remains a candidate. Unknown windows and
+    a second real window are never silently discarded or selected by order.
+    The shared read-only provider rechecks handle ownership around queries.
+    """
+    windows = smoke.visible_windows(pid)
+    require_ui(len(windows) <= window_probe.WINDOW_BOUND, "window_bound")
+    candidates = []
+    ignored = 0
+    for window in windows:
+        diagnostics.check_deadline()
+        kind = keyboard_window_kind(api, window, pid)
+        if kind in {"vanished", "hidden"}:
+            continue
+        if kind == "event_target":
+            ignored += 1
+        else:
+            candidates.append(window)
+    # Diagnostic counts use the same explicit 0/1/2-or-more convention as
+    # selector_matches. A successful candidate count of one remains exact.
+    diagnostics.value["window_candidates"] = min(len(candidates), 2)
+    diagnostics.value["event_targets_ignored"] = max(
+        diagnostics.value["event_targets_ignored"], min(ignored, 2))
+    return candidates
+
+
+def owned_window(job, handle, pid, diagnostics, seconds=30, *, api=None):
     deadline = time.monotonic() + seconds
+    if api is None:
+        try:
+            api = window_probe.Win32()
+        except window_probe.ProbeFailure:
+            raise DiagnosticFailure("window_facts") from None
     while True:
         diagnostics.check_deadline()
         diagnostics.operation("process_status")
         require_ui(job.kernel.WaitForSingleObject(handle, 0) == 258, "app_exited")
         diagnostics.operation("window_enumeration")
-        windows = smoke.visible_windows(pid)
+        windows = keyboard_window_candidates(pid, diagnostics, api)
         if windows:
             require_ui(len(windows) == 1, "window_count")
             diagnostics.value["owned_window_seen"] = True

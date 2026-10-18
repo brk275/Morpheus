@@ -25,6 +25,7 @@ def diagnostic(**overrides):
             "username_seen": True, "password_seen": True,
             "selector_matches": 1, "incomplete_passes": 0, "foreground_recoveries": 0,
             "bounded_snapshots": 0, "password_semantics": "protected",
+            "window_candidates": 1, "event_targets_ignored": 0,
             "traversed_node_matched": False, "cleanup": "passed", "profile_owned": True, **overrides}
 
 
@@ -33,6 +34,42 @@ def report(**overrides):
             "sign_in_semantics": True, "account_menu_keyboard": True, "appearance_config": True,
             "normal_window_close": True, "app_log_public": False, "screen_reader_acceptance": False,
             "diagnostic": diagnostic(), **overrides}
+
+
+def window_record(**changes):
+    return {"pid": 77, "class": "Window Class", "style": 0x16CF0000, "exstyle": 0x00040100,
+            "owner": None, "rect": (10, 20, 490, 340), "visible": True, **changes}
+
+
+class WindowQuery:
+    """Read-only provider double: no Win32 call, process, focus or keyboard."""
+    def __init__(self):
+        self.windows = {
+            65538: window_record(),
+            2: window_record(**{"class": "Winit Thread Event Target", "style": 0x90000000,
+                                "exstyle": 0x080800A0, "rect": (0, 0, 0, 0)}),
+        }
+
+    def process_of(self, window):
+        return self.windows[window]["pid"]
+
+    def class_name(self, window):
+        return self.windows[window]["class"]
+
+    def long(self, window, index):
+        return self.windows[window]["style" if index == ui.window_probe.GWL_STYLE else "exstyle"]
+
+    def owner(self, window):
+        return self.windows[window]["owner"]
+
+    def rect(self, window):
+        return self.windows[window]["rect"]
+
+    def is_visible(self, window):
+        return self.windows[window]["visible"]
+
+    def is_window(self, window):
+        return window in self.windows
 
 
 def node(id, name="", *, parent=0, pid=77, type="custom", password=False, focused=False, error=False,
@@ -1070,15 +1107,88 @@ class DiagnosticsAndReportTests(unittest.TestCase):
         job.kernel.WaitForSingleObject.return_value = 258
         trace = ui.Diagnostics({})
         with patch.object(smoke, "visible_windows", return_value=[65538]):
-            self.assertEqual(ui.owned_window(job, 20, 77, trace), 65538)
+            self.assertEqual(ui.owned_window(job, 20, 77, trace, api=WindowQuery()), 65538)
         self.assertTrue(trace.value["owned_window_seen"])
+        api = WindowQuery()
+        api.windows[1] = window_record()
         with patch.object(smoke, "visible_windows", return_value=[1, 2]), self.assertRaises(ui.DiagnosticFailure) as error:
-            ui.owned_window(job, 20, 77, ui.Diagnostics({}))
+            # A real second window must remain ambiguous, even if encountered first.
+            api.windows[2] = window_record()
+            ui.owned_window(job, 20, 77, ui.Diagnostics({}), api=api)
         self.assertEqual(error.exception.code, "window_count")
         job.kernel.WaitForSingleObject.return_value = 0
         with patch.object(smoke, "visible_windows", return_value=[]), self.assertRaises(ui.DiagnosticFailure) as error:
-            ui.owned_window(job, 20, 77, ui.Diagnostics({}))
+            ui.owned_window(job, 20, 77, ui.Diagnostics({}), api=WindowQuery())
         self.assertEqual(error.exception.code, "app_exited")
+
+    def test_exact_event_target_is_ignored_in_either_enumeration_order(self):
+        job = Mock()
+        job.kernel.WaitForSingleObject.return_value = 258
+        for windows in ([65538, 2], [2, 65538]):
+            trace = ui.Diagnostics({})
+            with self.subTest(windows=windows), patch.object(smoke, "visible_windows", return_value=windows):
+                self.assertEqual(ui.owned_window(job, 20, 77, trace, api=WindowQuery()), 65538)
+            self.assertEqual((trace.value["window_candidates"], trace.value["event_targets_ignored"]), (1, 1))
+
+    def test_near_match_helpers_are_not_discarded(self):
+        changes = ({"class": "unknown private class"}, {"style": 0x94000000},
+                   {"exstyle": 0x080801A0}, {"owner": 65538},
+                   {"rect": (0, 0, 1, 0)}, {"rect": (0, 0, 0, 1)})
+        job = Mock()
+        job.kernel.WaitForSingleObject.return_value = 258
+        for change in changes:
+            api = WindowQuery()
+            api.windows[2].update(change)
+            trace = ui.Diagnostics({})
+            with (self.subTest(change=change), patch.object(smoke, "visible_windows", return_value=[2, 65538]),
+                  self.assertRaises(ui.DiagnosticFailure) as error):
+                ui.owned_window(job, 20, 77, trace, api=api)
+            self.assertEqual(error.exception.code, "window_count")
+            self.assertEqual(trace.value["window_candidates"], 2)
+            self.assertNotIn("private", json.dumps(trace.value))
+
+    def test_event_target_alone_waits_for_the_actual_window(self):
+        job = Mock()
+        job.kernel.WaitForSingleObject.return_value = 258
+        trace = ui.Diagnostics({})
+        with (patch.object(smoke, "visible_windows", side_effect=[[2], [2, 65538]]),
+              patch.object(ui.time, "sleep")):
+            self.assertEqual(ui.owned_window(job, 20, 77, trace, api=WindowQuery()), 65538)
+        self.assertEqual((trace.value["window_candidates"], trace.value["event_targets_ignored"]), (1, 1))
+        with (patch.object(smoke, "visible_windows", return_value=[2]),
+              self.assertRaises(ui.DiagnosticFailure) as error):
+            ui.owned_window(job, 20, 77, ui.Diagnostics({}), seconds=0, api=WindowQuery())
+        self.assertEqual(error.exception.code, "wait_timeout")
+
+    def test_foreign_and_reused_handles_fail_before_selection(self):
+        for owners in ([99], [77, 99]):
+            api = WindowQuery()
+            with (self.subTest(owners=owners), patch.object(api, "process_of", side_effect=owners),
+                  self.assertRaises(ui.DiagnosticFailure) as error):
+                ui.keyboard_window_kind(api, 65538, 77)
+            self.assertEqual(error.exception.code, "window_unowned")
+
+    def test_vanished_windows_are_ignored_but_live_query_failures_reject(self):
+        for exists in (False, True):
+            api = WindowQuery()
+            with (self.subTest(exists=exists), patch.object(api, "class_name", side_effect=ui.window_probe.ApiError),
+                  patch.object(api, "is_window", return_value=exists)):
+                if exists:
+                    with self.assertRaises(ui.DiagnosticFailure) as error:
+                        ui.keyboard_window_kind(api, 65538, 77)
+                    self.assertEqual(error.exception.code, "window_facts")
+                else:
+                    self.assertEqual(ui.keyboard_window_kind(api, 65538, 77), "vanished")
+
+    def test_hidden_windows_and_overflow_do_not_produce_a_candidate(self):
+        api = WindowQuery()
+        api.windows[65538]["visible"] = False
+        with patch.object(smoke, "visible_windows", return_value=[65538]):
+            self.assertEqual(ui.keyboard_window_candidates(77, ui.Diagnostics({}), api), [])
+        with (patch.object(smoke, "visible_windows", return_value=[65538] * 65),
+              self.assertRaises(ui.DiagnosticFailure) as error):
+            ui.keyboard_window_candidates(77, ui.Diagnostics({}), api)
+        self.assertEqual(error.exception.code, "window_bound")
 
     def test_main_publishes_only_the_fixed_report_and_requires_the_nonce_argument(self):
         captured = io.StringIO()
@@ -1104,13 +1214,16 @@ class DiagnosticsAndReportTests(unittest.TestCase):
                diagnostic(bridge_error="PRIVATE"), diagnostic(password_semantics="PRIVATE"),
                diagnostic(selector_matches=3), diagnostic(foreground_recoveries=-1), diagnostic(bounded_snapshots="0"),
                diagnostic(owned_window_seen=1), diagnostic(profile_owned="yes"), diagnostic(private_text="SECRET"),
+               diagnostic(window_candidates=3), diagnostic(event_targets_ignored=True),
+               diagnostic(event_targets_ignored=-1),
                diagnostic(profile_removed=True)]
         for value in bad:
             with self.subTest(value=value), self.assertRaises(RuntimeError):
                 parse(report(diagnostic=value))
         incomplete = [diagnostic(password_semantics="unchecked"), diagnostic(cleanup="failed"),
                       diagnostic(profile_owned=False), diagnostic(uia_root_seen=False),
-                      diagnostic(bridge_error="unowned"), diagnostic(step="appearance")]
+                      diagnostic(bridge_error="unowned"), diagnostic(step="appearance"),
+                      diagnostic(window_candidates=0), diagnostic(window_candidates=2)]
         for value in incomplete:
             with self.subTest(value=value), self.assertRaises(RuntimeError):
                 parse(report(diagnostic=value))

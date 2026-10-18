@@ -656,6 +656,7 @@ KEYBOARD_OBSERVATIONS = frozenset({
 # Installed Windows UI Automation/keyboard driver: fixed tokens only.
 WINDOWS_KEYBOARD_FAILURES = frozenset({
     "none", "guard", "install_state", "profile_invalid", "window_count", "app_exited",
+    "window_bound", "window_unowned", "window_facts",
     "selector_ambiguous", "tree_bound", "wait_timeout", "password_semantics",
     "focus_unowned", "foreground_unowned", "input_rejected", "scale_unreachable",
     "bridge_invalid", "bridge_timeout", "bridge_exited", "bridge_overflow",
@@ -744,7 +745,8 @@ def validate_macos_keyboard_diagnostic(value, passed):
 
 
 def validate_windows_keyboard_diagnostic(value, passed):
-    counts = ("selector_matches", "incomplete_passes", "foreground_recoveries", "bounded_snapshots")
+    counts = ("selector_matches", "incomplete_passes", "foreground_recoveries", "bounded_snapshots",
+              "window_candidates", "event_targets_ignored")
     expected = WINDOWS_KEYBOARD_OBSERVATIONS | set(counts) | {
         "step", "operation", "failure", "password_semantics", "cleanup", "profile_owned",
         "traversed_node_matched", "bridge_error",
@@ -764,6 +766,7 @@ def validate_windows_keyboard_diagnostic(value, passed):
     require(not passed or (value["step"] == "complete" and value["failure"] == "none"
             and value["cleanup"] == "passed" and value["profile_owned"]
             and value["password_semantics"] == "protected" and value["bridge_error"] == "none"
+            and value["window_candidates"] == 1
             and all(value[key] for key in WINDOWS_KEYBOARD_OBSERVATIONS)),
             "Incomplete installed Windows keyboard diagnostics")
 

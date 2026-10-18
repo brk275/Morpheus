@@ -5,8 +5,8 @@ The installed Windows keyboard check failed at `step=window`,
 top-level window of its own, while
 `scripts/windows_package_ui.py` requires exactly one. This probe gathers cheap
 evidence about which windows those are, without a release build, an installer,
-a profile or Morpheus application code. It does not change the keyboard driver
-or production window selection.
+a profile or Morpheus application code. The probe sends no input; installed
+keyboard window selection is a separate check.
 
 ## Hypothesis from the pinned sources
 
@@ -88,5 +88,24 @@ was found.
 - That the installed native-calls release has no further visible windows. A
   result of exactly `winit_window` plus `winit_event_target` supports only the
   winit hypothesis for the default build.
-- Which window the keyboard driver should choose. Any production change still
-  needs its own review.
+- That the installed keyboard selection and interaction checks pass. They need
+  separate source review and installed-package acceptance.
+
+## Installed keyboard selection
+
+The installed driver excludes only the pinned event target's exact class,
+complete raw style words (`0x90000000` and `0x080800a0`), absent owner and zero
+width **and** height. It rechecks the borrowed handle's process ownership before
+and after queries. A different class, extra style bit, owner or dimension keeps
+the window as a candidate. Two candidates remain an error; enumeration order
+never chooses one. An event target alone keeps the driver waiting for the app.
+
+Diagnostics expose only candidate and ignored-target counts, each saturating at
+two, alongside the existing fixed fields. Successful interaction requires an
+exact candidate count of one. Raw names, coordinates, handles and process IDs
+are never published. A vanished window can be retried; a live metadata failure
+or foreign handle fails the check.
+
+This selector change still requires hosted native-probe and installed-package
+verification. The tiny default-feature subject does not establish the complete
+window set of an installed native-calls build.
