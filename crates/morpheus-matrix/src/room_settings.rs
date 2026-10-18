@@ -476,9 +476,8 @@ impl RoomSettingsSession {
                 .await
                 .map_err(|_| RoomSettingsError::Unavailable)?;
             self.check()?;
-            if !upload.content_uri.is_valid() {
-                return Err(RoomSettingsError::InvalidState);
-            }
+            crate::media::validate_media_address(&upload.content_uri)
+                .map_err(|_| RoomSettingsError::InvalidState)?;
             self.avatar_permission(&baseline).await?;
             let mut info = ImageInfo::new();
             info.width = Some(UInt::from(image.width));
@@ -786,7 +785,7 @@ fn assemble(
     let avatar_content = avatar.map(content::<RoomAvatarEventContent>).transpose()?;
     let url = avatar_content.as_ref().and_then(|a| a.url.as_ref());
     let avatar_source = url
-        .filter(|url| url.is_valid())
+        .filter(|url| crate::media::validate_media_address(url).is_ok())
         .cloned()
         .map(MediaSource::Plain);
     let info = avatar_content.as_ref().and_then(|a| a.info.as_ref());
@@ -1443,6 +1442,52 @@ mod tests {
         .unwrap();
         assert!(value.avatar_source.is_none());
         assert!(!value.snapshot.avatar.preview_available);
+    }
+
+    #[test]
+    fn avatar_state_uses_bounded_components_without_leaking_sources() {
+        let create = creation("11");
+        let read = |address: &str| {
+            let avatar = envelope(StateEventType::RoomAvatar, json!({"url": address}));
+            assemble(
+                &user_id!("@casey:example.org").to_owned(),
+                &create,
+                None,
+                Some(&avatar),
+                None,
+                None,
+                None,
+                true,
+            )
+            .unwrap()
+        };
+        for labels in 36..=40 {
+            let host = format!("{}.example", vec!["aaaaa"; labels].join("."));
+            for port in [1, 11, 111, 1111, 11111] {
+                let server = format!("{host}:{port}");
+                let address = format!("mxc://{server}/avatar");
+                let value = read(&address);
+                assert!(value.snapshot.avatar.present);
+                assert!(value.snapshot.avatar.preview_available);
+                assert!(value.avatar_source.is_some());
+                assert!(!format!("{:?}", value.snapshot).contains(&server));
+            }
+        }
+        let oversized = format!("mxc://{}/avatar", "a".repeat(513));
+        for address in [
+            "https://example.org/private",
+            "file:///private",
+            "mxc://example.org/",
+            "mxc://example.org/a/b",
+            "mxc://example.org/é",
+            oversized.as_str(),
+        ] {
+            let value = read(address);
+            assert!(value.snapshot.avatar.present);
+            assert!(!value.snapshot.avatar.preview_available);
+            assert!(value.avatar_source.is_none());
+            assert!(!format!("{:?}", value.snapshot).contains(address));
+        }
     }
 
     #[test]
