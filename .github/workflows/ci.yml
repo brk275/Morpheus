@@ -40,10 +40,39 @@ jobs:
           tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
           printf '[extend]\nuseDefault = true\n' > "$RUNNER_TEMP/morpheus-gitleaks-default.toml"
           : > "$RUNNER_TEMP/morpheus-gitleaks-empty.ignore"
+          scan_status=0
           "$RUNNER_TEMP/gitleaks/gitleaks" dir . --redact=100 --ignore-gitleaks-allow --no-banner \
             --config "$RUNNER_TEMP/morpheus-gitleaks-default.toml" \
             --gitleaks-ignore-path "$RUNNER_TEMP/morpheus-gitleaks-empty.ignore" \
-            --max-target-megabytes 0
+            --max-target-megabytes 0 --report-format json \
+            --report-path "$RUNNER_TEMP/source-scan.json" || scan_status=$?
+          if [ "$scan_status" -ne 0 ] && [ "$scan_status" -ne 1 ]; then
+            echo "Independent source scanner failed; private report withheld"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import collections, hashlib, json, os
+          from pathlib import Path
+          # Root-reviewed exact upstream test fixtures. No candidate scanner allowlists.
+          expected = {'vendor/livekit-api/src/test_token.txt': {'sha256': '45fb9c7ff611f830d96b61c071a3b4d6b6b034442e424acef10566fb705838d0', 'findings': [['jwt', 1, 1]]}, 'vendor/matrix-rtc-core/src/client/tests.rs': {'sha256': '491c6ab21475df2cc2edae150194199b9d94cfa06c804e14c282ae2c6dd673d4', 'findings': [['generic-api-key', 166, 166]]}, 'vendor/matrix-rtc-core/src/host/event.rs': {'sha256': 'f61742a9622ceecd1a36c38b0e454da66be7920e911b3fd267380146462dfe5a', 'findings': [['generic-api-key', 454, 454], ['generic-api-key', 514, 514]]}, 'vendor/matrix-rtc-core/src/compat/room_state.rs': {'sha256': '084b4ace74155f9d189af91a1a3cab06383fc7dc312491c899091a1c14439d63', 'findings': [['generic-api-key', 1062, 1062], ['generic-api-key', 1074, 1074]]}, 'vendor/matrix-rtc-core/src/compat/sticky_2025.rs': {'sha256': '8ec2d4339e0c850833594c088e005f365773a44683b7c142492c5128bb86759f', 'findings': [['generic-api-key', 628, 628], ['generic-api-key', 633, 633], ['generic-api-key', 644, 644], ['generic-api-key', 738, 738], ['generic-api-key', 752, 752], ['generic-api-key', 771, 771], ['generic-api-key', 772, 772], ['generic-api-key', 773, 773], ['generic-api-key', 790, 790], ['generic-api-key', 801, 801]]}}
+          observed = json.loads((Path(os.environ["RUNNER_TEMP"]) / "source-scan.json").read_text())
+          if not isinstance(observed, list):
+              raise SystemExit("Independent source scan report invalid")
+          allowed = collections.Counter()
+          for name, record in expected.items():
+              if hashlib.sha256(Path(name).read_bytes()).hexdigest() != record["sha256"]:
+                  raise SystemExit("Reviewed upstream fixture changed")
+              for rule, start, end in record["findings"]:
+                  allowed[(name, rule, start, end)] += 1
+          actual = collections.Counter()
+          for row in observed:
+              if not isinstance(row, dict):
+                  raise SystemExit("Independent source scan report invalid")
+              actual[(row.get("File"), row.get("RuleID"), row.get("StartLine"), row.get("EndLine"))] += 1
+          if actual != allowed:
+              raise SystemExit("Unreviewed source scan finding; private report withheld")
+          print("Independent full-tree scan: exact 16 unchanged upstream test fixtures; zero unreviewed findings")
+          PY
       - name: Targeted diagnostics helper tests
         run: python3 -m unittest discover -s scripts/tests -p test_matrix_acceptance.py -v
       - name: Matrix and disposable vault dependencies
