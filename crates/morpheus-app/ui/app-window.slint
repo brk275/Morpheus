@@ -947,18 +947,24 @@ export component StartupErrorWindow inherits Window {
         spacing: 16px;
         Text {
             text: "Morpheus";
+            accessible-role: text;
+            accessible-label: self.text;
             color: #f2f4ff;
             font-size: 26px;
             font-weight: 750;
         }
         Text {
             text: "Saved accounts could not be opened";
+            accessible-role: text;
+            accessible-label: self.text;
             color: #c7baff;
             font-size: 18px;
             wrap: word-wrap;
         }
         Text {
             text: root.detail;
+            accessible-role: text;
+            accessible-label: self.text;
             color: #f2f4ff;
             font-size: 14px;
             wrap: word-wrap;

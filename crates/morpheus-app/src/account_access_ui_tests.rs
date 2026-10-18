@@ -13,7 +13,7 @@ use slint::platform::{Key, WindowEvent};
 use slint::{Color, StyledText};
 use std::time::Duration;
 
-fn key(ui: &AppWindow, text: impl Into<slint::SharedString>) {
+fn key(ui: &impl slint::ComponentHandle, text: impl Into<slint::SharedString>) {
     let text = text.into();
     ui.window()
         .dispatch_event(WindowEvent::KeyPressed { text: text.clone() });
@@ -352,7 +352,7 @@ async fn assert_sign_in_keyboard(ui: &AppWindow) {
 // neither forces focus nor activates an accessible action. The public testing
 // element search needs debug-info code generation; this direct item-tree read
 // keeps the normal build and production properties unchanged.
-fn focused_control_has_label(ui: &AppWindow, expected: &str) -> bool {
+fn focused_control_has_label(ui: &impl slint::ComponentHandle, expected: &str) -> bool {
     use slint::private_unstable_api::re_exports::{AccessibleStringProperty, ItemRc, WindowInner};
     use std::ops::ControlFlow;
 
@@ -1533,7 +1533,110 @@ fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
     slint::run_event_loop_until_quit().unwrap();
 }
 
+#[cfg(not(morpheus_timeline_acceptance))]
+fn exercise_startup_recovery() {
+    use morpheus_matrix::MatrixCoreError;
+    use slint::private_unstable_api::re_exports::{AccessibleStringProperty, ItemRc, WindowInner};
+    use std::{cell::Cell, fs, ops::ControlFlow, rc::Rc};
+
+    // This runs inside the existing, single Slint test event loop. It never
+    // signs in, opens a credential vault or creates a second backend/proxy.
+    let directory = tempfile::tempdir().unwrap();
+    let data = directory.path().join("profile");
+    let ids = [
+        "10000000-0000-4000-8000-000000000001",
+        "10000000-0000-4000-8000-000000000002",
+    ];
+    let aliases = ["@morgan:matrix-a.test", "@reese:matrix-b.test"];
+    let servers = ["https://matrix-a.test", "https://matrix-b.test"];
+    let accounts = ids
+        .iter()
+        .zip(aliases)
+        .zip(servers)
+        .map(|((id, user), server)| {
+            serde_json::json!({
+                "id": id, "user_id": user, "device_id": "SYNTHETIC",
+                "homeserver": server
+            })
+        })
+        .collect::<Vec<_>>();
+    let registry = serde_json::to_vec(&serde_json::json!({
+        "version": 1, "active_account_id": ids[0], "accounts": accounts
+    }))
+    .unwrap();
+    for id in ids {
+        let store = data.join("accounts").join(id);
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("preserved"), b"synthetic stored bytes").unwrap();
+    }
+    fs::write(data.join("accounts.json"), &registry).unwrap();
+    for malformed in [false, true] {
+        if malformed {
+            fs::write(data.join("account-access.json"), b"{}").unwrap();
+        }
+        let error = match morpheus_matrix::AccountManager::open(&data) {
+            Ok(_) => panic!("an existing profile without a valid policy must stay closed"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, MatrixCoreError::AppPasswordUnavailable));
+        let ui = crate::StartupErrorWindow::new().unwrap();
+        let detail = crate::startup_error::message(&error);
+        ui.set_detail(detail.into());
+        let closes = Rc::new(Cell::new(0));
+        let callback = closes.clone();
+        ui.on_exit_requested(move || callback.set(callback.get() + 1));
+        ui.show().unwrap();
+        i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+        let window = WindowInner::from_pub(ui.window());
+        let root = ItemRc::new_root(window.component());
+        let mut labels = Vec::new();
+        let _ = root.visit_descendants(|item| {
+            if let Some(label) = item.accessible_string_property(AccessibleStringProperty::Label) {
+                labels.push(label.to_string());
+            }
+            ControlFlow::<()>::Continue(())
+        });
+        assert!(labels.iter().any(|label| label == detail));
+        assert!(labels.iter().any(|label| label == "Close Morpheus"));
+        for alias in aliases {
+            assert!(labels.iter().all(|label| !label.contains(alias)));
+        }
+        for forbidden in [
+            "Sign in to Matrix",
+            "Add account",
+            "Manage accounts",
+            "Explore the interactive preview",
+        ] {
+            assert!(labels.iter().all(|label| label != forbidden));
+        }
+        for _ in 0..8 {
+            if focused_control_has_label(&ui, "Close Morpheus") {
+                break;
+            }
+            key(&ui, Key::Tab);
+        }
+        assert!(focused_control_has_label(&ui, "Close Morpheus"));
+        key(&ui, Key::Return);
+        assert_eq!(closes.get(), 1);
+        ui.hide().unwrap();
+        assert_eq!(fs::read(data.join("accounts.json")).unwrap(), registry);
+        for id in ids {
+            assert_eq!(
+                fs::read(data.join("accounts").join(id).join("preserved")).unwrap(),
+                b"synthetic stored bytes"
+            );
+        }
+        if malformed {
+            assert_eq!(fs::read(data.join("account-access.json")).unwrap(), b"{}");
+        } else {
+            assert!(!data.join("account-access.json").exists());
+        }
+    }
+}
+
 async fn exercise_account_ui(runtime: Handle) {
+    #[cfg(not(morpheus_timeline_acceptance))]
+    exercise_startup_recovery();
     let directory = tempfile::tempdir().unwrap();
     let manager =
         Arc::new(morpheus_matrix::AccountManager::open(directory.path().join("profile")).unwrap());
