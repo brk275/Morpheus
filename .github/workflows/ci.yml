@@ -1,12 +1,12 @@
 # TEMPORARY focused native offline app checks. NEVER MERGE this workflow.
 name: Reviewed sticker native checks
-run-name: Reviewed sticker integration 65e2223 - Linux only
+run-name: Reviewed sticker integration b49121b - Linux only
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: sticker-native-checks-65e2223
+  group: sticker-native-checks-b49121b
   cancel-in-progress: false
 jobs:
   contracts:
@@ -17,11 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 65e2223413936e8b00bada6ebd0c71df2a926099
+          ref: b49121b2fb98bf8c2c50c717dfb0aa43aa0d6527
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact reviewed source
-        run: test "$(git rev-parse HEAD)" = 65e2223413936e8b00bada6ebd0c71df2a926099
+        run: test "$(git rev-parse HEAD)" = b49121b2fb98bf8c2c50c717dfb0aa43aa0d6527
       - name: Scan source before executing reviewed native tests
         shell: bash
         run: |
@@ -126,7 +126,7 @@ jobs:
           summaries=re.findall(r'^test result: ok\. ([0-9]+) passed; 0 failed; ([0-9]+) ignored;',output,re.MULTILINE)
           passed=reason is None and code==0 and needed<=ok and len(summaries)==1 and int(summaries[0][0])>=3
           print(json.dumps({'check':'sticker_core_boundaries','status':'passed' if passed else 'failed',
-              'source':'65e2223413936e8b00bada6ebd0c71df2a926099','failure':reason,
+              'source':'b49121b2fb98bf8c2c50c717dfb0aa43aa0d6527','failure':reason,
               'tests_passed':int(summaries[0][0]) if len(summaries)==1 else None,
               'ignored':int(summaries[0][1]) if len(summaries)==1 else None,
               'required_tests':{name:name in ok for name in sorted(needed)},
@@ -216,7 +216,7 @@ jobs:
           summaries=re.findall(r'^test result: ok\. ([0-9]+) passed; 0 failed; ([0-9]+) ignored;',output,re.MULTILINE)
           passed=reason is None and code==0 and needed<=ok and len(summaries)==1 and int(summaries[0][0])>=303
           print(json.dumps({'check':'beta_offline_native_app','status':'passed' if passed else 'failed',
-              'source':'65e2223413936e8b00bada6ebd0c71df2a926099','failure':reason,
+              'source':'b49121b2fb98bf8c2c50c717dfb0aa43aa0d6527','failure':reason,
               'tests_passed':int(summaries[0][0]) if len(summaries)==1 else None,
               'ignored':int(summaries[0][1]) if len(summaries)==1 else None,
               'required_tests':{name:name in ok for name in sorted(needed)},
