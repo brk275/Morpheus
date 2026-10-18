@@ -847,7 +847,7 @@ mod tests {
         assert!(!restored.discarded_rich_intent);
         for (bad, reason) in [
             (
-                html.replace("data-morpheus-compose=\"2\"", "data-morpheus-compose=\"3\""),
+                html.replace("data-morpheus-compose=\"1\"", "data-morpheus-compose=\"3\""),
                 QuarantineReason::UnsupportedVersion,
             ),
             (format!("{html}<!-- x -->"), QuarantineReason::Malformed),
