@@ -32,6 +32,27 @@ class FocusedSuiteTests(unittest.TestCase):
                 with self.subTest(missing=missing), self.assertRaises(RuntimeError):
                     focused.finish_checks()
 
+    def test_drafts_only_completion_and_summary_cannot_claim_other_checks(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="drafts-only")
+            with self.assertRaises(RuntimeError):
+                runner.finish_checks()
+            runner.results = [{"check": "drafts_local", "passed": 2, "seconds": 1}]
+            runner.finish_checks()
+            full = Acceptance(root, "scanner")
+            full.results = list(runner.results)
+            with self.assertRaises(RuntimeError):
+                full.finish_checks()
+            summary = root / "summary.md"
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
+                runner.summary()
+            report = json.loads((root / "outcomes.json").read_text())
+            self.assertEqual(report["suite"], "drafts-only")
+            self.assertEqual(report["not_run"], {})
+            self.assertIn("No app recovery, moderation, OAuth or RTC checks", summary.read_text())
+            self.assertIn("not full acceptance", summary.read_text())
+
     def test_unknown_suite_rejected_before_creating_directories(self):
         with patch.object(acceptance_module, "private_directory") as directory:
             with self.assertRaisesRegex(ValueError, "Unknown acceptance suite"):
@@ -200,6 +221,22 @@ class FinalizationTests(unittest.TestCase):
         runner.oauth_cases.assert_not_called()
         runner.outgoing_ring_cases.assert_not_called()
         runner.rtc_cases.assert_not_called()
+        runner.element_case.assert_not_called()
+        self.assert_both_cleanups(runner)
+
+    def test_drafts_only_main_runs_only_drafts_and_preserves_cleanup(self):
+        with self.mocked_main() as (runner, _):
+            with patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner",
+                                           "--suite", "drafts-only"]):
+                self.assertIsNone(acceptance_module.main())
+        self.assertEqual(len(runner.test.call_args_list), 1)
+        self.assertEqual(runner.test.call_args.args[0], "drafts_local")
+        runner.finish_checks.assert_called_once()
+        runner.draft_recovery_cases.assert_not_called()
+        runner.app_recovery.assert_not_called()
+        runner.oauth_cases.assert_not_called()
+        runner.rtc_cases.assert_not_called()
+        runner.outgoing_ring_cases.assert_not_called()
         runner.element_case.assert_not_called()
         self.assert_both_cleanups(runner)
 

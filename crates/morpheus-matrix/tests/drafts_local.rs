@@ -2573,6 +2573,9 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
             HashSet::from([hold_id.clone(), eighth_txn.clone()]),
             "its persisted request is kept, not dropped or sent"
         );
+        // Composed sends reject a non-joined room before recovery coverage.
+        // Require that exact local guard, then prove rejection changed no queue
+        // state; do not loosen this to accepting an arbitrary failed send.
         assert!(matches!(
             manager
                 .send_composed_owned_for(
@@ -2584,8 +2587,19 @@ fn pending_sends_are_recovered_from_real_sdk_requests() {
                     None
                 )
                 .await,
-            Err(MatrixCoreError::RecoveryIncomplete)
+            Err(MatrixCoreError::Sdk(message))
+                if message == "A selected mention is unavailable or is no longer allowed in this room."
         ));
+        assert!(!sdk_new_room.send_queue().is_enabled());
+        assert_eq!(
+            persisted_requests(&sdk_new_room).await,
+            HashSet::from([hold_id.clone(), eighth_txn.clone()]),
+            "the rejected send neither queues nor removes a request"
+        );
+        assert!(manager
+            .room_recovery_incomplete(&selection, &new_room)
+            .await
+            .unwrap());
         // Joined again: still not covered until the on-demand scan, which
         // finds the unreadable row and keeps the room paused.
         manager

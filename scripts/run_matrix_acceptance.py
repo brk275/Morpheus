@@ -333,7 +333,9 @@ PLANNED_CHECKS = (*CHAT_CHECKS, APP_RECOVERY_LABEL, "recovery_local", *OAUTH_LAB
 # A focused retry still establishes the identity required by moderation and
 # runs every app recovery guard. It cannot stand in for full acceptance.
 DRAFT_RECOVERY_CHECKS = ("drafts_local", "formatted_local", "moderation_local", APP_RECOVERY_LABEL)
-SUITES = {"full": PLANNED_CHECKS, "draft-recovery": DRAFT_RECOVERY_CHECKS}
+DRAFT_ONLY_CHECKS = ("drafts_local",)
+SUITES = {"full": PLANNED_CHECKS, "draft-recovery": DRAFT_RECOVERY_CHECKS,
+          "drafts-only": DRAFT_ONLY_CHECKS}
 # Leave a full minute before the workflow's 55-minute hard kill. Work stops
 # with eleven minutes left: up to three for nested OAuth/Element cleanup, then
 # eight for both shared-service cleanups, checked inventories and log scans.
@@ -1111,6 +1113,10 @@ class Acceptance:
                 if self.suite == "full":
                     output.write("Full suite: real Synapse, Matrix Authentication Service, OS Secret Service and LiveKit; "
                                  "synthetic call media and OAuth browser-form protocol automation.\n\n")
+                elif self.suite == "drafts-only":
+                    output.write("Focused drafts-only rerun: real Synapse and an ephemeral OS Secret Service. "
+                                 "Only the draft persistence/recovery cases ran. "
+                                 "No app recovery, moderation, OAuth or RTC checks; this is not full acceptance.\n\n")
                 else:
                     output.write("Focused draft-recovery rerun: real Synapse and an ephemeral OS Secret Service. "
                                  "Includes the formatting prerequisite for moderation and all app recovery guards. "
@@ -1186,6 +1192,10 @@ def main():
         acceptance.require_containment()
         acceptance.script("local_matrix_env", "up")
         fixture = fixture_from_output(str(root / "accounts.json"), root)
+        if args.suite == "drafts-only":
+            acceptance.group(DRAFT_ONLY_CHECKS, lambda: acceptance.test("drafts_local", fixture))
+            acceptance.finish_checks()
+            return
         if args.suite == "draft-recovery":
             acceptance.draft_recovery_cases(fixture)
             acceptance.finish_checks()
