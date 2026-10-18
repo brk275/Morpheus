@@ -4156,21 +4156,31 @@ export component AppWindow inherits Window {
                 if root.page == 1 : settings-scroll := ScrollView {
                     vertical-stretch: 1;
                     horizontal-scrollbar-policy: always-off;
+                    // This page scrolls vertically. Do not let a long label
+                    // enlarge its content beyond the visible canvas.
+                    content-width: self.visible-width;
                     // Bring a control at `offset` from the top of the content
                     // into view, computed from the live layout.
                     function reveal(offset: length) {
                         self.content-y = -max(0px, min(offset - 16px, self.content-height - self.visible-height));
                     }
                     settings-content := VerticalLayout {
-                        width: parent.width;
+                        width: settings-scroll.visible-width;
+                        min-width: 0px;
                         padding: 26px;
                         spacing: 18px;
                         Text { text: "Appearance"; color: root.ink; font-size: 24px * root.text-scale; font-weight: 780; }
-                        Text { text: "Shape your workspace: typography, spacing, geometry and conversation style."; color: root.muted; font-size: 13px * root.text-scale; }
+                        Text { text: "Shape your workspace: typography, spacing, geometry and conversation style."; color: root.muted; font-size: 13px * root.text-scale; wrap: word-wrap; }
                         Text { text: "Starting points"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         Text { text: "Presets fill in editable settings. Fonts use installed families; a missing family falls back to your system font."; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
                         for name[index] in ["Nocturne", "Terminal", "Paper"] : ActionRect {
                             property <int> reveal-request: index == 0 ? root.reveal-request("appearance.presets") : 0;
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4193,11 +4203,22 @@ export component AppWindow inherits Window {
                         ActionRect {
                             height: 42px * root.text-scale;
                             property <int> reveal-request: root.reveal-request("appearance.reduce_motion");
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                     self.focus();
                                     if self.has-focus { root.settings-revealed-id = "appearance.reduce_motion"; }
+                                }
+                            }
+                            focus-state-changed(focused) => {
+                                if focused {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                 }
                             }
                             label: "Reduce motion" + (StyleTokens.reduced-motion ? ", on" : ", off");
@@ -4227,6 +4248,12 @@ export component AppWindow inherits Window {
                             border-radius: StyleTokens.radius;
                             token-list := ColorTokenList {
                                 property <int> reveal-request: root.reveal-request("appearance.colors");
+                                // Keyboard focus and search share the same bounded reveal.
+                                changed has-focus => {
+                                    if self.has-focus {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    }
+                                }
                                 changed reveal-request => {
                                     if self.reveal-request > 0 {
                                         settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4251,6 +4278,12 @@ export component AppWindow inherits Window {
                                 // A color search result selects its token first,
                                 // then asks for this field.
                                 property <int> reveal-request: root.reveal-request("appearance.color_hex");
+                                // Keyboard focus and search share the same bounded reveal.
+                                changed has-focus => {
+                                    if self.has-focus {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    }
+                                }
                                 changed reveal-request => {
                                     if self.reveal-request > 0 {
                                         settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4281,6 +4314,12 @@ export component AppWindow inherits Window {
                             border-radius: StyleTokens.radius;
                             window-opacity-setting := WindowOpacitySetting {
                                 property <int> reveal-request: root.reveal-request("appearance.window_opacity");
+                                // Keyboard focus and search share the same bounded reveal.
+                                changed has-focus => {
+                                    if self.has-focus {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    }
+                                }
                                 changed reveal-request => {
                                     if self.reveal-request > 0 {
                                         settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4300,6 +4339,12 @@ export component AppWindow inherits Window {
                         Text { text: "Fonts"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         StyleFontSetting { label: "Interface font family"; family <=> root.appearance-ui-font-input;
                             property <int> reveal-request: root.reveal-request("appearance.fonts");
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4319,6 +4364,12 @@ export component AppWindow inherits Window {
                         }
                         StyleNumberSetting {
                             property <int> reveal-request: root.reveal-request("appearance.message_size");
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4331,6 +4382,12 @@ export component AppWindow inherits Window {
                             changed-value(value) => { root.change-style-number(0, value); } }
                         StyleNumberSetting {
                             property <int> reveal-request: root.reveal-request("appearance.sender_weight");
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4354,6 +4411,12 @@ export component AppWindow inherits Window {
                         Text { text: "Room header"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         for name[index] in ["Full · room header and introduction", "Compact · room header and topic", "Minimal · room name and actions"] : ActionRect {
                             property <int> reveal-request: index == 0 ? root.reveal-request("appearance.room_header") : 0;
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4385,6 +4448,12 @@ export component AppWindow inherits Window {
                         Text { text: "Conversation style"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         for name[index] in ["Stacked · names above messages", "Compact · smaller names and avatars", "Columns · aligned timestamps and nicknames"] : ActionRect {
                             property <int> reveal-request: index == 0 ? root.reveal-request("appearance.message_layout") : 0;
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4404,6 +4473,12 @@ export component AppWindow inherits Window {
                             color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
                         for name[index] in ["Message avatars", "Message timestamps", "Colored sender names"] : style-toggle := ActionRect {
                             property <int> reveal-request: index == 0 ? root.reveal-request("appearance.message_details") : 0;
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4424,6 +4499,12 @@ export component AppWindow inherits Window {
                         Text { text: "Timestamp style"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         for name[index] in ["12-hour · 3:04 PM", "24-hour · 15:04", "24-hour with seconds · 15:04:05"] : ActionRect {
                             property <int> reveal-request: index == 0 ? root.reveal-request("appearance.timestamps") : 0;
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4483,6 +4564,12 @@ export component AppWindow inherits Window {
                         Text { text: "Geometry"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         StyleNumberSetting {
                             property <int> reveal-request: root.reveal-request("appearance.geometry");
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4495,6 +4582,12 @@ export component AppWindow inherits Window {
                             changed-value(value) => { root.change-style-number(1, value); } }
                         StyleNumberSetting {
                             property <int> reveal-request: root.reveal-request("appearance.spacing");
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4510,6 +4603,12 @@ export component AppWindow inherits Window {
                             changed-value(value) => { root.change-style-number(3, value); } }
                         StyleNumberSetting {
                             property <int> reveal-request: root.reveal-request("appearance.rail_width");
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4529,6 +4628,12 @@ export component AppWindow inherits Window {
                             spacing: 12px;
                             for choice[index] in ["Dark", "Light", "High contrast", "System"] : ActionRect {
                                 property <int> reveal-request: index == 0 ? root.reveal-request("appearance.base_palette") : 0;
+                                // Keyboard focus and search share the same bounded reveal.
+                                changed has-focus => {
+                                    if self.has-focus {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    }
+                                }
                                 changed reveal-request => {
                                     if self.reveal-request > 0 {
                                         settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4587,6 +4692,12 @@ export component AppWindow inherits Window {
                             }
                             decrease-font-scale := IconAction {
                                 property <int> reveal-request: root.reveal-request("appearance.font_scale");
+                                // Keyboard focus and search share the same bounded reveal.
+                                changed has-focus => {
+                                    if self.has-focus {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    }
+                                }
                                 changed reveal-request => {
                                     if self.reveal-request > 0 {
                                         settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4613,6 +4724,12 @@ export component AppWindow inherits Window {
                             spacing: 10px;
                             for choice[index] in ["Compact", "Comfortable", "Spacious"] : ActionRect {
                                 property <int> reveal-request: index == 0 ? root.reveal-request("appearance.density") : 0;
+                                // Keyboard focus and search share the same bounded reveal.
+                                changed has-focus => {
+                                    if self.has-focus {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    }
+                                }
                                 changed reveal-request => {
                                     if self.reveal-request > 0 {
                                         settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4637,6 +4754,12 @@ export component AppWindow inherits Window {
                             spacing: 6px; alignment: start; vertical-stretch: 0;
                             for choice[index] in ["Icon rail", "Text sidebar"] : TextAction {
                                 property <int> reveal-request: index == 0 ? root.reveal-request("layout.navigation") : 0;
+                                // Keyboard focus and search share the same bounded reveal.
+                                changed has-focus => {
+                                    if self.has-focus {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    }
+                                }
                                 changed reveal-request => {
                                     if self.reveal-request > 0 {
                                         settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4681,6 +4804,12 @@ export component AppWindow inherits Window {
                                 IconAction {
                                     icon: root.show-side-panel ? "✓" : "+";
                                     property <int> reveal-request: root.reveal-request("layout.panes");
+                                    // Keyboard focus and search share the same bounded reveal.
+                                    changed has-focus => {
+                                        if self.has-focus {
+                                            settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                        }
+                                    }
                                     changed reveal-request => {
                                         if self.reveal-request > 0 {
                                             settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4730,6 +4859,12 @@ export component AppWindow inherits Window {
                                 IconAction {
                                     icon: root.sort-unread-first ? "✓" : "+";
                                     property <int> reveal-request: root.reveal-request("layout.unread_first");
+                                    // Keyboard focus and search share the same bounded reveal.
+                                    changed has-focus => {
+                                        if self.has-focus {
+                                            settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                        }
+                                    }
                                     changed reveal-request => {
                                         if self.reveal-request > 0 {
                                             settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4765,6 +4900,12 @@ export component AppWindow inherits Window {
                         ActionRect {
                             height: 68px; border-radius: 10px; background: root.elevated; focus-color: root.accent;
                             property <int> reveal-request: root.reveal-request("notifications.desktop");
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4787,6 +4928,12 @@ export component AppWindow inherits Window {
                         ActionRect {
                             height: 68px; border-radius: 10px; background: root.elevated; focus-color: root.accent;
                             property <int> reveal-request: root.reveal-request("notifications.sounds");
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4809,6 +4956,12 @@ export component AppWindow inherits Window {
                         ActionRect {
                             height: 68px; border-radius: 10px; background: root.elevated; focus-color: root.accent;
                             property <int> reveal-request: root.reveal-request("notifications.previews");
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4839,6 +4992,12 @@ export component AppWindow inherits Window {
                                     text <=> root.notification-highlight-input;
                                     color: root.ink; font-size: 12px * root.text-scale;
                                     property <int> reveal-request: root.reveal-request("notifications.highlights");
+                                    // Keyboard focus and search share the same bounded reveal.
+                                    changed has-focus => {
+                                        if self.has-focus {
+                                            settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                        }
+                                    }
                                     changed reveal-request => {
                                         if self.reveal-request > 0 {
                                             settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -4889,6 +5048,12 @@ export component AppWindow inherits Window {
                                         Text { text: "Account security"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; horizontal-stretch: 1; }
                                         Button {
                                             property <int> reveal-request: root.reveal-request("security.recovery");
+                                            // Keyboard focus and search share the same bounded reveal.
+                                            changed has-focus => {
+                                                if self.has-focus {
+                                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                                }
+                                            }
                                             changed reveal-request => {
                                                 if self.reveal-request > 0 {
                                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -5083,6 +5248,12 @@ export component AppWindow inherits Window {
                             height: 40px * root.text-scale; border-radius: 8px; background: self.has-hover ? root.hover : root.elevated;
                             focus-color: root.accent;
                             property <int> reveal-request: root.reveal-request("media.image_previews");
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -5104,6 +5275,12 @@ export component AppWindow inherits Window {
                             current-index <=> root.audio-microphone-index;
                             enabled: root.audio-devices-enabled && !root.audio-devices-busy;
                             property <int> reveal-request: root.reveal-request("media.audio_devices");
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -5145,6 +5322,12 @@ export component AppWindow inherits Window {
                         }
                         ShortcutSetting {
                             property <int> reveal-request: root.reveal-request("shortcuts");
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -5173,6 +5356,12 @@ export component AppWindow inherits Window {
                         // Read-only and selectable, so the path can be copied into an editor.
                         ThemedTextInput {
                             property <int> reveal-request: root.reveal-request("advanced.config_file");
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
                             changed reveal-request => {
                                 if self.reveal-request > 0 {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
@@ -5199,6 +5388,12 @@ export component AppWindow inherits Window {
                             spacing: 10px;
                             Button {
                                 property <int> reveal-request: root.reveal-request("updates");
+                                // Keyboard focus and search share the same bounded reveal.
+                                changed has-focus => {
+                                    if self.has-focus {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    }
+                                }
                                 changed reveal-request => {
                                     if self.reveal-request > 0 {
                                         settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);

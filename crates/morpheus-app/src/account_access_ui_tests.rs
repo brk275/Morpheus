@@ -687,6 +687,13 @@ async fn assert_native_motion_and_preference(ui: &AppWindow, config_path: &std::
             );
         }
         assert!(persisted);
+        assert!(
+            inside_window(
+                ui,
+                bounds_before.expect("focused motion control has bounds")
+            ),
+            "keyboard focus must reveal the whole motion control at {scale}%"
+        );
         assert!(ui.global::<crate::StyleTokens>().get_reduced_motion());
         assert_eq!(
             ui.global::<crate::StyleTokens>().get_interaction_duration(),
