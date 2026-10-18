@@ -1,27 +1,27 @@
 # TEMPORARY focused native offline app checks. NEVER MERGE this workflow.
 name: Reviewed sticker native checks
-run-name: Sticker 200 percent closed layout diagnosis - 8db21c4
+run-name: Reviewed sticker layout fix 6a62a3b - affected checks
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: sticker-native-checks-8db21c4
+  group: sticker-native-checks-6a62a3b
   cancel-in-progress: false
 jobs:
   contracts:
-    name: Diagnose reviewed sticker control bounds
+    name: Test reviewed sticker layout and encrypted media
     if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 8db21c4bea86de451957c8d2473d008c3932d975
+          ref: 6a62a3b99ca414f5fae489226a375a7feabab220
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact reviewed source
-        run: test "$(git rev-parse HEAD)" = 8db21c4bea86de451957c8d2473d008c3932d975
+        run: test "$(git rev-parse HEAD)" = 6a62a3b99ca414f5fae489226a375a7feabab220
       - name: Scan source before executing reviewed native tests
         shell: bash
         run: |
@@ -50,7 +50,7 @@ jobs:
         with:
           key: verified-sdk-archives-v1
           save-if: false
-      - name: Identify the exact failing synthetic control with private bounded logs
+      - name: Verify corrected consent target and generated UI keyboard bounds
         timeout-minutes: 105
         env:
           CARGO_BUILD_JOBS: "2"
@@ -144,7 +144,7 @@ jobs:
                   layout = {'scope':scope,'control':labels.index(label),
                       'bounds':dict(zip(('left','top','right','bottom'),bounds))}
           print(json.dumps({'check':'focused_native_sticker_ui','status':'passed' if passed else 'failed',
-              'source':'8db21c4bea86de451957c8d2473d008c3932d975','failure':reason,
+              'source':'6a62a3b99ca414f5fae489226a375a7feabab220','failure':reason,
               'synthetic_layout_failure':layout,
               'tests_passed':int(summaries[0][0]) if len(summaries)==1 else None,
               'ignored':int(summaries[0][1]) if len(summaries)==1 else None,
@@ -156,4 +156,22 @@ jobs:
               'native_installed_app':False},sort_keys=True),flush=True)
           if not passed: raise SystemExit(1)
           PY
-      # Diagnosis only. No accounts, media fixture, installers or artifact uploads.
+      - name: Compile the reviewed media fixture before generated accounts exist
+        timeout-minutes: 25
+        env:
+          CARGO_BUILD_JOBS: "2"
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: cargo test --locked -p morpheus-matrix --test media_local --no-run
+      - name: Verify encrypted sticker catalog send and receive with disposable accounts
+        timeout-minutes: 55
+        env:
+          CARGO_BUILD_JOBS: "2"
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: >-
+          dbus-run-session -- python3 scripts/run_matrix_acceptance.py
+          --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks" --suite media-only
+      # Fresh hosted synthetic vault only; no owner data, signing material or artifacts.
