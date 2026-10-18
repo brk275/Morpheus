@@ -17,6 +17,8 @@ def diagnostic(**overrides):
             "selector_matches": 1, "password_role": "password_text", "cleanup": "passed",
             "traversed_node_matched": False,
             "child_count_unavailable": 0, "child_unavailable": 0, "incomplete_passes": 0,
+            "focus_kind": "other", "focused_nodes": 1,
+            "focus_anchor_seen": True, "focus_requested": True,
             **overrides}
 
 
@@ -213,6 +215,42 @@ class KeyboardFlowMockTests(unittest.TestCase):
         driver = self.fake_menu()
         ui.menu_keyboard(driver)
         self.assertEqual(driver.keys, ["Return", "Escape", "space", "Tab", "Return", "Tab", "shift+Tab", "Escape"])
+
+    def test_menu_diagnostics_preserve_the_exact_keyboard_sequence(self):
+        driver = self.fake_menu()
+        diagnostics = ui.Diagnostics({})
+        ui.menu_keyboard(driver, diagnostics)
+        self.assertEqual(driver.keys, ["Return", "Escape", "space", "Tab", "Return", "Tab", "shift+Tab", "Escape"])
+        self.assertEqual(diagnostics.value["step"], "menu_final_focus")
+        smoke.validate_keyboard_diagnostic(diagnostics.value, False)
+
+    def test_menu_diagnostic_pins_initial_focus_failure_without_private_label(self):
+        driver = self.fake_menu()
+        driver.focus = Mock(side_effect=RuntimeError("PRIVATE_ACCOUNT_LABEL"))
+        diagnostics = ui.Diagnostics({})
+        with self.assertRaises(RuntimeError) as error:
+            ui.menu_keyboard(driver, diagnostics)
+        diagnostics.failed(error.exception)
+        self.assertEqual(driver.keys, [])
+        self.assertEqual(diagnostics.value["step"], "menu_trigger_focus")
+        self.assertNotIn("PRIVATE", json.dumps(diagnostics.value))
+
+    def test_focus_diagnostics_distinguish_lookup_request_and_observation_failure(self):
+        for stage, anchor_seen, requested in [("lookup", False, False),
+                                              ("request", True, False),
+                                              ("observation", True, True)]:
+            driver = object.__new__(ui.AccessibleUI)
+            driver.diagnostics = ui.Diagnostics({})
+            driver.window = Mock(return_value="0x123")
+            target = Mock()
+            target.queryComponent.return_value.grabFocus.return_value = stage != "request"
+            driver.wait = Mock(side_effect=ui.DiagnosticFailure("wait_timeout")) if stage == "lookup" else Mock(return_value=target)
+            driver.expect_focus = Mock(side_effect=ui.DiagnosticFailure("wait_timeout"))
+            with patch.object(ui, "command"), self.assertRaises(RuntimeError):
+                driver.focus("Account menu for PRIVATE_ACCOUNT", prefix=True)
+            self.assertEqual(driver.diagnostics.value["focus_anchor_seen"], anchor_seen)
+            self.assertEqual(driver.diagnostics.value["focus_requested"], requested)
+            self.assertNotIn("PRIVATE", json.dumps(driver.diagnostics.value))
 
     def test_menu_escape_without_focus_return_fails(self):
         with self.assertRaisesRegex(RuntimeError, "focus mismatch"):
@@ -753,6 +791,8 @@ class SequenceDiagnosticTests(unittest.TestCase):
             driver.focused_name()
         self.assertIsInstance(error.exception, LookupError)
         self.assertEqual(driver.diagnostics.value["incomplete_passes"], 1)
+        self.assertEqual(driver.diagnostics.value["focus_kind"], "unavailable")
+        self.assertEqual(driver.diagnostics.value["focused_nodes"], 0)
         with patch.object(smoke, "process_status", return_value=None):
             self.assertTrue(driver.expect_focus("Account menu"))
         self.assertEqual(passes, [0, 1])
@@ -781,6 +821,37 @@ class SequenceDiagnosticTests(unittest.TestCase):
             driver.focused_name()
         self.assertNotIsInstance(error.exception, LookupError)
         self.assertEqual(driver.diagnostics.value["incomplete_passes"], 0)
+        self.assertEqual(driver.diagnostics.value["focus_kind"], "ambiguous")
+        self.assertEqual(driver.diagnostics.value["focused_nodes"], 2)
+
+    def test_focus_categories_never_return_an_account_label_or_unknown_text(self):
+        for name, expected in [(None, "none"), ("Account menu for PRIVATE_ACCOUNT", "account_trigger"),
+                               ("Switch to PRIVATE_ACCOUNT", "account_choice"),
+                               ("Manage accounts", "manage_choice"), ("Add another Matrix account", "add_choice"),
+                               ("Done", "done"), ("Add account", "add_account"),
+                               ("PRIVATE_MESSAGE_OR_VALUE", "other")]:
+            self.assertEqual(ui.focus_kind(name), expected)
+            self.assertIn(expected, smoke.KEYBOARD_FOCUS_KINDS)
+            self.assertNotIn("PRIVATE", expected)
+
+    def test_complete_focus_observation_retains_only_count_and_fixed_category(self):
+        driver = fake_driver([])
+        driver.api.STATE_FOCUSED = object()
+        driver.nodes = lambda: iter([self.focused("PRIVATE_FOCUSED_LABEL")])
+        self.assertEqual(driver.focused_name(), "PRIVATE_FOCUSED_LABEL")
+        self.assertEqual(driver.diagnostics.value["focus_kind"], "other")
+        self.assertEqual(driver.diagnostics.value["focused_nodes"], 1)
+        self.assertNotIn("PRIVATE", json.dumps(driver.diagnostics.value))
+
+    def test_report_rejects_raw_focus_text_and_inconsistent_or_ambiguous_success(self):
+        for value in [diagnostic(focus_kind="PRIVATE_ACCOUNT"), diagnostic(focused_nodes=True),
+                      diagnostic(focus_requested="PRIVATE_ACCOUNT"), diagnostic(focus_anchor_seen=1),
+                      diagnostic(focus_anchor_seen=False, focus_requested=True),
+                      diagnostic(focus_kind="none", focused_nodes=1),
+                      diagnostic(focus_kind="unavailable", focused_nodes=0),
+                      diagnostic(focus_kind="ambiguous", focused_nodes=2)]:
+            with self.assertRaises(RuntimeError):
+                smoke.validate_keyboard_diagnostic(value, True)
 
     def test_persistent_focus_gap_ends_as_wait_timeout(self):
         driver = fake_driver([])

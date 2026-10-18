@@ -1,10 +1,11 @@
 # Native screenshots
 
-These are real Slint window captures of Morpheus at
-[`a38fe43`](https://github.com/brk275/Morpheus/commit/a38fe43ba149cd5f1384dfcb736a26ec4f652001),
-using fictional offline preview accounts. They were captured on the standard
-Ubuntu runner in [CI run 38737708120](https://github.com/brk275/Morpheus/actions/runs/38737708120),
-attempt 1, on October 15, 2026.
+These are real Slint window captures of Morpheus from the tested
+[PR 9](https://github.com/brk275/Morpheus/pull/9) merge snapshot
+`78f6f46d401d0dd091eedae1278c015c459760c9`, using fictional offline preview accounts.
+They were captured on the standard Ubuntu runner in
+[CI run 39074067812](https://github.com/brk275/Morpheus/actions/runs/39074067812),
+attempt 1, on October 17, 2026.
 
 The images are 1440 × 900 lossless PNGs with unchanged pixels and no embedded
 metadata. They are application screenshots, not generated artwork. A preview
@@ -60,21 +61,21 @@ retry control. See [account access](../ACCOUNT_ACCESS.md) for behavior and limit
 
 The native capture command is `--morpheus-capture-preview`; CI converts its RGB
 snapshots to PNG with `scripts/encode_preview_pngs.py`. The source artifact was
-`native-preview-a38fe43ba149cd5f1384dfcb736a26ec4f652001-1`,
-ID `11974809132`. Its archive SHA-256 is
-`794d015daf2aa08e06d7f35ef2477039d2f654eff24d4766229fc31fc2692e99`.
+`native-preview-78f6f46d401d0dd091eedae1278c015c459760c9-1`, ID `12116672244`.
+Its archive SHA-256 is
+`e2cb955703f14afe8c82e4638918ed9087f32dc5338abda8d39eec548f86ce28`.
 `desktop-preview.png` was copied here as `desktop.png`, and `paper-preview.png`
 as `paper.png`. Every image was copied byte for byte after privacy and visual
 review. All eight images below came from the same native executable, SHA-256
-`ddc66c3c73379f0b0a5e3581eb53548b3beedba56882c9eadc6a45eb2d404b17`.
+`828516c07b29468eff912666c41a8c1370854bb105e773875c9f84ecd7a33918`.
 
 | File | SHA-256 |
 | --- | --- |
-| `desktop.png` | `83e665a72322f850ed43fe97994ad1037a4f32d0b39cd6ede06f1753f40d016d` |
-| `account-switcher.png` | `41e564379d0d30b7c5eef2e13047c3d0e9933b063ef438ad6ae777124605d459` |
-| `paper.png` | `e457518119ad00235a9a426704a4d293db72f32a25bf59dd399e8045b2a5c6a6` |
-| `manage-accounts.png` | `730375e5c7105414022e9a5069cbd525c522db67f21ae0c1c23f47e0d6e479a3` |
-| `account-password.png` | `2ff2503a6d165e9b5617ef92ab66fcfad72eb607a193939c5f112f08ca49a21a` |
+| `desktop.png` | `e46322d8ba1ef3c285df62a7fb2f9cbd9a5c7ee7809b1d0f7797088f38ef4051` |
+| `account-switcher.png` | `c131e5238c5323ae5a27180be943f6832c6837c559ba7a9ec06e44e0935b5a55` |
+| `paper.png` | `14df8b7d3b9266633c08a83f36c31c6ca7431ab1aa22ff4d0d964e482ea5576e` |
+| `manage-accounts.png` | `422081010f89253a4d97eaacf086e987da81ba26e89fdf005025fdd22044b305` |
+| `account-password.png` | `7d4c7ac0fb304f82fd9ab80371d092b2ee6893472cbfc78bbcf083730b0b4a21` |
 | `sign-in.png` | `efcf41e65b1ca636511c612f2fbb56a024ba9b1f32c1ef906766e10a9d6ef367` |
-| `terminal-sidebar.png` | `49bc38a632967106e2e068348dda67412f3d7957392cc82e79e485c0295494f4` |
-| `terminal-space-labels.png` | `6a889b7599c7ca89cb92875bd643027b127359dab8aa0a3eaea4f4087cdcf112` |
+| `terminal-sidebar.png` | `113c69a3ef7fd607c884a6973424766969b706721098c424116ab4fb47770766` |
+| `terminal-space-labels.png` | `4250c62a176e235b6877cc02d63bbe1ec93a9049a818527b2fac9b92a1af8781` |

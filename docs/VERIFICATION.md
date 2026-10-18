@@ -3,6 +3,58 @@
 Morpheus is pre-alpha software with no approved installer release. This log records checks actually completed;
 the [release matrix](FEATURE_MATRIX.md) remains the beta gate.
 
+## Appearance and keyboard validation: `2fddb7f`
+
+[PR 9](https://github.com/brk275/Morpheus/pull/9) was reviewed and merged as
+[`5c99063`](https://github.com/brk275/Morpheus/commit/5c990639de167185266b5b2429bafe00f959fdb6)
+after [run 39074067812](https://github.com/brk275/Morpheus/actions/runs/39074067812)
+passed on Apple Silicon, Intel Mac, Windows and Linux. All four targets passed
+39 configuration tests and the native/controller suites, including the original
+long generated-Slint keyboard walks at 100% and 200% text sizes. The full-bounds
+focus fix preserves keyboard reveal when controls sit at a clipped edge.
+Message-role colors, sender palettes, timestamp formats and nickname-column
+settings are documented in [customization](CUSTOMIZATION.md).
+
+Linux passed twenty Rust integration commands and all 46 fixed setup, test and
+cleanup records, including protected accounts, encrypted recovery, both sync
+search paths, OAuth refresh and the four Current/Sticky2025 DM/room ringing
+cases. The stock pre-synced peer passed its eleven interoperability facts;
+fresh-device and production interoperability remain open. Windows also passed
+its owned synthetic capture fixture. The separate system Wayland capture test
+was outside these appearance inputs and remains an open failing release gate.
+
+Every selected job and cache post completed. Seven complete job logs scanned
+with zero credential findings. The only artifact was the native preview;
+no installer was uploaded. Twelve native captures passed privacy and visual
+review, and eight are in [the screenshot gallery](screenshots/README.md).
+They use fictional accounts, unchanged pixels and no embedded metadata.
+
+The producing workflow checked out snapshot
+`78f6f46d401d0dd091eedae1278c015c459760c9`. The merge preserves the intervening
+README cleanup; all non-Markdown file modes and blob IDs match that tested
+snapshot. These results establish the selected native checks, not installed
+interaction, screen-reader behavior, physical media, signing or beta readiness.
+
+## Installed Linux keyboard check: `4037b3a`
+
+[Run 39079458014](https://github.com/brk275/Morpheus/actions/runs/39079458014)
+built the ordinary unsigned AppImage and passed license/theme resources,
+desktop metadata, the ELF baseline, owned X11 startup/stop and all three
+sign-in field checks, including the protected password role. Its AppImage
+SHA-256 is `3ad34a5bf00cd2f13f8d5ab7cf369c19ba3b6339f5592639f4d08b9ee369dd6c`.
+
+The installed account-menu keyboard phase timed out. Its fixed diagnostics
+reported an incomplete accessibility traversal and unavailable child-count
+calls; those observations do not establish the underlying cause. Appearance
+interaction and normal close were not reached. Cleanup passed, all jobs/cache
+posts completed, complete logs scanned with zero credential findings and no
+installer artifact was uploaded.
+
+The next diagnostic change adds exact menu checkpoints and fixed focus
+categories. It preserves the same keyboard sequence, ownership, unique-match,
+complete-traversal and focus assertions, plus the existing time limits. This
+instrumentation is not a fix or evidence that the installed interaction passes.
+
 ## Installed Linux keyboard progress: `cad1abc`
 
 [Run 39057685675](https://github.com/brk275/Morpheus/actions/runs/39057685675)
@@ -21,7 +73,10 @@ hidden subtrees from AT-SPI. The driver now reaches the scale action through
 bounded real Tab input before querying that row, and emits only fixed
 appearance checkpoints if a later assertion fails. A separate UI change gives
 the scale buttons full focus bounds so keyboard scrolling can reveal them.
-Both changes still require hosted verification; no assertion was relaxed.
+The driver change passed its helper checks, and the full-bounds focus fix
+passed the generated-Slint regression above on all four native targets. The
+combined installed-AppImage path still needs a fresh hosted check; no assertion
+was relaxed.
 
 All jobs/cache posts finished, complete logs scanned with zero findings and
 no artifact was uploaded. AppImage SHA-256:
@@ -2915,4 +2970,4 @@ The current checks do not establish current-format Element Call interoperability
 live received video in the Morpheus call stage,
 packaged-app screen-sharing controls and permissions, Linux or Windows GUI
 behavior, screen-reader acceptance, install/update/remove behavior, signed
-packages, or Cinny-level messaging and administration breadth.
+packages, or the full messaging and administration requirements.

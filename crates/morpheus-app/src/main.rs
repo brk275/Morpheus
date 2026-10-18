@@ -607,6 +607,9 @@ fn apply_state(ui: &AppWindow, state: &PreviewState) {
         ui.set_composer_busy(false);
         ui.set_composer_operation(ui.get_composer_operation().wrapping_add(1));
         ui.set_thread_root_id("".into());
+        ui.set_thread_root_is_own(false);
+        ui.set_thread_root_palette_index(0);
+        ui.set_thread_root_accent(Color::default());
         ui.set_thread_messages(ModelRc::new(VecModel::from(Vec::<MessageItem>::new())));
         ui.set_thread_composer_text("".into());
         ui.set_thread_send_pending(false);

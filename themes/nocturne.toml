@@ -30,6 +30,11 @@ unread_ink = "#201733"
 destructive = "#F1A1AC"
 destructive_ink = "#39141F"
 voice = "#9DD8CD"
+timestamp = "#A5AFBE"
+sender = "#E8EDF2"
+message = "#E8EDF2"
+own_message = "#F3F6FA"
+own_surface = "#20283A"
 
 [senders]
 # Sender names only; avatar backgrounds retain their separate identity colors.

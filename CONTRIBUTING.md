@@ -11,6 +11,19 @@ that explains the behavior, tests, and remaining limitations. Treat people
 respectfully and discuss the work. Contributions use the repository license;
 keep third-party copyright and license notices intact.
 
+## Product documentation
+
+Describe Morpheus in its own terms. Keep comparisons and reference-app branding
+out of the README and user guides. Name dependencies and interoperating clients
+where needed for technical instructions, compatibility evidence or attribution.
+
+Keep the README focused on the app, screenshots and getting started. Record
+detailed test history in [verification](docs/VERIFICATION.md), and distinguish
+implemented features from verified behavior in the [feature matrix](docs/FEATURE_MATRIX.md).
+Use real native screenshots with fictional accounts; retain capture provenance.
+
+## Build policy
+
 Read [AGENTS.md](AGENTS.md) before building or changing workflows. Choose checks
 by impact, reuse valid evidence, and avoid duplicate or paid builds. Ordinary
 documentation edits do not need native packaging. Shared native changes need

@@ -17,10 +17,12 @@ width. Existing controls cover font scale (75–200%), room/message density,
 unread-first sorting, pane widths and the details panel. These preferences use
 the same configuration path in live sessions and the offline preview.
 
-At `a38fe43`, native builds and the configuration, navigation and generated-Slint
-keyboard guards passed on all four targets. Twelve Linux captures passed visual
-review, including sidebar navigation and labeled Spaces. Full platform font
-coverage, installed interaction and screen-reader acceptance remain open; see
+At `2fddb7f`, [native validation](https://github.com/brk275/Morpheus/actions/runs/39074067812)
+passed on all four targets, including 39 configuration tests, message/theme
+projections and the generated-Slint keyboard guards at 100%/200% text sizes.
+Twelve Linux captures passed privacy and visual review; eight are in the
+[native screenshot gallery](screenshots/README.md). Full platform font coverage,
+installed interaction and screen-reader acceptance remain open. See
 [verification](VERIFICATION.md), including the separate failed system Wayland
 capture check.
 
@@ -79,7 +81,7 @@ Omitting the table restores rail mode, hidden rail labels and separate DMs.
 Unknown modes or misspelled fields reject the edit; the app keeps its last valid
 configuration. Appearance presets preserve these three navigation preferences.
 
-The native projection/focus guards passed on all four targets at `a38fe43`;
+The native projection/focus guards passed on all four targets at `2fddb7f`;
 the sidebar and labeled rail passed Linux visual review. Broader installed
 keyboard and screen-reader checks remain required, including long names, many
 Spaces and 200% text scale.
@@ -139,6 +141,8 @@ edit, so spelling mistakes do not silently become inactive settings.
 | `chat.timestamp_width` | `72` | 48–160 logical pixels before text scaling; timestamp gutter in Columns layout |
 | `chat.color_senders` | `false` | Use the current sender palette for name text |
 | `chat.nickname_width` | `128` | 64–240; desired nickname column width |
+| `chat.nickname_brackets` | `false` | Show the Columns nickname as `<name>`; the accessible name stays plain |
+| `chat.nickname_alignment` | `"right"` | `"left"` or `"right"`; text alignment inside the Columns nickname column |
 
 Font names must be nonblank, at most 128 UTF-8 bytes, and contain no control or
 direction-format characters. The app selects installed font families; it does
@@ -182,7 +186,10 @@ When the conversation is narrower than 640 logical pixels, or 640 multiplied by
 a text scale above 100%, columns uses a compact header. A timestamp width above
 72 adds the extra scaled width to that threshold, preserving message/action
 space. Nickname columns also
-stay within 20% of the conversation width. Pane sizes contribute to the minimum
+stay within 20% of the conversation width. **Nickname angle brackets** and
+**Nickname alignment** in Settings → Appearance decorate and align that column
+only; stacked and compact headers, thread replies and every accessible label
+keep the plain name. The Terminal preset turns brackets on. Pane sizes contribute to the minimum
 window width, preserving at least 360 logical pixels for the main content.
 Hide the details panel or reduce the pane widths for a smaller workspace.
 
@@ -219,6 +226,8 @@ timestamp_brackets = true
 timestamp_width = 88
 color_senders = true
 nickname_width = 112
+nickname_brackets = true
+nickname_alignment = "right"
 ```
 
 The appearance controls cover the main conversation, navigation, composer and
@@ -344,6 +353,11 @@ also include `[roles]` and `[senders]`. These belong in the theme TOML beside
 | `destructive` | Destructive-action backgrounds and logout text |
 | `destructive_ink` | Their text |
 | `voice` | Voice-room icons and labels |
+| `timestamp` | Clock and delivery-status text in every timeline header, including the compact narrow header, and in thread replies; omitted keeps the muted color |
+| `sender` | Sender names while colored sender names are off; omitted keeps ink |
+| `message` | Message body text; omitted keeps ink |
+| `own_message` | Name and body text of your own messages in the timeline, the thread root and thread replies; omitted falls back to `sender`, `message`, then ink |
+| `own_surface` | Background of your own messages (timeline rows, the thread root and thread replies) when the row is neither selected nor hovered; omitted keeps the previous row background |
 
 For example, keep the `[colors]` table from the dark Nocturne theme and set
 these optional sections in that theme file:
@@ -365,6 +379,11 @@ unread_ink = "#201733"
 destructive = "#F1A1AC"
 destructive_ink = "#39141F"
 voice = "#9DD8CD"
+timestamp = "#A5AFBE"
+sender = "#E8EDF2"
+message = "#E8EDF2"
+own_message = "#F3F6FA"
+own_surface = "#20283A"
 
 [senders]
 colors = ["#C2AEFA", "#9DD8CD", "#F0C28F", "#ACCEFF", "#E7AED1", "#C7D59B"]
@@ -374,13 +393,19 @@ All colors must be `#RRGGBB`; names, transparency values and malformed strings
 are rejected. `senders.colors` accepts **1–16 colors**. An empty list is invalid;
 omit it to restore the previous sender colors. Repeated colors and a one-color
 palette are allowed. Sender colors apply when **Settings → Appearance → Colored
-sender names** is on (`chat.color_senders = true`). This palette changes name text,
-in timeline messages and thread replies, independently of avatar backgrounds,
-account badges and Space identity colors. Thread-root headings and search
-result authors retain their existing text colors, with selection colors when
-applicable. Users choose their own contrast; syntactically valid low-contrast colors are
-not silently replaced. The three shipped presets include semantic roles and
-sender text palettes with source contrast checks.
+sender names** is on (`chat.color_senders = true`). It takes precedence over the
+`sender` and `own_message` roles for name text. Selection colors take precedence
+over every message role on a selected row, and hover keeps its surface over
+`own_surface`. Own-message styling follows the account that sent the event, not
+a display name; an opened thread carries that ownership from the root message.
+Loading a theme replaces the whole role set, so a role the new file omits falls
+back to ink, muted or the previous row background as if it were never set.
+This palette changes name text in timeline messages, thread roots and thread
+replies, independently of avatar backgrounds, account badges and Space identity
+colors. Search result authors retain their existing text colors, with selection
+colors when applicable. Users choose their own contrast; syntactically valid
+low-contrast colors are not silently replaced. The three shipped presets include
+semantic roles and sender text palettes with source contrast checks.
 
 Old eleven-token themes keep their previous per-control fallbacks. Omitting a
 role restores that control's existing color; it does not borrow the value from
@@ -398,8 +423,8 @@ font/layout/geometry fields, so use that when resetting the whole style.
 
 The new roles cover their documented controls. They do not recolor images,
 video, avatar backgrounds, modal scrims or theme-preview swatches. Native
-rendering, live-reload interaction and accessibility checks remain required;
-source contrast checks alone do not establish those results.
+preview renders are recorded in the screenshot gallery. Live-session interaction,
+file-watcher edge cases and accessibility checks remain required.
 
 Morpheus rejects an unknown schema version instead of silently discarding
 settings. New versions read existing schema 1 configuration and theme files

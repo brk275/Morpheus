@@ -36,8 +36,8 @@ when publication inputs change.
       reading a plaintext token file.
 - [ ] Validate room lists and timelines with native sliding sync and classic
       `/sync`, including invite, leave, unread, and a room in multiple Spaces.
-- [ ] Exercise the Cinny v4.12.7 messaging/navigation/admin benchmark in
-      [the feature matrix](FEATURE_MATRIX.md), plus replies, edits, media,
+- [ ] Complete the [chat and desktop behavior checklist](CHAT_CHECKLIST.md)
+      and [feature matrix](FEATURE_MATRIX.md), including replies, edits, media,
       threads, search, drafts, notification settings, and room moderation.
 - [ ] Test a 10,000-message room with variable-height content; scrolling must
       remain responsive and not instantiate every message delegate.
