@@ -98,6 +98,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: 7ec8c2acc1e8abb1117d20f53584d58bedfd75a4
+          fetch-depth: 0
           persist-credentials: false
       - name: Verify exact reviewed source
         shell: bash
@@ -108,6 +109,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse "$GITHUB_SHA:scripts/harden_linux_notice_host.py")" = "$(git rev-parse HEAD:scripts/harden_linux_notice_host.py)"
           # Bootstrap from this immutable reviewed workflow revision, including
           # when the selected package source predates the provisioning helper.
           git show --no-ext-diff --no-textconv "$GITHUB_SHA:scripts/harden_linux_notice_host.py" |
