@@ -2200,6 +2200,8 @@ impl LiveUi {
             let delivery = Arc::new(crate::timeline_delivery::Latest::new());
             loop {
                 let messages = updates.borrow_and_update().clone();
+                #[cfg(test)]
+                let observed = messages.clone();
                 if delivery.submit(messages) {
                     let ui_for_update = ui.clone();
                     let current_generation = feed_generation.clone();
@@ -2237,6 +2239,16 @@ impl LiveUi {
                         break;
                     }
                 }
+                // Test builds only. Reached only after a successful enqueue:
+                // this snapshot is held by a queued UI callback (queued just
+                // above, or still pending from an earlier successful one).
+                #[cfg(test)]
+                timeline_controller_tests::callback_queued(
+                    &feed_account_id,
+                    &feed_room_id,
+                    None,
+                    &observed,
+                );
                 if !matches!(selection.guard(updates.changed()).await, Some(Ok(()))) {
                     break;
                 }
@@ -2334,6 +2346,8 @@ impl LiveUi {
             let delivery = Arc::new(crate::timeline_delivery::Latest::new());
             loop {
                 let messages = updates.borrow_and_update().clone();
+                #[cfg(test)]
+                let observed = messages.clone();
                 if delivery.submit(messages) {
                     let ui_for_update = ui.clone();
                     let current_generation = current_generation.clone();
@@ -2373,6 +2387,16 @@ impl LiveUi {
                         break;
                     }
                 }
+                // Test builds only. Reached only after a successful enqueue:
+                // this snapshot is held by a queued UI callback (queued just
+                // above, or still pending from an earlier successful one).
+                #[cfg(test)]
+                timeline_controller_tests::callback_queued(
+                    &account_id,
+                    &room_id,
+                    Some(root_event_id.as_str()),
+                    &observed,
+                );
                 if !matches!(selection.guard(updates.changed()).await, Some(Ok(()))) {
                     break;
                 }

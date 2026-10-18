@@ -22,6 +22,16 @@
 //! its feeds first, which would mask the exact selection lease checked here.
 //! The Space scan that `account_activated` spawns is also avoided, because its
 //! closing refresh would legitimately reopen the room during the stale checks.
+//!
+//! Two revocation cases are covered. In the idle case both feeds are waiting
+//! for updates when A -> B ends them. In the queued case the UI thread is held
+//! in a bounded synchronous wait while a Tokio worker sends new events, waits
+//! for the controller's test-build observation that callbacks carrying them
+//! are queued on the event loop, and performs A -> B -> A; the held loop then
+//! runs those callbacks, which must publish nothing.
+//!
+//! Each fixed `MORPHEUS_LIVE_TIMELINE_CHECK name=true` record is printed once,
+//! only after its assertions passed. Records carry no IDs, values or text.
 
 use std::future::Future;
 
@@ -33,6 +43,13 @@ use super::*;
 macro_rules! stage {
     ($name:ident) => {
         eprintln!("\nMORPHEUS_LIVE_TIMELINE_STAGE {}", stringify!($name));
+    };
+}
+
+// Printed once per name, only after the corresponding assertions passed.
+macro_rules! check {
+    ($name:ident) => {
+        eprintln!("\nMORPHEUS_LIVE_TIMELINE_CHECK {}=true", stringify!($name));
     };
 }
 
@@ -78,23 +95,54 @@ pub(crate) async fn run_if_configured(runtime: Handle) {
         return;
     };
     let scenario = exercise(runtime, alice, carol, room);
-    tokio::time::timeout(Duration::from_secs(300), scenario)
+    tokio::time::timeout(Duration::from_secs(420), scenario)
         .await
         .expect("live timeline controller scenario must finish within its bound");
 }
 
+/// Owns one task spawned on the runtime. Dropping it, for example when the
+/// outer timeout or the UI scenario is cancelled mid-await, requests abort so
+/// the work is not left detached. Abort is only a request: it does not wait
+/// for the task to finish; the runtime drops the task's future when it next
+/// processes the cancellation. Aborting a task that already finished is a
+/// no-op, so the guard is also dropped after a normal `join`.
+struct OwnedTask<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for OwnedTask<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T> OwnedTask<T> {
+    fn spawn<F>(runtime: &Handle, work: F) -> Self
+    where
+        T: Send + 'static,
+        F: Future<Output = T> + Send + 'static,
+    {
+        Self(runtime.spawn(work))
+    }
+
+    /// Await the result. A panic in the work is re-raised here so the harness
+    /// test fails with it.
+    async fn join(&mut self) -> T {
+        match (&mut self.0).await {
+            Ok(value) => value,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(_) => panic!("Live timeline runtime work was cancelled"),
+        }
+    }
+}
+
 /// Run core work on the Tokio runtime and await it from the Slint event loop.
-/// A panic in that work is re-raised here so the harness test fails with it.
+/// Cancelling the returned future aborts the work (see `OwnedTask`).
 async fn on_runtime<T, F>(runtime: &Handle, work: F) -> T
 where
     T: Send + 'static,
     F: Future<Output = T> + Send + 'static,
 {
-    match runtime.spawn(work).await {
-        Ok(value) => value,
-        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-        Err(_) => panic!("Live timeline runtime work was cancelled"),
-    }
+    let mut task = OwnedTask::spawn(runtime, work);
+    task.join().await
 }
 
 /// Explicit FIFO event-loop barrier: every UI callback the controller queued
@@ -167,6 +215,73 @@ fn marker(prefix: &str) -> String {
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or_default();
     format!("{prefix}-{unique}")
+}
+
+/// Which armed callbacks have been observed queued with their marker.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Queued {
+    room: bool,
+    thread: bool,
+}
+
+/// The one scope and pair of unique server-copy markers the queued case
+/// waits for. Nothing else is recorded.
+struct QueuedWatch {
+    account: String,
+    room: String,
+    root: String,
+    room_body: String,
+    reply_body: String,
+    seen: tokio::sync::watch::Sender<Queued>,
+}
+
+static QUEUED_WATCH: std::sync::Mutex<Option<QueuedWatch>> = std::sync::Mutex::new(None);
+
+/// Disarms the watch when dropped, including on a failed assertion.
+struct ArmedWatch;
+
+impl Drop for ArmedWatch {
+    fn drop(&mut self) {
+        *QUEUED_WATCH.lock().unwrap_or_else(|error| error.into_inner()) = None;
+    }
+}
+
+fn arm_queued_watch(watch: QueuedWatch) -> ArmedWatch {
+    let mut armed = QUEUED_WATCH.lock().unwrap_or_else(|error| error.into_inner());
+    assert!(armed.is_none(), "Only one queued watch may be armed");
+    *armed = Some(watch);
+    ArmedWatch
+}
+
+/// Called by the controller's room and thread feed loops in test builds only,
+/// after a successful `upgrade_in_event_loop`: the snapshot is now held by a
+/// UI callback queued on the event loop (queued in that iteration, or still
+/// pending in one queued earlier that has not taken its payload yet). Only the
+/// armed account, room and thread root, and only the server copy of the armed
+/// unique markers, are recorded; every other call returns without effect.
+pub(crate) fn callback_queued(
+    account: &str,
+    room: &str,
+    thread: Option<&str>,
+    snapshot: &[Arc<MessageInfo>],
+) {
+    let armed = QUEUED_WATCH.lock().unwrap_or_else(|error| error.into_inner());
+    let Some(watch) = armed.as_ref() else {
+        return;
+    };
+    if account != watch.account || room != watch.room {
+        return;
+    }
+    let holds_marker = |body: &str| snapshot.iter().any(|m| is_server_copy(m, body));
+    match thread {
+        None if holds_marker(&watch.room_body) => {
+            watch.seen.send_modify(|seen| seen.room = true);
+        }
+        Some(root) if root == watch.root && holds_marker(&watch.reply_body) => {
+            watch.seen.send_modify(|seen| seen.thread = true);
+        }
+        _ => {}
+    }
 }
 
 /// Wait until the room is visible to the active account, then scan it the
@@ -265,6 +380,7 @@ impl Scenario {
         let published = |ui: &AppWindow| delivered(&ui.get_messages(), &root_text);
         wait_for_ui(&self.ui, "The room feed did not publish", published).await;
         let root = event_id_of(&self.ui.get_messages(), &root_text).unwrap();
+        check!(room_delivery);
 
         // Thread: the Slint handler names the root and clears the list, then
         // the actual open_thread subscribes to the SDK thread timeline.
@@ -274,26 +390,31 @@ impl Scenario {
         self.send_reply(&root, &reply_text).await;
         let replied = |ui: &AppWindow| delivered(&ui.get_thread_messages(), &reply_text);
         wait_for_ui(&self.ui, "The thread feed did not publish", replied).await;
+        check!(thread_delivery);
         assert!(
             !has_event_id(&self.ui.get_thread_messages(), &root),
             "The thread list must exclude its root"
         );
+        check!(thread_root_excluded);
 
         // Both subscriptions published into a live window and keep waiting
         // for the next update: from here only their lease can end them.
         assert_eq!(feeds_running(&self.live).await, (true, true), "Feeds end too early");
+        check!(feeds_running);
         let lease = self.manager.account_selection(&self.account).unwrap();
         assert!(lease.is_current(), "The lease must be current before revocation");
 
-        // A -> B, without the controller: another account signs in on this
-        // profile and becomes active. Both feeds must end on their own.
+        // Idle case, A -> B without the controller: another account signs in
+        // on this profile and becomes active. Both waiting feeds must end.
         stage!(revocation);
         let other_id = self.switch_away(other).await;
         assert!(!lease.is_current(), "Signing in another account must end the lease");
+        check!(old_lease_revoked);
         self.wait_until_stopped().await;
         settle(&self.ui).await;
         assert!(self.shows_scope(&self.ui), "The controller must not have been told");
         assert!(self.ui.get_thread_root_id().as_str() == root, "The thread must stay named");
+        check!(idle_feeds_stopped);
 
         // A -> B -> A, without the controller: the same account and room are
         // visible again under a new lease. New server events reach the same
@@ -309,6 +430,7 @@ impl Scenario {
         self.send_reply(&root, &late_reply).await;
         self.wait_for_core_room_event(&late_room).await;
         self.wait_for_core_thread_event(&root, &late_reply).await;
+        check!(late_events_in_core);
         // Bounded window for any surviving subscriber to queue a callback,
         // then drain the event loop in order before checking.
         tokio::time::sleep(Duration::from_secs(2)).await;
@@ -320,24 +442,126 @@ impl Scenario {
             !shows_body(&self.ui.get_messages(), &late_room),
             "A stale room feed published after A -> B -> A"
         );
+        check!(stale_room_rejected);
         assert!(
             !shows_body(&self.ui.get_thread_messages(), &late_reply),
             "A stale thread feed published after A -> B -> A"
         );
+        check!(stale_thread_rejected);
         assert_eq!(feeds_running(&self.live).await, (false, false), "Ended feeds restarted");
 
         // Positive controls under the renewed lease: the same window and the
         // actual open paths deliver the late events, so the negative checks
-        // above were not caused by a dead window or a broken feed.
+        // above were not caused by a dead window or a broken feed. The room is
+        // reopened first because reselecting it clears the thread feed.
         stage!(reopen);
-        self.open_thread(&root).await;
-        let reply_back = |ui: &AppWindow| delivered(&ui.get_thread_messages(), &late_reply);
-        wait_for_ui(&self.ui, "The reopened thread did not publish", reply_back).await;
         self.select_room().await;
         let room_back = |ui: &AppWindow| delivered(&ui.get_messages(), &late_room);
         wait_for_ui(&self.ui, "The reselected room did not publish", room_back).await;
-        assert!(feeds_running(&self.live).await.0, "The renewed room feed must keep running");
+        check!(renewed_room_delivery);
+        self.open_thread(&root).await;
+        let reply_back = |ui: &AppWindow| delivered(&ui.get_thread_messages(), &late_reply);
+        wait_for_ui(&self.ui, "The reopened thread did not publish", reply_back).await;
+        check!(renewed_thread_delivery);
+
+        self.queued_across_revocation(&root, &other_id).await;
         other_id
+    }
+
+    /// Queued case: callbacks carrying new server events are already queued
+    /// on the UI loop, but have not run, when A -> B -> A happens.
+    async fn queued_across_revocation(&self, root: &str, other: &str) {
+        stage!(queued_revocation);
+        assert_eq!(feeds_running(&self.live).await, (true, true), "Both feeds must be open");
+        let lease = self.manager.account_selection(&self.account).unwrap();
+        assert!(lease.is_current(), "The renewed lease must be current");
+        // Drain earlier callbacks so only this case's payloads are pending.
+        settle(&self.ui).await;
+        let room_text = marker("live-timeline-queued-room");
+        let reply_text = marker("live-timeline-queued-reply");
+        let (seen, mut queued) = tokio::sync::watch::channel(Queued::default());
+        let armed = arm_queued_watch(QueuedWatch {
+            account: self.account.clone(),
+            room: self.room.clone(),
+            root: root.to_owned(),
+            room_body: room_text.clone(),
+            reply_body: reply_text.clone(),
+            seen,
+        });
+        let manager = self.manager.clone();
+        let (account, room) = (self.account.clone(), self.room.clone());
+        let (root_id, other) = (root.to_owned(), other.to_owned());
+        let (room_body, reply_body) = (room_text.clone(), reply_text.clone());
+        let (done, finished) = std::sync::mpsc::channel();
+        // Async work on the runtime only: it awaits the real feeds and the
+        // core, and never waits for the UI thread.
+        let mut worker = OwnedTask::spawn(&self.runtime, async move {
+            let sent = manager.send_text_for(&account, &room, room_body).await;
+            sent.expect("Cannot send the queued room marker");
+            let replied = manager.send_thread_text_for(&account, &room, &root_id, reply_body).await;
+            replied.expect("Cannot send the queued thread marker");
+            let both = |seen: &Queued| seen.room && seen.thread;
+            // Copy the state out and release the watch borrow before any
+            // later await; the feed loops' observations must never wait on it.
+            let observed = {
+                let waited =
+                    tokio::time::timeout(Duration::from_secs(60), queued.wait_for(both)).await;
+                match waited {
+                    Ok(Ok(seen)) => *seen,
+                    _ => Queued::default(),
+                }
+            };
+            // Revoke and renew only once both callbacks are known queued.
+            if observed.room && observed.thread {
+                let away = manager.switch_to(&other).await;
+                away.expect("Cannot switch away while callbacks are queued");
+                let back = manager.switch_to(&account).await;
+                back.expect("Cannot switch back while callbacks are queued");
+            }
+            let _ = done.send(());
+            observed
+        });
+        // Bounded synchronous wait on the UI thread itself: the event loop
+        // cannot run the queued callbacks until the worker reports.
+        let reported = finished.recv_timeout(Duration::from_secs(120));
+        drop(armed);
+        let timed_out = matches!(reported, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        assert!(!timed_out, "The queued A -> B -> A must finish within its bound");
+        let observed = worker.join().await;
+        assert!(observed.room && observed.thread, "Both callbacks must be queued with the events");
+        assert!(!lease.is_current(), "The queued callbacks' lease must be revoked");
+        let renewed = self.manager.account_selection(&self.account).unwrap();
+        assert!(renewed.is_current(), "The account must be selected again under a new lease");
+        check!(queued_callbacks_observed);
+
+        // Resume the real loop: the queued callbacks run now, in order, before
+        // this barrier. The window still names the matching scope, and the
+        // controller's generation and navigation checks still pass.
+        stage!(queued_drain);
+        settle(&self.ui).await;
+        settle(&self.ui).await;
+        assert!(self.shows_scope(&self.ui), "The scope must still match");
+        assert!(self.ui.get_thread_root_id().as_str() == root, "The thread must still match");
+        assert!(
+            !shows_body(&self.ui.get_messages(), &room_text),
+            "A queued room callback published after A -> B -> A"
+        );
+        check!(queued_room_rejected);
+        assert!(
+            !shows_body(&self.ui.get_thread_messages(), &reply_text),
+            "A queued thread callback published after A -> B -> A"
+        );
+        check!(queued_thread_rejected);
+        self.wait_until_stopped().await;
+
+        // Positive control under the newest lease.
+        stage!(queued_reopen);
+        self.select_room().await;
+        let room_back = |ui: &AppWindow| delivered(&ui.get_messages(), &room_text);
+        wait_for_ui(&self.ui, "The room did not deliver after reopening", room_back).await;
+        self.open_thread(root).await;
+        let reply_back = |ui: &AppWindow| delivered(&ui.get_thread_messages(), &reply_text);
+        wait_for_ui(&self.ui, "The thread did not deliver after reopening", reply_back).await;
     }
 
     fn shows_scope(&self, ui: &AppWindow) -> bool {
@@ -510,6 +734,55 @@ impl Scenario {
         }
         drop(manager);
         directory.close().unwrap();
+        check!(cleanup_complete);
         stage!(complete);
     }
+}
+
+/// Signals once when dropped, so a test can observe that a future holding it
+/// was dropped rather than inferring it from elapsed time.
+struct DropWitness(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for DropWitness {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+/// Pure regression for `OwnedTask`: no Slint backend, network or fixture.
+/// Cancelling the caller of `on_runtime` mid-await must abort the spawned
+/// work so the runtime drops its future (and what it holds) while the runtime
+/// is still running, instead of leaving it detached. The wait below is for
+/// that drop signal, bounded; abort itself does not wait for completion.
+#[test]
+fn cancelling_runtime_work_aborts_and_drops_the_spawned_future() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let handle = runtime.handle().clone();
+    runtime.block_on(async move {
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (dropped, released) = tokio::sync::oneshot::channel();
+        let witness = DropWitness(Some(dropped));
+        let mut caller = Box::pin(on_runtime(&handle, async move {
+            let _witness = witness;
+            let _ = started.send(());
+            // Never completes on its own: only cancellation can drop it.
+            std::future::pending::<()>().await
+        }));
+        // The first poll spawns the work and then waits for its result.
+        assert!(futures_util::poll!(caller.as_mut()).is_pending());
+        running.await.expect("the spawned work must start");
+        // Cancel the caller, as the outer timeout or the UI scenario would.
+        drop(caller);
+        let signal = tokio::time::timeout(Duration::from_secs(5), released).await;
+        assert!(
+            matches!(signal, Ok(Ok(()))),
+            "cancelling the caller must drop the spawned future"
+        );
+    });
 }
