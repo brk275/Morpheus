@@ -1239,9 +1239,7 @@ impl LiveUi {
                             &room_id,
                         )
                     {
-                        ui.set_messages(ModelRc::new(VecModel::from(
-                            messages.iter().map(message_item).collect::<Vec<_>>(),
-                        )));
+                        ui.set_messages(crate::timeline_model::update(ui.get_messages(), messages));
                     }
                 });
                 if updates.changed().await.is_err() {
@@ -1342,15 +1340,16 @@ impl LiveUi {
                         && ui.get_active_room_id().as_str() == room_id
                         && ui.get_thread_root_id().as_str() == root_event_id
                     {
-                        ui.set_thread_messages(ModelRc::new(VecModel::from(
-                            messages
-                                .iter()
-                                .filter(|message| {
-                                    message.event_id.as_deref() != Some(root_event_id.as_str())
-                                })
-                                .map(message_item)
-                                .collect::<Vec<_>>(),
-                        )));
+                        let replies = messages
+                            .into_iter()
+                            .filter(|message| {
+                                message.event_id.as_deref() != Some(root_event_id.as_str())
+                            })
+                            .collect();
+                        ui.set_thread_messages(crate::timeline_model::update(
+                            ui.get_thread_messages(),
+                            replies,
+                        ));
                     }
                 });
                 if updates.changed().await.is_err() {
@@ -2073,7 +2072,7 @@ fn member_item(info: &RoomMemberInfo) -> MemberItem {
     }
 }
 
-fn message_item(info: &MessageInfo) -> MessageItem {
+pub(super) fn message_item(info: &MessageInfo) -> MessageItem {
     let sender = display_user(&info.sender);
     let sender_initials = initials(&sender);
     let clocks =

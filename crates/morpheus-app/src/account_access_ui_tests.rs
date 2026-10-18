@@ -687,6 +687,73 @@ async fn assert_native_motion_and_preference(ui: &AppWindow, config_path: &std::
     settle(ui).await;
 }
 
+async fn assert_lazy_timeline_view(ui: &AppWindow) {
+    use crate::timeline_model::{projection_count, tests::fixture, update};
+    use slint::private_unstable_api::re_exports::{AccessibleStringProperty, ItemRc, WindowInner};
+    use std::ops::ControlFlow;
+
+    let has_label = |label: &str| {
+        let window = WindowInner::from_pub(ui.window());
+        ItemRc::new_root(window.component())
+            .visit_descendants(|item| {
+                if item
+                    .accessible_string_property(AccessibleStringProperty::Label)
+                    .as_deref()
+                    == Some(label)
+                {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .is_some()
+    };
+    ui.set_page(0);
+    ui.set_font_scale_percent(100);
+    let mut rows: Vec<_> = (0..10_000).map(fixture).collect();
+    let original = rows[0].body.clone();
+    let model = update(ModelRc::default(), rows.clone());
+    assert_eq!(projection_count(&model), 0);
+    ui.set_messages(model.clone());
+    settle(ui).await;
+    let initial = projection_count(&model);
+    assert!(
+        initial > 0 && initial < 1_000,
+        "the real ListView must project a bounded visible subset: {initial}"
+    );
+    assert!(has_label(&original));
+
+    rows[0].body = "Updated visible timeline fixture".into();
+    rows[0].rich_markdown = Some(rows[0].body.clone());
+    rows[0].rich_accessible = Some(rows[0].body.clone());
+    let changed = update(ui.get_messages(), rows.clone());
+    assert_eq!(changed, model, "an edit must retain the live model");
+    ui.set_messages(changed);
+    settle(ui).await;
+    assert!(has_label(&rows[0].body));
+    assert!(!has_label(&original));
+    let after_edit = projection_count(&model);
+    assert!(
+        after_edit - initial < 1_000,
+        "editing one row must not format the entire history"
+    );
+
+    rows.push(fixture(10_000));
+    let appended = update(ui.get_messages(), rows);
+    assert_eq!(appended, model);
+    ui.set_messages(appended);
+    settle(ui).await;
+    assert_eq!(ui.get_messages().row_count(), 10_001);
+    assert!(
+        projection_count(&model) - after_edit < 1_000,
+        "appending must not format the entire history"
+    );
+    ui.set_messages(ModelRc::new(VecModel::<MessageItem>::default()));
+    settle(ui).await;
+    assert_eq!(ui.get_messages().row_count(), 0);
+    assert!(!has_label("Updated visible timeline fixture"));
+}
+
 async fn assert_palette_and_density_keyboard(ui: &AppWindow) {
     use std::{cell::RefCell, rc::Rc};
 
@@ -1418,6 +1485,7 @@ async fn exercise_account_ui(runtime: Handle) {
     assert_navigation_projection_and_focus(&ui).await;
     assert_accessible_action_focus_and_first_click(&ui).await;
     assert_native_motion_and_preference(&ui, &directory.path().join("appearance.toml")).await;
+    assert_lazy_timeline_view(&ui).await;
     assert_palette_and_density_keyboard(&ui).await;
     assert_scale_keyboard_and_focus_bounds(&ui).await;
     assert_message_role_precedence_and_thread_metadata(&ui).await;
