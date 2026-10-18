@@ -2208,6 +2208,61 @@ fn composer_focus_evidence(ui: &AppWindow, label: &str) -> Vec<String> {
     evidence
 }
 
+/// Inspect only the next bounded raw graph segment and numeric viewport
+/// state at the known synthetic focus-loss boundary. Never print labels/text.
+fn focus_boundary_evidence(ui: &AppWindow) -> Vec<String> {
+    use slint::private_unstable_api::re_exports::{
+        Flickable, FocusScope, ItemRc, TextInput, WindowInner,
+    };
+    use std::ops::ControlFlow;
+    let window = WindowInner::from_pub(ui.window());
+    let root = ItemRc::new_root(window.component());
+    let mut evidence = Vec::new();
+    if let Some(focused) = window.focus_item.borrow().upgrade() {
+        let mut cursor = focused;
+        for offset in 0..32 {
+            let (kind, enabled) = if let Some(input) = cursor.downcast::<TextInput>() {
+                (1, Some(input.as_pin_ref().enabled()))
+            } else if let Some(scope) = cursor.downcast::<FocusScope>() {
+                (2, Some(scope.as_pin_ref().enabled()))
+            } else {
+                (0, None)
+            };
+            evidence.push(format!(
+                "offset={offset}; kind={kind}; enabled={enabled:?}; visible={}; bounds={:?}",
+                cursor.is_visible(),
+                item_bounds(&cursor)
+            ));
+            cursor = cursor.next_focus_item();
+        }
+    } else {
+        evidence.push("no focus".into());
+    }
+    let mut visited = 0;
+    root.visit_descendants(|item| {
+        visited += 1;
+        if evidence.len() < 48 {
+            if let Some(flickable) = item.downcast::<Flickable>() {
+                let f = flickable.as_pin_ref();
+                evidence.push(format!(
+                    "viewport={:?}; canvas=({},{},{},{})",
+                    item_bounds(item),
+                    f.content_x().0,
+                    f.content_y().0,
+                    f.content_width().0,
+                    f.content_height().0
+                ));
+            }
+        }
+        if visited >= 4096 {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    evidence
+}
+
 /// Bounds of the control that currently has keyboard focus, if any.
 fn focused_control_bounds(ui: &AppWindow) -> Option<Bounds> {
     use slint::private_unstable_api::re_exports::WindowInner;
@@ -2579,6 +2634,7 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
     // Bounded, numeric-only failure evidence: classify focus against the
     // fixture's known labels without printing any input or account contents.
     let mut room_focus_trace = Vec::new();
+    let mut loss_boundary = Vec::new();
     for step in 0..400 {
         if room_focus_trace.len() < 64 {
             let category = if focused_control_has_label(ui, &composer_label) {
@@ -2616,7 +2672,19 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
                 room_strip_controls += 1;
             }
         }
-        key(ui, Key::Tab);
+        if step == 24 {
+            loss_boundary.push(focus_boundary_evidence(ui));
+            let tab: slint::SharedString = Key::Tab.into();
+            ui.window()
+                .dispatch_event(WindowEvent::KeyPressed { text: tab.clone() });
+            loss_boundary.push(focus_boundary_evidence(ui));
+            ui.window()
+                .dispatch_event(WindowEvent::KeyReleased { text: tab });
+            i_slint_backend_testing::mock_elapsed_time(Duration::ZERO);
+            loss_boundary.push(focus_boundary_evidence(ui));
+        } else {
+            key(ui, Key::Tab);
+        }
     }
     assert!(
         room_strip_controls >= 28,
@@ -2624,12 +2692,13 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
     );
     assert!(
         focused_control_has_label(ui, &composer_label),
-        "the tab walk must leave the strip and reach the composer input; mode={}, controls={}, trace={:?}; before={:?}; after={:?}",
+        "the tab walk must leave the strip and reach the composer input; mode={}, controls={}, trace={:?}; before={:?}; after={:?}; loss_boundary={:?}",
         ui.get_composer_mode(),
         room_strip_controls,
         room_focus_trace,
         composer_before_walk,
-        composer_focus_evidence(ui, &composer_label)
+        composer_focus_evidence(ui, &composer_label),
+        loss_boundary
     );
     assert_eq!(
         room_control_identities.len(),
