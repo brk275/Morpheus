@@ -32,6 +32,7 @@ use matrix_sdk::{
                 MediaSource,
                 message::{MessageType, SyncRoomMessageEvent},
             },
+            sticker::{StickerEventContent, SyncStickerEvent},
         },
     },
     send_queue::{RoomSendQueueUpdate, SendHandle},
@@ -52,6 +53,8 @@ pub const MAX_IMAGE_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
 const MEDIA_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_MEDIA_REDIRECTS: usize = 5;
 const MAX_MATRIX_ERROR_BYTES: usize = 4096;
+// Bound secondary parsing of untrusted attachment events.
+const MAX_ATTACHMENT_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_MEDIA_ADDRESS_BYTES: usize = 64 * 1024;
 const MAX_MEDIA_SERVER_BYTES: usize = 512;
 
@@ -817,15 +820,38 @@ async fn resolve_attachment(
         .await
         .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
     let event_was_encrypted = event.encryption_info().is_some();
+    if event.raw().json().get().len() > MAX_ATTACHMENT_EVENT_BYTES {
+        return Err(MatrixCoreError::InvalidMedia(
+            "The attachment event is too large to read".into(),
+        ));
+    }
     let raw = event
         .raw()
         .deserialize()
-        .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
+        .map_err(|_| MatrixCoreError::InvalidMedia("Cannot read the attachment event".into()))?;
     match raw {
         AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::RoomMessage(
             SyncRoomMessageEvent::Original(event),
         )) => {
             let mut resolved = from_message(event_id, &event.content.msgtype)?;
+            resolved.event_was_encrypted = event_was_encrypted;
+            Ok(resolved)
+        }
+        AnySyncTimelineEvent::MessageLike(AnySyncMessageLikeEvent::Sticker(
+            SyncStickerEvent::Original(sticker),
+        )) => {
+            // Some clients use an encrypted-file extension. If this SDK build
+            // cannot interpret it, never fall back to a second plaintext URL.
+            let content = event
+                .raw()
+                .get_field::<serde_json::Value>("content")
+                .map_err(|_| {
+                    MatrixCoreError::InvalidMedia("Cannot read the attachment event".into())
+                })?;
+            let has_file = content
+                .as_ref()
+                .is_some_and(|value| value.get("file").is_some());
+            let mut resolved = from_sticker(event_id, &sticker.content, has_file)?;
             resolved.event_was_encrypted = event_was_encrypted;
             Ok(resolved)
         }
@@ -862,6 +888,52 @@ pub(crate) fn validate_media_address(
     }
     let server = matrix_sdk::ruma::ServerName::parse(server).map_err(|_| invalid())?;
     Ok((server, media))
+}
+
+fn from_sticker(
+    event_id: &str,
+    sticker: &StickerEventContent,
+    has_file: bool,
+) -> Result<ResolvedAttachment> {
+    let source: MediaSource = sticker.source.clone().into();
+    if has_file && !matches!(source, MediaSource::Encrypted(_)) {
+        return Err(MatrixCoreError::InvalidMedia(
+            "This encrypted sticker format is not supported".into(),
+        ));
+    }
+    let uri = match &source {
+        MediaSource::Plain(uri) => uri,
+        MediaSource::Encrypted(file) => &file.url,
+    };
+    validate_media_address(uri)?;
+    let mime_type = sticker
+        .info
+        .mimetype
+        .as_deref()
+        .and_then(|value| parse_mime(value).ok())
+        .map_or_else(
+            || "application/octet-stream".into(),
+            |value| value.to_string(),
+        );
+    let filename = match mime_type.as_str() {
+        "image/png" => "sticker.png",
+        "image/jpeg" => "sticker.jpg",
+        "image/gif" => "sticker.gif",
+        "image/webp" => "sticker.webp",
+        _ => "sticker",
+    };
+    Ok(ResolvedAttachment {
+        event_was_encrypted: false,
+        metadata: AttachmentMetadata {
+            event_id: event_id.into(),
+            filename: filename.into(),
+            mime_type,
+            declared_size: sticker.info.size.map(u64::from),
+            kind: AttachmentKind::Image,
+            encrypted: matches!(source, MediaSource::Encrypted(_)),
+        },
+        source,
+    })
 }
 
 fn from_message(event_id: &str, message: &MessageType) -> Result<ResolvedAttachment> {
@@ -1048,6 +1120,73 @@ fn is_windows_reserved_name(filename: &str) -> bool {
 mod tests {
     use super::*;
     use futures_util::stream;
+
+    fn sticker_fixture() -> StickerEventContent {
+        let mut info = matrix_sdk::ruma::events::room::ImageInfo::new();
+        info.mimetype = Some("image/png".into());
+        info.size = Some(69_u32.into());
+        StickerEventContent::new(
+            "../private-description\u{202e}.exe".into(),
+            info,
+            "mxc://example.org/private-sticker-source".into(),
+        )
+    }
+
+    #[test]
+    fn sticker_metadata_preserves_image_hints_without_source_or_body() {
+        let resolved = from_sticker("$sticker", &sticker_fixture(), false).unwrap();
+        assert_eq!(resolved.metadata.kind, AttachmentKind::Image);
+        assert_eq!(resolved.metadata.filename, "sticker.png");
+        assert_eq!(resolved.metadata.mime_type, "image/png");
+        assert_eq!(resolved.metadata.declared_size, Some(69));
+        assert!(!resolved.metadata.encrypted);
+        let public = serde_json::to_string(&resolved.metadata).unwrap();
+        assert!(!public.contains("private-sticker-source"));
+        assert!(!public.contains("private-description"));
+        assert!(!public.contains("mxc://"));
+    }
+
+    #[test]
+    fn sticker_encrypted_extension_never_falls_back_to_plain_url() {
+        assert!(matches!(
+            from_sticker("$sticker", &sticker_fixture(), true),
+            Err(MatrixCoreError::InvalidMedia(_))
+        ));
+    }
+
+    #[test]
+    fn sticker_sources_must_be_valid_matrix_media_addresses() {
+        let mut sticker = sticker_fixture();
+        for address in [
+            "https://example.org/image.png",
+            "file:///private/image.png",
+            "mxc://example.org",
+            "mxc://example.org/",
+            "mxc://example.org/a/b",
+        ] {
+            sticker.source =
+                matrix_sdk::ruma::events::sticker::StickerMediaSource::Plain(address.into());
+            assert!(matches!(
+                from_sticker("$sticker", &sticker, false),
+                Err(MatrixCoreError::InvalidMedia(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn sticker_previews_keep_encrypted_context_and_size_guards() {
+        let mut sticker = sticker_fixture();
+        let resolved = from_sticker("$sticker", &sticker, false).unwrap();
+        assert!(validate_preview_metadata(&resolved.metadata, true, false, false).is_err());
+        assert!(validate_preview_metadata(&resolved.metadata, false, true, false).is_err());
+        assert!(validate_preview_metadata(&resolved.metadata, true, true, true).is_ok());
+        sticker.info.size = Some(((MAX_IMAGE_PREVIEW_BYTES + 1) as u32).into());
+        let oversized = from_sticker("$sticker", &sticker, false).unwrap();
+        assert!(matches!(
+            validate_preview_metadata(&oversized.metadata, false, false, true),
+            Err(MatrixCoreError::MediaTooLarge { .. })
+        ));
+    }
 
     #[test]
     fn media_address_limits_are_checked_before_endpoint_construction() {

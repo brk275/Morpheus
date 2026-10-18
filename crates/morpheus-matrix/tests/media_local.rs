@@ -7,7 +7,14 @@ mod opened_room;
 
 use std::{collections::HashMap, fs, path::Path, time::Duration};
 
-use matrix_sdk::ruma::RoomId;
+use matrix_sdk::ruma::{
+    EventId, RoomId,
+    events::{
+        relation::Thread,
+        room::{ImageInfo, message::Relation},
+        sticker::StickerEventContent,
+    },
+};
 use morpheus_matrix::{AccountManager, AttachmentKind, AttachmentSendUpdate, MatrixCoreError};
 use serde::Deserialize;
 use tokio::time::{Instant, sleep, timeout, timeout_at};
@@ -129,6 +136,8 @@ fn encrypted_file_roundtrips_between_disposable_accounts() {
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
     }
     let filename = format!("encrypted-{}.bin", Uuid::new_v4());
+    let sticker_body = format!("Original sticker {}", Uuid::new_v4());
+    let thread_sticker_body = format!("Original thread sticker {}", Uuid::new_v4());
     let file_path = root.join(&filename);
     let preview_path = root.join("original-preview.png");
     fs::write(&preview_path, PREVIEW_PNG).expect("Cannot create original preview fixture");
@@ -308,6 +317,198 @@ fn encrypted_file_roundtrips_between_disposable_accounts() {
             assert_eq!(plain_image.bytes, PREVIEW_PNG);
             assert_eq!(plain_image.metadata.kind, AttachmentKind::Image);
             assert!(!plain_image.metadata.encrypted);
+
+            // Pack media is public even when its m.sticker event is encrypted.
+            // This deliberately uploads only our original non-secret 1px PNG.
+            // No production compose API or credential/store shortcut is used.
+            let sticker_uri = sender_client
+                .media()
+                .upload(&mime::IMAGE_PNG, PREVIEW_PNG.to_vec(), None)
+                .await
+                .map_err(|_| ())?
+                .content_uri;
+            let mut sticker_info = ImageInfo::new();
+            sticker_info.mimetype = Some("image/png".into());
+            sticker_info.size = Some((PREVIEW_PNG.len() as u32).into());
+            let encrypted_sender = sender_client
+                .get_room(&RoomId::parse(room_id).map_err(|_| ())?)
+                .ok_or(())?;
+            let sticker_event = encrypted_sender
+                .send(StickerEventContent::new(
+                    sticker_body.clone(),
+                    sticker_info,
+                    sticker_uri.clone(),
+                ))
+                .await
+                .map_err(|_| ())?
+                .event_id
+                .to_string();
+            loop {
+                if let Some(item) = receiver_feed
+                    .snapshot()
+                    .into_iter()
+                    .find(|item| item.event_id.as_deref() == Some(sticker_event.as_str()))
+                {
+                    assert_eq!(item.body, sticker_body);
+                    assert_eq!(item.attachment_name.as_deref(), Some("Sticker"));
+                    assert!(item.attachment_is_image);
+                    assert!(item.rich_markdown.is_none());
+                    break;
+                }
+                sleep(Duration::from_millis(300)).await;
+            }
+            let received_sticker = encrypted
+                .load_or_fetch_event(&EventId::parse(&sticker_event).map_err(|_| ())?, None)
+                .await
+                .map_err(|_| ())?;
+            assert!(received_sticker.encryption_info().is_some());
+            assert!(matches!(
+                receiver
+                    .download_image_preview_for(&receiver_selection, room_id, &sticker_event, false)
+                    .await,
+                Err(MatrixCoreError::InvalidMedia(_))
+            ));
+            assert!(matches!(
+                receiver
+                    .download_image_preview_for(&sender_selection, room_id, &sticker_event, true)
+                    .await,
+                Err(MatrixCoreError::SelectedAccountChanged)
+            ));
+            let sticker = receiver
+                .download_image_preview_for(&receiver_selection, room_id, &sticker_event, true)
+                .await
+                .map_err(|_| ())?
+                .into_plaintext()
+                .map_err(|_| ())?;
+            assert_eq!(sticker.bytes, PREVIEW_PNG);
+            assert_eq!(sticker.metadata.filename, "sticker.png");
+            // Media encryption and enclosing-event encryption are independent.
+            assert!(!sticker.metadata.encrypted);
+            let saved_sticker = receiver
+                .download_attachment_for(&receiver_account.id, room_id, &sticker_event)
+                .await
+                .map_err(|_| ())?;
+            assert_eq!(saved_sticker.bytes, PREVIEW_PNG);
+            assert_eq!(saved_sticker.metadata.kind, AttachmentKind::Image);
+
+            // A sticker must also survive the real thread-focused timeline,
+            // without being duplicated into the ordinary room conversation.
+            // Use the existing encrypted image message as the thread root.
+            let thread_feed = receiver
+                .thread_message_feed_for(&receiver_account.id, room_id, &image_event)
+                .await
+                .map_err(|_| ())?;
+            let root = EventId::parse(&image_event).map_err(|_| ())?;
+            let mut thread_info = ImageInfo::new();
+            thread_info.mimetype = Some("image/png".into());
+            thread_info.size = Some((PREVIEW_PNG.len() as u32).into());
+            let mut thread_content = StickerEventContent::new(
+                thread_sticker_body.clone(),
+                thread_info,
+                sticker_uri.clone(),
+            );
+            thread_content.relates_to = Some(Relation::Thread(Thread::plain(root.clone(), root)));
+            let thread_sticker_event = encrypted_sender
+                .send(thread_content)
+                .await
+                .map_err(|_| ())?
+                .event_id
+                .to_string();
+            loop {
+                if let Some(item) = thread_feed
+                    .snapshot()
+                    .into_iter()
+                    .find(|item| item.event_id.as_deref() == Some(thread_sticker_event.as_str()))
+                {
+                    assert_eq!(item.body, thread_sticker_body);
+                    assert_eq!(item.attachment_name.as_deref(), Some("Sticker"));
+                    assert!(item.attachment_is_image);
+                    break;
+                }
+                sleep(Duration::from_millis(300)).await;
+            }
+            let thread_event = encrypted
+                .load_or_fetch_event(
+                    &EventId::parse(&thread_sticker_event).map_err(|_| ())?,
+                    None,
+                )
+                .await
+                .map_err(|_| ())?;
+            assert!(thread_event.encryption_info().is_some());
+            assert!(matches!(
+                receiver
+                    .download_image_preview_for(
+                        &receiver_selection,
+                        room_id,
+                        &thread_sticker_event,
+                        false,
+                    )
+                    .await,
+                Err(MatrixCoreError::InvalidMedia(_))
+            ));
+            let thread_sticker = receiver
+                .download_image_preview_for(
+                    &receiver_selection,
+                    room_id,
+                    &thread_sticker_event,
+                    true,
+                )
+                .await
+                .map_err(|_| ())?
+                .into_plaintext()
+                .map_err(|_| ())?;
+            assert_eq!(thread_sticker.bytes, PREVIEW_PNG);
+            assert_eq!(thread_sticker.metadata.filename, "sticker.png");
+
+            // An ordinary later event is the ordered live-timeline barrier;
+            // testing absence immediately after thread delivery could race
+            // the independent room projection task and give a false pass.
+            let barrier = format!("Thread sticker barrier {}", Uuid::new_v4());
+            sender
+                .send_text_for(&sender_account.id, room_id, barrier.clone())
+                .await
+                .map_err(|_| ())?;
+            loop {
+                if receiver_feed
+                    .snapshot()
+                    .iter()
+                    .any(|item| item.body == barrier)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(300)).await;
+            }
+            assert!(
+                receiver_feed
+                    .snapshot()
+                    .iter()
+                    .all(|item| item.event_id.as_deref() != Some(thread_sticker_event.as_str()))
+            );
+            let ambiguous_event = encrypted_sender
+                .send_raw(
+                    "m.sticker",
+                    serde_json::json!({
+                        "body": "Unreadable sticker source fixture",
+                        "info": { "mimetype": "image/png" },
+                        "url": sticker_uri,
+                        "file": null
+                    }),
+                )
+                .await
+                .map_err(|_| ())?
+                .event_id
+                .to_string();
+            assert!(matches!(
+                receiver
+                    .download_image_preview_for(
+                        &receiver_selection,
+                        room_id,
+                        &ambiguous_event,
+                        true,
+                    )
+                    .await,
+                Err(MatrixCoreError::InvalidMedia(_))
+            ));
             Ok::<(), ()>(())
         })
         .await
@@ -323,6 +524,22 @@ fn encrypted_file_roundtrips_between_disposable_accounts() {
         fs::remove_file(&preview_path).expect("Cannot remove preview fixture input");
         assert!(!contains_plaintext(&root.join("sender"), &payload[..80]));
         assert!(!contains_plaintext(&root.join("receiver"), &payload[..80]));
+        assert!(!contains_plaintext(
+            &root.join("sender"),
+            sticker_body.as_bytes()
+        ));
+        assert!(!contains_plaintext(
+            &root.join("receiver"),
+            sticker_body.as_bytes()
+        ));
+        assert!(!contains_plaintext(
+            &root.join("sender"),
+            thread_sticker_body.as_bytes()
+        ));
+        assert!(!contains_plaintext(
+            &root.join("receiver"),
+            thread_sticker_body.as_bytes()
+        ));
         sender
             .logout_account(&sender_account.id)
             .await

@@ -3870,7 +3870,15 @@ async fn room_info(room: &Room) -> RoomInfo {
 
 fn message_info(item: &TimelineItem) -> Option<MessageInfo> {
     let event = item.as_event()?;
-    let message = event.content().as_message()?;
+    let content = event.content();
+    let message = content.as_message();
+    // Stickers are their own Matrix event type. The SDK deliberately does not
+    // expose them through as_message(), but they still belong in the timeline.
+    let body = message.map(|message| message.body()).or_else(|| {
+        content
+            .as_sticker()
+            .map(|sticker| sticker.content().body.as_str())
+    })?;
     let reply_preview =
         event
             .content()
@@ -3888,7 +3896,14 @@ fn message_info(item: &TimelineItem) -> Option<MessageInfo> {
                     let body = replied_to
                         .content
                         .as_message()
-                        .map(|message| message.body().lines().next().unwrap_or("message"))
+                        .map(|message| message.body())
+                        .or_else(|| {
+                            replied_to
+                                .content
+                                .as_sticker()
+                                .map(|sticker| sticker.content().body.as_str())
+                        })
+                        .map(|body| body.lines().next().unwrap_or("message"))
                         .unwrap_or("message");
                     format!("{sender}: {}", body.chars().take(72).collect::<String>())
                 }
@@ -3899,10 +3914,10 @@ fn message_info(item: &TimelineItem) -> Option<MessageInfo> {
         Some(EventSendState::SendingFailed { .. }) => MessageSendState::Failed,
         Some(EventSendState::Sent { .. }) | None => MessageSendState::Sent,
     };
-    let formatted = match message.msgtype() {
-        MessageType::Text(content) => content.formatted.as_ref(),
-        MessageType::Notice(content) => content.formatted.as_ref(),
-        MessageType::Emote(content) => content.formatted.as_ref(),
+    let formatted = match message.map(|message| message.msgtype()) {
+        Some(MessageType::Text(content)) => content.formatted.as_ref(),
+        Some(MessageType::Notice(content)) => content.formatted.as_ref(),
+        Some(MessageType::Emote(content)) => content.formatted.as_ref(),
         _ => None,
     };
     let rich_markdown = formatted
@@ -3915,11 +3930,15 @@ fn message_info(item: &TimelineItem) -> Option<MessageInfo> {
         key: item.unique_id().0.clone(),
         event_id: event.event_id().map(ToString::to_string),
         sender: event.sender().to_string(),
-        body: message.body().to_owned(),
+        body: body.to_owned(),
         rich_markdown,
         rich_accessible,
-        attachment_name: media::attachment_name(message.msgtype()),
-        attachment_is_image: matches!(message.msgtype(), MessageType::Image(_)),
+        attachment_name: message
+            .and_then(|message| media::attachment_name(message.msgtype()))
+            .or_else(|| content.is_sticker().then(|| "Sticker".into())),
+        attachment_is_image: message
+            .is_some_and(|message| matches!(message.msgtype(), MessageType::Image(_)))
+            || content.is_sticker(),
         reply_preview,
         reaction_summary: event
             .reactions()
