@@ -405,8 +405,11 @@ For `AXChildren`, an explicit `AXError.noValue` with a nil payload is a
 declared empty collection, as used by native AppKit leaf buttons. It is not
 an unreadable subtree. Unsupported attributes, messaging errors, invalid
 elements, malformed success payloads and contradictory non-nil `noValue`
-payloads remain incomplete. This distinction needs native classifier and
-owned-tree checks on both Mac architectures, followed by installed-app
+payloads remain incomplete. Successful arrays also need an
+explicit CF array type, a count within the retained-node bound and an AX
+element type check for every child before conversion. Swift's conditional
+cast alone does not validate those CF element types. These changes require
+native classifier and owned-tree checks on both Mac architectures, followed by installed-app
 verification; a synthetic AppKit subject does not prove Morpheus's full tree.
 
 - `Homeserver URL` and `Matrix ID or username` must be `AXTextField` without

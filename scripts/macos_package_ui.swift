@@ -84,8 +84,22 @@ func classifiedChildren(_ result: AXError, _ value: CFTypeRef?) -> [AXUIElement]
     if result == .noValue && value == nil {
         return []
     }
-    guard result == .success else { return nil }
-    return value as? [AXUIElement]
+    guard result == .success, let value = value,
+          CFGetTypeID(value) == CFArrayGetTypeID() else { return nil }
+    let array = value as! CFArray
+    // Check the count before materializing a Swift array. The AX API already
+    // returned its CFArray; this bound limits our own retained children.
+    guard CFArrayGetCount(array) <= maxNodes,
+          let objects = value as? [AnyObject] else { return nil }
+    var children: [AXUIElement] = []
+    children.reserveCapacity(objects.count)
+    for object in objects {
+        // Swift conditional casts to CF reference types do not prove the
+        // runtime CF type. Validate each item before the guarded force cast.
+        guard CFGetTypeID(object) == AXUIElementGetTypeID() else { return nil }
+        children.append(object as! AXUIElement)
+    }
+    return children
 }
 
 func childElements(_ element: AXUIElement) -> [AXUIElement]? {
