@@ -581,6 +581,10 @@ type Step<T = ()> = Result<T, &'static str>;
 /// Fixed progress labels for private fixture logs, without room/account/media IDs.
 enum StickerStage {
     Catalog,
+    CatalogFeed,
+    CatalogUpload,
+    CatalogPublish,
+    CatalogRead,
     Consent,
     RoomPreview,
     RoomEnqueue,
@@ -605,6 +609,10 @@ enum StickerStage {
 fn sticker_stage(stage: StickerStage) {
     let code = match stage {
         StickerStage::Catalog => "catalog",
+        StickerStage::CatalogFeed => "catalog_feed",
+        StickerStage::CatalogUpload => "catalog_upload",
+        StickerStage::CatalogPublish => "catalog_publish",
+        StickerStage::CatalogRead => "catalog_read",
         StickerStage::Consent => "consent",
         StickerStage::RoomPreview => "room_preview",
         StickerStage::RoomEnqueue => "room_enqueue",
@@ -826,12 +834,14 @@ async fn sticker_scenario(
         .await
         .map_err(|_| "Receiver client missing")?;
     let receiver_room = sdk_room(&receiver_client, room_id)?;
+    sticker_stage(StickerStage::CatalogFeed);
     let receiver_feed = receiver
         .message_feed(room_id)
         .await
         .map_err(|_| "Receiver feed failed")?;
     // Pack media is public even for an encrypted conversation. Upload only
     // the original non-secret 1px PNG; nothing is fetched from elsewhere.
+    sticker_stage(StickerStage::CatalogUpload);
     let uri = client
         .media()
         .upload(&mime::IMAGE_PNG, PREVIEW_PNG.to_vec(), None)
@@ -841,7 +851,9 @@ async fn sticker_scenario(
         .to_string();
     let room = sdk_room(&client, room_id)?;
     let room_body = format!("Sleeping owl {marker}");
+    sticker_stage(StickerStage::CatalogPublish);
     publish_pack(&room, PACK_KEY, owl_pack(&uri, &room_body)).await?;
+    sticker_stage(StickerStage::CatalogRead);
     let catalog = catalog_with(sender, selection, room_id, None, &room_body, true).await;
     let owl = label_index(&catalog, &room_body).ok_or("No room sticker")?;
     let wave = sibling(&catalog, &room_body, "owl_wave").ok_or("No second sticker")?;

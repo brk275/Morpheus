@@ -1,7 +1,8 @@
 """Closed timeout diagnostics; never forward fixture values or failed assertions."""
 
 STAGES = frozenset((
-    "catalog", "consent", "room_preview", "room_enqueue", "room_outcome",
+    "catalog", "catalog_feed", "catalog_upload", "catalog_publish", "catalog_read",
+    "consent", "room_preview", "room_enqueue", "room_outcome",
     "room_receive", "room_queue_clear", "thread_catalog", "thread_send",
     "thread_receive", "thread_queue_clear", "barrier", "pack_change",
     "enabled_packs", "plain_room", "disable_pack", "recovery_gate",
