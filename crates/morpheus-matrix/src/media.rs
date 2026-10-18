@@ -52,6 +52,8 @@ pub const MAX_IMAGE_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
 const MEDIA_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_MEDIA_REDIRECTS: usize = 5;
 const MAX_MATRIX_ERROR_BYTES: usize = 4096;
+const MAX_MEDIA_ADDRESS_BYTES: usize = 64 * 1024;
+const MAX_MEDIA_SERVER_BYTES: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -418,6 +420,7 @@ pub(crate) async fn fetch_bounded_media(
         MediaSource::Plain(uri) => uri,
         MediaSource::Encrypted(file) => &file.url,
     };
+    let (server_name, media_id) = validate_media_address(uri)?;
     let supported = client
         .supported_versions()
         .await
@@ -451,18 +454,20 @@ pub(crate) async fn fetch_bounded_media(
             let token = client.access_token().ok_or_else(|| {
                 MatrixCoreError::Sdk("authenticated media requires a session".into())
             })?;
-            authenticated_media::get_content::v1::Request::from_uri(uri)
-                .map_err(|error| MatrixCoreError::InvalidMedia(error.to_string()))?
-                .try_into_http_request::<Vec<u8>>(
-                    base_url.as_str(),
-                    SendAccessToken::IfRequired(&token),
-                    Cow::Borrowed(&supported),
-                )
-                .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?
+            authenticated_media::get_content::v1::Request::new(
+                media_id.to_owned(),
+                server_name.clone(),
+            )
+            .try_into_http_request::<Vec<u8>>(
+                base_url.as_str(),
+                SendAccessToken::IfRequired(&token),
+                Cow::Borrowed(&supported),
+            )
+            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?
         } else {
             #[allow(deprecated)]
-            let request = media::get_content::v3::Request::from_url(uri)
-                .map_err(|error| MatrixCoreError::InvalidMedia(error.to_string()))?;
+            let request =
+                media::get_content::v3::Request::new(media_id.to_owned(), server_name.clone());
             request
                 .try_into_http_request::<Vec<u8>>(
                     base_url.as_str(),
@@ -828,6 +833,37 @@ async fn resolve_attachment(
     }
 }
 
+pub(crate) fn validate_media_address(
+    uri: &matrix_sdk::ruma::MxcUri,
+) -> Result<(matrix_sdk::ruma::OwnedServerName, &str)> {
+    // Validate bounded components before building a media request.
+    // Long valid DNS authorities still work; endpoint constructors receive
+    // independent typed components, never a direct HTTP/file URL.
+    let invalid = || {
+        MatrixCoreError::InvalidMedia(
+            "The attachment has an unsupported Matrix media address".into(),
+        )
+    };
+    if uri.as_str().len() > MAX_MEDIA_ADDRESS_BYTES {
+        return Err(invalid());
+    }
+    let (server, media) = uri
+        .as_str()
+        .strip_prefix("mxc://")
+        .and_then(|value| value.split_once('/'))
+        .ok_or_else(invalid)?;
+    if server.len() > MAX_MEDIA_SERVER_BYTES
+        || media.is_empty()
+        || !media
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(invalid());
+    }
+    let server = matrix_sdk::ruma::ServerName::parse(server).map_err(|_| invalid())?;
+    Ok((server, media))
+}
+
 fn from_message(event_id: &str, message: &MessageType) -> Result<ResolvedAttachment> {
     let (kind, filename, mime_type, declared_size, source) = match message {
         MessageType::Image(content) => (
@@ -1012,6 +1048,92 @@ fn is_windows_reserved_name(filename: &str) -> bool {
 mod tests {
     use super::*;
     use futures_util::stream;
+
+    #[test]
+    fn media_address_limits_are_checked_before_endpoint_construction() {
+        for length in [MAX_MEDIA_SERVER_BYTES + 1, 2048] {
+            let address = format!("mxc://{}/image", "a".repeat(length));
+            assert!(validate_media_address(address.as_str().into()).is_err());
+        }
+        let address = format!("mxc://example.org/{}", "a".repeat(MAX_MEDIA_ADDRESS_BYTES));
+        assert!(validate_media_address(address.as_str().into()).is_err());
+        for address in [
+            "https://example.org/image",
+            "file:///image",
+            "mxc://example.org",
+            "mxc://example.org/",
+            "mxc:///image",
+            "mxc://example.org/a/b",
+            "mxc://example.org/image?key=value",
+            "mxc://example.org/é",
+        ] {
+            assert!(validate_media_address(address.into()).is_err());
+        }
+        for address in [
+            "mxc://example.org/image",
+            "mxc://example.org:8448/image_1-2",
+            "mxc://[::1]:8448/image",
+        ] {
+            assert!(validate_media_address(address.into()).is_ok());
+        }
+    }
+
+    #[test]
+    fn long_media_authorities_keep_their_endpoint_components() {
+        for labels in [32, 36, 40] {
+            let server = format!("{}.example.org:8448", vec!["aaaaa"; labels].join("."));
+            assert!(server.len() > 200);
+            let address = format!("mxc://{server}/image_1-2");
+            let (parsed, media) = validate_media_address(address.as_str().into()).unwrap();
+            let authenticated = authenticated_media::get_content::v1::Request::new(
+                media.to_owned(),
+                parsed.clone(),
+            );
+            #[allow(deprecated)]
+            let legacy = media::get_content::v3::Request::new(media.to_owned(), parsed);
+            assert_eq!(authenticated.server_name.as_str(), server);
+            assert_eq!(legacy.server_name.as_str(), server);
+            assert_eq!(authenticated.media_id, "image_1-2");
+            assert_eq!(legacy.media_id, "image_1-2");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_media_is_rejected_before_any_homeserver_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_millis(250))
+            .build()
+            .unwrap();
+        let client = Client::builder()
+            .http_client(http)
+            .homeserver_url(format!("http://{}", listener.local_addr().unwrap()))
+            .build()
+            .await
+            .unwrap();
+        for address in [
+            "https://example.org/image",
+            "file:///image",
+            "mxc://example.org/",
+            "mxc://example.org/a/b",
+            "mxc://example.org/é",
+        ] {
+            let source = MediaSource::Plain(address.into());
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                fetch_bounded_media(&client, &source, MAX_IMAGE_PREVIEW_BYTES),
+            )
+            .await;
+            assert!(matches!(result, Ok(Err(MatrixCoreError::InvalidMedia(_)))));
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
 
     #[test]
     fn media_redirects_validate_targets_before_request() {

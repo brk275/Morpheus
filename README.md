@@ -1,20 +1,20 @@
 # Morpheus
 
-**Your Matrix. Your layout.**
-
-A native Rust desktop client for **macOS, Linux and Windows**, with multiple
-accounts and deep control over how it looks.
+A native Matrix client built in Rust for **macOS, Linux and Windows**.
+Multiple accounts, configurable layouts, and themes you can make your own.
 
 [Screenshots](docs/screenshots/README.md) · [Customization](docs/CUSTOMIZATION.md) ·
 [Documentation](docs/README.md) · [Contributing](CONTRIBUTING.md)
 
+**Pre-alpha · No installer release yet.** See [development status](#development).
+
 ![Morpheus with the Terminal preset and bottom-left account switcher](docs/screenshots/account-switcher.png)
 
-*Terminal theme · native app screenshot · fictional preview accounts*
+*Terminal preset. Real native capture with fictional accounts.*
 
-## Make it yours
+## Your setup
 
-Start with **Nocturne**, **Terminal** or **Paper**, then shape the interface:
+Start with a preset or create a TOML theme. Customize:
 
 - **Type:** separate interface, message and monospace fonts.
 - **Messages:** stacked, compact or nickname columns; avatars, timestamps and spacing.
@@ -22,30 +22,23 @@ Start with **Nocturne**, **Terminal** or **Paper**, then shape the interface:
 - **Layout:** pane widths, headers, density and corners.
 - **Color:** theme packs with dedicated focus, unread, link, voice and sender colors.
 
-Use the settings panel or edit `config.toml`. Valid changes reload live; invalid
-edits keep the last working configuration.
-[Browse customization →](docs/CUSTOMIZATION.md)
+Settings and `config.toml` control the same preferences. Valid edits reload live;
+invalid edits keep the last working configuration.
+[Customization guide](docs/CUSTOMIZATION.md)
 
-## Keep your accounts close
+| Nocturne | Paper |
+| :---: | :---: |
+| ![Nocturne: dark surfaces and stacked messages](docs/screenshots/desktop.png) | ![Paper: light surfaces and serif messages](docs/screenshots/paper.png) |
 
-Switch accounts from the bottom-left profile menu, including accounts on
-different homeservers. Sessions, encryption stores, drafts and vault entries
-stay separate. Inactive accounts pause by default.
+## Multiple accounts
+
+The bottom-left profile menu switches between accounts on different homeservers.
+Each account has separate sessions, encryption stores, drafts and vault entries.
+Inactive accounts pause by default.
 
 An optional local app password protects switches and startup restore.
-**Manage accounts** includes direct removal and retries for incomplete cleanup.
-[Account controls →](docs/ACCOUNT_ACCESS.md)
-
-## Development status
-
-**Pre-alpha. No installer release is available yet.**
-
-Messaging, encryption and native calls are in development. Calls require a
-compatible MatrixRTC service. Accessibility, installed-app behavior, device
-interoperability, signing and updates still have open checks. Do not rely on
-Morpheus for important conversations or encryption-key recovery yet.
-
-[Feature status](docs/FEATURE_MATRIX.md) · [Release checklist](docs/RELEASE_CHECKLIST.md)
+Remove accounts from **Manage accounts**, with retries for incomplete cleanup.
+[Account controls](docs/ACCOUNT_ACCESS.md)
 
 ## Build from source
 
@@ -56,9 +49,18 @@ Follow the [build policy](AGENTS.md), install the
 cargo run --locked -p morpheus-app
 ```
 
-The app opens at Matrix sign-in and offers an offline preview.
+The app opens at Matrix sign-in and offers an offline preview. Native calls
+require a compatible MatrixRTC service.
 
-[Contribute](CONTRIBUTING.md) · [Report a vulnerability privately](SECURITY.md)
+## Development
+
+Morpheus is still in active development. Messaging, encryption and native calls
+have open acceptance checks, alongside accessibility, installed-app behavior,
+device compatibility, signing and updates. Do not rely on it for important
+conversations or encryption-key recovery yet.
+
+[Feature status](docs/FEATURE_MATRIX.md) · [Release checklist](docs/RELEASE_CHECKLIST.md) ·
+[Private security reports](SECURITY.md)
 
 ## License
 
