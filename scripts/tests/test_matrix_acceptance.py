@@ -561,7 +561,8 @@ class DraftStageTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "deadline"):
                     runner.run("drafts_local", ["mock-test"], test=True, seconds=1)
             kill.assert_called_once_with(123456, acceptance_module.signal.SIGKILL)
-            records = [json.loads(line) for line in visible.getvalue().splitlines()]
+            records = [json.loads(line) for line in visible.getvalue().splitlines() if line.startswith("{")]
+            self.assertEqual(len(records), 1)
             self.assertEqual(records[0]["drafts_diagnostics"],
                              {"test_entered": True, "stage": "tracked_enqueue", "failure": "deadline"})
             self.assertEqual(records[0]["native_process"]["result"], "deadline")
