@@ -5205,6 +5205,8 @@ mod tests {
 
     #[test]
     fn a_lagged_observer_reports_a_lost_outcome_only_when_asked() {
+        use matrix_sdk::ruma::TransactionId;
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
