@@ -1,12 +1,12 @@
 # TEMPORARY config-contract checks only. NEVER MERGE this workflow.
 name: Reviewed customization config contracts
-run-name: Customization config contracts - 80c9925
+run-name: Customization config contracts - 0993315
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: config-contracts-80c9925
+  group: config-contracts-0993315
   cancel-in-progress: false
 jobs:
   contracts:
@@ -17,11 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 80c9925f72a59dac18b77ae65208b5a75fff1a57
+          ref: 0993315ed812b6567e80d4ba8f5576f3bd6576c1
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact reviewed source
-        run: test "$(git rev-parse HEAD)" = 80c9925f72a59dac18b77ae65208b5a75fff1a57
+        run: test "$(git rev-parse HEAD)" = 0993315ed812b6567e80d4ba8f5576f3bd6576c1
       - name: Scan source before executing reviewed native tests
         shell: bash
         run: |
@@ -70,7 +70,7 @@ jobs:
           reason = None
           code = None
           with log.open('xb') as output:
-              child = subprocess.Popen(['cargo','test','--locked','-p','morpheus-config','--lib',
+              child = subprocess.Popen(['cargo','test','--locked','-p','morpheus-config','--lib','--test','appearance_example',
                   '--','--test-threads=1'],
                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                   env=environment, start_new_session=True)
@@ -115,13 +115,15 @@ jobs:
           needed={'tests::runtime_store_errors_never_repeat_file_content',
               'tests::the_field_reference_agrees_with_the_real_schema',
               'diagnostics::tests::unknown_keys_and_account_ids_are_never_shown',
-              'diagnostics::tests::account_errors_point_at_the_failing_entry_of_the_failing_account'}
+              'diagnostics::tests::account_errors_point_at_the_failing_entry_of_the_failing_account',
+              'tests::shipped_semantic_roles_and_sender_text_have_readable_contrast',
+              'sparse_appearance_example_uses_supported_settings'}
           summaries=re.findall(r'^test result: ok\. ([0-9]+) passed; 0 failed; ([0-9]+) ignored;',output,re.MULTILINE)
-          passed=reason is None and code==0 and needed<=ok and len(summaries)==1 and int(summaries[0][0])>=len(needed) and int(summaries[0][1])==0
+          passed=reason is None and code==0 and needed<=ok and len(summaries)==2 and sum(int(row[0]) for row in summaries)>=len(needed) and all(int(row[1])==0 for row in summaries)
           print(json.dumps({'check':'customization_config_contracts','status':'passed' if passed else 'failed',
-              'source':'80c9925f72a59dac18b77ae65208b5a75fff1a57','failure':reason,
-              'tests_passed':int(summaries[0][0]) if len(summaries)==1 else None,
-              'ignored':int(summaries[0][1]) if len(summaries)==1 else None,
+              'source':'0993315ed812b6567e80d4ba8f5576f3bd6576c1','failure':reason,
+              'tests_passed':sum(int(row[0]) for row in summaries) if len(summaries)==2 else None,
+              'ignored':sum(int(row[1]) for row in summaries) if len(summaries)==2 else None,
               'required_tests':{name:name in ok for name in sorted(needed)},
               'error_codes':sorted(set(re.findall(r'error\[(E[0-9]{4})\]',output))),
               'rust_locations':sorted(set(re.findall(r'(?:crates/[A-Za-z0-9_./-]+\.rs:[0-9]+:[0-9]+)',output))),
