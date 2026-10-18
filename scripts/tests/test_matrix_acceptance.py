@@ -501,6 +501,84 @@ class LiveStageTests(unittest.TestCase):
                 self.assertEqual(len(runner.results), int(accepted))
 
 
+class DraftStageTests(unittest.TestCase):
+    child = LiveStageTests.child
+
+    def test_exact_fixed_tokens_and_no_reflected_payloads(self):
+        for stage in acceptance_module.DRAFTS_STAGES:
+            with self.subTest(stage=stage):
+                self.assertEqual(acceptance_module.drafts_diagnostics(
+                    f"MORPHEUS_DRAFTS_STAGE {stage}\n"),
+                    {"test_entered": stage == "fixture", "stage": stage})
+        for payload in ("private_token", "https://private.example", "/private/path",
+                        "complete private-password", "complete\rprivate-password", "x" * 1000):
+            with self.subTest(payload=payload):
+                self.assertEqual(acceptance_module.drafts_diagnostics(
+                    "MORPHEUS_DRAFTS_STAGE fixture\n"
+                    "MORPHEUS_DRAFTS_STAGE tracked_enqueue\n"
+                    f"MORPHEUS_DRAFTS_STAGE {payload}\n"),
+                    {"test_entered": True, "stage": "tracked_enqueue"})
+
+    def test_source_emits_all_unique_stages_from_entry_through_cleanup(self):
+        source = (Path(__file__).resolve().parents[2]
+                  / "crates/morpheus-matrix/tests/drafts_local.rs").read_text()
+        emitted = re.findall(r"phase!\(([a-z_]+)\)", source)
+        self.assertEqual(set(emitted), acceptance_module.DRAFTS_STAGES)
+        self.assertEqual(len(emitted), len(set(emitted)))
+        self.assertEqual((emitted[0], emitted[-1]), ("fixture", "complete"))
+        self.assertLess(source.index("phase!(tracked_enqueue)"),
+                        source.index(".send_text_tracked_for("))
+        self.assertLess(source.index('.expect("Cannot queue tracked message")'),
+                        source.index("phase!(tracked_outcome)"))
+        self.assertLess(source.index("phase!(tracked_outcome)"),
+                        source.index("queued.wait_outcome()"))
+        self.assertLess(source.index('fs::remove_dir_all(root)'),
+                        source.index("phase!(complete)"))
+
+    def test_success_requires_positive_test_result_entry_and_completed_cleanup(self):
+        passed = "test result: ok. 1 passed; 0 failed; 0 ignored;\n"
+        entry = "MORPHEUS_DRAFTS_STAGE fixture\n"
+        complete = "MORPHEUS_DRAFTS_STAGE complete\n"
+        for output, accepted in ((passed, False), (complete + passed, False),
+                                 (entry + passed, False), (entry + complete + passed, True),
+                                 (entry + complete + "test result: ok. 0 passed; 0 failed; 1 ignored;\n", False)):
+            with self.subTest(output=output), tempfile.TemporaryDirectory() as folder:
+                runner = Acceptance(Path(folder), "unused-scanner")
+                with self.child(runner, output):
+                    if accepted:
+                        runner.run("drafts_local", ["mock-test"], test=True)
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            runner.run("drafts_local", ["mock-test"], test=True)
+                self.assertEqual(len(runner.results), int(accepted))
+
+    def test_deadline_retains_last_stage_and_withholds_private_output(self):
+        output = ("MORPHEUS_DRAFTS_STAGE fixture\n"
+                  "MORPHEUS_DRAFTS_STAGE tracked_enqueue\nprivate-server-response\n")
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            with self.child(runner, output, timeout=True) as (visible, kill):
+                with self.assertRaisesRegex(RuntimeError, "deadline"):
+                    runner.run("drafts_local", ["mock-test"], test=True, seconds=1)
+            kill.assert_called_once_with(123456, acceptance_module.signal.SIGKILL)
+            records = [json.loads(line) for line in visible.getvalue().splitlines() if line.startswith("{")]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["drafts_diagnostics"],
+                             {"test_entered": True, "stage": "tracked_enqueue", "failure": "deadline"})
+            self.assertEqual(records[0]["native_process"]["result"], "deadline")
+            self.assertNotIn("private-server", visible.getvalue())
+            self.assertEqual(runner.results, [])
+
+    def test_rejected_scan_prevents_publication(self):
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "unused-scanner")
+            with self.child(runner, "MORPHEUS_DRAFTS_STAGE fixture\n", scanner_code=1) as (visible, _):
+                with self.assertRaisesRegex(RuntimeError, "credential scanning"):
+                    runner.run("drafts_local", ["mock-test"], test=True)
+            self.assertNotIn("drafts_diagnostics", visible.getvalue())
+            self.assertEqual(runner.results, [])
+
+
 class LiveEvidenceTests(unittest.TestCase):
     def test_rtc_bootstrap_follows_independent_checks_and_failure_stays_fatal(self):
         for failed in (False, True):

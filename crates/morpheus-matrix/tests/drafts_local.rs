@@ -19,6 +19,13 @@ use serde::Deserialize;
 use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
+// Fixed source tokens only: never identifiers, draft text or credential data.
+macro_rules! phase {
+    ($name:ident) => {
+        eprintln!("\nMORPHEUS_DRAFTS_STAGE {}", stringify!($name));
+    };
+}
+
 #[derive(Deserialize)]
 struct Fixture {
     accounts: Vec<TestAccount>,
@@ -89,6 +96,7 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
         eprintln!("Skipped local draft test; set MORPHEUS_MATRIX_TEST_ACCOUNTS to opt in.");
         return;
     };
+    phase!(fixture);
     let fixture: Fixture = serde_json::from_slice(
         &fs::read(PathBuf::from(credentials_path)).expect("Cannot read local fixture"),
     )
@@ -151,11 +159,14 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
         let legacy_text = format!("legacy-plain-{} {target} @room", Uuid::new_v4());
 
         let manager = AccountManager::open(&root).expect("Cannot open account manager");
+        phase!(login_alice);
         let a_account = manager
             .add_password_account(&alice.homeserver_url, &alice.username, &alice.password)
             .await
             .expect("First login failed");
+        phase!(room_alice);
         wait_for_room(&manager, a_room).await;
+        phase!(drafts_alice);
         manager
             .save_composed_draft_for(&a_account.id, a_room, None, &typed_room)
             .await
@@ -173,6 +184,7 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
             .save_composed_draft_for(&a_account.id, a_room, Some(first_thread), &typed_thread)
             .await
             .expect("Cannot persist typed thread draft");
+        phase!(legacy_seed);
         let client = manager.active_client().await.expect("Draft client missing");
         let room = client
             .get_room(&RoomId::parse(a_room).expect("Invalid draft room"))
@@ -201,6 +213,7 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
                 .await
                 .is_err()
         );
+        phase!(tracked_enqueue);
         let queued = manager
             .send_text_tracked_for(
                 &a_account.id,
@@ -209,6 +222,7 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
             )
             .await
             .expect("Cannot queue tracked message");
+        phase!(tracked_outcome);
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(30), queued.wait_outcome())
                 .await
@@ -216,11 +230,14 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
             QueuedSendOutcome::Sent
         );
 
+        phase!(login_carol);
         let b_account = manager
             .add_password_account(&carol.homeserver_url, &carol.username, &carol.password)
             .await
             .expect("Second login failed");
+        phase!(room_carol);
         wait_for_room(&manager, b_room).await;
+        phase!(drafts_carol);
         assert_eq!(
             manager
                 .load_composer_draft_for(&b_account.id, b_room)
@@ -256,8 +273,10 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
             a_body
         );
 
+        phase!(stop_primary);
         manager.stop().await;
         drop(manager);
+        phase!(plaintext_scan);
         assert!(!contains_plaintext(&root, a_body.as_bytes()));
         assert!(!contains_plaintext(&root, b_body.as_bytes()));
         for body in [
@@ -280,7 +299,9 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
             !contains_plaintext(&root, typed_thread.draft_html().unwrap().as_bytes()),
             "Typed thread intent encoding leaked into plaintext storage"
         );
+        phase!(reopen);
         let manager = AccountManager::open(&root).expect("Cannot reopen account manager");
+        phase!(restore_carol);
         let restored = manager
             .restore_last_active()
             .await
@@ -300,10 +321,12 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
                 .unwrap(),
             b_thread_body
         );
+        phase!(switch_alice);
         manager
             .switch_to(&a_account.id)
             .await
             .expect("Cannot switch accounts");
+        phase!(verify_alice);
         assert_eq!(
             manager
                 .load_composer_draft_for(&a_account.id, a_room)
@@ -358,6 +381,7 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
             other.text.body == b_thread_body && other.text.mentions.is_empty(),
             "Selected mentions crossed account/room boundaries"
         );
+        phase!(clear_alice);
         manager
             .save_scoped_composer_draft_for(&a_account.id, a_room, Some(first_thread), "")
             .await
@@ -394,15 +418,18 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
                 .unwrap(),
             ""
         );
+        phase!(logout_alice);
         manager
             .logout_account(&a_account.id)
             .await
             .expect("Cannot remove first account");
         assert!(!root.join("accounts").join(&a_account.id).exists());
+        phase!(switch_carol);
         manager
             .switch_to(&b_account.id)
             .await
             .expect("Cannot switch to second account");
+        phase!(verify_carol);
         assert_eq!(
             manager
                 .load_composer_draft_for(&b_account.id, b_room)
@@ -417,11 +444,15 @@ fn drafts_survive_restart_without_plaintext_or_account_crossover() {
                 .unwrap(),
             b_thread_body
         );
+        phase!(logout_carol);
         manager
             .logout_account(&b_account.id)
             .await
             .expect("Cannot remove second account");
+        phase!(stop_final);
         manager.stop().await;
     });
+    phase!(cleanup);
     fs::remove_dir_all(root).expect("Cannot clean local test data");
+    phase!(complete);
 }
