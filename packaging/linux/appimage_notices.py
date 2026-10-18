@@ -28,6 +28,14 @@ PACKAGE = re.compile(r"[a-z0-9][a-z0-9+.-]*(?::[a-z0-9][a-z0-9-]*)?")
 SONAME = re.compile(r"[A-Za-z0-9_+.-]+")
 HEX = re.compile(r"[0-9a-f]{64}")
 VERSION = re.compile(r"[A-Za-z0-9.+:~_-]{1,160}")
+# One GNU build-ID note as GNU readelf --wide --notes prints it: the owner,
+# the descriptor size and the note type, then the description on the SAME
+# line (without --wide it would start on the next line). Separators are
+# matched structurally as runs of spaces/tabs; the owner and type text carry
+# the note's identity. The hex is lowercase, as readelf prints it.
+BUILD_ID_NOTE = re.compile(
+    r"^[ \t]*GNU[ \t]+0x([0-9a-f]{8})[ \t]+NT_GNU_BUILD_ID \(unique build ID bitstring\)"
+    r"[ \t]+Build ID:[ \t]*([0-9a-f]+)[ \t]*$", re.MULTILINE)
 
 
 class InventoryFailure(RuntimeError):
@@ -77,13 +85,31 @@ def command(runner, label, argv, root, environment, *, limit=1024 * 1024, expect
         raise InventoryFailure("input") from None
 
 
+def parse_build_id(output):
+    """The single GNU build ID in a `readelf --wide --notes` report.
+
+    Exactly one well-formed GNU build-ID note line is required, and the text
+    `Build ID:` and the type `NT_GNU_BUILD_ID` must each occur exactly once in
+    the whole report, so a duplicate, malformed or stray occurrence is never
+    ignored. The ID is bounded lowercase even-length hex whose length agrees
+    with the note's reported descriptor size.
+    """
+    notes = BUILD_ID_NOTE.findall(output)
+    if (len(notes) != 1 or output.count("Build ID:") != 1
+            or output.count("NT_GNU_BUILD_ID") != 1):
+        raise InventoryFailure("elf_build_id")
+    size, build_id = notes[0]
+    if (not 8 <= len(build_id) <= 128 or len(build_id) % 2
+            or int(size, 16) * 2 != len(build_id)):
+        raise InventoryFailure("elf_build_id")
+    return build_id
+
+
 def parse_elf_report(output):
-    ids = re.findall(r"^\s*Build ID:\s*([0-9a-f]+)\s*$", output, re.MULTILINE)
+    build_id = parse_build_id(output)
     needed = re.findall(r"\(NEEDED\).*?Shared library: \[([^\]\n]+)\]", output)
     names = re.findall(r"\(SONAME\).*?Library soname: \[([^\]\n]+)\]", output)
     searches = re.findall(r"\((?:RPATH|RUNPATH)\).*?: \[([^\]\n]*)\]", output)
-    if len(ids) != 1 or not 8 <= len(ids[0]) <= 128 or len(ids[0]) % 2:
-        raise InventoryFailure("elf_build_id")
     if (len(needed) > 128 or len(needed) != len(set(needed))
             or any(not SONAME.fullmatch(value) for value in needed)):
         raise InventoryFailure("elf_needed")
@@ -91,7 +117,7 @@ def parse_elf_report(output):
         raise InventoryFailure("elf_soname")
     if len(searches) > 1:
         raise InventoryFailure("elf_search")
-    return {"build_id": ids[0], "needed": sorted(needed), "soname": names[0] if names else None,
+    return {"build_id": build_id, "needed": sorted(needed), "soname": names[0] if names else None,
             "search": searches[0].split(":") if searches else []}
 
 
