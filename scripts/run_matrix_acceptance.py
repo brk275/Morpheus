@@ -878,6 +878,13 @@ class Acceptance:
             or (element_checks and element_diagnostics(output).get("stage") in ELEMENT_TEST_STAGES)
         )
         if process.returncode or timed_out:
+            if label == "timeline_10k":
+                # The child already emits a closed summary, but run() raises
+                # before returning its output on failure. Forward only that
+                # validated record, after the independent log scan above.
+                from run_timeline_acceptance import SUMMARY_PREFIX, failed_summary
+                if timeline_failure := failed_summary(output):
+                    print(SUMMARY_PREFIX + json.dumps(timeline_failure, sort_keys=True), flush=True)
             # Scanner coverage is not a guarantee: arbitrary server errors can
             # reflect secrets without a recognizable prefix. Never publish raw
             # child logs, including on failure. Only source locations and Rust

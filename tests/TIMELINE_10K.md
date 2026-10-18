@@ -64,10 +64,11 @@ performance result. The real-room performance gate remains open.
 Failure summaries now use explicit vocabulary for every published field.
 `failed_summary` accepts one exact failed record after a caller scans its
 private log; arbitrary lowercase strings, extra fields, duplicate records,
-oversized records and success claims are refused. A hosted wrapper must forward
-this validated failure separately when its outer command raises, while keeping
-raw logs private. This parser alone does not prove that forwarding or the live
-workload succeeds.
+oversized records and success claims are refused. The outer fixture runner now
+forwards this validated record for a failed `timeline_10k` command after its
+independent log scan and before raising. Scanner failure withholds diagnostics.
+No other command forwards these records, and raw logs remain private. Synthetic
+forwarding checks do not prove that the live workload succeeds.
 
 ### Instrumented build
 
