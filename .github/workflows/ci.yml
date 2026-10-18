@@ -1,19 +1,19 @@
-name: CI
+# TEMPORARY owner-selected native diagnostic. NEVER MERGE into main.
+# The unchanged system PipeWire first-frame failure remains an OPEN release gate.
+# This dispatch proves Linux only, with full Matrix integration after fixture repair.
+# ARM/Windows/Intel proof is separate; the unchanged system Wayland gate remains open.
+name: Linux native candidate diagnostic - release gates open
+run-name: Linux native candidate ceadc30 - release gates open
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  # Manual dispatch always checks the complete supported native matrix.
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: native-diagnostic-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_BUILD_JOBS: "2"
@@ -25,14 +25,16 @@ jobs:
   scope:
     name: Security and change scope
     # Hosted validation is disabled while private to prevent unauthorized paid builds.
-    if: github.event.repository.private == false
+    if: github.event.repository.private == false && github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/codex/beta-linux-ceadc30' && github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
-      native: ${{ steps.scope.outputs.native }}
-      native_matrix: ${{ steps.scope.outputs.native_matrix }}
-      config: ${{ steps.scope.outputs.config }}
-      wayland: ${{ steps.scope.outputs.wayland }}
+      native: "true"
+      native_matrix: '{"os":["ubuntu-24.04"]}'
+      config: "false"
+      # Known unchanged system-library failure is outside this diagnostic.
+      # Normal CI and release gates are preserved on the integration branch.
+      wayland: "false"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -67,12 +69,6 @@ jobs:
             --config "$RUNNER_TEMP/morpheus-gitleaks-default.toml" \
             --gitleaks-ignore-path "$RUNNER_TEMP/morpheus-gitleaks-empty.ignore" \
             --log-opts=--all .
-      - name: Select checks from changed inputs using reviewed classifier
-        id: scope
-        working-directory: candidate
-        # Isolated mode excludes the candidate working directory and Python
-        # environment hooks from import lookup. The classifier uses stdlib only.
-        run: python3 -I ../trusted/scripts/ci_scope.py --github-event
 
   helpers:
     name: Validation helper tests
@@ -83,7 +79,21 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          # Bind workers directly; do not depend on diagnostic commit depth.
+          ref: ceadc30ecf8c4cc26f219cd7ddf31293881b2f71
+          fetch-depth: 2
           persist-credentials: false
+      - name: Restore exact reviewed workflow source for contract checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show ceadc30ecf8c4cc26f219cd7ddf31293881b2f71:.github/workflows/ci.yml > "$RUNNER_TEMP/reviewed-native-ci.yml"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            python3 -I -B -c 'from pathlib import Path; import hashlib, sys; assert hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest() == "441865418b1b863b29c2315538eed52e9cda0c862461ab8f02dc86c6af3b134a"' "$RUNNER_TEMP/reviewed-native-ci.yml"
+          else
+            echo "441865418b1b863b29c2315538eed52e9cda0c862461ab8f02dc86c6af3b134a  $RUNNER_TEMP/reviewed-native-ci.yml" | sha256sum --check --status
+          fi
+          cp "$RUNNER_TEMP/reviewed-native-ci.yml" .github/workflows/ci.yml
       - name: Check scope and packaging helpers
         run: |
           python3 -m unittest discover -s scripts/tests -v
@@ -105,13 +115,27 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          # Bind workers directly; do not depend on diagnostic commit depth.
+          ref: ceadc30ecf8c4cc26f219cd7ddf31293881b2f71
+          fetch-depth: 2
           persist-credentials: false
+      - name: Restore exact reviewed workflow source for contract checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show ceadc30ecf8c4cc26f219cd7ddf31293881b2f71:.github/workflows/ci.yml > "$RUNNER_TEMP/reviewed-native-ci.yml"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            python3 -I -B -c 'from pathlib import Path; import hashlib, sys; assert hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest() == "441865418b1b863b29c2315538eed52e9cda0c862461ab8f02dc86c6af3b134a"' "$RUNNER_TEMP/reviewed-native-ci.yml"
+          else
+            echo "441865418b1b863b29c2315538eed52e9cda0c862461ab8f02dc86c6af3b134a  $RUNNER_TEMP/reviewed-native-ci.yml" | sha256sum --check --status
+          fi
+          cp "$RUNNER_TEMP/reviewed-native-ci.yml" .github/workflows/ci.yml
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action, pinned compiler below
         with:
           toolchain: 1.99.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+          save-if: "false"
       - run: cargo test --locked -p morpheus-config
 
   compile:
@@ -120,7 +144,7 @@ jobs:
     if: github.event.repository.private == false && needs.scope.outputs.native == 'true'
     runs-on: ${{ matrix.os }}
     concurrency:
-      group: native-${{ github.sha }}-${{ matrix.os }}
+      group: native-ceadc30ecf8c4cc26f219cd7ddf31293881b2f71-${{ matrix.os }}
       cancel-in-progress: false
     timeout-minutes: 90
     strategy:
@@ -129,7 +153,21 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          # Bind workers directly; do not depend on diagnostic commit depth.
+          ref: ceadc30ecf8c4cc26f219cd7ddf31293881b2f71
+          fetch-depth: 2
           persist-credentials: false
+      - name: Restore exact reviewed workflow source for contract checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show ceadc30ecf8c4cc26f219cd7ddf31293881b2f71:.github/workflows/ci.yml > "$RUNNER_TEMP/reviewed-native-ci.yml"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            python3 -I -B -c 'from pathlib import Path; import hashlib, sys; assert hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest() == "441865418b1b863b29c2315538eed52e9cda0c862461ab8f02dc86c6af3b134a"' "$RUNNER_TEMP/reviewed-native-ci.yml"
+          else
+            echo "441865418b1b863b29c2315538eed52e9cda0c862461ab8f02dc86c6af3b134a  $RUNNER_TEMP/reviewed-native-ci.yml" | sha256sum --check --status
+          fi
+          cp "$RUNNER_TEMP/reviewed-native-ci.yml" .github/workflows/ci.yml
       - name: Linux native dependencies
         if: runner.os == 'Linux'
         run: |
@@ -161,11 +199,9 @@ jobs:
         with:
           # Preserve compiled dependencies when a later acceptance check fails.
           # The save guard still makes untrusted/PR executions restore-only.
-          # Older SDK extractions lack the verified downloader's receipt.
-          # The key separates both primary and fallback cache namespaces.
           key: verified-sdk-archives-v1
           cache-on-failure: true
-          save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+          save-if: "false"
       - name: Check formatting
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
@@ -182,63 +218,6 @@ jobs:
         run: cargo check --locked -p morpheus-app -p morpheus-matrix
       - name: Build desktop with native call and device adapters
         run: cargo build --locked -p morpheus-app --features native-calls
-      - name: Capture actual native preview screens
-        id: preview-capture
-        if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && (github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push'))
-        continue-on-error: true
-        timeout-minutes: 2
-        env:
-          SLINT_SCALE_FACTOR: "1"
-          SLINT_BACKEND: winit-software
-        shell: bash
-        run: |
-          set -euo pipefail
-          umask 077
-          preview_root="$RUNNER_TEMP/morpheus-preview-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          mkdir "$preview_root"
-          # This debug-only early CLI renders fictional fixtures before any
-          # account/config store or network service initialization. Native
-          # logs and raw frames stay private and are never uploaded.
-          # Reviewed PRs capture their tested merge tree before integration;
-          # their PNGs remain untrusted until visual/privacy review.
-          if ! timeout --kill-after=5s 30s xvfb-run -a -s '-screen 0 1440x900x24' \
-            sh -c 'xdotool mousemove 1 1 && exec "$@"' sh \
-            target/debug/morpheus-app --morpheus-capture-preview "$preview_root/raw" \
-            >"$preview_root/native.log" 2>&1; then
-            echo "Native preview capture failed; private output was not published."
-            exit 1
-          fi
-          python3 scripts/encode_preview_pngs.py \
-            --input-dir "$preview_root/raw" --output-dir "$preview_root/png" \
-            --source-commit "$GITHUB_SHA" --binary target/debug/morpheus-app \
-            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
-      - name: Upload native preview PNGs and provenance only
-        id: preview-upload
-        if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && (github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push')) && steps.preview-capture.outcome == 'success'
-        continue-on-error: true
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: native-preview-${{ github.sha }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/desktop-preview.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/account-switcher.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/sign-in.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/incoming-call.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/room-settings.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/paper-preview.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/manage-accounts.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/account-password.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/account-password-large.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/sign-in-large.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/terminal-sidebar.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/terminal-space-labels.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/send-recovery.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/send-recovery-thread-large.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/provenance.json
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
-          include-hidden-files: false
       - name: Smoke test Linux desktop startup under Xvfb
         if: runner.os == 'Linux'
         shell: bash
@@ -338,17 +317,17 @@ jobs:
               print(error, file=sys.stderr)
               raise SystemExit(1)
           if os.environ["WAYLAND_SELECTED"] == "false":
-              print("System Wayland was outside this change's inputs; its existing release gate remains open.")
+              print("Known unchanged system Wayland failure was not rerun in this diagnostic; its release gate remains open.")
           PY_WAYLAND_ACCEPTANCE
       - name: Enforce collected acceptance results
-        if: ${{ !cancelled() && (steps.model-tests.outcome == 'failure' || steps.preview-capture.outcome == 'failure' || steps.preview-upload.outcome == 'failure' || steps.desktop-tests.outcome == 'failure' || steps.wayland-tests.outcome == 'failure' || steps.windows-capture-tests.outcome == 'failure' || steps.sdk-receipt-tests.outcome == 'failure' || steps.vendor-tests.outcome == 'failure') }}
+        if: ${{ !cancelled() && (steps.model-tests.outcome == 'failure' || steps.desktop-tests.outcome == 'failure' || steps.wayland-tests.outcome == 'failure' || steps.windows-capture-tests.outcome == 'failure' || steps.sdk-receipt-tests.outcome == 'failure' || steps.vendor-tests.outcome == 'failure') }}
         shell: bash
         run: |
-          echo "Protocol model, native preview, desktop controller, native capture, SDK receipt, or vendor regression tests failed; this candidate is not verified."
+          echo "Protocol model, desktop controller, native capture, SDK receipt, or vendor regression tests failed; this candidate is not verified."
           exit 1
 
   acceptance:
-    name: CI acceptance
+    name: Diagnostic result - release gates remain open
     needs: [scope, helpers, config, compile]
     # Run after failed/skipped dependencies too. A selected check may never
     # disappear behind a skipped aggregate that branch protection accepts.
