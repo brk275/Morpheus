@@ -1,27 +1,27 @@
 # TEMPORARY focused native offline app checks. NEVER MERGE this workflow.
-name: Reviewed combined customization app checks
-run-name: Combined customization app regressions - 33b0660
+name: Reviewed customization candidate checks
+run-name: Customization candidate regressions - 9b11ba9
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: combined-app-checks-33b0660
+  group: customization-candidate-9b11ba9
   cancel-in-progress: false
 jobs:
   contracts:
-    name: Test reviewed customization, accounts and sticker UI
+    name: Test reviewed settings focus motion and exact-device enrollment
     if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 33b0660679b0b3f69cf02e2dbb03dfe0c9467276
+          ref: 9b11ba9fb2dc04ea178b216cbbcde4f890043867
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact reviewed source
-        run: test "$(git rev-parse HEAD)" = 33b0660679b0b3f69cf02e2dbb03dfe0c9467276
+        run: test "$(git rev-parse HEAD)" = 9b11ba9fb2dc04ea178b216cbbcde4f890043867
       - name: Scan source before executing reviewed native tests
         shell: bash
         run: |
@@ -50,6 +50,99 @@ jobs:
         with:
           key: verified-sdk-archives-v1
           save-if: false
+      - name: Test config schema agreement, safe diagnostics and bounded input
+        timeout-minutes: 15
+        env:
+          CARGO_BUILD_JOBS: "2"
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          CARGO_TERM_COLOR: never
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -I -B - <<'PY'
+          import json, os, pathlib, re, select, signal, subprocess, tempfile, time
+          assert os.environ.get('GITHUB_ACTIONS') == 'true'
+          assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+          assert os.environ.get('ImageOS') == 'ubuntu24'
+          names = ('PATH','HOME','LANG','LC_ALL','TMPDIR','CARGO_HOME','RUSTUP_HOME','RUSTUP_TOOLCHAIN',
+              'PKG_CONFIG_PATH','LD_LIBRARY_PATH','SSL_CERT_FILE','SSL_CERT_DIR','CARGO_BUILD_JOBS',
+              'CARGO_INCREMENTAL','CARGO_PROFILE_DEV_DEBUG','CARGO_PROFILE_TEST_DEBUG','CARGO_TERM_COLOR',
+              'GITHUB_ACTIONS','RUNNER_ENVIRONMENT','RUNNER_OS','ImageOS','RUNNER_TEMP','RUNNER_TRACKING_ID')
+          environment = {name:os.environ[name] for name in names if name in os.environ}
+          root = pathlib.Path(tempfile.mkdtemp(prefix='morpheus-config-contracts-',dir=os.environ['RUNNER_TEMP']))
+          root.chmod(0o700)
+          logs = root/'logs'; logs.mkdir(mode=0o700)
+          log = logs/'cargo.log'
+          reason = None
+          code = None
+          with log.open('xb') as output:
+              child = subprocess.Popen(['cargo','test','--locked','-p','morpheus-config','--lib','--test','appearance_example','--test','hover_timing',
+                  '--','--test-threads=1'],
+                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                  env=environment, start_new_session=True)
+              deadline = time.monotonic()+12*60
+              size = 0
+              try:
+                  while True:
+                      remaining = deadline-time.monotonic()
+                      if remaining<=0:
+                          reason='deadline'; break
+                      ready,_,_=select.select([child.stdout],[],[],remaining)
+                      if not ready:
+                          reason='deadline'; break
+                      block=os.read(child.stdout.fileno(),65536)
+                      if not block: break
+                      size+=len(block)
+                      if size>50*1024*1024:
+                          reason='output_limit'; break
+                      output.write(block)
+                  if reason is None:
+                      code=child.wait(timeout=10)
+              except (OSError,subprocess.SubprocessError):
+                  reason='process_error'
+              finally:
+                  # Never signal an already-reaped PID/group. Timeout and
+                  # overflow keep our child anchored until after group kill.
+                  if child.returncode is None:
+                      try: os.killpg(child.pid,signal.SIGKILL)
+                      except ProcessLookupError: pass
+                      child.wait(timeout=10)
+                  child.stdout.close()
+          with (root/'scan.log').open('wb') as output:
+              scan=subprocess.run([os.environ['RUNNER_TEMP']+'/gitleaks/gitleaks','dir',str(logs),
+                  '--redact=100','--ignore-gitleaks-allow','--no-banner','--max-target-megabytes','0',
+                  '--config',os.environ['RUNNER_TEMP']+'/default.toml',
+                  '--gitleaks-ignore-path',os.environ['RUNNER_TEMP']+'/empty.ignore'],
+                  stdout=output,stderr=subprocess.STDOUT,timeout=60)
+          if scan.returncode!=0:
+              print('OFFLINE_NATIVE_LOG_WITHHELD',flush=True); raise SystemExit(1)
+          output=log.read_text(errors='replace')
+          ok=set(re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. ok$',output,re.MULTILINE))
+          needed={'tests::runtime_store_errors_never_repeat_file_content',
+              'tests::the_field_reference_agrees_with_the_real_schema',
+              'diagnostics::tests::unknown_keys_and_account_ids_are_never_shown',
+              'diagnostics::tests::account_errors_point_at_the_failing_entry_of_the_failing_account',
+              'tests::shipped_semantic_roles_and_sender_text_have_readable_contrast',
+              'sparse_appearance_example_uses_supported_settings',
+              'hover_timing_defaults_and_round_trips_without_losing_reduced_motion',
+              'hover_timing_rejects_unbounded_values_and_is_discoverable'}
+          summaries=re.findall(r'^test result: ok\. ([0-9]+) passed; 0 failed; ([0-9]+) ignored;',output,re.MULTILINE)
+          passed=reason is None and code==0 and needed<=ok and len(summaries)==3 and sum(int(row[0]) for row in summaries)>=63 and all(int(row[1])==0 for row in summaries)
+          print(json.dumps({'check':'customization_config_contracts','status':'passed' if passed else 'failed',
+              'source':'9b11ba9fb2dc04ea178b216cbbcde4f890043867','failure':reason,
+              'tests_passed':sum(int(row[0]) for row in summaries) if len(summaries)==3 else None,
+              'ignored':sum(int(row[1]) for row in summaries) if len(summaries)==3 else None,
+              'required_tests':{name:name in ok for name in sorted(needed)},
+              'error_codes':sorted(set(re.findall(r'error\[(E[0-9]{4})\]',output))),
+              'rust_locations':sorted(set(re.findall(r'(?:crates/[A-Za-z0-9_./-]+\.rs:[0-9]+:[0-9]+)',output))),
+              'failed_tests':sorted(set(re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. FAILED$',output,re.MULTILINE))),
+              'raw_logs_public':False,'real_accounts':False,'physical_devices':False,
+              'native_installed_app':False},sort_keys=True),flush=True)
+          if not passed: raise SystemExit(1)
+          PY
       - name: Check new Rust controllers, CLI functions and generated UI together
         timeout-minutes: 105
         env:
@@ -63,7 +156,7 @@ jobs:
           set -euo pipefail
           umask 077
           python3 -I -B - <<'PY'
-          import json, os, pathlib, re, select, signal, subprocess, tempfile, time
+          import json, math, os, pathlib, re, select, signal, subprocess, tempfile, time
           assert os.environ.get('GITHUB_ACTIONS') == 'true'
           assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
           assert os.environ.get('ImageOS') == 'ubuntu24'
@@ -121,7 +214,8 @@ jobs:
           if scan.returncode!=0:
               print('OFFLINE_NATIVE_LOG_WITHHELD',flush=True); raise SystemExit(1)
           output=log.read_text(errors='replace')
-          ok=set(re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. ok$',output,re.MULTILINE))
+          seen_list=re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\.',output,re.MULTILINE)
+          seen=set(seen_list)
           needed={'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
               'config_cli::tests::usage_errors_and_help_never_start_validation',
               'config_cli::tests::excess_arguments_are_refused_rather_than_dropped',
@@ -129,22 +223,63 @@ jobs:
               'config_cli::tests::validation_of_a_file_is_read_only_and_reports_fixed_codes',
               'config_cli::tests::the_schema_lists_every_field_token_and_code_from_the_registry',
               'appearance_editor::tests::filters_match_every_word_across_groups_and_groups_list_their_tokens',
-              'appearance_editor::tests::sources_name_the_layer_that_supplies_the_color'}
-          summaries=re.findall(r'^test result: ok\. ([0-9]+) passed; 0 failed; ([0-9]+) ignored;',output,re.MULTILINE)
-          passed=reason is None and code==0 and needed<=ok and len(summaries)==1 and int(summaries[0][0])>=303 and int(summaries[0][1])==1
+              'appearance_editor::tests::sources_name_the_layer_that_supplies_the_color',
+              'timeline_acceptance::tests::only_enrollment_records_its_device_in_a_new_private_file'}
+          summaries=re.findall(r'^test result: (ok|FAILED)\. ([0-9]+) passed; ([0-9]+) failed; ([0-9]+) ignored;',output,re.MULTILINE)
+          failed=set(re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. FAILED$',output,re.MULTILINE))
           ignored=set(re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. ignored',output,re.MULTILINE))
           allowed_ignored={'outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction'}
-          # The existing opt-in live ringing fixture has its own isolated
-          # acceptance run; no newly skipped application regression is allowed.
-          passed=passed and ignored==allowed_ignored
+          # CLI tests write directly to stdout; require the complete libtest
+          # accounting instead of assuming their names and final ok share a line.
+          complete=len(summaries)==1 and len(seen_list)==len(seen)
+          if complete:
+              result,passed_count,failed_count,ignored_count=summaries[0]
+              passed_count,failed_count,ignored_count=map(int,(passed_count,failed_count,ignored_count))
+              complete=(len(seen)==passed_count+failed_count+ignored_count
+                  and len(failed)==failed_count and len(ignored)==ignored_count
+                  and failed<=seen and ignored<=seen and not failed&ignored)
+          else:
+              passed_count=failed_count=ignored_count=None
+          ok=seen-failed-ignored if complete else set()
+          passed=(reason is None and code==0 and complete and summaries[0][0]=='ok'
+              and failed_count==0 and passed_count>=304 and needed<=ok and ignored==allowed_ignored)
           clean=re.sub(r'\x1b\[[0-9;]*m','',output)
           binding_loops=re.findall(r'^warning: morpheus-app@[0-9.]+: ([^\r\n]*part of a binding loop[^\r\n]*)',clean,re.MULTILINE)
           passed=passed and not binding_loops
-          print(json.dumps({'check':'combined_customization_app_tests','status':'passed' if passed else 'failed',
-              'source':'33b0660679b0b3f69cf02e2dbb03dfe0c9467276','failure':reason,
+          # Never forward arbitrary marker content. This synthetic-only probe
+          # permits finite bounded geometry and booleans, no free-form strings.
+          probes=[]
+          probe_invalid=False
+          expected={'scale','calls','requested','saved','focus_before','focus_after',
+              'bounds_before','bounds_after','window','page','config_error_present','presentation','layout'}
+          def vector(value,length):
+              return isinstance(value,list) and len(value)==length and all(
+                  type(x) in (int,float) and math.isfinite(x) and abs(x)<=100000 for x in value)
+          for line in output.splitlines():
+              if not line.startswith('MORPHEUS_MOTION_FAILURE '): continue
+              try:
+                  assert len(line)<=8192 and len(probes)<2
+                  data=json.loads(line.split(' ',1)[1])
+                  assert type(data) is dict and set(data)==expected
+                  assert type(data['scale']) is int and data['scale'] in (100,200)
+                  assert type(data['calls']) is int and 0<=data['calls']<=1000
+                  assert type(data['page']) is int and 0<=data['page']<=20
+                  assert all(type(data[k]) is bool for k in ('requested','saved','focus_before',
+                      'focus_after','config_error_present','presentation'))
+                  assert vector(data['window'],2)
+                  assert type(data['layout']) is list and 1<=len(data['layout'])<=17
+                  assert all(vector(row,8) for row in data['layout'])
+                  assert all(data[k] is None or vector(data[k],4) for k in ('bounds_before','bounds_after'))
+                  probes.append(data)
+              except (AssertionError,ValueError,TypeError):
+                  probe_invalid=True
+          passed=passed and not probe_invalid and not probes
+          print(json.dumps({'check':'combined_customization_app_tests','motion_probe':probes,'probe_invalid':probe_invalid,'complete_test_accounting':complete,'status':'passed' if passed else 'failed',
+              'source':'9b11ba9fb2dc04ea178b216cbbcde4f890043867','failure':reason,
               'ignored_tests':sorted(ignored),'ui_binding_loop_warnings':binding_loops[:8],
-              'tests_passed':int(summaries[0][0]) if len(summaries)==1 else None,
-              'ignored':int(summaries[0][1]) if len(summaries)==1 else None,
+              'tests_passed':passed_count,
+              'tests_failed':failed_count,
+              'ignored':ignored_count,
               'required_tests':{name:name in ok for name in sorted(needed)},
               'error_codes':sorted(set(re.findall(r'error\[(E[0-9]{4})\]',output))),
               'rust_locations':sorted(set(re.findall(r'(?:crates/[A-Za-z0-9_./-]+\.rs:[0-9]+:[0-9]+)',output))),
@@ -153,5 +288,5 @@ jobs:
               'native_installed_app':False},sort_keys=True),flush=True)
           if not passed: raise SystemExit(1)
           PY
-      # No media fixture rerun: its precise failed stage remains under investigation.
+      # Media has its own distinct await-diagnostic run; do not duplicate it here.
       # No accounts, physical devices, native packages or artifact uploads.
