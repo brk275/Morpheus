@@ -18,6 +18,7 @@
 import AppKit
 import ApplicationServices
 import CoreGraphics
+import Darwin
 import Foundation
 
 let maxNodes = 5000

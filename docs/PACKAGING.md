@@ -345,16 +345,32 @@ The attach step works as follows:
   application. So the driver asks again only while the bridge reports absent
   metadata: no running application, no bundle identifier or no executable
   URL.
-- **Bounds.** The wait is limited to 10 seconds, with a 0.2-second interval.
-  Before and after every attempt the driver rechecks that the anchored
-  process is alive, unreaped and still owned. Before each lookup the bridge
-  turns its otherwise idle main run loop once, for at most 0.05 seconds, in
-  the default mode.
+- **Budget.** Registration has a 10-second monotonic budget:
+  - no attempt starts once the budget has passed, and a zero budget makes
+    none;
+  - each bridge reply wait ends at the budget, as well as at the 20-second
+    reply bound and the acceptance deadline;
+  - the 0.2-second pause between attempts is clipped to what remains;
+  - a success counts only if the budget has not passed, both when the reply
+    arrives and after the ownership recheck that follows it.
+
+  Other bridge commands keep their existing bounds.
+- **Ownership rechecks.** Before and after every attempt, including failed or
+  timed-out ones, the driver rechecks that the anchored process is alive,
+  unreaped and still owned. A lost anchor takes precedence over other
+  failures. These rechecks are OS queries with their own bounds (the
+  process table read times out after 5 seconds). Elapsed time can therefore
+  exceed the budget by their duration, but a late success is never accepted.
+- **Run-loop turn.** Before each lookup the bridge turns its otherwise idle
+  main run loop once, for at most 0.05 seconds, in the default mode.
 - **Failure.** A present identifier or executable that differs, or an
   executable that cannot be resolved, fails at once. The bridge sets its
-  target only after every check passes. A wait that runs out fails as
-  `wait_timeout` with the last absent-metadata token. Transient answers are
-  not recorded, so a passing report is unchanged.
+  target only after every check passes.
+  - A budget that runs out between attempts fails as `wait_timeout` with the
+    last absent-metadata token.
+  - A reply wait cut by the budget, or a late success, fails as
+    `wait_timeout` with no bridge token.
+  - Transient answers are not recorded, so a passing report is unchanged.
 
 Darwin's `ps` prints the
 session structure's kernel address under `sess` (Apple adv_cmds

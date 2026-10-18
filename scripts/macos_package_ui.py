@@ -492,12 +492,22 @@ class Bridge:
         finally:
             self.replies.put(None)
 
-    def reply(self):
-        remaining = min(BRIDGE_REPLY_SECONDS, max(0.0, self.diagnostics.deadline - time.monotonic()))
+    def reply(self, deadline=None):
+        """One reply within the reply bound and the acceptance deadline.
+
+        An optional narrower monotonic deadline also cuts the wait; a wait it
+        ends fails as wait_timeout. Without one, nothing changes.
+        """
+        now = time.monotonic()
+        remaining = min(BRIDGE_REPLY_SECONDS, max(0.0, self.diagnostics.deadline - now))
+        if deadline is not None:
+            remaining = min(remaining, max(0.0, deadline - now))
         try:
             line = self.replies.get(timeout=remaining)
         except queue.Empty:
             self.diagnostics.check_deadline()
+            if deadline is not None and time.monotonic() >= deadline:
+                raise DiagnosticFailure("wait_timeout") from None
             raise DiagnosticFailure("bridge_timeout") from None
         require_ui(line is not None, "bridge_exited")
         require_ui(line is not OVERLONG, "bridge_overflow")
@@ -516,10 +526,18 @@ class Bridge:
         except (OSError, ValueError):
             raise DiagnosticFailure("bridge_exited") from None
 
-    def call(self, command, allow_error=False, record_error=True):
+    def call(self, command, allow_error=False, record_error=True, deadline=None):
+        """Send one command and return its successful reply.
+
+        With a narrower monotonic deadline, no command is sent once it has
+        passed, the reply wait ends at it, and a success arriving at or after
+        it is refused as wait_timeout. The default keeps every other
+        operation's bounds unchanged.
+        """
         self.diagnostics.check_deadline()
+        require_ui(deadline is None or time.monotonic() < deadline, "wait_timeout")
         self.transmit(command)
-        value = self.reply()
+        value = self.reply(deadline)
         if not value["ok"]:
             code = value.get("error")
             code = code if code in smoke.MACOS_BRIDGE_ERRORS else "bridge_error"
@@ -528,6 +546,7 @@ class Bridge:
             if allow_error:
                 raise BridgeFailure(code)
             raise DiagnosticFailure("bridge_invalid")
+        require_ui(deadline is None or time.monotonic() < deadline, "wait_timeout")
         return value
 
     def close(self):
@@ -825,34 +844,61 @@ def attach_owned(bridge, process, executable, bundle, diagnostics, seconds=REGIS
 
     libproc can show the installed executable as soon as exec completes, before
     AppKit has registered the process as an application, so the bridge may
-    report absent metadata. Only those answers are asked again, within a hard
-    bound, and the anchored process is rechecked before and after every
-    attempt. A bundle identifier or executable that is present but different
-    fails at once, and the bridge never keeps a partial identity. Transient
-    answers are not recorded, so a successful report is unchanged.
+    report absent metadata. Only those answers are asked again. A bundle
+    identifier or executable that is present but different fails at once,
+    and the bridge never keeps a partial identity.
+
+    The registration budget is a monotonic deadline:
+
+    - no attempt starts once it has passed, and a zero budget makes none;
+    - each reply wait ends at it;
+    - the pause between attempts is clipped to what remains;
+    - a success counts only if it is still inside the budget after the
+      anchored recheck that follows it.
+
+    The anchored process is rechecked before every attempt and after every
+    attempt, including failed or timed-out ones; a lost anchor takes
+    precedence. Those rechecks are OS queries with their own bounds (the
+    process table read times out at 5 seconds), so wall time can pass the
+    budget by their duration, but no late success is ever accepted. The
+    acceptance deadline still applies throughout. Transient answers are not
+    recorded, so a successful report is unchanged.
     """
     command = {"op": "attach", "pid": process.pid, "executable": str(executable), "bundle": bundle}
     deadline = time.monotonic() + seconds
+    pending = None
+
+    def expired():
+        # The last absent-metadata answer, if any, explains the timeout.
+        if pending is not None:
+            diagnostics.bridge_error(pending)
+        return DiagnosticFailure("wait_timeout")
+
     while True:
         diagnostics.check_deadline()
-        require_anchored(process, executable, diagnostics)
         diagnostics.operation("attach")
-        try:
-            bridge.call(command, allow_error=True, record_error=False)
-            code = None
-        except BridgeFailure as error:
-            code = error.code
-        require_anchored(process, executable, diagnostics)
-        diagnostics.operation("attach")
-        if code is None:
-            return
-        if code not in REGISTRATION_PENDING:
-            diagnostics.bridge_error(code)
-            raise DiagnosticFailure("bridge_invalid")
         if time.monotonic() >= deadline:
-            diagnostics.bridge_error(code)
-            raise DiagnosticFailure("wait_timeout")
-        time.sleep(REGISTRATION_POLL_SECONDS)
+            raise expired()
+        require_anchored(process, executable, diagnostics)
+        diagnostics.operation("attach")
+        if time.monotonic() >= deadline:
+            raise expired()
+        try:
+            bridge.call(command, allow_error=True, record_error=False, deadline=deadline)
+            pending = None
+        except BridgeFailure as error:
+            pending = error.code
+        finally:
+            require_anchored(process, executable, diagnostics)
+            diagnostics.operation("attach")
+        if pending is None:
+            # Accept only within the budget, after the recheck that followed.
+            require_ui(time.monotonic() < deadline, "wait_timeout")
+            return
+        if pending not in REGISTRATION_PENDING:
+            diagnostics.bridge_error(pending)
+            raise DiagnosticFailure("bridge_invalid")
+        time.sleep(min(REGISTRATION_POLL_SECONDS, max(0.0, deadline - time.monotonic())))
 
 
 def owned_window(bridge, process, diagnostics, seconds=30):
