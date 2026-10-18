@@ -2920,9 +2920,17 @@ Fourth source-review round (same branch, still unrun). Send preparation is
 selection-bound end to end: `prepare_pending_send` re-checks its selection
 after every await, a committed enqueuing record survives a selection that ends
 after it was written (the next discovery restores it as unconfirmed), and a
-failed preparation rolls back only its own uncommitted steps once the
-selection is gone, with no write, no unindex and no scheduled flush;
-`persist_scope_and_index` re-checks before touching the room index. Re-seeding
+failed preparation rolls back only its own steps: once the selection is gone
+it drops only a record that never reached the row, never removes an index
+entry (durable before the call or the anchor a committed record needs; the
+account-bound flush writes a cached entry the row still lacks), makes no
+write and schedules no flush; while the selection is current it re-checks
+ownership after every write before the next write or the scheduled flush. For
+a thread send the durable order is now room index, then thread record, then
+grant, so a crash leaves at most an empty index entry and never an unindexed
+record; the cache reports whether indexing added the root so only an added
+entry is ever undone. `persist_scope_and_index` re-checks before touching the
+room index and before scheduling a retry. Re-seeding
 a scope the cache kept across an account switch marks every awaiting record
 restored (queued only where discovery attached the exact request, otherwise
 unconfirmed, including records that never received an id; kept text stays
@@ -2956,8 +2964,10 @@ reworked holds in both gated fixtures, including an encrypted new room.
 Known limits and open points: the hold relies on the local homeserver refusing
 an oversize event permanently, which the fixture verifies at run time rather
 than assumes; the interrupted-preparation regression replays the stale
-rollback directly because the interruption cannot be injected mid-await
-without a hook, which this branch does not add; an uncovered room is scanned only when it is
+rollback directly after a complete preparation (room and thread scopes),
+because the interruption cannot be injected mid-await without a hook, which
+this branch does not add, so it does not cover revocation during an awaited
+rollback write; an uncovered room is scanned only when it is
 opened or a scan is requested for it; discovery failures caused by a store read
 error cannot be forced by the fixture and are covered by unit tests of the
 registry only; a persisted SDK request whose record never received its id

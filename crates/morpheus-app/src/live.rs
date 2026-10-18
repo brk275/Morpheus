@@ -86,15 +86,21 @@ pub struct LiveUi {
     space_scan_epoch: AtomicU64,
 }
 
-/// Which steps of one send preparation reached the encrypted row. Steps that
-/// did not are the cache's alone and may be dropped without a write; steps
-/// that did are durable and survive the selection that created them.
+/// Which steps of one send preparation happened, and which reached the
+/// encrypted row. A step that did not reach the row is the cache's alone and
+/// may be reconciled without a write; a step that did is durable and survives
+/// the selection that created it. Durable order for a thread send: the room
+/// index first, then the thread record, then the grant, so a crash leaves at
+/// most an extra empty index entry and never an unindexed record.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Prepared {
     /// The enqueuing record was written to its scope's row.
     record: bool,
-    /// The thread root was written into the room's index row.
-    index: bool,
+    /// This preparation added the thread root to the room's cached index; a
+    /// root that was already indexed is never this preparation's to remove.
+    index_added: bool,
+    /// The room index carrying this root was written to the room row.
+    index_committed: bool,
 }
 
 impl LiveUi {
@@ -327,30 +333,20 @@ impl LiveUi {
                 return Err(revoked());
             }
         }
+        // The record is validated and created in memory first; nothing is
+        // written until the index, then the record, in that order.
         let handle = self
             .drafts
             .begin_pending(account, room, thread, text, revision)
             .map_err(PrepareError::Record)?;
         let mut prepared = Prepared::default();
-        if let Err(error) = self
-            .drafts
-            .persist_scoped(&self.manager, account, room, thread)
-            .await
-        {
-            self.rollback_pending(selection, scope, handle.nonce(), &prepared).await;
-            return Err(PrepareError::Store(error));
-        }
-        prepared.record = true;
-        // From here the enqueuing record is durable. If the selection ended
-        // while it was written, the row keeps it for the next discovery to
-        // review; nothing of the departed account's cache is touched.
-        if !draft_recovery::still_owned(selection, scope) {
-            return Err(revoked());
-        }
         if let Some(root) = thread {
-            if let Err(error) = self.drafts.index_thread(account, room, root) {
-                self.rollback_pending(selection, scope, handle.nonce(), &prepared).await;
-                return Err(PrepareError::Record(error));
+            match self.drafts.index_thread(account, room, root) {
+                Ok(added) => prepared.index_added = added,
+                Err(error) => {
+                    self.rollback_pending(selection, scope, handle.nonce(), &prepared).await;
+                    return Err(PrepareError::Record(error));
+                }
             }
             if let Err(error) = self
                 .drafts
@@ -360,10 +356,29 @@ impl LiveUi {
                 self.rollback_pending(selection, scope, handle.nonce(), &prepared).await;
                 return Err(PrepareError::Store(error));
             }
-            prepared.index = true;
+            prepared.index_committed = true;
             if !draft_recovery::still_owned(selection, scope) {
+                // The durable index entry is harmless on its own; the record
+                // never reached its row and is reconciled in the cache only.
+                self.rollback_pending(selection, scope, handle.nonce(), &prepared).await;
                 return Err(revoked());
             }
+        }
+        if let Err(error) = self
+            .drafts
+            .persist_scoped(&self.manager, account, room, thread)
+            .await
+        {
+            self.rollback_pending(selection, scope, handle.nonce(), &prepared).await;
+            return Err(PrepareError::Store(error));
+        }
+        prepared.record = true;
+        // From here the enqueuing record is durable and indexed. If the
+        // selection ended while it was written, the row keeps it for the next
+        // discovery to review; nothing of the departed account's cache is
+        // touched.
+        if !draft_recovery::still_owned(selection, scope) {
+            return Err(revoked());
         }
         match self
             .manager
@@ -382,13 +397,18 @@ impl LiveUi {
     }
 
     /// Undo a failed preparation. Only this call's own steps are undone, and
-    /// only as far as the selection still owns them: a step that never reached
-    /// the row is dropped from the cache (the cache is otherwise ahead of the
-    /// row), a committed step is rolled back with a write only while the
-    /// selection is current, and after the selection ended nothing committed
-    /// is touched, nothing is unindexed and no write is scheduled. The
-    /// durable enqueuing record then belongs to the next discovery, which
-    /// restores it as unconfirmed.
+    /// only as far as the selection still owns them. After the selection
+    /// ended: a record that never reached the row is dropped from the cache
+    /// (the cache is otherwise ahead of the row); a committed record stays for
+    /// the next discovery; the index entry is never removed, whether it was
+    /// durable before this call or is the anchor the committed record needs,
+    /// and the account-bound flush writes a cached entry the row still lacks;
+    /// no write is made and no flush is scheduled. While the selection is
+    /// current: the record is abandoned exactly, the index entry this call
+    /// added is dropped once the thread is idle, each write is followed by an
+    /// ownership re-check before the next write or the scheduled flush, and
+    /// the thread row is written before the room row so the core's
+    /// dropped-index proof sees an idle thread.
     async fn rollback_pending(
         &self,
         selection: &AccountSelection,
@@ -401,28 +421,32 @@ impl LiveUi {
             if !prepared.record {
                 self.drafts.drop_uncommitted_pending(account, room, thread, nonce);
             }
-            if let Some(root) = thread
-                && !prepared.index
-            {
-                self.drafts.drop_uncommitted_index(account, room, root);
-            }
             return;
         }
         self.drafts.abandon_pending(account, room, thread, nonce);
-        if let Some(root) = thread {
-            self.drafts.unindex_thread_if_idle(account, room, root);
+        if prepared.record {
+            // Best effort: a failed rollback write leaves an enqueuing record
+            // that the next start reports as unconfirmed, never as sent.
+            let _ = self
+                .drafts
+                .persist_scoped(&self.manager, account, room, thread)
+                .await;
+            if !draft_recovery::still_owned(selection, scope) {
+                return;
+            }
         }
-        // Best effort: a failed rollback write leaves an enqueuing record that
-        // the next start reports as unconfirmed, never as sent.
-        let _ = self
-            .drafts
-            .persist_scoped(&self.manager, account, room, thread)
-            .await;
-        if thread.is_some() {
+        if let Some(root) = thread
+            && prepared.index_added
+            && self.drafts.unindex_thread_if_idle(account, room, root)
+            && prepared.index_committed
+        {
             let _ = self
                 .drafts
                 .persist_scoped(&self.manager, account, room, None)
                 .await;
+            if !draft_recovery::still_owned(selection, scope) {
+                return;
+            }
         }
         self.queue_draft_write();
     }
@@ -473,9 +497,13 @@ impl LiveUi {
                 .drafts
                 .abandon_pending(&scope.account, &scope.room, scope.thread(), nonce)
         {
+            // The index entry was durable before this send or added by its
+            // preparation; either way the record it anchored is being dropped,
+            // so the idle-thread rule decides whether the entry goes too.
             let prepared = Prepared {
                 record: true,
-                index: scope.thread().is_some(),
+                index_added: scope.thread().is_some(),
+                index_committed: scope.thread().is_some(),
             };
             self.rollback_pending(selection, scope, nonce, &prepared).await;
         }
@@ -516,7 +544,9 @@ impl LiveUi {
             .await
             .is_err()
         {
-            self.queue_draft_write();
+            if draft_recovery::still_owned(selection, scope) {
+                self.queue_draft_write();
+            }
             return;
         }
         // The index is touched only while the selection still owns the scope;
@@ -3495,6 +3525,34 @@ mod stale_observer_tests {
                 .map(|record| record.is_queued())
         };
         assert_eq!(in_row().await, Some(false), "committed as enqueuing");
+        // A thread send prepared the same way: the room index is durable
+        // before the thread record (the record is never left unindexed), and
+        // the index entry this preparation added is recorded as its own.
+        let root = "$interrupted-thread:fixture.invalid";
+        live.drafts.set_scoped(&a_account.id, &a_room, Some(root), "thread reply");
+        let thread_scope = SendScope {
+            account: a_account.id.clone(),
+            room: a_room.clone(),
+            thread: Some(root.to_owned()),
+        };
+        let thread_revision = live.drafts.scoped_revision(&a_account.id, &a_room, Some(root)).unwrap();
+        let thread_handle = live
+            .prepare_pending_send(&selection, &thread_scope, &ComposeText::plain("thread reply"), thread_revision)
+            .await
+            .expect("the thread record is durable before enqueue");
+        let thread_nonce = thread_handle.nonce().clone();
+        let room_row = manager.load_composed_draft_for(&a_account.id, &a_room, None).await.unwrap();
+        assert!(room_row.envelope.threads().iter().any(|known| known == root), "the room index anchors the thread");
+        assert_eq!(
+            manager
+                .load_composed_draft_for(&a_account.id, &a_room, Some(root))
+                .await
+                .unwrap()
+                .envelope
+                .find(&thread_nonce)
+                .map(|record| record.is_queued()),
+            Some(false)
+        );
 
         // A -> B -> A while the preparation's continuation is still pending.
         let b_account = manager
@@ -3512,10 +3570,47 @@ mod stale_observer_tests {
         // The stale continuation's rollback (its grant having failed with the
         // selection) touches nothing committed and writes nothing.
         let dirty_before = live.drafts.dirty_keys();
-        live.rollback_pending(&selection, &scope, &nonce, &Prepared { record: true, index: false }).await;
+        live.rollback_pending(
+            &selection,
+            &scope,
+            &nonce,
+            &Prepared { record: true, index_added: false, index_committed: false },
+        )
+        .await;
         assert_eq!(status(), Some(PendingStatus::Enqueuing), "the departed cache is left alone");
         assert_eq!(live.drafts.dirty_keys(), dirty_before, "no write was scheduled");
         assert_eq!(in_row().await, Some(false), "the committed record is preserved for discovery");
+        // The same for a thread send prepared before the switch: its room
+        // index entry (added and committed by that preparation) and its
+        // committed record both stay; a stale rollback removes neither.
+        let root = "$interrupted-thread:fixture.invalid";
+        let thread_scope = SendScope {
+            account: a_account.id.clone(),
+            room: a_room.clone(),
+            thread: Some(root.to_owned()),
+        };
+        live.rollback_pending(
+            &selection,
+            &thread_scope,
+            &thread_nonce,
+            &Prepared { record: true, index_added: true, index_committed: true },
+        )
+        .await;
+        assert!(live.drafts.thread_send_pending(&a_account.id, &a_room, root), "the thread record stays cached");
+        let room_row = manager.load_composed_draft_for(&a_account.id, &a_room, None).await.unwrap();
+        assert!(room_row.envelope.threads().iter().any(|known| known == root), "the durable index anchor stays");
+        assert_eq!(
+            manager
+                .load_composed_draft_for(&a_account.id, &a_room, Some(root))
+                .await
+                .unwrap()
+                .envelope
+                .find(&thread_nonce)
+                .map(|record| record.is_queued()),
+            Some(false),
+            "the thread's committed record stays for discovery"
+        );
+        assert_eq!(live.drafts.dirty_keys(), dirty_before, "still no write scheduled");
         // The renewed selection re-seeds the scope: the id-less record is now
         // an unconfirmed record awaiting the user's review, the row is still
         // writable, and the account-bound flush does not get stuck.

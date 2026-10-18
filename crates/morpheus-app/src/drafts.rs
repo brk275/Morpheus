@@ -694,19 +694,6 @@ impl DraftStore {
         true
     }
 
-    /// Drop a thread root from the room's cached index when the index entry
-    /// never reached the room row. Like `drop_uncommitted_pending`, this
-    /// reconciles the cache without scheduling a write.
-    pub fn drop_uncommitted_index(&self, account: &str, room: &str, root: &str) -> bool {
-        let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
-        let Some(draft) = drafts.get_mut(&key(account, room, None)) else {
-            return false;
-        };
-        let before = draft.threads.len();
-        draft.threads.retain(|known| known != root);
-        draft.threads.len() != before
-    }
-
     /// Record the exact SDK transaction id. Returns whether the submission was
     /// cleared from the composer, which happens only when the composer is
     /// unchanged since `begin_pending`; the record keeps the text either way.
@@ -1017,7 +1004,9 @@ impl DraftStore {
 
     /// Add a thread root to the room's discovery index. The room scope must be
     /// cached (loaded) first so the room text is never overwritten.
-    pub fn index_thread(&self, account: &str, room: &str, root: &str) -> Result<(), PendingError> {
+    /// Returns whether the root was newly added (`true`) or already indexed
+    /// (`false`, nothing changed); a caller undoes only an entry it added.
+    pub fn index_thread(&self, account: &str, room: &str, root: &str) -> Result<bool, PendingError> {
         let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
         let draft = drafts
             .get_mut(&key(account, room, None))
@@ -1026,11 +1015,12 @@ impl DraftStore {
             return Err(PendingError::Unreadable);
         }
         let mut envelope = draft.envelope().map_err(|_| PendingError::Mismatch)?;
-        if envelope.index_thread(root)? {
+        let added = envelope.index_thread(root)?;
+        if added {
             draft.threads.push(root.to_owned());
             draft.changed();
         }
-        Ok(())
+        Ok(added)
     }
 
     /// Drop a thread root from the room index once that thread's cached scope
@@ -1807,16 +1797,27 @@ mod tests {
         let queued = begin(&drafts, "a", "room", None, "text");
         drafts.mark_pending_queued("a", "room", None, &queued, &"4".repeat(32));
         assert!(!drafts.drop_uncommitted_pending("a", "room", None, queued.nonce()));
-        // An index entry that never reached the room row is dropped the same
-        // way; one the row already has is left for the exact idle rule.
+        // The index reports whether a root was newly added, so a preparation
+        // knows which entry is its own to undo; an existing entry is never
+        // removed on its account, and only an added entry dirties the room.
         drafts.clear_dirty_like_a_write_would("a", "room", None);
-        drafts.index_thread("a", "room", "$root:example.org").unwrap();
+        assert_eq!(drafts.index_thread("a", "room", "$root:example.org"), Ok(true));
         assert!(drafts.is_dirty("a", "room", None));
         drafts.clear_dirty_like_a_write_would("a", "room", None);
-        assert!(drafts.drop_uncommitted_index("a", "room", "$root:example.org"));
-        assert!(!drafts.is_dirty("a", "room", None));
-        assert!(!drafts.drop_uncommitted_index("a", "room", "$root:example.org"));
-        assert!(drafts.snapshot("a", "room", None).unwrap().1.threads().is_empty());
+        assert_eq!(drafts.index_thread("a", "room", "$root:example.org"), Ok(false), "already indexed");
+        assert!(!drafts.is_dirty("a", "room", None), "re-indexing an existing root changes nothing");
+        assert_eq!(
+            drafts.snapshot("a", "room", None).unwrap().1.threads(),
+            ["$root:example.org"]
+        );
+        // The idle rule still governs removal: a thread holding a record keeps
+        // its entry, an idle one loses it exactly once.
+        drafts.set_scoped("a", "room", Some("$root:example.org"), "reply");
+        let in_thread = begin(&drafts, "a", "room", Some("$root:example.org"), "reply");
+        assert!(!drafts.unindex_thread_if_idle("a", "room", "$root:example.org"));
+        assert!(drafts.abandon_pending("a", "room", Some("$root:example.org"), in_thread.nonce()));
+        assert!(drafts.unindex_thread_if_idle("a", "room", "$root:example.org"));
+        assert!(!drafts.unindex_thread_if_idle("a", "room", "$root:example.org"));
     }
 
     #[test]
