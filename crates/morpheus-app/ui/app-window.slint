@@ -846,7 +846,7 @@ export component AppWindow inherits Window {
             : root.timestamp-format == 2 ? message.time-24h-seconds : message.time;
         return clock == "" ? "" : root.timestamp-brackets ? "[" + clock + "]" : clock;
     }
-    // Halloy-style nickname column decoration. Accessible labels keep the
+    // Optional nickname column decoration. Accessible labels keep the
     // plain name, so the brackets are visual only.
     pure function nickname-column-label(sender: string) -> string {
         return root.nickname-brackets ? "<" + sender + ">" : sender;
@@ -1489,7 +1489,7 @@ export component AppWindow inherits Window {
             }
         }
 
-        // Room list and Discord-style account control.
+        // Room list and bottom-left account control.
         Rectangle {
             width: root.room-list-width * 1px;
             background: root.sidebar;
