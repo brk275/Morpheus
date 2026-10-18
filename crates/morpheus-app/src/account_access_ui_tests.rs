@@ -2102,6 +2102,20 @@ fn item_bounds(item: &slint::private_unstable_api::re_exports::ItemRc) -> Bounds
 /// Where the real generated controls with a given accessible label sit, as
 /// window-relative bounds. Empty when none is instantiated.
 fn control_bounds(ui: &AppWindow, label: &str) -> Vec<Bounds> {
+    labelled_bounds(ui, label, None)
+}
+
+fn button_bounds(ui: &AppWindow, label: &str) -> Vec<Bounds> {
+    use slint::private_unstable_api::re_exports::AccessibleRole;
+
+    labelled_bounds(ui, label, Some(AccessibleRole::Button))
+}
+
+fn labelled_bounds(
+    ui: &AppWindow,
+    label: &str,
+    role: Option<slint::private_unstable_api::re_exports::AccessibleRole>,
+) -> Vec<Bounds> {
     use slint::private_unstable_api::re_exports::{AccessibleStringProperty, ItemRc, WindowInner};
     use std::ops::ControlFlow;
 
@@ -2109,10 +2123,11 @@ fn control_bounds(ui: &AppWindow, label: &str) -> Vec<Bounds> {
     let root = ItemRc::new_root(window.component());
     let mut bounds = Vec::new();
     let _ = root.visit_descendants(|item| {
-        if item
-            .accessible_string_property(AccessibleStringProperty::Label)
-            .as_deref()
-            == Some(label)
+        if role.is_none_or(|role| item.accessible_role() == role)
+            && item
+                .accessible_string_property(AccessibleStringProperty::Label)
+                .as_deref()
+                == Some(label)
         {
             bounds.push(item_bounds(item));
         }
@@ -2501,7 +2516,9 @@ async fn assert_sticker_picker_projection(ui: &AppWindow) {
         control_bounds(ui, "Sticker Sleeping owl from Forest friends").len(),
         1
     );
-    assert_eq!(control_bounds(ui, "Allow sticker images here").len(), 1);
+    // TextAction's caption is a separate accessible text node with this
+    // same label. Require exactly one actionable button, not a caption.
+    assert_eq!(button_bounds(ui, "Allow sticker images here").len(), 1);
     assert!(
         control_bounds(ui, "Sticker preview: Waving fox").is_empty(),
         "no image is presented before consent"
@@ -2548,7 +2565,7 @@ async fn assert_sticker_picker_projection(ui: &AppWindow) {
     tab_to_control(ui, "Send sticker");
     ui.set_sticker_needs_consent(false);
     settle(ui).await;
-    assert!(control_bounds(ui, "Allow sticker images here").is_empty());
+    assert!(button_bounds(ui, "Allow sticker images here").is_empty());
     assert_eq!(control_bounds(ui, "Sticker preview: Waving fox").len(), 1);
     key(ui, Key::Return);
     assert_eq!(sent.borrow().as_slice(), ["41:0"]);
@@ -2562,7 +2579,7 @@ async fn assert_sticker_picker_projection(ui: &AppWindow) {
     ui.set_sticker_send_visible(true);
     settle(ui).await;
     assert!(control_bounds(ui, "Sticker picker").is_empty());
-    assert_eq!(control_bounds(ui, "Retry this sticker").len(), 1);
+    assert_eq!(button_bounds(ui, "Retry this sticker").len(), 1);
     tab_to_control(ui, "Cancel this sticker");
     key(ui, Key::Return);
     assert_eq!(cancelled.get(), 1);
