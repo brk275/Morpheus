@@ -813,7 +813,7 @@ component MentionPopup inherits Rectangle {
     mention-list := ListView {
         x: 4px; y: 4px; width: parent.width - 8px; height: parent.height - 8px;
         horizontal-scrollbar-policy: always-off;
-        viewport-y: -max(0px, (root.current + 1) * (36px * root.text-scale + 10px) - self.height);
+        content-y: -max(0px, (root.current + 1) * (36px * root.text-scale + 10px) - self.height);
         for item[index] in root.items : ActionRect {
             width: mention-list.visible-width; height: 36px * root.text-scale + 10px;
             label: item.name + " " + item.key + (index == root.current ? ", selected" : "");
@@ -899,7 +899,7 @@ component EmojiPopup inherits Rectangle {
             color: root.muted; font-size: 10px * root.text-scale; wrap: word-wrap; }
         emoji-list := ListView {
             vertical-stretch: 1; horizontal-scrollbar-policy: always-off;
-            viewport-y: -max(0px, (root.current + 1) * (34px * root.text-scale + 6px) - self.height);
+            content-y: -max(0px, (root.current + 1) * (34px * root.text-scale + 6px) - self.height);
             for item[index] in root.items : ActionRect {
                 width: emoji-list.visible-width; height: 34px * root.text-scale + 6px;
                 label: "Insert " + item.name + " " + item.symbol + (index == root.current ? ", selected" : "");
@@ -4141,7 +4141,11 @@ export component AppWindow inherits Window {
                         dismissed: root.settings-search-dismissed;
                         ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
                         accent: root.accent; outline: root.divider; text-scale: root.text-scale;
-                        max-results-height: max(96px, root.height * 0.35);
+                        // Keep this cap independent of Window.height: this
+                        // pinned area's preferred height contributes to the
+                        // window's intrinsic layout, so a fraction of its
+                        // resulting height creates a binding cycle.
+                        max-results-height: 200px;
                         search(query) => { root.settings-search(query); }
                         choose(id) => { root.settings-search-choose(id); }
                     }
