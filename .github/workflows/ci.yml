@@ -1,6 +1,6 @@
 # TEMPORARY combined interface compiler check. NEVER MERGE this workflow.
 name: Reviewed combined customization interface
-run-name: Combined customization Slint compiler - d5f3d55
+run-name: Diagnose combined search layout warnings - d5f3d55
 on:
   workflow_dispatch:
 permissions:
@@ -121,6 +121,7 @@ jobs:
               'status':'passed' if passed else 'failed','failure':reason,
               'error_codes':sorted(set(re.findall(r'error\[(E[0-9]{4})\]',clean))),
               'compiler_messages':errors,
+              'ui_compiler_warnings':re.findall(r'^warning: morpheus-ui-check@[0-9.]+: ([^\r\n]{1,240})',clean,re.MULTILINE)[:100],
               'source_locations':sorted(set(re.findall(r'(?:crates/[A-Za-z0-9_./-]+\.(?:rs|slint):[0-9]+(?::[0-9]+)?)',clean))),
               'app_executed':False,'real_accounts':False,'physical_devices':False,
               'raw_logs_public':False},sort_keys=True),flush=True)
