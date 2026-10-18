@@ -181,6 +181,51 @@ pub(crate) mod tests {
         }
     }
 
+    /// Mixed conversation shapes for the real generated ListView. Keep the
+    /// small equality/notification fixtures separate so their contracts remain
+    /// easy to inspect; this workload exercises width-dependent text layout.
+    pub(crate) fn rich_fixture(index: usize) -> MessageInfo {
+        let mut row = fixture(index);
+        row.body = match index % 6 {
+            0 => format!("Short timeline message {index}."),
+            1 => format!("Timeline plan {index}\nReview the room settings.\nConfirm the next check."),
+            2 => format!(
+                "Workshop notes {index}: {}",
+                "A longer conversation should wrap naturally as the reading width changes, while nearby messages retain their own heights. ".repeat(4)
+            ),
+            3 => format!("Build output {index}\nfn ready() {{\n    prepare();\n    verify();\n}}"),
+            4 => format!("Sharing the revised room layout {index}."),
+            _ => format!("Checklist {index}\n- Review contrast\n- Check keyboard focus\n- Keep the selected alias visible"),
+        };
+        row.rich_markdown = Some(if index % 6 == 3 {
+            format!(
+                "Build output {index}\n\n```rust\nfn ready() {{\n    prepare();\n    verify();\n}}\n```"
+            )
+        } else {
+            // Match Matrix hard line breaks rather than Markdown soft wraps.
+            row.body.replace('\n', "  \n")
+        });
+        row.rich_accessible = Some(row.body.clone());
+        row.sender = [
+            "@casey:example.org",
+            "@morgan:example.org",
+            "@jules:example.org",
+            "@sam:example.org",
+        ][index % 4]
+            .into();
+        row.timestamp_ms = 1_700_000_000_000 + index as u64 * 60_000;
+        if index % 5 == 4 {
+            row.attachment_name = Some(format!("layout-notes-{index}.pdf"));
+        }
+        if index % 7 == 4 {
+            row.reply_preview = Some("Morgan: Please review the revised reading width.".into());
+        }
+        if index % 4 == 0 {
+            row.reaction_summary = "✓  3".into();
+        }
+        row
+    }
+
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum Change {
         Changed(usize, usize),
