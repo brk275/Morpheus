@@ -265,7 +265,9 @@ fn outside(path: &Path, checkout: &Path) -> Result<PathBuf, Refusal> {
         return Err("path_not_absolute");
     }
     let resolved = path.canonicalize().map_err(|_| "path_unavailable")?;
-    let checkout = checkout.canonicalize().map_err(|_| "checkout_unavailable")?;
+    let checkout = checkout
+        .canonicalize()
+        .map_err(|_| "checkout_unavailable")?;
     if resolved.starts_with(&checkout) {
         return Err("path_in_checkout");
     }
@@ -870,8 +872,16 @@ impl Context {
             return Err("profile_not_fresh");
         }
         for (account, room, stage) in [
-            (&run.switch, &run.switch_enroll_room, "enroll_switch_account"),
-            (&run.measured, &run.measured_enroll_room, "enroll_measured_account"),
+            (
+                &run.switch,
+                &run.switch_enroll_room,
+                "enroll_switch_account",
+            ),
+            (
+                &run.measured,
+                &run.measured_enroll_room,
+                "enroll_measured_account",
+            ),
         ] {
             self.enter(stage);
             let manager = self.live.manager.clone();
@@ -948,10 +958,7 @@ impl Context {
         let sent = Instant::now();
         self.ui.invoke_open_room(room.into());
         let shown = until(WAIT_LIMIT, POLL, "room_not_shown", || self.showing(room)).await?;
-        Ok((
-            millis(shown - sent),
-            self.ui.get_messages().row_count(),
-        ))
+        Ok((millis(shown - sent), self.ui.get_messages().row_count()))
     }
 
     async fn measure(&self) -> Result<Value, Refusal> {
@@ -1111,7 +1118,8 @@ impl Context {
         let away = until(WAIT_LIMIT, POLL, "switch_away", || self.active(&switch)).await?;
         self.enter("switch_back");
         let back_sent = Instant::now();
-        self.ui.invoke_switch_account(self.account_index(&measured)?);
+        self.ui
+            .invoke_switch_account(self.account_index(&measured)?);
         let back = until(WAIT_LIMIT, POLL, "switch_back", || self.active(&measured)).await?;
         self.enter("reopen_room");
         let (reopen_ms, reopen_rows) = self.open_room(&room).await?;
@@ -1287,7 +1295,12 @@ mod tests {
         assert_eq!(marker_index("tl10k-12ab3"), None);
         assert_eq!(marker_index("tl10k-123"), None);
         assert_eq!(marker_index("ordinary message"), None);
-        let bodies = ["tl10k-00001 a", "tl10k-00002 b", "tl10k-00001 again", "other"];
+        let bodies = [
+            "tl10k-00001 a",
+            "tl10k-00002 b",
+            "tl10k-00001 again",
+            "other",
+        ];
         assert_eq!(fixture_rows(bodies.into_iter()), (3, 2));
     }
 
@@ -1444,7 +1457,10 @@ mod tests {
             validate(files.run("measure", None)).err(),
             Some("room_file_mode")
         );
-        files.write("room.json", r#"{"room_id": "!fixture:morpheus-a.test", "events": 9999}"#);
+        files.write(
+            "room.json",
+            r#"{"room_id": "!fixture:morpheus-a.test", "events": 9999}"#,
+        );
         assert_eq!(
             validate(files.run("measure", Some("room.json"))).err(),
             Some("room_file_invalid")
@@ -1476,7 +1492,10 @@ mod tests {
             );
         }
         let files = Files::new();
-        files.write("fixture.json", &fixture_json("http://matrix.example.org:8008"));
+        files.write(
+            "fixture.json",
+            &fixture_json("http://matrix.example.org:8008"),
+        );
         assert_eq!(
             validate(files.run("enroll", None)).err(),
             Some("homeserver_not_loopback")
@@ -1513,7 +1532,13 @@ mod tests {
         write_report(&run.report, &value).unwrap();
         assert!(write_report(&run.report, &value).is_err());
         let text = fs::read_to_string(&run.report).unwrap();
-        for private in ["bob", "carol", "generated-password", "morpheus-a.test", "!enc"] {
+        for private in [
+            "bob",
+            "carol",
+            "generated-password",
+            "morpheus-a.test",
+            "!enc",
+        ] {
             assert!(!text.contains(private), "{private}");
         }
         let parsed: Value = serde_json::from_str(&text).unwrap();

@@ -121,7 +121,9 @@ impl Drop for Stores {
 
 fn checkout() -> PathBuf {
     ok(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize(),
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize(),
         "checkout",
     )
 }
@@ -130,7 +132,9 @@ fn checkout() -> PathBuf {
 fn output_path(raw: PathBuf) -> PathBuf {
     require(raw.is_absolute() && !raw.exists(), "output_path");
     let parent = ok(
-        raw.parent().ok_or(()).and_then(|parent| parent.canonicalize().map_err(|_| ())),
+        raw.parent()
+            .ok_or(())
+            .and_then(|parent| parent.canonicalize().map_err(|_| ())),
         "output_path",
     );
     require(!parent.starts_with(checkout()), "output_in_checkout");

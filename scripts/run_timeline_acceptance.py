@@ -53,9 +53,9 @@ HOSTED = {
 # Only these reach the app and the seeder; no other runner variable does.
 PASSED_ENVIRONMENT = (
     "PATH", "HOME", "LANG", "DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR",
-    "DBUS_SESSION_BUS_ADDRESS", *HOSTED,
+    "DBUS_SESSION_BUS_ADDRESS", "CARGO_HOME", "CARGO_BUILD_JOBS",
+    "CARGO_INCREMENTAL", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN", *HOSTED,
 )
-PASSED_PREFIXES = ("CARGO_", "RUSTUP_")
 TOKEN = re.compile(r"[a-z_]{1,48}")
 SEED_FAILURE = re.compile(r"MORPHEUS_TIMELINE_SEED_FAILURE ([a-z_]{1,48})$", re.MULTILINE)
 SEED_COMPLETE = f"MORPHEUS_TIMELINE_SEED_COMPLETE events={EVENTS}"
@@ -176,8 +176,6 @@ def guard(environment) -> str | None:
 
 def child_environment(environment) -> dict[str, str]:
     passed = {name: environment[name] for name in PASSED_ENVIRONMENT if environment.get(name)}
-    passed.update({name: value for name, value in environment.items()
-                   if name.startswith(PASSED_PREFIXES) and value})
     return passed
 
 

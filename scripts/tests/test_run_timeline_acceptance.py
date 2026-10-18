@@ -152,11 +152,20 @@ class GuardTests(unittest.TestCase):
 
     def test_children_get_only_allowlisted_variables(self):
         passed = runner.child_environment(HOSTED | {"GITHUB_TOKEN": "private", "AWS_SECRET": "private",
-                                                    "CARGO_HOME": "/home/runner/.cargo"})
+                                                    "CARGO_HOME": "/home/runner/.cargo",
+                                                    "CARGO_REGISTRY_TOKEN": "private",
+                                                    "CARGO_REGISTRIES_PRIVATE_TOKEN": "private",
+                                                    "RUSTUP_AUTH_TOKEN": "private",
+                                                    "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER": "/unreviewed",
+                                                    "RUSTUP_TOOLCHAIN": "1.99.0"})
         self.assertNotIn("GITHUB_TOKEN", passed)
         self.assertNotIn("AWS_SECRET", passed)
         self.assertEqual(passed["CARGO_HOME"], "/home/runner/.cargo")
         self.assertEqual(passed["DISPLAY"], ":99")
+        self.assertEqual(passed["RUSTUP_TOOLCHAIN"], "1.99.0")
+        for excluded in ("CARGO_REGISTRY_TOKEN", "CARGO_REGISTRIES_PRIVATE_TOKEN",
+                         "RUSTUP_AUTH_TOKEN", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER"):
+            self.assertNotIn(excluded, passed)
 
 
 class ReportTests(unittest.TestCase):
