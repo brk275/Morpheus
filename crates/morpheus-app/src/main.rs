@@ -878,9 +878,12 @@ fn make_stress_messages() -> Vec<MessageItem> {
         .collect()
 }
 
+/// A validated `#RRGGBB` or `#RRGGBBAA` color, alpha last. Validation has
+/// already rejected anything else; an unexpected value paints black.
 fn color_from_hex(value: &str) -> Color {
-    let rgb = u32::from_str_radix(value.strip_prefix('#').unwrap_or_default(), 16).unwrap_or(0);
-    Color::from_rgb_u8((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
+    let [red, green, blue, alpha] =
+        morpheus_config::registry::parse_hex_color(value).unwrap_or([0, 0, 0, 0xff]);
+    Color::from_argb_u8(alpha, red, green, blue)
 }
 
 fn apply_room_sort(ui: &AppWindow) {
@@ -903,7 +906,7 @@ fn apply_notification_settings(ui: &AppWindow, config: &Config) {
 
 fn apply_config(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
     appearance::apply_config(ui, config);
-    appearance::apply_theme(ui, theme);
+    appearance::apply_theme(ui, config, theme);
     shortcuts::apply_config(ui, config);
     audio_devices::apply_config(ui, config);
     image_previews::apply_config(ui, config);

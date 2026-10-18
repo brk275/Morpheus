@@ -9,7 +9,9 @@ use morpheus_config::{
 use slint::fontique_011::fontique;
 use slint::{ComponentHandle, ModelRc, VecModel};
 
-use super::{AppWindow, ColorRole, StyleTokens, ThemeRoleSet, color_from_hex, save_config_change};
+use super::{
+    AppWindow, BaseColorSet, ColorRole, StyleTokens, ThemeRoleSet, color_from_hex, save_config_change,
+};
 
 /// Theme-mode preferences of the last configuration this window accepted.
 /// Only a successfully loaded configuration replaces them, so a rejected
@@ -98,9 +100,13 @@ pub(crate) fn theme_mode_index(mode: ThemeMode) -> i32 {
 
 /// Apply a complete projection every time, including clearing omitted overrides.
 /// Sender colors are a live UI model: existing message rows need no rebuilding.
-pub(super) fn apply_theme(ui: &AppWindow, theme: Option<&ThemePack>) {
-    let (roles, senders) = theme_projection(theme);
-    ui.global::<StyleTokens>().set_roles(roles);
+/// A `[colors]` override in `config.toml` wins over the theme pack, which wins
+/// over each control's built-in color.
+pub(super) fn apply_theme(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
+    let (roles, senders) = theme_projection(config, theme);
+    let tokens = ui.global::<StyleTokens>();
+    tokens.set_roles(roles);
+    tokens.set_base(base_projection(config));
     ui.set_sender_palette(ModelRc::new(VecModel::from(senders)));
 }
 
@@ -111,43 +117,82 @@ fn color_role(value: Option<&str>) -> ColorRole {
     })
 }
 
-fn theme_projection(theme: Option<&ThemePack>) -> (ThemeRoleSet, Vec<slint::Color>) {
-    let Some(theme) = theme else {
-        return (ThemeRoleSet::default(), Vec::new());
+fn base_projection(config: &Config) -> BaseColorSet {
+    let base = |id: &str| color_role(config.colors.get(id).map(String::as_str));
+    BaseColorSet {
+        rail: base("rail"),
+        sidebar: base("sidebar"),
+        canvas: base("canvas"),
+        panel: base("panel"),
+        elevated: base("elevated"),
+        hover: base("hover"),
+        ink: base("ink"),
+        muted: base("muted"),
+        divider: base("divider"),
+        accent: base("accent"),
+        accent_ink: base("accent_ink"),
+    }
+}
+
+fn theme_projection(config: &Config, theme: Option<&ThemePack>) -> (ThemeRoleSet, Vec<slint::Color>) {
+    let role = |id: &str| {
+        let value = config
+            .colors
+            .get(id)
+            .map(String::as_str)
+            .or_else(|| theme.and_then(|theme| theme.roles.get(id)));
+        color_role(value)
     };
-    let roles = &theme.roles;
+    let senders = theme
+        .and_then(|theme| theme.senders.colors.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .map(|value| color_from_hex(value))
+        .collect();
     (
         ThemeRoleSet {
-            error: color_role(roles.error.as_deref()),
-            error_surface: color_role(roles.error_surface.as_deref()),
-            error_ink: color_role(roles.error_ink.as_deref()),
-            success: color_role(roles.success.as_deref()),
-            success_surface: color_role(roles.success_surface.as_deref()),
-            success_ink: color_role(roles.success_ink.as_deref()),
-            selection: color_role(roles.selection.as_deref()),
-            selection_ink: color_role(roles.selection_ink.as_deref()),
-            focus: color_role(roles.focus.as_deref()),
-            link: color_role(roles.link.as_deref()),
-            unread: color_role(roles.unread.as_deref()),
-            unread_ink: color_role(roles.unread_ink.as_deref()),
-            destructive: color_role(roles.destructive.as_deref()),
-            destructive_ink: color_role(roles.destructive_ink.as_deref()),
-            voice: color_role(roles.voice.as_deref()),
-            timestamp: color_role(roles.timestamp.as_deref()),
-            sender: color_role(roles.sender.as_deref()),
-            message: color_role(roles.message.as_deref()),
-            own_message: color_role(roles.own_message.as_deref()),
-            own_surface: color_role(roles.own_surface.as_deref()),
+            error: role("error"),
+            error_surface: role("error_surface"),
+            error_ink: role("error_ink"),
+            success: role("success"),
+            success_surface: role("success_surface"),
+            success_ink: role("success_ink"),
+            selection: role("selection"),
+            selection_ink: role("selection_ink"),
+            focus: role("focus"),
+            link: role("link"),
+            unread: role("unread"),
+            unread_ink: role("unread_ink"),
+            destructive: role("destructive"),
+            destructive_ink: role("destructive_ink"),
+            voice: role("voice"),
+            timestamp: role("timestamp"),
+            sender: role("sender"),
+            message: role("message"),
+            own_message: role("own_message"),
+            own_surface: role("own_surface"),
+            scrim: role("scrim"),
+            shadow: role("shadow"),
+            media_backdrop: role("media_backdrop"),
+            presence_online: role("presence_online"),
+            avatar_ink: role("avatar_ink"),
         },
-        theme
-            .senders
-            .colors
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(|value| color_from_hex(value))
-            .collect(),
+        senders,
     )
+}
+
+/// Fixed status for the window transparency control. Support depends on the
+/// window system; nothing here can observe whether a compositor blends it.
+fn transparency_status(percent: u8) -> &'static str {
+    if percent >= 100 {
+        "Opaque. Lower the value to let the desktop show through the window's panes."
+    } else if cfg!(target_os = "macos") {
+        "Applied to the window as you change it. Not yet verified on this build."
+    } else if cfg!(target_os = "windows") {
+        "Requested from Windows. Whether the desktop shows through depends on desktop composition and the graphics driver. Not yet verified on this build."
+    } else {
+        "Requested from the window system. Wayland compositors, and X11 with a running compositing manager, can show the desktop; without one the panes may look black or stay opaque. Not yet verified on this build."
+    }
 }
 
 /// Stable identity token, independent of message text, palette length and theme.
@@ -206,6 +251,11 @@ fn font_family_with_resolver(
 pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
     ui.global::<StyleTokens>()
         .set_reduced_motion(config.appearance.reduce_motion);
+    let opacity = config.window.opacity_percent;
+    ui.global::<StyleTokens>()
+        .set_window_opacity(f32::from(opacity) / 100.0);
+    ui.set_window_opacity_percent(opacity.into());
+    ui.set_window_transparency_status(transparency_status(opacity).into());
     // Move only a focused, disappearing navigation control before changing its
     // conditional subtree. Other input and modal focus remains untouched.
     ui.invoke_apply_navigation_mode(match config.layout.navigation {
@@ -497,9 +547,10 @@ mod theme_tests {
 
     #[test]
     fn omitted_roles_and_sender_palette_restore_legacy_bindings() {
-        let (roles, senders) = theme_projection(None);
+        let (roles, senders) = theme_projection(&Config::default(), None);
         assert_eq!(roles, ThemeRoleSet::default());
         assert!(senders.is_empty());
+        assert_eq!(base_projection(&Config::default()), BaseColorSet::default());
         assert!(!color_role(None).present);
         let black = color_role(Some("#000000"));
         assert!(black.present, "black is an explicit color, not an omission");
@@ -521,7 +572,7 @@ mod theme_tests {
             "senders": {"colors": ["#414243", "#515253"]}
         }))
         .unwrap();
-        let (roles, senders) = theme_projection(Some(&theme));
+        let (roles, senders) = theme_projection(&Config::default(), Some(&theme));
         assert_eq!(
             roles.error.color,
             slint::Color::from_rgb_u8(0x12, 0x13, 0x14)
@@ -545,9 +596,32 @@ mod theme_tests {
         );
         theme.roles = Default::default();
         theme.senders = Default::default();
-        let (roles, senders) = theme_projection(Some(&theme));
+        let (roles, senders) = theme_projection(&Config::default(), Some(&theme));
         assert_eq!(roles, ThemeRoleSet::default());
         assert!(senders.is_empty());
+    }
+
+    #[test]
+    fn config_overrides_win_over_the_theme_and_accept_alpha() {
+        let mut theme = morpheus_config::BuiltInStylePreset::Nocturne.theme().unwrap();
+        theme.roles.link = Some("#111111".into());
+        let mut config = Config::default();
+        config.colors.insert("link".into(), "#22222280".into());
+        config.colors.insert("canvas".into(), "#33333300".into());
+        config.colors.insert("scrim".into(), "#000000CC".into());
+        let (roles, _) = theme_projection(&config, Some(&theme));
+        assert!(roles.link.present);
+        assert_eq!(roles.link.color, slint::Color::from_argb_u8(0x80, 0x22, 0x22, 0x22));
+        assert_eq!(roles.scrim.color, slint::Color::from_argb_u8(0xcc, 0, 0, 0));
+        // Without the override the theme's role applies again.
+        config.colors.remove("link");
+        let (roles, _) = theme_projection(&config, Some(&theme));
+        assert_eq!(roles.link.color, slint::Color::from_rgb_u8(0x11, 0x11, 0x11));
+        let base = base_projection(&config);
+        assert!(base.canvas.present && !base.panel.present);
+        assert_eq!(base.canvas.color, slint::Color::from_argb_u8(0, 0x33, 0x33, 0x33));
+        assert!(transparency_status(100).starts_with("Opaque"));
+        assert!(transparency_status(40).contains("Not yet verified"));
     }
 
     #[test]

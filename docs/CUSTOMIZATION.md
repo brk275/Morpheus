@@ -407,8 +407,10 @@ own_surface = "#20283A"
 colors = ["#C2AEFA", "#9DD8CD", "#F0C28F", "#ACCEFF", "#E7AED1", "#C7D59B"]
 ```
 
-All colors must be `#RRGGBB`; names, transparency values and malformed strings
-are rejected. `senders.colors` accepts **1–16 colors**. An empty list is invalid;
+All colors must be `#RRGGBB` or `#RRGGBBAA` (alpha last); names and malformed
+strings are rejected. See [the appearance contract](APPEARANCE.md) for the hex
+convention, sparse `[colors]` overrides in `config.toml` and window
+transparency. `senders.colors` accepts **1–16 colors**. An empty list is invalid;
 omit it to restore the previous sender colors. Repeated colors and a one-color
 palette are allowed. Sender colors apply when **Settings → Appearance → Colored
 sender names** is on (`chat.color_senders = true`). It takes precedence over the
@@ -429,9 +431,9 @@ Old eleven-token themes keep their previous per-control fallbacks. Omitting a
 role restores that control's existing color; it does not borrow the value from
 the previously selected theme. Editing colors or removing optional fields
 reloads the active palette. Invalid edits retain the last valid appearance and
-show an error. Semantic and sender-palette values are edited in the theme file;
-Settings currently offers preset/base-palette selection and the sender-color
-toggle, not an individual color editor.
+show an error. Any token can also be overridden in the `[colors]` table of `config.toml`,
+which the Settings color editor writes; sender palettes are edited in the theme
+file.
 
 To reset custom colors, choose a **Base palette** in Settings; this clears the
 custom theme selection and preserves fonts and geometry. To reset an embedded
