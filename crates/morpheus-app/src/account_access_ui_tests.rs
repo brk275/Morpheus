@@ -2217,6 +2217,21 @@ fn focused_control_bounds(ui: &AppWindow) -> Option<Bounds> {
     Some(item_bounds(&focused))
 }
 
+/// Weak identity distinguishes each record's control without retaining a
+/// removed repeated item across keyboard dispatches.
+fn focused_control_identity(
+    ui: &AppWindow,
+) -> Option<slint::private_unstable_api::re_exports::ItemWeak> {
+    use slint::private_unstable_api::re_exports::WindowInner;
+    let window = WindowInner::from_pub(ui.window());
+    let identity = window
+        .focus_item
+        .borrow()
+        .upgrade()
+        .map(|item| item.downgrade());
+    identity
+}
+
 fn window_size(ui: &AppWindow) -> (f32, f32) {
     let size = ui.window().size().to_logical(ui.window().scale_factor());
     (size.width, size.height)
@@ -2560,6 +2575,7 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
     tab_to_record_control(ui, CANCEL_LABEL);
     let composer_before_walk = composer_focus_evidence(ui, &composer_label);
     let mut room_strip_controls = 0;
+    let mut room_control_identities = Vec::new();
     // Bounded, numeric-only failure evidence: classify focus against the
     // fixture's known labels without printing any input or account contents.
     let mut room_focus_trace = Vec::new();
@@ -2593,6 +2609,10 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
                     focused.left < window_width / 2.0,
                     "{label} must sit in the room composer: {focused:?}"
                 );
+                let identity = focused_control_identity(ui).expect("a focused room action");
+                if !room_control_identities.contains(&identity) {
+                    room_control_identities.push(identity);
+                }
                 room_strip_controls += 1;
             }
         }
@@ -2610,6 +2630,11 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
         room_focus_trace,
         composer_before_walk,
         composer_focus_evidence(ui, &composer_label)
+    );
+    assert_eq!(
+        room_control_identities.len(),
+        28,
+        "all eight room records must contribute their distinct actions; repeated cycles do not count"
     );
     let focused = focused_control_bounds(ui).unwrap();
     assert!(
@@ -2644,6 +2669,7 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
     // is fully inside the window on both axes, including stacked ones.
     tab_to_control(ui, "Show thread");
     let mut seen_strip_controls = 0;
+    let mut thread_control_identities = Vec::new();
     for _ in 0..400 {
         key(ui, Key::Tab);
         if focused_control_has_label(ui, &thread_label) {
@@ -2660,6 +2686,10 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
                     focused.left >= window_width / 2.0,
                     "{label} must sit in the side pane: {focused:?}"
                 );
+                let identity = focused_control_identity(ui).expect("a focused thread action");
+                if !thread_control_identities.contains(&identity) {
+                    thread_control_identities.push(identity);
+                }
                 seen_strip_controls += 1;
             }
         }
@@ -2671,6 +2701,11 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
     assert!(
         focused_control_has_label(ui, &thread_label),
         "the walk must end at the thread input"
+    );
+    assert_eq!(
+        thread_control_identities.len(),
+        28,
+        "all eight thread records must contribute their distinct actions; repeated cycles do not count"
     );
     draft_recovery::publish_thread(ui, &PendingSummary::default(), &[]);
     draft_recovery::publish_room(ui, &PendingSummary::default(), &[]);
