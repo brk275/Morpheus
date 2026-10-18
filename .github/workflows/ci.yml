@@ -1,19 +1,18 @@
-name: CI
+# TEMPORARY Mac-only diagnostic wrapper; NEVER MERGE into main.
+# Source b976 has immutable passing helper evidence run39096729416/job117584668595.
+# Linux/Windows continue there. Only failed Mac setup is retried here.
+# System Wayland, installed packages and release gates remain OPEN.
+name: Recovery Mac diagnostics - release gates remain open
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  # Manual dispatch always checks the complete supported native matrix.
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: recovery-macos-diagnostic-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_BUILD_JOBS: "2"
@@ -24,28 +23,18 @@ env:
 jobs:
   scope:
     name: Security and change scope
-    # Hosted validation is disabled while private to prevent unauthorized paid builds.
-    if: github.event.repository.private == false
+    if: github.event.repository.private == false && github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/codex/recovery-macos-diagnostic' && github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
-      native: ${{ steps.scope.outputs.native }}
-      native_matrix: ${{ steps.scope.outputs.native_matrix }}
-      config: ${{ steps.scope.outputs.config }}
-      wayland: ${{ steps.scope.outputs.wayland }}
+      native: "true"
+      native_matrix: '{"os":["macos-15","macos-15-intel"]}'
+      wayland: "false"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           path: candidate
           fetch-depth: 0
-          persist-credentials: false
-      - name: Check out reviewed validation inputs
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          # PR input is read as data; classification code comes from its base.
-          # Push uses reviewed main; dispatch uses its owner-selected revision.
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
-          path: trusted
           persist-credentials: false
       - name: Scan committed history for credentials
         working-directory: candidate
@@ -67,56 +56,9 @@ jobs:
             --config "$RUNNER_TEMP/morpheus-gitleaks-default.toml" \
             --gitleaks-ignore-path "$RUNNER_TEMP/morpheus-gitleaks-empty.ignore" \
             --log-opts=--all .
-      - name: Select checks from changed inputs using reviewed classifier
-        id: scope
-        working-directory: candidate
-        # Isolated mode excludes the candidate working directory and Python
-        # environment hooks from import lookup. The classifier uses stdlib only.
-        run: python3 -I ../trusted/scripts/ci_scope.py --github-event
-
-  helpers:
-    name: Validation helper tests
-    needs: scope
-    if: github.event.repository.private == false
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - name: Check scope and packaging helpers
-        run: |
-          python3 -m unittest discover -s scripts/tests -v
-          python3 -m unittest discover -s scripts -p 'test_*.py' -v
-          python3 -m compileall -q scripts
-          node --check scripts/element_call_peer.mjs
-          node --check scripts/element_call_stock_peer.mjs
-          python3 scripts/package.py --check
-
-  config:
-    name: Theme configuration tests
-    needs: [scope, helpers]
-    if: github.event.repository.private == false && needs.scope.outputs.config == 'true'
-    runs-on: ubuntu-24.04
-    concurrency:
-      group: native-${{ github.sha }}-ubuntu-24.04
-      cancel-in-progress: false
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action, pinned compiler below
-        with:
-          toolchain: 1.99.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
-      - run: cargo test --locked -p morpheus-config
-
   compile:
     name: Check and test (${{ matrix.os }})
-    needs: [scope, helpers]
+    needs: scope
     if: github.event.repository.private == false && needs.scope.outputs.native == 'true'
     runs-on: ${{ matrix.os }}
     concurrency:
@@ -129,7 +71,15 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          fetch-depth: 2
           persist-credentials: false
+      - name: Verify and restore exact reviewed workflow source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show b976bf4da98451112f96be5b94766de19947f67b:.github/workflows/ci.yml > "$RUNNER_TEMP/reviewed-native-ci.yml"
+          python3 -I -B -c 'from pathlib import Path; import hashlib, sys; assert hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest() == "df7218b7d027e6ad437ca9743595237fff64c80712cdfaa2d5522e3f25451ac8"' "$RUNNER_TEMP/reviewed-native-ci.yml"
+          cp "$RUNNER_TEMP/reviewed-native-ci.yml" .github/workflows/ci.yml
       - name: Linux native dependencies
         if: runner.os == 'Linux'
         run: |
@@ -342,71 +292,19 @@ jobs:
           exit 1
 
   acceptance:
-    name: CI acceptance
-    needs: [scope, helpers, config, compile]
-    # Run after failed/skipped dependencies too. A selected check may never
-    # disappear behind a skipped aggregate that branch protection accepts.
-    if: always() && github.event.repository.private == false
+    name: Mac diagnostic result - release gates remain open
+    needs: [scope, compile]
+    if: ${{ always() && !cancelled() && github.event.repository.private == false }}
     runs-on: ubuntu-24.04
-    permissions: {}
-    timeout-minutes: 2
     steps:
-      # No checkout, dependency/cache restore, artifacts, or submitted code.
-      # This combines job conclusions; source/workflow review remains required.
-      - name: Require every selected check to succeed
+      - name: Require both selected Mac native outcomes
         env:
           CHECK_RESULTS: ${{ toJSON(needs) }}
-        shell: bash
         run: |
-          python3 - <<'PY_ACCEPTANCE'
-          import json
-          import os
-          import sys
-
-          def acceptance_error(needs):
-              if not isinstance(needs, dict) or set(needs) != {"scope", "helpers", "config", "compile"}:
-                  return "Missing dependency conclusions."
-              if any(not isinstance(value, dict) for value in needs.values()):
-                  return "Malformed dependency conclusions."
-              if needs["scope"].get("result") != "success":
-                  return "Security and change scope did not succeed."
-              if needs["helpers"].get("result") != "success":
-                  return "Validation helper tests did not succeed."
-              outputs = needs["scope"].get("outputs")
-              if not isinstance(outputs, dict):
-                  return "Scope outputs are missing."
-              native, config, wayland = outputs.get("native"), outputs.get("config"), outputs.get("wayland")
-              if any(flag not in ("true", "false") for flag in (native, config, wayland)):
-                  return "Scope flags are missing or malformed."
-              if native == config == "true":
-                  return "Native checks already include configuration tests."
-              try:
-                  matrix = json.loads(outputs.get("native_matrix", ""))
-              except (TypeError, ValueError):
-                  return "Native matrix is missing or malformed."
-              if not isinstance(matrix, dict) or set(matrix) != {"os"}:
-                  return "Native matrix must contain only standard operating systems."
-              platforms = matrix["os"]
-              allowed = {"macos-15", "macos-15-intel", "ubuntu-24.04", "windows-2025"}
-              if (not isinstance(platforms, list)
-                      or any(not isinstance(item, str) or item not in allowed for item in platforms)
-                      or len(platforms) != len(set(platforms))
-                      or bool(platforms) != (native == "true")):
-                  return "Native matrix disagrees with the selected standard checks."
-              if wayland == "true" and "ubuntu-24.04" not in platforms:
-                  return "Selected Wayland acceptance requires the Linux native job."
-              for job, selected in (("config", config), ("compile", native)):
-                  expected = "success" if selected == "true" else "skipped"
-                  if needs[job].get("result") != expected:
-                      return "A selected check failed, was cancelled, or did not run."
-              return None
-
-          try:
-              error = acceptance_error(json.loads(os.environ["CHECK_RESULTS"]))
-          except (KeyError, ValueError):
-              error = "Dependency conclusions are missing or malformed."
-          if error:
-              print(error, file=sys.stderr)
-              raise SystemExit(1)
-          print("Security checks and every selected validation job succeeded.")
-          PY_ACCEPTANCE
+          python3 -I -B - <<'PY_MAC_DIAGNOSTIC'
+          import json, os
+          result = json.loads(os.environ["CHECK_RESULTS"])
+          if set(result) != {"scope", "compile"} or any(result[key].get("result") != "success" for key in result):
+              raise SystemExit("Mac native diagnostics failed or did not complete.")
+          print("Both Mac native diagnostic jobs succeeded; remaining release gates are open.")
+          PY_MAC_DIAGNOSTIC
