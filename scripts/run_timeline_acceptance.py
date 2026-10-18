@@ -25,10 +25,13 @@ import math
 import os
 from pathlib import Path
 import re
+import select
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 from fixture_paths import external_path, private_directory, write_private
 
@@ -44,6 +47,8 @@ BOB_DEVICES = len(ADAPTERS) + 1
 ENROLL_SECONDS = 15 * 60
 SEED_SECONDS = 60 * 60
 MEASURE_SECONDS = 50 * 60
+MAX_LOG_BYTES = 16 * 1024 * 1024
+OUTPUT_LIMIT = -2
 HOSTED = {
     "GITHUB_ACTIONS": "true",
     "RUNNER_ENVIRONMENT": "github-hosted",
@@ -215,24 +220,55 @@ def valid_report(report, mode: str, adapter: str) -> bool:
 
 
 def run_process(command: list[str], environment: dict[str, str], timeout: int, log: Path) -> int | None:
-    """Raw output goes only to a new owner-only log in the private directory."""
+    """Bound time and raw bytes; stop the owned group before reaping its leader."""
     descriptor = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, "wb") as output:
         process = subprocess.Popen(command, cwd=REPO, env=environment, stdin=subprocess.DEVNULL,
-                                   stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        deadline = time.monotonic() + timeout
+        size = 0
+        reaped = False
         try:
-            return process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
-            return None
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                ready, _, _ = select.select([process.stdout], [], [], remaining)
+                if not ready:
+                    return None
+                block = os.read(process.stdout.fileno(), 65536)
+                if not block:
+                    try:
+                        code = process.wait(timeout=max(.001, deadline - time.monotonic()))
+                    except subprocess.TimeoutExpired:
+                        return None
+                    reaped = True
+                    return code
+                size += len(block)
+                if size > MAX_LOG_BYTES:
+                    return OUTPUT_LIMIT
+                output.write(block)
+        finally:
+            if not reaped:
+                # No poll/wait has released the child PID. Kill its session
+                # group even if a descendant is keeping the output pipe open.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+            process.stdout.close()
 
 
 def load_json(path: Path):
     try:
-        if path.is_symlink() or not path.is_file() or path.stat().st_size > 64 * 1024:
-            return None
-        return json.loads(path.read_text(encoding="utf-8"))
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 64 * 1024:
+                return None
+            data = stream.read(64 * 1024 + 1)
+        return json.loads(data) if len(data) <= 64 * 1024 else None
     except (OSError, UnicodeError, ValueError):
         return None
 
@@ -275,6 +311,8 @@ class Acceptance:
         environment = self.environment | {"MORPHEUS_TIMELINE_ACCEPTANCE": str(run_file)}
         timeout = ENROLL_SECONDS if mode == "enroll" else MEASURE_SECONDS
         code = self.runner([str(self.app)], environment, timeout, self.work / f"log-{mode}-{adapter}.txt")
+        if code == OUTPUT_LIMIT:
+            raise StepFailure(mode, adapter, "output_limit")
         value = load_json(report)
         if not isinstance(value, dict):
             raise StepFailure(mode, adapter, "timeout" if code is None else "no_report")
@@ -296,6 +334,8 @@ class Acceptance:
         command = ["cargo", "test", "--locked", "-p", "morpheus-matrix", "--test", "timeline_10k_local",
                    "--", "--nocapture", "--test-threads=1"]
         code = self.runner(command, environment, SEED_SECONDS, log)
+        if code == OUTPUT_LIMIT:
+            raise StepFailure("seed", None, "output_limit")
         try:
             output = log.read_text(encoding="utf-8", errors="replace")
         except OSError:

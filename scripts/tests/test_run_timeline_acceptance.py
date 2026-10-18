@@ -1,7 +1,7 @@
 """Mocked contracts for the real-room timeline acceptance runner.
 
-No app, Matrix server, display, keyring or cargo process is started: a fake
-runner writes the reports the instrumented app and seeder would write.
+No app, Matrix server, display, keyring or cargo process is started. Flow tests
+use fake reports; process-boundary tests run only Python synthetic output.
 """
 
 import contextlib
@@ -284,6 +284,48 @@ class FlowTests(RunnerTest):
             code = runner.main(["--fixture", str(self.fixture)])
         self.assertEqual(code, 2)
         self.assertEqual(json.loads(output.getvalue())["failure"], "not_hosted")
+
+
+class ProcessBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.folder = Path(folder.name)
+
+    def run_synthetic(self, code, timeout=5):
+        return runner.run_process([sys.executable, "-I", "-B", "-c", code],
+                                  {"PATH": "/usr/bin"}, timeout, self.folder / "output.log")
+
+    def test_output_is_private_bounded_and_never_printed(self):
+        output = io.StringIO()
+        with patch.object(runner, "MAX_LOG_BYTES", 1024), contextlib.redirect_stdout(output):
+            result = self.run_synthetic("import os; os.write(1, b'synthetic-only' * 4096)")
+        self.assertEqual(result, runner.OUTPUT_LIMIT)
+        self.assertEqual(output.getvalue(), "")
+        log = self.folder / "output.log"
+        self.assertLessEqual(log.stat().st_size, 1024)
+        self.assertEqual(stat.S_IMODE(log.stat().st_mode), 0o600)
+
+    def test_normal_exit_captures_both_streams(self):
+        result = self.run_synthetic("import os; os.write(1,b'first'); os.write(2,b'second')")
+        self.assertEqual(result, 0)
+        self.assertEqual((self.folder / "output.log").read_bytes(), b"firstsecond")
+
+    def test_quiet_timeout_stops_and_reaps_the_child(self):
+        self.assertIsNone(self.run_synthetic("import time; time.sleep(60)", timeout=.1))
+
+    def test_reports_reject_links_special_files_and_oversize(self):
+        report = self.folder / "report.json"
+        report.write_text('{"synthetic":true}')
+        self.assertEqual(runner.load_json(report), {"synthetic": True})
+        alias = self.folder / "alias.json"
+        alias.symlink_to(report)
+        self.assertIsNone(runner.load_json(alias))
+        report.write_bytes(b"x" * (64 * 1024 + 1))
+        self.assertIsNone(runner.load_json(report))
+        pipe = self.folder / "pipe"
+        os.mkfifo(pipe)
+        self.assertIsNone(runner.load_json(pipe))
 
 
 if __name__ == "__main__":
