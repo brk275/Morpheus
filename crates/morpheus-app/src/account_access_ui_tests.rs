@@ -1996,6 +1996,7 @@ async fn exercise_account_ui(runtime: Handle) {
     ui.set_room_admin_topic_input("private topic".into());
     ui.set_attachment_status("private upload name".into());
     assert_recovery_strip_projection(&ui).await;
+    assert_sticker_picker_projection(&ui).await;
     // Exercise chat controls before opening the one-time-key modal. Then
     // render that private surface as well before testing the real detach.
     ui.set_security_recovery_input("synthetic recovery input".into());
@@ -2420,6 +2421,150 @@ const DISCARD_UNREADABLE_LABEL: &str =
 /// per record with its own exact controls, keyboard reachable, routing the
 /// record's opaque key and never another record's; the narrow thread pane at
 /// 200% text stacks the controls inside the window instead of clipping them.
+/// The real sticker popup and send-status strip. Opaque keys route through
+/// the generated callbacks; the search field owns arrows, Return and Escape;
+/// consent is an explicit keyboard-reachable action; no image element exists
+/// before consent and Return cannot send while sending is not allowed.
+async fn assert_sticker_picker_projection(ui: &AppWindow) {
+    use crate::StickerItem;
+    use slint::{Image, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    ui.set_show_sign_in(false);
+    ui.set_page(0);
+    ui.set_live_session(true);
+    ui.set_active_account_local_id("presentation-only".into());
+    ui.set_active_room_id("!presentation:example.org".into());
+    ui.set_composer_mode(0);
+    ui.set_composer_busy(false);
+    let navigated: Rc<RefCell<Vec<i32>>> = Rc::default();
+    let queries: Rc<RefCell<Vec<String>>> = Rc::default();
+    let sent: Rc<RefCell<Vec<String>>> = Rc::default();
+    let consents: Rc<RefCell<Vec<bool>>> = Rc::default();
+    let dismissed = Rc::new(Cell::new(0));
+    let cancelled = Rc::new(Cell::new(0));
+    let sink = navigated.clone();
+    ui.on_sticker_navigate(move |offset| sink.borrow_mut().push(offset));
+    let sink = queries.clone();
+    ui.on_sticker_query(move |query| sink.borrow_mut().push(query.to_string()));
+    let sink = sent.clone();
+    ui.on_sticker_send(move |key| sink.borrow_mut().push(key.to_string()));
+    let sink = consents.clone();
+    ui.on_sticker_consent(move |allowed| sink.borrow_mut().push(allowed));
+    let sink = dismissed.clone();
+    ui.on_sticker_dismiss(move || sink.set(sink.get() + 1));
+    let sink = cancelled.clone();
+    ui.on_sticker_send_cancel(move || sink.set(sink.get() + 1));
+
+    ui.set_sticker_items(ModelRc::new(VecModel::from(vec![
+        StickerItem {
+            key: "41:0".into(),
+            label: "Waving fox".into(),
+            pack: "Forest friends".into(),
+        },
+        StickerItem {
+            key: "41:1".into(),
+            label: "Sleeping owl".into(),
+            pack: "Forest friends".into(),
+        },
+    ])));
+    ui.set_sticker_packs(ModelRc::new(VecModel::from(vec![
+        SharedString::from("All packs"),
+        SharedString::from("Forest friends"),
+    ])));
+    ui.set_sticker_index(0);
+    ui.set_sticker_phase(1);
+    ui.set_sticker_status("2 stickers in 1 pack.".into());
+    ui.set_sticker_needs_consent(true);
+    ui.set_sticker_can_send(false);
+    ui.set_sticker_preview_status("Images appear after you allow sticker images here.".into());
+    ui.set_sticker_threaded(false);
+    ui.set_sticker_open(true);
+    settle(ui).await;
+    assert!(ui.get_mention_ui_allowed(), "fixture is a visible idle room composer");
+    assert_eq!(control_bounds(ui, "Sticker picker").len(), 1);
+    assert_eq!(
+        control_bounds(ui, "Sticker Waving fox from Forest friends, selected").len(),
+        1
+    );
+    assert_eq!(
+        control_bounds(ui, "Sticker Sleeping owl from Forest friends").len(),
+        1
+    );
+    assert_eq!(control_bounds(ui, "Allow sticker images here").len(), 1);
+    assert!(
+        control_bounds(ui, "Sticker preview: Waving fox").is_empty(),
+        "no image is presented before consent"
+    );
+
+    // The search field takes focus when the popup opens.
+    key(ui, Key::DownArrow);
+    key(ui, Key::UpArrow);
+    assert_eq!(navigated.borrow().as_slice(), [1, -1]);
+    key(ui, Key::Return);
+    assert!(sent.borrow().is_empty(), "Return cannot send before it is allowed");
+    type_text(ui, "owl");
+    assert_eq!(ui.get_sticker_query_text().as_str(), "owl");
+    assert_eq!(queries.borrow().last().map(String::as_str), Some("owl"));
+    key(ui, Key::Escape);
+    assert_eq!(dismissed.get(), 1, "Escape in the search field closes the picker");
+
+    tab_to_control(ui, "Allow sticker images here");
+    key(ui, Key::Return);
+    assert_eq!(consents.borrow().as_slice(), [true]);
+    tab_to_control(ui, "Sticker Sleeping owl from Forest friends");
+    key(ui, Key::Escape);
+    assert_eq!(dismissed.get(), 2, "Escape on a sticker row closes the picker");
+
+    // The controller publishes permission and the decoded preview. Move focus
+    // to Send before the consent prompt disappears from the tree.
+    ui.set_sticker_can_send(true);
+    ui.set_sticker_preview_image(Image::from_rgba8(SharedPixelBuffer::<Rgba8Pixel>::new(2, 2)));
+    ui.set_sticker_preview_loaded(true);
+    settle(ui).await;
+    tab_to_control(ui, "Send sticker");
+    ui.set_sticker_needs_consent(false);
+    settle(ui).await;
+    assert!(control_bounds(ui, "Allow sticker images here").is_empty());
+    assert_eq!(control_bounds(ui, "Sticker preview: Waving fox").len(), 1);
+    key(ui, Key::Return);
+    assert_eq!(sent.borrow().as_slice(), ["41:0"]);
+
+    // After enqueue the popup closes and the exact request's controls remain.
+    ui.set_sticker_open(false);
+    ui.set_sticker_send_threaded(false);
+    ui.set_sticker_send_status("Sticker could not be sent. Retry it or cancel it.".into());
+    ui.set_sticker_send_can_cancel(true);
+    ui.set_sticker_send_can_retry(true);
+    ui.set_sticker_send_visible(true);
+    settle(ui).await;
+    assert!(control_bounds(ui, "Sticker picker").is_empty());
+    assert_eq!(control_bounds(ui, "Retry this sticker").len(), 1);
+    tab_to_control(ui, "Cancel this sticker");
+    key(ui, Key::Return);
+    assert_eq!(cancelled.get(), 1);
+    assert_eq!(sent.borrow().len(), 1, "status controls never send another sticker");
+
+    ui.set_sticker_send_visible(false);
+    ui.set_sticker_send_status("".into());
+    ui.set_sticker_send_can_cancel(false);
+    ui.set_sticker_send_can_retry(false);
+    ui.set_sticker_items(ModelRc::new(VecModel::from(Vec::<StickerItem>::new())));
+    ui.set_sticker_packs(ModelRc::new(VecModel::from(Vec::<SharedString>::new())));
+    ui.set_sticker_index(-1);
+    ui.set_sticker_phase(0);
+    ui.set_sticker_status("".into());
+    ui.set_sticker_preview_image(Image::default());
+    ui.set_sticker_preview_loaded(false);
+    ui.set_sticker_preview_status("".into());
+    ui.set_sticker_query_text("".into());
+    ui.set_sticker_can_send(false);
+    settle(ui).await;
+}
+
 async fn assert_recovery_strip_projection(ui: &AppWindow) {
     use crate::draft_recovery;
     use crate::drafts::{PendingItem, PendingStatus, PendingSummary};

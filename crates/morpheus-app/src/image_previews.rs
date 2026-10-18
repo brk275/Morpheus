@@ -25,7 +25,7 @@ pub(super) struct Pixels {
     rgba: Zeroizing<Vec<u8>>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum PreviewError {
+pub(crate) enum PreviewError {
     Unavailable,
     TooLarge,
     Unsupported,
@@ -52,6 +52,14 @@ impl PreviewError {
             }
         }
     }
+}
+
+/// The same bounded PNG/baseline-JPEG decoder for other memory-only native
+/// previews: (width, height, RGBA). Call it only on a dedicated worker.
+pub(crate) fn decode_rgba(
+    bytes: Zeroizing<Vec<u8>>,
+) -> Result<(u32, u32, Zeroizing<Vec<u8>>), PreviewError> {
+    decode::decode(bytes).map(|pixels| (pixels.width, pixels.height, pixels.rgba))
 }
 
 #[derive(Default)]

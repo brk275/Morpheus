@@ -20,8 +20,9 @@ use std::time::{Duration, Instant};
 use morpheus_matrix::{
     AccountInfo, AccountManager, AccountSelection, ComposeSendTarget, ComposeText,
     DownloadedAttachment, EditBaseline, Generation, MatrixCoreError, MatrixLinkTarget, MessageInfo,
-    MessageSendState, QueuedAttachment, QueuedMessage, QueuedSendUpdate, RecoveredDraft, RoomInfo,
-    RoomMemberInfo, RoomMembership, SyncBackend, SyncStatus, TextFormat,
+    MessageSendState, PublicMediaConsent, QueuedAttachment, QueuedMessage, QueuedSendUpdate,
+    RecoveredDraft, RoomInfo, RoomMemberInfo, RoomMembership, StickerCatalog, SyncBackend,
+    SyncStatus, TextFormat,
 };
 use slint::{Color, Model, ModelRc, StyledText, VecModel, Weak};
 use tokio::{
@@ -2489,6 +2490,20 @@ impl LiveUi {
             return Err(error);
         }
         Ok(queued)
+    }
+
+    /// Queue one sticker while its account and room are still the visible
+    /// ones. The core re-validates the catalog's selection, destination,
+    /// consent and pack source and applies the room's send gate; like a text
+    /// send, a queued sticker is never aborted merely because the view moved.
+    pub async fn send_sticker(
+        &self,
+        catalog: &StickerCatalog,
+        index: usize,
+        consent: Option<&PublicMediaConsent>,
+    ) -> Result<QueuedMessage, MatrixCoreError> {
+        self.require_media_context(catalog.account_id(), catalog.room_id()).await?;
+        self.manager.send_sticker_for(catalog, index, consent).await
     }
 
     pub async fn download_attachment(

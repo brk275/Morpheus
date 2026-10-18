@@ -58,6 +58,14 @@ export struct MentionItem {
     name: string,
 }
 
+// One sticker row. `key` is an opaque routing value the controller checks
+// against its open picker; it is never a media address and never displayed.
+export struct StickerItem {
+    key: string,
+    label: string,
+    pack: string,
+}
+
 // One saved send record of the visible composer scope. `key` is an opaque
 // routing value for the exact record and is never displayed.
 export struct PendingSendItem {
@@ -851,6 +859,219 @@ component EmojiPopup inherits Rectangle {
     }
 }
 
+// Labels stay usable before any image loads. Images of an encrypted
+// conversation appear only after the explicit consent in this popup.
+component StickerPopup inherits Rectangle {
+    in property <[StickerItem]> items;
+    in property <[string]> packs;
+    in-out property <int> pack-index;
+    in property <int> current;
+    in-out property <string> query;
+    // 0 loading, 1 ready, 2 failed.
+    in property <int> phase;
+    in property <string> status;
+    in property <string> notice;
+    in property <bool> needs-consent;
+    in property <image> preview;
+    in property <bool> preview-loaded;
+    in property <string> preview-status;
+    in property <bool> can-send;
+    in property <color> surface;
+    in property <color> elevated;
+    in property <color> hover;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> accent;
+    in property <color> outline;
+    in property <float> text-scale: 1;
+    callback searched(string);
+    callback navigate(int);
+    callback choose-pack(int);
+    callback highlight(string);
+    callback send(string);
+    callback consent(bool);
+    callback dismiss();
+    property <bool> has-current: root.current >= 0 && root.current < root.items.length;
+    property <length> row-height: 34px * root.text-scale + 6px;
+    height: min(470px, 330px * root.text-scale + 130px);
+    background: surface; border-radius: StyleTokens.radius * 0.9; border-width: 1px; border-color: accent;
+    accessible-role: region; accessible-label: "Sticker picker";
+    FocusScope {
+        width: parent.width; height: parent.height;
+        key-pressed(event) => {
+            if event.text == Key.Escape { root.dismiss(); accept } else { reject }
+        }
+        VerticalLayout {
+            padding: 8px; spacing: 6px;
+            HorizontalLayout {
+                height: 34px * root.text-scale; spacing: 6px;
+                Rectangle {
+                    horizontal-stretch: 1; background: root.elevated; border-radius: StyleTokens.radius * 0.6;
+                    if root.query == "" : Text {
+                        x: 8px; width: parent.width - 16px; height: parent.height;
+                        text: "Search stickers"; color: root.muted; font-size: 12px * root.text-scale;
+                        vertical-alignment: center;
+                    }
+                    sticker-search := ThemedTextInput {
+                        x: 8px; width: parent.width - 16px; height: parent.height;
+                        text <=> root.query; color: root.ink; font-size: 12px * root.text-scale;
+                        single-line: true; vertical-alignment: center;
+                        accessible-label: "Search stickers by description, shortcode or pack";
+                        init => { self.focus(); }
+                        edited => { root.searched(self.text); }
+                        key-pressed(event) => {
+                            if !event.modifiers.control && !event.modifiers.meta && !event.modifiers.alt {
+                                if event.text == Key.Escape { root.dismiss(); accept }
+                                else if event.text == Key.UpArrow { root.navigate(-1); accept }
+                                else if event.text == Key.DownArrow { root.navigate(1); accept }
+                                else if event.text == Key.Return {
+                                    if root.has-current && root.can-send { root.send(root.items[root.current].key); }
+                                    accept
+                                } else { reject }
+                            } else { reject }
+                        }
+                    }
+                }
+                if root.packs.length > 1 : ComboBox {
+                    width: 160px * root.text-scale;
+                    model: root.packs;
+                    current-index <=> root.pack-index;
+                    accessible-label: "Sticker pack";
+                    selected(value) => { root.choose-pack(self.current-index); }
+                }
+                IconAction {
+                    width: 30px * root.text-scale; icon: "×"; label: "Close sticker picker";
+                    ink: root.muted; surface: root.surface; hover-surface: root.hover;
+                    activated => { root.dismiss(); }
+                }
+            }
+            if root.needs-consent : Rectangle {
+                background: root.elevated; border-radius: StyleTokens.radius * 0.6;
+                border-width: 1px; border-color: root.outline;
+                VerticalLayout {
+                    padding: 8px; spacing: 6px;
+                    Text {
+                        text: "This conversation is encrypted, but sticker images are not. Your homeserver can see which sticker images you load and send here. Labels stay available without images.";
+                        color: root.ink; font-size: 11px * root.text-scale; wrap: word-wrap;
+                        accessible-live-region: polite;
+                    }
+                    HorizontalLayout {
+                        spacing: 8px; alignment: start;
+                        TextAction {
+                            text: "Allow sticker images here"; ink: root.ink; muted: root.muted;
+                            surface: root.surface; hover-surface: root.hover; outline: root.outline; text-scale: root.text-scale;
+                            enabled: root.phase == 1;
+                            activated => { root.consent(true); }
+                        }
+                        TextAction {
+                            text: "Cancel"; ink: root.ink; muted: root.muted;
+                            surface: root.surface; hover-surface: root.hover; outline: root.outline; text-scale: root.text-scale;
+                            activated => { root.consent(false); }
+                        }
+                    }
+                }
+            }
+            Text {
+                text: root.notice != "" ? root.notice
+                    : root.phase != 1 ? root.status
+                    : root.has-current ? "Selected sticker: " + root.items[root.current].label + ", from " + root.items[root.current].pack
+                    : root.status;
+                color: root.ink; font-size: 11px * root.text-scale; wrap: word-wrap;
+                accessible-live-region: polite;
+            }
+            HorizontalLayout {
+                vertical-stretch: 1; spacing: 8px;
+                sticker-list := ListView {
+                    horizontal-stretch: 1; horizontal-scrollbar-policy: always-off;
+                    viewport-y: -max(0px, (root.current + 1) * root.row-height - self.height);
+                    for item[index] in root.items : ActionRect {
+                        width: sticker-list.visible-width; height: root.row-height;
+                        label: "Sticker " + item.label + " from " + item.pack + (index == root.current ? ", selected" : "");
+                        background: index == root.current || self.has-hover ? root.hover : root.surface;
+                        border-radius: StyleTokens.radius * 0.5; focus-color: root.accent; cancel-on-escape: true;
+                        cancelled => { root.dismiss(); }
+                        activated => { root.highlight(item.key); }
+                        VerticalLayout {
+                            padding-left: 7px; padding-right: 7px; padding-top: 2px; padding-bottom: 2px; spacing: 1px;
+                            Text { text: item.label; color: root.ink; font-size: 12px * root.text-scale; overflow: elide; vertical-alignment: center; }
+                            Text { text: item.pack; color: root.muted; font-size: 10px * root.text-scale; overflow: elide; }
+                        }
+                    }
+                }
+                Rectangle {
+                    width: 132px * root.text-scale; background: root.elevated; border-radius: StyleTokens.radius * 0.6;
+                    if root.preview-loaded : Image {
+                        x: 6px; y: 6px; width: parent.width - 12px; height: parent.height - 12px;
+                        source: root.preview; image-fit: contain;
+                        accessible-role: image;
+                        accessible-label: root.has-current ? "Sticker preview: " + root.items[root.current].label : "Sticker preview";
+                    }
+                    if !root.preview-loaded : Text {
+                        x: 8px; width: parent.width - 16px; height: parent.height;
+                        text: root.preview-status; color: root.muted; font-size: 11px * root.text-scale;
+                        wrap: word-wrap; horizontal-alignment: center; vertical-alignment: center;
+                    }
+                }
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    text: "Arrows choose · Enter sends · Escape closes"; color: root.muted;
+                    font-size: 10px * root.text-scale; wrap: word-wrap; vertical-alignment: center; horizontal-stretch: 1;
+                }
+                TextAction {
+                    text: "Send sticker"; ink: root.ink; muted: root.muted;
+                    surface: root.surface; hover-surface: root.hover; outline: root.outline; text-scale: root.text-scale;
+                    enabled: root.has-current && root.can-send;
+                    activated => { root.send(root.items[root.current].key); }
+                }
+            }
+        }
+    }
+}
+
+// The one tracked sticker send for the visible composer. Cancel and Retry act
+// on the exact queued request; nothing here enqueues a second sticker.
+component StickerSendStatus inherits Rectangle {
+    in property <string> status;
+    in property <bool> can-cancel;
+    in property <bool> can-retry;
+    in property <color> surface;
+    in property <color> hover;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> accent;
+    in property <float> text-scale: 1;
+    callback cancel();
+    callback retry();
+    callback dismiss();
+    height: max(30px, 22px * root.text-scale + 8px);
+    background: surface; border-radius: StyleTokens.radius * 0.6;
+    HorizontalLayout {
+        padding-left: 8px; padding-right: 4px; spacing: 6px;
+        Text {
+            text: root.status; color: root.muted; font-size: 11px * root.text-scale;
+            vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
+            accessible-label: "Sticker send status: " + root.status; accessible-live-region: polite;
+        }
+        if root.can-retry : IconAction {
+            width: 27px; height: 26px; icon: "↻"; label: "Retry this sticker";
+            ink: root.accent; surface: transparent; hover-surface: root.hover;
+            activated => { root.retry(); }
+        }
+        if root.can-cancel : IconAction {
+            width: 27px; height: 26px; icon: "×"; label: "Cancel this sticker";
+            ink: root.muted; surface: transparent; hover-surface: root.hover;
+            activated => { root.cancel(); }
+        }
+        if !root.can-cancel : IconAction {
+            width: 27px; height: 26px; icon: "✓"; label: "Dismiss sticker status";
+            ink: root.muted; surface: transparent; hover-surface: root.hover;
+            activated => { root.dismiss(); }
+        }
+    }
+}
+
 component ShortcutSetting inherits Rectangle {
     in property <string> label;
     in-out property <string> binding;
@@ -1468,6 +1689,20 @@ export component AppWindow inherits Window {
     callback emoji-navigate(int);
     callback emoji-choose(string);
     callback emoji-dismiss();
+    // Sticker picker. Keys are opaque; the controller re-binds every action to
+    // its picker, account selection, room, thread and pack snapshot.
+    callback open-stickers(bool);
+    callback sticker-query(string);
+    callback sticker-navigate(int);
+    callback sticker-choose-pack(int);
+    callback sticker-highlight(string);
+    callback sticker-send(string);
+    callback sticker-consent(bool);
+    callback sticker-dismiss();
+    callback sticker-context-changed();
+    callback sticker-send-cancel();
+    callback sticker-send-retry();
+    callback sticker-send-dismiss();
     callback focus-composer(bool);
     focus-composer(threaded) => {
         root.composer-focus-thread = threaded;
@@ -1579,12 +1814,36 @@ export component AppWindow inherits Window {
     in-out property <bool> emoji-open: false;
     in-out property <bool> emoji-threaded: false;
     in-out property <string> emoji-query-text;
+    in-out property <bool> sticker-open: false;
+    in-out property <bool> sticker-threaded: false;
+    in-out property <[StickerItem]> sticker-items;
+    in-out property <[string]> sticker-packs;
+    in-out property <int> sticker-pack-index: 0;
+    in-out property <int> sticker-index: -1;
+    in-out property <string> sticker-query-text;
+    in-out property <int> sticker-phase: 0;
+    in-out property <string> sticker-status;
+    in-out property <string> sticker-notice;
+    in-out property <bool> sticker-needs-consent: false;
+    in-out property <image> sticker-preview-image;
+    in-out property <bool> sticker-preview-loaded: false;
+    in-out property <string> sticker-preview-status;
+    in-out property <bool> sticker-can-send: false;
+    in-out property <bool> sticker-send-visible: false;
+    in-out property <bool> sticker-send-threaded: false;
+    in-out property <string> sticker-send-status;
+    in-out property <bool> sticker-send-can-cancel: false;
+    in-out property <bool> sticker-send-can-retry: false;
+    // The destination the picker and send status belong to; any change closes
+    // or hides them before a stale choice can act.
+    property <string> sticker-scope: root.active-account-local-id + "\n" + root.active-room-id + "\n" + root.thread-root-id + "\n" + root.composer-mode + "\n" + root.side-panel-tab;
+    changed sticker-scope => { root.sticker-context-changed(); }
     property <bool> composer-focus-thread: false;
     property <int> composer-focus-request: 0;
 
     in-out property <int> thread-mention-index: 0;
     out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.access-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open && !root.image-preview-open;
-    changed mention-ui-allowed => { if !root.mention-ui-allowed { root.mention-context-changed(); } }
+    changed mention-ui-allowed => { if !root.mention-ui-allowed { root.mention-context-changed(); root.sticker-context-changed(); } }
     // Input IDs live inside conditional subtrees; callbacks cross that boundary.
     in-out property <int> composer-caret: -1;
     in-out property <int> composer-anchor: -1;
@@ -2816,8 +3075,20 @@ export component AppWindow inherits Window {
                                     ink: root.muted; surface: transparent; hover-surface: root.hover;
                                     enabled: root.mention-ui-allowed && !root.composer-busy;
                                     activated => {
+                                        if root.sticker-open { root.sticker-dismiss(); }
                                         root.composer-caret = message-input.caret-bytes; root.composer-anchor = message-input.anchor-bytes; root.composer-preedit = message-input.composing;
                                         root.open-emoji(false);
+                                    }
+                                }
+                                IconAction {
+                                    width: 32px; icon: "✿"; label: "Open sticker picker for this room";
+                                    ink: root.sticker-open && !root.sticker-threaded ? root.accent : root.muted;
+                                    selected: root.sticker-open && !root.sticker-threaded;
+                                    surface: transparent; hover-surface: root.hover;
+                                    enabled: root.mention-ui-allowed && !root.composer-busy && root.composer-mode == 0 && root.active-room-id != "";
+                                    activated => {
+                                        if root.emoji-open { root.emoji-dismiss(); }
+                                        root.open-stickers(false);
                                     }
                                 }
                                 IconAction {
@@ -2902,7 +3173,32 @@ export component AppWindow inherits Window {
                                 root.emoji-choose(key);
                             }
                         }
-                        if root.composer-mentions.length > 0 && root.mention-ui-allowed && !root.emoji-open : MentionPopup {
+                        if root.sticker-open && !root.sticker-threaded && root.mention-ui-allowed : StickerPopup {
+                            x: root.content-inset; y: -self.height; width: max(0px, parent.width - 2 * root.content-inset);
+                            items: root.sticker-items; packs: root.sticker-packs; pack-index <=> root.sticker-pack-index;
+                            current: root.sticker-index; query <=> root.sticker-query-text;
+                            phase: root.sticker-phase; status: root.sticker-status; notice: root.sticker-notice;
+                            needs-consent: root.sticker-needs-consent; can-send: root.sticker-can-send;
+                            preview: root.sticker-preview-image; preview-loaded: root.sticker-preview-loaded; preview-status: root.sticker-preview-status;
+                            surface: root.panel; elevated: root.elevated; hover: root.hover; ink: root.ink; muted: root.muted; accent: root.accent;
+                            outline: root.divider; text-scale: root.text-scale;
+                            searched(query) => { root.sticker-query(query); }
+                            navigate(offset) => { root.sticker-navigate(offset); }
+                            choose-pack(index) => { root.sticker-choose-pack(index); }
+                            highlight(key) => { root.sticker-highlight(key); }
+                            send(key) => { root.sticker-send(key); }
+                            consent(allowed) => { root.sticker-consent(allowed); }
+                            dismiss => { root.sticker-dismiss(); }
+                        }
+                        if root.sticker-send-visible && !root.sticker-send-threaded && !root.sticker-open && !root.emoji-open && root.composer-mentions.length == 0 : StickerSendStatus {
+                            x: root.content-inset; y: -self.height; width: max(0px, parent.width - 2 * root.content-inset);
+                            status: root.sticker-send-status; can-cancel: root.sticker-send-can-cancel; can-retry: root.sticker-send-can-retry;
+                            surface: root.panel; hover: root.hover; ink: root.ink; muted: root.muted; accent: root.accent; text-scale: root.text-scale;
+                            cancel => { root.sticker-send-cancel(); }
+                            retry => { root.sticker-send-retry(); }
+                            dismiss => { root.sticker-send-dismiss(); }
+                        }
+                        if root.composer-mentions.length > 0 && root.mention-ui-allowed && !root.emoji-open && !root.sticker-open : MentionPopup {
                             x: root.content-inset; y: -self.height; width: max(0px, parent.width - 2 * root.content-inset);
                             items: root.composer-mentions; current: root.composer-mention-index;
                             surface: root.panel; hover: root.hover; ink: root.ink; muted: root.muted; accent: root.accent; text-scale: root.text-scale;
@@ -4541,8 +4837,20 @@ export component AppWindow inherits Window {
                                 ink: root.muted; surface: root.panel; hover-surface: root.hover;
                                 enabled: root.mention-ui-allowed && !root.thread-send-pending;
                                 activated => {
+                                    if root.sticker-open { root.sticker-dismiss(); }
                                     root.thread-caret = thread-input.caret-bytes; root.thread-anchor = thread-input.anchor-bytes; root.thread-preedit = thread-input.composing;
                                     root.open-emoji(true);
+                                }
+                            }
+                            IconAction {
+                                width: 28px; icon: "✿"; label: "Open sticker picker for this thread";
+                                ink: root.sticker-open && root.sticker-threaded ? root.accent : root.muted;
+                                selected: root.sticker-open && root.sticker-threaded;
+                                surface: root.panel; hover-surface: root.hover;
+                                enabled: root.mention-ui-allowed && !root.thread-send-pending;
+                                activated => {
+                                    if root.emoji-open { root.emoji-dismiss(); }
+                                    root.open-stickers(true);
                                 }
                             }
                             IconAction {
@@ -4573,7 +4881,32 @@ export component AppWindow inherits Window {
                                 root.emoji-choose(key);
                             }
                         }
-                        if root.thread-mentions.length > 0 && root.mention-ui-allowed && !root.emoji-open : MentionPopup {
+                        if root.sticker-open && root.sticker-threaded && root.mention-ui-allowed : StickerPopup {
+                            x: 4px; y: -self.height; width: parent.width - 8px;
+                            items: root.sticker-items; packs: root.sticker-packs; pack-index <=> root.sticker-pack-index;
+                            current: root.sticker-index; query <=> root.sticker-query-text;
+                            phase: root.sticker-phase; status: root.sticker-status; notice: root.sticker-notice;
+                            needs-consent: root.sticker-needs-consent; can-send: root.sticker-can-send;
+                            preview: root.sticker-preview-image; preview-loaded: root.sticker-preview-loaded; preview-status: root.sticker-preview-status;
+                            surface: root.panel; elevated: root.elevated; hover: root.hover; ink: root.ink; muted: root.muted; accent: root.accent;
+                            outline: root.divider; text-scale: root.text-scale;
+                            searched(query) => { root.sticker-query(query); }
+                            navigate(offset) => { root.sticker-navigate(offset); }
+                            choose-pack(index) => { root.sticker-choose-pack(index); }
+                            highlight(key) => { root.sticker-highlight(key); }
+                            send(key) => { root.sticker-send(key); }
+                            consent(allowed) => { root.sticker-consent(allowed); }
+                            dismiss => { root.sticker-dismiss(); }
+                        }
+                        if root.sticker-send-visible && root.sticker-send-threaded && !root.sticker-open && !root.emoji-open && root.thread-mentions.length == 0 : StickerSendStatus {
+                            x: 4px; y: -self.height; width: parent.width - 8px;
+                            status: root.sticker-send-status; can-cancel: root.sticker-send-can-cancel; can-retry: root.sticker-send-can-retry;
+                            surface: root.panel; hover: root.hover; ink: root.ink; muted: root.muted; accent: root.accent; text-scale: root.text-scale;
+                            cancel => { root.sticker-send-cancel(); }
+                            retry => { root.sticker-send-retry(); }
+                            dismiss => { root.sticker-send-dismiss(); }
+                        }
+                        if root.thread-mentions.length > 0 && root.mention-ui-allowed && !root.emoji-open && !root.sticker-open : MentionPopup {
                             x: 4px; y: -self.height; width: parent.width - 8px;
                             items: root.thread-mentions; current: root.thread-mention-index;
                             surface: root.panel; hover: root.hover; ink: root.ink; muted: root.muted; accent: root.accent; text-scale: root.text-scale;
