@@ -1785,6 +1785,8 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
+            // This manual LoadedAccount fixture must match build_client.
+            client.send_queue().set_enabled(false).await;
             let (incoming_verification_tx, _) = watch::channel(Vec::new());
             let loaded = Arc::new(LoadedAccount {
                 client: client.clone(),

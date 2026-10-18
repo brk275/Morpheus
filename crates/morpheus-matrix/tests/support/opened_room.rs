@@ -1,5 +1,6 @@
 //! Positive fixture setup corresponding to opening a joined room in the app.
 //! Merely receiving a room in sync does not authorize its paused send queue.
+//! Only use this for fresh fixture rooms with no saved drafts to adopt.
 
 use morpheus_matrix::AccountManager;
 use std::time::Duration;
@@ -12,12 +13,15 @@ pub async fn scan(manager: &AccountManager, room_id: &str) -> Result<(), &'stati
     let selection = manager
         .account_selection(&account.id)
         .ok_or("Fixture account changed")?;
-    tokio::time::timeout(
+    let recovered = tokio::time::timeout(
         Duration::from_secs(30),
         manager.recover_room_for(&selection, room_id),
     )
     .await
     .map_err(|_| "Fixture room recovery timed out")?
     .map_err(|_| "Fixture room recovery failed")?;
+    if !recovered.is_empty() {
+        return Err("Fresh fixture room unexpectedly contains recovered drafts");
+    }
     Ok(())
 }

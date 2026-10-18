@@ -845,16 +845,36 @@ mod tests {
         let restored = ComposeText::restore_draft(value.body.clone(), Some(&html));
         assert_eq!(restored.text, value);
         assert!(!restored.discarded_rich_intent);
-        for bad in [
-            html.replace("data-morpheus-compose=\"1\"", "data-morpheus-compose=\"2\""),
-            format!("{html}<!-- x -->"),
-            html.replace("@casey", "@riley"),
+        for (bad, reason) in [
+            (
+                html.replace("data-morpheus-compose=\"2\"", "data-morpheus-compose=\"3\""),
+                QuarantineReason::UnsupportedVersion,
+            ),
+            (format!("{html}<!-- x -->"), QuarantineReason::Malformed),
+            (
+                html.replace("@casey", "@riley"),
+                QuarantineReason::Malformed,
+            ),
         ] {
+            assert_ne!(bad, html, "each rejection case must change the saved row");
             let restored = ComposeText::restore_draft(value.body.clone(), Some(&bad));
             assert_eq!(restored.text.body, value.body);
             assert!(restored.text.mentions.is_empty());
-            assert!(restored.discarded_rich_intent);
+            assert_eq!(restored.blocked(), Some(reason));
+            assert!(!restored.discarded_rich_intent);
+            assert!(restored.blocked_revision().is_some());
+            let original = restored.envelope.quarantine().unwrap();
+            assert_eq!(
+                original.original_plain().as_deref(),
+                Some(value.body.as_str())
+            );
+            assert_eq!(original.original_html().as_deref(), Some(bad.as_str()));
         }
+        let foreign = ComposeText::restore_draft(value.body.clone(), Some("<b>untrusted</b>"));
+        assert_eq!(foreign.text.body, value.body);
+        assert!(foreign.text.mentions.is_empty());
+        assert!(foreign.discarded_rich_intent);
+        assert!(foreign.blocked().is_none());
         assert!(
             ComposeText::restore_draft(value.body.clone(), None)
                 .text

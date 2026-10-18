@@ -4923,6 +4923,8 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
+            // Match build_client: SDK defaults must not resume persisted sends.
+            client_a.send_queue().set_enabled(false).await;
             client_b.send_queue().set_enabled(false).await;
             {
                 let mut state = manager.state.lock().await;
