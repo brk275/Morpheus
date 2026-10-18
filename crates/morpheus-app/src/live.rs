@@ -5,6 +5,10 @@
 #[path = "../../morpheus-matrix/tests/support/opened_room.rs"]
 mod opened_room;
 
+#[cfg(test)]
+#[path = "live_timeline_controller_tests.rs"]
+pub(crate) mod timeline_controller_tests;
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{
