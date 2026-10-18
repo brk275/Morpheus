@@ -46,6 +46,17 @@ class RevisionIdentityTests(unittest.TestCase):
         self.assertTrue(all(call.kwargs["timeout"] == 20 and not call.kwargs.get("shell", False)
                             for call in run.call_args_list))
 
+    def test_windows_line_ending_is_canonicalized_without_accepting_extra_lines(self):
+        with patch.object(revision.subprocess, "run", side_effect=[
+                subprocess.CompletedProcess([], 0, b"b" * 40 + b"\r\n", b""),
+                subprocess.CompletedProcess([], 0, b"", b"")]):
+            self.assertEqual(revision.verify_checkout(Path("source"), "b" * 40), "b" * 40)
+        for ending in (b"\r", b"\r\n\r\n", b" \n"):
+            with self.subTest(ending=ending), patch.object(revision.subprocess, "run", return_value=
+                    subprocess.CompletedProcess([], 0, b"b" * 40 + ending, b"")):
+                with self.assertRaises(revision.SourceRevisionError):
+                    revision.verify_checkout(Path("source"), "b" * 40)
+
     def test_head_failure_cannot_reach_dirty_check_or_reflect_git_output(self):
         failures = [subprocess.CompletedProcess([], 0, b"a" * 40 + b"\n", b""),
                     subprocess.CompletedProcess([], 1, b"private-output", b"private-error"),

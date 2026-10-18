@@ -42,7 +42,9 @@ def verify_checkout(root, expected):
     try:
         result = subprocess.run(["git", "rev-parse", "--verify", "HEAD^{commit}"], cwd=Path(root),
                                 capture_output=True, timeout=20, check=False)
-        if result.returncode or result.stdout != (expected + "\n").encode("ascii") or result.stderr:
+        # Git's single result line may use either platform line ending.
+        lines = {(expected + "\n").encode("ascii"), (expected + "\r\n").encode("ascii")}
+        if result.returncode or result.stdout not in lines or result.stderr:
             raise SourceRevisionError("checkout")
         clean = subprocess.run(["git", "diff", "--no-ext-diff", "--no-textconv", "--quiet", "HEAD", "--"],
                                cwd=Path(root), capture_output=True, timeout=20, check=False)
