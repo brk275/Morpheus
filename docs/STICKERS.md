@@ -28,7 +28,9 @@ Morpheus has a native sticker catalog, picker and gated send path for the room a
 | Sent sticker content | 16 KiB |
 | Preview media | 2 MiB; PNG and baseline JPEG only, at most 4,096 pixels per side and 4 megapixels |
 | Search query | 100 characters |
-| Queue lookup | 256 local echoes |
+| Queue lookup, newest sticker | Newest first; at most 256 queued sticker events read in full, and a larger queue is reported as "at least" |
+| Queue lookup, exact transaction | Every queued request compared by transaction; only the match is read in full |
+| Unresolved sends held at once | 16; while 16 are held no new sticker is sent anywhere, and none is dropped |
 | Time limits | catalog 15 s in the core and 20 s in the picker; send preparation 20 s; preview fetch 45 s; decode-slot wait 5 s |
 
 Malformed or oversized entries are left out and counted, and the picker reports that some were left out. Packs in rooms this device has not joined are shown only as a count.
@@ -45,17 +47,20 @@ Malformed or oversized entries are left out and counted, and the picker reports 
 - **Revocation.** The existing account-selection revocation (account switch, protected switch, removal, detach or stop) and any change of the visible destination close the picker. Switching away and back never revives a choice, preview or consent.
 - **Previews.** Each picker has one latest-only preview lane. A newer request replaces a waiting one and cancels a running fetch, so there is at most one fetch and one codec run at a time. A superseded job, or one whose picker or selection closed, is never decoded, even when the decode slot is free. The codec runs on a dedicated thread and keeps its slot until it returns.
 - **Sending.** A sticker goes into the room's persistent SDK send queue, behind the existing per-room recovery and discovery gate and the pending-owner check. A blocked scope refuses it, and a thread that is waiting on a text reply refuses it. Nothing uses a direct room send or enables the account-wide queue. The text composer and its saved drafts are never touched.
-- **One send at a time.** One sticker is tracked at a time. Cancel and retry are single-flight: the controls are disabled while a command runs, and the command channel holds at most one command. Retry only unwedges the same request in place.
+- **One send at a time.** One sticker is tracked at a time. Cancel and retry are single-flight: the controls are disabled while a command runs, and the command channel holds at most one command. Retry only unwedges the same request in place. Cancel, retry and the **I checked** confirmation act only on what the status strip last showed, and only while it is still shown there.
 
-## Uncertain sends and restarts
+## Unresolved sends and restarts
 
-A send is uncertain when the SDK enqueue began but did not return within its time limit, so the request may or may not have been stored.
+A send is held when its outcome is not known. A held send blocks new stickers to its exact room or thread; nothing is retried, replayed or sent again, and the status strip explains it with fixed text.
 
-- **Quarantine.** The picker closes, so the choice is spent. No other sticker is sent and nothing is retried. The controller looks in the room's queue, through a read-only lookup that keeps the request's original transaction, 10 times, 3 seconds apart, for a sticker request for exactly that room or thread.
-- **Found.** The request is then observed in place, with cancel and retry.
-- **Not found.** The status says the sticker was either sent or never queued. Only an explicit **I checked** action lifts the quarantine; a plain dismissal does not.
-- **Restart, or switching back.** The SDK store persists queued requests. After discovery covers the room, the existing gate resumes the request as its original transaction, as for attachments, and the timeline shows it as pending. Opening the picker in that room or thread finds the newest queued sticker and observes it, and counts any others. This code never sends such a request again.
-- **No persistence or schema change.** The quarantine itself is in memory, and after a restart or a switch the SDK queue is the record. A request that was never stored is simply gone; a stored one is found in the queue or sent once. If the app restarts while a send is uncertain and that request was stored and then sent before the picker opens, the quarantine message is lost; the sent sticker remains visible in the conversation.
+- **SDK limit.** The SDK creates a request's transaction inside its queue's store write and reports it only when that write returns. There is no transaction before the enqueue, and a caller cannot supply one.
+- **Enqueue that did not return.** If the enqueue does not return within its time limit, the request may or may not have been stored, and there is no transaction to look for. The picker closes, so the choice is spent. No queued sticker can be shown to be that request, so none lifts the hold: only an explicit **I checked** confirmation does, and a plain dismissal does not. The SDK's timeline shows a stored request as pending, which is what the user checks.
+- **Lost outcome.** An observed request whose outcome is lost is held with its known transaction, never reported as sent or cancelled. An outcome is lost when the update stream ends, when it lags (it may have skipped the outcome; the SDK's per-room channel holds 32 updates), when the account selection ends while the request is observed, or when its observer stops for any other reason.
+- **Exact reconciliation.** Under a current selection a lost request is looked up by its exact transaction at once and then up to 10 times, 3 seconds apart. Opening the picker in that room or thread looks it up again. Found still queued, it is observed again in place under its original transaction, with cancel and retry, and only then is its hold lifted. Gone from the queue, it was sent or cancelled, and nothing here can tell which: the status says so, and only **I checked** lifts the hold. A request known to be gone is not looked up again.
+- **Other queued stickers.** Opening the picker observes the newest sticker the queue holds for that room or thread when nothing else is observed, and counts the others. It may be shown beside a hold, and it may be sent or cancelled there, but it lifts a hold only if its transaction is exactly that hold's.
+- **Scope of a hold.** A hold belongs to the account and the exact room or thread, not to one account selection, so switching away and back keeps it. Holds are in memory for this run only.
+- **Restarts.** The SDK store persists queued requests. After discovery covers the room, the existing gate resumes a request as its original transaction, as for attachments, and the timeline shows it as pending. Opening the picker then observes the newest queued sticker as above. This code never sends such a request again.
+- **No persistence or schema change.** Holds are not written anywhere. After a restart the SDK queue is the record: a request that was never stored is gone, and a stored one is found in the queue or sent once. A hold's message does not survive a restart; a sticker sent meanwhile remains visible in the conversation.
 
 ## Known gaps
 
@@ -67,13 +72,15 @@ A send is uncertain when the SDK enqueue began but did not return within its tim
 - There is no sticker in reply or edit mode; the room picker is for new messages only.
 - Pack management is not implemented: creating, editing, enabling and disabling packs happen elsewhere.
 - The picker tracks one sticker at a time, although the SDK queue may hold more.
+- Holds do not survive a restart, and a hold whose room was left can only be cleared by a restart, which counts toward the limit of 16 until then.
+- While another sticker is observed, a lost request found again stays held until its next lookup finds the tracked slot free, or until the user confirms.
 - Reads are not atomic with sync; see the consistency boundary above.
 
 ## Verification status
 
 Nothing below has compiled or executed. Each item exists as source only.
 
-- **Core unit tests:** the Matrix 1.19 example pack, usage rules, malformed and unsafe images, dropped thumbnails, count bounds, deduplication, sanitized labels, enabled-list parsing, consent binding, epoch, room and thread binding, header-only room-pack selection with large raw counts, exact snapshot comparison including the enabling account data, and changes during paused store reads (leaving the pack room, a changed enabling list, the selection ending).
-- **Controller unit tests:** search, opaque keys, destination binding, queue status mapping, fixed failure text, and the latest-only preview lane (rapid replacements, cancelled fetches, closed contexts and a decode slot that is still taken).
-- **Real-window UI scenarios:** keyboard and accessibility projection of the picker and the send status. At 200% text, in both the room composer and the narrow thread pane, every control stays inside the window and is keyboard reachable. The real controller is also driven over a recording fake core: stale commands after room, account, composer, modal, session and thread changes; persistence of an accepted send; single-flight cancel; quarantine and recovery of uncertain sends; and a sticker still queued after a restart.
-- **Opt-in live fixture:** `sticker_packs_send_between_disposable_accounts` in `media_local`, with disposable local accounts and fictional content. It covers encrypted room and thread send and receive, consent, foreign and stale selections, a changed pack, an enabled and then disabled pack, an unjoined enabled room, the recovery gate for a new room, room departure and queue drain.
+- **Core unit tests:** newest-first bounded queue reads with truncation beyond 256 queued stickers, exact transaction lookup over more than 256 requests, a lagged observer reporting a lost outcome, the Matrix 1.19 example pack, usage rules, malformed and unsafe images, dropped thumbnails, count bounds, deduplication, sanitized labels, enabled-list parsing, consent binding, epoch, room and thread binding, header-only room-pack selection with large raw counts, exact snapshot comparison including the enabling account data, and changes during paused store reads (leaving the pack room, a changed enabling list, the selection ending).
+- **Controller unit tests:** search, opaque keys, destination binding, queue status mapping (a lost outcome is held, never finished), holds per destination with the limit and exact-only lifting, fixed failure text, and the latest-only preview lane (rapid replacements, cancelled fetches, closed contexts and a decode slot that is still taken).
+- **Real-window UI scenarios:** keyboard and accessibility projection of the picker and the send status. At 200% text, in both the room composer and the narrow thread pane, every control stays inside the window and is keyboard reachable. The real controller is also driven over a recording fake core: stale commands after room, account, composer, modal, session and thread changes; persistence of an accepted send; single-flight cancel; an enqueue that did not return, held while older unrelated stickers are observed beside it and sent or cancelled, with a truncated lookup and a confirmation bound to the room it was shown in; lost outcomes reconciled by exact transaction, both gone from the queue and found again; and a sticker still queued after a restart that loses its outcome on revocation and is found again after switching back.
+- **Opt-in live fixture:** `sticker_packs_send_between_disposable_accounts` in `media_local`, with disposable local accounts and fictional content. It covers encrypted room and thread send and receive, consent, foreign and stale selections, a changed pack, an enabled and then disabled pack, an unjoined enabled room, the recovery gate for a new room, room departure, queue drain, and the exact transaction lookup before and after a send.

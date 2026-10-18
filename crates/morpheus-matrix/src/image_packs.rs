@@ -56,10 +56,11 @@ use matrix_sdk::{
             sticker::StickerEventContent,
         },
     },
-    send_queue::LocalEchoContent,
+    send_queue::{LocalEcho, LocalEchoContent, RoomSendQueueUpdate},
 };
 use serde::{Deserialize, de::IgnoredAny};
 use serde_json::{Map, Value};
+use tokio::sync::broadcast;
 
 use crate::{
     AccountManager, AccountSelection, MatrixCoreError, QueuedMessage, Result, account_room, media,
@@ -96,8 +97,11 @@ const MAX_ATTRIBUTION_CHARS: usize = 120;
 const MAX_STICKER_EVENT_BYTES: usize = 16 * 1024;
 const BUILD_TIMEOUT: Duration = Duration::from_secs(15);
 const SEND_TIMEOUT: Duration = Duration::from_secs(20);
-/// Local echoes inspected when looking for a queued sticker.
+/// Queued sticker events read in full, newest first, when looking for the
+/// newest sticker of a destination. Exact transaction lookups compare every
+/// queued request instead and deserialize none.
 const MAX_PENDING_ECHOES: usize = 256;
+const STICKER_EVENT: &str = "m.sticker";
 
 const ROOM_PACK: &str = "m.room.image_pack";
 const ENABLED_PACKS: &str = "m.image_pack.rooms";
@@ -164,18 +168,23 @@ impl StickerPreview {
 }
 
 /// The newest sticker request this device's SDK queue still holds for one
-/// destination, for example from before a restart or after an uncertain
-/// enqueue. Observing it never sends anything again: the request keeps its
-/// original transaction and is sent, cancelled or retried in place.
+/// destination, for example from before a restart. Observing it never sends
+/// anything again: the request keeps its original transaction and is sent,
+/// cancelled or retried in place. It is not necessarily any particular earlier
+/// send; nothing here can establish that without the exact transaction.
 pub struct PendingSticker {
     /// Sanitized, bounded text of the queued sticker; never its media address.
     pub label: String,
     /// The SDK recorded an unrecoverable failure; it waits for retry or cancel.
     pub wedged: bool,
-    /// Other sticker requests queued for the same destination.
+    /// Other sticker requests for the same destination among those read.
     pub others: usize,
+    /// More sticker requests were queued than were read; `others` is a floor.
+    pub truncated: bool,
     pub queued: QueuedMessage,
 }
+
+type QueueSnapshot = (Vec<LocalEcho>, broadcast::Receiver<RoomSendQueueUpdate>);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PackOrigin {
@@ -455,7 +464,9 @@ impl AccountManager {
 
     /// Find the newest sticker request still held by the room's persistent
     /// queue for exactly this room or thread. Read-only: nothing is queued,
-    /// resumed or replayed, and the room's recovery gate is not touched. The
+    /// resumed or replayed, and the room's recovery gate is not touched. Queued
+    /// stickers are read newest first and at most `MAX_PENDING_ECHOES` of them
+    /// are deserialized; `truncated` reports that more were left unread. The
     /// returned observer subscribed together with the queue snapshot, so no
     /// later update for it can be missed.
     pub async fn pending_sticker_for(
@@ -464,20 +475,16 @@ impl AccountManager {
         room_id: &str,
         thread_root: Option<&str>,
     ) -> Result<Option<PendingSticker>> {
-        self.require_selection(selection)?;
-        let room = {
-            let state = self.state.lock().await;
-            selected_loaded_for(&state, selection.account_id())?;
-            account_room(&state, selection.account_id(), room_id)?
-        };
-        let (echoes, updates) = room
-            .send_queue()
-            .subscribe()
-            .await
-            .map_err(|_| unavailable())?;
-        current(selection)?;
-        let mut found = Vec::new();
-        for echo in echoes.into_iter().take(MAX_PENDING_ECHOES) {
+        let (echoes, updates) = self.sticker_queue(selection, room_id).await?;
+        let types: Vec<Option<&str>> = echoes.iter().map(echo_event_type).collect();
+        let (order, truncated) = sticker_echo_order(&types);
+        let mut echoes: Vec<Option<LocalEcho>> = echoes.into_iter().map(Some).collect();
+        let mut found = None;
+        let mut others = 0;
+        for index in order {
+            let Some(echo) = echoes[index].take() else {
+                continue;
+            };
             let LocalEchoContent::Event {
                 serialized_event,
                 send_handle,
@@ -490,20 +497,25 @@ impl AccountManager {
             else {
                 continue;
             };
-            if in_scope(&sticker, thread_root) {
-                let label = display_text(&sticker.body, MAX_LABEL_CHARS);
-                let wedged = send_error.is_some();
-                found.push((echo.transaction_id, send_handle, wedged, label));
+            if !in_scope(&sticker, thread_root) {
+                continue;
             }
+            if found.is_some() {
+                others += 1;
+                continue;
+            }
+            let label = display_text(&sticker.body, MAX_LABEL_CHARS);
+            let wedged = send_error.is_some();
+            found = Some((echo.transaction_id, send_handle, wedged, label));
         }
-        let others = found.len().saturating_sub(1);
-        let Some((transaction_id, handle, wedged, label)) = found.pop() else {
+        let Some((transaction_id, handle, wedged, label)) = found else {
             return Ok(None);
         };
         Ok(Some(PendingSticker {
             label,
             wedged,
             others,
+            truncated,
             queued: QueuedMessage {
                 transaction_id: transaction_id.to_string(),
                 handle,
@@ -511,6 +523,81 @@ impl AccountManager {
                 finished: false,
             },
         }))
+    }
+
+    /// Find exactly the request with `transaction_id` in the room's queue, to
+    /// reconcile a send whose outcome was lost. Every queued request is
+    /// compared by transaction alone and only the match is read in full;
+    /// nothing is queued, resumed or replayed. `None` means the request is no
+    /// longer queued: it was sent or cancelled, and nothing here can tell
+    /// which. The returned observer subscribed together with the snapshot.
+    pub async fn queued_sticker_for(
+        &self,
+        selection: &AccountSelection,
+        room_id: &str,
+        transaction_id: &str,
+    ) -> Result<Option<PendingSticker>> {
+        let (echoes, updates) = self.sticker_queue(selection, room_id).await?;
+        let transactions: Vec<&str> = echoes
+            .iter()
+            .map(|echo| echo.transaction_id.as_str())
+            .collect();
+        let Some(index) = exact_echo(&transactions, transaction_id) else {
+            return Ok(None);
+        };
+        let Some(echo) = echoes.into_iter().nth(index) else {
+            return Ok(None);
+        };
+        // A matching request that is not an event cannot be this sticker; it
+        // is reported as unreadable rather than as gone from the queue.
+        let LocalEchoContent::Event {
+            serialized_event,
+            send_handle,
+            send_error,
+        } = echo.content
+        else {
+            return Err(unavailable());
+        };
+        let label = match serialized_event.deserialize() {
+            Ok(AnyMessageLikeEventContent::Sticker(sticker)) => {
+                display_text(&sticker.body, MAX_LABEL_CHARS)
+            }
+            _ => String::new(),
+        };
+        Ok(Some(PendingSticker {
+            label,
+            wedged: send_error.is_some(),
+            others: 0,
+            truncated: false,
+            queued: QueuedMessage {
+                transaction_id: transaction_id.to_owned(),
+                handle: send_handle,
+                updates,
+                finished: false,
+            },
+        }))
+    }
+
+    /// The room queue's requests and an update subscription taken together,
+    /// under this exact selection. Read-only.
+    async fn sticker_queue(
+        &self,
+        selection: &AccountSelection,
+        room_id: &str,
+    ) -> Result<QueueSnapshot> {
+        self.require_selection(selection)?;
+        let room = {
+            let state = self.state.lock().await;
+            selected_loaded_for(&state, selection.account_id())?;
+            account_room(&state, selection.account_id(), room_id)?
+        };
+        let snapshot = room
+            .send_queue()
+            .subscribe()
+            .await
+            .map_err(|_| unavailable())?;
+        current(selection)?;
+        Ok(snapshot)
     }
 
     fn require_selection(&self, selection: &AccountSelection) -> Result<()> {
@@ -673,6 +760,39 @@ impl AccountManager {
             encryption.is_encrypted(),
         ))
     }
+}
+
+fn echo_event_type(echo: &LocalEcho) -> Option<&str> {
+    match &echo.content {
+        LocalEchoContent::Event {
+            serialized_event, ..
+        } => Some(serialized_event.raw().1),
+        _ => None,
+    }
+}
+
+/// Indexes of queued sticker events to read in full, newest first and at most
+/// `MAX_PENDING_ECHOES` of them, and whether more were left unread. Only the
+/// cheap event type is inspected here.
+fn sticker_echo_order(event_types: &[Option<&str>]) -> (Vec<usize>, bool) {
+    let mut order = Vec::new();
+    for (index, event_type) in event_types.iter().enumerate().rev() {
+        if *event_type != Some(STICKER_EVENT) {
+            continue;
+        }
+        if order.len() == MAX_PENDING_ECHOES {
+            return (order, true);
+        }
+        order.push(index);
+    }
+    (order, false)
+}
+
+/// The queued request with exactly this transaction, comparing every one.
+fn exact_echo(transactions: &[&str], wanted: &str) -> Option<usize> {
+    transactions
+        .iter()
+        .position(|transaction| *transaction == wanted)
 }
 
 /// A room destination holds stickers without a thread relation; a thread
@@ -1927,5 +2047,36 @@ mod tests {
                 Err(MatrixCoreError::SelectedAccountChanged)
             ));
         });
+    }
+
+    #[test]
+    fn queued_stickers_are_read_newest_first_within_the_bound() {
+        // More stickers than the bound, the newest last in queue order, then
+        // a text message and a request that is not an event.
+        let mut types = vec![Some(STICKER_EVENT); 300];
+        types.push(Some("m.room.message"));
+        types.push(None);
+        let (order, truncated) = sticker_echo_order(&types);
+        assert!(truncated);
+        assert_eq!(order.len(), MAX_PENDING_ECHOES);
+        assert_eq!(order.first(), Some(&299));
+        assert_eq!(order.last(), Some(&44));
+        // Exactly the bound is read in full and is not reported as truncated.
+        let (order, truncated) = sticker_echo_order(&types[44..]);
+        assert!(!truncated);
+        assert_eq!(order.len(), MAX_PENDING_ECHOES);
+        let none = sticker_echo_order(&[None, Some("m.room.message")]);
+        assert_eq!(none, (Vec::new(), false));
+    }
+
+    #[test]
+    fn an_exact_lookup_compares_every_queued_transaction() {
+        let owned: Vec<String> = (0..300).map(|index| format!("txn-{index}")).collect();
+        let transactions: Vec<&str> = owned.iter().map(String::as_str).collect();
+        assert_eq!(exact_echo(&transactions, "txn-299"), Some(299));
+        assert_eq!(exact_echo(&transactions, "txn-0"), Some(0));
+        assert_eq!(exact_echo(&transactions, "txn-29"), Some(29));
+        assert_eq!(exact_echo(&transactions, "txn-300"), None);
+        assert_eq!(exact_echo(&transactions, "txn-2"), Some(2));
     }
 }

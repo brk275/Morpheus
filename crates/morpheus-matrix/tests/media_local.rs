@@ -868,10 +868,29 @@ async fn sticker_scenario(
         preview(sender, &catalog, owl, Some(&room_consent)).await,
         "Sticker preview bytes differ",
     )?;
-    sent(
-        send(sender, &catalog, owl, Some(&room_consent)).await,
-        "Room sticker was not sent",
-    )?;
+    // The exact lookup that reconciles a lost outcome finds the request by its
+    // transaction while it is queued, never another one, and nothing once the
+    // request is sent.
+    let queued = sender
+        .send_sticker_for(&catalog, owl, Some(&room_consent))
+        .await
+        .map_err(|_| "Room sticker was not queued")?;
+    let transaction = queued.transaction_id().to_owned();
+    let early = sender
+        .queued_sticker_for(selection, room_id, &transaction)
+        .await;
+    let exact = match early {
+        Ok(Some(found)) => found.queued.transaction_id() == transaction,
+        Ok(None) => true,
+        Err(_) => false,
+    };
+    ensure(exact, "The exact lookup found another request")?;
+    sent(Ok(queued.wait_outcome().await), "Room sticker was not sent")?;
+    let late = sender
+        .queued_sticker_for(selection, room_id, &transaction)
+        .await;
+    let gone = matches!(late, Ok(None));
+    ensure(gone, "A sent sticker was still found by its transaction")?;
     let row = feed_row(&receiver_feed, &room_body).await;
     let card = row.attachment_name.as_deref() == Some("Sticker") && row.attachment_is_image;
     ensure(card, "Room sticker was not shown as one")?;

@@ -704,6 +704,22 @@ impl QueuedMessage {
         update
     }
 
+    /// Like `next_update`, but a lagged subscription, which may have skipped
+    /// this request's outcome, reports `Unknown` instead of waiting on. The
+    /// caller then treats the outcome as lost and reconciles it by its
+    /// transaction; nothing is enqueued again.
+    pub async fn next_update_or_loss(&mut self) -> QueuedSendUpdate {
+        if self.finished {
+            return QueuedSendUpdate::Unknown;
+        }
+        let update = matching_send_update(&mut self.updates, &self.transaction_id, true).await;
+        self.finished = matches!(
+            update,
+            QueuedSendUpdate::Sent | QueuedSendUpdate::Cancelled | QueuedSendUpdate::Unknown
+        );
+        update
+    }
+
     pub async fn wait_outcome(mut self) -> QueuedSendOutcome {
         loop {
             match self.next_update().await {
@@ -719,6 +735,16 @@ impl QueuedMessage {
 async fn next_queued_send_update(
     updates: &mut broadcast::Receiver<RoomSendQueueUpdate>,
     transaction_id: &str,
+) -> QueuedSendUpdate {
+    matching_send_update(updates, transaction_id, false).await
+}
+
+/// The next update for `transaction_id`. A lagged receiver may have missed
+/// it: with `lag_is_loss` that reports `Unknown`, otherwise reading goes on.
+async fn matching_send_update(
+    updates: &mut broadcast::Receiver<RoomSendQueueUpdate>,
+    transaction_id: &str,
+    lag_is_loss: bool,
 ) -> QueuedSendUpdate {
     loop {
         match updates.recv().await {
@@ -743,6 +769,9 @@ async fn next_queued_send_update(
                 return QueuedSendUpdate::Cancelled;
             }
             Ok(_) => {}
+            Err(broadcast::error::RecvError::Lagged(_)) if lag_is_loss => {
+                return QueuedSendUpdate::Unknown;
+            }
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => return QueuedSendUpdate::Unknown,
         }
@@ -5170,6 +5199,42 @@ mod tests {
             assert_eq!(
                 next_queued_send_update(&mut updates, TransactionId::new().as_str()).await,
                 QueuedSendUpdate::Unknown
+            );
+        });
+    }
+
+    #[test]
+    fn a_lagged_observer_reports_a_lost_outcome_only_when_asked() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let wanted = TransactionId::new();
+            let wanted_id = wanted.to_string();
+            let (sender, mut lenient) = broadcast::channel(1);
+            let mut strict = sender.subscribe();
+            for _ in 0..2 {
+                let other = TransactionId::new();
+                let update = RoomSendQueueUpdate::CancelledLocalEvent {
+                    transaction_id: other,
+                };
+                sender.send(update).unwrap();
+            }
+            let sent = RoomSendQueueUpdate::SentEvent {
+                transaction_id: wanted,
+                event_id: EventId::parse("$lagged:example.org").unwrap(),
+            };
+            sender.send(sent).unwrap();
+            // Both receivers lagged. The strict observer cannot know whether
+            // the skipped updates held its outcome, so it reports the loss.
+            assert_eq!(
+                matching_send_update(&mut strict, &wanted_id, true).await,
+                QueuedSendUpdate::Unknown
+            );
+            assert_eq!(
+                matching_send_update(&mut lenient, &wanted_id, false).await,
+                QueuedSendUpdate::Sent
             );
         });
     }

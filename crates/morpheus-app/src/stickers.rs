@@ -20,12 +20,17 @@
 //! and one codec run exist at a time, and nothing superseded is decoded.
 //!
 //! Sends go through the account's persistent SDK queue, one tracked sticker at
-//! a time. When the core cannot tell whether an enqueue completed, the send is
-//! quarantined: nothing new is sent and nothing is retried until the queued
-//! request is found in the SDK queue and observed in place, or the user
-//! confirms they checked the conversation. After a restart or a switch back,
-//! a sticker still in the queue is found the same way when the picker opens
-//! there. It keeps its original transaction and is never sent again here.
+//! a time. A send whose outcome is not known is held: nothing new is sent to
+//! its destination and nothing is retried or replayed. When the enqueue
+//! itself did not return there is no transaction to look for, so only the
+//! user's confirmation that they checked the conversation lifts the hold.
+//! When an observed request loses its outcome (its update stream ended or
+//! lagged, or its selection ended), the hold keeps the request's transaction:
+//! finding exactly that transaction still queued observes it again in place,
+//! and otherwise the user confirms. Any other queued sticker may be observed
+//! meanwhile, but it never lifts a hold. Holds live in memory for this run and
+//! belong to the account and destination, not to one selection, so switching
+//! away and back keeps them. Nothing here ever sends a request again.
 
 use crate::{
     AppWindow, StickerItem,
@@ -78,13 +83,26 @@ const LIVE_TIMING: Timing = Timing {
 const MAX_QUERY_CHARS: usize = 100;
 const MAX_ROWS: usize = 300;
 
-const UNCERTAIN_STATUS: &str = "This sticker may already be queued. Looking for it in the queue; \
-    no other sticker is sent until it is found or you confirm you checked the conversation.";
+/// Unresolved sends held at once. While this many are held no new sticker is
+/// sent anywhere; a hold is never dropped to make room.
+const MAX_HOLDS: usize = 16;
+
+const UNCERTAIN_STATUS: &str = "This sticker may or may not have been queued. Check the \
+    conversation, then confirm; no other sticker is sent here until you do.";
+const CHECKING_STATUS: &str = "This sticker's progress was lost. Looking for it in the queue; no \
+    other sticker is sent here until it is found or you confirm you checked the conversation.";
+const LOST_STATUS: &str = "This sticker's progress was lost. Open the sticker picker here to look \
+    for it again, or check the conversation and confirm.";
+const GONE_STATUS: &str = "This sticker is no longer queued: it was sent or cancelled. Check the \
+    conversation, then confirm to send stickers here again.";
 const ALREADY_SENT: &str = "The sticker was already sent.";
 const CANCEL_FAILED: &str = "The sticker could not be cancelled yet.";
 const RETRY_FAILED: &str = "The sticker could not be retried. Cancel it or check the conversation.";
-const UNRESOLVED_STATUS: &str = "This sticker was not found in the queue: it was either sent or \
-    never queued. Check the conversation, then confirm to send stickers again.";
+const BUSY_NOTICE: &str = "Wait for the previous sticker to finish, or resolve it.";
+const HELD_NOTICE: &str = "An earlier sticker here is unresolved. Check the conversation and \
+    confirm first.";
+const FULL_NOTICE: &str = "Too many sticker sends are unresolved. Check their conversations and \
+    confirm them first.";
 
 /// The account selection a picker or a send belongs to.
 pub(crate) trait Selection: Clone + Send + Sync + 'static {
@@ -124,11 +142,14 @@ pub(crate) trait QueuedSticker: Send + 'static {
     fn retry_wedged(&self) -> impl Future<Output = Result<(), MatrixCoreError>> + Send;
 }
 
-/// The newest sticker the queue still holds for one destination.
+/// A sticker the queue still holds: the newest one for a destination, or
+/// the one with an exact transaction.
 pub(crate) struct Pending<Q> {
     label: String,
     wedged: bool,
     others: usize,
+    /// More stickers were queued than were read; `others` is a floor.
+    truncated: bool,
     queued: Q,
 }
 
@@ -174,6 +195,15 @@ pub(crate) trait StickerBackend: Send + Sync + 'static {
         selection: &Self::Selection,
         room: &str,
         thread: Option<&str>,
+    ) -> impl Future<Output = Result<Option<Pending<Self::Queued>>, MatrixCoreError>> + Send;
+
+    /// Exactly the request with `transaction`, if the room's queue still
+    /// holds it. Read-only.
+    fn queued(
+        &self,
+        selection: &Self::Selection,
+        room: &str,
+        transaction: &str,
     ) -> impl Future<Output = Result<Option<Pending<Self::Queued>>, MatrixCoreError>> + Send;
 
     fn room_updates(
@@ -229,8 +259,10 @@ impl QueuedSticker for QueuedMessage {
         QueuedMessage::transaction_id(self)
     }
 
+    /// A lagged subscription may have skipped the outcome; it reports a lost
+    /// outcome instead of waiting for an update that may never come.
     fn next_update(&mut self) -> impl Future<Output = QueuedSendUpdate> + Send {
-        QueuedMessage::next_update(self)
+        QueuedMessage::next_update_or_loss(self)
     }
 
     fn abort(&self) -> impl Future<Output = Result<bool, MatrixCoreError>> + Send {
@@ -303,26 +335,40 @@ impl StickerBackend for LiveStickers {
     ) -> Result<Option<Pending<QueuedMessage>>, MatrixCoreError> {
         let manager = &self.0.manager;
         let lookup = manager.pending_sticker_for(selection, room, thread);
-        let found = lookup.await?;
-        Ok(found.map(|found| {
-            let PendingSticker {
-                label,
-                wedged,
-                others,
-                queued,
-            } = found;
-            Pending {
-                label,
-                wedged,
-                others,
-                queued,
-            }
-        }))
+        Ok(lookup.await?.map(pending))
+    }
+
+    async fn queued(
+        &self,
+        selection: &AccountSelection,
+        room: &str,
+        transaction: &str,
+    ) -> Result<Option<Pending<QueuedMessage>>, MatrixCoreError> {
+        let manager = &self.0.manager;
+        let lookup = manager.queued_sticker_for(selection, room, transaction);
+        Ok(lookup.await?.map(pending))
     }
 
     async fn room_updates(&self, account: &str) -> Option<broadcast::Receiver<RoomUpdates>> {
         let (owner, updates) = self.0.manager.subscribe_room_updates().await.ok()?;
         (owner == account).then_some(updates)
+    }
+}
+
+fn pending(found: PendingSticker) -> Pending<QueuedMessage> {
+    let PendingSticker {
+        label,
+        wedged,
+        others,
+        truncated,
+        queued,
+    } = found;
+    Pending {
+        label,
+        wedged,
+        others,
+        truncated,
+        queued,
     }
 }
 
@@ -683,18 +729,43 @@ enum Command {
 enum SendPhase {
     /// Queued and observed by its transaction.
     Observed,
-    /// The SDK may or may not hold the request: nothing new is sent until it
-    /// is found in the queue or the user confirms they checked.
-    Uncertain,
-    /// Sent, cancelled or no longer observable.
+    /// Sent or cancelled.
     Finished,
+    /// The outcome was lost. The request is held with its transaction and
+    /// never reported as finished.
+    Lost,
+}
+
+/// Why a send is held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Hold {
+    /// The enqueue did not return, so there is no transaction to look for.
+    Enqueue,
+    /// The outcome was lost; the transaction can be looked up again.
+    Lost,
+    /// The exact transaction is being looked up.
+    Checking,
+    /// The exact transaction is no longer queued: it was sent or cancelled.
+    Gone,
+}
+
+/// A send whose outcome is not known. Nothing new is sent to its destination
+/// until exactly this request is found still queued or the user confirms they
+/// checked the conversation. It belongs to the account and destination, not
+/// to one selection, and lives in memory for this run.
+struct Held {
+    id: u64,
+    destination: Destination,
+    /// The request's transaction, whenever it was known.
+    transaction: Option<String>,
+    hold: Hold,
 }
 
 struct Tracked<B: StickerBackend> {
     send: u64,
     destination: Destination,
     selection: B::Selection,
-    transaction: Option<String>,
+    transaction: String,
     status: String,
     phase: SendPhase,
     can_cancel: bool,
@@ -707,6 +778,13 @@ struct State<B: StickerBackend> {
     picker: Option<Picker<B>>,
     tracked: Option<Tracked<B>>,
     enqueuing: bool,
+    /// Unresolved sends, oldest first. New sends stop at `MAX_HOLDS`, so no
+    /// more than that are ever held.
+    held: Vec<Held>,
+    /// The hold and the tracked send the status last showed. Confirmation
+    /// and commands apply only to what was shown.
+    shown_hold: Option<u64>,
+    shown_send: Option<u64>,
 }
 
 impl<B: StickerBackend> Default for State<B> {
@@ -715,6 +793,9 @@ impl<B: StickerBackend> Default for State<B> {
             picker: None,
             tracked: None,
             enqueuing: false,
+            held: Vec::new(),
+            shown_hold: None,
+            shown_send: None,
         }
     }
 }
@@ -743,6 +824,7 @@ pub(crate) struct StickerUi<B: StickerBackend> {
     sessions: AtomicU64,
     previews: AtomicU64,
     sends: AtomicU64,
+    holds: AtomicU64,
     worker: Arc<AtomicBool>,
 }
 
@@ -803,38 +885,70 @@ fn picker_valid<B: StickerBackend>(ui: &AppWindow, picker: &Picker<B>) -> bool {
     )
 }
 
-fn tracked_visible<B: StickerBackend>(ui: &AppWindow, tracked: &Tracked<B>) -> bool {
-    let threaded = tracked.destination.threaded();
-    tracked.selection.is_current()
-        && ui.get_live_session()
-        && destination(ui, threaded).as_ref() == Some(&tracked.destination)
+/// The place is the visible conversation, with its thread pane shown.
+fn shown_at(ui: &AppWindow, place: &Destination) -> bool {
+    let threaded = place.threaded();
+    ui.get_live_session()
+        && destination(ui, threaded).as_ref() == Some(place)
         && (!threaded || ui.get_side_panel_tab() == 1)
 }
 
-/// One sticker at a time: a request still observed or still uncertain under
-/// the current selection blocks the next one.
-fn blocks_send<B: StickerBackend>(tracked: &Tracked<B>) -> bool {
-    tracked.phase != SendPhase::Finished && tracked.selection.is_current()
+fn tracked_visible<B: StickerBackend>(ui: &AppWindow, tracked: &Tracked<B>) -> bool {
+    tracked.selection.is_current() && shown_at(ui, &tracked.destination)
 }
 
-/// Whether a request found in the queue may be observed now. It never
-/// displaces another observed request, only resolves an uncertain send for
-/// the same destination, and is never observed twice.
-fn may_adopt<B: StickerBackend>(
-    tracked: Option<&Tracked<B>>,
-    destination: &Destination,
-    transaction: &str,
-) -> bool {
-    let Some(tracked) = tracked.filter(|tracked| tracked.selection.is_current()) else {
-        return true;
-    };
-    if tracked.transaction.as_deref() == Some(transaction) {
-        return false;
+/// One sticker at a time: a request still observed under the current
+/// selection blocks the next one.
+fn blocks_send<B: StickerBackend>(tracked: &Tracked<B>) -> bool {
+    tracked.phase == SendPhase::Observed && tracked.selection.is_current()
+}
+
+/// Whether a request found in the queue may be observed now: it never
+/// displaces an observed request and is never observed twice. Observing a
+/// request lifts no hold by itself; see `exact_hold`.
+fn may_adopt<B: StickerBackend>(tracked: Option<&Tracked<B>>, transaction: &str) -> bool {
+    tracked.is_none_or(|tracked| {
+        tracked.phase != SendPhase::Observed && tracked.transaction != transaction
+    })
+}
+
+/// The hold that observing exactly `transaction` at `place` lifts, if any.
+/// Any other request, however recent, never resolves a hold.
+fn exact_hold(held: &[Held], place: &Destination, transaction: &str) -> Option<usize> {
+    held.iter().position(|held| {
+        held.destination == *place && held.transaction.as_deref() == Some(transaction)
+    })
+}
+
+/// Why no new sticker may be sent to `place` now, if none may: another send
+/// is in progress, an earlier one here is unresolved, or too many are.
+fn send_blocker(busy: bool, held: &[Held], place: &Destination) -> Option<&'static str> {
+    if busy {
+        Some(BUSY_NOTICE)
+    } else if held.iter().any(|held| held.destination == *place) {
+        Some(HELD_NOTICE)
+    } else if held.len() >= MAX_HOLDS {
+        Some(FULL_NOTICE)
+    } else {
+        None
     }
-    match tracked.phase {
-        SendPhase::Finished => true,
-        SendPhase::Uncertain => tracked.destination == *destination,
-        SendPhase::Observed => false,
+}
+
+fn hold_status(hold: Hold) -> &'static str {
+    match hold {
+        Hold::Enqueue => UNCERTAIN_STATUS,
+        Hold::Lost => LOST_STATUS,
+        Hold::Checking => CHECKING_STATUS,
+        Hold::Gone => GONE_STATUS,
+    }
+}
+
+/// The send status text: the hold shown here, then the tracked send.
+fn strip_status(hold: Option<Hold>, tracked: Option<&str>) -> String {
+    match (hold.map(hold_status), tracked) {
+        (Some(hold), Some(tracked)) => format!("{hold}\n{tracked}"),
+        (Some(text), None) | (None, Some(text)) => text.into(),
+        (None, None) => String::new(),
     }
 }
 
@@ -920,7 +1034,8 @@ fn download_failure(error: &MatrixCoreError) -> &'static str {
 }
 
 /// Status of the tracked send after one queue update: text, cancel, retry
-/// and phase. A wedged request is retried in place, never sent again.
+/// and phase. A wedged request is retried in place, never sent again. A lost
+/// outcome is never reported as finished: the request is held instead.
 fn update_status(update: QueuedSendUpdate) -> (&'static str, bool, bool, SendPhase) {
     match update {
         QueuedSendUpdate::Sent => ("Sticker sent.", false, false, SendPhase::Finished),
@@ -937,12 +1052,7 @@ fn update_status(update: QueuedSendUpdate) -> (&'static str, bool, bool, SendPha
             SendPhase::Observed,
         ),
         QueuedSendUpdate::Cancelled => ("Sticker cancelled.", false, false, SendPhase::Finished),
-        QueuedSendUpdate::Unknown => (
-            "Sticker status is unknown. Check the conversation before sending another.",
-            false,
-            false,
-            SendPhase::Finished,
-        ),
+        QueuedSendUpdate::Unknown => (CHECKING_STATUS, false, false, SendPhase::Lost),
     }
 }
 
@@ -972,8 +1082,9 @@ fn sending_status(label: &str) -> String {
     }
 }
 
-/// A sticker found in the queue, for example from before a restart.
-fn pending_status(label: &str, wedged: bool, others: usize) -> String {
+/// A sticker found in the queue, for example from before a restart. When
+/// more were queued than were read, the count is a floor.
+fn pending_status(label: &str, wedged: bool, others: usize, truncated: bool) -> String {
     let mut text = if label.is_empty() {
         String::from("A sticker is still queued here.")
     } else {
@@ -982,7 +1093,9 @@ fn pending_status(label: &str, wedged: bool, others: usize) -> String {
     if wedged {
         text.push_str(" It could not be sent; retry or cancel it.");
     }
-    if others > 0 {
+    if truncated {
+        text.push_str(&format!(" At least {others} more queued here will send in order."));
+    } else if others > 0 {
         text.push_str(&format!(" {others} more queued here will send in order."));
     }
     text
@@ -998,6 +1111,7 @@ impl<B: StickerBackend> StickerUi<B> {
             sessions: AtomicU64::new(0),
             previews: AtomicU64::new(0),
             sends: AtomicU64::new(0),
+            holds: AtomicU64::new(0),
             worker: Arc::new(AtomicBool::new(false)),
         });
         let weak = ui.as_weak();
@@ -1205,8 +1319,10 @@ impl<B: StickerBackend> StickerUi<B> {
         if !open {
             return;
         }
-        // A sticker the queue still holds here, from an earlier session or an
-        // uncertain enqueue, is observed in place and never sent again.
+        // Held requests here whose transaction is known are looked up again,
+        // and a sticker the queue still holds here, for example from before a
+        // restart, is observed in place. Neither is ever sent again.
+        self.recheck_held(&selection, &destination, &weak);
         self.find_pending(&selection, &destination, &weak).await;
         self.request_preview();
         self.schedule_publish(&weak);
@@ -1490,8 +1606,8 @@ impl<B: StickerBackend> StickerUi<B> {
             let catalog = picker.catalog().cloned()?;
             picker.highlighted = Some(row);
             let entry = picker.rows[row];
-            if busy {
-                picker.notice = "Wait for the previous sticker to finish, or resolve it.".into();
+            if let Some(notice) = send_blocker(busy, &state.held, &picker.destination) {
+                picker.notice = notice.into();
                 return Some(None);
             }
             if !picker.consented() {
@@ -1549,7 +1665,13 @@ impl<B: StickerBackend> StickerUi<B> {
                     owner.close_session(prepared.session, &weak);
                 }
                 Err(MatrixCoreError::ComposedSendUncertain) => {
-                    owner.quarantine(prepared.selection, prepared.destination, &weak);
+                    // There is no transaction to look for, so only the user's
+                    // confirmation lifts this hold; nothing is retried.
+                    {
+                        let mut state = owner.lock();
+                        state.enqueuing = false;
+                        owner.hold(&mut state, prepared.destination, None, Hold::Enqueue);
+                    }
                     owner.close_session(prepared.session, &weak);
                 }
                 Err(error) => {
@@ -1608,7 +1730,7 @@ impl<B: StickerBackend> StickerUi<B> {
             send,
             destination,
             selection: selection.clone(),
-            transaction: Some(queued.transaction_id().to_owned()),
+            transaction: queued.transaction_id().to_owned(),
             status,
             phase: SendPhase::Observed,
             can_cancel: true,
@@ -1618,9 +1740,10 @@ impl<B: StickerBackend> StickerUi<B> {
         (send, receiver)
     }
 
-    /// Observe one recorded sticker by its transaction until it finishes, the
-    /// user cancels it, or its account selection ends. The SDK request itself
-    /// persists in the account's queue either way.
+    /// Observe one recorded sticker by its transaction until it finishes or
+    /// the user cancels it. When its outcome is lost (the update stream ended
+    /// or lagged, or the selection ended) it is held with its transaction.
+    /// The SDK request itself persists in the account's queue either way.
     fn observe(
         self: &Arc<Self>,
         mut queued: B::Queued,
@@ -1640,8 +1763,7 @@ impl<B: StickerBackend> StickerUi<B> {
                 let event = tokio::select! {
                     biased;
                     _ = selection.revoked() => {
-                        owner.end_tracked(send);
-                        owner.schedule_publish(&weak);
+                        owner.lose(send, &selection, &weak);
                         return;
                     }
                     update = queued.next_update() => Event::Update(update),
@@ -1650,6 +1772,10 @@ impl<B: StickerBackend> StickerUi<B> {
                 match event {
                     Event::Update(update) => {
                         let (text, can_cancel, can_retry, phase) = update_status(update);
+                        if phase == SendPhase::Lost {
+                            owner.lose(send, &selection, &weak);
+                            return;
+                        }
                         wedged = can_retry;
                         owner.set_status(send, text, can_cancel, can_retry, phase);
                         owner.schedule_publish(&weak);
@@ -1684,45 +1810,247 @@ impl<B: StickerBackend> StickerUi<B> {
                         owner.set_status(send, text, true, retry, SendPhase::Observed);
                         owner.schedule_publish(&weak);
                     }
-                    Event::Command(None) => return,
+                    Event::Command(None) => {
+                        // The tracked send was held or replaced elsewhere.
+                        owner.lose(send, &selection, &weak);
+                        return;
+                    }
                 }
             }
         });
     }
 
     /// Observe the newest sticker the queue still holds for `destination`,
-    /// when nothing else is observed: it keeps its original transaction.
+    /// when nothing else is observed: it keeps its original transaction. It
+    /// lifts a hold only when it is exactly that hold's request.
     async fn find_pending(
         self: &Arc<Self>,
         selection: &B::Selection,
         destination: &Destination,
         weak: &slint::Weak<AppWindow>,
-    ) -> bool {
+    ) {
         let (backend, thread) = (&self.backend, destination.thread.as_deref());
         let lookup = backend.pending(selection, &destination.room, thread);
         let found = tokio::select! {
             biased;
-            _ = selection.revoked() => return false,
+            _ = selection.revoked() => return,
             found = tokio::time::timeout(self.timing.catalog, lookup) => found,
         };
         let Ok(Ok(Some(pending))) = found else {
-            return false;
+            return;
         };
         let Pending {
             label,
             wedged,
             others,
+            truncated,
             queued,
         } = pending;
-        let status = pending_status(&label, wedged, others);
+        let status = pending_status(&label, wedged, others, truncated);
         let (send, commands) = {
             let mut state = self.lock();
+            self.retire_ended(&mut state);
             let transaction = queued.transaction_id();
-            let free = !state.enqueuing
-                && may_adopt(state.tracked.as_ref(), destination, transaction);
-            if !free {
-                return false;
+            let exact = exact_hold(&state.held, destination, transaction);
+            let room = exact.is_some() || state.held.len() < MAX_HOLDS;
+            let free = !state.enqueuing && may_adopt(state.tracked.as_ref(), transaction);
+            if !room || !free {
+                return;
             }
+            if let Some(index) = exact {
+                state.held.remove(index);
+            }
+            self.record(
+                &mut state,
+                &queued,
+                selection,
+                destination.clone(),
+                status,
+                wedged,
+            )
+        };
+        self.observe(queued, selection.clone(), send, commands, wedged, weak);
+    }
+
+    /// Hold a send under the caller's lock and return the hold's id.
+    fn hold(
+        &self,
+        state: &mut State<B>,
+        destination: Destination,
+        transaction: Option<String>,
+        hold: Hold,
+    ) -> u64 {
+        let id = next_id(&self.holds);
+        state.held.push(Held {
+            id,
+            destination,
+            transaction,
+            hold,
+        });
+        id
+    }
+
+    /// Under the caller's lock, hold the observed tracked request `send` with
+    /// its transaction. `None` when `send` is no longer the observed request.
+    fn retire(&self, state: &mut State<B>, send: u64) -> Option<u64> {
+        match &state.tracked {
+            Some(tracked) if tracked.send == send && tracked.phase == SendPhase::Observed => {}
+            _ => return None,
+        }
+        let tracked = state.tracked.take()?;
+        let transaction = Some(tracked.transaction);
+        Some(self.hold(state, tracked.destination, transaction, Hold::Lost))
+    }
+
+    /// Under the caller's lock: a request observed under an ended selection
+    /// lost its outcome and is held; a finished one is dropped.
+    fn retire_ended(&self, state: &mut State<B>) {
+        let ended = state
+            .tracked
+            .as_ref()
+            .filter(|tracked| !tracked.selection.is_current())
+            .map(|tracked| tracked.send);
+        if let Some(send) = ended
+            && self.retire(state, send).is_none()
+        {
+            state.tracked = None;
+        }
+    }
+
+    /// The tracked request `send` lost its outcome. It is held with its
+    /// transaction and, under a current selection, looked up again at once.
+    fn lose(self: &Arc<Self>, send: u64, selection: &B::Selection, weak: &slint::Weak<AppWindow>) {
+        let held = self.retire(&mut self.lock(), send);
+        if let Some(id) = held
+            && selection.is_current()
+        {
+            self.reconcile(id, selection.clone(), weak);
+        }
+        self.schedule_publish(weak);
+    }
+
+    /// Look up every request held here whose transaction is known and that is
+    /// not already being looked up, with this picker's selection.
+    fn recheck_held(
+        self: &Arc<Self>,
+        selection: &B::Selection,
+        destination: &Destination,
+        weak: &slint::Weak<AppWindow>,
+    ) {
+        let ids: Vec<u64> = self
+            .lock()
+            .held
+            .iter()
+            .filter(|held| held.destination == *destination && held.hold == Hold::Lost)
+            .map(|held| held.id)
+            .collect();
+        for id in ids {
+            self.reconcile(id, selection.clone(), weak);
+        }
+    }
+
+    /// Look the held request `id` up by its exact transaction, a bounded
+    /// number of times while `selection` stays current. Still queued, it is
+    /// observed again in place; gone from the queue, it was sent or cancelled
+    /// and only the user can confirm which. Nothing is ever sent again.
+    fn reconcile(
+        self: &Arc<Self>,
+        id: u64,
+        selection: B::Selection,
+        weak: &slint::Weak<AppWindow>,
+    ) {
+        let Some((destination, transaction)) = self.begin_check(id) else {
+            return;
+        };
+        let owner = self.clone();
+        let weak = weak.clone();
+        self.runtime.spawn(async move {
+            let hold = owner
+                .check_queue(id, &selection, &destination, &transaction, &weak)
+                .await;
+            owner.end_check(id, hold);
+            owner.schedule_publish(&weak);
+        });
+        self.schedule_publish(weak);
+    }
+
+    /// Mark the held request `id` as being looked up, unless it already is,
+    /// has no transaction or is known to be gone.
+    fn begin_check(&self, id: u64) -> Option<(Destination, String)> {
+        let mut state = self.lock();
+        let held = state
+            .held
+            .iter_mut()
+            .find(|held| held.id == id && held.hold == Hold::Lost)?;
+        let transaction = held.transaction.clone()?;
+        held.hold = Hold::Checking;
+        Some((held.destination.clone(), transaction))
+    }
+
+    /// Look the held transaction up. `None` once it is observed again or the
+    /// hold was confirmed meanwhile; otherwise the hold it ends in.
+    async fn check_queue(
+        self: &Arc<Self>,
+        id: u64,
+        selection: &B::Selection,
+        destination: &Destination,
+        transaction: &str,
+        weak: &slint::Weak<AppWindow>,
+    ) -> Option<Hold> {
+        let room = &destination.room;
+        for attempt in 0..self.timing.checks {
+            if attempt > 0 {
+                tokio::select! {
+                    biased;
+                    _ = selection.revoked() => return Some(Hold::Lost),
+                    _ = tokio::time::sleep(self.timing.recheck) => {}
+                }
+            }
+            if !self.is_held(id) {
+                return None;
+            }
+            let lookup = self.backend.queued(selection, room, transaction);
+            let found = tokio::select! {
+                biased;
+                _ = selection.revoked() => return Some(Hold::Lost),
+                found = tokio::time::timeout(self.timing.catalog, lookup) => found,
+            };
+            match found {
+                Ok(Ok(Some(pending))) => {
+                    if self.observe_again(id, pending, selection, destination, weak) {
+                        return None;
+                    }
+                }
+                Ok(Ok(None)) => return Some(Hold::Gone),
+                Ok(Err(_)) | Err(_) => {}
+            }
+        }
+        Some(Hold::Lost)
+    }
+
+    /// Observe the exact held request again in place, lifting its hold, when
+    /// the hold still exists and the tracked slot is free.
+    fn observe_again(
+        self: &Arc<Self>,
+        id: u64,
+        pending: Pending<B::Queued>,
+        selection: &B::Selection,
+        destination: &Destination,
+        weak: &slint::Weak<AppWindow>,
+    ) -> bool {
+        let status = pending_status(&pending.label, pending.wedged, 0, false);
+        let wedged = pending.wedged;
+        let queued = pending.queued;
+        let (send, commands) = {
+            let mut state = self.lock();
+            self.retire_ended(&mut state);
+            let transaction = queued.transaction_id();
+            let exact = exact_hold(&state.held, destination, transaction);
+            let free = !state.enqueuing && may_adopt(state.tracked.as_ref(), transaction);
+            let Some(index) = exact.filter(|index| free && state.held[*index].id == id) else {
+                return false;
+            };
+            state.held.remove(index);
             self.record(
                 &mut state,
                 &queued,
@@ -1736,60 +2064,18 @@ impl<B: StickerBackend> StickerUi<B> {
         true
     }
 
-    /// The enqueue may or may not have completed. Nothing new is sent and
-    /// nothing is retried: the queue is checked for the request a bounded
-    /// number of times, and only finding it there or the user's confirmation
-    /// that they checked the conversation lifts the quarantine.
-    fn quarantine(
-        self: &Arc<Self>,
-        selection: B::Selection,
-        destination: Destination,
-        weak: &slint::Weak<AppWindow>,
-    ) {
-        let send = next_id(&self.sends);
-        {
-            let mut state = self.lock();
-            state.enqueuing = false;
-            state.tracked = Some(Tracked {
-                send,
-                destination: destination.clone(),
-                selection: selection.clone(),
-                transaction: None,
-                status: UNCERTAIN_STATUS.into(),
-                phase: SendPhase::Uncertain,
-                can_cancel: false,
-                can_retry: false,
-                commands: None,
-            });
-        }
-        self.schedule_publish(weak);
-        let owner = self.clone();
-        let weak = weak.clone();
-        self.runtime.spawn(async move {
-            for _ in 0..owner.timing.checks {
-                tokio::select! {
-                    biased;
-                    _ = selection.revoked() => return,
-                    _ = tokio::time::sleep(owner.timing.recheck) => {}
-                }
-                if !owner.still_uncertain(send) {
-                    return;
-                }
-                if owner.find_pending(&selection, &destination, &weak).await {
-                    return;
-                }
-            }
-            let phase = SendPhase::Uncertain;
-            owner.set_status(send, UNRESOLVED_STATUS, false, false, phase);
-            owner.schedule_publish(&weak);
-        });
+    fn is_held(&self, id: u64) -> bool {
+        self.lock().held.iter().any(|held| held.id == id)
     }
 
-    fn still_uncertain(&self, send: u64) -> bool {
-        self.lock()
-            .tracked
-            .as_ref()
-            .is_some_and(|tracked| tracked.send == send && tracked.phase == SendPhase::Uncertain)
+    /// Record how the lookup of `id` ended, unless its hold was lifted.
+    fn end_check(&self, id: u64, hold: Option<Hold>) {
+        let mut state = self.lock();
+        if let Some(hold) = hold
+            && let Some(held) = state.held.iter_mut().find(|held| held.id == id)
+        {
+            held.hold = hold;
+        }
     }
 
     fn set_status(
@@ -1817,17 +2103,6 @@ impl<B: StickerBackend> StickerUi<B> {
         }
     }
 
-    fn end_tracked(&self, send: u64) {
-        let mut state = self.lock();
-        if state
-            .tracked
-            .as_ref()
-            .is_some_and(|tracked| tracked.send == send)
-        {
-            state.tracked = None;
-        }
-    }
-
     fn clear_finished(&self, send: u64) {
         let mut state = self.lock();
         if state
@@ -1844,10 +2119,11 @@ impl<B: StickerBackend> StickerUi<B> {
     fn command(&self, ui: &AppWindow, command: Command) {
         {
             let mut state = self.lock();
+            let shown = state.shown_send;
             let Some(tracked) = state
                 .tracked
                 .as_mut()
-                .filter(|tracked| tracked_visible(ui, tracked))
+                .filter(|tracked| shown == Some(tracked.send) && tracked_visible(ui, tracked))
             else {
                 drop(state);
                 self.publish(ui);
@@ -1875,16 +2151,25 @@ impl<B: StickerBackend> StickerUi<B> {
         self.publish(ui);
     }
 
-    /// Clear a finished status, or acknowledge an uncertain one after the
-    /// user checked the conversation. An observed send is never dismissed.
+    /// Lift the hold the status showed, after the user checked the
+    /// conversation, or clear a finished status. Only what was shown, and is
+    /// still shown here, is acted on; an observed send is never dismissed.
     fn dismiss_status(&self, ui: &AppWindow) {
         {
             let mut state = self.lock();
-            let clear = state.tracked.as_ref().is_some_and(|tracked| {
-                !tracked.selection.is_current()
-                    || (tracked_visible(ui, tracked) && tracked.phase != SendPhase::Observed)
+            let (hold, send) = (state.shown_hold, state.shown_send);
+            let index = state
+                .held
+                .iter()
+                .position(|held| Some(held.id) == hold && shown_at(ui, &held.destination));
+            let finished = state.tracked.as_ref().is_some_and(|tracked| {
+                Some(tracked.send) == send
+                    && tracked.phase == SendPhase::Finished
+                    && tracked_visible(ui, tracked)
             });
-            if clear {
+            if let Some(index) = index {
+                state.held.remove(index);
+            } else if hold.is_none() && finished {
                 state.tracked = None;
             }
         }
@@ -1916,19 +2201,13 @@ impl<B: StickerBackend> StickerUi<B> {
                 .as_ref()
                 .is_some_and(|picker| !picker_valid(ui, picker));
             let stopped = if stale { state.picker.take() } else { None };
-            if state
-                .tracked
-                .as_ref()
-                .is_some_and(|tracked| !tracked.selection.is_current())
-            {
-                state.tracked = None;
-            }
+            self.retire_ended(&mut state);
             stopped
         };
         if let Some(picker) = stale {
             picker.stop.stop();
         }
-        let state = self.lock();
+        let mut state = self.lock();
         match &state.picker {
             None => {
                 ui.set_sticker_open(false);
@@ -1992,11 +2271,12 @@ impl<B: StickerBackend> StickerUi<B> {
                 ui.set_sticker_notice(picker.notice.clone().into());
                 ui.set_sticker_needs_consent(picker.catalog().is_some() && !picker.consented());
                 let busy = state.enqueuing || state.tracked.as_ref().is_some_and(blocks_send);
+                let blocked = send_blocker(busy, &state.held, &picker.destination);
                 ui.set_sticker_can_send(
                     picker.catalog().is_some()
                         && picker.current_entry().is_some()
                         && picker.consented()
-                        && !busy,
+                        && blocked.is_none(),
                 );
                 match &picker.preview.pixels {
                     Some(pixels) => {
@@ -2014,28 +2294,35 @@ impl<B: StickerBackend> StickerUi<B> {
                 ui.set_sticker_open(true);
             }
         }
-        match state
+        // One status per visible place: the oldest hold shown here, and the
+        // tracked send when it belongs to the same place.
+        let held = state
+            .held
+            .iter()
+            .find(|held| shown_at(ui, &held.destination));
+        let place = held.map(|held| &held.destination);
+        let tracked = state
             .tracked
             .as_ref()
             .filter(|tracked| tracked_visible(ui, tracked))
-        {
-            Some(tracked) => {
-                let threaded = tracked.destination.threaded();
-                ui.set_sticker_send_threaded(threaded);
-                ui.set_sticker_send_status(tracked.status.clone().into());
-                ui.set_sticker_send_can_cancel(tracked.can_cancel);
-                ui.set_sticker_send_can_retry(tracked.can_retry);
-                ui.set_sticker_send_uncertain(tracked.phase == SendPhase::Uncertain);
-                ui.set_sticker_send_visible(true);
-            }
-            None => {
-                ui.set_sticker_send_visible(false);
-                ui.set_sticker_send_status(SharedString::new());
-                ui.set_sticker_send_can_cancel(false);
-                ui.set_sticker_send_can_retry(false);
-                ui.set_sticker_send_uncertain(false);
-            }
-        }
+            .filter(|tracked| place.is_none_or(|place| *place == tracked.destination));
+        let text = strip_status(
+            held.map(|held| held.hold),
+            tracked.map(|tracked| tracked.status.as_str()),
+        );
+        let can_cancel = tracked.is_some_and(|tracked| tracked.can_cancel);
+        let can_retry = tracked.is_some_and(|tracked| tracked.can_retry);
+        let threaded = place
+            .or(tracked.map(|tracked| &tracked.destination))
+            .map(Destination::threaded);
+        let shown = (held.map(|held| held.id), tracked.map(|tracked| tracked.send));
+        ui.set_sticker_send_status(text.into());
+        ui.set_sticker_send_can_cancel(can_cancel);
+        ui.set_sticker_send_can_retry(can_retry);
+        ui.set_sticker_send_uncertain(shown.0.is_some());
+        ui.set_sticker_send_threaded(threaded.unwrap_or(false));
+        ui.set_sticker_send_visible(threaded.is_some());
+        (state.shown_hold, state.shown_send) = shown;
     }
 }
 
@@ -2185,9 +2472,52 @@ mod tests {
         let (_, cancel, retry, phase) =
             update_status(QueuedSendUpdate::Retained { recoverable: false });
         assert!(cancel && retry && phase == SendPhase::Observed);
-        for update in [QueuedSendUpdate::Cancelled, QueuedSendUpdate::Unknown] {
-            let (_, cancel, retry, phase) = update_status(update);
-            assert!(!cancel && !retry && phase == SendPhase::Finished);
+        let (_, cancel, retry, phase) = update_status(QueuedSendUpdate::Cancelled);
+        assert!(!cancel && !retry && phase == SendPhase::Finished);
+        // A lost outcome is held with its transaction, never reported as
+        // finished, and offers neither cancel nor retry.
+        let (text, cancel, retry, phase) = update_status(QueuedSendUpdate::Unknown);
+        assert_eq!((text, cancel, retry), (CHECKING_STATUS, false, false));
+        assert_eq!(phase, SendPhase::Lost);
+    }
+
+    fn held(id: u64, at: &Destination, transaction: Option<&str>, hold: Hold) -> Held {
+        Held {
+            id,
+            destination: at.clone(),
+            transaction: transaction.map(str::to_owned),
+            hold,
+        }
+    }
+
+    #[test]
+    fn holds_block_their_destination_and_only_their_exact_request_lifts_one() {
+        let (room, thread, other) = (place(None), place(Some("$root")), place(Some("$other")));
+        let holds = [
+            held(1, &room, None, Hold::Enqueue),
+            held(2, &thread, Some("txn-lost"), Hold::Gone),
+        ];
+        assert_eq!(send_blocker(true, &[], &room), Some(BUSY_NOTICE));
+        assert_eq!(send_blocker(false, &holds, &room), Some(HELD_NOTICE));
+        assert_eq!(send_blocker(false, &holds, &thread), Some(HELD_NOTICE));
+        assert_eq!(send_blocker(false, &holds, &other), None);
+        // A full set of holds stops every new send; none is dropped for room.
+        let full: Vec<Held> = (0..MAX_HOLDS as u64)
+            .map(|id| held(id, &thread, None, Hold::Enqueue))
+            .collect();
+        assert_eq!(send_blocker(false, &full, &other), Some(FULL_NOTICE));
+        // An enqueue that never returned has no transaction, so no queued
+        // request lifts it; a lost outcome is lifted only by its own request.
+        assert_eq!(exact_hold(&holds, &room, "txn-lost"), None);
+        assert_eq!(exact_hold(&holds, &room, "txn-newest"), None);
+        assert_eq!(exact_hold(&holds, &thread, "txn-newest"), None);
+        assert_eq!(exact_hold(&holds, &other, "txn-lost"), None);
+        assert_eq!(exact_hold(&holds, &thread, "txn-lost"), Some(1));
+        let both = strip_status(Some(Hold::Gone), Some("Sticker sent."));
+        assert_eq!(both, format!("{GONE_STATUS}\nSticker sent."));
+        assert_eq!(strip_status(None, None), "");
+        for hold in [Hold::Enqueue, Hold::Lost, Hold::Checking, Hold::Gone] {
+            assert!(hold_status(hold).contains("confirm"), "{hold:?}");
         }
     }
 
@@ -2199,12 +2529,14 @@ mod tests {
         assert!(!download_failure(&detail).contains("PRIVATE"));
         assert!(send_failure(&MatrixCoreError::StickerConsentRequired).contains("Allow"));
         assert!(send_failure(&MatrixCoreError::StickerUnavailable).contains("again"));
-        let found = pending_status("Sleeping owl", true, 2);
+        let found = pending_status("Sleeping owl", true, 2, false);
         assert!(found.contains("still queued"));
         assert!(found.contains("retry or cancel"));
-        assert!(found.contains("2 more"));
-        let unnamed = pending_status("", false, 0);
+        assert!(found.contains(" 2 more"));
+        let unnamed = pending_status("", false, 0, false);
         assert_eq!(unnamed, "A sticker is still queued here.");
+        let truncated = pending_status("Waving fox", false, 255, true);
+        assert!(truncated.contains("At least 255 more"));
     }
 
     #[test]
@@ -2618,12 +2950,24 @@ pub(crate) mod controller_tests {
         fetches: AtomicUsize,
         sends: AtomicUsize,
         plans: Mutex<VecDeque<Plan>>,
+        /// The newest queued sticker the next lookup finds.
         pending: Mutex<Option<Pending<FakeQueued>>>,
+        /// Requests an exact lookup finds by transaction; others are gone.
+        exact: Mutex<Vec<Pending<FakeQueued>>>,
+        lookups: AtomicUsize,
     }
 
     impl FakeBackend {
         fn plan(&self, plan: Plan) {
             self.plans.lock().unwrap().push_back(plan);
+        }
+
+        fn newest(&self, pending: Pending<FakeQueued>) {
+            *self.pending.lock().unwrap() = Some(pending);
+        }
+
+        fn keep(&self, pending: Pending<FakeQueued>) {
+            self.exact.lock().unwrap().push(pending);
         }
     }
 
@@ -2711,6 +3055,20 @@ pub(crate) mod controller_tests {
             Ok(self.pending.lock().unwrap().take())
         }
 
+        async fn queued(
+            &self,
+            _: &FakeSelection,
+            _: &str,
+            transaction: &str,
+        ) -> Result<Option<Pending<FakeQueued>>, MatrixCoreError> {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            let mut exact = self.exact.lock().unwrap();
+            let index = exact
+                .iter()
+                .position(|pending| pending.queued.transaction == transaction);
+            Ok(index.map(|index| exact.remove(index)))
+        }
+
         async fn room_updates(&self, _: &str) -> Option<broadcast::Receiver<RoomUpdates>> {
             None
         }
@@ -2727,6 +3085,21 @@ pub(crate) mod controller_tests {
             aborts: aborts.clone(),
         };
         (updates, queued)
+    }
+
+    fn found(
+        label: &str,
+        others: usize,
+        truncated: bool,
+        queued: FakeQueued,
+    ) -> Pending<FakeQueued> {
+        Pending {
+            label: label.into(),
+            wedged: false,
+            others,
+            truncated,
+            queued,
+        }
     }
 
     async fn settle(ui: &AppWindow) {
@@ -2895,12 +3268,13 @@ pub(crate) mod controller_tests {
         settle(ui).await;
         assert!(!ui.get_sticker_send_visible());
 
-        // An uncertain enqueue is quarantined: the choice is spent, nothing is
-        // retried or sent, and finding the request in the queue resolves it.
+        // An enqueue that did not return is held: the choice is spent, nothing
+        // is retried or sent here, and no queued sticker lifts the hold, since
+        // none can be shown to be the request that was being queued.
         backend.plan(Plan::Uncertain);
         open_ready(ui, false).await;
         ui.invoke_sticker_send(first_key(ui));
-        until(ui, "the uncertain send is quarantined", || {
+        until(ui, "the uncertain send is held", || {
             ui.get_sticker_send_uncertain()
         })
         .await;
@@ -2908,55 +3282,161 @@ pub(crate) mod controller_tests {
             !ui.get_sticker_open()
         })
         .await;
+        assert_eq!(ui.get_sticker_send_status().as_str(), UNCERTAIN_STATUS);
         assert!(!ui.get_sticker_send_can_retry());
         assert!(!ui.get_sticker_send_can_cancel());
+        // An older, unrelated queued sticker is observed beside the hold. It
+        // is sent, and the hold remains.
+        let (older_updates, older) = queued("txn-older", &aborts);
+        backend.newest(found("Sleeping owl", 0, false, older));
         open_ready(ui, false).await;
+        until(ui, "the older sticker is observed beside the hold", || {
+            ui.get_sticker_send_can_cancel()
+        })
+        .await;
+        assert!(ui.get_sticker_send_uncertain());
         assert!(!ui.get_sticker_can_send());
         ui.invoke_sticker_send(first_key(ui));
         settle(ui).await;
-        assert_eq!(sends(), 2, "nothing new while a send is uncertain");
+        assert_eq!(sends(), 2, "nothing new while a send is held");
         ui.invoke_sticker_dismiss();
-        let (found_updates, found) = queued("txn-found", &aborts);
-        *backend.pending.lock().unwrap() = Some(Pending {
-            label: "Waving fox".into(),
-            wedged: false,
-            others: 0,
-            queued: found,
-        });
-        until(ui, "the request is found in the queue", || {
-            ui.get_sticker_send_visible() && !ui.get_sticker_send_uncertain()
+        older_updates.send(QueuedSendUpdate::Sent).unwrap();
+        until(ui, "the older sticker is sent", || {
+            ui.get_sticker_send_status().ends_with("Sticker sent.")
         })
         .await;
-        assert!(ui.get_sticker_send_can_cancel());
-        assert_eq!(sends(), 2, "found, never sent again");
-        found_updates.send(QueuedSendUpdate::Sent).unwrap();
-        until(ui, "the found sticker is sent", || {
-            ui.get_sticker_send_status() == "Sticker sent."
+        assert!(
+            ui.get_sticker_send_uncertain(),
+            "an unrelated sent sticker lifted the hold"
+        );
+        until(ui, "the sent status clears beside the hold", || {
+            ui.get_sticker_send_status().as_str() == UNCERTAIN_STATUS
         })
         .await;
-        ui.invoke_sticker_send_dismiss();
-        settle(ui).await;
-
-        // Not found within the bounded checks: only the user's confirmation
-        // that they checked the conversation lifts the quarantine.
-        backend.plan(Plan::Uncertain);
+        // A second unrelated sticker is cancelled; the hold still remains.
+        let (cancelled_updates, cancelled) = queued("txn-cancelled", &aborts);
+        backend.newest(found("Waving fox", 0, false, cancelled));
         open_ready(ui, false).await;
-        ui.invoke_sticker_send(first_key(ui));
-        until(ui, "the checks end unresolved", || {
-            ui.get_sticker_send_uncertain()
-                && ui.get_sticker_send_status().as_str() == UNRESOLVED_STATUS
+        until(ui, "the second older sticker is observed", || {
+            ui.get_sticker_send_can_cancel()
         })
         .await;
+        ui.invoke_sticker_dismiss();
+        cancelled_updates.send(QueuedSendUpdate::Cancelled).unwrap();
+        until(ui, "the older sticker is cancelled", || {
+            ui.get_sticker_send_status().ends_with("Sticker cancelled.")
+        })
+        .await;
+        assert!(
+            ui.get_sticker_send_uncertain(),
+            "an unrelated cancelled sticker lifted the hold"
+        );
+        // A lookup over more queued stickers than it reads says so, and its
+        // newest sticker is still not taken for the held send.
+        let (newest_updates, newest) = queued("txn-newest", &aborts);
+        backend.newest(found("Waving fox", 255, true, newest));
+        open_ready(ui, false).await;
+        until(ui, "the truncated lookup is reported", || {
+            ui.get_sticker_send_status().contains("At least 255 more")
+        })
+        .await;
+        assert!(ui.get_sticker_send_uncertain());
+        assert!(!ui.get_sticker_can_send());
+        ui.invoke_sticker_dismiss();
+        // A confirmation applies only to the hold that was shown, where it is
+        // still shown.
+        ui.set_active_room_id("!two:example.org".into());
+        ui.invoke_sticker_send_dismiss();
+        visible_room(ui, "fixture-a", "!one:example.org");
+        settle(ui).await;
+        assert!(
+            ui.get_sticker_send_uncertain(),
+            "a hold was lifted from another room"
+        );
+        newest_updates.send(QueuedSendUpdate::Sent).unwrap();
+        until(ui, "the newest sticker is sent and cleared", || {
+            ui.get_sticker_send_status().as_str() == UNCERTAIN_STATUS
+        })
+        .await;
+        // Only the user's confirmation lifts the hold.
         ui.invoke_sticker_send_dismiss();
         settle(ui).await;
         assert!(!ui.get_sticker_send_visible());
         open_ready(ui, false).await;
         assert!(
             ui.get_sticker_can_send(),
-            "acknowledged: a new sticker may be sent"
+            "confirmed: a new sticker may be sent"
         );
         ui.invoke_sticker_dismiss();
+        assert_eq!(sends(), 2);
+
+        // A lost outcome is held with its transaction, never reported as
+        // finished. Gone from the queue, the request was sent or cancelled:
+        // the hold stays until the user confirms and nothing is sent again.
+        let (lost_updates, lost) = queued("txn-lost", &aborts);
+        backend.plan(Plan::Queue(lost));
+        open_ready(ui, false).await;
+        ui.invoke_sticker_send(first_key(ui));
+        until(ui, "the sticker is observed", || {
+            ui.get_sticker_send_can_cancel()
+        })
+        .await;
         assert_eq!(sends(), 3);
+        drop(lost_updates);
+        until(ui, "the lost request is gone from the queue", || {
+            ui.get_sticker_send_status().as_str() == GONE_STATUS
+        })
+        .await;
+        assert!(ui.get_sticker_send_uncertain());
+        assert!(!ui.get_sticker_send_can_cancel());
+        assert_eq!(backend.lookups.load(Ordering::SeqCst), 1);
+        // An unrelated queued sticker is observed and sent beside it; the
+        // hold stays, and a request known to be gone is not looked up again.
+        let (other_updates, other) = queued("txn-unrelated", &aborts);
+        backend.newest(found("Sleeping owl", 0, false, other));
+        open_ready(ui, false).await;
+        until(ui, "the unrelated sticker is observed", || {
+            ui.get_sticker_send_can_cancel()
+        })
+        .await;
+        ui.invoke_sticker_dismiss();
+        other_updates.send(QueuedSendUpdate::Sent).unwrap();
+        until(ui, "the unrelated sticker is sent and cleared", || {
+            ui.get_sticker_send_status().as_str() == GONE_STATUS
+        })
+        .await;
+        assert_eq!(backend.lookups.load(Ordering::SeqCst), 1);
+        ui.invoke_sticker_send_dismiss();
+        settle(ui).await;
+        assert!(!ui.get_sticker_send_visible());
+        assert_eq!(sends(), 3, "a lost outcome is never sent again");
+
+        // Found still queued by its exact transaction, the request is observed
+        // again in place and only then is its hold lifted.
+        let (kept_updates, kept) = queued("txn-kept", &aborts);
+        backend.plan(Plan::Queue(kept));
+        open_ready(ui, false).await;
+        ui.invoke_sticker_send(first_key(ui));
+        until(ui, "the kept sticker is observed", || {
+            ui.get_sticker_send_can_cancel()
+        })
+        .await;
+        let (again_updates, kept_again) = queued("txn-kept", &aborts);
+        backend.keep(found("Waving fox", 0, false, kept_again));
+        drop(kept_updates);
+        until(ui, "the exact request is observed again", || {
+            ui.get_sticker_send_status().contains("still queued")
+                && !ui.get_sticker_send_uncertain()
+        })
+        .await;
+        assert!(ui.get_sticker_send_can_cancel());
+        assert_eq!(backend.lookups.load(Ordering::SeqCst), 2);
+        assert_eq!(sends(), 4, "observed again, never sent again");
+        again_updates.send(QueuedSendUpdate::Sent).unwrap();
+        until(ui, "the kept sticker is sent and cleared", || {
+            !ui.get_sticker_send_visible()
+        })
+        .await;
 
         // After a restart a fresh controller finds the sticker still queued
         // here and observes it in place; nothing is sent again.
@@ -2968,6 +3448,7 @@ pub(crate) mod controller_tests {
             label: "Sleeping owl".into(),
             wedged: true,
             others: 1,
+            truncated: false,
             queued: earlier,
         });
         first.revoke();
@@ -2991,15 +3472,41 @@ pub(crate) mod controller_tests {
         );
         assert_eq!(restarted.sends.load(Ordering::SeqCst), 0);
 
-        // Ending the selection ends the picker and the observation; the
-        // queued request itself is left to the SDK queue.
+        // Ending the selection ends the picker, and the observed request
+        // loses its outcome: it is held with its transaction, and the hold
+        // outlives the selection. The request itself stays in the SDK queue.
         again.revoke();
         ui.invoke_sticker_context_changed();
         settle(ui).await;
         assert!(!ui.get_sticker_open());
-        assert!(!ui.get_sticker_send_visible());
+        until(ui, "the revoked observation is held", || {
+            ui.get_sticker_send_uncertain()
+        })
+        .await;
+        assert_eq!(ui.get_sticker_send_status().as_str(), LOST_STATUS);
+        assert!(!ui.get_sticker_send_can_retry());
         let cancelled = aborts.load(Ordering::SeqCst);
         assert_eq!(cancelled, 1, "revocation never cancels a queued request");
+        // Back on the account, opening the picker looks the exact request up
+        // again and observes it in place; nothing is sent again.
+        let back = FakeSelection::new("fixture-a");
+        restarted.selections.lock().unwrap().push(back.clone());
+        let (back_updates, still) = queued("txn-earlier", &aborts);
+        restarted.keep(found("Sleeping owl", 0, false, still));
+        open_ready(ui, false).await;
+        until(ui, "the exact request is observed again", || {
+            !ui.get_sticker_send_uncertain() && ui.get_sticker_send_can_cancel()
+        })
+        .await;
+        assert_eq!(restarted.lookups.load(Ordering::SeqCst), 1);
+        assert_eq!(restarted.sends.load(Ordering::SeqCst), 0);
+        ui.invoke_sticker_dismiss();
+        back_updates.send(QueuedSendUpdate::Sent).unwrap();
+        until(ui, "the earlier sticker is sent and cleared", || {
+            !ui.get_sticker_send_visible()
+        })
+        .await;
+        back.revoke();
 
         // Leave the window as the following scenarios expect it.
         ui.set_active_account_local_id("".into());

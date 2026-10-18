@@ -1205,10 +1205,11 @@ component StickerPopup inherits Rectangle {
     }
 }
 
-// The one tracked sticker send for the visible composer. Cancel and Retry act
-// on the exact queued request; nothing here enqueues a second sticker. The
-// status wraps rather than eliding, and an uncertain send is lifted only by
-// confirming the conversation was checked, never by a plain dismissal.
+// The held send and the one tracked sticker send for the visible composer.
+// Cancel and Retry act on the exact queued request; nothing here enqueues a
+// second sticker. The status wraps rather than eliding, and a held send is
+// lifted only by confirming the conversation was checked, never by a plain
+// dismissal.
 component StickerSendStatus inherits Rectangle {
     in property <string> status;
     in property <bool> can-cancel;
