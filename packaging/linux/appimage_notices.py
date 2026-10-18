@@ -32,7 +32,8 @@ VERSION = re.compile(r"[A-Za-z0-9.+:~_-]{1,160}")
 
 class InventoryFailure(RuntimeError):
     def __init__(self, reason):
-        allowed = {"input", "tool", "elf", "dependency", "package", "notice", "deployment", "limit"}
+        allowed = {"input", "tool", "elf", "dependency", "package", "notice", "deployment", "limit",
+                   "elf_build_id", "elf_needed", "elf_soname", "elf_search", "search"}
         self.reason = reason if reason in allowed else "input"
         super().__init__("AppImage inventory failed: " + self.reason)
 
@@ -81,15 +82,22 @@ def parse_elf_report(output):
     needed = re.findall(r"\(NEEDED\).*?Shared library: \[([^\]\n]+)\]", output)
     names = re.findall(r"\(SONAME\).*?Library soname: \[([^\]\n]+)\]", output)
     searches = re.findall(r"\((?:RPATH|RUNPATH)\).*?: \[([^\]\n]*)\]", output)
-    if (len(ids) != 1 or not 8 <= len(ids[0]) <= 128 or len(ids[0]) % 2
-            or len(needed) > 128 or len(needed) != len(set(needed)) or len(names) > 1
-            or len(searches) > 1 or any(not SONAME.fullmatch(value) for value in needed + names)):
-        raise InventoryFailure("elf")
+    if len(ids) != 1 or not 8 <= len(ids[0]) <= 128 or len(ids[0]) % 2:
+        raise InventoryFailure("elf_build_id")
+    if (len(needed) > 128 or len(needed) != len(set(needed))
+            or any(not SONAME.fullmatch(value) for value in needed)):
+        raise InventoryFailure("elf_needed")
+    if len(names) > 1 or any(not SONAME.fullmatch(value) for value in names):
+        raise InventoryFailure("elf_soname")
+    if len(searches) > 1:
+        raise InventoryFailure("elf_search")
     return {"build_id": ids[0], "needed": sorted(needed), "soname": names[0] if names else None,
             "search": searches[0].split(":") if searches else []}
 
 
-def elf_record(runner, path, root, environment):
+def elf_record(runner, path, root, environment, label="inventory-elf"):
+    if type(label) is not str or label not in {"inventory-elf", "inventory-elf-client", "inventory-elf-dependency", "inventory-elf-deployed"}:
+        raise InventoryFailure("input")
     data = regular(path, MAX_ELF)
     # This distribution is x86-64 little-endian ELF, ET_EXEC or ET_DYN only.
     if (len(data) < 64 or data[:7] != b"\x7fELF\x02\x01\x01"
@@ -97,7 +105,7 @@ def elf_record(runner, path, root, environment):
             or int.from_bytes(data[18:20], "little") != 62):
         raise InventoryFailure("elf")
     readelf = root_owned("/usr/bin/readelf")
-    output = command(runner, "inventory-elf", [str(readelf), "--wide", "--dynamic", "--notes", str(path)],
+    output = command(runner, label, [str(readelf), "--wide", "--dynamic", "--notes", str(path)],
                      root, environment)
     return {**parse_elf_report(output), "sha256": digest(data)}
 
@@ -199,7 +207,7 @@ def prepare(runner, root, binary, stage, source_metadata, config, environment):
     components = {}
     main = elf_record(runner, binary, root, environment)
     if main["search"]:
-        raise InventoryFailure("dependency")
+        raise InventoryFailure("search")
     components["morpheus-app"] = {**main, "kind": "project"}
     pending = list(main["needed"])
     while pending:
@@ -210,22 +218,24 @@ def prepare(runner, root, binary, stage, source_metadata, config, environment):
             raise InventoryFailure("limit")
         if name == client.SONAME:
             path = stage / name
-            record = elf_record(runner, path, root, environment)
+            record = elf_record(runner, path, root, environment, "inventory-elf-client")
             if (record["sha256"] != source_metadata.get("source_client_sha256")
                     or record["build_id"] != source_metadata.get("build_id")):
                 raise InventoryFailure("input")
             record.update(kind="pipewire", source_version=source_metadata["source_version"])
         else:
             path = resolve_library(name)
-            record = elf_record(runner, path, root, environment)
+            record = elf_record(runner, path, root, environment, "inventory-elf-dependency")
             package, copyright_text, common = package_record(runner, path, root, environment)
             key = package["package"].replace(":", "_")
             notice = add_notice(directory, config, notices, key + ".copyright", copyright_text)
             for common_name, content in common.items():
                 add_notice(directory, config, notices, "common-" + common_name, content)
             record.update(kind="system-package", **package, copyright_notice=notice)
-        if record["soname"] != name or record["search"]:
+        if record["soname"] != name:
             raise InventoryFailure("dependency")
+        if record["search"]:
+            raise InventoryFailure("search")
         components[name] = record
         pending.extend(record["needed"])
     add_notice(directory, config, notices, "Morpheus-LICENSE", regular(client.ROOT / "LICENSE", MAX_NOTICE))
@@ -292,7 +302,7 @@ def verify(runner, appdir, notice_record, shipped_pipewire, environment):
         if prefix != b"\x7fELF":
             continue
         relative = path.relative_to(appdir).as_posix()
-        record = elf_record(runner, path, appdir, environment)
+        record = elf_record(runner, path, appdir, environment, "inventory-elf-deployed")
         key = "morpheus-app" if relative == "usr/bin/morpheus-app" else record["soname"]
         original = components.get(key)
         if (original is None or key in seen or record["build_id"] != original["build_id"]

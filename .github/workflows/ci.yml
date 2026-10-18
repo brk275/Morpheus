@@ -89,7 +89,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git show a8b0e7c6a626e6915db526f1ec211d215e14559e:.github/workflows/ci.yml > "$RUNNER_TEMP/reviewed-native-ci.yml"
+          git show 13f39cb13cde05d672b7088709d6a1ec8ea50ad7:.github/workflows/ci.yml > "$RUNNER_TEMP/reviewed-native-ci.yml"
           if [ "$RUNNER_OS" = "macOS" ]; then
             python3 -I -B -c 'from pathlib import Path; import hashlib, sys; assert hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest() == "df7218b7d027e6ad437ca9743595237fff64c80712cdfaa2d5522e3f25451ac8"' "$RUNNER_TEMP/reviewed-native-ci.yml"
           else
@@ -123,7 +123,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git show a8b0e7c6a626e6915db526f1ec211d215e14559e:.github/workflows/ci.yml > "$RUNNER_TEMP/reviewed-native-ci.yml"
+          git show 13f39cb13cde05d672b7088709d6a1ec8ea50ad7:.github/workflows/ci.yml > "$RUNNER_TEMP/reviewed-native-ci.yml"
           if [ "$RUNNER_OS" = "macOS" ]; then
             python3 -I -B -c 'from pathlib import Path; import hashlib, sys; assert hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest() == "df7218b7d027e6ad437ca9743595237fff64c80712cdfaa2d5522e3f25451ac8"' "$RUNNER_TEMP/reviewed-native-ci.yml"
           else
@@ -159,7 +159,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git show a8b0e7c6a626e6915db526f1ec211d215e14559e:.github/workflows/ci.yml > "$RUNNER_TEMP/reviewed-native-ci.yml"
+          git show 13f39cb13cde05d672b7088709d6a1ec8ea50ad7:.github/workflows/ci.yml > "$RUNNER_TEMP/reviewed-native-ci.yml"
           if [ "$RUNNER_OS" = "macOS" ]; then
             python3 -I -B -c 'from pathlib import Path; import hashlib, sys; assert hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest() == "df7218b7d027e6ad437ca9743595237fff64c80712cdfaa2d5522e3f25451ac8"' "$RUNNER_TEMP/reviewed-native-ci.yml"
           else

@@ -91,6 +91,46 @@ class ProgressTests(unittest.TestCase):
             self.assertEqual(p.value["failure"]["reason"], "unknown")
             self.assertNotIn("private", json.dumps(p.value))
 
+    def test_only_real_inventory_fixed_subreasons_are_published(self):
+        import appimage_notices as N
+        reasons = ("input", "tool", "elf", "dependency", "package", "notice", "deployment", "limit",
+                   "elf_build_id", "elf_needed", "elf_soname", "elf_search", "search")
+        for reason in reasons:
+            error = N.InventoryFailure(reason)
+            error.args = ("private path and server body",)
+            self.assertEqual(D.reason(error), "inventory_" + reason)
+            self.assertIn(D.reason(error), D.REASONS)
+        for invalid in ("private-token", {"private": "body"}, None):
+            error = N.InventoryFailure("input")
+            error.reason = invalid
+            self.assertEqual(D.reason(error), "inventory")
+        def forbidden(_self):
+            raise AssertionError("foreign reason must not be read")
+        foreign = type("InventoryFailure", (Exception,), {"reason": property(forbidden)})
+        self.assertEqual(D.reason(foreign("private message")), "inventory")
+
+    def test_inventory_role_and_subreason_survive_only_scanned_publication(self):
+        import appimage_notices as N
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            progress = D.Progress(root)
+            progress.wrapper("build")
+            progress.command("inventory-elf-dependency")
+            error = N.InventoryFailure("elf_build_id")
+            error.args = ("private ELF report and path",)
+            progress.failed(error)
+            progress.command("inventory-elf-deployed")
+            progress.failed(N.InventoryFailure("deployment"))
+            progress.cleanup(False)
+            progress.cleanup(True)
+            self.assertEqual(D.public_failure(root, scan_passed=False, outer_cleanup="passed", outer_reason="namespace_exit"),
+                             {"diagnostics": "withheld", "passed": False})
+            result = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+            self.assertEqual(result["failure"]["reason"], "inventory_elf_build_id")
+            self.assertEqual(result["failure"]["command_stage"], "inventory-elf-dependency")
+            self.assertEqual(result["inner_cleanup"], "failed")
+            self.assertNotIn("private", json.dumps(result))
+
     def test_fixed_schema_matches_peer_and_command_source(self):
         import appimage_capture as capture
         self.assertEqual(D.PEER_FACTS, set(capture.FACTS))
