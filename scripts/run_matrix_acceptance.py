@@ -354,8 +354,12 @@ DRAFT_ONLY_CHECKS = ("drafts_local",)
 # prerequisite for moderation, both search sync paths and real key recovery.
 TIMELINE_READ_TESTS = ("live_local", "formatted_local", "media_local", "moderation_local", "search_local")
 TIMELINE_READ_CHECKS = (*TIMELINE_READ_TESTS, "search_local-classic", "recovery_local", "unsupported_transport_local", APP_TIMELINE_LABEL)
+# Retry the two failed binaries and formatting's dependent moderation check.
+# Passing room/thread UI, media and search cases retain their own evidence.
+TIMELINE_FAILURE_CHECKS = ("formatted_local", "moderation_local", "recovery_local")
 SUITES = {"full": PLANNED_CHECKS, "draft-recovery": DRAFT_RECOVERY_CHECKS,
-          "drafts-only": DRAFT_ONLY_CHECKS, "timeline-reads": TIMELINE_READ_CHECKS}
+          "drafts-only": DRAFT_ONLY_CHECKS, "timeline-reads": TIMELINE_READ_CHECKS,
+          "timeline-failures": TIMELINE_FAILURE_CHECKS}
 # Leave a full minute before the workflow's 55-minute hard kill. Work stops
 # with eleven minutes left: up to three for nested OAuth/Element cleanup, then
 # eight for both shared-service cleanups, checked inventories and log scans.
@@ -881,22 +885,22 @@ class Acceptance:
             failed = re.findall(r"^test ([A-Za-z0-9_:]+) \.\.\. FAILED$", output, re.MULTILINE)
             locations = re.findall(r"panicked at (crates/[A-Za-z0-9_./-]+\.rs:\d+:\d+)", output)
             evidence = {"check": label, "failed_tests": failed, "panic_locations": locations}
+            if test:
+                # All entered test binaries need the same bounded process
+                # facts, including aborts without a Rust FAILED/panic record.
+                evidence["native_process"] = native_process_diagnostics(output, observed_returncode, timed_out)
             if label == "live_local":
                 evidence["live_diagnostics"] = live_diagnostics(output)
-                evidence["native_process"] = native_process_diagnostics(output, observed_returncode, timed_out)
                 if timed_out:
                     evidence["live_diagnostics"]["failure"] = "deadline"
             if label == "drafts_local":
                 evidence["drafts_diagnostics"] = drafts_diagnostics(output)
-                evidence["native_process"] = native_process_diagnostics(output, observed_returncode, timed_out)
                 if timed_out:
                     evidence["drafts_diagnostics"]["failure"] = "deadline"
             if label == APP_RECOVERY_LABEL:
                 evidence["app_recovery_diagnostics"] = app_recovery_diagnostics(output)
-                evidence["native_process"] = native_process_diagnostics(output, observed_returncode, timed_out)
             if label == APP_TIMELINE_LABEL:
                 evidence["app_timeline_diagnostics"] = app_timeline_diagnostics(output)
-                evidence["native_process"] = native_process_diagnostics(output, observed_returncode, timed_out)
             if fixture_diagnostics := matrix_fixture_diagnostics(output):
                 if timed_out:
                     fixture_diagnostics["failure"] = "deadline"
@@ -1056,6 +1060,20 @@ class Acceptance:
             print(json.dumps({"check": "moderation_local", "status": "not_run",
                               "reason": "dependency_failed"}), flush=True)
         self.group((APP_RECOVERY_LABEL,), lambda: self.app_recovery(fixture))
+
+    def timeline_failure_cases(self, fixture: Path):
+        formatted = self.group(("formatted_local",), lambda: self.test("formatted_local", fixture))
+        if formatted:
+            self.group(("moderation_local",), lambda: self.test("moderation_local", fixture))
+        else:
+            self.not_run["moderation_local"] = "dependency_failed"
+            print(json.dumps({"check": "moderation_local", "status": "not_run",
+                              "reason": "dependency_failed"}), flush=True)
+
+        def recovery_case():
+            recovery = fixture_from_output(self.script("local_matrix_env", "recovery-fixture"), self.root)
+            self.test("recovery_local", recovery, extra={"MORPHEUS_MATRIX_TEST_RECOVERY": "1"})
+        self.group(("recovery_local",), recovery_case)
 
     def timeline_read_cases(self, fixture: Path):
         formatted_passed = False
@@ -1226,6 +1244,9 @@ class Acceptance:
                     output.write("Focused timeline-read checks: real Synapse and an ephemeral OS Secret Service. "
                                  "Includes encrypted messages/threads, formatting, media, moderation, both search sync paths, key recovery, chat without a call service and generated-window model delivery/revocation. "
                                  "No OAuth, live-call interoperability or installed-app checks; this is not full acceptance.\n\n")
+                elif self.suite == "timeline-failures":
+                    output.write("Focused formatting, dependent moderation and fresh encrypted-history recovery checks. "
+                                 "This is not full acceptance; other native and live UI evidence is recorded separately.\n\n")
                 elif self.suite == "drafts-only":
                     output.write("Focused drafts-only rerun: real Synapse and an ephemeral OS Secret Service. "
                                  "Only the draft persistence/recovery cases ran. "
@@ -1315,6 +1336,10 @@ def main():
             return
         if args.suite == "timeline-reads":
             acceptance.timeline_read_cases(fixture)
+            acceptance.finish_checks()
+            return
+        if args.suite == "timeline-failures":
+            acceptance.timeline_failure_cases(fixture)
             acceptance.finish_checks()
             return
         # Each selector owns its local profile, fresh devices and unique test

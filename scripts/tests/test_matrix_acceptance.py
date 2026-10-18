@@ -175,6 +175,77 @@ class FocusedSuiteTests(unittest.TestCase):
             self.assertNotIn("Full suite:", summary.read_text())
 
 
+class TimelineFailureSuiteTests(unittest.TestCase):
+    def test_closed_retry_requires_all_three_cases_and_cannot_satisfy_full_acceptance(self):
+        expected = ("formatted_local", "moderation_local", "recovery_local")
+        self.assertEqual(acceptance_module.SUITES["timeline-failures"], expected)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="timeline-failures")
+            for missing in expected:
+                runner.results = [{"check": label} for label in expected if label != missing]
+                with self.subTest(missing=missing), self.assertRaises(RuntimeError):
+                    runner.finish_checks()
+            runner.results = [{"check": label} for label in expected]
+            runner.finish_checks()
+            full = Acceptance(root, "scanner")
+            full.results = list(runner.results)
+            with self.assertRaises(RuntimeError):
+                full.finish_checks()
+
+    def test_retry_preserves_moderation_prerequisite_and_fresh_recovery_credentials(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="timeline-failures")
+            fixture, recovery = root / "fixture.json", root / "recovery.json"
+            with patch.object(runner, "test") as test, \
+                    patch.object(runner, "script", return_value="private-fixture") as script, \
+                    patch.object(acceptance_module, "fixture_from_output", return_value=recovery) as read:
+                runner.timeline_failure_cases(fixture)
+            self.assertEqual([call.args for call in test.call_args_list], [
+                ("formatted_local", fixture), ("moderation_local", fixture), ("recovery_local", recovery),
+            ])
+            self.assertEqual([call.kwargs for call in test.call_args_list], [
+                {}, {}, {"extra": {"MORPHEUS_MATRIX_TEST_RECOVERY": "1"}},
+            ])
+            script.assert_called_once_with("local_matrix_env", "recovery-fixture")
+            read.assert_called_once_with("private-fixture", root)
+            self.assertEqual(runner.failures, [])
+            self.assertEqual(runner.not_run, {})
+
+    def test_formatting_failure_blocks_moderation_but_does_not_hide_recovery(self):
+        visible = io.StringIO()
+        with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(visible):
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="timeline-failures")
+            failure = acceptance_module.CheckFailure("formatted_local", "test_failed")
+            with patch.object(runner, "test", side_effect=[failure, None]) as test, \
+                    patch.object(runner, "script", return_value="private-fixture"), \
+                    patch.object(acceptance_module, "fixture_from_output", return_value=root / "recovery.json"):
+                runner.timeline_failure_cases(root / "fixture.json")
+            self.assertEqual([call.args[0] for call in test.call_args_list], ["formatted_local", "recovery_local"])
+            self.assertEqual(runner.not_run, {"moderation_local": "dependency_failed"})
+            self.assertEqual(runner.failures, [{"check": "formatted_local", "reason": "test_failed"}])
+            with self.assertRaises(RuntimeError):
+                runner.finish_checks()
+        self.assertNotIn("private-fixture", visible.getvalue())
+
+    def test_summary_names_only_the_selected_retry_scope(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="timeline-failures")
+            runner.results = [{"check": label, "passed": 1, "seconds": 1}
+                              for label in acceptance_module.TIMELINE_FAILURE_CHECKS]
+            summary = root / "summary.md"
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
+                runner.summary()
+            report = json.loads((root / "outcomes.json").read_text())
+            self.assertEqual(report["suite"], "timeline-failures")
+            self.assertEqual(report["not_run"], {})
+            self.assertIn("not full acceptance", summary.read_text())
+            self.assertNotIn("Full suite:", summary.read_text())
+
+
 class AppTimelineEvidenceTests(unittest.TestCase):
     @staticmethod
     def output():
@@ -779,6 +850,39 @@ class NativeProcessDiagnosticTests(unittest.TestCase):
             self.assertNotIn("signal", records[0]["native_process"])
             self.assertEqual(records[0]["live_diagnostics"]["stage"], "encrypted_restart_message")
             self.assertNotIn("private-server", visible.getvalue())
+
+
+    def test_all_native_test_failures_report_bounded_abort_facts_without_payload(self):
+        for label in ("formatted_local", "recovery_local"):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as folder:
+                runner = Acceptance(Path(folder), "unused-scanner")
+                runner.containment_verified = True
+                process = Mock(returncode=None)
+                visible = io.StringIO()
+                output = ("running 1 test\nthread 'private-worker' has overflowed its stack\n"
+                          "  process didn't exit successfully: private-command (signal: 6, SIGABRT: abort)\n"
+                          "private-server-response\n")
+                def start(_args, **kwargs):
+                    kwargs["stdout"].write(output.encode())
+                    return process
+                def cleanup(child):
+                    child.returncode = -9
+                with (patch.object(acceptance_module, "namespace_command", return_value=["owned"]),
+                      patch.object(acceptance_module.subprocess, "Popen", side_effect=start),
+                      patch.object(acceptance_module, "wait_owned", return_value=101),
+                      patch.object(acceptance_module, "stop_owned", side_effect=cleanup),
+                      patch.object(acceptance_module.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)),
+                      contextlib.redirect_stdout(visible), self.assertRaises(acceptance_module.CheckFailure)):
+                    runner.run(label, ["mock-test"], test=True, pid_namespace=True)
+                records = [json.loads(line) for line in visible.getvalue().splitlines() if line.startswith("{")]
+                self.assertEqual(records[0]["failed_tests"], [])
+                self.assertEqual(records[0]["panic_locations"], [])
+                process_facts = records[0]["native_process"]
+                self.assertEqual(process_facts["exit_code"], 101)
+                self.assertTrue(process_facts["stack_overflow"])
+                self.assertEqual((process_facts["test_signal"], process_facts["test_signal_name"]), (6, "SIGABRT"))
+                self.assertNotIn("private", visible.getvalue())
+                self.assertEqual(runner.results, [])
 
 
 class LiveStageTests(unittest.TestCase):
