@@ -1634,6 +1634,425 @@ fn exercise_startup_recovery() {
     }
 }
 
+/// The Appearance workspace and Settings search on the generated window: hex
+/// apply, partial-input hints, invalid-file retention, Reset and Undo,
+/// window opacity rollback and persistence, single-paint translucency, every
+/// search target reaching a real control, and bounded results at the smallest
+/// window with 200% text.
+async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std::path::Path) {
+    use i_slint_backend_testing::ElementHandle;
+    use morpheus_config::{ConfigStore, registry};
+
+    let store = ConfigStore::at(directory.join("workspace.toml"));
+    let config = store.load_or_create().unwrap();
+    crate::appearance_editor::register(ui, &store);
+    crate::settings_search::register(ui);
+    apply_config(ui, &config, None);
+    ui.set_page(1);
+    settle(ui).await;
+    for token in registry::COLOR_TOKENS {
+        assert!(
+            ui.invoke_token_known(token.id.into()),
+            "{} has no color",
+            token.id
+        );
+    }
+
+    // A partial value only hints; a complete one applies and saves at once.
+    ui.invoke_color_token_chosen("canvas".into());
+    settle(ui).await;
+    assert_eq!(ui.get_color_selected_id(), "canvas");
+    ui.invoke_color_hex_edited("#10203".into());
+    settle(ui).await;
+    assert!(!ui.get_color_editor().hint.is_empty());
+    assert!(
+        store.load().unwrap().colors.is_empty(),
+        "a partial value was saved"
+    );
+    ui.invoke_color_hex_edited("#10203040".into());
+    settle(ui).await;
+    let canvas = || store.load().unwrap().colors.get("canvas").cloned();
+    assert_eq!(canvas().as_deref(), Some("#10203040"));
+    let applied = Color::from_argb_u8(0x40, 0x10, 0x20, 0x30);
+    assert_eq!(ui.invoke_token_color("canvas".into()), applied);
+    assert!(ui.get_color_editor().overridden && ui.get_color_editor().can_undo);
+    // A partial-alpha pane is painted once at 100%: the window clears.
+    assert!(ui.get_window_background_cleared());
+
+    // An invalid hand edit is never overwritten and the last valid color stays.
+    let saved = std::fs::read_to_string(store.path()).unwrap();
+    let broken = "[colors]\ncanvas = \"broken\"\n";
+    std::fs::write(store.path(), broken).unwrap();
+    ui.invoke_color_hex_edited("#AABBCC".into());
+    settle(ui).await;
+    assert_eq!(std::fs::read_to_string(store.path()).unwrap(), broken);
+    assert_eq!(ui.invoke_token_color("canvas".into()), applied);
+    assert!(!ui.get_config_error().is_empty());
+    assert!(!ui.get_config_error().contains("broken"));
+    std::fs::write(store.path(), &saved).unwrap();
+
+    // Reset removes one override; Undo restores it.
+    ui.invoke_color_reset();
+    settle(ui).await;
+    assert_eq!(canvas(), None);
+    assert!(
+        !ui.get_window_background_cleared(),
+        "opaque panes keep the window background"
+    );
+    ui.invoke_color_undo();
+    settle(ui).await;
+    assert_eq!(canvas().as_deref(), Some("#10203040"));
+    ui.invoke_color_reset();
+    settle(ui).await;
+
+    // This test runs no watcher, so a valid edit written straight to the file
+    // stays undelivered until the editor's own next save. The undo step takes
+    // its prior value from the re-read file, never from the applied view, and
+    // the save keeps the other edit.
+    let colors = || store.load().unwrap().colors;
+    let color = |id: &str| colors().get(id).cloned();
+    ui.invoke_color_hex_edited("#112233".into());
+    settle(ui).await;
+    assert_eq!(canvas().as_deref(), Some("#112233"));
+    let mut external = store.load().unwrap();
+    external.colors.insert("canvas".into(), "#445566".into());
+    external.colors.insert("link".into(), "#778899".into());
+    store.save(&external).unwrap();
+    ui.invoke_color_hex_edited("#ABCDEF".into());
+    settle(ui).await;
+    assert_eq!(canvas().as_deref(), Some("#ABCDEF"));
+    assert_eq!(
+        color("link").as_deref(),
+        Some("#778899"),
+        "an undelivered edit was overwritten"
+    );
+    ui.invoke_color_undo();
+    settle(ui).await;
+    assert_eq!(
+        canvas().as_deref(),
+        Some("#445566"),
+        "undo restored the stale applied value"
+    );
+    assert_eq!(color("link").as_deref(), Some("#778899"));
+    // Undo never overwrites a later edit made elsewhere: the step is dropped
+    // with a hint and the file is left as it is.
+    ui.invoke_color_hex_edited("#123456".into());
+    settle(ui).await;
+    assert!(ui.get_color_editor().can_undo);
+    let mut external = store.load().unwrap();
+    external.colors.insert("canvas".into(), "#654321".into());
+    store.save(&external).unwrap();
+    let superseded = std::fs::read_to_string(store.path()).unwrap();
+    ui.invoke_color_undo();
+    settle(ui).await;
+    assert_eq!(std::fs::read_to_string(store.path()).unwrap(), superseded);
+    assert!(!ui.get_color_editor().can_undo);
+    assert!(!ui.get_color_editor().hint.is_empty());
+
+    // Arming Reset all keeps single-color undo; the removal takes the
+    // overrides the file holds then, including an undelivered one.
+    ui.invoke_color_token_chosen("link".into());
+    settle(ui).await;
+    ui.invoke_color_hex_edited("#010203".into());
+    settle(ui).await;
+    ui.invoke_color_reset_all();
+    settle(ui).await;
+    assert!(!ui.get_color_reset_all_notice().is_empty());
+    assert!(
+        ui.get_color_editor().can_undo,
+        "arming Reset all dropped undo"
+    );
+    let mut external = store.load().unwrap();
+    external.colors.insert("accent".into(), "#0A0B0C".into());
+    store.save(&external).unwrap();
+    let expected = store.load().unwrap().colors;
+    assert_eq!(expected.len(), 3);
+    ui.invoke_color_reset_all();
+    settle(ui).await;
+    assert!(colors().is_empty());
+    assert_eq!(
+        ui.get_color_reset_all_notice(),
+        "Restore the 3 removed colors"
+    );
+    assert!(!ui.get_color_editor().can_undo);
+    // A failed restore leaves the file alone and keeps the snapshot, so the
+    // restore can be tried again once the file is valid.
+    let cleared = std::fs::read_to_string(store.path()).unwrap();
+    std::fs::write(store.path(), "not = [valid\n").unwrap();
+    ui.invoke_color_reset_all();
+    settle(ui).await;
+    assert_eq!(
+        std::fs::read_to_string(store.path()).unwrap(),
+        "not = [valid\n"
+    );
+    assert!(!ui.get_config_error().is_empty());
+    assert_eq!(
+        ui.get_color_reset_all_notice(),
+        "Restore the 3 removed colors"
+    );
+    std::fs::write(store.path(), &cleared).unwrap();
+    ui.invoke_color_reset_all();
+    settle(ui).await;
+    assert_eq!(colors(), expected);
+    assert!(ui.get_color_reset_all_notice().is_empty());
+    // Back to no overrides, as applied, for the checks below.
+    let mut plain = store.load().unwrap();
+    plain.colors.clear();
+    store.save(&plain).unwrap();
+    apply_config(ui, &plain, None);
+    ui.invoke_color_token_chosen("canvas".into());
+    settle(ui).await;
+
+    // A rejected opacity save rolls the preview back to the last valid value.
+    let tokens = ui.global::<crate::StyleTokens>();
+    ui.invoke_preview_window_opacity(30);
+    settle(ui).await;
+    assert!((tokens.get_window_opacity() - 0.3).abs() < 0.001);
+    assert!(ui.get_window_background_cleared());
+    let valid = std::fs::read_to_string(store.path()).unwrap();
+    std::fs::write(store.path(), "not = [valid\n").unwrap();
+    ui.invoke_set_window_opacity(30);
+    settle(ui).await;
+    assert_eq!(tokens.get_window_opacity(), 1.0);
+    assert_eq!(ui.get_window_opacity_percent(), 100);
+    assert!(!ui.get_window_background_cleared());
+    std::fs::write(store.path(), &valid).unwrap();
+    ui.invoke_set_window_opacity(99);
+    settle(ui).await;
+    assert_eq!(store.load().unwrap().window.opacity_percent, 99);
+    assert!(ui.get_window_background_cleared());
+    ui.invoke_set_window_opacity(100);
+    settle(ui).await;
+    assert!(!ui.get_window_background_cleared());
+
+    // Keyboard changes persist on key release; accessibility changes after
+    // the value settles, with no pointer release.
+    assert!(crate::settings_search::reveal(
+        ui,
+        "appearance.window_opacity"
+    ));
+    settle(ui).await;
+    assert_eq!(ui.get_settings_revealed_id(), "appearance.window_opacity");
+    assert!(focused_control_has_label(
+        ui,
+        "Window background opacity, percent"
+    ));
+    key(ui, Key::LeftArrow);
+    settle(ui).await;
+    assert_eq!(store.load().unwrap().window.opacity_percent, 99);
+    let slider = ElementHandle::find_by_accessible_label(ui, "Window background opacity, percent")
+        .next()
+        .expect("the opacity slider is exposed to assistive technology");
+    slider.set_accessible_value("50");
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(500));
+    settle(ui).await;
+    assert_eq!(store.load().unwrap().window.opacity_percent, 50);
+    ui.invoke_set_window_opacity(100);
+    settle(ui).await;
+
+    // Every search target reaches a real, enabled control; none changes a
+    // setting or runs an action.
+    use std::{cell::Cell, rc::Rc};
+    let actions = Rc::new(Cell::new(0));
+    let counted = actions.clone();
+    ui.on_check_for_updates(move || counted.set(counted.get() + 1));
+    let counted = actions.clone();
+    ui.on_refresh_security(move || counted.set(counted.get() + 1));
+    let counted = actions.clone();
+    ui.on_select_audio_microphone(move |_| counted.set(counted.get() + 1));
+    let before = std::fs::read_to_string(store.path()).unwrap();
+    let live = ui.get_live_session();
+    ui.set_live_session(true);
+    ui.set_update_can_check(true);
+    ui.set_audio_devices_enabled(true);
+    ui.set_audio_devices_busy(false);
+    ui.set_security_loading(false);
+    ui.set_security_busy(false);
+    settle(ui).await;
+    for target in registry::SETTING_TARGETS {
+        ui.set_manage_accounts_open(false);
+        ui.set_settings_revealed_id("".into());
+        settle(ui).await;
+        assert!(
+            crate::settings_search::reveal(ui, target.id),
+            "{}",
+            target.id
+        );
+        settle(ui).await;
+        assert_eq!(
+            ui.get_settings_revealed_id(),
+            target.id,
+            "{} has no destination",
+            target.id
+        );
+    }
+    for (target, label) in [
+        ("appearance.reduce_motion", "Reduce motion, off"),
+        ("notifications.desktop", "Desktop notifications"),
+        ("updates", "Check for updates"),
+    ] {
+        assert!(crate::settings_search::reveal(ui, target));
+        settle(ui).await;
+        assert!(focused_control_has_label(ui, label), "{target} focus");
+    }
+    // Unavailable controls are never claimed: their status line is revealed
+    // and reported as such, and nothing is invoked.
+    ui.set_update_can_check(false);
+    ui.set_audio_devices_enabled(false);
+    ui.set_security_busy(true);
+    settle(ui).await;
+    let update_status = format!(
+        "Application update status: {}",
+        if ui.get_update_status().is_empty() {
+            "No update status yet.".into()
+        } else {
+            ui.get_update_status()
+        }
+    );
+    let security_status = format!(
+        "Device security status: {}",
+        ui.get_security_device_status()
+    );
+    for (target, label) in [
+        ("updates", update_status.as_str()),
+        ("security.recovery", security_status.as_str()),
+    ] {
+        assert!(crate::settings_search::reveal(ui, target));
+        settle(ui).await;
+        assert_eq!(ui.get_settings_revealed_id(), format!("{target}:status"));
+        assert!(
+            focused_control_has_label(ui, label),
+            "{target} status focus"
+        );
+    }
+    for (enabled, busy) in [(false, false), (true, true)] {
+        ui.set_audio_devices_enabled(enabled);
+        ui.set_audio_devices_busy(busy);
+        ui.set_settings_revealed_id("".into());
+        settle(ui).await;
+        assert!(crate::settings_search::reveal(ui, "media.audio_devices"));
+        settle(ui).await;
+        assert_eq!(ui.get_settings_revealed_id(), "media.audio_devices:status");
+    }
+    assert_eq!(actions.get(), 0, "search ran an action");
+    ui.on_check_for_updates(|| {});
+    ui.on_refresh_security(|| {});
+    ui.on_select_audio_microphone(|_| {});
+    ui.set_security_busy(false);
+    ui.set_audio_devices_busy(false);
+    ui.set_manage_accounts_open(false);
+    ui.set_live_session(live);
+    settle(ui).await;
+    assert_eq!(std::fs::read_to_string(store.path()).unwrap(), before);
+
+    // At the smallest window, at 100% and 200% text, the token list is a
+    // bounded region and choosing a token by keyboard brings its editor into
+    // view with the hex field focused.
+    for scale in [100, 200] {
+        ui.window().set_size(slint::PhysicalSize::new(940, 620));
+        ui.set_font_scale_percent(scale);
+        ui.set_page(1);
+        settle(ui).await;
+        assert!(crate::settings_search::reveal(ui, "appearance.colors"));
+        settle(ui).await;
+        assert_eq!(ui.get_settings_revealed_id(), "appearance.colors");
+        let window_height = ui
+            .window()
+            .size()
+            .to_logical(ui.window().scale_factor())
+            .height;
+        let list = control_with_label(ui, "Colors to edit");
+        assert!(
+            list.geometry().size.height <= (140.0f32).max(window_height * 0.24) + 1.0,
+            "{scale}%: the token list is not bounded"
+        );
+        type_text(ui, "link");
+        settle(ui).await;
+        tab_to_control(ui, "Links, selected");
+        key(ui, Key::Return);
+        settle(ui).await;
+        let hex_label = "Hex color for Links, #RRGGBB or #RRGGBBAA";
+        assert!(
+            focused_control_has_label(ui, hex_label),
+            "{scale}%: the editor field has focus"
+        );
+        let hex = control_with_label(ui, hex_label);
+        let top = hex.map_to_window(hex.geometry().origin).y;
+        assert!(
+            top >= 0.0 && top + hex.geometry().size.height <= window_height + 0.5,
+            "{scale}%: the hex field is outside the window"
+        );
+        ui.set_color_filter("".into());
+        ui.invoke_color_filter_changed("".into());
+        settle(ui).await;
+    }
+
+    // Eight long results at the smallest window and 200% text stay inside the
+    // window; Down keeps the highlighted row visible and Enter reveals it.
+    // Whatever the eighth result is, its control is available here.
+    ui.set_update_can_check(true);
+    ui.set_audio_devices_enabled(true);
+    ui.window().set_size(slint::PhysicalSize::new(940, 620));
+    ui.set_font_scale_percent(200);
+    ui.set_settings_search_query("".into());
+    ui.invoke_settings_search("".into());
+    settle(ui).await;
+    click_control_once(ui, "Search settings");
+    type_text(ui, "e");
+    settle(ui).await;
+    let results = ui.get_settings_search_results();
+    assert_eq!(results.row_count(), registry::MAX_SEARCH_RESULTS);
+    let window_height = ui
+        .window()
+        .size()
+        .to_logical(ui.window().scale_factor())
+        .height;
+    let field = control_with_label(ui, "Search settings");
+    let field_bottom =
+        field.map_to_window(field.geometry().origin).y + field.geometry().size.height;
+    assert!(
+        field_bottom < window_height / 2.0,
+        "the search field stays near the top"
+    );
+    for _ in 1..registry::MAX_SEARCH_RESULTS {
+        key(ui, Key::DownArrow);
+    }
+    settle(ui).await;
+    assert_eq!(
+        ui.get_settings_search_index(),
+        registry::MAX_SEARCH_RESULTS as i32 - 1
+    );
+    assert!(
+        focused_control_has_label(ui, "Search settings"),
+        "the field keeps focus"
+    );
+    let last = results.row_data(registry::MAX_SEARCH_RESULTS - 1).unwrap();
+    let row = control_with_label(
+        ui,
+        &format!("{}, {}. {}", last.label, last.breadcrumb, last.description),
+    );
+    let top = row.map_to_window(row.geometry().origin).y;
+    let bottom = top + row.geometry().size.height;
+    assert!(
+        top >= field_bottom - 0.5 && bottom <= window_height + 0.5,
+        "{top}..{bottom}"
+    );
+    key(ui, Key::Return);
+    settle(ui).await;
+    assert_eq!(ui.get_settings_revealed_id(), last.id);
+
+    ui.set_manage_accounts_open(false);
+    ui.set_update_can_check(false);
+    ui.set_audio_devices_enabled(false);
+    ui.set_settings_search_query("".into());
+    ui.invoke_settings_search("".into());
+    ui.set_font_scale_percent(100);
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    ui.set_page(0);
+    apply_config(ui, &Config::default(), None);
+    settle(ui).await;
+}
+
 async fn exercise_account_ui(runtime: Handle) {
     #[cfg(not(morpheus_timeline_acceptance))]
     exercise_startup_recovery();
@@ -1656,6 +2075,7 @@ async fn exercise_account_ui(runtime: Handle) {
     assert_palette_and_density_keyboard(&ui).await;
     assert_scale_keyboard_and_focus_bounds(&ui).await;
     assert_message_role_precedence_and_thread_metadata(&ui).await;
+    assert_appearance_workspace_and_search(&ui, directory.path()).await;
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),
     )));
@@ -2556,7 +2976,10 @@ async fn assert_sticker_picker_projection(ui: &AppWindow) {
     assert_eq!(button_bounds(ui, "Allow sticker images here").len(), 1);
     // A placed action keeps a real height: an action sized by a zero
     // preferred height is still focusable but has no visible target.
-    for label in ["Allow sticker images here", "Cancel and close the sticker picker"] {
+    for label in [
+        "Allow sticker images here",
+        "Cancel and close the sticker picker",
+    ] {
         let bounds = button_bounds(ui, label);
         assert_eq!(bounds.len(), 1, "{label}");
         assert!(

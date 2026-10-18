@@ -11,6 +11,9 @@ while the app runs. A broken edit produces an error, and the last valid
 configuration remains active. The file never contains Matrix access tokens or
 recovery keys.
 
+For assistant-assisted edits, see the [editing guide](EDITING_APPEARANCE.md)
+and its sparse, validated configuration example.
+
 Settings edits appearance presets, interface/message/monospace fonts, message
 layout, avatars, timestamps, sender colors, spacing, corner radius and rail
 width. Existing controls cover font scale (75–200%), room/message density,
@@ -376,6 +379,13 @@ also include `[roles]` and `[senders]`. These belong in the theme TOML beside
 | `message` | Message body text; omitted keeps ink |
 | `own_message` | Name and body text of your own messages in the timeline, the thread root and thread replies; omitted falls back to `sender`, `message`, then ink |
 | `own_surface` | Background of your own messages (timeline rows, the thread root and thread replies) when the row is neither selected nor hovered; omitted keeps the previous row background |
+| `scrim` | Backdrop behind dialogs and the image viewer, usually translucent; omitted keeps the built-in dark backdrop |
+| `shadow` | Shadow beneath popups, usually translucent; omitted keeps `#00000044` |
+| `media_backdrop` | Background behind an opened image; omitted keeps `#11131B` |
+| `presence_online` | The online dot beside member names; omitted keeps `#64C9A7` |
+| `avatar_ink` | Initials on avatar backgrounds, whose colors stay identity colors; omitted keeps `#FFFFFF` |
+
+Every built-in preset theme sets every role explicitly.
 
 For example, keep the `[colors]` table from the dark Nocturne theme and set
 these optional sections in that theme file:
@@ -402,13 +412,20 @@ sender = "#E8EDF2"
 message = "#E8EDF2"
 own_message = "#F3F6FA"
 own_surface = "#20283A"
+scrim = "#000000AA"
+shadow = "#00000044"
+media_backdrop = "#111216"
+presence_online = "#9FD5BD"
+avatar_ink = "#FFFFFF"
 
 [senders]
 colors = ["#C2AEFA", "#9DD8CD", "#F0C28F", "#ACCEFF", "#E7AED1", "#C7D59B"]
 ```
 
-All colors must be `#RRGGBB`; names, transparency values and malformed strings
-are rejected. `senders.colors` accepts **1–16 colors**. An empty list is invalid;
+All colors must be `#RRGGBB` or `#RRGGBBAA` (alpha last); names and malformed
+strings are rejected. See [the appearance contract](APPEARANCE.md) for the hex
+convention, sparse `[colors]` overrides in `config.toml` and window
+transparency. `senders.colors` accepts **1–16 colors**. An empty list is invalid;
 omit it to restore the previous sender colors. Repeated colors and a one-color
 palette are allowed. Sender colors apply when **Settings → Appearance → Colored
 sender names** is on (`chat.color_senders = true`). It takes precedence over the
@@ -429,9 +446,9 @@ Old eleven-token themes keep their previous per-control fallbacks. Omitting a
 role restores that control's existing color; it does not borrow the value from
 the previously selected theme. Editing colors or removing optional fields
 reloads the active palette. Invalid edits retain the last valid appearance and
-show an error. Semantic and sender-palette values are edited in the theme file;
-Settings currently offers preset/base-palette selection and the sender-color
-toggle, not an individual color editor.
+show an error. Any token can also be overridden in the `[colors]` table of `config.toml`,
+which the Settings color editor writes; sender palettes are edited in the theme
+file.
 
 To reset custom colors, choose a **Base palette** in Settings; this clears the
 custom theme selection and preserves fonts and geometry. To reset an embedded

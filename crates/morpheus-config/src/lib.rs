@@ -14,6 +14,12 @@ use std::thread;
 use std::time::Duration;
 use thiserror::Error;
 
+pub mod diagnostics;
+mod input;
+pub mod registry;
+
+pub use input::{InputError, MAX_CONFIG_BYTES, MAX_THEME_BYTES, read_bounded};
+
 pub const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Error)]
@@ -22,16 +28,131 @@ pub enum ConfigError {
     MissingConfigDirectory,
     #[error("configuration file I/O failed: {0}")]
     Io(#[from] std::io::Error),
-    #[error("invalid TOML configuration: {0}")]
-    Decode(#[from] toml::de::Error),
+    /// A parse or schema-shape error, reduced to fixed text: the TOML
+    /// parser's own message can quote the file, so it is never shown.
+    #[error("invalid TOML: {0}")]
+    Decode(diagnostics::DecodeError),
     #[error("could not encode TOML configuration: {0}")]
     Encode(#[from] toml::ser::Error),
-    #[error("unsupported configuration schema version {0}")]
-    Version(u32),
+    /// The rejected number is file content, so the error carries none:
+    /// neither its text nor its `Debug` form can repeat it.
+    #[error("unsupported configuration schema version; this version reads schema_version = 1")]
+    Version,
     #[error("invalid configuration: {0}")]
     Invalid(String),
     #[error("invalid theme pack: {0}")]
     InvalidTheme(String),
+    #[error("configuration file: {0}")]
+    Input(#[from] InputError),
+    /// One field of `config.toml` is invalid. The message never quotes the
+    /// rejected value.
+    #[error("invalid configuration: {field} {problem}")]
+    Field { field: String, problem: Problem },
+    /// One field of the selected theme file is invalid.
+    #[error("invalid theme pack: {field} {problem}")]
+    ThemeField { field: String, problem: Problem },
+}
+
+/// What is wrong with one field, as fixed text with a stable code. Bounds
+/// come from the schema; the rejected value is never repeated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Problem {
+    Range { minimum: u32, maximum: u32 },
+    FontFamily,
+    ThemeName,
+    ThemeDisplayName,
+    Color,
+    UnknownColorToken,
+    PaletteLength { maximum: usize },
+    AudioDevice,
+    RoomId,
+    CallModeConflict,
+    UnknownShortcutAction,
+    Shortcut(&'static str),
+    ShortcutConflict,
+}
+
+impl Problem {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Range { .. } => "out-of-range",
+            Self::FontFamily => "invalid-font-family",
+            Self::ThemeName => "invalid-theme-name",
+            Self::ThemeDisplayName => "invalid-theme-display-name",
+            Self::Color => "invalid-color",
+            Self::UnknownColorToken => "unknown-color-token",
+            Self::PaletteLength { .. } => "invalid-palette-length",
+            Self::AudioDevice => "invalid-audio-device",
+            Self::RoomId => "invalid-room-id",
+            Self::CallModeConflict => "call-mode-conflict",
+            Self::UnknownShortcutAction => "unknown-shortcut-action",
+            Self::Shortcut(_) => "invalid-shortcut",
+            Self::ShortcutConflict => "shortcut-conflict",
+        }
+    }
+}
+
+impl std::fmt::Display for Problem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Range { minimum, maximum } => {
+                write!(formatter, "must be between {minimum} and {maximum}")
+            }
+            Self::FontFamily => formatter.write_str(
+                "must be a nonempty font family of at most 128 bytes without control or direction characters",
+            ),
+            Self::ThemeName => formatter.write_str("must be a theme name, not a path"),
+            Self::ThemeDisplayName => {
+                formatter.write_str("must contain between 1 and 80 characters")
+            }
+            Self::Color => formatter.write_str("must be a #RRGGBB or #RRGGBBAA color"),
+            Self::UnknownColorToken => {
+                formatter.write_str("names a color token this version does not have")
+            }
+            Self::PaletteLength { maximum } => write!(
+                formatter,
+                "must contain between 1 and {maximum} colors; omit it to use the built-in colors"
+            ),
+            Self::AudioDevice => formatter.write_str(
+                "must be a host-qualified device ID of at most 4096 bytes; remove the field to use the system default",
+            ),
+            Self::RoomId => formatter.write_str("must contain Matrix room IDs"),
+            Self::CallModeConflict => {
+                formatter.write_str("lists a room that also uses the other Element Call mode")
+            }
+            Self::UnknownShortcutAction => formatter.write_str("names an unknown shortcut action"),
+            Self::Shortcut(reason) => formatter.write_str(reason),
+            Self::ShortcutConflict => formatter.write_str("conflicts with another shortcut"),
+        }
+    }
+}
+
+/// Parse TOML text, keeping only a sanitized error. Every runtime load, theme
+/// load, reload and Settings save, and the offline validator, parse here.
+pub(crate) fn parse_toml<T: serde::de::DeserializeOwned>(
+    raw: &str,
+    file: diagnostics::FileKind,
+) -> Result<T, ConfigError> {
+    toml::from_str(raw)
+        .map_err(|error| ConfigError::Decode(diagnostics::decode_error(file, raw, &error)))
+}
+
+pub(crate) fn is_room_id(value: &str) -> bool {
+    validate_room_id(value).is_ok()
+}
+
+fn field_error(field: impl Into<String>, problem: Problem) -> ConfigError {
+    ConfigError::Field {
+        field: field.into(),
+        problem,
+    }
+}
+
+fn theme_error(field: impl Into<String>, problem: Problem) -> ConfigError {
+    ConfigError::ThemeField {
+        field: field.into(),
+        problem,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +170,30 @@ pub struct Config {
     pub shortcuts: BTreeMap<String, String>,
     pub experimental: Experimental,
     pub account_overrides: BTreeMap<String, AccountOverrides>,
+    /// Sparse color overrides keyed by `registry::COLOR_TOKENS` IDs. They
+    /// apply over the built-in palette and the selected theme pack, in every
+    /// theme mode, and survive choosing a starting point.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub colors: BTreeMap<String, String>,
+    pub window: WindowStyle,
+}
+
+/// The native window's own background.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WindowStyle {
+    /// Percent of each window surface's own alpha that is painted: 100 is
+    /// unchanged and 0 leaves only the desktop behind those surfaces. Text,
+    /// icons, controls, cards and dialogs keep their own colors.
+    pub opacity_percent: u8,
+}
+
+impl Default for WindowStyle {
+    fn default() -> Self {
+        Self {
+            opacity_percent: 100,
+        }
+    }
 }
 
 impl Default for Config {
@@ -66,6 +211,8 @@ impl Default for Config {
             shortcuts: default_shortcuts(),
             experimental: Experimental::default(),
             account_overrides: BTreeMap::new(),
+            colors: BTreeMap::new(),
+            window: WindowStyle::default(),
         }
     }
 }
@@ -73,69 +220,90 @@ impl Default for Config {
 impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.schema_version != SCHEMA_VERSION {
-            return Err(ConfigError::Version(self.schema_version));
+            return Err(ConfigError::Version);
         }
-        if !(75..=200).contains(&self.appearance.scale_percent) {
-            return Err(ConfigError::Invalid(
-                "appearance.scale_percent must be between 75 and 200".into(),
-            ));
-        }
-        if !(180..=480).contains(&self.layout.room_list_width) {
-            return Err(ConfigError::Invalid(
-                "layout.room_list_width must be between 180 and 480".into(),
-            ));
-        }
-        if !(200..=520).contains(&self.layout.details_width) {
-            return Err(ConfigError::Invalid(
-                "layout.details_width must be between 200 and 520".into(),
-            ));
-        }
+        validate_range(
+            "appearance.scale_percent",
+            self.appearance.scale_percent,
+            75,
+            200,
+        )?;
+        validate_range(
+            "layout.room_list_width",
+            self.layout.room_list_width,
+            180,
+            480,
+        )?;
+        validate_range("layout.details_width", self.layout.details_width, 200, 520)?;
         validate_font_family("appearance.font_family", &self.appearance.font_family)?;
         self.typography.validate()?;
         self.geometry.validate()?;
         self.chat.validate()?;
         if let Some(name) = &self.appearance.theme_pack
-            && (name.is_empty()
-                || !name.chars().all(|character| {
-                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
-                }))
+            && !is_theme_name(name)
         {
-            return Err(ConfigError::Invalid(
-                "appearance.theme_pack must be a theme name, not a path".into(),
-            ));
+            return Err(field_error("appearance.theme_pack", Problem::ThemeName));
         }
+        for (id, value) in &self.colors {
+            if registry::color_token(id).is_none() {
+                return Err(field_error("colors", Problem::UnknownColorToken));
+            }
+            if registry::parse_hex_color(value).is_none() {
+                return Err(field_error(format!("colors.{id}"), Problem::Color));
+            }
+        }
+        let (minimum, maximum) = (
+            *registry::WINDOW_OPACITY_RANGE.start(),
+            *registry::WINDOW_OPACITY_RANGE.end(),
+        );
+        validate_range(
+            "window.opacity_percent",
+            self.window.opacity_percent.into(),
+            minimum.into(),
+            maximum.into(),
+        )?;
         validate_shortcuts(&self.shortcuts)?;
         self.media.validate_audio_devices()?;
         for overrides in self.account_overrides.values() {
-            for room_id in &overrides.local_voice_rooms {
-                if validate_room_id(room_id).is_err() {
-                    return Err(ConfigError::Invalid(
-                        "account_overrides.local_voice_rooms must contain Matrix room IDs".into(),
+            for (field, rooms) in [
+                ("local_voice_rooms", &overrides.local_voice_rooms),
+                (
+                    "legacy_element_call_rooms",
+                    &overrides.legacy_element_call_rooms,
+                ),
+                (
+                    "element_call_matrix_2_0_rooms",
+                    &overrides.element_call_matrix_2_0_rooms,
+                ),
+            ] {
+                if rooms
+                    .iter()
+                    .any(|room_id| validate_room_id(room_id).is_err())
+                {
+                    // The account ID is never part of a field path.
+                    return Err(field_error(
+                        format!("account_overrides.<account>.{field}"),
+                        Problem::RoomId,
                     ));
                 }
             }
-            for room_id in &overrides.legacy_element_call_rooms {
-                if validate_room_id(room_id).is_err() {
-                    return Err(ConfigError::Invalid(
-                        "account_overrides.legacy_element_call_rooms must contain Matrix room IDs"
-                            .into(),
-                    ));
-                }
-            }
-            for room_id in &overrides.element_call_matrix_2_0_rooms {
-                if validate_room_id(room_id).is_err() {
-                    return Err(ConfigError::Invalid(
-                        "account_overrides.element_call_matrix_2_0_rooms must contain Matrix room IDs".into(),
-                    ));
-                }
-                if overrides.legacy_element_call_rooms.contains(room_id) {
-                    return Err(ConfigError::Invalid(
-                        "a room cannot use both Element Call compatibility modes".into(),
-                    ));
-                }
+            if overrides
+                .element_call_matrix_2_0_rooms
+                .iter()
+                .any(|room_id| overrides.legacy_element_call_rooms.contains(room_id))
+            {
+                return Err(field_error(
+                    "account_overrides.<account>.element_call_matrix_2_0_rooms",
+                    Problem::CallModeConflict,
+                ));
             }
         }
         Ok(())
+    }
+
+    /// The valid override of one color token, if `config.toml` sets one.
+    pub fn color_override(&self, id: &str) -> Option<[u8; 4]> {
+        registry::parse_hex_color(self.colors.get(id)?)
     }
 
     /// Materialize a built-in style into the same preferences edited by TOML
@@ -603,11 +771,24 @@ pub struct Conversation {
 
 fn validate_range(name: &str, value: u16, minimum: u16, maximum: u16) -> Result<(), ConfigError> {
     if !(minimum..=maximum).contains(&value) {
-        return Err(ConfigError::Invalid(format!(
-            "{name} must be between {minimum} and {maximum}"
-        )));
+        return Err(field_error(
+            name,
+            Problem::Range {
+                minimum: minimum.into(),
+                maximum: maximum.into(),
+            },
+        ));
     }
     Ok(())
+}
+
+/// A theme file name: ASCII letters, digits, `-` or `_`, never a path.
+pub fn is_theme_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
 fn validate_font_family(name: &str, family: &str) -> Result<(), ConfigError> {
@@ -618,9 +799,7 @@ fn validate_font_family(name: &str, family: &str) -> Result<(), ConfigError> {
                 || matches!(character, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
         })
     {
-        return Err(ConfigError::Invalid(format!(
-            "{name} must be a nonempty font family of at most 128 bytes without control or direction characters"
-        )));
+        return Err(field_error(name, Problem::FontFamily));
     }
     Ok(())
 }
@@ -654,7 +833,7 @@ impl BuiltInStylePreset {
     }
 
     pub fn theme(self) -> Result<ThemePack, ConfigError> {
-        let theme: ThemePack = toml::from_str(self.theme_source())?;
+        let theme: ThemePack = parse_toml(self.theme_source(), diagnostics::FileKind::Theme)?;
         theme.validate()?;
         Ok(theme)
     }
@@ -754,9 +933,7 @@ impl Media {
                         && !device.trim().is_empty()
                 });
             if !valid {
-                return Err(ConfigError::Invalid(format!(
-                    "media.{field} must be a host-qualified device ID of at most 4096 bytes; remove the field to use the system default"
-                )));
+                return Err(field_error(format!("media.{field}"), Problem::AudioDevice));
             }
         }
         Ok(())
@@ -898,7 +1075,7 @@ impl Shortcut {
     /// on macOS and Control elsewhere. Missing actions are disabled; empty or
     /// malformed values are errors, so a typo cannot silently disable a binding.
     pub fn parse(value: &str) -> Result<Self, ConfigError> {
-        let invalid = |reason: &str| ConfigError::Invalid(format!("shortcut {value:?}: {reason}"));
+        let invalid = |reason: &'static str| field_error("shortcuts", Problem::Shortcut(reason));
         if value.len() > 64 || !value.is_ascii() || value.chars().any(char::is_control) {
             return Err(invalid("use a short ASCII key combination"));
         }
@@ -1032,12 +1209,14 @@ pub fn validate_shortcuts(values: &BTreeMap<String, String>) -> Result<(), Confi
     let mut bindings: Vec<(&str, Shortcut)> = Vec::new();
     for (name, value) in values {
         if ShortcutAction::parse(name).is_none() {
-            return Err(ConfigError::Invalid(format!(
-                "unknown shortcut action {name:?}"
-            )));
+            return Err(field_error("shortcuts", Problem::UnknownShortcutAction));
         }
-        let shortcut = Shortcut::parse(value)?;
-        for (other_name, other) in &bindings {
+        // The action name is known, so naming it repeats no file content.
+        let shortcut = Shortcut::parse(value).map_err(|error| match error {
+            ConfigError::Field { problem, .. } => field_error(format!("shortcuts.{name}"), problem),
+            other => other,
+        })?;
+        for (_, other) in &bindings {
             // A config is portable: reject an alias conflict on either platform,
             // even when the file is currently being edited on the other one.
             if other.key == shortcut.key
@@ -1045,9 +1224,10 @@ pub fn validate_shortcuts(values: &BTreeMap<String, String>) -> Result<(), Confi
                     .into_iter()
                     .any(|macos| other.modifiers(macos) == shortcut.modifiers(macos))
             {
-                return Err(ConfigError::Invalid(format!(
-                    "shortcuts {other_name} and {name} conflict"
-                )));
+                return Err(field_error(
+                    format!("shortcuts.{name}"),
+                    Problem::ShortcutConflict,
+                ));
             }
         }
         bindings.push((name, shortcut));
@@ -1085,23 +1265,31 @@ impl ConfigStore {
             .join("themes"))
     }
 
+    /// The theme file a validated `appearance.theme_pack` names. The name was
+    /// checked to contain no separator, so it cannot leave the themes folder.
+    pub fn theme_path(&self, name: &str) -> Result<PathBuf, ConfigError> {
+        if !is_theme_name(name) {
+            return Err(field_error("appearance.theme_pack", Problem::ThemeName));
+        }
+        Ok(self.themes_dir()?.join(format!("{name}.toml")))
+    }
+
     pub fn load_theme(&self, config: &Config) -> Result<Option<ThemePack>, ConfigError> {
         let Some(name) = config.appearance.theme_pack.as_deref() else {
             return Ok(None);
         };
         config.validate()?;
-        let path = self.themes_dir()?.join(format!("{name}.toml"));
-        let raw = match fs::read_to_string(path) {
+        let raw = match read_bounded(&self.theme_path(name)?, MAX_THEME_BYTES) {
             Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(InputError::Missing) => {
                 if let Some(preset) = BuiltInStylePreset::from_theme_name(name) {
                     return preset.theme().map(Some);
                 }
-                return Err(error.into());
+                return Err(InputError::Missing.into());
             }
             Err(error) => return Err(error.into()),
         };
-        let theme: ThemePack = toml::from_str(&raw)?;
+        let theme: ThemePack = parse_toml(&raw, diagnostics::FileKind::Theme)?;
         theme.validate()?;
         Ok(Some(theme))
     }
@@ -1116,8 +1304,8 @@ impl ConfigStore {
     }
 
     pub fn load(&self) -> Result<Config, ConfigError> {
-        let raw = fs::read_to_string(&self.path)?;
-        let config: Config = toml::from_str(&raw)?;
+        let raw = read_bounded(&self.path, MAX_CONFIG_BYTES)?;
+        let config: Config = parse_toml(&raw, diagnostics::FileKind::Config)?;
         config.validate()?;
         Ok(config)
     }
@@ -1147,13 +1335,13 @@ impl ConfigStore {
         let (sender, receiver) = mpsc::channel();
         let path = self.path.clone();
         thread::spawn(move || {
-            let mut last_raw: Option<String> = None;
+            let mut last_raw: Option<Result<String, InputError>> = None;
             loop {
                 thread::sleep(interval);
-                let Ok(raw) = fs::read_to_string(&path) else {
-                    continue;
-                };
-                if last_raw.as_ref() == Some(&raw) {
+                // A missing file is not reported here; any other unreadable,
+                // oversized or special file reports once per change.
+                let raw = read_bounded(&path, MAX_CONFIG_BYTES);
+                if raw == Err(InputError::Missing) || last_raw.as_ref() == Some(&raw) {
                     continue;
                 }
                 last_raw = Some(raw);
@@ -1177,13 +1365,12 @@ impl ConfigStore {
         let store = self.clone();
         thread::spawn(move || {
             let mut last_signature: Option<(
-                Result<String, String>,
-                Option<Result<String, String>>,
+                Result<String, InputError>,
+                Option<Result<String, InputError>>,
             )> = None;
             loop {
                 thread::sleep(interval);
-                let config_raw =
-                    fs::read_to_string(store.path()).map_err(|error| error.to_string());
+                let config_raw = read_bounded(store.path(), MAX_CONFIG_BYTES);
                 let config = config_raw
                     .as_ref()
                     .ok()
@@ -1197,10 +1384,8 @@ impl ConfigStore {
                     .and_then(|config| config.validate().ok().map(|_| config))
                     .and_then(|config| config.appearance.theme_pack.as_ref())
                     .and_then(|name| {
-                        store.themes_dir().ok().map(|directory| {
-                            fs::read_to_string(directory.join(format!("{name}.toml")))
-                                .map_err(|error| error.to_string())
-                        })
+                        let path = store.theme_path(name).ok()?;
+                        Some(read_bounded(&path, MAX_THEME_BYTES))
                     });
                 let signature = (config_raw, theme_raw);
                 if last_signature.as_ref() == Some(&signature) {
@@ -1245,12 +1430,10 @@ pub struct ThemePack {
 impl ThemePack {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.schema_version != SCHEMA_VERSION {
-            return Err(ConfigError::Version(self.schema_version));
+            return Err(ConfigError::Version);
         }
         if self.name.trim().is_empty() || self.name.chars().count() > 80 {
-            return Err(ConfigError::InvalidTheme(
-                "name must contain between 1 and 80 characters".into(),
-            ));
+            return Err(theme_error("name", Problem::ThemeDisplayName));
         }
         for (label, value) in self.colors.entries() {
             validate_theme_color(&format!("colors.{label}"), value)?;
@@ -1262,9 +1445,12 @@ impl ThemePack {
         }
         if let Some(colors) = &self.senders.colors {
             if !(1..=MAX_SENDER_COLORS).contains(&colors.len()) {
-                return Err(ConfigError::InvalidTheme(format!(
-                    "senders.colors must contain between 1 and {MAX_SENDER_COLORS} colors; omit it to use the legacy sender colors"
-                )));
+                return Err(theme_error(
+                    "senders.colors",
+                    Problem::PaletteLength {
+                        maximum: MAX_SENDER_COLORS,
+                    },
+                ));
             }
             for (index, value) in colors.iter().enumerate() {
                 validate_theme_color(&format!("senders.colors[{index}]"), value)?;
@@ -1274,16 +1460,11 @@ impl ThemePack {
     }
 }
 
+/// Theme colors use the same `#RRGGBB` or `#RRGGBBAA` convention as
+/// `config.toml`; see `registry::parse_hex_color`.
 fn validate_theme_color(field: &str, value: &str) -> Result<(), ConfigError> {
-    if value.len() != 7
-        || !value.starts_with('#')
-        || !value[1..]
-            .chars()
-            .all(|character| character.is_ascii_hexdigit())
-    {
-        return Err(ConfigError::InvalidTheme(format!(
-            "{field} must be a #RRGGBB color"
-        )));
+    if registry::parse_hex_color(value).is_none() {
+        return Err(theme_error(field, Problem::Color));
     }
     Ok(())
 }
@@ -1341,10 +1522,25 @@ pub struct ThemeRoles {
     /// nor hovered; omitted keeps the previous row background.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub own_surface: Option<String>,
+    /// Backdrop that dims the window behind dialogs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scrim: Option<String>,
+    /// Shadow under popups.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<String>,
+    /// Area around an opened image; never the image pixels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub media_backdrop: Option<String>,
+    /// Online-member status dot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_online: Option<String>,
+    /// Initials drawn on avatar backgrounds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avatar_ink: Option<String>,
 }
 
 impl ThemeRoles {
-    pub fn entries(&self) -> [(&'static str, Option<&str>); 20] {
+    pub fn entries(&self) -> [(&'static str, Option<&str>); 25] {
         [
             ("error", self.error.as_deref()),
             ("error_surface", self.error_surface.as_deref()),
@@ -1366,7 +1562,20 @@ impl ThemeRoles {
             ("message", self.message.as_deref()),
             ("own_message", self.own_message.as_deref()),
             ("own_surface", self.own_surface.as_deref()),
+            ("scrim", self.scrim.as_deref()),
+            ("shadow", self.shadow.as_deref()),
+            ("media_backdrop", self.media_backdrop.as_deref()),
+            ("presence_online", self.presence_online.as_deref()),
+            ("avatar_ink", self.avatar_ink.as_deref()),
         ]
+    }
+
+    /// The theme's value for one role token, if it sets one.
+    pub fn get(&self, id: &str) -> Option<&str> {
+        self.entries()
+            .into_iter()
+            .find(|(name, _)| *name == id)
+            .and_then(|(_, value)| value)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1408,7 +1617,7 @@ pub struct ThemeColors {
 }
 
 impl ThemeColors {
-    fn entries(&self) -> [(&'static str, &str); 11] {
+    pub fn entries(&self) -> [(&'static str, &str); 11] {
         [
             ("rail", &self.rail),
             ("sidebar", &self.sidebar),
@@ -1601,7 +1810,7 @@ mod tests {
         let store = ConfigStore::at(dir.path().join("config.toml"));
         store.save(&Config::default()).unwrap();
         fs::write(store.path(), "schema_version = 99\n").unwrap();
-        assert!(matches!(store.load(), Err(ConfigError::Version(99))));
+        assert!(matches!(store.load(), Err(ConfigError::Version)));
         assert_eq!(
             fs::read_to_string(store.path()).unwrap(),
             "schema_version = 99\n"
@@ -1724,7 +1933,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             store.load_theme(&config),
-            Err(ConfigError::InvalidTheme(_))
+            Err(ConfigError::ThemeField { .. })
         ));
         config.appearance.theme_pack = Some("../escape".into());
         assert!(config.validate().is_err());
@@ -1741,7 +1950,7 @@ mod tests {
         let updates = store.watch_with_theme(Duration::from_millis(10));
         assert!(matches!(
             updates.recv_timeout(Duration::from_secs(2)).unwrap(),
-            Err(ConfigError::Io(_))
+            Err(ConfigError::Input(InputError::Missing))
         ));
 
         let themes = store.themes_dir().unwrap();
@@ -2287,7 +2496,7 @@ mod tests {
         let message_roles: ThemePack = toml::from_str(&message_roles).unwrap();
         message_roles.validate().unwrap();
         assert_eq!(message_roles.roles.own_surface.as_deref(), Some("#20283A"));
-        assert_eq!(message_roles.roles.entries().len(), 20);
+        assert_eq!(message_roles.roles.entries().len(), 25);
         for field in [
             "timestamp",
             "sender",
@@ -2297,7 +2506,10 @@ mod tests {
         ] {
             let bad: ThemePack =
                 toml::from_str(&format!("{encoded}\n[roles]\n{field} = 'tomato'\n")).unwrap();
-            assert!(bad.validate().is_err(), "{field} must be #RRGGBB");
+            assert!(
+                bad.validate().is_err(),
+                "{field} must be #RRGGBB or #RRGGBBAA"
+            );
         }
     }
 
@@ -2307,7 +2519,15 @@ mod tests {
             toml::from_str(include_str!("../../../themes/aurora.toml")).unwrap();
         let encoded = toml::to_string_pretty(&legacy).unwrap();
         for (role, _) in ThemeRoles::default().entries() {
-            for bad in ["red", "#12345", "#1234567", "#abcdef00", "#gggggg", "#éabc"] {
+            for bad in [
+                "red",
+                "#12345",
+                "#1234567",
+                "#abcdef0",
+                "#abcdef000",
+                "#gggggg",
+                "#éabc",
+            ] {
                 let text = format!("{encoded}\n[roles]\n{role} = '{bad}'\n");
                 let theme: ThemePack = toml::from_str(&text).unwrap();
                 let error = theme.validate().unwrap_err().to_string();
@@ -2378,7 +2598,7 @@ mod tests {
         fs::write(&path, &override_text).unwrap();
         assert!(matches!(
             store.load_theme(&config),
-            Err(ConfigError::InvalidTheme(_))
+            Err(ConfigError::ThemeField { .. })
         ));
         assert_eq!(fs::read_to_string(&path).unwrap(), override_text);
     }
@@ -2425,6 +2645,15 @@ mod tests {
                 for background in surfaces {
                     assert_contrast(&theme.name, foreground.as_deref().unwrap(), background, 4.5);
                 }
+            }
+            // The online dot is a non-text indicator beside member names.
+            for background in surfaces {
+                assert_contrast(
+                    &theme.name,
+                    roles.presence_online.as_deref().unwrap(),
+                    background,
+                    3.0,
+                );
             }
             for (foreground, background) in [
                 (&roles.error_ink, &roles.error_surface),
@@ -2695,6 +2924,346 @@ mod tests {
             assert_eq!(reset.chat.timestamp_format, TimestampFormat::TwelveHour);
             assert!(!reset.chat.timestamp_brackets);
             assert_eq!(reset.chat.timestamp_width, 72);
+        }
+    }
+
+    #[test]
+    fn sparse_color_overrides_and_window_opacity_round_trip() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let mut config = store.load_or_create().unwrap();
+        // Defaults write no color table, and the window stays opaque.
+        let raw = fs::read_to_string(store.path()).unwrap();
+        assert!(!raw.contains("[colors]"));
+        assert_eq!(config.window.opacity_percent, 100);
+        config.colors.insert("canvas".into(), "#1E233080".into());
+        config.colors.insert("link".into(), "#afcdff".into());
+        config.window.opacity_percent = 0;
+        store.save(&config).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded, config);
+        assert_eq!(
+            loaded.color_override("canvas"),
+            Some([0x1e, 0x23, 0x30, 0x80])
+        );
+        assert_eq!(
+            loaded.color_override("link"),
+            Some([0xaf, 0xcd, 0xff, 0xff])
+        );
+        assert_eq!(loaded.color_override("panel"), None);
+        // Overrides are sparse and survive choosing a starting point.
+        let mut preset = loaded.clone();
+        preset.apply_style_preset(BuiltInStylePreset::Paper);
+        assert_eq!(preset.colors, loaded.colors);
+        assert_eq!(preset.window, loaded.window);
+        // Every registry token is accepted, in either case and with alpha.
+        for token in registry::COLOR_TOKENS {
+            let mut each = Config::default();
+            each.colors.insert(token.id.into(), "#00000000".into());
+            each.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn invalid_overrides_and_oversized_files_keep_the_last_valid_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let mut config = store.load_or_create().unwrap();
+        config.colors.insert("canvas".into(), "#101010".into());
+        store.save(&config).unwrap();
+        let saved = fs::read(store.path()).unwrap();
+        for (key, value) in [
+            ("canvas", "#10101"),
+            ("canvas", "red"),
+            ("canvas", "#1010100"),
+            ("not_a_token", "#101010"),
+        ] {
+            let mut bad = config.clone();
+            bad.colors.insert(key.into(), value.into());
+            assert!(matches!(store.save(&bad), Err(ConfigError::Field { .. })));
+            assert_eq!(fs::read(store.path()).unwrap(), saved);
+        }
+        let mut transparent = config.clone();
+        transparent.window.opacity_percent = 101;
+        assert!(store.save(&transparent).is_err());
+        assert_eq!(fs::read(store.path()).unwrap(), saved);
+
+        let updates = store.watch_with_theme(Duration::from_millis(10));
+        assert!(
+            updates
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .is_ok()
+        );
+        let oversized = format!("# {}\n", "x".repeat(MAX_CONFIG_BYTES as usize));
+        fs::write(store.path(), oversized).unwrap();
+        assert!(matches!(
+            updates.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Err(ConfigError::Input(InputError::TooLarge))
+        ));
+        assert!(matches!(
+            store.load(),
+            Err(ConfigError::Input(InputError::TooLarge))
+        ));
+        fs::write(store.path(), &saved).unwrap();
+        assert_eq!(
+            updates
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap()
+                .config,
+            config
+        );
+    }
+
+    #[test]
+    fn theme_names_cannot_name_paths_or_escape_the_themes_folder() {
+        let store = ConfigStore::at("/profile/config.toml");
+        let long = "n".repeat(65);
+        for name in [
+            "",
+            "..",
+            "../x",
+            "a/b",
+            "a\\b",
+            "a.toml",
+            "C:",
+            "~",
+            long.as_str(),
+        ] {
+            assert!(!is_theme_name(name), "{name:?}");
+            assert!(store.theme_path(name).is_err());
+        }
+        assert!(
+            store
+                .theme_path("my-theme_2")
+                .unwrap()
+                .ends_with("themes/my-theme_2.toml")
+        );
+    }
+
+    #[test]
+    fn validation_errors_never_repeat_the_rejected_value() {
+        let mut config = Config::default();
+        config.appearance.font_family = "secret\u{202e}family".into();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("appearance.font_family") && !error.contains("secret"));
+        let mut config = Config::default();
+        config
+            .shortcuts
+            .insert("search".into(), "Mod+SECRET".into());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("shortcuts.search") && !error.contains("SECRET"));
+        let mut config = Config::default();
+        config.media.microphone_device = Some("secret device".into());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("media.microphone_device") && !error.contains("secret"));
+    }
+
+    /// Every runtime path that shows an error (load, theme load, reload and
+    /// Settings saves, which call `load` first) shows sanitized text only.
+    #[test]
+    fn runtime_store_errors_never_repeat_file_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        for raw in [
+            "[geometry]\ncorner_radius = \"secret-type\"\n",
+            "[chat]\nlayout = \"secret-variant\"\n",
+            "secret-syntax = [\n",
+            "secret_unknown_key = 1\n",
+            "[account_overrides.secretaccount]\ntheme = \"secret-mode\"\n",
+            "[account_overrides.secretaccount]\nlocal_voice_rooms = [\"secret room\"]\n",
+            "[colors]\nlink = \"secret\"\n",
+            "[shortcuts]\nsearch = \"Mod+secret\"\n",
+            "schema_version = 777\n",
+        ] {
+            fs::write(store.path(), raw).unwrap();
+            let error = store.load().unwrap_err();
+            let shown = format!("{error} {error:?}");
+            assert!(
+                !shown.contains("secret") && !shown.contains("777"),
+                "{raw}: {shown}"
+            );
+        }
+
+        // A theme file's content never reaches its error either.
+        let mut config = Config::default();
+        config.appearance.theme_pack = Some("custom".into());
+        store.save(&config).unwrap();
+        fs::create_dir_all(store.themes_dir().unwrap()).unwrap();
+        let theme_path = store.theme_path("custom").unwrap();
+        for raw in [
+            "secret-theme-syntax = [\n",
+            "schema_version = 1\nname = \"x\"\nsecret_key = 1\n",
+            "schema_version = 1\nname = 7\n",
+        ] {
+            fs::write(&theme_path, raw).unwrap();
+            let error = store.load_theme(&config).unwrap_err();
+            let shown = format!("{error} {error:?}");
+            assert!(
+                !shown.contains("secret") && !shown.contains("7"),
+                "{raw}: {shown}"
+            );
+            assert!(matches!(error, ConfigError::Decode(_)));
+        }
+
+        // The reload path reports the same sanitized error.
+        fs::write(&theme_path, "secret-theme-syntax = [\n").unwrap();
+        let updates = store.watch_with_theme(Duration::from_millis(10));
+        let error = updates
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap_err();
+        assert!(!format!("{error} {error:?}").contains("secret"));
+    }
+
+    /// `registry::FIELDS` is what the schema output and documentation print,
+    /// so it must not drift from the real schema and validator.
+    #[test]
+    fn the_field_reference_agrees_with_the_real_schema() {
+        use registry::{FIELDS, FieldKind};
+        use std::collections::BTreeSet;
+
+        fn leaves(value: &toml::Value, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+            match value {
+                toml::Value::Table(table) => {
+                    for (key, value) in table {
+                        path.push(key.clone());
+                        leaves(value, path, out);
+                        path.pop();
+                    }
+                }
+                _ => out.push(path.clone()),
+            }
+        }
+        // Dynamic keys are written as the placeholders FIELDS documents.
+        fn pattern(path: &[String]) -> String {
+            match path.first().map(String::as_str) {
+                Some("colors") => "colors.<token>".into(),
+                Some("shortcuts") => "shortcuts.<action>".into(),
+                Some("account_overrides") => {
+                    format!("account_overrides.<account>.{}", path[2..].join("."))
+                }
+                _ => path.join("."),
+            }
+        }
+
+        // Every optional and dynamic field present.
+        let mut full = Config::default();
+        full.appearance.theme_pack = Some("paper".into());
+        full.typography.message_font_family = Some("serif".into());
+        full.typography.sender_weight = Some(600);
+        full.media.microphone_device = Some("alsa:microphone".into());
+        full.media.speaker_device = Some("alsa:speaker".into());
+        full.media.camera_device = Some("camera".into());
+        full.colors.insert("link".into(), "#123456".into());
+        full.account_overrides.insert(
+            "account".into(),
+            AccountOverrides {
+                notifications_enabled: Some(true),
+                theme: Some(ThemeMode::Light),
+                local_voice_rooms: vec!["!a:example.org".into()],
+                legacy_element_call_rooms: vec!["!b:example.org".into()],
+                element_call_matrix_2_0_rooms: vec!["!c:example.org".into()],
+            },
+        );
+        full.validate().unwrap();
+        let mut found = Vec::new();
+        leaves(
+            &toml::Value::try_from(&full).unwrap(),
+            &mut Vec::new(),
+            &mut found,
+        );
+        let found: BTreeSet<String> = found.iter().map(|path| pattern(path)).collect();
+        let documented: BTreeSet<String> =
+            FIELDS.iter().map(|field| field.key.to_owned()).collect();
+        assert_eq!(found, documented, "FIELDS and the schema differ");
+
+        // Defaults match Config::default(); "(none)" fields are omitted.
+        let defaults = toml::Value::try_from(Config::default()).unwrap();
+        for field in FIELDS.iter().filter(|field| !field.key.contains('<')) {
+            let actual = field
+                .key
+                .split('.')
+                .try_fold(&defaults, |value, key| value.get(key));
+            if field.default == "(none)" {
+                assert!(actual.is_none(), "{} has a default", field.key);
+            } else {
+                let expected: toml::Table =
+                    toml::from_str(&format!("v = {}", field.default)).unwrap();
+                assert_eq!(actual, expected.get("v"), "default of {}", field.key);
+            }
+        }
+        for action in default_shortcuts().keys() {
+            assert!(ShortcutAction::parse(action).is_some());
+        }
+
+        // Every documented range and option agrees with validation.
+        fn document(key: &str, name: &str, value: &str) -> String {
+            let key = key
+                .replace("<account>", "account")
+                .replace("<token>", name)
+                .replace("<action>", name);
+            match key.rsplit_once('.') {
+                Some((table, leaf)) => format!("[{table}]\n{leaf} = {value}\n"),
+                None => format!("{key} = {value}\n"),
+            }
+        }
+        let accepts = |text: &str| {
+            toml::from_str::<Config>(text).is_ok_and(|config| config.validate().is_ok())
+        };
+        for field in FIELDS {
+            let names: Vec<&str> = if field.key.contains("<token>") {
+                registry::COLOR_TOKENS
+                    .iter()
+                    .map(|token| token.id)
+                    .collect()
+            } else if field.key.contains("<action>") {
+                ShortcutAction::ALL
+                    .iter()
+                    .map(|action| action.name())
+                    .collect()
+            } else {
+                vec![""]
+            };
+            for name in names {
+                let check = |value: &str| accepts(&document(field.key, name, value));
+                let (good, bad): (Vec<String>, Vec<String>) = match field.kind {
+                    FieldKind::Integer { minimum, maximum } => (
+                        vec![minimum.to_string(), maximum.to_string()],
+                        vec![(minimum - 1).to_string(), (maximum + 1).to_string()],
+                    ),
+                    FieldKind::Enum(values) => (
+                        values.iter().map(|value| format!("\"{value}\"")).collect(),
+                        vec!["\"not_an_option\"".into()],
+                    ),
+                    FieldKind::Bool => {
+                        (vec!["true".into(), "false".into()], vec!["\"yes\"".into()])
+                    }
+                    FieldKind::FontFamily => (vec!["\"Inter\"".into()], vec!["\"\"".into()]),
+                    FieldKind::ThemeName => (vec!["\"paper\"".into()], vec!["\"../paper\"".into()]),
+                    FieldKind::Color => (
+                        vec!["\"#123456\"".into(), "\"#12345678\"".into()],
+                        vec!["\"#12345\"".into()],
+                    ),
+                    FieldKind::DeviceId => {
+                        (vec!["\"alsa:device\"".into()], vec!["\"no-host\"".into()])
+                    }
+                    FieldKind::Text => (vec!["\"anything\"".into()], vec!["5".into()]),
+                    FieldKind::TextList => (vec!["[\"word\"]".into()], vec!["5".into()]),
+                    FieldKind::RoomIdList => (
+                        vec!["[\"!a:example.org\"]".into()],
+                        vec!["[\"not a room\"]".into()],
+                    ),
+                    FieldKind::Table => (vec!["\"Mod+J\"".into()], vec!["\"Tab\"".into()]),
+                };
+                for value in &good {
+                    assert!(check(value), "{} {name} should accept {value}", field.key);
+                }
+                for value in &bad {
+                    assert!(!check(value), "{} {name} should reject {value}", field.key);
+                }
+            }
         }
     }
 }

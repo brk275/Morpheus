@@ -1,0 +1,1530 @@
+//! The one registry of editable appearance tokens and Settings search targets.
+//!
+//! The TOML validator, the in-app color editor, the Settings search index, the
+//! offline schema output and the documentation tables all read these tables.
+//! A token is listed here only when the interface actually consumes it, so an
+//! accepted key is never an inactive setting. Planned tokens are documented as
+//! gaps instead of being accepted early.
+
+/// A group of color tokens in the Appearance workspace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenGroup {
+    Surfaces,
+    Text,
+    Accents,
+    Controls,
+    Calls,
+    Avatars,
+}
+
+impl TokenGroup {
+    pub const ALL: [Self; 6] = [
+        Self::Surfaces,
+        Self::Text,
+        Self::Accents,
+        Self::Controls,
+        Self::Calls,
+        Self::Avatars,
+    ];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Surfaces => "surfaces",
+            Self::Text => "text",
+            Self::Accents => "accents",
+            Self::Controls => "controls",
+            Self::Calls => "calls",
+            Self::Avatars => "avatars",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Surfaces => "Surfaces",
+            Self::Text => "Text and messages",
+            Self::Accents => "Accents and states",
+            Self::Controls => "Inputs and controls",
+            Self::Calls => "Calls",
+            Self::Avatars => "Avatars",
+        }
+    }
+}
+
+/// Where a theme pack supplies the token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenSource {
+    /// One of the eleven required `[colors]` of a theme pack.
+    Base,
+    /// An optional `[roles]` entry of a theme pack.
+    Role,
+}
+
+/// What a token shows when neither `config.toml` nor the theme pack sets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fallback {
+    /// The built-in palette of the effective theme mode.
+    Palette,
+    /// Follows another token.
+    Token(&'static str),
+    /// Each control keeps its previous built-in color, so the default differs
+    /// between controls; `example` is the most common one, as `#RRGGBB(AA)`.
+    Legacy { example: &'static str },
+}
+
+pub struct ColorToken {
+    /// Stable key in `[colors]` of `config.toml` and in a theme pack.
+    pub id: &'static str,
+    pub group: TokenGroup,
+    pub label: &'static str,
+    pub description: &'static str,
+    /// Extra search words, including alternative spellings.
+    pub keywords: &'static [&'static str],
+    pub source: TokenSource,
+    pub fallback: Fallback,
+}
+
+const fn token(
+    id: &'static str,
+    group: TokenGroup,
+    source: TokenSource,
+    fallback: Fallback,
+    label: &'static str,
+    description: &'static str,
+    keywords: &'static [&'static str],
+) -> ColorToken {
+    ColorToken {
+        id,
+        group,
+        label,
+        description,
+        keywords,
+        source,
+        fallback,
+    }
+}
+
+use Fallback::{Legacy, Palette, Token};
+use TokenGroup::{Accents, Avatars, Calls, Controls, Surfaces, Text};
+use TokenSource::{Base, Role};
+
+/// Every color token the interface consumes, in editor order.
+pub const COLOR_TOKENS: &[ColorToken] = &[
+    token(
+        "rail",
+        Surfaces,
+        Base,
+        Palette,
+        "Space rail",
+        "Background of the Space and navigation rail. The window transparency setting applies to it.",
+        &["navigation", "spaces", "background", "window"],
+    ),
+    token(
+        "sidebar",
+        Surfaces,
+        Base,
+        Palette,
+        "Room list",
+        "Background of the room list and the text sidebar. The window transparency setting applies to it.",
+        &["rooms", "channels", "navigation", "background", "window"],
+    ),
+    token(
+        "canvas",
+        Surfaces,
+        Base,
+        Palette,
+        "Conversation canvas",
+        "Main background behind conversations, Settings and dialogs. The window transparency setting applies to the window behind it.",
+        &["background", "main", "chat", "window"],
+    ),
+    token(
+        "panel",
+        Surfaces,
+        Base,
+        Palette,
+        "Panels",
+        "Details panel, cards and secondary panels.",
+        &["details", "members", "card", "background"],
+    ),
+    token(
+        "elevated",
+        Surfaces,
+        Base,
+        Palette,
+        "Raised surfaces",
+        "Inputs, buttons, cards and popups that sit above a panel.",
+        &["input", "button", "card", "popup", "field"],
+    ),
+    token(
+        "hover",
+        Surfaces,
+        Base,
+        Palette,
+        "Hover",
+        "Background under the pointer, and selected controls when no selection color is set.",
+        &["pointer", "highlight", "mouse"],
+    ),
+    token(
+        "selection",
+        Surfaces,
+        Role,
+        Token("hover"),
+        "Selected item",
+        "Selected navigation rows, messages, search results and text selections.",
+        &["selected", "active", "highlight"],
+    ),
+    token(
+        "own_surface",
+        Surfaces,
+        Role,
+        Legacy {
+            example: "#00000000",
+        },
+        "Your message background",
+        "Background of your own messages when they are neither selected nor hovered. Unset keeps the normal row background.",
+        &["own", "mine", "bubble", "message"],
+    ),
+    token(
+        "scrim",
+        Surfaces,
+        Role,
+        Legacy {
+            example: "#000000AA",
+        },
+        "Dialog backdrop",
+        "Dims the window behind dialogs. Unset keeps each dialog's built-in dimming.",
+        &["modal", "overlay", "dim", "backdrop"],
+    ),
+    token(
+        "shadow",
+        Surfaces,
+        Role,
+        Legacy {
+            example: "#00000044",
+        },
+        "Popup shadow",
+        "Shadow under the account menu popup.",
+        &["drop shadow", "popup", "menu"],
+    ),
+    token(
+        "media_backdrop",
+        Surfaces,
+        Role,
+        Legacy { example: "#11131B" },
+        "Image viewer background",
+        "Area around an opened image. The image itself is never recolored.",
+        &["image", "viewer", "photo", "preview", "media"],
+    ),
+    token(
+        "ink",
+        Text,
+        Base,
+        Palette,
+        "Primary text",
+        "Main text and icons.",
+        &["text", "font color", "foreground"],
+    ),
+    token(
+        "muted",
+        Text,
+        Base,
+        Palette,
+        "Secondary text",
+        "Descriptions, hints and inactive icons.",
+        &["secondary", "hint", "subtle", "grey", "gray"],
+    ),
+    token(
+        "message",
+        Text,
+        Role,
+        Token("ink"),
+        "Message text",
+        "Body text of messages.",
+        &["body", "chat text"],
+    ),
+    token(
+        "own_message",
+        Text,
+        Role,
+        Token("sender"),
+        "Your message text",
+        "Name and body text of your own messages. Unset follows Sender names and Message text, then Primary text.",
+        &["own", "mine", "self"],
+    ),
+    token(
+        "sender",
+        Text,
+        Role,
+        Token("ink"),
+        "Sender names",
+        "Sender names while colored sender names are off.",
+        &["name", "author", "nickname", "nick"],
+    ),
+    token(
+        "timestamp",
+        Text,
+        Role,
+        Token("muted"),
+        "Timestamps",
+        "Clock and delivery status in the timeline and thread replies.",
+        &["time", "clock", "date"],
+    ),
+    token(
+        "link",
+        Text,
+        Role,
+        Token("accent"),
+        "Links",
+        "Links in rich messages.",
+        &["url", "hyperlink"],
+    ),
+    token(
+        "accent",
+        Accents,
+        Base,
+        Palette,
+        "Accent",
+        "Highlights, the app mark, selected indicators and primary actions.",
+        &["brand", "primary", "highlight color"],
+    ),
+    token(
+        "accent_ink",
+        Accents,
+        Base,
+        Palette,
+        "Text on accent",
+        "Text and icons drawn on the accent color.",
+        &["accent text", "on accent"],
+    ),
+    token(
+        "focus",
+        Accents,
+        Role,
+        Legacy { example: "#AD91FF" },
+        "Keyboard focus ring",
+        "Outline of the control that has keyboard focus.",
+        &["outline", "keyboard", "focus ring", "accessibility"],
+    ),
+    token(
+        "unread",
+        Accents,
+        Role,
+        Token("accent"),
+        "Unread badge",
+        "Background of unread-count badges.",
+        &["badge", "count", "notification"],
+    ),
+    token(
+        "unread_ink",
+        Accents,
+        Role,
+        Token("accent_ink"),
+        "Unread badge text",
+        "Number on unread-count badges.",
+        &["badge text", "count"],
+    ),
+    token(
+        "selection_ink",
+        Accents,
+        Role,
+        Legacy { example: "#FFFFFF" },
+        "Text on selected item",
+        "Text and icons on selected items and selected input text. Unset keeps each control's text color.",
+        &["selected text"],
+    ),
+    token(
+        "error",
+        Accents,
+        Role,
+        Legacy { example: "#E47483" },
+        "Error text",
+        "Inline error messages.",
+        &["warning", "failure", "red"],
+    ),
+    token(
+        "error_surface",
+        Accents,
+        Role,
+        Legacy { example: "#9F3F50" },
+        "Error banner",
+        "Background of error banners.",
+        &["warning", "banner", "alert"],
+    ),
+    token(
+        "error_ink",
+        Accents,
+        Role,
+        Legacy { example: "#FFFFFF" },
+        "Error banner text",
+        "Text on error banners.",
+        &["banner text", "alert"],
+    ),
+    token(
+        "success",
+        Accents,
+        Role,
+        Legacy { example: "#78C8B1" },
+        "Success text",
+        "Inline confirmations.",
+        &["ok", "done", "green"],
+    ),
+    token(
+        "success_surface",
+        Accents,
+        Role,
+        Legacy { example: "#214A46" },
+        "Success banner",
+        "Background of success and transfer banners.",
+        &["banner", "notice"],
+    ),
+    token(
+        "success_ink",
+        Accents,
+        Role,
+        Legacy { example: "#FFFFFF" },
+        "Success banner text",
+        "Text on success banners.",
+        &["banner text", "notice"],
+    ),
+    token(
+        "destructive",
+        Accents,
+        Role,
+        Legacy { example: "#E47483" },
+        "Destructive action",
+        "Log out text and destructive buttons such as leaving a call.",
+        &["danger", "delete", "remove", "leave"],
+    ),
+    token(
+        "destructive_ink",
+        Accents,
+        Role,
+        Legacy { example: "#10131B" },
+        "Destructive action text",
+        "Text on destructive buttons.",
+        &["danger text"],
+    ),
+    token(
+        "presence_online",
+        Accents,
+        Role,
+        Legacy { example: "#64C9A7" },
+        "Online status",
+        "Dot beside members who are online.",
+        &["presence", "status", "online", "member"],
+    ),
+    token(
+        "divider",
+        Controls,
+        Base,
+        Palette,
+        "Dividers and borders",
+        "Separator lines and control borders.",
+        &["border", "line", "separator", "outline"],
+    ),
+    token(
+        "voice",
+        Calls,
+        Role,
+        Legacy { example: "#78C8B1" },
+        "Voice rooms",
+        "Voice-room icons, labels and voice-space status.",
+        &["call", "audio", "voice space"],
+    ),
+    token(
+        "avatar_ink",
+        Avatars,
+        Role,
+        Legacy { example: "#FFFFFF" },
+        "Avatar initials",
+        "Initials drawn on avatar backgrounds.",
+        &["avatar", "initials", "profile"],
+    ),
+];
+
+pub fn color_token(id: &str) -> Option<&'static ColorToken> {
+    COLOR_TOKENS.iter().find(|token| token.id == id)
+}
+
+/// A color in `#RRGGBB` or `#RRGGBBAA` form: hexadecimal digits in either
+/// case, alpha last, `00` fully transparent and `FF` opaque. Returns the
+/// red, green, blue and alpha bytes.
+pub fn parse_hex_color(value: &str) -> Option<[u8; 4]> {
+    let digits = value.strip_prefix('#')?;
+    if !matches!(digits.len(), 6 | 8) || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let byte = |index: usize| u8::from_str_radix(&digits[index..index + 2], 16).ok();
+    let alpha = if digits.len() == 8 { byte(6)? } else { u8::MAX };
+    Some([byte(0)?, byte(2)?, byte(4)?, alpha])
+}
+
+/// The canonical spelling the editor writes: uppercase, and the alpha pair
+/// only when the color is not opaque.
+pub fn format_hex_color([red, green, blue, alpha]: [u8; 4]) -> String {
+    if alpha == u8::MAX {
+        format!("#{red:02X}{green:02X}{blue:02X}")
+    } else {
+        format!("#{red:02X}{green:02X}{blue:02X}{alpha:02X}")
+    }
+}
+
+/// Window background opacity, in percent of each window surface's own alpha.
+pub const WINDOW_OPACITY_RANGE: core::ops::RangeInclusive<u8> = 0..=100;
+
+/// The type and accepted values of one `config.toml` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldKind {
+    Bool,
+    Integer {
+        minimum: i64,
+        maximum: i64,
+    },
+    Enum(&'static [&'static str]),
+    /// A nonempty font family name of at most 128 bytes.
+    FontFamily,
+    /// A theme file name: ASCII letters, digits, `-` and `_`, at most 64.
+    ThemeName,
+    /// `#RRGGBB` or `#RRGGBBAA`.
+    Color,
+    /// A host-qualified audio device ID.
+    DeviceId,
+    /// Free text that is stored without validation.
+    Text,
+    TextList,
+    RoomIdList,
+    /// A table keyed by documented names; see the field's description.
+    Table,
+}
+
+pub struct FieldSpec {
+    /// Dotted TOML key. `<token>`, `<action>` and `<account>` stand for keys
+    /// named in the description.
+    pub key: &'static str,
+    pub kind: FieldKind,
+    /// The default, as TOML, or `(none)` when the key is normally omitted.
+    pub default: &'static str,
+    pub description: &'static str,
+    /// The setting is stored but nothing in the app uses it yet.
+    pub inactive: bool,
+}
+
+const fn field(
+    key: &'static str,
+    kind: FieldKind,
+    default: &'static str,
+    description: &'static str,
+) -> FieldSpec {
+    FieldSpec {
+        key,
+        kind,
+        default,
+        description,
+        inactive: false,
+    }
+}
+
+const fn inactive(mut spec: FieldSpec) -> FieldSpec {
+    spec.inactive = true;
+    spec
+}
+
+use FieldKind::{Bool, Integer};
+
+const THEME_MODES: &[&str] = &["dark", "light", "high_contrast", "system"];
+
+/// Every field of `config.toml` schema version 1. A test in this crate
+/// (`the_field_reference_agrees_with_the_real_schema`) checks that a fully
+/// populated configuration uses exactly these keys, that defaults match
+/// `Config::default()`, and that every range and option agrees with
+/// validation.
+pub const FIELDS: &[FieldSpec] = &[
+    field(
+        "schema_version",
+        Integer {
+            minimum: 1,
+            maximum: 1,
+        },
+        "1",
+        "Configuration schema version.",
+    ),
+    field(
+        "appearance.theme",
+        FieldKind::Enum(THEME_MODES),
+        "\"dark\"",
+        "Base palette for all accounts.",
+    ),
+    field(
+        "appearance.theme_pack",
+        FieldKind::ThemeName,
+        "(none)",
+        "Theme file in the themes folder beside config.toml, or a built-in theme: nocturne, terminal, paper.",
+    ),
+    field(
+        "appearance.font_family",
+        FieldKind::FontFamily,
+        "\"Inter\"",
+        "Interface font family.",
+    ),
+    field(
+        "appearance.density",
+        FieldKind::Enum(&["compact", "comfortable", "spacious"]),
+        "\"comfortable\"",
+        "Room and message row density.",
+    ),
+    field(
+        "appearance.scale_percent",
+        Integer {
+            minimum: 75,
+            maximum: 200,
+        },
+        "100",
+        "Text scale in percent.",
+    ),
+    field(
+        "appearance.reduce_motion",
+        Bool,
+        "false",
+        "Immediate hover feedback instead of short fades.",
+    ),
+    field(
+        "typography.message_font_family",
+        FieldKind::FontFamily,
+        "(none)",
+        "Message and composer font family; omitted follows appearance.font_family.",
+    ),
+    field(
+        "typography.monospace_font_family",
+        FieldKind::FontFamily,
+        "\"monospace\"",
+        "Timestamp and security-code font family.",
+    ),
+    field(
+        "typography.message_size",
+        Integer {
+            minimum: 10,
+            maximum: 32,
+        },
+        "14",
+        "Message text size in logical pixels before text scaling.",
+    ),
+    field(
+        "typography.sender_weight",
+        Integer {
+            minimum: 100,
+            maximum: 900,
+        },
+        "(none)",
+        "Sender-name font weight; omitted keeps each surface's weight.",
+    ),
+    field(
+        "geometry.corner_radius",
+        Integer {
+            minimum: 0,
+            maximum: 24,
+        },
+        "10",
+        "Base corner radius in logical pixels.",
+    ),
+    field(
+        "geometry.message_gap",
+        Integer {
+            minimum: 0,
+            maximum: 32,
+        },
+        "12",
+        "Base vertical message padding, adjusted by density.",
+    ),
+    field(
+        "geometry.content_padding",
+        Integer {
+            minimum: 0,
+            maximum: 48,
+        },
+        "24",
+        "Conversation inset and composer margin.",
+    ),
+    field(
+        "geometry.rail_width",
+        Integer {
+            minimum: 44,
+            maximum: 100,
+        },
+        "70",
+        "Space rail width.",
+    ),
+    field(
+        "chat.layout",
+        FieldKind::Enum(&["stacked", "compact", "columns"]),
+        "\"stacked\"",
+        "Message layout.",
+    ),
+    field("chat.show_avatars", Bool, "true", "Show message avatars."),
+    field(
+        "chat.show_timestamps",
+        Bool,
+        "true",
+        "Show message timestamps.",
+    ),
+    field(
+        "chat.timestamp_format",
+        FieldKind::Enum(&[
+            "twelve_hour",
+            "twenty_four_hour",
+            "twenty_four_hour_seconds",
+        ]),
+        "\"twelve_hour\"",
+        "Local clock format.",
+    ),
+    field(
+        "chat.timestamp_brackets",
+        Bool,
+        "false",
+        "Square brackets around timestamps.",
+    ),
+    field(
+        "chat.timestamp_width",
+        Integer {
+            minimum: 48,
+            maximum: 160,
+        },
+        "72",
+        "Timestamp column width in Columns layout.",
+    ),
+    field(
+        "chat.color_senders",
+        Bool,
+        "false",
+        "Color sender names with the sender palette.",
+    ),
+    field(
+        "chat.nickname_width",
+        Integer {
+            minimum: 64,
+            maximum: 240,
+        },
+        "128",
+        "Nickname column width in Columns layout.",
+    ),
+    field(
+        "chat.nickname_brackets",
+        Bool,
+        "false",
+        "Show Columns nicknames as <name>.",
+    ),
+    field(
+        "chat.nickname_alignment",
+        FieldKind::Enum(&["left", "right"]),
+        "\"right\"",
+        "Nickname alignment in Columns layout.",
+    ),
+    field(
+        "conversation.header",
+        FieldKind::Enum(&["full", "compact", "minimal"]),
+        "\"full\"",
+        "Room header presentation.",
+    ),
+    field(
+        "layout.navigation",
+        FieldKind::Enum(&["rail", "sidebar"]),
+        "\"rail\"",
+        "Icon rail or text sidebar.",
+    ),
+    field(
+        "layout.room_list_width",
+        Integer {
+            minimum: 180,
+            maximum: 480,
+        },
+        "260",
+        "Room list width.",
+    ),
+    field(
+        "layout.details_width",
+        Integer {
+            minimum: 200,
+            maximum: 520,
+        },
+        "300",
+        "Details panel width.",
+    ),
+    field(
+        "layout.show_member_panel",
+        Bool,
+        "true",
+        "Show the members and thread panel.",
+    ),
+    field(
+        "layout.show_space_labels",
+        Bool,
+        "false",
+        "Labels under icon-rail Spaces.",
+    ),
+    field(
+        "layout.group_direct_messages",
+        Bool,
+        "true",
+        "List direct messages separately.",
+    ),
+    field(
+        "layout.sort_unread_first",
+        Bool,
+        "false",
+        "Unread conversations first.",
+    ),
+    field(
+        "notifications.enabled",
+        Bool,
+        "true",
+        "Desktop notifications.",
+    ),
+    field("notifications.sounds", Bool, "true", "Notification sounds."),
+    field(
+        "notifications.show_message_preview",
+        Bool,
+        "false",
+        "Decrypted text in desktop notifications.",
+    ),
+    field(
+        "notifications.highlight_words",
+        FieldKind::TextList,
+        "[]",
+        "Local highlight words and phrases; Settings accepts up to 32 of at most 64 characters.",
+    ),
+    field(
+        "media.microphone_device",
+        FieldKind::DeviceId,
+        "(none)",
+        "Microphone for the next call; omitted follows the system default.",
+    ),
+    field(
+        "media.speaker_device",
+        FieldKind::DeviceId,
+        "(none)",
+        "Speaker for the next call; omitted follows the system default.",
+    ),
+    inactive(field(
+        "media.camera_device",
+        FieldKind::Text,
+        "(none)",
+        "Saved camera; not used yet.",
+    )),
+    inactive(field(
+        "media.noise_suppression",
+        Bool,
+        "true",
+        "Noise suppression; not used yet.",
+    )),
+    inactive(field(
+        "media.autoplay_animated_media",
+        Bool,
+        "false",
+        "Animated media autoplay; not used yet.",
+    )),
+    field(
+        "media.previews_in_encrypted_rooms",
+        Bool,
+        "false",
+        "Image previews in encrypted rooms.",
+    ),
+    field(
+        "shortcuts.<action>",
+        FieldKind::Table,
+        "see description",
+        "Key combination per action: quick_switcher (Mod+K), search (Mod+F), next_unread (Alt+Down), previous_unread (Alt+Up). Omit an action to disable it.",
+    ),
+    inactive(field(
+        "experimental.background_account_sync",
+        Bool,
+        "false",
+        "Background sync of inactive accounts; not used yet.",
+    )),
+    field(
+        "account_overrides.<account>.notifications_enabled",
+        Bool,
+        "(none)",
+        "Desktop notifications for one local account ID.",
+    ),
+    field(
+        "account_overrides.<account>.theme",
+        FieldKind::Enum(THEME_MODES),
+        "(none)",
+        "Base palette while this account is active.",
+    ),
+    field(
+        "account_overrides.<account>.local_voice_rooms",
+        FieldKind::RoomIdList,
+        "[]",
+        "Rooms shown as voice spaces for this account.",
+    ),
+    field(
+        "account_overrides.<account>.legacy_element_call_rooms",
+        FieldKind::RoomIdList,
+        "[]",
+        "Rooms using the legacy Element Call mode.",
+    ),
+    field(
+        "account_overrides.<account>.element_call_matrix_2_0_rooms",
+        FieldKind::RoomIdList,
+        "[]",
+        "Rooms using the Element Call Matrix 2.0 mode.",
+    ),
+    field(
+        "colors.<token>",
+        FieldKind::Color,
+        "(none)",
+        "Sparse color override for one token; see the token list.",
+    ),
+    field(
+        "window.opacity_percent",
+        Integer {
+            minimum: 0,
+            maximum: 100,
+        },
+        "100",
+        "Share of the window panes' own alpha that is painted; text, controls and dialogs stay opaque.",
+    ),
+];
+
+/// Something a search result must have available to be offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Requirement {
+    Always,
+    /// Shown only while a Matrix session is signed in.
+    LiveSession,
+}
+
+/// Which control of Manage accounts receives focus. None of them acts on
+/// focus; each still needs its own activation and that dialog's confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountsFocus {
+    /// The dialog's close action.
+    Close,
+    /// Add account.
+    Add,
+    /// Set or change the app password.
+    Protection,
+}
+
+/// How a search result reaches its control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    /// Scroll the Settings page to the control with this target's ID and
+    /// focus it.
+    Settings,
+    /// Open Manage accounts and focus one of its controls.
+    ManageAccounts(AccountsFocus),
+}
+
+pub struct SettingTarget {
+    /// Stable ID; the Settings page names the same ID on the control.
+    pub id: &'static str,
+    pub label: &'static str,
+    pub description: &'static str,
+    pub keywords: &'static [&'static str],
+    pub category: &'static str,
+    pub breadcrumb: &'static str,
+    pub route: Route,
+    pub requires: Requirement,
+}
+
+const fn target(
+    id: &'static str,
+    category: &'static str,
+    breadcrumb: &'static str,
+    label: &'static str,
+    description: &'static str,
+    keywords: &'static [&'static str],
+) -> SettingTarget {
+    SettingTarget {
+        id,
+        label,
+        description,
+        keywords,
+        category,
+        breadcrumb,
+        route: Route::Settings,
+        requires: Requirement::Always,
+    }
+}
+
+const fn live(mut setting: SettingTarget) -> SettingTarget {
+    setting.requires = Requirement::LiveSession;
+    setting
+}
+
+const fn accounts(mut setting: SettingTarget, focus: AccountsFocus) -> SettingTarget {
+    setting.route = Route::ManageAccounts(focus);
+    setting
+}
+
+const APPEARANCE: &str = "Appearance";
+
+/// Every Settings search target. Each ID must have a destination in the
+/// interface; a generated-window test reveals every one of them.
+pub const SETTING_TARGETS: &[SettingTarget] = &[
+    target(
+        "appearance.presets",
+        APPEARANCE,
+        "Settings › Appearance › Starting points",
+        "Appearance starting points",
+        "Fill in fonts, layout, geometry and palette from an editable preset.",
+        &[
+            "preset", "theme", "style", "nocturne", "terminal", "paper", "template",
+        ],
+    ),
+    target(
+        "appearance.colors",
+        APPEARANCE,
+        "Settings › Appearance › Colors and window",
+        "Colors",
+        "Edit any color with a hex value, and reset one color without resetting the theme.",
+        &[
+            "color", "colour", "colors", "colours", "hex", "palette", "theme", "rgb", "rgba",
+        ],
+    ),
+    target(
+        "appearance.window_opacity",
+        APPEARANCE,
+        "Settings › Appearance › Colors and window › Window",
+        "Window transparency",
+        "See the desktop through the window background while text stays opaque.",
+        &[
+            "transparency",
+            "transparent",
+            "opacity",
+            "translucent",
+            "alpha",
+            "see through",
+            "background",
+        ],
+    ),
+    target(
+        "appearance.base_palette",
+        APPEARANCE,
+        "Settings › Appearance › Base palette",
+        "Base palette",
+        "Dark, light, high contrast or follow the system.",
+        &[
+            "dark mode",
+            "light mode",
+            "high contrast",
+            "system theme",
+            "theme mode",
+        ],
+    ),
+    target(
+        "appearance.reduce_motion",
+        APPEARANCE,
+        "Settings › Appearance › Reduce motion",
+        "Reduce motion",
+        "Use immediate hover feedback instead of short fades.",
+        &[
+            "animation",
+            "animations",
+            "motion",
+            "reduced motion",
+            "accessibility",
+        ],
+    ),
+    target(
+        "appearance.fonts",
+        APPEARANCE,
+        "Settings › Appearance › Fonts",
+        "Font families",
+        "Interface, message and monospaced font families.",
+        &[
+            "font",
+            "typeface",
+            "family",
+            "monospace",
+            "serif",
+            "typography",
+        ],
+    ),
+    target(
+        "appearance.message_size",
+        APPEARANCE,
+        "Settings › Appearance › Fonts",
+        "Message font size",
+        "Size of message text before text scaling.",
+        &["font size", "text size", "typography"],
+    ),
+    target(
+        "appearance.sender_weight",
+        APPEARANCE,
+        "Settings › Appearance › Fonts",
+        "Sender font weight",
+        "Weight of sender names in the timeline and threads.",
+        &["bold", "weight", "font weight", "typography"],
+    ),
+    target(
+        "appearance.room_header",
+        APPEARANCE,
+        "Settings › Appearance › Room header",
+        "Room header",
+        "Full, compact or minimal conversation header.",
+        &["header", "topic", "title bar"],
+    ),
+    target(
+        "appearance.message_layout",
+        APPEARANCE,
+        "Settings › Appearance › Conversation style",
+        "Conversation style",
+        "Stacked, compact or column message layout.",
+        &["layout", "irc", "columns", "compact", "message style"],
+    ),
+    target(
+        "appearance.message_details",
+        APPEARANCE,
+        "Settings › Appearance › Conversation style",
+        "Avatars, timestamps and sender colors",
+        "Show or hide message avatars and timestamps, and color sender names.",
+        &[
+            "avatar",
+            "avatars",
+            "timestamp",
+            "sender color",
+            "nick color",
+        ],
+    ),
+    target(
+        "appearance.timestamps",
+        APPEARANCE,
+        "Settings › Appearance › Timestamp style",
+        "Timestamp style",
+        "12-hour, 24-hour or 24-hour with seconds.",
+        &["time", "clock", "24 hour", "seconds", "date format"],
+    ),
+    target(
+        "appearance.geometry",
+        APPEARANCE,
+        "Settings › Appearance › Geometry",
+        "Corner radius",
+        "Roundness of controls and conversation surfaces.",
+        &[
+            "radius",
+            "rounded",
+            "corners",
+            "square",
+            "geometry",
+            "border radius",
+        ],
+    ),
+    target(
+        "appearance.spacing",
+        APPEARANCE,
+        "Settings › Appearance › Geometry",
+        "Message spacing and inset",
+        "Space between messages and around the conversation.",
+        &["spacing", "padding", "gap", "margin", "inset"],
+    ),
+    target(
+        "appearance.rail_width",
+        APPEARANCE,
+        "Settings › Appearance › Geometry",
+        "Space rail width",
+        "Width of the Space and navigation rail.",
+        &["rail", "pane size", "width", "sidebar width"],
+    ),
+    target(
+        "appearance.font_scale",
+        APPEARANCE,
+        "Settings › Appearance › Font scale",
+        "Font scale",
+        "Scale all text from 75% to 200%.",
+        &["zoom", "text size", "scale", "bigger text", "accessibility"],
+    ),
+    target(
+        "appearance.density",
+        APPEARANCE,
+        "Settings › Appearance › Density",
+        "Density",
+        "Compact, comfortable or spacious room and message rows.",
+        &["compact", "spacious", "row height", "spacing"],
+    ),
+    target(
+        "layout.navigation",
+        "Layout",
+        "Settings › Layout › Navigation",
+        "Navigation",
+        "Icon rail or text sidebar, Space labels and direct message grouping.",
+        &["sidebar", "rail", "spaces", "direct messages", "dm"],
+    ),
+    target(
+        "layout.panes",
+        "Layout",
+        "Settings › Layout",
+        "Pane sizes and members panel",
+        "Room list width, details panel width and the members panel.",
+        &["pane", "panel", "width", "members", "details", "resize"],
+    ),
+    target(
+        "layout.unread_first",
+        "Layout",
+        "Settings › Layout",
+        "Unread rooms first",
+        "Sort unread conversations above read ones.",
+        &["sort", "order", "unread"],
+    ),
+    target(
+        "notifications.desktop",
+        "Notifications",
+        "Settings › Notifications",
+        "Desktop notifications",
+        "Show notifications for the active account.",
+        &["notification", "alerts", "banner", "popups"],
+    ),
+    target(
+        "notifications.sounds",
+        "Notifications",
+        "Settings › Notifications",
+        "Notification sounds",
+        "Play a sound with notifications.",
+        &["sound", "audio", "mute", "ping"],
+    ),
+    target(
+        "notifications.previews",
+        "Notifications",
+        "Settings › Notifications",
+        "Message previews in notifications",
+        "Show decrypted text in desktop notifications.",
+        &["preview", "privacy", "content"],
+    ),
+    target(
+        "notifications.highlights",
+        "Notifications",
+        "Settings › Notifications",
+        "Highlight words",
+        "Words and phrases that mark a notification as a highlight.",
+        &["keywords", "mentions", "highlight", "alert words"],
+    ),
+    accounts(
+        target(
+            "accounts.manage",
+            "Accounts",
+            "Accounts › Manage accounts",
+            "Add or open accounts",
+            "Open Manage accounts to add, open or remove a saved account.",
+            &[
+                "account",
+                "add account",
+                "sign in",
+                "login",
+                "switch account",
+            ],
+        ),
+        AccountsFocus::Add,
+    ),
+    accounts(
+        target(
+            "accounts.remove",
+            "Accounts",
+            "Accounts › Manage accounts",
+            "Remove an account",
+            "Each saved account has a Remove action in Manage accounts; removing asks for confirmation.",
+            &[
+                "remove",
+                "delete account",
+                "forget",
+                "log out",
+                "logout",
+                "sign out",
+            ],
+        ),
+        AccountsFocus::Close,
+    ),
+    accounts(
+        target(
+            "accounts.switch_password",
+            "Security",
+            "Accounts › Manage accounts › Switch protection",
+            "App password for account switching",
+            "Set or change the local password required to switch accounts.",
+            &[
+                "password",
+                "app password",
+                "switch password",
+                "lock",
+                "protection",
+                "security",
+            ],
+        ),
+        AccountsFocus::Protection,
+    ),
+    live(target(
+        "security.recovery",
+        "Security",
+        "Settings › Security & recovery",
+        "Security & recovery",
+        "Device verification, recovery key setup and recovering this device, for the signed-in account.",
+        &[
+            "security",
+            "encryption",
+            "e2ee",
+            "verify",
+            "verification",
+            "sas",
+            "emoji",
+            "device",
+            "recovery",
+            "recovery key",
+            "passphrase",
+            "backup",
+            "key backup",
+            "cross signing",
+        ],
+    )),
+    target(
+        "media.image_previews",
+        "Media",
+        "Settings › Image previews",
+        "Image previews in encrypted rooms",
+        "Allow image previews in encrypted conversations.",
+        &["image", "images", "media", "preview", "photos"],
+    ),
+    target(
+        "media.audio_devices",
+        "Media",
+        "Settings › Call audio devices",
+        "Call audio devices",
+        "Microphone and speaker for your next call.",
+        &[
+            "microphone",
+            "mic",
+            "speaker",
+            "headphones",
+            "audio",
+            "sound device",
+            "call",
+        ],
+    ),
+    target(
+        "shortcuts",
+        "Shortcuts",
+        "Settings › Keyboard shortcuts",
+        "Keyboard shortcuts",
+        "Change or disable shortcuts for switching and searching.",
+        &["shortcut", "hotkey", "keybinding", "keys", "keyboard"],
+    ),
+    target(
+        "advanced.config_file",
+        "Advanced",
+        "Settings › Advanced customization",
+        "Settings file",
+        "Edit config.toml and theme files directly; valid changes apply automatically.",
+        &["toml", "config", "file", "theme file", "advanced"],
+    ),
+    target(
+        "updates",
+        "Updates",
+        "Settings › Application updates",
+        "Application updates",
+        "Check for, download and install updates.",
+        &["update", "upgrade", "version", "release"],
+    ),
+];
+
+pub fn setting_target(id: &str) -> Option<&'static SettingTarget> {
+    SETTING_TARGETS.iter().find(|target| target.id == id)
+}
+
+/// Longest query considered, in characters.
+pub const MAX_SEARCH_QUERY_CHARS: usize = 64;
+/// Most results returned for one query.
+pub const MAX_SEARCH_RESULTS: usize = 8;
+
+/// Search the Settings targets that are available now. Matching is
+/// case-insensitive over the label, keywords, category and description; every
+/// word of the query must match. Results are ranked, stable and bounded.
+pub fn search_settings(
+    query: &str,
+    available: impl Fn(Requirement) -> bool,
+) -> Vec<&'static SettingTarget> {
+    let query: String = query.chars().take(MAX_SEARCH_QUERY_CHARS).collect();
+    let query = query.to_lowercase();
+    let words: Vec<&str> = query.split_whitespace().collect();
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let mut ranked: Vec<(u32, usize, &'static SettingTarget)> = SETTING_TARGETS
+        .iter()
+        .enumerate()
+        .filter(|(_, target)| available(target.requires))
+        .filter_map(|(order, target)| Some((score(target, &words)?, order, target)))
+        .collect();
+    ranked.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+    ranked
+        .into_iter()
+        .take(MAX_SEARCH_RESULTS)
+        .map(|(_, _, target)| target)
+        .collect()
+}
+
+fn score(target: &SettingTarget, words: &[&str]) -> Option<u32> {
+    let label = target.label.to_lowercase();
+    let category = target.category.to_lowercase();
+    let description = target.description.to_lowercase();
+    let mut total = 0;
+    for word in words {
+        let keyword = target.keywords.iter().map(|keyword| keyword.to_lowercase());
+        let best = if label.split_whitespace().any(|part| part.starts_with(word)) {
+            8
+        } else if keyword.clone().any(|keyword| keyword == *word) {
+            7
+        } else if keyword.clone().any(|keyword| keyword.starts_with(word)) {
+            5
+        } else if label.contains(word) || category.starts_with(word) {
+            4
+        } else if keyword.clone().any(|keyword| keyword.contains(word)) {
+            3
+        } else if description.contains(word) {
+            1
+        } else {
+            return None;
+        };
+        total += best;
+    }
+    Some(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn token_ids_are_unique_stable_keys_with_resolvable_fallbacks() {
+        let mut ids = HashSet::new();
+        for token in COLOR_TOKENS {
+            assert!(ids.insert(token.id), "duplicate token {}", token.id);
+            assert!(
+                token
+                    .id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+                "{} is not a stable snake_case key",
+                token.id
+            );
+            assert!(!token.label.is_empty() && !token.description.is_empty());
+            match token.fallback {
+                Fallback::Palette => assert_eq!(token.source, TokenSource::Base, "{}", token.id),
+                Fallback::Token(other) => {
+                    assert!(color_token(other).is_some(), "{} follows {other}", token.id);
+                    assert_ne!(other, token.id);
+                }
+                Fallback::Legacy { example } => {
+                    assert!(parse_hex_color(example).is_some(), "{}", token.id);
+                }
+            }
+        }
+        // The eleven theme-pack colors are all editable tokens.
+        for base in [
+            "rail",
+            "sidebar",
+            "canvas",
+            "panel",
+            "elevated",
+            "hover",
+            "ink",
+            "muted",
+            "divider",
+            "accent",
+            "accent_ink",
+        ] {
+            assert_eq!(
+                color_token(base).map(|token| token.source),
+                Some(TokenSource::Base)
+            );
+        }
+        assert_eq!(
+            COLOR_TOKENS
+                .iter()
+                .filter(|token| token.source == TokenSource::Base)
+                .count(),
+            11
+        );
+        for group in TokenGroup::ALL {
+            assert!(COLOR_TOKENS.iter().any(|token| token.group == group));
+        }
+    }
+
+    #[test]
+    fn hex_colors_accept_rgb_and_rgba_with_alpha_last() {
+        assert_eq!(parse_hex_color("#1e2330"), Some([0x1e, 0x23, 0x30, 0xff]));
+        assert_eq!(parse_hex_color("#1E233080"), Some([0x1e, 0x23, 0x30, 0x80]));
+        assert_eq!(parse_hex_color("#00000000"), Some([0, 0, 0, 0]));
+        for invalid in [
+            "",
+            "#",
+            "#123",
+            "#1234",
+            "#12345",
+            "#1234567",
+            "#123456789",
+            "1E2330",
+            "#GG2330",
+            "#1E2330 ",
+            " #1E2330",
+            "#１２３４５６",
+            "red",
+            "#+12345",
+        ] {
+            assert_eq!(parse_hex_color(invalid), None, "{invalid:?}");
+        }
+        assert_eq!(format_hex_color([0x1e, 0x23, 0x30, 0xff]), "#1E2330");
+        assert_eq!(format_hex_color([0x1e, 0x23, 0x30, 0x80]), "#1E233080");
+        for value in ["#ABCDEF", "#ABCDEF01", "#00000000"] {
+            assert_eq!(format_hex_color(parse_hex_color(value).unwrap()), value);
+        }
+    }
+
+    #[test]
+    fn setting_targets_are_unique_and_searchable_by_their_aliases() {
+        let mut ids = HashSet::new();
+        for target in SETTING_TARGETS {
+            assert!(ids.insert(target.id), "duplicate target {}", target.id);
+            assert!(!target.label.is_empty() && !target.description.is_empty());
+            assert!(!target.category.is_empty() && !target.breadcrumb.is_empty());
+        }
+        let all = |_| true;
+        let first = |query: &str| search_settings(query, all).first().map(|target| target.id);
+        assert_eq!(first("colour"), Some("appearance.colors"));
+        assert_eq!(first("COLOR"), Some("appearance.colors"));
+        assert_eq!(first("transparency"), Some("appearance.window_opacity"));
+        assert_eq!(first("opacity"), Some("appearance.window_opacity"));
+        assert_eq!(first("font"), Some("appearance.fonts"));
+        assert_eq!(first("animations"), Some("appearance.reduce_motion"));
+        assert_eq!(first("switch password"), Some("accounts.switch_password"));
+        assert_eq!(first("microphone"), Some("media.audio_devices"));
+        assert_eq!(first("hotkey"), Some("shortcuts"));
+        assert_eq!(first("recovery key"), Some("security.recovery"));
+        assert!(search_settings("", all).is_empty());
+        assert!(search_settings("   ", all).is_empty());
+        assert!(search_settings("no such setting zzz", all).is_empty());
+        // Bounded: a query matching many targets returns at most the limit.
+        assert!(search_settings("e", all).len() <= MAX_SEARCH_RESULTS);
+        let long = "a".repeat(10_000);
+        assert!(search_settings(&long, all).is_empty());
+        // Unavailable targets are never offered.
+        let offline = |requirement| requirement == Requirement::Always;
+        assert!(
+            search_settings("verify", offline)
+                .iter()
+                .all(|target| target.requires == Requirement::Always)
+        );
+    }
+
+    #[test]
+    fn account_results_open_a_dialog_without_focusing_removal() {
+        let remove = setting_target("accounts.remove").unwrap();
+        assert_eq!(remove.route, Route::ManageAccounts(AccountsFocus::Close));
+        for target in SETTING_TARGETS {
+            if let Route::ManageAccounts(focus) = target.route {
+                assert!(matches!(
+                    focus,
+                    AccountsFocus::Close | AccountsFocus::Add | AccountsFocus::Protection
+                ));
+            }
+        }
+    }
+}

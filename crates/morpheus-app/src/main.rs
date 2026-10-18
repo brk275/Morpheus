@@ -4,6 +4,7 @@
 
 mod account_access;
 mod appearance;
+mod appearance_editor;
 mod attachments;
 mod audio_devices;
 #[cfg(feature = "native-calls")]
@@ -11,6 +12,7 @@ mod call_membership;
 #[cfg(feature = "native-calls")]
 mod calls;
 mod composer_mentions;
+mod config_cli;
 mod draft_recovery;
 mod drafts;
 mod image_previews;
@@ -28,6 +30,7 @@ mod outgoing_ring;
 mod preview_capture;
 mod room_settings;
 mod security;
+mod settings_search;
 mod shortcuts;
 mod sso;
 #[cfg(not(morpheus_timeline_acceptance))]
@@ -879,9 +882,12 @@ fn make_stress_messages() -> Vec<MessageItem> {
         .collect()
 }
 
+/// A validated `#RRGGBB` or `#RRGGBBAA` color, alpha last. Validation has
+/// already rejected anything else; an unexpected value paints black.
 fn color_from_hex(value: &str) -> Color {
-    let rgb = u32::from_str_radix(value.strip_prefix('#').unwrap_or_default(), 16).unwrap_or(0);
-    Color::from_rgb_u8((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8)
+    let [red, green, blue, alpha] =
+        morpheus_config::registry::parse_hex_color(value).unwrap_or([0, 0, 0, 0xff]);
+    Color::from_argb_u8(alpha, red, green, blue)
 }
 
 fn apply_room_sort(ui: &AppWindow) {
@@ -904,7 +910,9 @@ fn apply_notification_settings(ui: &AppWindow, config: &Config) {
 
 fn apply_config(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
     appearance::apply_config(ui, config);
-    appearance::apply_theme(ui, theme);
+    appearance::apply_theme(ui, config, theme);
+    // After the theme, so the workspace reads the colors now shown.
+    appearance_editor::project(ui, config, theme);
     shortcuts::apply_config(ui, config);
     audio_devices::apply_config(ui, config);
     image_previews::apply_config(ui, config);
@@ -954,15 +962,33 @@ fn save_config_change(
     store: &ConfigStore,
     change: impl FnOnce(&mut Config),
 ) -> Option<Config> {
+    save_config_edit(ui, store, |config| {
+        change(config);
+        true
+    })
+}
+
+/// `save_config_change` for a change decided on the file as re-read: when
+/// `change` returns false, nothing is written or applied and `None` is
+/// returned without an error, so the caller tells a declined change from a
+/// failed save by what its closure recorded.
+fn save_config_edit(
+    ui: &AppWindow,
+    store: &ConfigStore,
+    change: impl FnOnce(&mut Config) -> bool,
+) -> Option<Config> {
     // Read from disk first so an invalid external edit is never overwritten by a UI action.
     let result = (|| {
         let mut config = store.load()?;
-        change(&mut config);
+        if !change(&mut config) {
+            return Ok(None);
+        }
         store.save(&config)?;
-        Ok::<_, morpheus_config::ConfigError>(config)
+        Ok::<_, morpheus_config::ConfigError>(Some(config))
     })();
     match result {
-        Ok(config) => {
+        Ok(None) => None,
+        Ok(Some(config)) => {
             // A missing or malformed theme should leave the last valid
             // appearance active, but it must not hold back notification
             // privacy changes from a successfully saved config.
@@ -1489,6 +1515,12 @@ fn continue_account_action(ui: &AppWindow, action: i32) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `config validate` and `config schema` run first: before the screenshot
+    // preview, the updater, the startup session, the window, the account
+    // store, the credential vault, sync and media devices. They write nothing.
+    if let Some(status) = config_cli::early_dispatch() {
+        std::process::exit(status);
+    }
     // An instrumented acceptance build refuses to start without a valid run
     // file, so it never runs as an ordinary app. See tests/TIMELINE_10K.md.
     #[cfg(morpheus_timeline_acceptance)]
@@ -4635,6 +4667,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     let setting_store = store.clone();
     appearance::install_callbacks(&ui, &store);
+    appearance_editor::register(&ui, &store);
+    settings_search::register(&ui);
     ui.on_choose_theme(move |index| {
         if let Some(ui) = weak.upgrade() {
             let theme = match index {

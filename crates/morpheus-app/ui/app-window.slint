@@ -1,4 +1,4 @@
-import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView } from "std-widgets.slint";
+import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView, Slider, SpinBox } from "std-widgets.slint";
 
 // Optional overrides retain each control's existing color when absent.
 export struct ColorRole {
@@ -27,12 +27,71 @@ export struct ThemeRoleSet {
     message: ColorRole,
     own-message: ColorRole,
     own-surface: ColorRole,
+    scrim: ColorRole,
+    shadow: ColorRole,
+    media-backdrop: ColorRole,
+    presence-online: ColorRole,
+    avatar-ink: ColorRole,
+}
+
+// Sparse `[colors]` overrides of the eleven base colors. An absent entry
+// keeps the theme pack's color, or the built-in palette's.
+export struct BaseColorSet {
+    rail: ColorRole,
+    sidebar: ColorRole,
+    canvas: ColorRole,
+    panel: ColorRole,
+    elevated: ColorRole,
+    hover: ColorRole,
+    ink: ColorRole,
+    muted: ColorRole,
+    divider: ColorRole,
+    accent: ColorRole,
+    accent-ink: ColorRole,
+}
+
+// One Settings search result. `id` is a registry target ID, never a path or URL.
+export struct SettingsResult {
+    id: string,
+    label: string,
+    breadcrumb: string,
+    description: string,
+}
+
+export struct ColorGroupItem {
+    id: string,
+    label: string,
+    count: int,
+    window: bool,
+}
+
+export struct ColorTokenItem {
+    id: string,
+    label: string,
+    group: string,
+    overridden: bool,
+}
+
+export struct ColorEditorState {
+    id: string,
+    label: string,
+    description: string,
+    group: string,
+    // Where the shown color comes from, as fixed text.
+    source: string,
+    overridden: bool,
+    can-undo: bool,
+    // Inline guidance for the typed value; the last valid color stays applied.
+    hint: string,
 }
 
 // Runtime geometry shared by small reusable controls and the main view.
 export global StyleTokens {
     in-out property <length> radius: 10px;
     in-out property <ThemeRoleSet> roles;
+    in-out property <BaseColorSet> base;
+    // Share of each window surface's own alpha that is painted, 0 to 1.
+    in-out property <float> window-opacity: 1;
     in-out property <bool> reduced-motion: false;
     out property <duration> interaction-duration: StyleTokens.reduced-motion ? 0ms : 90ms;
 }
@@ -227,7 +286,7 @@ export struct MessageSearchItem {
 component AvatarBadge inherits Rectangle {
     in property <string> initials;
     in property <color> accent;
-    in property <color> ink: #ffffff;
+    in property <color> ink: StyleTokens.roles.avatar-ink.present ? StyleTokens.roles.avatar-ink.color : #ffffff;
     width: 38px;
     height: 38px;
     border-radius: StyleTokens.radius * 1.3;
@@ -280,6 +339,7 @@ component IconAction inherits Rectangle {
     in property <bool> reveal-full-control: true;
     // Reveal the associated value row as well as a small settings action.
     in property <length> reveal-height: root.height;
+    out property <bool> has-focus: keyboard-focus.has-focus;
     property <bool> vector-icon: icon == "S" || icon == "C" || icon == "P" || icon == "⌂" || icon == "+" || icon == "↓" || icon == "F" || icon == "↩" || icon == "♥" || icon == "⌫" || icon == "✎" || icon == "☷";
     opacity: !quiet || context-hover || area.has-hover || keyboard-focus.has-focus ? 1 : 0;
     callback activated();
@@ -1274,6 +1334,8 @@ component ShortcutSetting inherits Rectangle {
     callback edited();
     height: 52px;
     background: transparent;
+    forward-focus: shortcut-input;
+    out property <bool> has-focus: shortcut-input.has-focus;
     HorizontalLayout {
         spacing: 12px;
         Text { text: root.label; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; }
@@ -1303,16 +1365,22 @@ component StyleNumberSetting inherits Rectangle {
     in property <color> hover-surface;
     in property <float> text-scale: 1;
     callback changed-value(int);
+    out property <bool> has-focus: decrease.has-focus || increase.has-focus;
+    // At its minimum the decrease action is disabled; focus the other one.
+    public function focus-control() {
+        if root.value > root.minimum { decrease.focus(); } else { increase.focus(); }
+    }
     height: max(58px, 34px * root.text-scale + 20px);
     background: surface; border-radius: StyleTokens.radius;
+    forward-focus: decrease;
     HorizontalLayout {
         padding: 10px; spacing: 8px;
         Text { text: root.label; color: root.ink; font-size: 12px * root.text-scale;
             vertical-alignment: center; horizontal-stretch: 1; wrap: word-wrap; }
         Text { text: root.value + " px"; color: root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; }
-        IconAction { icon: "−"; label: "Decrease " + root.label; ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
+        decrease := IconAction { icon: "−"; label: "Decrease " + root.label; ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
             enabled: root.value > root.minimum; activated => { root.changed-value(max(root.minimum, root.value - root.step)); } }
-        IconAction { icon: "+"; label: "Increase " + root.label; ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
+        increase := IconAction { icon: "+"; label: "Increase " + root.label; ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
             enabled: root.value < root.maximum; activated => { root.changed-value(min(root.maximum, root.value + root.step)); } }
     }
 }
@@ -1325,6 +1393,8 @@ component StyleFontSetting inherits Rectangle {
     in property <color> accent;
     in property <float> text-scale: 1;
     height: 74px * root.text-scale;
+    forward-focus: input;
+    out property <bool> has-focus: input.has-focus;
     VerticalLayout {
         spacing: 7px;
         Text { text: root.label; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; }
@@ -1339,6 +1409,377 @@ component StyleFontSetting inherits Rectangle {
             }
         }
     }
+}
+
+// Pinned Settings search. Up and Down move the highlighted result, Enter
+// reveals it and Escape clears the query. Choosing a result only reveals and
+// focuses its control; it never changes a setting.
+component SettingsSearchBar inherits VerticalLayout {
+    in-out property <string> query;
+    in property <[SettingsResult]> results;
+    in-out property <int> index;
+    in property <bool> dismissed;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> surface;
+    in property <color> hover-surface;
+    in property <color> accent;
+    in property <color> outline;
+    in property <float> text-scale: 1;
+    // Results scroll inside this height, so the field and Settings below
+    // stay reachable at large text and small windows.
+    in property <length> max-results-height: 240px;
+    callback search(string);
+    callback choose(string);
+    property <bool> open: root.query != "" && !root.dismissed;
+    forward-focus: input;
+    spacing: 4px;
+    alignment: start;
+    function pick() {
+        if root.index >= 0 && root.index < root.results.length {
+            root.choose(root.results[root.index].id);
+        }
+    }
+    Rectangle {
+        height: max(40px, 32px * root.text-scale);
+        background: root.surface;
+        border-radius: StyleTokens.radius * 0.8;
+        border-width: input.has-focus ? 2px : 1px;
+        border-color: input.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent) : root.outline;
+        InterfaceGlyph {
+            x: 10px; y: (parent.height - self.height) / 2; width: 16px; height: 16px;
+            icon: "S"; ink: root.muted;
+        }
+        if root.query == "" : Text {
+            x: 34px; width: parent.width - 44px; height: parent.height;
+            text: "Search settings: colors, fonts, transparency, password…";
+            color: root.muted; font-size: 12px * root.text-scale; vertical-alignment: center; overflow: elide;
+        }
+        // Capture navigation keys before the text field edits with them.
+        keys := FocusScope {
+            x: 34px; width: parent.width - 44px; height: parent.height;
+            focus-on-click: false;
+            focus-on-tab-navigation: false;
+            capture-key-pressed(event) => {
+                if event.text == Key.DownArrow && root.open && root.results.length > 0 {
+                    root.index = min(root.index + 1, root.results.length - 1);
+                    accept
+                } else if event.text == Key.UpArrow && root.open && root.results.length > 0 {
+                    root.index = max(root.index - 1, 0);
+                    accept
+                } else if event.text == Key.Escape && root.query != "" {
+                    root.query = "";
+                    root.search("");
+                    accept
+                } else { reject }
+            }
+            input := ThemedTextInput {
+                width: parent.width; height: parent.height;
+                text <=> root.query; single-line: true;
+                color: root.ink; font-size: 13px * root.text-scale; vertical-alignment: center;
+                accessible-label: "Search settings";
+                accessible-description: root.open && root.results.length > 0 && root.index >= 0 && root.index < root.results.length
+                    ? root.results[root.index].label + ", " + root.results[root.index].breadcrumb : "";
+                edited => { root.search(self.text); }
+                accepted => { root.pick(); }
+            }
+        }
+    }
+    if root.open && root.results.length == 0 : Text {
+        text: "No matching settings. Try another word, such as color, font or password.";
+        color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+        accessible-live-region: polite;
+    }
+    if root.open && root.results.length > 0 : results-scroll := ScrollView {
+        height: min(results-content.preferred-height, root.max-results-height);
+        horizontal-scrollbar-policy: always-off;
+        // Keep the highlighted row inside the visible part of the list.
+        function reveal-row(top: length, height: length) {
+            if top < -self.content-y {
+                self.content-y = -top;
+            } else if top + height > -self.content-y + self.visible-height {
+                self.content-y = -(top + height - self.visible-height);
+            }
+        }
+        results-content := VerticalLayout {
+        width: results-scroll.visible-width;
+        spacing: 2px; alignment: start;
+        for result[i] in root.results : ActionRect {
+            property <bool> highlighted: i == root.index;
+            changed highlighted => {
+                if self.highlighted { results-scroll.reveal-row(self.y, self.height); }
+            }
+            min-height: max(44px, label-text.preferred-height + trail-text.preferred-height + 14px);
+            label: result.label + ", " + result.breadcrumb + ". " + result.description;
+            background: i == root.index || self.has-hover ? root.hover-surface : transparent;
+            border-radius: StyleTokens.radius * 0.6;
+            border-width: i == root.index ? 1px : 0px;
+            border-color: root.accent;
+            focus-color: root.accent;
+            activated => { root.index = i; root.choose(result.id); }
+            VerticalLayout {
+                padding-left: 10px; padding-right: 10px; padding-top: 6px; padding-bottom: 6px; spacing: 2px;
+                label-text := Text { text: result.label; color: root.ink; font-size: 12px * root.text-scale; font-weight: 650; wrap: word-wrap; }
+                trail-text := Text { text: result.breadcrumb; color: root.muted; font-size: 10px * root.text-scale; wrap: word-wrap; }
+            }
+        }
+        }
+    }
+}
+
+// Color groups, a filter over every token and the tokens shown. Choosing a
+// token opens it in the editor; nothing changes until a valid value is typed.
+component ColorTokenList inherits VerticalLayout {
+    in property <[ColorGroupItem]> groups;
+    in property <[ColorTokenItem]> tokens;
+    in property <int> group-index;
+    in property <string> selected-id;
+    in-out property <string> filter;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> surface;
+    in property <color> hover-surface;
+    in property <color> accent;
+    in property <color> outline;
+    in property <float> text-scale: 1;
+    // The groups and tokens scroll inside this height, so the editor stays
+    // close to the list at narrow widths and large text.
+    in property <length> max-list-height: 320px;
+    out property <bool> has-focus: filter-input.has-focus;
+    pure callback color-of(string) -> color;
+    callback filter-edited(string);
+    callback group-chosen(int);
+    callback token-chosen(string);
+    forward-focus: filter-input;
+    spacing: 4px;
+    alignment: start;
+    Rectangle {
+        height: max(36px, 30px * root.text-scale);
+        background: root.surface; border-radius: StyleTokens.radius * 0.7;
+        border-width: filter-input.has-focus ? 2px : 1px;
+        border-color: filter-input.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent) : root.outline;
+        if root.filter == "" : Text {
+            x: 10px; width: parent.width - 20px; height: parent.height;
+            text: "Filter colors: link, badge, backdrop…"; color: root.muted;
+            font-size: 12px * root.text-scale; vertical-alignment: center; overflow: elide;
+        }
+        filter-input := ThemedTextInput {
+            x: 10px; width: parent.width - 20px; height: parent.height;
+            text <=> root.filter; single-line: true;
+            color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center;
+            accessible-label: "Filter colors by name";
+            edited => { root.filter-edited(self.text); }
+        }
+    }
+    list-scroll := ScrollView {
+        height: min(list-content.preferred-height, root.max-list-height);
+        horizontal-scrollbar-policy: always-off;
+        accessible-role: list;
+        accessible-label: "Colors to edit";
+        // A row that takes keyboard focus is scrolled into view by Slint in
+        // this list and in the Settings page alike.
+        list-content := VerticalLayout {
+    width: list-scroll.visible-width;
+    spacing: 2px; alignment: start;
+    if root.filter == "" : VerticalLayout {
+        spacing: 2px; alignment: start;
+        for group[index] in root.groups : ActionRect {
+            height: max(32px, 26px * root.text-scale);
+            label: group.label + (index == root.group-index ? ", selected" : "");
+            background: index == root.group-index ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover-surface)
+                : self.has-hover ? root.hover-surface : transparent;
+            border-radius: StyleTokens.radius * 0.6; focus-color: root.accent;
+            activated => { root.group-chosen(index); }
+            HorizontalLayout {
+                padding-left: 10px; padding-right: 10px; spacing: 6px;
+                Text {
+                    text: group.label;
+                    color: index == root.group-index && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink;
+                    font-size: 12px * root.text-scale; font-weight: index == root.group-index ? 700 : 500;
+                    vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
+                }
+                Text { text: group.window ? "" : ("" + group.count); color: root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; }
+            }
+        }
+    }
+    Rectangle { height: 1px; background: root.outline; }
+    if root.tokens.length == 0 : Text {
+        text: "No colors match. Try another word."; color: root.muted;
+        font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite;
+    }
+    for token in root.tokens : ActionRect {
+        height: max(36px, 30px * root.text-scale);
+        label: token.label + (token.overridden ? ", customized" : "") + (token.id == root.selected-id ? ", selected" : "");
+        background: token.id == root.selected-id ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover-surface)
+            : self.has-hover ? root.hover-surface : transparent;
+        border-radius: StyleTokens.radius * 0.6; focus-color: root.accent;
+        activated => { root.token-chosen(token.id); }
+        HorizontalLayout {
+            padding-left: 8px; padding-right: 8px; spacing: 8px;
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 18px; height: 18px; border-radius: 4px;
+                    border-width: 1px; border-color: root.outline; background: root.color-of(token.id);
+                }
+            }
+            Text {
+                text: token.label;
+                color: token.id == root.selected-id && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink;
+                font-size: 12px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
+            }
+            if token.overridden : Text { text: "edited"; color: root.muted; font-size: 10px * root.text-scale; vertical-alignment: center; }
+        }
+    }
+        }
+    }
+}
+
+// The one selected color. A valid #RRGGBB or #RRGGBBAA value applies and
+// saves at once; partial or invalid input only shows a hint and the last
+// valid color stays applied. Escape restores the field to the shown color.
+component ColorTokenEditor inherits VerticalLayout {
+    in property <ColorEditorState> state;
+    in property <color> swatch;
+    in-out property <string> hex;
+    in property <int> override-count;
+    in property <string> reset-all-notice;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> surface;
+    in property <color> hover-surface;
+    in property <color> accent;
+    in property <color> outline;
+    in property <float> text-scale: 1;
+    callback hex-edited(string);
+    callback restore-input();
+    callback reset();
+    callback undo();
+    callback reset-all();
+    out property <bool> has-focus: hex-input.has-focus;
+    forward-focus: hex-input;
+    spacing: 8px;
+    alignment: start;
+    HorizontalLayout {
+        spacing: 12px;
+        VerticalLayout {
+            alignment: start;
+            Rectangle {
+                width: 52px; height: 52px; border-radius: StyleTokens.radius * 0.8;
+                border-width: 1px; border-color: root.outline; background: root.swatch;
+                accessible-role: image; accessible-label: "Current color of " + root.state.label;
+            }
+        }
+        VerticalLayout {
+            alignment: start; spacing: 3px; horizontal-stretch: 1;
+            Text { text: root.state.label; color: root.ink; font-size: 14px * root.text-scale; font-weight: 700; wrap: word-wrap; }
+            Text { text: root.state.group + " · " + root.state.source; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+        }
+    }
+    Text { text: root.state.description; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+    Rectangle {
+        height: max(38px, 32px * root.text-scale);
+        background: root.surface; border-radius: StyleTokens.radius * 0.7;
+        border-width: hex-input.has-focus ? 2px : 1px;
+        border-color: hex-input.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent) : root.outline;
+        FocusScope {
+            x: 10px; width: parent.width - 20px; height: parent.height;
+            focus-on-click: false;
+            focus-on-tab-navigation: false;
+            capture-key-pressed(event) => {
+                if event.text == Key.Escape { root.restore-input(); accept } else { reject }
+            }
+            hex-input := ThemedTextInput {
+                width: parent.width; height: parent.height;
+                text <=> root.hex; single-line: true;
+                color: root.ink; font-size: 13px * root.text-scale; vertical-alignment: center;
+                accessible-label: "Hex color for " + root.state.label + ", #RRGGBB or #RRGGBBAA";
+                accessible-description: root.state.hint;
+                edited => { root.hex-edited(self.text); }
+                accepted => { root.hex-edited(self.text); }
+            }
+        }
+    }
+    if root.state.hint != "" : Text {
+        text: root.state.hint; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+        accessible-live-region: polite;
+    }
+    HorizontalLayout {
+        spacing: 8px; alignment: start;
+        if root.state.overridden : TextAction {
+            text: "Reset"; label: "Reset " + root.state.label + " to its theme or built-in color";
+            ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+            outline: root.outline; text-scale: root.text-scale;
+            activated => { root.reset(); }
+        }
+        if root.state.can-undo : TextAction {
+            text: "Undo"; label: "Undo the last change to " + root.state.label;
+            ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+            outline: root.outline; text-scale: root.text-scale;
+            activated => { root.undo(); }
+        }
+    }
+    Text { text: "Advanced: key " + root.state.id + " in the [colors] table of config.toml"; color: root.muted; font-size: 10px * root.text-scale; wrap: word-wrap; }
+    if root.override-count > 0 || root.reset-all-notice != "" : TextAction {
+        wrap-caption: true;
+        text: root.reset-all-notice != "" ? root.reset-all-notice : "Reset all " + root.override-count + " customized colors";
+        ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+        outline: root.outline; text-scale: root.text-scale;
+        activated => { root.reset-all(); }
+    }
+}
+
+// Native window transparency. The slider previews while dragging and saves
+// on release; the number saves when edited. Both edit the same value.
+component WindowOpacitySetting inherits VerticalLayout {
+    in property <int> value;
+    // Bumped after every save attempt so both controls show the saved value,
+    // including after a rejected save restored the previous one.
+    in property <int> revision;
+    in property <string> status;
+    in property <color> ink;
+    in property <color> muted;
+    in property <float> text-scale: 1;
+    // A value to preview now and save shortly; keyboard and accessibility
+    // changes arrive here too.
+    callback previewed(int);
+    // A value to save now, such as on pointer or key release.
+    callback changed-value(int);
+    out property <bool> has-focus: slider.has-focus;
+    forward-focus: slider;
+    spacing: 6px;
+    alignment: start;
+    changed value => {
+        slider.value = root.value;
+        number.value = root.value;
+    }
+    changed revision => {
+        slider.value = root.value;
+        number.value = root.value;
+    }
+    Text { text: "Window transparency"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+    Text {
+        text: "Lower values let the desktop show through the window's panes. Text, icons, inputs, cards and dialogs stay opaque; sign-in and recovery always stay opaque.";
+        color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+    }
+    HorizontalLayout {
+        spacing: 10px;
+        slider := Slider {
+            horizontal-stretch: 1; minimum: 0; maximum: 100; step: 1;
+            value: root.value;
+            accessible-label: "Window background opacity, percent";
+            changed(value) => { root.previewed(round(value)); }
+            released(value) => { root.changed-value(round(value)); }
+        }
+        number := SpinBox {
+            width: max(96px, 80px * root.text-scale);
+            minimum: 0; maximum: 100; value: root.value;
+            accessible-label: "Window background opacity, percent, as a number";
+            edited(value) => { root.previewed(value); }
+        }
+        Text { text: "%"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; }
+    }
+    Text { text: root.status; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
 }
 
 // Separate from AppWindow so a blocked account store exposes no sign-in,
@@ -1561,6 +2002,48 @@ export component AppWindow inherits Window {
     callback set-style-flag(int, bool);
     callback set-sender-weight(int);
     callback choose-timestamp-format(int);
+
+    // Settings search. Results come from the Rust registry; choosing one only
+    // reveals and focuses its control and never changes a setting.
+    in-out property <string> settings-search-query;
+    in-out property <[SettingsResult]> settings-search-results;
+    in-out property <int> settings-search-index: -1;
+    in-out property <bool> settings-search-dismissed: false;
+    callback settings-search(string);
+    callback settings-search-choose(string);
+    // The control whose registry ID matches scrolls into view and takes focus
+    // each time the serial changes; it then reports its ID.
+    in-out property <string> settings-reveal-id;
+    in-out property <int> settings-reveal-serial: 0;
+    in-out property <string> settings-revealed-id;
+    // Manage accounts focuses "add", "protection" or its close action.
+    in-out property <string> manage-accounts-focus;
+    pure function reveal-request(id: string) -> int {
+        return root.settings-reveal-id == id ? root.settings-reveal-serial : 0;
+    }
+
+    // Appearance workspace: one selected color token at a time.
+    in-out property <[ColorGroupItem]> color-groups;
+    in-out property <[ColorTokenItem]> color-tokens;
+    in-out property <int> color-group-index: 0;
+    in-out property <string> color-filter;
+    in-out property <string> color-selected-id;
+    in-out property <ColorEditorState> color-editor;
+    in-out property <string> color-hex-input;
+    in-out property <string> color-reset-all-notice;
+    in-out property <int> color-override-count: 0;
+    callback color-filter-changed(string);
+    callback color-group-chosen(int);
+    callback color-token-chosen(string);
+    callback color-hex-edited(string);
+    callback color-reset();
+    callback color-undo();
+    callback color-reset-all();
+    in-out property <int> window-opacity-percent: 100;
+    in-out property <int> window-opacity-revision: 0;
+    in-out property <string> window-transparency-status;
+    callback preview-window-opacity(int);
+    callback set-window-opacity(int);
 
     // Empty alternate clocks identify delivery status or a row with no clock.
     // Keep those labels unchanged even when clocks are hidden or decorated.
@@ -2146,19 +2629,94 @@ export component AppWindow inherits Window {
     property <length> message-row-gap: root.message-gap-px * 1px * (root.density-mode == 0 ? 0.5 : root.density-mode == 2 ? 1.333 : 1);
     property <length> content-inset: root.content-padding-px * 1px;
 
-    property <color> rail: custom-theme-active ? custom-rail : light-palette ? #e7ebf3 : theme-mode == 2 ? #000000 : #10131b;
-    property <color> sidebar: custom-theme-active ? custom-sidebar : light-palette ? #f1f3f8 : theme-mode == 2 ? #101010 : #171b26;
-    property <color> canvas: custom-theme-active ? custom-canvas : light-palette ? #ffffff : theme-mode == 2 ? #000000 : #1e2330;
-    property <color> panel: custom-theme-active ? custom-panel : light-palette ? #f8f9fc : theme-mode == 2 ? #101010 : #191e2a;
-    property <color> elevated: custom-theme-active ? custom-elevated : light-palette ? #ffffff : theme-mode == 2 ? #181818 : #272d3b;
-    property <color> hover: custom-theme-active ? custom-hover : light-palette ? #e3e8f2 : theme-mode == 2 ? #333333 : #32394b;
-    property <color> ink: custom-theme-active ? custom-ink : light-palette ? #182132 : #ffffff;
-    property <color> muted: custom-theme-active ? custom-muted : light-palette ? #596579 : theme-mode == 2 ? #ffffff : #a7afc1;
-    property <color> divider: custom-theme-active ? custom-divider : light-palette ? #dfe4ee : theme-mode == 2 ? #ffffff : #303747;
-    property <color> accent: custom-theme-active ? custom-accent : light-palette ? #6545b5 : theme-mode == 2 ? #ffff00 : #ad91ff;
-    property <color> accent-ink: custom-theme-active ? custom-accent-ink : light-palette ? #ffffff : theme-mode == 2 ? #000000 : #10131b;
+    property <color> rail: StyleTokens.base.rail.present ? StyleTokens.base.rail.color : custom-theme-active ? custom-rail : light-palette ? #e7ebf3 : theme-mode == 2 ? #000000 : #10131b;
+    property <color> sidebar: StyleTokens.base.sidebar.present ? StyleTokens.base.sidebar.color : custom-theme-active ? custom-sidebar : light-palette ? #f1f3f8 : theme-mode == 2 ? #101010 : #171b26;
+    property <color> canvas: StyleTokens.base.canvas.present ? StyleTokens.base.canvas.color : custom-theme-active ? custom-canvas : light-palette ? #ffffff : theme-mode == 2 ? #000000 : #1e2330;
+    property <color> panel: StyleTokens.base.panel.present ? StyleTokens.base.panel.color : custom-theme-active ? custom-panel : light-palette ? #f8f9fc : theme-mode == 2 ? #101010 : #191e2a;
+    property <color> elevated: StyleTokens.base.elevated.present ? StyleTokens.base.elevated.color : custom-theme-active ? custom-elevated : light-palette ? #ffffff : theme-mode == 2 ? #181818 : #272d3b;
+    property <color> hover: StyleTokens.base.hover.present ? StyleTokens.base.hover.color : custom-theme-active ? custom-hover : light-palette ? #e3e8f2 : theme-mode == 2 ? #333333 : #32394b;
+    property <color> ink: StyleTokens.base.ink.present ? StyleTokens.base.ink.color : custom-theme-active ? custom-ink : light-palette ? #182132 : #ffffff;
+    property <color> muted: StyleTokens.base.muted.present ? StyleTokens.base.muted.color : custom-theme-active ? custom-muted : light-palette ? #596579 : theme-mode == 2 ? #ffffff : #a7afc1;
+    property <color> divider: StyleTokens.base.divider.present ? StyleTokens.base.divider.color : custom-theme-active ? custom-divider : light-palette ? #dfe4ee : theme-mode == 2 ? #ffffff : #303747;
+    property <color> accent: StyleTokens.base.accent.present ? StyleTokens.base.accent.color : custom-theme-active ? custom-accent : light-palette ? #6545b5 : theme-mode == 2 ? #ffff00 : #ad91ff;
+    property <color> accent-ink: StyleTokens.base.accent-ink.present ? StyleTokens.base.accent-ink.color : custom-theme-active ? custom-accent-ink : light-palette ? #ffffff : theme-mode == 2 ? #000000 : #10131b;
+    // Surfaces painted directly on the native window. Below 100% their own
+    // alpha is scaled and the window's background is cleared, so the desktop
+    // shows through only these panes; text, icons, inputs, cards, popups,
+    // sign-in and dialogs keep their own colors. At 100% nothing changes.
+    // The color each registry token shows now, for swatches and the editor.
+    // A role without a value shows the built-in color it falls back to.
+    public pure function token-color(id: string) -> color {
+        if id == "rail" { return root.rail; }
+        if id == "sidebar" { return root.sidebar; }
+        if id == "canvas" { return root.canvas; }
+        if id == "panel" { return root.panel; }
+        if id == "elevated" { return root.elevated; }
+        if id == "hover" { return root.hover; }
+        if id == "ink" { return root.ink; }
+        if id == "muted" { return root.muted; }
+        if id == "divider" { return root.divider; }
+        if id == "accent" { return root.accent; }
+        if id == "accent_ink" { return root.accent-ink; }
+        if id == "selection" { return StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover; }
+        if id == "own_surface" { return StyleTokens.roles.own-surface.present ? StyleTokens.roles.own-surface.color : transparent; }
+        if id == "scrim" { return StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa; }
+        if id == "shadow" { return StyleTokens.roles.shadow.present ? StyleTokens.roles.shadow.color : #00000044; }
+        if id == "media_backdrop" { return StyleTokens.roles.media-backdrop.present ? StyleTokens.roles.media-backdrop.color : #11131b; }
+        if id == "message" { return StyleTokens.roles.message.present ? StyleTokens.roles.message.color : root.ink; }
+        if id == "sender" { return StyleTokens.roles.sender.present ? StyleTokens.roles.sender.color : root.ink; }
+        if id == "own_message" {
+            return StyleTokens.roles.own-message.present ? StyleTokens.roles.own-message.color
+                : StyleTokens.roles.sender.present ? StyleTokens.roles.sender.color
+                : StyleTokens.roles.message.present ? StyleTokens.roles.message.color : root.ink;
+        }
+        if id == "timestamp" { return StyleTokens.roles.timestamp.present ? StyleTokens.roles.timestamp.color : root.muted; }
+        if id == "link" { return StyleTokens.roles.link.present ? StyleTokens.roles.link.color : root.accent; }
+        if id == "focus" { return StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent; }
+        if id == "unread" { return StyleTokens.roles.unread.present ? StyleTokens.roles.unread.color : root.accent; }
+        if id == "unread_ink" { return StyleTokens.roles.unread-ink.present ? StyleTokens.roles.unread-ink.color : root.accent-ink; }
+        if id == "selection_ink" { return StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink; }
+        if id == "error" { return StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483; }
+        if id == "error_surface" { return StyleTokens.roles.error-surface.present ? StyleTokens.roles.error-surface.color : #9f3f50; }
+        if id == "error_ink" { return StyleTokens.roles.error-ink.present ? StyleTokens.roles.error-ink.color : #ffffff; }
+        if id == "success" { return StyleTokens.roles.success.present ? StyleTokens.roles.success.color : #78c8b1; }
+        if id == "success_surface" { return StyleTokens.roles.success-surface.present ? StyleTokens.roles.success-surface.color : #214a46; }
+        if id == "success_ink" { return StyleTokens.roles.success-ink.present ? StyleTokens.roles.success-ink.color : #ffffff; }
+        if id == "destructive" { return StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : #e47483; }
+        if id == "destructive_ink" { return StyleTokens.roles.destructive-ink.present ? StyleTokens.roles.destructive-ink.color : #10131b; }
+        if id == "presence_online" { return StyleTokens.roles.presence-online.present ? StyleTokens.roles.presence-online.color : #64c9a7; }
+        if id == "voice" { return StyleTokens.roles.voice.present ? StyleTokens.roles.voice.color : #78c8b1; }
+        if id == "avatar_ink" { return StyleTokens.roles.avatar-ink.present ? StyleTokens.roles.avatar-ink.color : #ffffff; }
+        return transparent;
+    }
+    // Whether `token-color` knows the ID; the registry coverage test uses it.
+    public pure function token-known(id: string) -> bool {
+        return id == "rail" || id == "sidebar" || id == "canvas" || id == "panel" || id == "elevated"
+            || id == "hover" || id == "ink" || id == "muted" || id == "divider" || id == "accent"
+            || id == "accent_ink" || id == "selection" || id == "own_surface" || id == "scrim"
+            || id == "shadow" || id == "media_backdrop" || id == "message" || id == "sender"
+            || id == "own_message" || id == "timestamp" || id == "link" || id == "focus"
+            || id == "unread" || id == "unread_ink" || id == "selection_ink" || id == "error"
+            || id == "error_surface" || id == "error_ink" || id == "success" || id == "success_surface"
+            || id == "success_ink" || id == "destructive" || id == "destructive_ink"
+            || id == "presence_online" || id == "voice" || id == "avatar_ink";
+    }
+    // Any pane color with its own alpha also clears the window background, so
+    // each pane is painted exactly once at every opacity, including 100%.
+    property <bool> window-translucent: StyleTokens.window-opacity < 1 || root.rail.alpha < 255
+        || root.sidebar.alpha < 255 || root.canvas.alpha < 255 || root.panel.alpha < 255;
+    // Whether the native window background is cleared for translucent panes.
+    out property <bool> window-background-cleared: root.window-translucent;
+    property <color> window-rail: root.rail.transparentize(1 - StyleTokens.window-opacity);
+    property <color> window-sidebar: root.sidebar.transparentize(1 - StyleTokens.window-opacity);
+    property <color> window-canvas: root.canvas.transparentize(1 - StyleTokens.window-opacity);
+    property <color> window-panel: root.panel.transparentize(1 - StyleTokens.window-opacity);
+    // Dialogs, sign-in, account unlock and recovery paint opaque versions of
+    // their colors, whatever alpha a token or the window setting has.
+    property <color> dialog-surface: root.canvas.with-alpha(1);
+    property <color> sign-in-surface: root.rail.with-alpha(1);
     default-font-family: root.ui-font-family;
-    background: canvas;
+    background: root.window-translucent ? transparent : canvas;
 
     shortcut-scope := FocusScope {
     width: parent.width;
@@ -2177,7 +2735,7 @@ export component AppWindow inherits Window {
         // Space and navigation rail (the default presentation).
         if root.navigation-mode == 0 : Rectangle {
             width: root.rail-width-px * 1px;
-            background: root.rail;
+            background: root.window-rail;
             VerticalLayout {
                 padding: 6px;
                 spacing: 10px;
@@ -2202,7 +2760,7 @@ export component AppWindow inherits Window {
                     focus-state-changed(focused) => { root.navigation-focus-changed(0, "route:home", focused); }
                     label: "Home and all rooms";
                     ink: root.page == 0 && root.active-space-id == "" ? root.accent : root.muted;
-                    surface: root.rail;
+                    surface: transparent;
                     hover-surface: root.hover;
                     selected: root.page == 0 && root.active-space-id == "";
                     activated => { root.active-space-id = ""; root.active-space-name = "Home"; root.select-space(""); root.page = 0; }
@@ -2250,7 +2808,7 @@ export component AppWindow inherits Window {
                     focus-state-changed(focused) => { root.navigation-focus-changed(0, "route:discover", focused); }
                     label: "Explore public Matrix rooms";
                     ink: root.page == 3 ? root.accent : root.muted;
-                    surface: root.rail;
+                    surface: transparent;
                     hover-surface: root.hover;
                     selected: root.page == 3;
                     activated => { root.page = 3; root.open-discovery(); }
@@ -2262,7 +2820,7 @@ export component AppWindow inherits Window {
                     focus-state-changed(focused) => { root.navigation-focus-changed(0, "route:calls", focused); }
                     label: "Open call stage";
                     ink: root.page == 2 ? root.accent : root.muted;
-                    surface: root.rail;
+                    surface: transparent;
                     hover-surface: root.hover;
                     selected: root.page == 2;
                     activated => { root.page = 2; }
@@ -2274,7 +2832,7 @@ export component AppWindow inherits Window {
                     focus-state-changed(focused) => { root.navigation-focus-changed(0, "route:settings", focused); }
                     label: "Open settings";
                     ink: root.page == 1 ? root.accent : root.muted;
-                    surface: root.rail;
+                    surface: transparent;
                     hover-surface: root.hover;
                     selected: root.page == 1;
                     activated => { root.page = 1; root.open-security(); }
@@ -2285,12 +2843,12 @@ export component AppWindow inherits Window {
         // Room list and bottom-left account control.
         Rectangle {
             width: root.room-list-width * 1px;
-            background: root.sidebar;
+            background: root.window-sidebar;
             VerticalLayout {
                 spacing: 0px;
                 Rectangle {
                     height: max(64px, 40px * root.text-scale + 24px);
-                    background: root.sidebar;
+                    background: transparent;
                     HorizontalLayout {
                         padding-left: 18px;
                         padding-right: 14px;
@@ -2326,7 +2884,7 @@ export component AppWindow inherits Window {
                 Rectangle { height: 1px; background: root.divider; }
                 Rectangle {
                     height: max(62px, 22px * root.text-scale + 40px);
-                    background: root.sidebar;
+                    background: transparent;
                     quick-switch-trigger := ActionRect {
                         x: 12px; y: 12px;
                         width: parent.width - 24px; height: parent.height - 24px;
@@ -2498,7 +3056,7 @@ export component AppWindow inherits Window {
                 Rectangle { height: 1px; background: root.divider; }
                 account-trigger := ActionRect {
                     height: max(69px, 38px * root.text-scale + 24px);
-                    background: root.rail;
+                    background: root.window-rail;
                     focus-color: root.accent;
                     label: "Account menu for " + root.active-account-name + ", " + root.active-account-handle;
                     accessible-expanded: root.account-menu-open;
@@ -2532,7 +3090,7 @@ export component AppWindow inherits Window {
                 border-color: root.divider;
                 border-width: 1px;
                 border-radius: StyleTokens.radius * 1.2;
-                drop-shadow-color: #00000044;
+                drop-shadow-color: StyleTokens.roles.shadow.present ? StyleTokens.roles.shadow.color : #00000044;
                 drop-shadow-blur: 18px;
                 drop-shadow-offset-y: 7px;
                 VerticalLayout {
@@ -2659,12 +3217,12 @@ export component AppWindow inherits Window {
             // Match the independent conversation minimum used by the Window.
             // Long room content must not push the fixed details pane offscreen.
             min-width: 360px;
-            background: root.canvas;
+            background: root.window-canvas;
             VerticalLayout {
                 spacing: 0px;
                 Rectangle {
                     height: max(64px, 40px * root.text-scale + 24px);
-                    background: root.canvas;
+                    background: transparent;
                     HorizontalLayout {
                         padding-left: 24px;
                         padding-right: 16px;
@@ -2711,7 +3269,7 @@ export component AppWindow inherits Window {
                         if root.page == 0 : VerticalLayout {
                             width: 34px; alignment: center;
                             IconAction {
-                            icon: "⚙"; label: "Edit room settings"; ink: root.muted; surface: root.canvas; hover-surface: root.hover;
+                            icon: "⚙"; label: "Edit room settings"; ink: root.muted; surface: transparent; hover-surface: root.hover;
                             enabled: root.live-session && root.active-room-id != "";
                             activated => {
                                 root.open-room-settings();
@@ -2721,7 +3279,7 @@ export component AppWindow inherits Window {
                         if root.page == 0 : VerticalLayout {
                             width: 34px; alignment: center;
                             IconAction {
-                            icon: "S"; label: "Search messages in this room"; ink: root.muted; surface: root.canvas; hover-surface: root.hover;
+                            icon: "S"; label: "Search messages in this room"; ink: root.muted; surface: transparent; hover-surface: root.hover;
                             selected: root.show-side-panel && root.side-panel-tab == 2;
                             enabled: root.live-session && root.active-room-id != "";
                             activated => { root.show-side-panel = true; root.side-panel-tab = 2; }
@@ -2730,7 +3288,7 @@ export component AppWindow inherits Window {
                         if root.page == 0 : VerticalLayout {
                             width: 34px; alignment: center;
                             IconAction {
-                            icon: "C"; label: "Open current room call stage"; ink: root.muted; surface: root.canvas; hover-surface: root.hover;
+                            icon: "C"; label: "Open current room call stage"; ink: root.muted; surface: transparent; hover-surface: root.hover;
                             activated => { root.page = 2; }
                         }
                         }
@@ -2738,7 +3296,7 @@ export component AppWindow inherits Window {
                             width: 34px; alignment: center;
                             IconAction {
                             icon: "P"; label: root.show-side-panel ? "Hide details panel" : "Show details panel";
-                            ink: root.muted; surface: root.canvas; hover-surface: root.hover;
+                            ink: root.muted; surface: transparent; hover-surface: root.hover;
                             selected: root.show-side-panel;
                             activated => { root.set-side-panel(!root.show-side-panel); }
                         }
@@ -2868,7 +3426,7 @@ export component AppWindow inherits Window {
                     spacing: 0px;
                     if root.conversation-header-mode == 0 : Rectangle {
                         height: root.message-layout == 0 ? max(110px, 54px * root.text-scale + 56px) : max(48px, 24px * root.text-scale + 24px);
-                        background: root.canvas;
+                        background: transparent;
                         VerticalLayout {
                             padding-left: 24px;
                             padding-right: 24px;
@@ -3189,7 +3747,7 @@ export component AppWindow inherits Window {
                     Rectangle {
                         property <length> status-height: root.composer-status-visible ? composer-status.height + 10px : 0px;
                         height: (root.composer-mode == 0 ? max(78px, 1.5 * root.message-font-px + 48px) : max(109px, 1.5 * root.message-font-px + 79px)) + (root.attachment-busy ? 29px : 0px) + self.status-height;
-                        background: root.canvas;
+                        background: transparent;
                         composer-status := PendingSendStrip {
                             x: 22px; y: (root.composer-mode == 0 ? 2px : 33px) + (root.attachment-busy ? 29px : 0px);
                             width: parent.width - 44px;
@@ -3572,10 +4130,31 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                if root.page == 1 : ScrollView {
+                if root.page == 1 : Rectangle {
+                    height: settings-search.preferred-height + 20px;
+                    background: transparent;
+                    settings-search := SettingsSearchBar {
+                        x: 26px; y: 10px; width: parent.width - 52px;
+                        query <=> root.settings-search-query;
+                        results: root.settings-search-results;
+                        index <=> root.settings-search-index;
+                        dismissed: root.settings-search-dismissed;
+                        ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                        accent: root.accent; outline: root.divider; text-scale: root.text-scale;
+                        max-results-height: max(96px, root.height * 0.35);
+                        search(query) => { root.settings-search(query); }
+                        choose(id) => { root.settings-search-choose(id); }
+                    }
+                }
+                if root.page == 1 : settings-scroll := ScrollView {
                     vertical-stretch: 1;
                     horizontal-scrollbar-policy: always-off;
-                    VerticalLayout {
+                    // Bring a control at `offset` from the top of the content
+                    // into view, computed from the live layout.
+                    function reveal(offset: length) {
+                        self.content-y = -max(0px, min(offset - 16px, self.content-height - self.visible-height));
+                    }
+                    settings-content := VerticalLayout {
                         width: parent.width;
                         padding: 26px;
                         spacing: 18px;
@@ -3584,6 +4163,14 @@ export component AppWindow inherits Window {
                         Text { text: "Starting points"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         Text { text: "Presets fill in editable settings. Fonts use installed families; a missing family falls back to your system font."; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
                         for name[index] in ["Nocturne", "Terminal", "Paper"] : ActionRect {
+                            property <int> reveal-request: index == 0 ? root.reveal-request("appearance.presets") : 0;
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus();
+                                    if self.has-focus { root.settings-revealed-id = "appearance.presets"; }
+                                }
+                            }
                             height: 66px * root.text-scale;
                             label: "Apply " + name + " appearance preset";
                             background: self.has-hover ? root.hover : root.elevated;
@@ -3598,6 +4185,14 @@ export component AppWindow inherits Window {
                         }
                         ActionRect {
                             height: 42px * root.text-scale;
+                            property <int> reveal-request: root.reveal-request("appearance.reduce_motion");
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus();
+                                    if self.has-focus { root.settings-revealed-id = "appearance.reduce_motion"; }
+                                }
+                            }
                             label: "Reduce motion" + (StyleTokens.reduced-motion ? ", on" : ", off");
                             accessible-checkable: true;
                             accessible-checked: StyleTokens.reduced-motion;
@@ -3611,8 +4206,90 @@ export component AppWindow inherits Window {
                         }
                         Text { text: "Use immediate hover feedback for buttons and navigation.";
                             color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+                        Text { text: "Colors and window"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
+                        Text {
+                            text: "Choose a color, then type #RRGGBB or #RRGGBBAA, with alpha last. A valid value applies and saves at once; Reset returns one color to its theme or built-in value. Your colors stay when you choose a starting point.";
+                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                        }
+                        color-workspace := Rectangle {
+                            // Side by side when there is room; stacked at narrow widths or large text.
+                            property <bool> wide: self.width >= 620px * root.text-scale;
+                            height: self.wide ? max(token-list.preferred-height, token-editor.preferred-height) + 24px
+                                : token-list.preferred-height + token-editor.preferred-height + 36px;
+                            background: root.elevated;
+                            border-radius: StyleTokens.radius;
+                            token-list := ColorTokenList {
+                                property <int> reveal-request: root.reveal-request("appearance.colors");
+                                changed reveal-request => {
+                                    if self.reveal-request > 0 {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                        self.focus();
+                                        if self.has-focus { root.settings-revealed-id = "appearance.colors"; }
+                                    }
+                                }
+                                x: 12px; y: 12px;
+                                width: parent.wide ? min(300px * root.text-scale, (parent.width - 36px) * 0.45) : parent.width - 24px;
+                                groups: root.color-groups; tokens: root.color-tokens;
+                                group-index: root.color-group-index; selected-id: root.color-selected-id;
+                                filter <=> root.color-filter;
+                                ink: root.ink; muted: root.muted; surface: root.canvas; hover-surface: root.hover;
+                                accent: root.accent; outline: root.divider; text-scale: root.text-scale;
+                                max-list-height: parent.wide ? max(240px, root.height * 0.5) : max(140px, root.height * 0.24);
+                                color-of(id) => { return root.token-color(id); }
+                                filter-edited(text) => { root.color-filter-changed(text); }
+                                group-chosen(index) => { root.color-group-chosen(index); }
+                                token-chosen(id) => { root.color-token-chosen(id); token-editor.focus(); }
+                            }
+                            token-editor := ColorTokenEditor {
+                                x: parent.wide ? token-list.x + token-list.width + 12px : 12px;
+                                y: parent.wide ? 12px : token-list.y + token-list.height + 12px;
+                                width: parent.wide ? parent.width - token-list.width - 36px : parent.width - 24px;
+                                state: root.color-editor;
+                                swatch: root.token-color(root.color-selected-id);
+                                hex <=> root.color-hex-input;
+                                override-count: root.color-override-count;
+                                reset-all-notice: root.color-reset-all-notice;
+                                ink: root.ink; muted: root.muted; surface: root.canvas; hover-surface: root.hover;
+                                accent: root.accent; outline: root.divider; text-scale: root.text-scale;
+                                hex-edited(text) => { root.color-hex-edited(text); }
+                                restore-input => { root.color-token-chosen(root.color-selected-id); }
+                                reset => { root.color-reset(); }
+                                undo => { root.color-undo(); }
+                                reset-all => { root.color-reset-all(); }
+                            }
+                        }
+                        window-opacity-card := Rectangle {
+                            height: window-opacity-setting.preferred-height + 24px;
+                            background: root.elevated;
+                            border-radius: StyleTokens.radius;
+                            window-opacity-setting := WindowOpacitySetting {
+                                property <int> reveal-request: root.reveal-request("appearance.window_opacity");
+                                changed reveal-request => {
+                                    if self.reveal-request > 0 {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                        self.focus();
+                                        if self.has-focus { root.settings-revealed-id = "appearance.window_opacity"; }
+                                    }
+                                }
+                                x: 12px; y: 12px; width: parent.width - 24px;
+                                value: root.window-opacity-percent;
+                                revision: root.window-opacity-revision;
+                                status: root.window-transparency-status;
+                                ink: root.ink; muted: root.muted; text-scale: root.text-scale;
+                                previewed(value) => { root.preview-window-opacity(value); }
+                                changed-value(value) => { root.set-window-opacity(value); }
+                            }
+                        }
                         Text { text: "Fonts"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         StyleFontSetting { label: "Interface font family"; family <=> root.appearance-ui-font-input;
+                            property <int> reveal-request: root.reveal-request("appearance.fonts");
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus();
+                                    if self.has-focus { root.settings-revealed-id = "appearance.fonts"; }
+                                }
+                            }
                             ink: root.ink; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; }
                         StyleFontSetting { label: "Message font family · blank follows interface"; family <=> root.appearance-message-font-input;
                             ink: root.ink; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; }
@@ -3623,10 +4300,28 @@ export component AppWindow inherits Window {
                             outline: root.divider; text-scale: root.text-scale;
                             activated => { root.set-style-fonts(root.appearance-ui-font-input, root.appearance-message-font-input, root.appearance-mono-font-input); }
                         }
-                        StyleNumberSetting { label: "Message font size"; value: root.message-font-size; minimum: 10; maximum: 32;
+                        StyleNumberSetting {
+                            property <int> reveal-request: root.reveal-request("appearance.message_size");
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus-control();
+                                    if self.has-focus { root.settings-revealed-id = "appearance.message_size"; }
+                                }
+                            }
+                            label: "Message font size"; value: root.message-font-size; minimum: 10; maximum: 32;
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
                             changed-value(value) => { root.change-style-number(0, value); } }
-                        StyleNumberSetting { label: "Sender font weight"; value: root.sender-font-weight > 0 ? root.sender-font-weight : 650; minimum: 100; maximum: 900; step: 50;
+                        StyleNumberSetting {
+                            property <int> reveal-request: root.reveal-request("appearance.sender_weight");
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus-control();
+                                    if self.has-focus { root.settings-revealed-id = "appearance.sender_weight"; }
+                                }
+                            }
+                            label: "Sender font weight"; value: root.sender-font-weight > 0 ? root.sender-font-weight : 650; minimum: 100; maximum: 900; step: 50;
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
                             changed-value(value) => { root.set-sender-weight(value); } }
                         TextAction {
@@ -3639,6 +4334,14 @@ export component AppWindow inherits Window {
                             color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
                         Text { text: "Room header"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         for name[index] in ["Full · room header and introduction", "Compact · room header and topic", "Minimal · room name and actions"] : ActionRect {
+                            property <int> reveal-request: index == 0 ? root.reveal-request("appearance.room_header") : 0;
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus();
+                                    if self.has-focus { root.settings-revealed-id = "appearance.room_header"; }
+                                }
+                            }
                             height: 40px * root.text-scale;
                             label: "Room header: " + name + (root.conversation-header-mode == index ? ", selected" : "");
                             background: root.conversation-header-mode == index ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : self.has-hover ? root.hover : root.elevated;
@@ -3662,6 +4365,14 @@ export component AppWindow inherits Window {
                         }
                         Text { text: "Conversation style"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         for name[index] in ["Stacked · names above messages", "Compact · smaller names and avatars", "Columns · aligned timestamps and nicknames"] : ActionRect {
+                            property <int> reveal-request: index == 0 ? root.reveal-request("appearance.message_layout") : 0;
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus();
+                                    if self.has-focus { root.settings-revealed-id = "appearance.message_layout"; }
+                                }
+                            }
                             height: 40px * root.text-scale;
                             label: name + (root.message-layout == index ? ", selected" : "");
                             background: root.message-layout == index || self.has-hover ? root.hover : root.elevated;
@@ -3673,6 +4384,14 @@ export component AppWindow inherits Window {
                         Text { text: "Columns use a compact header when the conversation is too narrow. Text scale and room density continue to apply.";
                             color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
                         for name[index] in ["Message avatars", "Message timestamps", "Colored sender names"] : style-toggle := ActionRect {
+                            property <int> reveal-request: index == 0 ? root.reveal-request("appearance.message_details") : 0;
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus();
+                                    if self.has-focus { root.settings-revealed-id = "appearance.message_details"; }
+                                }
+                            }
                             property <bool> selected: index == 0 ? root.show-message-avatars : index == 1 ? root.show-message-timestamps : root.color-message-senders;
                             height: 42px * root.text-scale;
                             label: name + (self.selected ? ", on" : ", off");
@@ -3685,6 +4404,14 @@ export component AppWindow inherits Window {
                         }
                         Text { text: "Timestamp style"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         for name[index] in ["12-hour · 3:04 PM", "24-hour · 15:04", "24-hour with seconds · 15:04:05"] : ActionRect {
+                            property <int> reveal-request: index == 0 ? root.reveal-request("appearance.timestamps") : 0;
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus();
+                                    if self.has-focus { root.settings-revealed-id = "appearance.timestamps"; }
+                                }
+                            }
                             height: 40px * root.text-scale;
                             label: "Timestamp format: " + name + (root.timestamp-format == index ? ", selected" : "");
                             background: root.timestamp-format == index ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : self.has-hover ? root.hover : root.elevated;
@@ -3735,16 +4462,43 @@ export component AppWindow inherits Window {
                         Text { text: "Clock style updates messages and thread replies. Column width applies in Columns layout. Narrow columns shorten displayed times; screen readers can read the full time. Sending and failed messages always keep their status.";
                             color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
                         Text { text: "Geometry"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
-                        StyleNumberSetting { label: "Corner radius"; value: root.corner-radius-px; minimum: 0; maximum: 24;
+                        StyleNumberSetting {
+                            property <int> reveal-request: root.reveal-request("appearance.geometry");
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus-control();
+                                    if self.has-focus { root.settings-revealed-id = "appearance.geometry"; }
+                                }
+                            }
+                            label: "Corner radius"; value: root.corner-radius-px; minimum: 0; maximum: 24;
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
                             changed-value(value) => { root.change-style-number(1, value); } }
-                        StyleNumberSetting { label: "Message spacing"; value: root.message-gap-px; minimum: 0; maximum: 32;
+                        StyleNumberSetting {
+                            property <int> reveal-request: root.reveal-request("appearance.spacing");
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus-control();
+                                    if self.has-focus { root.settings-revealed-id = "appearance.spacing"; }
+                                }
+                            }
+                            label: "Message spacing"; value: root.message-gap-px; minimum: 0; maximum: 32;
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
                             changed-value(value) => { root.change-style-number(2, value); } }
                         StyleNumberSetting { label: "Conversation inset"; value: root.content-padding-px; minimum: 0; maximum: 48; step: 2;
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
                             changed-value(value) => { root.change-style-number(3, value); } }
-                        StyleNumberSetting { label: "Space rail width"; value: root.rail-width-px; minimum: 44; maximum: 100; step: 2;
+                        StyleNumberSetting {
+                            property <int> reveal-request: root.reveal-request("appearance.rail_width");
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus-control();
+                                    if self.has-focus { root.settings-revealed-id = "appearance.rail_width"; }
+                                }
+                            }
+                            label: "Space rail width"; value: root.rail-width-px; minimum: 44; maximum: 100; step: 2;
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
                             changed-value(value) => { root.change-style-number(4, value); } }
                         StyleNumberSetting { label: "Nickname column width"; value: root.nickname-width-px; minimum: 64; maximum: 240; step: 8;
@@ -3755,6 +4509,14 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             spacing: 12px;
                             for choice[index] in ["Dark", "Light", "High contrast", "System"] : ActionRect {
+                                property <int> reveal-request: index == 0 ? root.reveal-request("appearance.base_palette") : 0;
+                                changed reveal-request => {
+                                    if self.reveal-request > 0 {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                        self.focus();
+                                        if self.has-focus { root.settings-revealed-id = "appearance.base_palette"; }
+                                    }
+                                }
                                 width: 128px;
                                 height: 100px;
                                 background: index == root.global-theme-mode ? root.hover : root.elevated;
@@ -3805,6 +4567,14 @@ export component AppWindow inherits Window {
                                 accessible-role: text; accessible-label: self.text;
                             }
                             decrease-font-scale := IconAction {
+                                property <int> reveal-request: root.reveal-request("appearance.font_scale");
+                                changed reveal-request => {
+                                    if self.reveal-request > 0 {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                        self.focus();
+                                        if self.has-focus { root.settings-revealed-id = "appearance.font_scale"; }
+                                    }
+                                }
                                 x: increase-font-scale.x - self.width - 9px;
                                 y: (parent.height - self.height) / 2;
                                 icon: "−"; label: "Decrease font scale"; reveal-full-control: true; reveal-height: font-scale-row.height;
@@ -3823,6 +4593,14 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             spacing: 10px;
                             for choice[index] in ["Compact", "Comfortable", "Spacious"] : ActionRect {
+                                property <int> reveal-request: index == 0 ? root.reveal-request("appearance.density") : 0;
+                                changed reveal-request => {
+                                    if self.reveal-request > 0 {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                        self.focus();
+                                        if self.has-focus { root.settings-revealed-id = "appearance.density"; }
+                                    }
+                                }
                                 width: 142px; height: 40px; border-radius: StyleTokens.radius * 0.9;
                                 background: index == root.density-mode ? root.hover : root.elevated;
                                 border-color: index == root.density-mode ? root.accent : root.divider;
@@ -3839,6 +4617,14 @@ export component AppWindow inherits Window {
                         VerticalLayout {
                             spacing: 6px; alignment: start; vertical-stretch: 0;
                             for choice[index] in ["Icon rail", "Text sidebar"] : TextAction {
+                                property <int> reveal-request: index == 0 ? root.reveal-request("layout.navigation") : 0;
+                                changed reveal-request => {
+                                    if self.reveal-request > 0 {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                        self.focus();
+                                        if self.has-focus { root.settings-revealed-id = "layout.navigation"; }
+                                    }
+                                }
                                 height: 36px * root.text-scale; vertical-stretch: 0;
                                 text: choice; label: "Use " + choice + " navigation";
                                 ink: root.ink; muted: root.muted; surface: root.navigation-mode == index ? root.hover : root.elevated;
@@ -3875,6 +4661,14 @@ export component AppWindow inherits Window {
                                 }
                                 IconAction {
                                     icon: root.show-side-panel ? "✓" : "+";
+                                    property <int> reveal-request: root.reveal-request("layout.panes");
+                                    changed reveal-request => {
+                                        if self.reveal-request > 0 {
+                                            settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                            self.focus();
+                                            if self.has-focus { root.settings-revealed-id = "layout.panes"; }
+                                        }
+                                    }
                                     label: root.show-side-panel ? "Hide side panel" : "Show side panel";
                                     ink: root.accent; surface: root.panel; hover-surface: root.hover;
                                     activated => { root.set-side-panel(!root.show-side-panel); }
@@ -3916,6 +4710,14 @@ export component AppWindow inherits Window {
                                 }
                                 IconAction {
                                     icon: root.sort-unread-first ? "✓" : "+";
+                                    property <int> reveal-request: root.reveal-request("layout.unread_first");
+                                    changed reveal-request => {
+                                        if self.reveal-request > 0 {
+                                            settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                            self.focus();
+                                            if self.has-focus { root.settings-revealed-id = "layout.unread_first"; }
+                                        }
+                                    }
                                     label: root.sort-unread-first ? "Turn off unread first sorting" : "Turn on unread first sorting";
                                     ink: root.accent; surface: root.panel; hover-surface: root.hover;
                                     activated => { root.set-sort-unread-first(!root.sort-unread-first); }
@@ -3943,6 +4745,14 @@ export component AppWindow inherits Window {
                         Text { text: "Notifications are shown for the active account while Morpheus runs. These preferences are shared by all accounts; room rules still come from Matrix."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         ActionRect {
                             height: 68px; border-radius: 10px; background: root.elevated; focus-color: root.accent;
+                            property <int> reveal-request: root.reveal-request("notifications.desktop");
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus();
+                                    if self.has-focus { root.settings-revealed-id = "notifications.desktop"; }
+                                }
+                            }
                             label: "Desktop notifications";
                             accessible-checkable: true; accessible-checked: root.notifications-enabled;
                             activated => { root.set-notifications-enabled(!root.notifications-enabled); }
@@ -3957,6 +4767,14 @@ export component AppWindow inherits Window {
                         }
                         ActionRect {
                             height: 68px; border-radius: 10px; background: root.elevated; focus-color: root.accent;
+                            property <int> reveal-request: root.reveal-request("notifications.sounds");
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus();
+                                    if self.has-focus { root.settings-revealed-id = "notifications.sounds"; }
+                                }
+                            }
                             label: "Notification sounds";
                             accessible-checkable: true; accessible-checked: root.notification-sounds;
                             activated => { root.set-notification-sounds(!root.notification-sounds); }
@@ -3971,6 +4789,14 @@ export component AppWindow inherits Window {
                         }
                         ActionRect {
                             height: 68px; border-radius: 10px; background: root.elevated; focus-color: root.accent;
+                            property <int> reveal-request: root.reveal-request("notifications.previews");
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus();
+                                    if self.has-focus { root.settings-revealed-id = "notifications.previews"; }
+                                }
+                            }
                             label: "Show message previews in desktop notifications";
                             accessible-checkable: true; accessible-checked: root.notification-show-preview;
                             activated => { root.set-notification-show-preview(!root.notification-show-preview); }
@@ -3993,6 +4819,14 @@ export component AppWindow inherits Window {
                                     x: 10px; width: parent.width - 20px; height: parent.height;
                                     text <=> root.notification-highlight-input;
                                     color: root.ink; font-size: 12px * root.text-scale;
+                                    property <int> reveal-request: root.reveal-request("notifications.highlights");
+                                    changed reveal-request => {
+                                        if self.reveal-request > 0 {
+                                            settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                            self.focus();
+                                            if self.has-focus { root.settings-revealed-id = "notifications.highlights"; }
+                                        }
+                                    }
                                     accessible-label: "New highlight word or phrase";
                                     edited => { root.notification-highlight-error = ""; }
                                     accepted => { root.add-highlight-word(root.notification-highlight-input); }
@@ -4034,9 +4868,30 @@ export component AppWindow inherits Window {
                                     padding: 14px; spacing: 5px;
                                     HorizontalLayout {
                                         Text { text: "Account security"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; horizontal-stretch: 1; }
-                                        Button { text: root.security-loading ? "Loading…" : "Refresh"; enabled: !root.security-loading && !root.security-busy; accessible-label: "Refresh account security status"; clicked => { root.refresh-security(); } }
+                                        Button {
+                                            property <int> reveal-request: root.reveal-request("security.recovery");
+                                            changed reveal-request => {
+                                                if self.reveal-request > 0 {
+                                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                                    if self.enabled {
+                                                        self.focus();
+                                                        if self.has-focus { root.settings-revealed-id = "security.recovery"; }
+                                                    } else {
+                                                        // Unavailable now: focus the status that explains why, and
+                                                        // report that rather than the disabled control.
+                                                        security-status-field.focus();
+                                                        if security-status-field.has-focus { root.settings-revealed-id = "security.recovery:status"; }
+                                                    }
+                                                }
+                                            }
+                                            text: root.security-loading ? "Loading…" : "Refresh"; enabled: !root.security-loading && !root.security-busy; accessible-label: "Refresh account security status"; clicked => { root.refresh-security(); } }
                                     }
-                                    Text { text: "This device: " + root.security-device-status; color: root.muted; font-size: 12px * root.text-scale; accessible-live-region: polite; }
+                                    // Read-only and focusable, so search can reveal it while Refresh is busy.
+                                    security-status-field := ThemedTextInput {
+                                        text: "This device: " + root.security-device-status; read-only: true; single-line: false; wrap: word-wrap;
+                                        color: root.muted; font-size: 12px * root.text-scale;
+                                        accessible-label: "Device security status: " + root.security-device-status;
+                                    }
                                     Text { text: "Recovery: " + root.security-recovery-status + "  ·  Key backup: " + root.security-backup-status; color: root.muted; font-size: 12px * root.text-scale; accessible-live-region: polite; }
                                 }
                             }
@@ -4208,6 +5063,14 @@ export component AppWindow inherits Window {
                         ActionRect {
                             height: 40px * root.text-scale; border-radius: 8px; background: self.has-hover ? root.hover : root.elevated;
                             focus-color: root.accent;
+                            property <int> reveal-request: root.reveal-request("media.image_previews");
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus();
+                                    if self.has-focus { root.settings-revealed-id = "media.image_previews"; }
+                                }
+                            }
                             label: "Allow image previews in encrypted rooms";
                             accessible-checkable: true; accessible-checked: root.image-previews-encrypted-enabled;
                             activated => { root.set-encrypted-image-previews(!root.image-previews-encrypted-enabled); }
@@ -4221,6 +5084,21 @@ export component AppWindow inherits Window {
                             model: root.audio-microphone-choices;
                             current-index <=> root.audio-microphone-index;
                             enabled: root.audio-devices-enabled && !root.audio-devices-busy;
+                            property <int> reveal-request: root.reveal-request("media.audio_devices");
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    if self.enabled {
+                                        self.focus();
+                                        if self.has-focus { root.settings-revealed-id = "media.audio_devices"; }
+                                    } else {
+                                        // Unavailable now: focus the status that explains why, and
+                                        // report that rather than the disabled control.
+                                        audio-status-field.focus();
+                                        if audio-status-field.has-focus { root.settings-revealed-id = "media.audio_devices:status"; }
+                                    }
+                                }
+                            }
                             accessible-label: "Microphone for the next call";
                             selected(value) => { root.select-audio-microphone(value); }
                         }
@@ -4233,14 +5111,29 @@ export component AppWindow inherits Window {
                             selected(value) => { root.select-audio-speaker(value); }
                         }
                         Button { text: root.audio-devices-busy ? "Finding devices…" : "Refresh audio devices"; enabled: root.audio-devices-enabled && !root.audio-devices-busy; clicked => { root.refresh-audio-devices(); } }
-                        Text { text: root.audio-device-notice; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-label: "Audio device status: " + root.audio-device-notice; accessible-live-region: polite; }
+                        // Read-only and focusable, so search can reveal it while devices are unavailable.
+                        audio-status-field := ThemedTextInput {
+                            text: root.audio-device-notice != "" ? root.audio-device-notice : "Choose Refresh audio devices to list devices.";
+                            read-only: true; single-line: false; wrap: word-wrap;
+                            color: root.muted; font-size: 12px * root.text-scale;
+                            accessible-label: "Audio device status: " + self.text;
+                        }
                         Rectangle { height: 1px; background: root.divider; }
                         Text { text: "Keyboard shortcuts"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text {
                             text: "Mod is Command on macOS and Ctrl elsewhere. Meta is Command on macOS and Windows/Super elsewhere. Combine Mod, Ctrl, Meta, Alt, or Shift with A–Z, 0–9, arrows, Home, End, PageUp, PageDown, or F1–F12. Include a modifier other than Shift. Blank disables an action. Shift+digits, Alt+letters/digits, and editing or window shortcuts are reserved.";
                             color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap;
                         }
-                        ShortcutSetting { label: "Switch room"; binding <=> root.shortcut-edit-quick-switcher; ink: root.ink; muted: root.muted; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; edited => { root.shortcuts-edited(); } }
+                        ShortcutSetting {
+                            property <int> reveal-request: root.reveal-request("shortcuts");
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus();
+                                    if self.has-focus { root.settings-revealed-id = "shortcuts"; }
+                                }
+                            }
+                            label: "Switch room"; binding <=> root.shortcut-edit-quick-switcher; ink: root.ink; muted: root.muted; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; edited => { root.shortcuts-edited(); } }
                         ShortcutSetting { label: "Search current room"; binding <=> root.shortcut-edit-search; ink: root.ink; muted: root.muted; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; edited => { root.shortcuts-edited(); } }
                         ShortcutSetting { label: "Next unread room"; binding <=> root.shortcut-edit-next-unread; ink: root.ink; muted: root.muted; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; edited => { root.shortcuts-edited(); } }
                         ShortcutSetting { label: "Previous unread room"; binding <=> root.shortcut-edit-previous-unread; ink: root.ink; muted: root.muted; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; edited => { root.shortcuts-edited(); } }
@@ -4258,15 +5151,50 @@ export component AppWindow inherits Window {
                         Rectangle { height: 1px; background: root.divider; }
                         Text { text: "Advanced customization"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Edit your settings and theme pack files. Valid changes appear here automatically."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
-                        Text { text: root.config-path; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+                        // Read-only and selectable, so the path can be copied into an editor.
+                        ThemedTextInput {
+                            property <int> reveal-request: root.reveal-request("advanced.config_file");
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus();
+                                    if self.has-focus { root.settings-revealed-id = "advanced.config_file"; }
+                                }
+                            }
+                            text: root.config-path; read-only: true; wrap: word-wrap;
+                            color: root.muted; font-size: 11px * root.text-scale;
+                            accessible-label: "Settings file location";
+                        }
                         Rectangle { height: 1px; background: root.divider; }
                         Text { text: "Application updates"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Updates are checked only when you ask. Downloading verifies the application signature; restarting installs the update. Leave any call and finish recovery before restarting."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         if root.update-version != "" : Text { text: "Available version: " + root.update-version; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; }
-                        Text { text: root.update-status; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-label: "Application update status: " + root.update-status; accessible-live-region: polite; }
+                        // Read-only and focusable, so search can reveal it when checking is unavailable.
+                        update-status-field := ThemedTextInput {
+                            text: root.update-status != "" ? root.update-status : "No update status yet.";
+                            read-only: true; single-line: false; wrap: word-wrap;
+                            color: root.muted; font-size: 12px * root.text-scale;
+                            accessible-label: "Application update status: " + self.text;
+                        }
                         HorizontalLayout {
                             spacing: 10px;
-                            Button { text: "Check for updates"; enabled: root.update-can-check; clicked => { root.check-for-updates(); } }
+                            Button {
+                                property <int> reveal-request: root.reveal-request("updates");
+                                changed reveal-request => {
+                                    if self.reveal-request > 0 {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                        if self.enabled {
+                                            self.focus();
+                                            if self.has-focus { root.settings-revealed-id = "updates"; }
+                                        } else {
+                                            // Unavailable now: focus the status that explains why, and
+                                            // report that rather than the disabled control.
+                                            update-status-field.focus();
+                                            if update-status-field.has-focus { root.settings-revealed-id = "updates:status"; }
+                                        }
+                                    }
+                                }
+                                text: "Check for updates"; enabled: root.update-can-check; clicked => { root.check-for-updates(); } }
                             Button { text: "Download update"; enabled: root.update-can-download; clicked => { root.download-update(); } }
                         }
                         HorizontalLayout {
@@ -4609,7 +5537,7 @@ export component AppWindow inherits Window {
 
         if root.show-side-panel && root.page == 0 : Rectangle {
             width: root.details-width * 1px;
-            background: root.panel;
+            background: root.window-panel;
             border-color: root.divider;
             border-width: 1px;
             accessible-role: region;
@@ -4618,7 +5546,7 @@ export component AppWindow inherits Window {
                 spacing: 0px;
                 Rectangle {
                     height: max(64px, 40px * root.text-scale + 24px);
-                    background: root.panel;
+                    background: transparent;
                     HorizontalLayout {
                         padding-left: 12px; padding-right: 12px; padding-top: 14px; padding-bottom: 14px; spacing: 4px;
                         ActionRect {
@@ -4670,7 +5598,7 @@ export component AppWindow inherits Window {
                         if root.live-session : IconAction {
                             width: 28px; height: 28px;
                             icon: "↻"; label: "Refresh room members";
-                            ink: root.muted; surface: root.panel; hover-surface: root.hover;
+                            ink: root.muted; surface: transparent; hover-surface: root.hover;
                             enabled: !root.member-loading && root.active-room-id != "";
                             activated => { root.refresh-room-members(); }
                         }
@@ -4775,7 +5703,7 @@ export component AppWindow inherits Window {
                                 }
                                 if !root.live-session : Rectangle {
                                     width: 7px; background: transparent;
-                                    Rectangle { y: (parent.height - 7px) / 2; width: 7px; height: 7px; border-radius: 4px; background: member.online ? #64c9a7 : root.muted; }
+                                    Rectangle { y: (parent.height - 7px) / 2; width: 7px; height: 7px; border-radius: 4px; background: member.online ? (StyleTokens.roles.presence-online.present ? StyleTokens.roles.presence-online.color : #64c9a7) : root.muted; }
                                 }
                             }
                         }
@@ -4890,7 +5818,7 @@ export component AppWindow inherits Window {
                         Text { text: "Thread"; color: root.ink; font-size: 17px * root.text-scale; font-weight: 750; horizontal-stretch: 1; vertical-alignment: center; }
                         if root.thread-root-id != "" : IconAction {
                             width: 28px; height: 28px; icon: "×"; label: "Close thread";
-                            ink: root.muted; surface: root.panel; hover-surface: root.hover;
+                            ink: root.muted; surface: transparent; hover-surface: root.hover;
                             activated => {
                                 root.thread-root-id = "";
                                 root.thread-root-is-own = false;
@@ -4980,7 +5908,7 @@ export component AppWindow inherits Window {
                     }
                     if root.thread-root-id != "" : Rectangle {
                         property <length> status-height: root.thread-status-visible ? thread-status.height + 12px : 0px;
-                        height: max(64px, 1.5 * root.message-font-px + 24px) + self.status-height; background: root.panel;
+                        height: max(64px, 1.5 * root.message-font-px + 24px) + self.status-height; background: transparent;
                         thread-status := PendingSendStrip {
                             x: 10px; y: 6px; width: parent.width - 20px;
                             items: root.thread-pending-items; blocked-notice: root.thread-blocked-notice;
@@ -5028,7 +5956,7 @@ export component AppWindow inherits Window {
                             }
                             IconAction {
                                 width: 28px; icon: "☺"; label: "Open emoji picker for thread reply";
-                                ink: root.muted; surface: root.panel; hover-surface: root.hover;
+                                ink: root.muted; surface: transparent; hover-surface: root.hover;
                                 enabled: root.mention-ui-allowed && !root.thread-send-pending;
                                 activated => {
                                     if root.sticker-open { root.sticker-dismiss(); }
@@ -5050,13 +5978,13 @@ export component AppWindow inherits Window {
                             IconAction {
                                 width: 32px; icon: "Md"; label: root.thread-markdown ? "Thread plain text" : "Thread Markdown";
                                 selected: root.thread-markdown; enabled: !root.thread-send-pending;
-                                ink: root.thread-markdown ? root.accent : root.muted; surface: root.panel; hover-surface: root.hover;
+                                ink: root.thread-markdown ? root.accent : root.muted; surface: transparent; hover-surface: root.hover;
                                 activated => { root.thread-markdown = !root.thread-markdown; root.thread-formatting-changed(root.thread-markdown); thread-input.focus(); }
                             }
                             IconAction {
                                 icon: "➤"; label: "Send thread reply"; ink: root.accent;
                                 enabled: !root.thread-send-pending;
-                                surface: root.panel; hover-surface: root.hover;
+                                surface: transparent; hover-surface: root.hover;
                                 activated => {
                                     root.thread-caret = thread-input.caret-bytes; root.thread-anchor = thread-input.anchor-bytes; root.thread-preedit = thread-input.composing;
                                     root.send-thread-message(root.thread-composer-text);
@@ -5241,12 +6169,12 @@ export component AppWindow inherits Window {
             else { reject }
         }
         Rectangle {
-            background: #000000cc;
+            background: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000cc;
             TouchArea { width: parent.width; height: parent.height; }
             Rectangle {
                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
                 width: min(980px, parent.width - 48px); height: min(760px, parent.height - 48px);
-                border-radius: 14px; border-width: 1px; border-color: root.accent; background: root.canvas;
+                border-radius: 14px; border-width: 1px; border-color: root.accent; background: root.dialog-surface;
                 accessible-role: region; accessible-label: "Image preview " + root.image-preview-title;
                 VerticalLayout {
                     padding: 16px; spacing: 12px;
@@ -5255,7 +6183,7 @@ export component AppWindow inherits Window {
                         image-preview-close := Button { text: "Close"; accessible-label: "Close image preview"; clicked => { root.dismiss-image-preview(); } }
                     }
                     Rectangle {
-                        background: #11131b; vertical-stretch: 1; border-radius: 9px;
+                        background: StyleTokens.roles.media-backdrop.present ? StyleTokens.roles.media-backdrop.color : #11131b; vertical-stretch: 1; border-radius: 9px;
                         if root.image-preview-loaded : Image {
                             width: parent.width; height: parent.height; source: root.image-preview-image; image-fit: contain;
                             accessible-role: image; accessible-label: "Attachment " + root.image-preview-title;
@@ -5291,12 +6219,12 @@ export component AppWindow inherits Window {
             } else { reject }
         }
         Rectangle {
-            background: #000000aa;
+            background: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
             TouchArea { width: parent.width; height: parent.height; }
             Rectangle {
                 x: (parent.width - 530px) / 2;
                 y: (parent.height - self.height) / 2;
-                width: 530px; height: min(580px, parent.height - 40px); background: root.canvas;
+                width: 530px; height: min(580px, parent.height - 40px); background: root.dialog-surface;
                 border-radius: 14px; border-color: root.accent; border-width: 1px;
                 accessible-role: region;
                 accessible-label: "Switch room in " + root.active-space-name;
@@ -5371,7 +6299,7 @@ export component AppWindow inherits Window {
             } else { reject }
         }
         Rectangle {
-            background: #000000aa;
+            background: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
             TouchArea { width: parent.width; height: parent.height; }
             Rectangle {
                 x: (parent.width - 462px) / 2;
@@ -5381,7 +6309,7 @@ export component AppWindow inherits Window {
                 border-radius: 14px;
                 border-color: root.divider;
                 border-width: 1px;
-                background: root.canvas;
+                background: root.dialog-surface;
                 accessible-role: region;
                 accessible-label: "Create or join a Matrix room";
                 VerticalLayout {
@@ -5488,14 +6416,14 @@ export component AppWindow inherits Window {
             } else { reject }
         }
         Rectangle {
-            background: #000000aa;
+            background: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
             TouchArea { width: parent.width; height: parent.height; }
             Rectangle {
                 width: min(620px, parent.width - 40px);
                 height: min(820px, parent.height - 40px);
                 x: (parent.width - self.width) / 2;
                 y: (parent.height - self.height) / 2;
-                background: root.canvas; border-color: root.divider; border-width: 1px; border-radius: 14px;
+                background: root.dialog-surface; border-color: root.divider; border-width: 1px; border-radius: 14px;
                 accessible-role: region;
                 accessible-label: "Room settings";
                 VerticalLayout {
@@ -5677,7 +6605,7 @@ export component AppWindow inherits Window {
                 if root.room-settings-confirmation != 0 : FocusScope {
                     init => { settings-confirm-cancel.focus(); }
                     Rectangle {
-                        background: #000000bb;
+                        background: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000bb;
                         TouchArea { width: parent.width; height: parent.height; }
                         Rectangle {
                             x: 20px; y: (parent.height - self.height) / 2; width: parent.width - 40px;
@@ -5728,14 +6656,14 @@ export component AppWindow inherits Window {
             } else { reject }
         }
         Rectangle {
-            background: #000000aa;
+            background: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
             TouchArea { width: parent.width; height: parent.height; }
             Rectangle {
                 x: (parent.width - 480px) / 2;
                 y: (parent.height - (root.room-admin-mode == 2 ? 325px : 430px)) / 2;
                 width: 480px;
                 height: root.room-admin-mode == 2 ? 325px : 430px;
-                background: root.canvas;
+                background: root.dialog-surface;
                 border-color: root.divider;
                 border-width: 1px;
                 border-radius: 14px;
@@ -5817,7 +6745,7 @@ export component AppWindow inherits Window {
             } else { reject }
         }
         Rectangle {
-            background: #000000aa;
+            background: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
             TouchArea { width: parent.width; height: parent.height; }
             Rectangle {
                 x: (parent.width - 430px) / 2;
@@ -5893,14 +6821,14 @@ export component AppWindow inherits Window {
             } else { reject }
         }
         Rectangle {
-            background: #000000aa;
+            background: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
             TouchArea { width: parent.width; height: parent.height; }
             Rectangle {
                 width: 486px;
                 height: 452px;
                 x: (parent.width - 486px) / 2;
                 y: (parent.height - 452px) / 2;
-                background: root.canvas;
+                background: root.dialog-surface;
                 border-color: root.divider;
                 border-width: 1px;
                 border-radius: 14px;
@@ -6043,7 +6971,7 @@ export component AppWindow inherits Window {
             } else { reject }
         }
         Rectangle {
-        background: #000000aa;
+        background: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
         TouchArea { width: parent.width; height: parent.height; }
         Rectangle {
             x: (parent.width - 392px) / 2;
@@ -6127,7 +7055,7 @@ export component AppWindow inherits Window {
             } else { reject }
         }
         Rectangle {
-        background: root.rail;
+        background: root.sign-in-surface;
         // The sign-in surface stays inside the window at every text scale.
         // Its fields and actions scroll together; focused actions reveal their
         // complete bounds without allowing Tab into the covered conversation.
@@ -6139,7 +7067,7 @@ export component AppWindow inherits Window {
             border-radius: StyleTokens.radius * 1.8;
             border-color: root.divider;
             border-width: 1px;
-            background: root.canvas;
+            background: root.dialog-surface;
             accessible-role: form;
             accessible-label: "Sign in to Matrix";
             login-body-scroll := ScrollView {
@@ -6264,13 +7192,13 @@ export component AppWindow inherits Window {
         init => { reveal-recovery-key.focus(); }
         key-pressed(event) => { if event.text == Key.Escape { accept } else { reject } }
         Rectangle {
-            background: #000000cc;
+            background: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000cc;
             TouchArea { width: parent.width; height: parent.height; }
             Rectangle {
                 x: (parent.width - 520px) / 2;
                 y: (parent.height - 348px) / 2;
                 width: 520px; height: 348px;
-                background: root.canvas; border-color: root.accent; border-width: 1px; border-radius: 14px;
+                background: root.dialog-surface; border-color: root.accent; border-width: 1px; border-radius: 14px;
                 accessible-role: region;
                 accessible-label: "One-time Matrix recovery key";
                 VerticalLayout {
@@ -6320,7 +7248,19 @@ export component AppWindow inherits Window {
         focus-on-tab-navigation: false;
         init => { if !root.access-open { manage-close.focus(); } }
         changed focus-request => {
-            if root.manage-accounts-open && !root.access-open { manage-close.focus(); }
+            if root.manage-accounts-open && !root.access-open {
+                if root.manage-accounts-focus == "add" {
+                    manage-add.focus();
+                } else if root.manage-accounts-focus == "protection" {
+                    manage-protection.focus();
+                } else {
+                    manage-close.focus();
+                }
+                if root.manage-accounts-focus != "" {
+                    root.settings-revealed-id = root.settings-reveal-id;
+                    root.manage-accounts-focus = "";
+                }
+            }
         }
         capture-key-pressed(event) => {
             if event.text == Key.Escape { root.manage-accounts-open = false; accept }
@@ -6329,13 +7269,13 @@ export component AppWindow inherits Window {
             else { reject }
         }
         Rectangle {
-            background: #000000aa;
+            background: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
             TouchArea { }
             Rectangle {
                 width: min(620px * root.text-scale, parent.width - 32px);
                 height: min(680px * root.text-scale, parent.height - 32px);
                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-                background: root.canvas; border-radius: StyleTokens.radius * 1.4; border-width: 1px; border-color: root.divider;
+                background: root.dialog-surface; border-radius: StyleTokens.radius * 1.4; border-width: 1px; border-color: root.divider;
                 accessible-role: region; accessible-label: "Manage saved Matrix accounts";
                 VerticalLayout {
                     padding: 20px; spacing: 12px;
@@ -6388,7 +7328,7 @@ export component AppWindow inherits Window {
                             Text { text: "One local app password for every account switch and startup restore. Works with SSO accounts too."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; vertical-stretch: 0; }
                             HorizontalLayout {
                                 height: 40px * root.text-scale; vertical-stretch: 0; spacing: 8px;
-                                TextAction {
+                                manage-protection := TextAction {
                                 reveal-full-control: true;
                                     height: 40px * root.text-scale; vertical-stretch: 0;
                                     text: root.app-password-enabled ? "Change password" : "Set app password";
@@ -6443,13 +7383,13 @@ export component AppWindow inherits Window {
             } else { reject }
         }
         Rectangle {
-            background: #000000bb;
+            background: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000bb;
             TouchArea { }
             Rectangle {
                 width: min(540px * root.text-scale, parent.width - 32px);
                 height: min(610px * root.text-scale, parent.height - 32px);
                 x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-                background: root.canvas; border-radius: StyleTokens.radius * 1.4; border-width: 1px; border-color: root.divider;
+                background: root.dialog-surface; border-radius: StyleTokens.radius * 1.4; border-width: 1px; border-color: root.divider;
                 accessible-role: form; accessible-label: root.access-mode == 4 ? "Remove saved account" : "Local app password";
                 VerticalLayout {
                     padding: 22px; spacing: 12px;
