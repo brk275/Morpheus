@@ -109,7 +109,7 @@ pub(crate) fn status_label(status: PendingStatus) -> &'static str {
 /// Fixed wording for a scope whose saved data blocks sends, or empty.
 pub(crate) fn blocked_notice(summary: &PendingSummary) -> &'static str {
     if summary.read_only {
-        "Saved send status here is too large for this version to read. It is kept untouched; nothing typed here is saved until you discard it."
+        "Saved data here is too large for this version to read, or holds a draft kind or attachments it does not handle. It is kept untouched; nothing typed here is saved until you discard it."
     } else if summary.quarantined {
         "Saved send status here could not be read by this version. It is kept with your drafts; sending here waits until you review it."
     } else {
@@ -230,6 +230,18 @@ pub(crate) fn update_notice(update: QueuedSendUpdate, resolution: Option<&Resolu
 /// wait itself ends when the account selection is revoked, so a queue that
 /// never emits again cannot pin the task, and nothing runs for a departed
 /// selection.
+/// Whether a cache mutation for `scope` is still authorized by the selection
+/// the work started under: that selection must still be current and name the
+/// scope's own account. Every observer and completion path checks this again
+/// after each await, immediately before touching the cache, so a core call
+/// that outlives the selection (a switch, a removal or A->B->A) changes
+/// nothing in the departed account's cache and schedules no write. The exact
+/// record, its transaction id and the account epoch stay the authority for
+/// what a current selection may change.
+pub(crate) fn still_owned(selection: &AccountSelection, scope: &SendScope) -> bool {
+    selection.is_current() && selection.account_id() == scope.account
+}
+
 pub(crate) fn spawn_observer(
     live: Arc<LiveUi>,
     ui: Weak<AppWindow>,
@@ -315,6 +327,6 @@ mod tests {
         summary.quarantined = true;
         assert!(blocked_notice(&summary).contains("review"));
         summary.read_only = true;
-        assert!(blocked_notice(&summary).contains("too large"));
+        assert!(blocked_notice(&summary).contains("kept untouched"));
     }
 }

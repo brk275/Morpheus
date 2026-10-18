@@ -371,12 +371,18 @@ impl LiveUi {
 
     /// Save the exact SDK transaction id. Returns whether the submission was
     /// cleared from the composer (unchanged since the record was begun).
+    /// Nothing is recorded once the selection the send ran under is gone: the
+    /// saved enqueuing record is reviewed by the next discovery instead.
     pub async fn record_pending_queued(
         &self,
+        selection: &AccountSelection,
         scope: &SendScope,
         handle: &PendingHandle,
         transaction_id: &str,
     ) -> Option<bool> {
+        if !draft_recovery::still_owned(selection, scope) {
+            return None;
+        }
         let (account, room, thread) = (scope.account.as_str(), scope.room.as_str(), scope.thread());
         let hidden = self
             .drafts
@@ -393,17 +399,34 @@ impl LiveUi {
         Some(hidden)
     }
 
-    /// Drop a record whose enqueue failed before the SDK stored anything.
-    pub async fn abandon_pending_send(&self, scope: &SendScope, nonce: &Generation) {
-        if self
-            .drafts
-            .abandon_pending(&scope.account, &scope.room, scope.thread(), nonce)
+    /// Drop a record whose enqueue failed before the SDK stored anything,
+    /// under the selection it was created for.
+    pub async fn abandon_pending_send(
+        &self,
+        selection: &AccountSelection,
+        scope: &SendScope,
+        nonce: &Generation,
+    ) {
+        if draft_recovery::still_owned(selection, scope)
+            && self
+                .drafts
+                .abandon_pending(&scope.account, &scope.room, scope.thread(), nonce)
         {
             self.rollback_pending(scope, nonce).await;
         }
     }
 
-    pub async fn mark_pending_unconfirmed(&self, scope: &SendScope, nonce: &Generation) {
+    /// Mark one record for review, under the selection the observation ran
+    /// under. A departed selection marks nothing and schedules no write.
+    pub async fn mark_pending_unconfirmed(
+        &self,
+        selection: &AccountSelection,
+        scope: &SendScope,
+        nonce: &Generation,
+    ) {
+        if !draft_recovery::still_owned(selection, scope) {
+            return;
+        }
         self.drafts.set_pending_status(
             &scope.account,
             &scope.room,
@@ -414,7 +437,13 @@ impl LiveUi {
         self.queue_draft_write();
     }
 
-    async fn persist_scope_and_index(&self, scope: &SendScope) {
+    /// Write one scope's row (and the room index it may have left) for a
+    /// current selection. A departed selection writes nothing: its account's
+    /// cache is cleared or re-seeded by the next activation.
+    async fn persist_scope_and_index(&self, selection: &AccountSelection, scope: &SendScope) {
+        if !draft_recovery::still_owned(selection, scope) {
+            return;
+        }
         let (account, room, thread) = (scope.account.as_str(), scope.room.as_str(), scope.thread());
         if self
             .drafts
@@ -491,7 +520,11 @@ impl LiveUi {
 
     /// Apply one SDK update to the exact owned record and the visible UI.
     /// Returns whether the update was terminal for that record. Nothing is
-    /// changed once the selection the observer runs under is gone.
+    /// changed once the selection the observer runs under is gone: the
+    /// selection is checked before the core call and again after it, before
+    /// either cache mutation, so a release that outlives the selection (a
+    /// switch, a removal or A->B->A) simply ends this observer. The exact
+    /// record and transaction id remain the authority for a current one.
     pub(crate) async fn apply_pending_update(
         self: &Arc<Self>,
         selection: &AccountSelection,
@@ -501,25 +534,33 @@ impl LiveUi {
         update: QueuedSendUpdate,
         ui: &Weak<AppWindow>,
     ) -> bool {
-        if !selection.is_current() {
+        if !draft_recovery::still_owned(selection, scope) {
             return true;
         }
         let (account, room, thread) = (scope.account.as_str(), scope.room.as_str(), scope.thread());
         let (terminal, resolution) = match update {
             QueuedSendUpdate::Sent | QueuedSendUpdate::Cancelled => {
                 let sent = update == QueuedSendUpdate::Sent;
-                if !self
+                let released = self
                     .manager
                     .release_pending_record_for(selection, room, thread, nonce, Some(transaction_id))
-                    .await
-                    .is_ok()
-                {
-                    // The core does not own this record any more (selection
-                    // changed, or the row was resolved another way): leave the
-                    // cache for review instead of guessing.
-                    self.mark_pending_unconfirmed(scope, nonce).await;
-                    self.publish_resolution(ui, selection.clone(), scope.clone(), None, draft_recovery::update_notice(QueuedSendUpdate::Unknown, None));
+                    .await;
+                if !draft_recovery::still_owned(selection, scope) {
+                    // The selection ended while the core call ran: whatever
+                    // it returned, this observer is stale and changes nothing.
                     return true;
+                }
+                match released {
+                    Ok(()) => {}
+                    Err(MatrixCoreError::SelectedAccountChanged) => return true,
+                    Err(_) => {
+                        // The core does not own this record any more (the row
+                        // was resolved another way): leave the cache for
+                        // review instead of guessing.
+                        self.mark_pending_unconfirmed(selection, scope, nonce).await;
+                        self.publish_resolution(ui, selection.clone(), scope.clone(), None, draft_recovery::update_notice(QueuedSendUpdate::Unknown, None));
+                        return true;
+                    }
                 }
                 let resolution = self.drafts.resolve_pending(
                     account,
@@ -529,7 +570,7 @@ impl LiveUi {
                     Some(transaction_id),
                     sent,
                 );
-                self.persist_scope_and_index(scope).await;
+                self.persist_scope_and_index(selection, scope).await;
                 (true, resolution)
             }
             QueuedSendUpdate::Retained { recoverable } => {
@@ -543,7 +584,7 @@ impl LiveUi {
                 (false, None)
             }
             QueuedSendUpdate::Unknown => {
-                self.mark_pending_unconfirmed(scope, nonce).await;
+                self.mark_pending_unconfirmed(selection, scope, nonce).await;
                 (true, None)
             }
         };
@@ -570,7 +611,7 @@ impl LiveUi {
             Ok(true) => "Cancelling. A message that already reached the server stays sent.",
             Ok(false) => "This message was already sent and cannot be cancelled.",
             Err(MatrixCoreError::PendingSendUnavailable) if selection.is_current() => {
-                self.mark_pending_unconfirmed(&scope, &target.nonce).await;
+                self.mark_pending_unconfirmed(&selection, &scope, &target.nonce).await;
                 "This message is no longer waiting here. Check the conversation, then choose."
             }
             Err(MatrixCoreError::SelectedAccountChanged) => return,
@@ -600,7 +641,7 @@ impl LiveUi {
             }
             Ok(()) => return,
             Err(MatrixCoreError::PendingSendUnavailable) if selection.is_current() => {
-                self.mark_pending_unconfirmed(&scope, &target.nonce).await;
+                self.mark_pending_unconfirmed(&selection, &scope, &target.nonce).await;
                 "This message is no longer waiting here. Check the conversation, then choose."
             }
             Err(MatrixCoreError::SelectedAccountChanged) => return,
@@ -641,7 +682,7 @@ impl LiveUi {
         if resolution.is_none() {
             return;
         }
-        self.persist_scope_and_index(&scope).await;
+        self.persist_scope_and_index(&selection, &scope).await;
         let notice = match &resolution {
             _ if sent => "Marked as sent. Nothing was resent.",
             Some(resolution) if resolution.restored.is_some() => {
@@ -691,7 +732,7 @@ impl LiveUi {
             None => "The composer changed; nothing was restored.",
         };
         if resolution.is_some() {
-            self.persist_scope_and_index(&scope).await;
+            self.persist_scope_and_index(&selection, &scope).await;
         }
         self.publish_resolution(&ui, selection, scope, resolution, notice);
     }
@@ -716,7 +757,7 @@ impl LiveUi {
             .drafts
             .discard_kept(&scope.account, &scope.room, scope.thread(), &nonce)
         {
-            self.persist_scope_and_index(&scope).await;
+            self.persist_scope_and_index(&selection, &scope).await;
         }
         self.publish_resolution(&ui, selection, scope, None, "Kept text discarded.");
     }
@@ -730,30 +771,45 @@ impl LiveUi {
         ui: Weak<AppWindow>,
     ) {
         // The discard applies to exactly the original the user reviewed: the
-        // cache's fingerprint is checked by the core and again at the cache.
-        let Some(fingerprint) = self
+        // core compares the complete stored row (both text columns, kind and
+        // every attachment value) against that original before releasing it,
+        // and the cache checks the same identity again.
+        let Some(revision) = self
             .drafts
-            .quarantine_fingerprint(&scope.account, &scope.room, scope.thread())
+            .quarantine_revision(&scope.account, &scope.room, scope.thread())
         else {
             return;
         };
-        if !selection.is_current()
-            || self
-                .manager
-                .discard_quarantine_for(&selection, &scope.room, scope.thread(), fingerprint)
-                .await
-                .is_err()
-            || !selection.is_current()
-        {
+        if !draft_recovery::still_owned(&selection, &scope) {
             return;
         }
-        if self
-            .drafts
-            .discard_quarantine(&scope.account, &scope.room, scope.thread(), fingerprint)
-        {
-            self.persist_scope_and_index(&scope).await;
+        let discarded = self
+            .manager
+            .discard_quarantine_for(&selection, &scope.room, scope.thread(), &revision)
+            .await;
+        if !draft_recovery::still_owned(&selection, &scope) {
+            return;
         }
-        self.publish_resolution(&ui, selection, scope, None, "Unreadable saved status discarded. Sending here is available again.");
+        let notice = match discarded {
+            Ok(()) => {
+                if self
+                    .drafts
+                    .discard_quarantine(&scope.account, &scope.room, scope.thread(), &revision)
+                {
+                    self.persist_scope_and_index(&selection, &scope).await;
+                }
+                "Unreadable saved status discarded. Sending here is available again."
+            }
+            Err(MatrixCoreError::SelectedAccountChanged) => return,
+            Err(MatrixCoreError::StaleDraftSnapshot) => {
+                "Saved data here changed since you reviewed it. It is kept untouched; review it again before discarding."
+            }
+            Err(MatrixCoreError::OriginalUnverifiable) => {
+                "Saved data here is too large for this version to verify before discarding. It is kept untouched."
+            }
+            Err(_) => "Could not discard the saved data right now. It is kept untouched.",
+        };
+        self.publish_resolution(&ui, selection, scope, None, notice);
     }
 
     /// Seed the cache with every draft scope the core found at selection and
@@ -3004,5 +3060,201 @@ mod account_presentation_tests {
         assert_feed_cancelled(feed_cancelled).await;
         assert_feed_cancelled(thread_cancelled).await;
         close_profile(directory, live).await;
+    }
+}
+
+/// Opt-in regression against the local Synapse fixture (the same
+/// `MORPHEUS_MATRIX_TEST_ACCOUNTS` file the core fixture reads). It drives the
+/// real app observer and completion helpers with real selections from the
+/// account manager, revokes them by an actual account switch and A->B->A, and
+/// proves the departed selection's observers end and change nothing without
+/// any further SDK event.
+#[cfg(test)]
+mod stale_observer_tests {
+    use super::*;
+    use crate::draft_recovery::SendScope;
+
+    struct FixtureAccount {
+        homeserver_url: String,
+        username: String,
+        password: String,
+    }
+
+    fn fixture() -> Option<(FixtureAccount, FixtureAccount, String)> {
+        let path = std::env::var_os("MORPHEUS_MATRIX_TEST_ACCOUNTS")?;
+        let fixture: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).expect("Cannot read local fixture"))
+                .expect("Invalid local fixture");
+        let account = |label: &str| {
+            let entry = fixture["accounts"]
+                .as_array()
+                .expect("fixture accounts")
+                .iter()
+                .find(|entry| entry["label"].as_str() == Some(label))
+                .expect("fixture account");
+            FixtureAccount {
+                homeserver_url: entry["homeserver_url"].as_str().unwrap().to_owned(),
+                username: entry["username"].as_str().unwrap().to_owned(),
+                password: entry["password"].as_str().unwrap().to_owned(),
+            }
+        };
+        let room = fixture["rooms"]["a_room"].as_str().expect("fixture room").to_owned();
+        Some((account("a_primary"), account("b_primary"), room))
+    }
+
+    async fn wait_for_room(manager: &AccountManager, room_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            if manager
+                .rooms_snapshot()
+                .await
+                .expect("Cannot read rooms")
+                .iter()
+                .any(|room| room.room_id == room_id)
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "Timed out waiting for room");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_observers_end_on_revocation_and_never_touch_the_departed_cache() {
+        let Some((alice, carol, a_room)) = fixture() else {
+            eprintln!("Skipped stale observer regression; set MORPHEUS_MATRIX_TEST_ACCOUNTS to opt in.");
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let manager = Arc::new(AccountManager::open(directory.path().join("profile")).unwrap());
+        let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
+            directory.path().join("config.toml"),
+        )));
+        let live = LiveUi::new(manager.clone(), Handle::current(), Weak::default(), voices);
+        let a_account = manager
+            .add_password_account(&alice.homeserver_url, &alice.username, &alice.password)
+            .await
+            .expect("First login failed");
+        wait_for_room(&manager, &a_room).await;
+        let selection = manager.account_selection(&a_account.id).expect("Selection missing");
+        // Discovery must cover the room before a recorded send; this is the
+        // same wait the controller performs at activation.
+        manager.take_recovered_drafts(&selection).await.unwrap();
+        live.is_live.store(true, Ordering::Release);
+        *live.selected_room.lock().await = Some(a_room.clone());
+        // Barrier: the request stays persisted and the SDK never emits for it,
+        // so every observer below ends only through revocation.
+        let client = manager.active_client().await.unwrap();
+        client.send_queue().set_enabled(false).await;
+
+        let scope = SendScope {
+            account: a_account.id.clone(),
+            room: a_room.clone(),
+            thread: None,
+        };
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let text = ComposeText::plain(format!("stale-observer-{unique}"));
+        live.drafts.set(&a_account.id, &a_room, &text.body);
+        let revision = live.drafts.revision(&a_account.id, &a_room).unwrap();
+        let handle = live
+            .prepare_pending_send(&selection, &scope, &text, revision)
+            .await
+            .expect("the record is durable before enqueue");
+        let queued = live
+            .send_composed(
+                selection.clone(),
+                a_room.clone(),
+                ComposeSendTarget::Room,
+                text.clone(),
+                None,
+                Some(handle.nonce()),
+            )
+            .await
+            .expect("enqueue under the current selection");
+        let transaction = queued.transaction_id().to_owned();
+        assert_eq!(
+            live.record_pending_queued(&selection, &scope, &handle, &transaction).await,
+            Some(true)
+        );
+        let nonce = handle.nonce().clone();
+        let queued_status = || live.drafts.record_status(&a_account.id, &a_room, None, &nonce);
+        assert_eq!(queued_status(), Some(PendingStatus::Queued));
+        assert_eq!(
+            live.drafts.record_transaction_id(&a_account.id, &a_room, None, &nonce),
+            Some(Some(transaction.clone()))
+        );
+
+        // The real observer waits on the paused queue: it holds the live
+        // controller and the SDK handle while it waits.
+        let idle_holds = Arc::strong_count(&live);
+        draft_recovery::spawn_observer(
+            live.clone(),
+            Weak::default(),
+            selection.clone(),
+            scope.clone(),
+            nonce.clone(),
+            transaction.clone(),
+            queued,
+        );
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(Arc::strong_count(&live) > idle_holds, "the observer holds its resources while waiting");
+
+        // A->B->A: adding the second account revokes the first selection;
+        // switching back issues a new one. No SDK event is produced for the
+        // persisted request at any point.
+        let b_account = manager
+            .add_password_account(&carol.homeserver_url, &carol.username, &carol.password)
+            .await
+            .expect("Second login failed");
+        assert!(!selection.is_current());
+        manager.switch_to(&a_account.id).await.expect("Cannot switch back");
+        let renewed = manager.account_selection(&a_account.id).expect("Renewed selection missing");
+        assert!(renewed.is_current());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&live) != idle_holds {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the stale observer must end on revocation and release what it held");
+        assert_eq!(queued_status(), Some(PendingStatus::Queued), "ending changed nothing");
+
+        // Late completions under the departed selection (the core call
+        // returning after revocation, or an acknowledgement arriving late)
+        // change nothing in the cache and schedule no write.
+        assert!(
+            live.apply_pending_update(&selection, &scope, &nonce, &transaction, QueuedSendUpdate::Sent, &Weak::default())
+                .await
+        );
+        live.mark_pending_unconfirmed(&selection, &scope, &nonce).await;
+        live.abandon_pending_send(&selection, &scope, &nonce).await;
+        assert_eq!(live.record_pending_queued(&selection, &scope, &handle, &transaction).await, None);
+        assert_eq!(queued_status(), Some(PendingStatus::Queued));
+        assert_eq!(
+            live.drafts.record_transaction_id(&a_account.id, &a_room, None, &nonce),
+            Some(Some(transaction.clone()))
+        );
+        // The saved state is intact for the renewed selection: discovery
+        // adopts exactly the persisted request, so nothing valid was dropped.
+        let recovered = manager.take_recovered_drafts(&renewed).await.unwrap();
+        let send = recovered
+            .iter()
+            .find(|draft| draft.room_id == a_room && draft.thread_root.is_none())
+            .and_then(|draft| draft.sends.iter().find(|send| send.nonce == nonce))
+            .expect("the record survives the switch");
+        assert_eq!(send.transaction_id.as_deref(), Some(transaction.as_str()));
+        assert!(send.queued.is_some(), "the exact persisted request is adopted");
+
+        manager.logout_account(&a_account.id).await.expect("Cannot remove first account");
+        manager.logout_account(&b_account.id).await.expect("Cannot remove second account");
+        manager.stop().await;
+        drop(live);
+        drop(manager);
+        directory.close().unwrap();
     }
 }

@@ -190,9 +190,21 @@ SDK persisted while the row still said enqueuing), exact adoption of a
 persisted request across a restart and a re-selection, a stale room snapshot
 refused because it would orphan an indexed thread, and a quarantined row
 pausing its room, keeping both stored columns through an edit, and resuming
-only after a discard that names exactly that original. Morpheus never enables
-the client-wide SDK queue; each room queue resumes through the discovery gate.
-Neither scenario has yet been built or run.
+only after a discard that names exactly that original. The same scenario then
+stores, through the SDK's own draft API, readable rows with an attachment or a
+reply or edit kind: they are shown but never rewritten, and a discard reviewed
+before an attachment value or the kind changed underneath it is refused as
+stale. It also creates a room after discovery (paused and recovery-incomplete
+until its safe scan, then a send completes there) and leaves a room holding a
+persisted request and an unreadable row (skipped by discovery, not scannable
+while left, scanned on demand after rejoining, paused until the exact
+discard). Morpheus never enables the client-wide SDK queue; each room queue
+resumes only once a scan under the current selection covered that room. The
+same fixture file also opts in `morpheus-app`'s `stale_observer_tests`, which
+spawns the app's real send observer on a persisted request, revokes its
+selection by adding the second account and switching back, and proves the
+observer ends and late completions leave the departed cache untouched. None of
+these scenarios has yet been built or run.
 
 ## Test encrypted-history recovery
 

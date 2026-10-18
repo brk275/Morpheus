@@ -66,8 +66,10 @@ fresh evidence. See [the verification log](VERIFICATION.md).
       and thread sends are now recorded in the encrypted draft row before
       enqueue with their complete typed text, reconciled by exact transaction
       after restart, and offered per-record native retry, cancel, restore,
-      copy and unconfirmed-review choices; unreadable saved data is quarantined
-      until discarded. That source has not been built or run yet.
+      copy and unconfirmed-review choices; unreadable saved data, and readable
+      drafts other clients stored with attachments or reply/edit targets, are
+      kept untouched until an explicit review of exactly that row. That source
+      has not been built or run yet.
 - [ ] Render long and mixed-height timelines with virtualization and keyboard
       navigation; benchmark a 10,000-message room.
 

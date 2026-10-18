@@ -29,6 +29,7 @@ use std::{
 use morpheus_matrix::{
     AccountManager, ComposeError, ComposeText, DraftEnvelope, Generation, MatrixCoreError,
     PendingLimitError, PendingRecord, QuarantinedRow, ReadOnlyRow, RecordText, RestoredCompose,
+    RowRevision,
 };
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -186,18 +187,18 @@ impl PendingDraft {
 enum Quarantine {
     /// The complete original row rides in the envelope of every save.
     Carried(QuarantinedRow),
-    /// The original row cannot be carried completely; the scope is never
-    /// written. Identified exactly so a discard applies to that row only.
+    /// The original row cannot be carried completely or rewritten faithfully
+    /// (too large, attachments, or a draft kind this build does not write);
+    /// the scope is never written.
     ReadOnly(ReadOnlyRow),
 }
 
-impl Quarantine {
-    fn fingerprint(&self) -> u64 {
-        match self {
-            Self::Carried(row) => row.fingerprint(),
-            Self::ReadOnly(row) => row.fingerprint,
-        }
-    }
+/// The unreadable original of one scope with the opaque identity the core
+/// minted for exactly that complete stored row. A discard names the identity;
+/// the core compares the complete row again before releasing anything.
+struct Blocked {
+    kind: Quarantine,
+    revision: RowRevision,
 }
 
 struct CachedDraft {
@@ -213,7 +214,7 @@ struct CachedDraft {
     pending: Vec<PendingDraft>,
     /// Room scope only: thread roots whose rows hold records.
     threads: Vec<String>,
-    quarantine: Option<Quarantine>,
+    quarantine: Option<Blocked>,
 }
 
 impl Default for CachedDraft {
@@ -255,7 +256,13 @@ impl CachedDraft {
     }
 
     fn read_only(&self) -> bool {
-        matches!(self.quarantine, Some(Quarantine::ReadOnly(_)))
+        matches!(
+            self.quarantine,
+            Some(Blocked {
+                kind: Quarantine::ReadOnly(_),
+                ..
+            })
+        )
     }
 
     fn envelope(&self) -> Result<DraftEnvelope, ComposeError> {
@@ -280,7 +287,10 @@ impl CachedDraft {
             });
         }
         let quarantine = match &self.quarantine {
-            Some(Quarantine::Carried(row)) => Some(row.clone()),
+            Some(Blocked {
+                kind: Quarantine::Carried(row),
+                ..
+            }) => Some(row.clone()),
             _ => None,
         };
         DraftEnvelope::restore(
@@ -308,7 +318,13 @@ impl CachedDraft {
                 .pending
                 .iter()
                 .any(|pending| pending.status == PendingStatus::Unconfirmed),
-            quarantined: matches!(self.quarantine, Some(Quarantine::Carried(_))),
+            quarantined: matches!(
+                self.quarantine,
+                Some(Blocked {
+                    kind: Quarantine::Carried(_),
+                    ..
+                })
+            ),
             read_only: self.read_only(),
         }
     }
@@ -390,6 +406,7 @@ impl CachedDraft {
 
     fn from_restored(restored: RestoredCompose, attached: Option<&[Generation]>) -> Self {
         let read_only = restored.read_only;
+        let revision = restored.revision;
         let envelope = restored.envelope;
         let mut pending = Vec::with_capacity(envelope.pending().len());
         for record in envelope.pending() {
@@ -416,10 +433,21 @@ impl CachedDraft {
                 text,
             });
         }
-        let quarantine = match (read_only, envelope.quarantine()) {
+        let kind = match (read_only, envelope.quarantine()) {
             (Some(row), _) => Some(Quarantine::ReadOnly(row)),
             (None, Some(row)) => Some(Quarantine::Carried(row.clone())),
             (None, None) => None,
+        };
+        // The core mints an identity for every blocked row it restores; a
+        // blocked row without one cannot be discarded from here, which is the
+        // safe failure.
+        let quarantine = match (kind, revision) {
+            (Some(kind), Some(revision)) => Some(Blocked { kind, revision }),
+            (Some(kind), None) => Some(Blocked {
+                kind,
+                revision: RowRevision::fresh(),
+            }),
+            (None, _) => None,
         };
         Self {
             text: restored.text,
@@ -912,25 +940,26 @@ impl DraftStore {
 
     /// Identity of the unreadable original this scope carries or freezes on,
     /// as the core's discard requires.
-    pub fn quarantine_fingerprint(&self, account: &str, room: &str, thread: Option<&str>) -> Option<u64> {
+    pub fn quarantine_revision(&self, account: &str, room: &str, thread: Option<&str>) -> Option<RowRevision> {
         self.by_room
             .lock()
             .expect("draft mutex poisoned")
             .get(&key(account, room, thread))?
             .quarantine
             .as_ref()
-            .map(Quarantine::fingerprint)
+            .map(|blocked| blocked.revision.clone())
     }
 
-    /// Explicit user discard of exactly the unreadable original they reviewed.
-    /// The scope becomes writable; the next save replaces the original row. A
+    /// Explicit user discard of exactly the unreadable original they reviewed,
+    /// after the core verified the complete stored row and released it. The
+    /// scope becomes writable; the next save replaces the original row. A
     /// different original (changed underneath the review) is left alone.
-    pub fn discard_quarantine(&self, account: &str, room: &str, thread: Option<&str>, fingerprint: u64) -> bool {
+    pub fn discard_quarantine(&self, account: &str, room: &str, thread: Option<&str>, revision: &RowRevision) -> bool {
         let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
         let Some(draft) = drafts.get_mut(&key(account, room, thread)) else {
             return false;
         };
-        if draft.quarantine.as_ref().map(Quarantine::fingerprint) != Some(fingerprint) {
+        if draft.quarantine.as_ref().map(|blocked| &blocked.revision) != Some(revision) {
             return false;
         }
         draft.quarantine = None;
@@ -1069,6 +1098,7 @@ impl DraftStore {
             discarded_rich_intent: false,
             envelope: DraftEnvelope::fresh(),
             read_only: None,
+            revision: None,
         };
         self.insert_restored_if_missing(key, restored, epoch, None);
     }
@@ -1606,11 +1636,11 @@ mod tests {
         // reviewing records or naming another original does not.
         assert!(again.review_unconfirmed("a", "room", None, &Generation::fresh(), true).is_none());
         assert!(again.pending_summary("a", "room", None).quarantined);
-        let fingerprint = again.quarantine_fingerprint("a", "room", None).unwrap();
-        assert!(!again.discard_quarantine("a", "room", None, fingerprint ^ 1));
+        let revision = again.quarantine_revision("a", "room", None).unwrap();
+        assert!(!again.discard_quarantine("a", "room", None, &RowRevision::fresh()));
         assert!(again.pending_summary("a", "room", None).quarantined);
-        assert!(again.discard_quarantine("a", "room", None, fingerprint));
-        assert!(!again.discard_quarantine("a", "room", None, fingerprint));
+        assert!(again.discard_quarantine("a", "room", None, &revision));
+        assert!(!again.discard_quarantine("a", "room", None, &revision));
         assert!(!again.pending_summary("a", "room", None).blocks_sends());
         assert!(again.snapshot("a", "room", None).unwrap().1.is_empty());
         assert!(again.is_dirty("a", "room", None));
@@ -1624,9 +1654,10 @@ mod tests {
             envelope: DraftEnvelope::fresh(),
             read_only: Some(ReadOnlyRow {
                 reason: morpheus_matrix::QuarantineReason::TooLarge,
-                fingerprint: 99,
             }),
+            revision: Some(RowRevision::fresh()),
         };
+        let revision = restored.revision.clone().unwrap();
         let drafts = DraftStore::default();
         drafts.seed_recovered("a", "room", None, restored, &[], drafts.account_epoch("a"));
         let summary = drafts.pending_summary("a", "room", None);
@@ -1639,9 +1670,25 @@ mod tests {
             Err(PendingError::Unreadable)
         ));
         assert!(drafts.index_thread("a", "room", "$root:example.org").is_err());
-        assert_eq!(drafts.quarantine_fingerprint("a", "room", None), Some(99));
-        assert!(!drafts.discard_quarantine("a", "room", None, 98), "a different original is not discarded");
-        assert!(drafts.discard_quarantine("a", "room", None, 99));
+        assert_eq!(drafts.quarantine_revision("a", "room", None), Some(revision.clone()));
+        assert!(!drafts.discard_quarantine("a", "room", None, &RowRevision::fresh()), "a different original is not discarded");
+        // Readable text stored with fields this build does not write is the
+        // same kind of scope: shown, never written, discarded only exactly.
+        let unsupported = RestoredCompose {
+            text: text("reply draft from another client"),
+            discarded_rich_intent: false,
+            envelope: DraftEnvelope::fresh(),
+            read_only: Some(ReadOnlyRow {
+                reason: morpheus_matrix::QuarantineReason::UnsupportedFields,
+            }),
+            revision: Some(RowRevision::fresh()),
+        };
+        drafts.seed_recovered("a", "other", None, unsupported, &[], drafts.account_epoch("a"));
+        assert_eq!(drafts.get("a", "other"), "reply draft from another client");
+        assert!(drafts.pending_summary("a", "other", None).read_only);
+        drafts.set("a", "other", "typed over it");
+        assert!(!drafts.clear_dirty_like_a_write_would("a", "other", None), "the stored row is never rewritten");
+        assert!(drafts.discard_quarantine("a", "room", None, &revision));
         assert!(drafts.clear_dirty_like_a_write_would("a", "room", None), "writes resume after the explicit discard");
         assert!(!drafts.pending_summary("a", "room", None).blocks_sends());
     }

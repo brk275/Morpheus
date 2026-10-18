@@ -11,7 +11,7 @@ use ruma::html::{Html, NodeData, NodeRef};
 use crate::TextFormat;
 use crate::draft_recovery::{
     DraftEnvelope, MAX_ENVELOPE_HEX_BYTES, QuarantineReason, QuarantinedRow, ReadOnlyRow,
-    row_fingerprint,
+    RowRevision,
 };
 
 pub const MAX_COMPOSE_BYTES: usize = 64 * 1024;
@@ -130,11 +130,16 @@ pub struct RestoredCompose {
     /// rows. For a quarantined row that fits the carry bound the envelope
     /// holds the complete original row in `quarantine()`.
     pub envelope: DraftEnvelope,
-    /// The row is Morpheus-written but cannot be carried completely (too
-    /// large, or it holds attachments): it stays untouched in the store and
-    /// nothing may be written to this scope until the user explicitly discards
-    /// exactly that row.
+    /// The row cannot be carried completely or rewritten faithfully (too
+    /// large, it holds attachments, or its draft kind is one this build does
+    /// not write): it stays untouched in the store and nothing may be written
+    /// to this scope until the user explicitly discards exactly that row.
     pub read_only: Option<ReadOnlyRow>,
+    /// Opaque identity of the unreadable original (carried or read-only),
+    /// minted for the complete row this value was restored from. `None` when
+    /// nothing is blocked. The store layer reconciles it with the identity it
+    /// already holds when a reload returns the identical complete row.
+    pub revision: Option<RowRevision>,
 }
 
 impl RestoredCompose {
@@ -146,10 +151,8 @@ impl RestoredCompose {
     }
 
     /// Identity of the unreadable original, carried or read-only.
-    pub fn blocked_fingerprint(&self) -> Option<u64> {
-        self.read_only
-            .map(|row| row.fingerprint)
-            .or_else(|| self.envelope.quarantine().map(QuarantinedRow::fingerprint))
+    pub fn blocked_revision(&self) -> Option<&RowRevision> {
+        self.revision.as_ref()
     }
 }
 
@@ -497,39 +500,66 @@ impl ComposeText {
 
     /// Restore a complete stored row. `kind` names the stored draft kind
     /// (`new`, `reply:<event id>` or `edit:<event id>`) and
-    /// `has_attachments` whether the row carries attachments; both decide how
-    /// an unreadable row is preserved, never how a readable one is shown.
+    /// `has_attachments` whether the row carries attachments. Neither changes
+    /// how the text is shown, but a row whose kind this build does not write,
+    /// or that holds attachments, is preserved read-only even when its text is
+    /// readable: a later save would otherwise rewrite it as a plain new
+    /// message and silently drop the reply or edit target or the attachments.
+    /// An unreadable row is carried verbatim or kept read-only in place.
     pub fn restore_stored_draft(
         body: String,
         html: Option<&str>,
         kind: &str,
         has_attachments: bool,
     ) -> RestoredCompose {
+        let unsupported_fields = kind != "new" || has_attachments;
+        // Readable text with stored fields this build cannot write back: shown,
+        // never rewritten until the user discards exactly this row.
+        let preserve = |restored: RestoredCompose| {
+            if restored.blocked().is_none() && unsupported_fields {
+                RestoredCompose {
+                    read_only: Some(ReadOnlyRow {
+                        reason: QuarantineReason::UnsupportedFields,
+                    }),
+                    revision: Some(RowRevision::fresh()),
+                    ..restored
+                }
+            } else {
+                restored
+            }
+        };
         let plain = |body: String| RestoredCompose {
             text: Self::plain(body),
             discarded_rich_intent: false,
             envelope: DraftEnvelope::fresh(),
             read_only: None,
+            revision: None,
         };
         let Some(html) = html else {
-            return plain(body);
+            return preserve(plain(body));
         };
         match Self::decode_draft(&body, html) {
-            Decoded::Text(text, envelope) => RestoredCompose {
-                text,
-                discarded_rich_intent: false,
-                envelope,
-                read_only: None,
-            },
-            Decoded::Foreign => RestoredCompose {
+            Decoded::Text(text, envelope) => {
+                // A readable row may still carry an earlier quarantined
+                // original; that carry keeps its own identity.
+                let revision = envelope.quarantine().is_some().then(RowRevision::fresh);
+                preserve(RestoredCompose {
+                    text,
+                    discarded_rich_intent: false,
+                    envelope,
+                    read_only: None,
+                    revision,
+                })
+            }
+            Decoded::Foreign => preserve(RestoredCompose {
                 discarded_rich_intent: true,
                 ..plain(body)
-            },
+            }),
             Decoded::Quarantine { reason, text } => {
                 // The complete original row (both columns and its kind)
                 // travels with the scope until the user discards exactly it;
                 // a row that cannot be carried completely stays read-only.
-                let fingerprint = row_fingerprint(&body, Some(html), kind);
+                // Either way the identity is minted for the complete row.
                 let carried = QuarantinedRow::new(reason, &body, Some(html), kind, has_attachments);
                 let text = text.unwrap_or_else(|| Self::plain(body));
                 match carried {
@@ -541,16 +571,15 @@ impl ComposeText {
                             discarded_rich_intent: false,
                             envelope,
                             read_only: None,
+                            revision: Some(RowRevision::fresh()),
                         }
                     }
                     None => RestoredCompose {
                         text,
                         discarded_rich_intent: false,
                         envelope: DraftEnvelope::fresh(),
-                        read_only: Some(ReadOnlyRow {
-                            reason,
-                            fingerprint,
-                        }),
+                        read_only: Some(ReadOnlyRow { reason }),
+                        revision: Some(RowRevision::fresh()),
                     },
                 }
             }
@@ -901,10 +930,16 @@ mod tests {
         assert_eq!(carried_row.original_html().as_deref(), Some(broken.as_str()));
         assert_eq!(carried_row.original_plain().as_deref(), Some(plain_column.as_str()));
         assert_eq!(carried_row.original_kind(), "reply:$target:example.org");
-        assert_eq!(
-            Some(carried_row.fingerprint()),
-            restored.blocked_fingerprint()
+        assert!(restored.blocked_revision().is_some(), "an unreadable original has an identity");
+        // Identity is opaque and per restored row: the same bytes restored
+        // again are a new review, never an equal identity derived from text.
+        let twin = ComposeText::restore_stored_draft(
+            plain_column.clone(),
+            Some(&broken),
+            "reply:$target:example.org",
+            false,
         );
+        assert_ne!(twin.blocked_revision(), restored.blocked_revision());
         let restored = ComposeText::restore_draft(value.body.clone(), Some(&broken));
         assert_eq!(restored.text, value, "a canonical span still yields the typed text");
         assert_eq!(
@@ -992,11 +1027,7 @@ mod tests {
         let restored = ComposeText::restore_draft("x".into(), Some(&huge));
         assert_eq!(restored.read_only.map(|row| row.reason), Some(QuarantineReason::TooLarge));
         assert_eq!(restored.blocked(), Some(QuarantineReason::TooLarge));
-        assert_eq!(
-            restored.blocked_fingerprint(),
-            Some(row_fingerprint("x", Some(&huge), "new")),
-            "a read-only row is identified exactly"
-        );
+        assert!(restored.blocked_revision().is_some(), "a read-only row has an identity");
         assert!(restored.envelope.is_empty());
         assert_eq!(restored.text.body, "x");
         // A row with attachments cannot be carried completely either.
@@ -1008,10 +1039,58 @@ mod tests {
         );
         assert_eq!(with_attachments.read_only.map(|row| row.reason), Some(QuarantineReason::Malformed));
         assert!(with_attachments.envelope.quarantine().is_none());
+        assert!(with_attachments.blocked_revision().is_some());
         // The same size without our marker is just foreign HTML.
         let foreign = format!("<b>{}</b>", "0".repeat(MAX_DRAFT_HTML_BYTES));
         let restored = ComposeText::restore_draft("x".into(), Some(&foreign));
         assert!(restored.discarded_rich_intent && restored.blocked().is_none());
+    }
+
+    #[test]
+    fn readable_rows_with_unsupported_stored_fields_are_preserved_read_only() {
+        use crate::draft_recovery::QuarantineReason;
+        let value = selected("send ", " now");
+        let html = value.draft_html().unwrap();
+        // A plain new message with nothing else stored restores writable.
+        let plain = ComposeText::restore_stored_draft(value.body.clone(), Some(&html), "new", false);
+        assert_eq!(plain.text, value);
+        assert!(plain.blocked().is_none() && plain.blocked_revision().is_none());
+        // Kind-only difference: a readable reply or edit draft shows its text
+        // but is never rewritten as a new message.
+        for kind in ["reply:$target:example.org", "edit:$target:example.org"] {
+            let restored = ComposeText::restore_stored_draft(value.body.clone(), Some(&html), kind, false);
+            assert_eq!(restored.text, value, "the typed text and mention intent still restore");
+            assert!(!restored.discarded_rich_intent);
+            assert_eq!(restored.blocked(), Some(QuarantineReason::UnsupportedFields));
+            assert_eq!(restored.read_only.map(|row| row.reason), Some(QuarantineReason::UnsupportedFields));
+            assert!(restored.envelope.quarantine().is_none(), "nothing is carried; the row stays in place");
+            assert!(restored.blocked_revision().is_some());
+        }
+        // Attachment-only difference: identical text and kind, attachments
+        // present. Preserved read-only, with its own identity each read.
+        let with_attachments = ComposeText::restore_stored_draft(value.body.clone(), Some(&html), "new", true);
+        assert_eq!(with_attachments.text, value);
+        assert_eq!(with_attachments.blocked(), Some(QuarantineReason::UnsupportedFields));
+        let again = ComposeText::restore_stored_draft(value.body.clone(), Some(&html), "new", true);
+        assert_ne!(again.blocked_revision(), with_attachments.blocked_revision());
+        // No HTML at all (another client's plain draft) with attachments: the
+        // plain body shows, the row is preserved.
+        let no_html = ComposeText::restore_stored_draft("just text".into(), None, "new", true);
+        assert_eq!(no_html.text, ComposeText::plain("just text"));
+        assert_eq!(no_html.blocked(), Some(QuarantineReason::UnsupportedFields));
+        assert!(!no_html.discarded_rich_intent);
+        let no_html_plain = ComposeText::restore_stored_draft("just text".into(), None, "new", false);
+        assert!(no_html_plain.blocked().is_none());
+        // Foreign HTML with a reply kind: the body falls back as before, and
+        // the row is still preserved rather than rewritten.
+        let foreign = ComposeText::restore_stored_draft("x".into(), Some("<b>x</b>"), "reply:$t:example.org", false);
+        assert!(foreign.discarded_rich_intent);
+        assert_eq!(foreign.blocked(), Some(QuarantineReason::UnsupportedFields));
+        // An unreadable row keeps its own reason; unsupported fields never
+        // mask it.
+        let broken = html.replace("data-format=\"", "data-format=\"x");
+        let unreadable = ComposeText::restore_stored_draft(value.body.clone(), Some(&broken), "reply:$t:example.org", true);
+        assert_eq!(unreadable.blocked(), Some(QuarantineReason::Malformed));
     }
 
     #[test]

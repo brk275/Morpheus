@@ -215,24 +215,41 @@ impl ComposerUi {
                 selection.clone(), submission.scope.room.clone(), submission.target(),
                 trimmed, submission.baseline.clone(), handle.as_ref().map(|handle| handle.nonce()),
             ).await;
+            // The selection is checked again after every await before the
+            // cache is touched: a switch, removal or A->B->A while the core
+            // call ran leaves the departed account's cache exactly as it was.
+            // The saved enqueuing record outlives this process's ownership and
+            // is reviewed by the next discovery, never abandoned or guessed.
             let mut queued = match result {
+                Ok(_) | Err(_) if !crate::draft_recovery::still_owned(&selection, &scope) => {
+                    fail(
+                        "Send could not be confirmed; the request may still send. Your text is retained. Check the conversation, then choose.",
+                        handle.is_some(),
+                    );
+                    return;
+                }
                 Ok(queued) => queued,
+                Err(morpheus_matrix::MatrixCoreError::SelectedAccountChanged) => {
+                    fail(
+                        "Send could not be confirmed; the request may still send. Your text is retained. Check the conversation, then choose.",
+                        handle.is_some(),
+                    );
+                    return;
+                }
                 Err(error) => {
-                    // A selection that ended mid-send cannot tell whether the
-                    // request was stored; its record also outlives this
-                    // process's ownership, so it is reviewed, not abandoned.
+                    // An uncertain outcome cannot tell whether the request was
+                    // stored; the record is reviewed, not abandoned.
                     let uncertain = matches!(
                         error,
                         morpheus_matrix::MatrixCoreError::ComposedSendUncertain
-                            | morpheus_matrix::MatrixCoreError::SelectedAccountChanged
                     );
                     if let Some(handle) = &handle {
                         if uncertain {
                             // The SDK may hold the request without our id: the
                             // saved enqueuing record stays, marked for review.
-                            live.mark_pending_unconfirmed(&scope, handle.nonce()).await;
+                            live.mark_pending_unconfirmed(&selection, &scope, handle.nonce()).await;
                         } else {
-                            live.abandon_pending_send(&scope, handle.nonce()).await;
+                            live.abandon_pending_send(&selection, &scope, handle.nonce()).await;
                         }
                     }
                     // A durable record now guards the scope, so its lease can
@@ -256,7 +273,7 @@ impl ComposerUi {
             // submitted text.
             let hidden = match &handle {
                 Some(handle) => live
-                    .record_pending_queued(&scope, handle, &transaction)
+                    .record_pending_queued(&selection, &scope, handle, &transaction)
                     .await
                     .unwrap_or(false),
                 None => false,

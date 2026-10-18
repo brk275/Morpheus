@@ -2844,9 +2844,10 @@ issued once per prepared record under the selection epoch and die with it, so
 A to B to A can neither regrant nor abandon an old enqueuing record. A room
 snapshot may drop a thread from its index only after the core proved that
 thread's row holds no record, kept text or unreadable data. Unreadable rows are
-carried with both stored columns and the draft kind, identified by a
-fingerprint; a save may ride only the exact carried original and a discard
-names exactly the reviewed original. Automatic restoration after a cancelled or
+carried with both stored columns and the draft kind; a save may ride only the
+exact carried original and a discard names exactly the reviewed original (the
+third round below replaces the hash this round used for that identity).
+Automatic restoration after a cancelled or
 reviewed send requires the record to still own the draft generation; a draft
 emptied by a later edit keeps the text as its own record instead, and every
 control validates its original selection at the cache mutation. The record
@@ -2857,7 +2858,7 @@ Added coverage, also unrun: registry tests for consume-then-regrant, the
 selection-epoch revocation, dropped index entries, exact-carry and exact
 discard checks; a selection test proving a guarded wait with no further event
 ends on revocation and releases its hold; cache tests for generation-owned
-restoration and fingerprint-bound discard; the real-window scenario now walks
+restoration and identity-bound discard; the real-window scenario now walks
 eight records in the room composer and the narrow thread pane at 200% text,
 asserting each focused control and the composer inputs fully inside the window
 on both axes; the real-SDK fixture now covers a request persisted while the row
@@ -2865,18 +2866,74 @@ still says enqueuing, a stale room snapshot that would orphan an indexed
 thread, both stored columns surviving an edit of a quarantined scope and a
 discard that names the wrong original.
 
-Known limits and open points: rooms discovery does not reach are scanned only
-when opened; discovery failures caused by a store read error cannot be forced by
-the fixture and are covered by unit tests of the registry only; a persisted SDK
-request whose record never received its id sends on its own once its room
-resumes, and its record stays unconfirmed for the user's review; the
-app-level observer and lease lifetime is exercised through the core's guarded
-wait, since the app's tests cannot mint an account selection without a core
-account; an unconfirmed send always requires the user's judgement after
-checking the conversation; the pinned SDK's room send queue keeps its broadcast
-sender while the room lives, and no strong client or SQLite handle leak has
-been shown from this path, so Windows file cleanup after these observers end
-is simply untested here.
+Third source-review round (same branch, still unrun). Discovery coverage is
+now positive: the gate records the rooms a scan under the current selection
+epoch read successfully, and only those may resume. A room absent from the
+discovery snapshot (created or joined later), skipped because it was left,
+banned or only invited, past the budget or unreadable is not covered: it stays
+paused, counts as recovery-incomplete, and every enqueue path (recorded sends,
+persisted retries, re-selection, replies, edits, reactions, thread replies,
+attachments) refuses it until the on-demand scan covers it. That scan waits for
+discovery to finish, scans only a joined room, and enables nothing when it
+fails or finds unreadable data; the end of discovery no longer enables any
+persisted room it did not scan. Unreadable-row identity is no longer a 64-bit
+hash. Every blocked row (carried or read-only) gets an opaque, process-local
+`RowRevision` minted for the complete stored row; a reload that returns the
+identical complete row keeps it, and a discard re-reads the row and compares
+it to the reviewed original before releasing anything: the exact carried
+columns for a carried row, the complete `ComposerDraft` (both text columns,
+draft kind and every attachment value) held verbatim and bounded for a
+read-only row. A row changed underneath the review in only an attachment value
+or only its kind is refused as stale; a row too large to hold stays read-only
+and reports that it cannot be verified rather than being discarded. The
+carried row's checksum remains as an integrity check only. Readable rows that
+another client stored with attachments or a reply or edit kind are now
+preserved read-only (shown, never rewritten as a plain new message) until the
+same exact discard, and the discovery budget counts attachment bytes. In the
+app, every observer and completion helper re-checks its original selection
+after each awaited core call and before any cache mutation; a core call that
+returns after a switch, removal or A to B to A ends the stale observer without
+touching the departed account's cache, scheduling a write, or dropping the
+saved record, and a selection-changed result from the core does the same. The
+re-export the app already relied on for the read-only row type is now present.
+
+Added coverage, also unrun: registry tests for stable identity across an
+identical reload and a live-text save, a new identity for a different carry or
+a changed read-only row, and a carry that may only be dropped or kept exactly
+after the discard; compose tests for kind-only, attachment-only and no-HTML
+attachment preservation; a cache test for preserved unsupported rows; the
+real-SDK fixture now drives, through the SDK's own draft API, an attachment-only
+change and a kind-only change that make an earlier review stale, a plain row
+with an attachment kept untouched until review, a room created after discovery
+that stays paused until its safe scan and then sends, and a room left with a
+persisted request and an unreadable row that discovery skips, that cannot be
+scanned while left, and that after rejoining is scanned on demand, stays
+paused on the unreadable row and resumes only after the exact discard; and a
+new opt-in app regression (same fixture file) that spawns the real observer on
+a real persisted request, revokes its selection by adding a second account and
+switching back without any SDK event, and proves the observer ends, releases
+what it held, and that late completions under the departed selection leave the
+cache and the saved record untouched while the renewed selection adopts the
+exact request. No unsolicited runtime send was observed or claimed.
+
+Known limits and open points: an uncovered room is scanned only when it is
+opened or a scan is requested for it; discovery failures caused by a store read
+error cannot be forced by the fixture and are covered by unit tests of the
+registry only; a persisted SDK request whose record never received its id
+sends on its own once its room resumes, and its record stays unconfirmed for
+the user's review; a read-only row larger than the hold bound (64 MiB per row,
+256 MiB per account) cannot be discarded from this build because its complete
+identity cannot be verified without a stronger digest, and adding one (for
+example the `sha2` crate already present through the pinned SDK) is a
+dependency edge for root review rather than a change made here; the
+"core call returned Ok but the selection was revoked meanwhile" window in the
+app is covered by the same post-await check as the error path but cannot be
+delayed from a test without a hook, which this branch does not add; an
+unconfirmed send always requires the user's judgement after checking the
+conversation; the pinned SDK's room send queue keeps its broadcast sender while
+the room lives, and no strong client or SQLite handle leak has been shown from
+this path, so Windows file cleanup after these observers end is simply
+untested here.
 
 ## Native outgoing video GUI acceptance (partial)
 
