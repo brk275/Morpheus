@@ -13,9 +13,10 @@ keep third-party copyright and license notices intact.
 
 ## Product documentation
 
-Describe Morpheus in its own terms. Keep comparisons and reference-app branding
-out of the README and user guides. Name dependencies and interoperating clients
-where needed for technical instructions, compatibility evidence or attribution.
+Describe Morpheus through its own features, appearance and behavior. Do not add
+comparisons, inspiration lists or other applications' branding to the README
+or user guides. Name third parties only where a technical instruction,
+interoperability check or required attribution needs the exact identity.
 
 Keep the README focused on the app, screenshots and getting started. Record
 detailed test history in [verification](docs/VERIFICATION.md), and distinguish

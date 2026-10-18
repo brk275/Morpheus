@@ -85,3 +85,15 @@ Apply this process when handling contributions; it does not schedule background
 monitoring. The build-spending and release policies above still apply. Documentation
 changes need relevant source checks, not a native matrix. Security-sensitive findings
 belong in the private reporting channel described in [SECURITY.md](SECURITY.md).
+
+## Product documentation
+
+- Present Morpheus through its own features, appearance and behavior. Keep
+  comparisons, inspiration lists and other applications' branding out of the
+  README and user guides. Exact dependency names, interoperability evidence and
+  required license notices belong in their technical context.
+- Keep the README focused on the app, authentic screenshots and getting started.
+  Put detailed test history in the verification record. Distinguish implemented
+  behavior from verified release readiness.
+- Use real native screenshots with fictional accounts and retain their capture
+  provenance. Do not generate or retouch application screenshots.
