@@ -150,6 +150,7 @@ class ScopeTests(unittest.TestCase):
         for path in ("packaging/linux/appimage_capture.py",
                      "packaging/linux/appimage_capture_worker.py",
                      "packaging/linux/appimage_diagnostics.py",
+                     "packaging/linux/appimage_notices.py",
                      "packaging/linux/appimage_process.py"):
             with self.subTest(path=path):
                 self.assertFalse(classify([path])["native"])
