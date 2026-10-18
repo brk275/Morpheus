@@ -15,6 +15,7 @@ import tempfile
 COMMANDS = frozenset((
     "none", "unknown", "cargo-version", "packager-version", "download", "native-build", "package", "extract", "update-metadata",
     "tool-version", "distro-patch", "configure", "client-build", "inventory-elf", "inventory-owner", "inventory-package",
+    "inventory-elf-client", "inventory-elf-dependency", "inventory-elf-deployed",
     "capture-case", "capture-accessibility", "capture-peer-build", "capture-peer-list", "capture-dbus-env", "capture-portal-owner", "capture-focus", "capture-window",
     "capture-yellow", "capture-green", "capture-magenta", "capture-remove-source", "capture-close-window", "capture-imports",
     "capture-inventory", "capture-env-up", "capture-env-down", "capture-rtc-up", "capture-rtc-probe", "capture-rtc-rtc-fixture",
@@ -28,7 +29,11 @@ PEER_FACTS = frozenset(("unavailable_audio_verified", "peer_ready", "exact_sende
                        "screen_stopped", "reopened_frame", "changed_after_reopen", "source_loss_stopped_track", "app_left", "cleanup", "complete"))
 REASONS = frozenset(("command_deadline", "command_output", "command_exit", "command_pipe", "command_cleanup", "command_input",
                      "interrupted", "capture", "identity", "binding", "package", "inventory", "unknown", "namespace_exit",
-                     "namespace_deadline", "namespace_output", "cleanup"))
+                     "namespace_deadline", "namespace_output", "cleanup",
+                     "inventory_input", "inventory_tool", "inventory_elf", "inventory_dependency",
+                     "inventory_package", "inventory_notice", "inventory_deployment", "inventory_limit",
+                     "inventory_elf_build_id", "inventory_elf_needed", "inventory_elf_soname",
+                     "inventory_elf_search", "inventory_search"))
 CLEANUP = frozenset(("not_started", "passed", "failed"))
 POSITIONS = ("wrapper_phase", "command_stage", "capture_mode", "capture_phase")
 FIELDS = frozenset((*POSITIONS, "schema", "peer_facts", "failure", "inner_cleanup"))
@@ -40,6 +45,13 @@ def reason(error):
         return "command_" + error.reason if "command_" + error.reason in REASONS else "unknown"
     if isinstance(error, (KeyboardInterrupt, SystemExit)):
         return "interrupted"
+    from appimage_notices import InventoryFailure
+    # Only our exact exception type has a bounded sub-reason. Never inspect
+    # a foreign exception's message, properties or payload for publication.
+    if type(error) is InventoryFailure:
+        value = error.reason
+        token = "inventory_" + value if type(value) is str else "inventory"
+        return token if token in REASONS else "inventory"
     # Only the enumerated category is emitted. No repr/str/args/attributes from
     # a foreign exception or server response are inspected or serialized.
     return {"CaptureFailure": "capture", "IdentityFailure": "identity", "BindingFailure": "binding",
