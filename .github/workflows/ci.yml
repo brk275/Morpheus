@@ -1,12 +1,12 @@
 # TEMPORARY focused native offline app checks. NEVER MERGE this workflow.
 name: Reviewed timeline device contracts
-run-name: Timeline device contracts - 239cb44
+run-name: Timeline device contract diagnosis - 239cb44
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: timeline-device-contracts-239cb44
+  group: timeline-device-contract-diagnosis-239cb44
   cancel-in-progress: false
 jobs:
   contracts:
@@ -79,7 +79,7 @@ jobs:
           reason = None
           code = None
           with log.open('xb') as output:
-              child = subprocess.Popen(['python3','-I','-B','-c',"import sys,unittest; sys.path.insert(0,'scripts/tests'); suite=unittest.defaultTestLoader.loadTestsFromNames(['test_run_timeline_acceptance']); result=unittest.TextTestRunner(verbosity=2).run(suite); raise SystemExit(not result.wasSuccessful() or result.testsRun != 19 or bool(result.skipped))"],
+              child = subprocess.Popen(['python3','-I','-B','-c',"import sys,unittest,json; sys.path.insert(0,'scripts/tests'); suite=unittest.defaultTestLoader.loadTestsFromNames(['test_run_timeline_acceptance']); result=unittest.TextTestRunner(verbosity=2).run(suite); print('MORPHEUS_CONTRACT_RESULT '+json.dumps({'ran':result.testsRun,'failed':[getattr(t,'test_case',t)._testMethodName for t,_ in result.failures],'errors':[getattr(t,'test_case',t)._testMethodName for t,_ in result.errors],'skipped':len(result.skipped)})); raise SystemExit(not result.wasSuccessful() or result.testsRun != 19 or bool(result.skipped))"],
                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                   env=environment, start_new_session=True)
               deadline = time.monotonic()+90
@@ -120,7 +120,20 @@ jobs:
               print('OFFLINE_NATIVE_LOG_WITHHELD',flush=True); raise SystemExit(1)
           output=log.read_text(errors='replace')
           passed=reason is None and code==0 and re.search(r'^Ran 19 tests in ',output,re.MULTILINE) is not None and re.search(r'^OK$',output,re.MULTILINE) is not None
-          print(json.dumps({'check':'timeline_device_supervisor_contracts','status':'passed' if passed else 'failed',
+          contracts=None
+          allowed_names=set(['test_a_failed_step_stops_the_run_with_closed_tokens_only', 'test_children_get_only_allowlisted_variables', 'test_closed_reports_for_the_requested_adapter_are_accepted', 'test_enrollment_must_record_one_distinct_plausible_device', 'test_enrolls_both_profiles_then_seeds_once_then_measures_both', 'test_failed_summary_extracts_only_one_exact_closed_record', 'test_failed_summary_refuses_open_fields_wrong_context_and_success', 'test_lowercase_private_text_is_not_public_diagnostic_vocabulary', 'test_main_prints_only_the_closed_summary', 'test_main_refuses_outside_a_hosted_runner', 'test_normal_exit_captures_both_streams', 'test_only_a_fresh_hosted_ubuntu_runner_with_a_bus_and_display_runs_it', 'test_open_or_misleading_reports_are_refused', 'test_output_is_private_bounded_and_never_printed', 'test_quiet_timeout_stops_and_reaps_the_child', 'test_reports_reject_links_special_files_and_oversize', 'test_seed_failures_report_only_their_fixed_stage', 'test_setup_refuses_other_binaries_and_reused_work', 'test_untrusted_failure_text_never_becomes_a_token', 'test_run_timeline_acceptance'])
+          for line in output.splitlines():
+              if not line.startswith('MORPHEUS_CONTRACT_RESULT '): continue
+              assert contracts is None and len(line)<=8192
+              data=json.loads(line.split(' ',1)[1])
+              assert type(data) is dict and set(data)=={'ran','failed','errors','skipped'}
+              assert all(type(data[k]) is int and 0<=data[k]<=100 for k in ('ran','skipped'))
+              assert all(type(data[k]) is list and len(data[k])<=100 and all(
+                  type(name) is str and name in allowed_names for name in data[k]) for k in ('failed','errors'))
+              contracts=data
+          passed=passed and contracts=={'ran':19,'failed':[],'errors':[],'skipped':0}
+
+          print(json.dumps({'check':'timeline_device_supervisor_contracts','contracts':contracts,'status':'passed' if passed else 'failed',
               'source':'239cb446e82389117bfab7906e272ed1d4e7fb87','failure':reason,
               'tests_passed':19 if passed else None,'raw_logs_public':False,
               'accounts_generated':False,'app_executed':False},sort_keys=True),flush=True)
