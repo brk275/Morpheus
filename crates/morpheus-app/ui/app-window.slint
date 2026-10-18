@@ -492,10 +492,14 @@ component TextAction inherits ActionRect {
     in property <color> hover-surface;
     in property <color> outline;
     in property <float> text-scale: 1;
+    in property <bool> wrap-caption: false;
     label: text;
-    min-width: max(32px, caption.preferred-width + 24px * root.text-scale);
-    min-height: 32px * root.text-scale;
-    horizontal-stretch: 0;
+    // Stacked actions must accept the pane's width rather than exporting an
+    // unbroken caption's intrinsic width into the surrounding layout.
+    min-width: root.wrap-caption ? 32px : max(32px, caption.preferred-width + 24px * root.text-scale);
+    preferred-width: root.wrap-caption ? 32px : self.min-width;
+    min-height: root.wrap-caption ? max(32px * root.text-scale, caption.preferred-height + 16px * root.text-scale) : 32px * root.text-scale;
+    horizontal-stretch: root.wrap-caption ? 1 : 0;
     border-radius: StyleTokens.radius * 0.7;
     border-width: 1px;
     border-color: outline;
@@ -509,13 +513,15 @@ component TextAction inherits ActionRect {
     caption := Text {
         x: 12px * root.text-scale;
         width: parent.width - 24px * root.text-scale;
-        height: parent.height;
+        height: root.wrap-caption ? self.preferred-height : parent.height;
+        y: (parent.height - self.height) / 2;
         text: root.text;
         color: root.enabled ? root.ink : root.muted;
         font-size: 12px * root.text-scale;
         horizontal-alignment: center;
         vertical-alignment: center;
-        overflow: elide;
+        wrap: root.wrap-caption ? word-wrap : no-wrap;
+        overflow: root.wrap-caption ? clip : elide;
     }
 }
 
@@ -541,42 +547,49 @@ component PendingRecordActions inherits VerticalLayout {
     if root.narrow : VerticalLayout {
         spacing: 4px; alignment: start;
         if root.item.unconfirmed : TextAction {
+            wrap-caption: true;
             text: "It was sent"; ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
             outline: root.outline; text-scale: root.text-scale; reveal-full-control: true;
             accessible-label: "It was sent: drop this saved message without resending";
             activated => { root.review(true); }
         }
         if root.item.unconfirmed : TextAction {
+            wrap-caption: true;
             text: "Not sent, keep my text"; ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
             outline: root.outline; text-scale: root.text-scale; reveal-full-control: true;
             accessible-label: "Not sent: keep this message's text";
             activated => { root.review(false); }
         }
         if root.item.can-retry : TextAction {
+            wrap-caption: true;
             text: "Retry"; ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
             outline: root.outline; text-scale: root.text-scale; reveal-full-control: true;
             accessible-label: "Retry sending this message";
             activated => { root.retry(); }
         }
         if root.item.can-cancel : TextAction {
+            wrap-caption: true;
             text: "Cancel sending"; ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
             outline: root.outline; text-scale: root.text-scale; reveal-full-control: true;
             accessible-label: "Cancel sending this message; a message that already reached the server stays sent";
             activated => { root.cancel(); }
         }
         if root.composer-empty : TextAction {
+            wrap-caption: true;
             text: "Restore text"; ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
             outline: root.outline; text-scale: root.text-scale; reveal-full-control: true;
             accessible-label: "Restore this message's text into the empty composer";
             activated => { root.restore(); }
         }
         TextAction {
+            wrap-caption: true;
             text: "Copy text"; ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
             outline: root.outline; text-scale: root.text-scale; reveal-full-control: true;
             accessible-label: "Copy this message's text to the system clipboard";
             activated => { root.copy(); }
         }
         if root.item.kept : TextAction {
+            wrap-caption: true;
             text: "Discard text"; ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
             outline: root.outline; text-scale: root.text-scale; reveal-full-control: true;
             accessible-label: "Discard this kept text";
@@ -670,6 +683,7 @@ component PendingSendStrip inherits ScrollView {
         HorizontalLayout {
             alignment: start;
             TextAction {
+                wrap-caption: root.narrow;
                 text: "Discard unreadable saved status"; ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
                 outline: root.outline; text-scale: root.text-scale; reveal-full-control: true;
                 accessible-label: "Discard saved send status this version cannot read; your typed text stays";
