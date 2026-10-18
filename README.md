@@ -1,7 +1,7 @@
 # Morpheus
 
 A native Matrix client for macOS, Linux and Windows, built in Rust.
-Multiple accounts. Live themes. A workspace you control.
+Multiple accounts for separate aliases. Live themes. A workspace you control.
 
 [Customization](docs/CUSTOMIZATION.md) · [Screenshots](docs/screenshots/README.md) · [Documentation](docs/README.md)
 
