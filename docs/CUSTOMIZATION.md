@@ -245,7 +245,17 @@ or line-height controls. Theme packs cannot execute code.
 
 Buttons and navigation use a short native fade for decorative hover feedback.
 Selection colors, focus outlines, click targets and account contents change
-immediately. Effects settle after 90 ms and do not use a repeating animation timer.
+immediately. Hover fades default to 90 ms and do not use a repeating animation timer.
+Choose **Appearance → Hover fade duration**, or search Settings for “animation speed”,
+to set 0–1,000 ms. The same value is editable in TOML:
+
+```toml
+[appearance]
+hover_duration_ms = 120
+```
+
+A value of 0 gives immediate feedback. Reduce motion overrides the duration while
+preserving it, so turning Reduce motion off restores your chosen timing.
 
 Choose **Appearance → Reduce motion** for immediate hover feedback, or set:
 

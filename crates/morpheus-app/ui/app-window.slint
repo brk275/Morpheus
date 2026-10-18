@@ -93,7 +93,8 @@ export global StyleTokens {
     // Share of each window surface's own alpha that is painted, 0 to 1.
     in-out property <float> window-opacity: 1;
     in-out property <bool> reduced-motion: false;
-    out property <duration> interaction-duration: StyleTokens.reduced-motion ? 0ms : 90ms;
+    in-out property <int> hover-duration-ms: 90;
+    out property <duration> interaction-duration: StyleTokens.reduced-motion ? 0ms : StyleTokens.hover-duration-ms * 1ms;
 }
 
 // Animate only the decorative hover layer. Selection colors, content, focus
@@ -4213,6 +4214,24 @@ export component AppWindow inherits Window {
                         }
                         Text { text: "Use immediate hover feedback for buttons and navigation.";
                             color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+                        StyleNumberSetting {
+                            label: "Hover fade duration"; value: StyleTokens.hover-duration-ms;
+                            minimum: 0; maximum: 1000; step: 10; suffix: " ms";
+                            property <int> reveal-request: root.reveal-request("appearance.hover_duration");
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus-control();
+                                    if self.has-focus { root.settings-revealed-id = "appearance.hover_duration"; }
+                                }
+                            }
+                            ink: root.ink; muted: root.muted; surface: root.elevated;
+                            hover-surface: root.hover; text-scale: root.text-scale;
+                            changed-value(value) => { root.change-style-number(7, value); }
+                        }
+                        Text { text: "0 ms is immediate. Reduce motion overrides this timing without changing your saved value.";
+                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
+
                         Text { text: "Colors and window"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         Text {
                             text: "Choose a color, then type #RRGGBB or #RRGGBBAA, with alpha last. A valid value applies and saves at once; Reset returns one color to its theme or built-in value. Your colors stay when you choose a starting point.";
