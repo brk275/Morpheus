@@ -1,27 +1,27 @@
 # TEMPORARY focused native offline app checks. NEVER MERGE this workflow.
-name: Reviewed combined customization app checks
-run-name: Combined customization app regressions - 33b0660
+name: Reviewed native motion diagnostics
+run-name: Native motion activation diagnosis - ddfbf39
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: combined-app-checks-33b0660
+  group: native-motion-diagnostics-ddfbf39
   cancel-in-progress: false
 jobs:
   contracts:
-    name: Test reviewed customization, accounts and sticker UI
+    name: Diagnose reviewed native motion activation
     if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 33b0660679b0b3f69cf02e2dbb03dfe0c9467276
+          ref: ddfbf39d38bc9a6bc0843fb332b2360a50cd4539
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact reviewed source
-        run: test "$(git rev-parse HEAD)" = 33b0660679b0b3f69cf02e2dbb03dfe0c9467276
+        run: test "$(git rev-parse HEAD)" = ddfbf39d38bc9a6bc0843fb332b2360a50cd4539
       - name: Scan source before executing reviewed native tests
         shell: bash
         run: |
@@ -50,7 +50,7 @@ jobs:
         with:
           key: verified-sdk-archives-v1
           save-if: false
-      - name: Check new Rust controllers, CLI functions and generated UI together
+      - name: Diagnose the single failed real keyboard settings regression
         timeout-minutes: 105
         env:
           CARGO_BUILD_JOBS: "2"
@@ -63,7 +63,7 @@ jobs:
           set -euo pipefail
           umask 077
           python3 -I -B - <<'PY'
-          import json, os, pathlib, re, select, signal, subprocess, tempfile, time
+          import json, math, os, pathlib, re, select, signal, subprocess, tempfile, time
           assert os.environ.get('GITHUB_ACTIONS') == 'true'
           assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
           assert os.environ.get('ImageOS') == 'ubuntu24'
@@ -81,7 +81,8 @@ jobs:
           with log.open('xb') as output:
               child = subprocess.Popen(['cargo','test','--locked','-p','morpheus-app','--features',
                   'native-calls','--bin','morpheus-app',
-                  '--','--test-threads=1'],
+                  'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
+                  '--','--exact','--test-threads=1'],
                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                   env=environment, start_new_session=True)
               deadline = time.monotonic()+95*60
@@ -122,26 +123,42 @@ jobs:
               print('OFFLINE_NATIVE_LOG_WITHHELD',flush=True); raise SystemExit(1)
           output=log.read_text(errors='replace')
           ok=set(re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. ok$',output,re.MULTILINE))
-          needed={'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
-              'config_cli::tests::usage_errors_and_help_never_start_validation',
-              'config_cli::tests::excess_arguments_are_refused_rather_than_dropped',
-              'config_cli::tests::a_valid_custom_theme_name_never_appears_in_output',
-              'config_cli::tests::validation_of_a_file_is_read_only_and_reports_fixed_codes',
-              'config_cli::tests::the_schema_lists_every_field_token_and_code_from_the_registry',
-              'appearance_editor::tests::filters_match_every_word_across_groups_and_groups_list_their_tokens',
-              'appearance_editor::tests::sources_name_the_layer_that_supplies_the_color'}
+          needed={'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'}
           summaries=re.findall(r'^test result: ok\. ([0-9]+) passed; 0 failed; ([0-9]+) ignored;',output,re.MULTILINE)
-          passed=reason is None and code==0 and needed<=ok and len(summaries)==1 and int(summaries[0][0])>=303 and int(summaries[0][1])==1
+          passed=reason is None and code==0 and needed<=ok and len(summaries)==1 and int(summaries[0][0])==1 and int(summaries[0][1])==0
           ignored=set(re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. ignored',output,re.MULTILINE))
-          allowed_ignored={'outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction'}
-          # The existing opt-in live ringing fixture has its own isolated
-          # acceptance run; no newly skipped application regression is allowed.
-          passed=passed and ignored==allowed_ignored
+          passed=passed and ignored==set()
           clean=re.sub(r'\x1b\[[0-9;]*m','',output)
           binding_loops=re.findall(r'^warning: morpheus-app@[0-9.]+: ([^\r\n]*part of a binding loop[^\r\n]*)',clean,re.MULTILINE)
           passed=passed and not binding_loops
-          print(json.dumps({'check':'combined_customization_app_tests','status':'passed' if passed else 'failed',
-              'source':'33b0660679b0b3f69cf02e2dbb03dfe0c9467276','failure':reason,
+          # Never forward arbitrary marker content. This synthetic-only probe
+          # permits finite bounded geometry and booleans, no free-form strings.
+          probes=[]
+          probe_invalid=False
+          expected={'scale','calls','requested','saved','focus_before','focus_after',
+              'bounds_before','bounds_after','window','page','config_error_present','presentation'}
+          def vector(value,length):
+              return isinstance(value,list) and len(value)==length and all(
+                  type(x) in (int,float) and math.isfinite(x) and abs(x)<=100000 for x in value)
+          for line in output.splitlines():
+              if not line.startswith('MORPHEUS_MOTION_FAILURE '): continue
+              try:
+                  assert len(line)<=2048 and len(probes)<2
+                  data=json.loads(line.split(' ',1)[1])
+                  assert type(data) is dict and set(data)==expected
+                  assert type(data['scale']) is int and data['scale'] in (100,200)
+                  assert type(data['calls']) is int and 0<=data['calls']<=1000
+                  assert type(data['page']) is int and 0<=data['page']<=20
+                  assert all(type(data[k]) is bool for k in ('requested','saved','focus_before',
+                      'focus_after','config_error_present','presentation'))
+                  assert vector(data['window'],2)
+                  assert all(data[k] is None or vector(data[k],4) for k in ('bounds_before','bounds_after'))
+                  probes.append(data)
+              except (AssertionError,ValueError,TypeError):
+                  probe_invalid=True
+          passed=passed and not probe_invalid and not probes
+          print(json.dumps({'check':'native_motion_activation_diagnostics','motion_probe':probes,'probe_invalid':probe_invalid,'status':'passed' if passed else 'failed',
+              'source':'ddfbf39d38bc9a6bc0843fb332b2360a50cd4539','failure':reason,
               'ignored_tests':sorted(ignored),'ui_binding_loop_warnings':binding_loops[:8],
               'tests_passed':int(summaries[0][0]) if len(summaries)==1 else None,
               'ignored':int(summaries[0][1]) if len(summaries)==1 else None,
@@ -153,5 +170,5 @@ jobs:
               'native_installed_app':False},sort_keys=True),flush=True)
           if not passed: raise SystemExit(1)
           PY
-      # No media fixture rerun: its precise failed stage remains under investigation.
+      # Only the failed UI scenario runs; the separate media diagnostic is in flight.
       # No accounts, physical devices, native packages or artifact uploads.
