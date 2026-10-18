@@ -2603,6 +2603,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if account_id.is_empty() || room_id.is_empty() {
             return;
         }
+        // Bind the click before spawning: account IDs alone cannot detect
+        // switching away and back before the worker first polls.
+        let Some(selection) = history_live.manager.account_selection(&account_id) else {
+            return;
+        };
         let operation = window.get_history_operation().wrapping_add(1);
         window.set_history_operation(operation);
         window.set_history_loading(true);
@@ -2612,10 +2617,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         history_handle.spawn(async move {
             let result = live
                 .manager
-                .paginate_backwards_for(&account_id, &room_id, 50)
+                .paginate_backwards_selected(&selection, &room_id, 50)
                 .await;
             let _ = weak.upgrade_in_event_loop(move |window| {
-                if window.get_active_account_local_id().as_str() != account_id
+                if !selection.is_current()
+                    || window.get_active_account_local_id().as_str() != account_id
                     || window.get_active_room_id().as_str() != room_id
                     || window.get_history_operation() != operation
                 {

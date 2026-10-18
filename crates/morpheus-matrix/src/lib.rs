@@ -19,6 +19,7 @@ pub use discovery::{
     MatrixLinkTarget, PublicRoomInfo, PublicRoomsPage, PublicRoomsQuery, ResolvedRoomAlias,
     parse_matrix_link_target,
 };
+mod history;
 mod search;
 pub use search::MessageSearchResult;
 mod formatting;
@@ -2350,35 +2351,6 @@ impl AccountManager {
         let item_id = TimelineEventItemId::EventId(parse_event_id(event_id)?);
         timeline
             .redact(&item_id, reason)
-            .await
-            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
-    }
-
-    /// Load older items. Returns true when the start of the room was reached.
-    pub async fn paginate_backwards(&self, room_id: &str, count: u16) -> Result<bool> {
-        let state = self.state.lock().await;
-        let loaded = selected_loaded(&state)?;
-        let timeline = loaded.timeline(room_id).await?;
-        timeline
-            .paginate_backwards(count)
-            .await
-            .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
-    }
-
-    /// Account-bound pagination for a desktop request that may outlive the
-    /// selected room or account. A late click cannot fetch another account's
-    /// timeline after a switch.
-    pub async fn paginate_backwards_for(
-        &self,
-        expected_account_id: &str,
-        room_id: &str,
-        count: u16,
-    ) -> Result<bool> {
-        let state = self.state.lock().await;
-        let loaded = selected_loaded_for(&state, expected_account_id)?;
-        let timeline = loaded.timeline(room_id).await?;
-        timeline
-            .paginate_backwards(count)
             .await
             .map_err(|e| MatrixCoreError::Sdk(e.to_string()))
     }
