@@ -669,8 +669,6 @@ component PendingSendStrip inherits ScrollView {
     callback discard(string);
     callback discard-unreadable();
     property <bool> narrow: self.width < 620px * root.text-scale;
-    min-width: 0px;
-    min-height: 0px;
     height: min(root.viewport-cap, root.natural-height);
     // Override Flickable's inferred content width: a child's intrinsic minimum
     // must never enlarge the horizontal canvas and center the actions offscreen.

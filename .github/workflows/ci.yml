@@ -166,6 +166,8 @@ jobs:
       - name: Check formatting
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
+      - name: Check native interface compilation before desktop dependencies
+        run: cargo check --locked -p morpheus-ui-check
       - name: Test configuration, Matrix, and RTC protocol models
         id: model-tests
         # Still fail the job below, but collect independent desktop/device

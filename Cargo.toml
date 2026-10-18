@@ -5,6 +5,7 @@ members = [
     "crates/morpheus-config",
     "crates/morpheus-matrix",
     "crates/morpheus-rtc",
+    "crates/morpheus-ui-check",
     "vendor/lru",
     "vendor/livekit-api",
     "vendor/matrix-rtc-livekit",
