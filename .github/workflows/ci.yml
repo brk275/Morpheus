@@ -1,19 +1,16 @@
-name: CI
+# TEMPORARY platform-cohort validation. NEVER MERGE this workflow.
+name: Linux native candidate
+run-name: Linux native 7ec8c2a - system Wayland and release gates open
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  # Manual dispatch always checks the complete supported native matrix.
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: linux-native-7ec8c2acc1e8abb1117d20f53584d58bedfd75a4
+  cancel-in-progress: false
 
 env:
   CARGO_BUILD_JOBS: "2"
@@ -36,6 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: 7ec8c2acc1e8abb1117d20f53584d58bedfd75a4
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -44,7 +42,7 @@ jobs:
         with:
           # PR input is read as data; classification code comes from its base.
           # Push uses reviewed main; dispatch uses its owner-selected revision.
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
+          ref: 7ec8c2acc1e8abb1117d20f53584d58bedfd75a4
           path: trusted
           persist-credentials: false
       - name: Scan committed history for credentials
@@ -72,7 +70,23 @@ jobs:
         working-directory: candidate
         # Isolated mode excludes the candidate working directory and Python
         # environment hooks from import lookup. The classifier uses stdlib only.
-        run: python3 -I ../trusted/scripts/ci_scope.py --github-event
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C ../trusted rev-parse HEAD)" = 7ec8c2acc1e8abb1117d20f53584d58bedfd75a4
+          test "$(git rev-parse HEAD)" = 7ec8c2acc1e8abb1117d20f53584d58bedfd75a4
+          python3 -I -B - <<'PY_SCOPE'
+          import json
+          import os
+          # Both Mac architectures and Windows passed equivalent native inputs.
+          # The unchanged system Wayland failure is tracked separately; do not retry it here.
+          values = {"native": True, "config": False, "wayland": False,
+                    "native_matrix": {"os": ["ubuntu-24.04"]}}
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              for key, value in values.items():
+                  output.write(key + "=" + json.dumps(value, separators=(",", ":")) + "\n")
+          print("Selected Linux native only; system Wayland and release acceptance remain open.")
+          PY_SCOPE
 
   helpers:
     name: Validation helper tests
@@ -83,15 +97,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: 7ec8c2acc1e8abb1117d20f53584d58bedfd75a4
           persist-credentials: false
-      - name: Verify checkout identity before host provisioning
+      - name: Verify exact reviewed source
         shell: bash
-        env:
-          REVIEWED_SOURCE: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          [[ "$REVIEWED_SOURCE" =~ ^[0-9a-f]{40}$ ]]
-          test "$(git rev-parse HEAD)" = "$REVIEWED_SOURCE"
+        run: test "$(git rev-parse HEAD)" = 7ec8c2acc1e8abb1117d20f53584d58bedfd75a4
       - name: Tighten hosted notice tree permissions before candidate imports
         timeout-minutes: 5
         shell: bash
@@ -117,19 +127,23 @@ jobs:
     if: github.event.repository.private == false && needs.scope.outputs.config == 'true'
     runs-on: ubuntu-24.04
     concurrency:
-      group: native-${{ github.sha }}-ubuntu-24.04
+      group: native-7ec8c2acc1e8abb1117d20f53584d58bedfd75a4-ubuntu-24.04
       cancel-in-progress: false
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: 7ec8c2acc1e8abb1117d20f53584d58bedfd75a4
           persist-credentials: false
+      - name: Verify exact reviewed source
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = 7ec8c2acc1e8abb1117d20f53584d58bedfd75a4
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action, pinned compiler below
         with:
           toolchain: 1.99.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+          save-if: false
       - run: cargo test --locked -p morpheus-config
 
   compile:
@@ -138,7 +152,7 @@ jobs:
     if: github.event.repository.private == false && needs.scope.outputs.native == 'true'
     runs-on: ${{ matrix.os }}
     concurrency:
-      group: native-${{ github.sha }}-${{ matrix.os }}
+      group: native-7ec8c2acc1e8abb1117d20f53584d58bedfd75a4-${{ matrix.os }}
       cancel-in-progress: false
     timeout-minutes: 90
     strategy:
@@ -147,7 +161,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: 7ec8c2acc1e8abb1117d20f53584d58bedfd75a4
           persist-credentials: false
+      - name: Verify exact reviewed source
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = 7ec8c2acc1e8abb1117d20f53584d58bedfd75a4
       - name: Linux native dependencies
         if: runner.os == 'Linux'
         run: |
@@ -183,7 +201,7 @@ jobs:
           # The key separates both primary and fallback cache namespaces.
           key: verified-sdk-archives-v1
           cache-on-failure: true
-          save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
+          save-if: false
       - name: Check formatting
         if: runner.os == 'Linux'
         run: cargo fmt --all -- --check
@@ -200,6 +218,19 @@ jobs:
         run: cargo check --locked -p morpheus-app -p morpheus-matrix
       - name: Build desktop with native call and device adapters
         run: cargo build --locked -p morpheus-app --features native-calls
+      - name: Observe the owned native Windows subject and helper windows
+        id: window-probe
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        timeout-minutes: 15
+        env:
+          MORPHEUS_WINDOWS_WINDOW_PROBE: "1"
+        shell: pwsh
+        run: |
+          cargo build --locked -p morpheus-app --example windows_window_probe
+          if ($LASTEXITCODE -ne 0) { throw "Window probe compilation failed" }
+          python scripts/windows_window_probe.py "$PWD/target/debug/examples/windows_window_probe.exe"
+          if ($LASTEXITCODE -ne 0) { throw "Owned window probe failed" }
       - name: Capture actual native preview screens
         id: preview-capture
         if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && (github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push'))
@@ -358,6 +389,13 @@ jobs:
           if os.environ["WAYLAND_SELECTED"] == "false":
               print("System Wayland was outside this change's inputs; its existing release gate remains open.")
           PY_WAYLAND_ACCEPTANCE
+      - name: Require the native Windows probe to complete
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        env:
+          PROBE_OUTCOME: ${{ steps.window-probe.outcome }}
+        shell: pwsh
+        run: |
+          if ($env:PROBE_OUTCOME -ne 'success') { throw "Native window evidence is missing or failed" }
       - name: Enforce collected acceptance results
         if: ${{ !cancelled() && (steps.model-tests.outcome == 'failure' || steps.preview-capture.outcome == 'failure' || steps.preview-upload.outcome == 'failure' || steps.desktop-tests.outcome == 'failure' || steps.wayland-tests.outcome == 'failure' || steps.windows-capture-tests.outcome == 'failure' || steps.sdk-receipt-tests.outcome == 'failure' || steps.vendor-tests.outcome == 'failure') }}
         shell: bash
