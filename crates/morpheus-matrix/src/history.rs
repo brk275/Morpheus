@@ -1,8 +1,9 @@
-//! Account-selection ownership for read-only history requests.
+//! Account-selection ownership for read-only timeline requests.
 //!
 //! Keep the manager state lock out of homeserver waits so a stalled history
-//! request cannot prevent account controls from acquiring it. Revocation drops
-//! the read future; an HTTP request already handed to a server cannot be recalled.
+//! or timeline-open request cannot prevent account controls from acquiring it.
+//! Revocation drops the read future; an HTTP request already handed to a server
+//! cannot be recalled.
 
 use std::future::Future;
 
@@ -48,7 +49,7 @@ impl AccountManager {
         room_id: &str,
         count: u16,
     ) -> Result<bool> {
-        self.read_selected_history(selection, |loaded| async move {
+        self.read_selected_timeline(selection, |loaded| async move {
             let timeline = loaded.timeline(room_id).await?;
             timeline
                 .paginate_backwards(count)
@@ -58,7 +59,88 @@ impl AccountManager {
         .await
     }
 
-    fn owns_history_selection(&self, selection: &AccountSelection) -> bool {
+    fn current_timeline_selection(&self) -> Result<AccountSelection> {
+        let account_id = self
+            .active_tx
+            .borrow()
+            .as_ref()
+            .map(|account| account.id.clone())
+            .ok_or(MatrixCoreError::NoActiveAccount)?;
+        self.account_selection(&account_id)
+            .ok_or(MatrixCoreError::SelectedAccountChanged)
+    }
+
+    /// Native UI friendly message snapshot for the account selected when polled.
+    /// The manager lock is released before timeline loading or subscription.
+    pub async fn messages_snapshot(&self, room_id: &str) -> Result<Vec<MessageInfo>> {
+        let selection = self.current_timeline_selection()?;
+        self.read_selected_timeline(&selection, |loaded| async move {
+            let timeline = loaded.timeline(room_id).await?;
+            let (items, _) = timeline.subscribe().await;
+            Ok(items.iter().filter_map(|item| message_info(item)).collect())
+        })
+        .await
+    }
+
+    /// Live message snapshots for the account selected when polled. Desktop
+    /// navigation should retain its exact lease and use message_feed_selected.
+    pub async fn message_feed(&self, room_id: &str) -> Result<MessageFeed> {
+        let selection = self.current_timeline_selection()?;
+        self.message_feed_selected(&selection, room_id).await
+    }
+
+    /// Open a room feed under the exact account selection captured by the caller.
+    /// A switch, removal or stop cancels loading, even for A -> B -> A.
+    /// Discard the returned feed when that selection or room changes.
+    pub async fn message_feed_selected(
+        &self,
+        selection: &AccountSelection,
+        room_id: &str,
+    ) -> Result<MessageFeed> {
+        self.read_selected_timeline(selection, |loaded| async move {
+            let timeline = loaded.timeline(room_id).await?;
+            Ok(
+                message_feed_from_timeline(selection.account_id().to_owned(), room_id, timeline)
+                    .await,
+            )
+        })
+        .await
+    }
+
+    /// Account-bound compatibility entry point for a thread feed. Desktop
+    /// navigation should use thread_message_feed_selected to retain its lease.
+    pub async fn thread_message_feed_for(
+        &self,
+        expected_account_id: &str,
+        room_id: &str,
+        root_event_id: &str,
+    ) -> Result<MessageFeed> {
+        let selection = self
+            .account_selection(expected_account_id)
+            .ok_or(MatrixCoreError::SelectedAccountChanged)?;
+        self.thread_message_feed_selected(&selection, room_id, root_event_id)
+            .await
+    }
+
+    /// Open a thread feed under one exact selection, with the same cancellation
+    /// and lock ownership as room feeds. Discard it when its target changes.
+    pub async fn thread_message_feed_selected(
+        &self,
+        selection: &AccountSelection,
+        room_id: &str,
+        root_event_id: &str,
+    ) -> Result<MessageFeed> {
+        self.read_selected_timeline(selection, |loaded| async move {
+            let timeline = loaded.thread_timeline(room_id, root_event_id).await?;
+            Ok(
+                message_feed_from_timeline(selection.account_id().to_owned(), room_id, timeline)
+                    .await,
+            )
+        })
+        .await
+    }
+
+    fn owns_timeline_selection(&self, selection: &AccountSelection) -> bool {
         selection.is_current()
             && self
                 .account_selection(selection.account_id())
@@ -67,22 +149,25 @@ impl AccountManager {
 
     // Private to this module: read-only operations only. A mutation already
     // submitted to an OS service or homeserver cannot be undone by cancellation.
-    async fn read_selected_history<F, Wait>(
+    async fn read_selected_timeline<T, F, Wait>(
         &self,
         selection: &AccountSelection,
         request: F,
-    ) -> Result<bool>
+    ) -> Result<T>
     where
         F: FnOnce(Arc<LoadedAccount>) -> Wait,
-        Wait: Future<Output = Result<bool>>,
+        Wait: Future<Output = Result<T>>,
     {
-        if !self.owns_history_selection(selection) {
+        if !self.owns_timeline_selection(selection) {
             return Err(MatrixCoreError::SelectedAccountChanged);
         }
         let loaded = {
-            let state = self.state.lock().await;
+            let state = selection
+                .guard(self.state.lock())
+                .await
+                .ok_or(MatrixCoreError::SelectedAccountChanged)?;
             // The lock acquisition can itself wait through account transitions.
-            if !self.owns_history_selection(selection) {
+            if !self.owns_timeline_selection(selection) {
                 return Err(MatrixCoreError::SelectedAccountChanged);
             }
             selected_loaded_for(&state, selection.account_id())?.clone()
@@ -166,7 +251,7 @@ mod tests {
             let worker_manager = manager.clone();
             let task = tokio::spawn(async move {
                 worker_manager
-                    .read_selected_history(&selection, move |loaded| async move {
+                    .read_selected_timeline(&selection, move |loaded| async move {
                         let _held_client = loaded;
                         started.send(()).unwrap();
                         std::future::pending::<Result<bool>>().await
@@ -216,7 +301,7 @@ mod tests {
             let called = calls.clone();
             assert!(matches!(
                 foreign
-                    .read_selected_history(&selection, move |_| {
+                    .read_selected_timeline(&selection, move |_| {
                         called.fetch_add(1, Ordering::SeqCst);
                         async { Ok(true) }
                     })
@@ -243,7 +328,7 @@ mod tests {
             let called = calls.clone();
             assert!(matches!(
                 manager
-                    .read_selected_history(&selection, move |_| {
+                    .read_selected_timeline(&selection, move |_| {
                         called.fetch_add(1, Ordering::SeqCst);
                         async { Ok(true) }
                     })
@@ -266,7 +351,7 @@ mod tests {
             let calls = Arc::new(AtomicUsize::new(0));
             let called = calls.clone();
             let state = manager.state.lock().await;
-            let mut wait = Box::pin(manager.read_selected_history(&selection, move |_| {
+            let mut wait = Box::pin(manager.read_selected_timeline(&selection, move |_| {
                 called.fetch_add(1, Ordering::SeqCst);
                 async { Ok(true) }
             }));
@@ -294,14 +379,14 @@ mod tests {
             let selection = manager.account_selection(&account.id).unwrap();
             assert!(
                 manager
-                    .read_selected_history(&selection, |_| async { Ok(true) })
+                    .read_selected_timeline(&selection, |_| async { Ok(true) })
                     .await
                     .unwrap()
             );
             assert!(matches!(
                 manager
-                    .read_selected_history(&selection, |_| async {
-                        Err(MatrixCoreError::RoomNotFound("!missing:example.org".into()))
+                    .read_selected_timeline(&selection, |_| async {
+                        Err::<bool, _>(MatrixCoreError::RoomNotFound("!missing:example.org".into()))
                     })
                     .await,
                 Err(MatrixCoreError::RoomNotFound(_))
@@ -309,7 +394,7 @@ mod tests {
             let revoked = manager.clone();
             assert!(matches!(
                 manager
-                    .read_selected_history(&selection, move |_| async move {
+                    .read_selected_timeline(&selection, move |_| async move {
                         revoked.publish_active_account(None);
                         Ok(true)
                     })
@@ -320,6 +405,132 @@ mod tests {
                 manager.paginate_backwards("!unused:example.org", 50).await,
                 Err(MatrixCoreError::NoActiveAccount)
             ));
+            drop(manager);
+            fs::remove_dir_all(directory).unwrap();
+        });
+    }
+
+    #[test]
+    fn stalled_room_thread_and_snapshot_opens_release_account_controls() {
+        runtime().block_on(async {
+            let (directory, manager, account) = fixture(None).await;
+            let loaded = {
+                let state = manager.state.lock().await;
+                state.loaded.get(&account.id).unwrap().clone()
+            };
+            // Stall at the real LoadedAccount timeline cache, before an offline
+            // room lookup could fail. No network or arbitrary sleep is needed.
+            let timeline_cache = loaded.timelines.lock().await;
+            for kind in 0..3 {
+                {
+                    let mut state = manager.state.lock().await;
+                    state.active_account_id = Some(account.id.clone());
+                    manager.publish_active_account(Some(account.clone()));
+                }
+                let selection = manager.account_selection(&account.id).unwrap();
+                assert_eq!(Arc::strong_count(&loaded), 2);
+                let mut opening = Box::pin(async {
+                    match kind {
+                        0 => manager.messages_snapshot("!waiting:example.org").await.map(drop),
+                        1 => manager.message_feed_selected(&selection, "!waiting:example.org").await.map(drop),
+                        _ => manager.thread_message_feed_selected(&selection, "!waiting:example.org", "$root").await.map(drop),
+                    }
+                });
+                let mut context = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+                assert!(opening.as_mut().poll(&mut context).is_pending());
+                assert_eq!(Arc::strong_count(&loaded), 3);
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(2), manager.accounts()).await
+                        .expect("a stalled timeline open must release the manager mutex"),
+                    [account.clone()]
+                );
+                {
+                    let mut state = manager.state.lock().await;
+                    state.active_account_id = None;
+                    manager.publish_active_account(None);
+                }
+                assert!(matches!(
+                    tokio::time::timeout(Duration::from_secs(2), opening).await.unwrap(),
+                    Err(MatrixCoreError::SelectedAccountChanged)
+                ));
+                assert_eq!(Arc::strong_count(&loaded), 2, "revocation releases the loaded client while its timeline cache is still blocked");
+            }
+            drop(timeline_cache);
+            drop(loaded);
+            drop(manager);
+            fs::remove_dir_all(directory).unwrap();
+        });
+    }
+
+    #[test]
+    fn feed_open_rejects_foreign_and_revoked_account_selection_before_room_lookup() {
+        runtime().block_on(async {
+            let (directory, manager, account) = fixture(None).await;
+            let (foreign_directory, foreign, _) = fixture(Some(account.clone())).await;
+            let stale = manager.account_selection(&account.id).unwrap();
+            manager.publish_active_account(None);
+            manager.publish_active_account(Some(account));
+            let current = manager.current_timeline_selection().unwrap();
+            for (target, selection) in [(&*manager, &stale), (&*foreign, &current)] {
+                assert!(matches!(
+                    target.message_feed_selected(selection, "not-a-room").await,
+                    Err(MatrixCoreError::SelectedAccountChanged)
+                ));
+                assert!(matches!(
+                    target
+                        .thread_message_feed_selected(selection, "not-a-room", "not-an-event")
+                        .await,
+                    Err(MatrixCoreError::SelectedAccountChanged)
+                ));
+            }
+            drop(foreign);
+            drop(manager);
+            fs::remove_dir_all(foreign_directory).unwrap();
+            fs::remove_dir_all(directory).unwrap();
+        });
+    }
+
+    #[test]
+    fn revoked_timeline_completion_drops_its_owned_result() {
+        runtime().block_on(async {
+            let (directory, manager, account) = fixture(None).await;
+            let selection = manager.account_selection(&account.id).unwrap();
+            let result = Arc::new(());
+            let lifetime = Arc::downgrade(&result);
+            let revoked = manager.clone();
+            assert!(matches!(
+                manager
+                    .read_selected_timeline(&selection, move |_| async move {
+                        revoked.publish_active_account(None);
+                        Ok(result)
+                    })
+                    .await,
+                Err(MatrixCoreError::SelectedAccountChanged)
+            ));
+            assert!(lifetime.upgrade().is_none());
+            drop(manager);
+            fs::remove_dir_all(directory).unwrap();
+        });
+    }
+
+    #[test]
+    fn revoked_timeline_read_stops_while_the_manager_mutex_is_still_held() {
+        runtime().block_on(async {
+            let (directory, manager, account) = fixture(None).await;
+            let selection = manager.account_selection(&account.id).unwrap();
+            let state = manager.state.lock().await;
+            let mut opening =
+                Box::pin(manager.message_feed_selected(&selection, "!unused:example.org"));
+            let mut context = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+            assert!(opening.as_mut().poll(&mut context).is_pending());
+            manager.publish_active_account(None);
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(2), opening)
+                    .await
+                    .unwrap(),
+                Err(MatrixCoreError::SelectedAccountChanged)
+            ));
+            drop(state);
             drop(manager);
             fs::remove_dir_all(directory).unwrap();
         });

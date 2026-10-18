@@ -2137,6 +2137,9 @@ impl LiveUi {
         navigation_epoch: u64,
         ui: Weak<AppWindow>,
     ) {
+        let Some(selection) = self.manager.account_selection(account_id) else {
+            return;
+        };
         if !self.navigation_is_current(navigation_epoch)
             || self.require_active_account(account_id).await.is_err()
             || self.selected_room.lock().await.as_deref() != Some(room_id.as_str())
@@ -2154,10 +2157,15 @@ impl LiveUi {
             }
         }
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        let feed = match self.manager.message_feed(&room_id).await {
+        let feed = match self
+            .manager
+            .message_feed_selected(&selection, &room_id)
+            .await
+        {
             Ok(feed) => feed,
             Err(error) => {
-                if self.navigation_is_current(navigation_epoch)
+                if selection.is_current()
+                    && self.navigation_is_current(navigation_epoch)
                     && self.require_active_account(account_id).await.is_ok()
                 {
                     show_error(&ui, error.to_string());
@@ -2165,7 +2173,8 @@ impl LiveUi {
                 return;
             }
         };
-        if self.generation.load(Ordering::Acquire) != generation
+        if !selection.is_current()
+            || self.generation.load(Ordering::Acquire) != generation
             || !self.navigation_is_current(navigation_epoch)
             || self.require_active_account(account_id).await.is_err()
             || self.selected_room.lock().await.as_deref() != Some(room_id.as_str())
@@ -2195,12 +2204,14 @@ impl LiveUi {
                     let account_id = feed_account_id.clone();
                     let room_id = feed_room_id.clone();
                     let pending = delivery.clone();
+                    let selected_account = selection.clone();
                     if ui_for_update
                         .upgrade_in_event_loop(move |ui| {
                             let Some(messages) = pending.take() else {
                                 return;
                             };
-                            if live_flag.load(Ordering::Acquire)
+                            if selected_account.is_current()
+                                && live_flag.load(Ordering::Acquire)
                                 && current_generation.load(Ordering::Acquire) == generation
                                 && current_navigation_epoch.load(Ordering::Acquire)
                                     == navigation_epoch
@@ -2222,7 +2233,7 @@ impl LiveUi {
                         break;
                     }
                 }
-                if updates.changed().await.is_err() {
+                if !matches!(selection.guard(updates.changed()).await, Some(Ok(()))) {
                     break;
                 }
             }
@@ -2250,6 +2261,10 @@ impl LiveUi {
         if self.thread_generation.load(Ordering::Acquire) != generation {
             return Ok(());
         }
+        let selection = self
+            .manager
+            .account_selection(&account_id)
+            .ok_or(MatrixCoreError::SelectedAccountChanged)?;
         self.require_selected_room(&room_id).await?;
         {
             let mut feed = self.thread_feed.lock().await;
@@ -2269,8 +2284,10 @@ impl LiveUi {
         let restore_account = account_id.clone();
         let restore_room = room_id.clone();
         let restore_root = root_event_id.clone();
+        let restore_selection = selection.clone();
         let _ = ui.upgrade_in_event_loop(move |ui| {
-            if restore_live.load(Ordering::Acquire)
+            if restore_selection.is_current()
+                && restore_live.load(Ordering::Acquire)
                 && restore_generation.load(Ordering::Acquire) == generation
                 && ui.get_active_account_local_id().as_str() == restore_account
                 && ui.get_active_room_id().as_str() == restore_room
@@ -2300,7 +2317,7 @@ impl LiveUi {
         }
         let feed = self
             .manager
-            .thread_message_feed_for(&account_id, &room_id, &root_event_id)
+            .thread_message_feed_selected(&selection, &room_id, &root_event_id)
             .await?;
         if self.thread_generation.load(Ordering::Acquire) != generation {
             return Ok(());
@@ -2321,12 +2338,14 @@ impl LiveUi {
                     let room_id = room_id.clone();
                     let root_event_id = root_event_id.clone();
                     let pending = delivery.clone();
+                    let selected_account = selection.clone();
                     if ui_for_update
                         .upgrade_in_event_loop(move |ui| {
                             let Some(messages) = pending.take() else {
                                 return;
                             };
-                            if is_live.load(Ordering::Acquire)
+                            if selected_account.is_current()
+                                && is_live.load(Ordering::Acquire)
                                 && current_generation.load(Ordering::Acquire) == generation
                                 && ui.get_active_account_local_id().as_str() == account_id
                                 && ui.get_active_room_id().as_str() == room_id
@@ -2350,7 +2369,7 @@ impl LiveUi {
                         break;
                     }
                 }
-                if updates.changed().await.is_err() {
+                if !matches!(selection.guard(updates.changed()).await, Some(Ok(()))) {
                     break;
                 }
             }

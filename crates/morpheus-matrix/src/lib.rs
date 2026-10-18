@@ -1517,55 +1517,6 @@ impl AccountManager {
         loaded.thread_timeline(room_id, root_event_id).await
     }
 
-    /// Native UI friendly message snapshot for the selected room. This omits
-    /// virtual markers and non-message events; the raw `timeline` remains
-    /// available for richer rendering.
-    pub async fn messages_snapshot(&self, room_id: &str) -> Result<Vec<MessageInfo>> {
-        let state = self.state.lock().await;
-        let id = state
-            .active_account_id
-            .as_ref()
-            .ok_or(MatrixCoreError::NoActiveAccount)?;
-        let loaded = state
-            .loaded
-            .get(id)
-            .ok_or(MatrixCoreError::NoActiveAccount)?;
-        let timeline = loaded.timeline(room_id).await?;
-        let (items, _) = timeline.subscribe().await;
-        Ok(items.iter().filter_map(|item| message_info(item)).collect())
-    }
-
-    /// Live message snapshots for the selected room. The stream tracks SDK
-    /// vector diffs, so edits, send states, redactions, and removals update it.
-    pub async fn message_feed(&self, room_id: &str) -> Result<MessageFeed> {
-        let state = self.state.lock().await;
-        let account_id = state
-            .active_account_id
-            .as_ref()
-            .ok_or(MatrixCoreError::NoActiveAccount)?
-            .clone();
-        let loaded = state
-            .loaded
-            .get(&account_id)
-            .ok_or(MatrixCoreError::NoActiveAccount)?;
-        let timeline = loaded.timeline(room_id).await?;
-        Ok(message_feed_from_timeline(account_id, room_id, timeline).await)
-    }
-
-    /// A native UI friendly stream of the root and replies in one thread.
-    /// Both account and room are checked before the subscriber is created.
-    pub async fn thread_message_feed_for(
-        &self,
-        expected_account_id: &str,
-        room_id: &str,
-        root_event_id: &str,
-    ) -> Result<MessageFeed> {
-        let state = self.state.lock().await;
-        let loaded = selected_loaded_for(&state, expected_account_id)?;
-        let timeline = loaded.thread_timeline(room_id, root_event_id).await?;
-        Ok(message_feed_from_timeline(expected_account_id.to_owned(), room_id, timeline).await)
-    }
-
     /// Queue a reply only for the account the user saw when composing it.
     pub async fn send_reply_for(
         &self,
