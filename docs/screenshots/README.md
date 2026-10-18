@@ -3,50 +3,48 @@
 Real native captures with fictional offline accounts. Each image is a
 1440 × 900 lossless PNG. These show the interface; Morpheus remains pre-alpha.
 
-## Terminal and account switching
+## Themes
 
-Monospaced messages, aligned nickname columns, square controls, no message
-avatars and a minimal room header. The upward account menu keeps separate
-aliases close at hand.
+| Terminal | Nocturne | Paper |
+| --- | --- | --- |
+| ![Terminal with text navigation](terminal-sidebar.png) | ![Nocturne with stacked messages and avatars](desktop.png) | ![Paper with serif messages and light surfaces](paper.png) |
+| Monospaced text, nickname columns and square controls. | Room context, avatars and a members panel. | Warm light surfaces, serif text and compact headers. |
 
-![Terminal preset with the account switcher open](account-switcher.png)
+[Customize a preset or make your own theme](../CUSTOMIZATION.md).
 
-## Sidebar and labeled rail
+## Navigation and accounts
 
-Optional text navigation, a combined room/DM list and unread-first ordering:
+The bottom-left profile menu opens upward to switch between accounts.
 
-![Terminal preset with text navigation and combined conversations](terminal-sidebar.png)
+![Terminal with the account switcher open](account-switcher.png)
 
-The narrow icon rail can also show Space labels. Long names shorten visually;
-controls retain the complete accessible name.
+<details>
+<summary>Labeled Space rail</summary>
 
-![Terminal preset with a labeled Space rail](terminal-space-labels.png)
+Long Space names shorten visually; controls retain their complete accessible name.
 
-## Nocturne
+![Terminal with a labeled Space rail](terminal-space-labels.png)
 
-Stacked messages, avatars, room context and the members panel.
+</details>
 
-![Nocturne conversation with fictional preview accounts](desktop.png)
+<details>
+<summary>Account management and local app password</summary>
 
-## Paper
+Direct removal, cleanup retries and one optional password for protected switches.
+The pending-removal row is a fixture. [Account controls](../ACCOUNT_ACCESS.md).
 
-Serif message text, warm light surfaces, compact headers and no message avatars.
-
-![Paper preset with serif message text](paper.png)
-
-## Account controls
-
-The account manager exposes direct removal and one optional local app password
-for protected switches. The fixture includes a pending-removal row to show the
-retry control. See [account access](../ACCOUNT_ACCESS.md) for behavior and limits.
-
-![Account manager with fictional accounts and removal controls](manage-accounts.png)
+![Account manager with fictional accounts](manage-accounts.png)
 
 ![Local app password dialog with empty fields](account-password.png)
 
-## Sign-in
+</details>
+
+<details>
+<summary>Sign-in</summary>
 
 ![Native Matrix sign-in screen](sign-in.png)
+
+</details>
 
 ## Capture provenance
 
