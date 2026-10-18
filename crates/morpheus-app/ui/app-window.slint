@@ -947,6 +947,9 @@ component StyleNumberSetting inherits Rectangle {
     in property <int> minimum;
     in property <int> maximum;
     in property <int> step: 1;
+    // Shown after the value: " px" for lengths, "" for a unitless value such
+    // as a font weight, " ms" for a duration, "%" for a percentage.
+    in property <string> suffix: " px";
     in property <color> ink;
     in property <color> muted;
     in property <color> surface;
@@ -965,7 +968,7 @@ component StyleNumberSetting inherits Rectangle {
         padding: 10px; spacing: 8px;
         Text { text: root.label; color: root.ink; font-size: 12px * root.text-scale;
             vertical-alignment: center; horizontal-stretch: 1; wrap: word-wrap; }
-        Text { text: root.value + " px"; color: root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; }
+        Text { text: root.value + root.suffix; color: root.muted; font-size: 11px * root.text-scale; vertical-alignment: center; }
         decrease := IconAction { icon: "−"; label: "Decrease " + root.label; ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
             enabled: root.value > root.minimum; activated => { root.changed-value(max(root.minimum, root.value - root.step)); } }
         increase := IconAction { icon: "+"; label: "Increase " + root.label; ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
@@ -3751,6 +3754,16 @@ export component AppWindow inherits Window {
                                 token-chosen(id) => { root.color-token-chosen(id); token-editor.focus(); }
                             }
                             token-editor := ColorTokenEditor {
+                                // A color search result selects its token first,
+                                // then asks for this field.
+                                property <int> reveal-request: root.reveal-request("appearance.color_hex");
+                                changed reveal-request => {
+                                    if self.reveal-request > 0 {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                        self.focus();
+                                        if self.has-focus { root.settings-revealed-id = "appearance.color_hex"; }
+                                    }
+                                }
                                 x: parent.wide ? token-list.x + token-list.width + 12px : 12px;
                                 y: parent.wide ? 12px : token-list.y + token-list.height + 12px;
                                 width: parent.wide ? parent.width - token-list.width - 36px : parent.width - 24px;
@@ -3832,6 +3845,8 @@ export component AppWindow inherits Window {
                                 }
                             }
                             label: "Sender font weight"; value: root.sender-font-weight > 0 ? root.sender-font-weight : 650; minimum: 100; maximum: 900; step: 50;
+                            // A CSS-style weight from 100 to 900 has no unit.
+                            suffix: "";
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
                             changed-value(value) => { root.set-sender-weight(value); } }
                         TextAction {

@@ -582,13 +582,93 @@ pub fn search_settings(
         .collect()
 }
 
+/// The result-ID prefix of one color token in Settings search; the rest of
+/// the ID is a registry token ID.
+pub const COLOR_RESULT_PREFIX: &str = "color:";
+
+/// One Settings search result. Both kinds come from the static registry
+/// tables, so a result can only name a known setting or token.
+#[derive(Clone, Copy)]
+pub enum SearchHit {
+    /// Choosing it reveals and focuses the setting's control.
+    Setting(&'static SettingTarget),
+    /// Choosing it selects the token in the color editor and focuses its
+    /// hex field.
+    Color(&'static ColorToken),
+}
+
+impl SearchHit {
+    /// The result ID: a setting ID, or [`COLOR_RESULT_PREFIX`] and a token ID.
+    pub fn id(self) -> String {
+        match self {
+            Self::Setting(target) => target.id.to_owned(),
+            Self::Color(token) => format!("{COLOR_RESULT_PREFIX}{}", token.id),
+        }
+    }
+}
+
+/// The color token a Settings search result ID names. Only registry token
+/// IDs are accepted.
+pub fn color_result(id: &str) -> Option<&'static ColorToken> {
+    id.strip_prefix(COLOR_RESULT_PREFIX).and_then(color_token)
+}
+
+/// Search the available Settings targets and every color token, so one
+/// query can reach a single color directly. Matching is as in
+/// [`search_settings`]; a token also matches its ID and the words of its ID.
+/// Results are ranked best first, settings before tokens at equal score, each
+/// in registry order, and bounded by [`MAX_SEARCH_RESULTS`].
+pub fn search(query: &str, available: impl Fn(Requirement) -> bool) -> Vec<SearchHit> {
+    let query: String = query.chars().take(MAX_SEARCH_QUERY_CHARS).collect();
+    let query = query.to_lowercase();
+    let words: Vec<&str> = query.split_whitespace().collect();
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let settings = SETTING_TARGETS
+        .iter()
+        .enumerate()
+        .filter(|(_, target)| available(target.requires))
+        .filter_map(|(order, target)| Some((score(target, &words)?, 0, order, SearchHit::Setting(target))));
+    let colors = COLOR_TOKENS
+        .iter()
+        .enumerate()
+        .filter_map(|(order, token)| Some((token_score(token, &words)?, 1, order, SearchHit::Color(token))));
+    let mut ranked: Vec<(u32, u8, usize, SearchHit)> = settings.chain(colors).collect();
+    ranked.sort_by(|left, right| {
+        right.0.cmp(&left.0).then(left.1.cmp(&right.1)).then(left.2.cmp(&right.2))
+    });
+    ranked
+        .into_iter()
+        .take(MAX_SEARCH_RESULTS)
+        .map(|(_, _, _, hit)| hit)
+        .collect()
+}
+
+fn token_score(token: &ColorToken, words: &[&str]) -> Option<u32> {
+    let mut keywords: Vec<&str> = token.keywords.to_vec();
+    keywords.push(token.id);
+    keywords.extend(token.id.split('_'));
+    score_fields(token.label, token.group.label(), &keywords, token.description, words)
+}
+
 fn score(target: &SettingTarget, words: &[&str]) -> Option<u32> {
-    let label = target.label.to_lowercase();
-    let category = target.category.to_lowercase();
-    let description = target.description.to_lowercase();
+    score_fields(target.label, target.category, target.keywords, target.description, words)
+}
+
+fn score_fields(
+    label: &str,
+    category: &str,
+    keywords: &[&str],
+    description: &str,
+    words: &[&str],
+) -> Option<u32> {
+    let label = label.to_lowercase();
+    let category = category.to_lowercase();
+    let description = description.to_lowercase();
     let mut total = 0;
     for word in words {
-        let keyword = target.keywords.iter().map(|keyword| keyword.to_lowercase());
+        let keyword = keywords.iter().map(|keyword| keyword.to_lowercase());
         let best = if label.split_whitespace().any(|part| part.starts_with(word)) {
             8
         } else if keyword.clone().any(|keyword| keyword == *word) {
@@ -707,6 +787,39 @@ mod tests {
                 .iter()
                 .all(|target| target.requires == Requirement::Always)
         );
+    }
+
+    #[test]
+    fn single_color_tokens_are_direct_bounded_search_results() {
+        let all = |_| true;
+        let ids = |query: &str| search(query, all).into_iter().map(SearchHit::id).collect::<Vec<_>>();
+        assert_eq!(ids("presence_online").first().map(String::as_str), Some("color:presence_online"));
+        assert_eq!(ids("online").first().map(String::as_str), Some("color:presence_online"));
+        assert!(ids("link").iter().any(|id| id == "color:link"));
+        assert!(ids("scrim").iter().any(|id| id == "color:scrim"));
+        // The generic Colors setting still leads for the general word.
+        assert_eq!(ids("colour").first().map(String::as_str), Some("appearance.colors"));
+        for query in ["e", "text", "background color", "a"] {
+            assert!(search(query, all).len() <= MAX_SEARCH_RESULTS, "{query}");
+        }
+        assert!(search("", all).is_empty() && search(&"a".repeat(10_000), all).is_empty());
+        // Every color result ID names exactly its registry token, and no other
+        // text resolves.
+        for token in COLOR_TOKENS {
+            let id = SearchHit::Color(token).id();
+            assert_eq!(color_result(&id).map(|found| found.id), Some(token.id));
+        }
+        for id in ["color:", "color:no_such_token", "link", "appearance.colors", "color:appearance.colors", "COLOR:link"] {
+            assert!(color_result(id).is_none(), "{id}");
+        }
+        // Setting results never collide with the color prefix.
+        assert!(SETTING_TARGETS.iter().all(|target| !target.id.starts_with(COLOR_RESULT_PREFIX)));
+        // Availability still applies to settings and never hides a color.
+        let offline = |requirement| requirement == Requirement::Always;
+        assert!(search("recovery", offline).iter().all(|hit| match hit {
+            SearchHit::Setting(target) => target.requires == Requirement::Always,
+            SearchHit::Color(_) => true,
+        }));
     }
 
     #[test]

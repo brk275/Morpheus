@@ -299,6 +299,18 @@ pub(super) fn project(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>
     reproject(ui, false);
 }
 
+/// Select one token for editing, as a Settings search result does: its group
+/// with no filter, and its shown color in the hex field. Nothing is saved.
+pub(super) fn select_token(ui: &AppWindow, token: &'static ColorToken) {
+    if let Some(index) = TokenGroup::ALL.iter().position(|group| *group == token.group) {
+        ui.set_color_group_index(index as i32);
+    }
+    ui.set_color_filter(SharedString::new());
+    ui.set_color_selected_id(token.id.into());
+    clear_hint();
+    reproject(ui, true);
+}
+
 fn current_config<R>(read: impl FnOnce(&Config) -> R) -> Option<R> {
     SESSION.with(|session| {
         let session = session.borrow();

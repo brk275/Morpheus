@@ -263,8 +263,15 @@ never reports "supported"; it reports "requested" and "not yet verified".
 
 A pinned search field at the top of Settings indexes `SETTING_TARGETS`: label,
 description, keywords and aliases (including "colour"), category and
-breadcrumb. Queries are at most 64 characters and return at most 8 results;
-every word must match. Up and Down move the highlighted result, Enter reveals
+breadcrumb. It also indexes every color token by its ID, the words of its ID,
+label, group, keywords and description, so `presence_online`, "online" or
+"links" reaches one color directly. Queries are at most 64 characters and
+return at most 8 results across both kinds; every word must match. At equal
+scores settings come first. A color result has the ID `color:<token>`, and
+only a registry token ID resolves. Choosing it selects that token in the
+workspace (its group, no filter, its shown color in the field) and focuses its
+hex field, reported as `appearance.color_hex`. Nothing is saved until a value
+is typed. Up and Down move the highlighted result, Enter reveals
 it and Escape clears the query. Choosing a result scrolls to the control,
 computed from the live layout, and focuses it; the focus ring is the
 highlight. A reveal reports its target only when that control actually took
@@ -309,6 +316,8 @@ settings file; updates.
 
 ## Remaining
 
+- Number settings show their unit: `px` for lengths, none for the sender font
+  weight, `ms` for durations and `%` for percentages as those fields arrive.
 - Typography line height and body weight, icon sizing and colors, avatar
   shape and the avatar/account palettes, pane order and visibility beyond the
   existing panel toggle, animation durations, the sender palette in the
