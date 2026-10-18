@@ -71,6 +71,24 @@ check active and completed runs before dispatching equivalent work.
 All hosted jobs are gated off while the repository is private; paid runs require
 separate owner authorization.
 
+On Ubuntu, CI's helper job and the Linux package job first run
+[`scripts/harden_linux_notice_host.py`](../scripts/harden_linux_notice_host.py)
+as root, before any other checkout code. The installed-notice inventory accepts
+a copyright or common-license file only when every path component is
+root-owned and not group- or world-writable, but the hosted Ubuntu 24.04 image
+ships `/usr/share`, `/usr/share/doc` and `/usr/share/common-licenses`
+world-writable. The step refuses anything but a fresh standard GitHub-hosted
+Ubuntu 24.04 x86-64 runner with real and effective root. It confirms that `/`
+and `/usr` are root-owned and not group- or world-writable. It then removes only
+the group and world write bits from `/usr/share` and from each directory and
+regular file in those two trees. It never follows a symlink, crosses a mount,
+changes an owner or removes anything. An entry owned by another user fails the
+job, as does a writable file with another hard link, whose mode would change
+through every alias; an already tight one is left alone. It prints only fixed
+reasons and counts. It trusts the official image as it is before candidate code
+runs. Tightening permissions is not a repair for a tampered host, and the
+inventory's ownership, mode, symlink and provenance checks are unchanged.
+
 For a local package, use `python3 scripts/package.py --formats deb,appimage`,
 `--formats dmg`, or `--formats nsis` on the relevant platform. Run
 `python3 scripts/package.py --check` to validate configuration without building.

@@ -94,8 +94,14 @@ class ProgressTests(unittest.TestCase):
     def test_only_real_inventory_fixed_subreasons_are_published(self):
         import appimage_notices as N
         reasons = ("input", "tool", "elf", "dependency", "package", "notice", "deployment", "limit",
-                   "elf_build_id", "elf_needed", "elf_soname", "elf_search", "search")
-        for reason in reasons:
+                   "elf_build_id", "elf_needed", "elf_soname", "elf_search", "search",
+                   "library_path_owner", "copyright_missing", "copyright_mode",
+                   "common_license_missing", "common_license_type", "common_license_access")
+        self.assertTrue(set(reasons) <= N.REASONS)
+        # Every inventory reason is publishable, and nothing else is.
+        self.assertEqual({value for value in D.REASONS if value.startswith("inventory_")},
+                         {"inventory_" + value for value in N.REASONS})
+        for reason in sorted(N.REASONS):
             error = N.InventoryFailure(reason)
             error.args = ("private path and server body",)
             self.assertEqual(D.reason(error), "inventory_" + reason)
@@ -129,6 +135,21 @@ class ProgressTests(unittest.TestCase):
             self.assertEqual(result["failure"]["reason"], "inventory_elf_build_id")
             self.assertEqual(result["failure"]["command_stage"], "inventory-elf-dependency")
             self.assertEqual(result["inner_cleanup"], "failed")
+            self.assertNotIn("private", json.dumps(result))
+
+    def test_notice_path_failure_after_package_query_keeps_its_property(self):
+        import appimage_notices as N
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            progress = D.Progress(root)
+            progress.wrapper("build")
+            progress.command("inventory-package")
+            error = N.InventoryFailure("common_license_missing")
+            error.args = ("private license path and copyright prose",)
+            progress.failed(error)
+            result = D.public_failure(root, scan_passed=True, outer_cleanup="passed", outer_reason="namespace_exit")
+            self.assertEqual(result["failure"]["reason"], "inventory_common_license_missing")
+            self.assertEqual(result["failure"]["command_stage"], "inventory-package")
             self.assertNotIn("private", json.dumps(result))
 
     def test_fixed_schema_matches_peer_and_command_source(self):
