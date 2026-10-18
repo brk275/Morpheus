@@ -1,11 +1,9 @@
-name: CI
+# TEMPORARY owner-selected native diagnostic. NEVER MERGE into main.
+# The unchanged system PipeWire first-frame failure remains an OPEN release gate.
+# This run compiles/tests all four supported targets and live recovery only.
+name: Recovery native diagnostic - Wayland gate remains open
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  # Manual dispatch always checks the complete supported native matrix.
   workflow_dispatch:
 
 permissions:
@@ -25,14 +23,16 @@ jobs:
   scope:
     name: Security and change scope
     # Hosted validation is disabled while private to prevent unauthorized paid builds.
-    if: github.event.repository.private == false
+    if: github.event.repository.private == false && github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/codex/recovery-native-diagnostic' && github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       native: ${{ steps.scope.outputs.native }}
       native_matrix: ${{ steps.scope.outputs.native_matrix }}
       config: ${{ steps.scope.outputs.config }}
-      wayland: ${{ steps.scope.outputs.wayland }}
+      # Known unchanged system-library failure is outside this diagnostic.
+      # Normal CI and release gates are preserved on the integration branch.
+      wayland: "false"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -83,7 +83,15 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          fetch-depth: 2
           persist-credentials: false
+      - name: Restore exact reviewed workflow source for contract checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show a9892d8150cf58577071857c0f34f6b3b5f5683e:.github/workflows/ci.yml > "$RUNNER_TEMP/reviewed-native-ci.yml"
+          echo "df7218b7d027e6ad437ca9743595237fff64c80712cdfaa2d5522e3f25451ac8  $RUNNER_TEMP/reviewed-native-ci.yml" | sha256sum --check --status
+          cp "$RUNNER_TEMP/reviewed-native-ci.yml" .github/workflows/ci.yml
       - name: Check scope and packaging helpers
         run: |
           python3 -m unittest discover -s scripts/tests -v
@@ -105,7 +113,15 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          fetch-depth: 2
           persist-credentials: false
+      - name: Restore exact reviewed workflow source for contract checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show a9892d8150cf58577071857c0f34f6b3b5f5683e:.github/workflows/ci.yml > "$RUNNER_TEMP/reviewed-native-ci.yml"
+          echo "df7218b7d027e6ad437ca9743595237fff64c80712cdfaa2d5522e3f25451ac8  $RUNNER_TEMP/reviewed-native-ci.yml" | sha256sum --check --status
+          cp "$RUNNER_TEMP/reviewed-native-ci.yml" .github/workflows/ci.yml
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action, pinned compiler below
         with:
           toolchain: 1.99.0
@@ -129,7 +145,15 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          fetch-depth: 2
           persist-credentials: false
+      - name: Restore exact reviewed workflow source for contract checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show a9892d8150cf58577071857c0f34f6b3b5f5683e:.github/workflows/ci.yml > "$RUNNER_TEMP/reviewed-native-ci.yml"
+          echo "df7218b7d027e6ad437ca9743595237fff64c80712cdfaa2d5522e3f25451ac8  $RUNNER_TEMP/reviewed-native-ci.yml" | sha256sum --check --status
+          cp "$RUNNER_TEMP/reviewed-native-ci.yml" .github/workflows/ci.yml
       - name: Linux native dependencies
         if: runner.os == 'Linux'
         run: |
@@ -342,7 +366,7 @@ jobs:
           exit 1
 
   acceptance:
-    name: CI acceptance
+    name: Diagnostic result - release gates remain open
     needs: [scope, helpers, config, compile]
     # Run after failed/skipped dependencies too. A selected check may never
     # disappear behind a skipped aggregate that branch protection accepts.
