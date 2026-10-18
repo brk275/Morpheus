@@ -39,7 +39,9 @@ fresh evidence. See [the verification log](VERIFICATION.md).
       behavior remain unverified. The room-mention projection and expanded
       encrypted room/reply/thread/edit fixture passed again in Linux at
       `51c04ce`. Composer keyboard/IME/accessibility, live rendered UI, rendered
-      emoji breadth, stickers and the complete behavior set remain open.
+      emoji breadth, stickers and the complete behavior set remain open. A
+      source-only sticker catalog, picker and gated send path
+      ([details](STICKERS.md)) has not executed.
 - [ ] Upload, download, preview, and safely open images, video, audio, and
       files in encrypted and unencrypted rooms. The Matrix core passed an
       encrypted binary-file upload/download roundtrip with metadata, account

@@ -1894,6 +1894,9 @@ async fn exercise_account_ui(runtime: Handle) {
     ui.set_attachment_status("private upload name".into());
     assert_recovery_strip_projection(&ui).await;
     assert_sticker_picker_projection(&ui).await;
+    // The real picker controller over a recording fake core: admission,
+    // persistence, single-flight commands, quarantine and queue recovery.
+    crate::stickers::controller_tests::run(&ui, runtime.clone()).await;
     // Exercise chat controls before opening the one-time-key modal. Then
     // render that private surface as well before testing the real detach.
     ui.set_security_recovery_input("synthetic recovery input".into());
@@ -2311,13 +2314,11 @@ const KEEP_LABEL: &str = "Not sent: keep this message's text";
 const SENT_LABEL: &str = "It was sent: drop this saved message without resending";
 const RESTORE_LABEL: &str = "Restore this message's text into the empty composer";
 const COPY_LABEL: &str = "Copy this message's text to the system clipboard";
+const STICKER_SEARCH: &str = "Search stickers by description, shortcode or pack";
+const STICKER_CONFIRM: &str = "I checked the conversation: allow sending stickers again";
 const DISCARD_UNREADABLE_LABEL: &str =
     "Discard saved send status this version cannot read; your typed text stays";
 
-/// The per-record saved-send surface in the real generated window: one block
-/// per record with its own exact controls, keyboard reachable, routing the
-/// record's opaque key and never another record's; the narrow thread pane at
-/// 200% text stacks the controls inside the window instead of clipping them.
 /// The real sticker popup and send-status strip. Opaque keys route through
 /// the generated callbacks; the search field owns arrows, Return and Escape;
 /// consent is an explicit keyboard-reachable action; no image element exists
@@ -2343,6 +2344,7 @@ async fn assert_sticker_picker_projection(ui: &AppWindow) {
     let consents: Rc<RefCell<Vec<bool>>> = Rc::default();
     let dismissed = Rc::new(Cell::new(0));
     let cancelled = Rc::new(Cell::new(0));
+    let acknowledged = Rc::new(Cell::new(0));
     let sink = navigated.clone();
     ui.on_sticker_navigate(move |offset| sink.borrow_mut().push(offset));
     let sink = queries.clone();
@@ -2355,6 +2357,8 @@ async fn assert_sticker_picker_projection(ui: &AppWindow) {
     ui.on_sticker_dismiss(move || sink.set(sink.get() + 1));
     let sink = cancelled.clone();
     ui.on_sticker_send_cancel(move || sink.set(sink.get() + 1));
+    let sink = acknowledged.clone();
+    ui.on_sticker_send_dismiss(move || sink.set(sink.get() + 1));
 
     ui.set_sticker_items(ModelRc::new(VecModel::from(vec![
         StickerItem {
@@ -2381,7 +2385,10 @@ async fn assert_sticker_picker_projection(ui: &AppWindow) {
     ui.set_sticker_threaded(false);
     ui.set_sticker_open(true);
     settle(ui).await;
-    assert!(ui.get_mention_ui_allowed(), "fixture is a visible idle room composer");
+    assert!(
+        ui.get_mention_ui_allowed(),
+        "fixture is a visible idle room composer"
+    );
     assert_eq!(control_bounds(ui, "Sticker picker").len(), 1);
     assert_eq!(
         control_bounds(ui, "Sticker Waving fox from Forest friends, selected").len(),
@@ -2402,19 +2409,30 @@ async fn assert_sticker_picker_projection(ui: &AppWindow) {
     key(ui, Key::UpArrow);
     assert_eq!(navigated.borrow().as_slice(), [1, -1]);
     key(ui, Key::Return);
-    assert!(sent.borrow().is_empty(), "Return cannot send before it is allowed");
+    assert!(
+        sent.borrow().is_empty(),
+        "Return cannot send before it is allowed"
+    );
     type_text(ui, "owl");
     assert_eq!(ui.get_sticker_query_text().as_str(), "owl");
     assert_eq!(queries.borrow().last().map(String::as_str), Some("owl"));
     key(ui, Key::Escape);
-    assert_eq!(dismissed.get(), 1, "Escape in the search field closes the picker");
+    assert_eq!(
+        dismissed.get(),
+        1,
+        "Escape in the search field closes the picker"
+    );
 
     tab_to_control(ui, "Allow sticker images here");
     key(ui, Key::Return);
     assert_eq!(consents.borrow().as_slice(), [true]);
     tab_to_control(ui, "Sticker Sleeping owl from Forest friends");
     key(ui, Key::Escape);
-    assert_eq!(dismissed.get(), 2, "Escape on a sticker row closes the picker");
+    assert_eq!(
+        dismissed.get(),
+        2,
+        "Escape on a sticker row closes the picker"
+    );
 
     // The controller publishes permission and the decoded preview. Move focus
     // to Send before the consent prompt disappears from the tree.
@@ -2443,7 +2461,107 @@ async fn assert_sticker_picker_projection(ui: &AppWindow) {
     tab_to_control(ui, "Cancel this sticker");
     key(ui, Key::Return);
     assert_eq!(cancelled.get(), 1);
-    assert_eq!(sent.borrow().len(), 1, "status controls never send another sticker");
+    assert_eq!(
+        sent.borrow().len(),
+        1,
+        "status controls never send another sticker"
+    );
+
+    // At 200% text the room composer and the narrow thread pane both keep
+    // every picker control keyboard reachable and inside the window; the
+    // thread pane stacks them in a scrolling area instead of squeezing a row.
+    let previous_scale = ui.get_font_scale_percent();
+    ui.set_font_scale_percent(200);
+    ui.set_sticker_send_visible(false);
+    for threaded in [false, true] {
+        let scope = if threaded { "thread" } else { "room" };
+        if threaded {
+            ui.set_thread_root_id("$sticker-root:example.org".into());
+            ui.invoke_show_thread_panel();
+        }
+        ui.set_sticker_threaded(threaded);
+        ui.set_sticker_needs_consent(true);
+        ui.set_sticker_can_send(false);
+        ui.set_sticker_preview_loaded(false);
+        for label in [
+            STICKER_SEARCH,
+            "Sticker pack",
+            "Close sticker picker",
+            "Allow sticker images here",
+            "Cancel and close the sticker picker",
+        ] {
+            // Reopen so the walk starts at the search field every time.
+            ui.set_sticker_open(false);
+            settle(ui).await;
+            ui.set_sticker_open(true);
+            settle(ui).await;
+            tab_to_control(ui, label);
+            let bounds = focused_control_bounds(ui).expect("a focused sticker control");
+            assert!(
+                inside_window(ui, bounds),
+                "{scope}: {label} is outside the window: {bounds:?}"
+            );
+            if threaded {
+                let pane = control_bounds(ui, "Conversation details")[0];
+                assert!(
+                    bounds.left >= pane.left - 0.5 && bounds.right <= pane.right + 0.5,
+                    "{scope}: {label} leaves the thread pane: {bounds:?} of {pane:?}"
+                );
+            }
+        }
+        // Consent accepted and the controller allows sending: Send is
+        // reachable and sends; Close is reachable and closes.
+        ui.set_sticker_needs_consent(false);
+        ui.set_sticker_can_send(true);
+        ui.set_sticker_open(false);
+        settle(ui).await;
+        ui.set_sticker_open(true);
+        settle(ui).await;
+        tab_to_control(ui, "Send sticker");
+        let bounds = focused_control_bounds(ui).expect("a focused Send action");
+        assert!(
+            inside_window(ui, bounds),
+            "{scope}: Send is outside the window"
+        );
+        let sends = sent.borrow().len();
+        key(ui, Key::Return);
+        assert_eq!(sent.borrow().len(), sends + 1, "{scope}: Send");
+        ui.set_sticker_open(false);
+        settle(ui).await;
+        ui.set_sticker_open(true);
+        settle(ui).await;
+        tab_to_control(ui, "Close sticker picker");
+        let closes = dismissed.get();
+        key(ui, Key::Return);
+        assert_eq!(dismissed.get(), closes + 1, "{scope}: Close");
+        // An uncertain send offers only the explicit confirmation.
+        ui.set_sticker_open(false);
+        ui.set_sticker_send_threaded(threaded);
+        ui.set_sticker_send_status("This sticker was not found in the queue.".into());
+        ui.set_sticker_send_can_cancel(false);
+        ui.set_sticker_send_can_retry(false);
+        ui.set_sticker_send_uncertain(true);
+        ui.set_sticker_send_visible(true);
+        settle(ui).await;
+        assert!(control_bounds(ui, "Dismiss sticker status").is_empty());
+        tab_to_record_control(ui, STICKER_CONFIRM);
+        let bounds = focused_control_bounds(ui).expect("a focused confirmation");
+        assert!(
+            inside_window(ui, bounds),
+            "{scope}: confirmation is outside"
+        );
+        let confirmations = acknowledged.get();
+        key(ui, Key::Return);
+        assert_eq!(acknowledged.get(), confirmations + 1);
+        ui.set_sticker_send_visible(false);
+        ui.set_sticker_send_uncertain(false);
+        settle(ui).await;
+    }
+    ui.set_font_scale_percent(previous_scale);
+    ui.set_thread_root_id("".into());
+    ui.set_sticker_threaded(false);
+    ui.set_sticker_open(false);
+    settle(ui).await;
 
     ui.set_sticker_send_visible(false);
     ui.set_sticker_send_status("".into());
@@ -2462,6 +2580,10 @@ async fn assert_sticker_picker_projection(ui: &AppWindow) {
     settle(ui).await;
 }
 
+/// The per-record saved-send surface in the real generated window: one block
+/// per record with its own exact controls, keyboard reachable, routing the
+/// record's opaque key and never another record's; the narrow thread pane at
+/// 200% text stacks the controls inside the window instead of clipping them.
 async fn assert_recovery_strip_projection(ui: &AppWindow) {
     use crate::draft_recovery;
     use crate::drafts::{PendingItem, PendingStatus, PendingSummary};

@@ -3364,7 +3364,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let composer_ui =
         composer_mentions::ui::ComposerUi::install(&ui, live.clone(), runtime.handle().clone());
     // Callbacks own the controller; picker state ends with its selection.
-    let _stickers = stickers::StickerUi::register(&ui, live.clone(), runtime.handle().clone());
+    let _stickers = stickers::register(&ui, live.clone(), runtime.handle().clone());
 
     let weak = ui.as_weak();
     let attach_live = live.clone();

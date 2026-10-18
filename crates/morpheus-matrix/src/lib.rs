@@ -16,8 +16,8 @@ pub use media::{
 };
 mod image_packs;
 pub use image_packs::{
-    MAX_STICKER_PREVIEW_BYTES, PublicMediaConsent, StickerCatalog, StickerEntry, StickerPack,
-    StickerPackSource, StickerPreview,
+    MAX_STICKER_PREVIEW_BYTES, PendingSticker, PublicMediaConsent, StickerCatalog, StickerEntry,
+    StickerPack, StickerPackSource, StickerPreview,
 };
 mod discovery;
 pub use discovery::{
