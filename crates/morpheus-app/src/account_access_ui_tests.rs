@@ -2021,6 +2021,14 @@ fn control_extents(ui: &AppWindow, label: &str) -> Vec<(f32, f32)> {
 /// chain without changing focus, scrolling, callbacks or widget properties.
 /// Only numeric geometry and static compiler element names/IDs are reported.
 fn clipped_control_geometry(ui: &AppWindow, label: &str) -> Vec<String> {
+    control_ancestor_geometry(ui, label, true)
+}
+
+fn control_ancestor_geometry(
+    ui: &AppWindow,
+    label: &str,
+    require_horizontal_clip: bool,
+) -> Vec<String> {
     use slint::private_unstable_api::re_exports::{
         AccessibleStringProperty, BorderRectangle, Clip, Empty, Flickable, FocusScope, ItemRc,
         Opacity, Rectangle, WindowInner,
@@ -2046,7 +2054,7 @@ fn clipped_control_geometry(ui: &AppWindow, label: &str) -> Vec<String> {
             == Some(label)
             && {
                 let bounds = item_bounds(item);
-                bounds.left < -0.5 || bounds.right > width + 0.5
+                !require_horizontal_clip || bounds.left < -0.5 || bounds.right > width + 0.5
             }
     });
     let mut trace = vec![format!(
@@ -2060,7 +2068,7 @@ fn clipped_control_geometry(ui: &AppWindow, label: &str) -> Vec<String> {
         nodes.len() >= NODE_LIMIT
     )];
     let Some(target) = target else {
-        trace.push("no horizontally clipped target found".into());
+        trace.push("no matching target found".into());
         return trace;
     };
     for node in &nodes {
@@ -2137,6 +2145,67 @@ fn clipped_control_geometry(ui: &AppWindow, label: &str) -> Vec<String> {
         }
     }
     trace
+}
+
+/// Read-only snapshot of the raw tab graph for the synthetic composer.
+/// No handles survive the call, and output contains only numeric geometry,
+/// fixed keys and booleans. It does not dispatch events or change focus.
+fn composer_focus_evidence(ui: &AppWindow, label: &str) -> Vec<String> {
+    use slint::private_unstable_api::re_exports::{
+        AccessibleStringProperty, ItemRc, TextInput, WindowInner,
+    };
+    use std::ops::ControlFlow;
+
+    let window = WindowInner::from_pub(ui.window());
+    let root = ItemRc::new_root(window.component());
+    let mut targets = Vec::new();
+    let mut visited = 0;
+    root.visit_descendants(|item| {
+        visited += 1;
+        if item
+            .accessible_string_property(AccessibleStringProperty::Label)
+            .as_deref()
+            == Some(label)
+        {
+            targets.push(item.clone());
+        }
+        if visited >= 4096 {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    let mut cursor = root.clone();
+    let mut target_ordinals = Vec::new();
+    let mut closed = false;
+    let mut graph_size = 0;
+    for ordinal in 0..4096 {
+        if targets.contains(&cursor) {
+            target_ordinals.push(ordinal);
+        }
+        graph_size += 1;
+        cursor = cursor.next_focus_item();
+        if cursor == root {
+            closed = true;
+            break;
+        }
+    }
+    let mut evidence = vec![format!(
+        "targets={}; visited={visited}; graph_size={graph_size}; closed={closed}; target_ordinals={target_ordinals:?}",
+        targets.len()
+    )];
+    for target in targets.iter().take(4) {
+        evidence.push(format!(
+            "visible={}; input_enabled={:?}; bounds={:?}",
+            target.is_visible(),
+            target
+                .downcast::<TextInput>()
+                .map(|input| input.as_pin_ref().enabled()),
+            item_bounds(target)
+        ));
+    }
+    evidence.extend(control_ancestor_geometry(ui, label, false));
+    evidence
 }
 
 /// Bounds of the control that currently has keyboard focus, if any.
@@ -2489,6 +2558,7 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
         "Discard this kept text",
     ];
     tab_to_record_control(ui, CANCEL_LABEL);
+    let composer_before_walk = composer_focus_evidence(ui, &composer_label);
     let mut room_strip_controls = 0;
     // Bounded, numeric-only failure evidence: classify focus against the
     // fixture's known labels without printing any input or account contents.
@@ -2534,10 +2604,12 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
     );
     assert!(
         focused_control_has_label(ui, &composer_label),
-        "the tab walk must leave the strip and reach the composer input; mode={}, controls={}, trace={:?}",
+        "the tab walk must leave the strip and reach the composer input; mode={}, controls={}, trace={:?}; before={:?}; after={:?}",
         ui.get_composer_mode(),
         room_strip_controls,
-        room_focus_trace
+        room_focus_trace,
+        composer_before_walk,
+        composer_focus_evidence(ui, &composer_label)
     );
     let focused = focused_control_bounds(ui).unwrap();
     assert!(
