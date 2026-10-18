@@ -10,6 +10,7 @@ class ScopeTests(unittest.TestCase):
     def test_reviewed_presentation_inputs_keep_full_native_without_system_wayland(self):
         reviewed = {"crates/morpheus-app/src/account_access_ui_tests.rs", "crates/morpheus-app/src/appearance.rs",
                     "crates/morpheus-app/src/live.rs", "crates/morpheus-app/src/main.rs",
+                    "crates/morpheus-app/src/timeline_model.rs",
                     "crates/morpheus-app/ui/app-window.slint", "crates/morpheus-config/src/lib.rs"}
         self.assertEqual(WAYLAND_UNRELATED_NATIVE_INPUTS, reviewed)
         paths = sorted(reviewed) + ["docs/CUSTOMIZATION.md"]
@@ -20,6 +21,20 @@ class ScopeTests(unittest.TestCase):
         result = classify(paths)
         self.assertEqual(result["native_matrix"]["os"], list(PLATFORMS))
         self.assertFalse(result["config"] or result["wayland"])
+
+    def test_timeline_model_keeps_four_native_targets_and_exact_dependency_scope(self):
+        timeline = "crates/morpheus-app/src/timeline_model.rs"
+        result = classify([timeline])
+        self.assertEqual(result["native_matrix"]["os"], list(PLATFORMS))
+        self.assertFalse(result["wayland"])
+        self.assertTrue(classify([timeline], force_all=True)["wayland"])
+        for dependency in ("Cargo.lock", "crates/morpheus-matrix/src/lib.rs",
+                           "crates/morpheus-rtc/Cargo.toml", "crates/morpheus-app/build.rs",
+                           "crates/morpheus-app/src/timeline_model_extra.rs"):
+            with self.subTest(dependency=dependency):
+                mixed = classify([timeline, dependency])
+                self.assertEqual(mixed["native_matrix"]["os"], list(PLATFORMS))
+                self.assertTrue(mixed["wayland"])
 
     def test_wayland_dependencies_mixed_or_unknown_inputs_fail_closed(self):
         theme = "crates/morpheus-app/src/appearance.rs"
