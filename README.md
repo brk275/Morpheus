@@ -1,63 +1,51 @@
 # Morpheus
 
-**A native Matrix client. Make it yours.**
+A native Matrix client for macOS, Linux and Windows. Built in Rust, with
+multiple accounts and an interface you can shape around your setup.
 
-Built in Rust for macOS, Linux and Windows, with multiple accounts and live
-control over themes, typography and layout.
+![Morpheus running the Terminal theme with text navigation](docs/screenshots/terminal-sidebar.png)
 
-[Customization](docs/CUSTOMIZATION.md) · [Screenshots](docs/screenshots/README.md) · [Documentation](docs/README.md) · [Contributing](CONTRIBUTING.md)
+[More screenshots](docs/screenshots/README.md) · [Customization](docs/CUSTOMIZATION.md) · [Documentation](docs/README.md)
 
-![Morpheus with the Terminal preset and text sidebar](docs/screenshots/terminal-sidebar.png)
+## Shape your workspace
 
-*The native app, using fictional accounts. Terminal is one of three built-in presets.*
+Start with **Nocturne**, **Terminal** or **Paper**, then change the details:
 
-## Your setup
+- Separate fonts for the interface, messages and code.
+- Stacked, compact or nickname-column messages, with adjustable spacing and avatars.
+- An icon rail or text sidebar, pane widths, room ordering and header density.
+- TOML color palettes for surfaces, text, senders, unread messages and focus.
 
-Start with **Nocturne**, **Terminal** or **Paper**, then tune it to fit:
+Settings and `config.toml` control the same preferences. Changes reload live;
+invalid edits keep the last working configuration and explain the error.
 
-- **Typography:** independent fonts for the interface, messages and code.
-- **Messages:** stacked, compact or nickname-column layouts; spacing and avatars.
-- **Navigation:** icon rail or text sidebar, Space labels and room ordering.
-- **Geometry:** pane widths, headers, density and corner radius.
-- **Color:** TOML palettes for surfaces, senders, links, focus, unread messages and voice.
+## Keep accounts separate
 
-Use Settings or edit `config.toml`. Both control the same preferences, and changes
-reload live. Invalid edits show an error and preserve the last working setup.
+Switch accounts from the bottom-left profile menu. Each account has its own
+session, encryption store, drafts and credential-vault entry. Inactive accounts
+pause by default.
 
-[Explore customization →](docs/CUSTOMIZATION.md)
+One optional local app password protects account switching and startup restore.
+Manage accounts includes direct removal and cleanup retries.
+[Account controls](docs/ACCOUNT_ACCESS.md).
 
-## Your accounts
+## Development
 
-The bottom-left profile menu keeps account switching close at hand. Each account
-has its own session, encryption store, drafts and credential-vault entry.
-Inactive accounts pause by default.
+**Pre-alpha. No installer release yet.** See the [feature status](docs/FEATURE_MATRIX.md)
+and [release checklist](docs/RELEASE_CHECKLIST.md) before relying on Morpheus.
 
-An optional local app password protects switching and startup restore.
-**Manage accounts** includes direct removal and a retry for incomplete cleanup.
-
-[Account controls →](docs/ACCOUNT_ACCESS.md)
-
-## Try the source
-
-**Pre-alpha — no installer release yet.** Morpheus is still in development and
-is not ready for important conversations or key recovery. See the
-[feature status](docs/FEATURE_MATRIX.md) and [release checklist](docs/RELEASE_CHECKLIST.md).
-
-Install the [native build dependencies](docs/PACKAGING.md), then use the pinned
-Rust toolchain:
+Install the [native build dependencies](docs/PACKAGING.md) and pinned Rust toolchain:
 
 ```sh
 cargo run --locked -p morpheus-app
 ```
 
-Sign in to Matrix or explore the offline preview. Calls require a compatible
-MatrixRTC service. Read the [build policy](AGENTS.md) before running hosted checks.
+Sign in with a Matrix account or explore the offline preview. Calls require a
+compatible MatrixRTC service. Screenshots use fictional accounts.
 
-## Contribute
-
-[Contribution guide](CONTRIBUTING.md) · [Open an issue](https://github.com/brk275/Morpheus/issues) · [Report a vulnerability privately](SECURITY.md)
+[Contribute](CONTRIBUTING.md) · [Build policy](AGENTS.md) · [Issues](https://github.com/brk275/Morpheus/issues) · [Private security reports](SECURITY.md)
 
 ## License
 
-[AGPL-3.0-or-later](LICENSE). See [third-party notices](vendor/README.md) for
-dependency licenses and provenance. Slint attribution is included in About.
+[AGPL-3.0-or-later](LICENSE). [Third-party notices](vendor/README.md).
+Slint attribution is included in About.
