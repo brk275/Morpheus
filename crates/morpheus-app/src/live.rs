@@ -405,8 +405,14 @@ impl LiveUi {
                 return Err(revoked());
             }
         }
-        // From here until the return no other writer can touch any row.
+        // From here until the return no other writer can touch any row. The
+        // wait for the lock is an await like any other: a send that queued
+        // behind the background writer and whose selection ended meanwhile
+        // creates nothing.
         let tx = self.drafts.begin_write_transaction().await;
+        if !draft_recovery::still_owned(selection, scope) {
+            return Err(revoked());
+        }
         let mut prepared = Prepared::default();
         if let Some(root) = thread {
             // The index is made durable before any record exists in the
@@ -4129,6 +4135,69 @@ mod stale_observer_tests {
         live.flush_drafts().await.expect("the flush succeeds");
         assert!(live.drafts.dirty_keys().is_empty());
         assert!(!row_has_record(&manager, &a_account.id, &a_room, None, &nonce).await);
+
+        manager.logout_account(&a_account.id).await.expect("Cannot remove first account");
+        manager.logout_account(&b_account.id).await.expect("Cannot remove second account");
+        manager.stop().await;
+        drop(manager);
+        close_profile(directory, live).await;
+    }
+
+    /// Forced interleaving: a preparation queued behind the writer lock (as
+    /// behind the background flush) whose selection ends while it waits. Once
+    /// the lock is released it creates nothing: no record, no index entry, no
+    /// dirty scope, no grant, no row change.
+    #[tokio::test]
+    async fn a_preparation_waiting_for_the_writer_lock_creates_nothing_once_its_selection_ended() {
+        let Some((alice, carol, a_room)) = fixture() else {
+            eprintln!("Skipped writer-lock wait regression; set MORPHEUS_MATRIX_TEST_ACCOUNTS to opt in.");
+            return;
+        };
+        let (directory, manager, live, a_account, selection) = prepared_live(&alice, &a_room).await;
+        let root = "$behind-the-lock:fixture.invalid";
+        let scope = SendScope {
+            account: a_account.id.clone(),
+            room: a_room.clone(),
+            thread: Some(root.to_owned()),
+        };
+        live.drafts.set(&a_account.id, &a_room, "room text stays");
+        live.drafts.set_scoped(&a_account.id, &a_room, Some(root), "thread reply");
+        live.flush_drafts().await.unwrap();
+        let revision = live.drafts.scoped_revision(&a_account.id, &a_room, Some(root)).unwrap();
+        let dirty_before = live.drafts.dirty_keys();
+        // The writer lock is held, as the background flush would hold it.
+        let held = live.drafts.begin_write_transaction().await;
+        let (prep_live, prep_selection, prep_scope) = (live.clone(), selection.clone(), scope.clone());
+        let prepare = tokio::spawn(async move {
+            prep_live
+                .prepare_pending_send(&prep_selection, &prep_scope, &ComposeText::plain("thread reply"), revision)
+                .await
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!prepare.is_finished(), "the preparation waits for the writer lock");
+        // A -> B -> A while it waits.
+        let b_account = manager
+            .add_password_account(&carol.homeserver_url, &carol.username, &carol.password)
+            .await
+            .expect("Second login failed");
+        manager.switch_to(&a_account.id).await.expect("Cannot switch back");
+        assert!(!selection.is_current());
+        drop(held);
+        let outcome = tokio::time::timeout(Duration::from_secs(30), prepare)
+            .await
+            .expect("the preparation must finish")
+            .unwrap();
+        assert!(matches!(outcome, Err(PrepareError::Store(MatrixCoreError::SelectedAccountChanged))));
+        assert!(live.drafts.pending_items(&a_account.id, &a_room, Some(root)).is_empty(), "no record was created");
+        assert!(!live.drafts.thread_send_pending(&a_account.id, &a_room, root));
+        assert_eq!(live.drafts.dirty_keys(), dirty_before, "no scope was dirtied");
+        let room_row = manager.load_composed_draft_for(&a_account.id, &a_room, None).await.unwrap();
+        assert!(!room_row.envelope.threads().iter().any(|known| known == root), "no index entry was written");
+        assert_eq!(room_row.text.body, "room text stays");
+        let thread_row = manager.load_composed_draft_for(&a_account.id, &a_room, Some(root)).await.unwrap();
+        assert!(thread_row.envelope.pending().is_empty(), "no record was written");
 
         manager.logout_account(&a_account.id).await.expect("Cannot remove first account");
         manager.logout_account(&b_account.id).await.expect("Cannot remove second account");
