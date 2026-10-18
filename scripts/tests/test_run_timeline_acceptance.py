@@ -266,15 +266,15 @@ class FlowTests(RunnerTest):
             "stage": "history_complete", "failure": "history_incomplete"})
 
     def test_seed_failures_report_only_their_fixed_stage(self):
-        for log, stage, reason in (
+        for index, (log, stage, reason) in enumerate((
             ("thread panicked at tests/x.rs:\nMORPHEUS_TIMELINE_SEED_FAILURE enrolled_device_absent\n",
              "enrolled_device_absent", "seed_failed"),
             ("thread panicked at tests/x.rs:\nMORPHEUS_TIMELINE_SEED_FAILURE bob_join\n", "bob_join", "seed_failed"),
             ("test result: ok. 5 passed; 0 failed;\n", None, "seed_incomplete"),
-        ):
+        )):
             with self.subTest(reason=reason):
                 fake = FakeRunner(seed_log=log)
-                work = self.folder / f"work-{reason}"
+                work = self.folder / f"work-seed-failure-{index}"
                 acceptance = runner.Acceptance(self.fixture, self.app, work, fake, HOSTED)
                 with self.assertRaises(runner.StepFailure) as raised:
                     acceptance.run()
