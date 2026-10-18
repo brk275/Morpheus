@@ -473,21 +473,29 @@ impl LiveUi {
 
     /// Undo a failed preparation inside its writer transaction. Only this
     /// call's own steps are undone, and only as far as the selection still
-    /// owns them. `prepared.record == false` means the record never reached
-    /// the store: the transaction held the writer lock since before the record
-    /// existed, so no other writer could have committed it, and it is simply
-    /// dropped from the cache (also after the selection ended). A committed
-    /// record is removed from the cache only after the core granted its exact
-    /// release (nonce, no transaction id) and the selection was re-checked:
-    /// the release, not fresh ownership, authorizes the drop, so a revocation
-    /// during the write cannot leave the cache without a record the row keeps,
-    /// and a failed write is completed by the account-bound flush under that
-    /// release; a refused release leaves cache and row alike for discovery.
-    /// After the selection ended nothing committed is touched, the index entry
-    /// is never removed, no write is made and no flush is scheduled. Each
-    /// write is followed by an ownership re-check before the next write or
-    /// the scheduled flush, and the thread row is written before the room row
-    /// so the core's dropped-index proof sees an idle thread.
+    /// owns them, and the typed submission is never lost. While the composer
+    /// still holds exactly that submission (body, format and mentions) the
+    /// record is dropped, since the text is right there; once the user typed
+    /// on during the preparation the record becomes kept text beside the
+    /// newer composer text instead. `prepared.record == false` means the
+    /// record never reached the store: the transaction held the writer lock
+    /// since before the record existed, so no other writer could have
+    /// committed it, and it is dropped from the cache (also after the
+    /// selection ended) unless it must be kept, in which case it is first made
+    /// durable as the fresh enqueuing record it is. A committed record is
+    /// removed or kept only after the core granted its exact release (nonce,
+    /// no transaction id) and the selection was re-checked, which is also the
+    /// core's one path from an enqueuing record to kept text: the release,
+    /// not fresh ownership, authorizes the change, so a revocation during the
+    /// write cannot leave the cache and the row disagreeing, and a failed
+    /// write is completed by the account-bound flush under that release; a
+    /// refused release leaves cache and row alike for discovery. After the
+    /// selection ended nothing committed is touched, the index entry is never
+    /// removed, no write is made and no flush is scheduled. Each write is
+    /// followed by an ownership re-check before the next write or the
+    /// scheduled flush; the thread row is written before the room row so the
+    /// core's dropped-index proof sees an idle thread, and a thread that keeps
+    /// text keeps its index entry.
     async fn rollback_pending(
         &self,
         tx: &WriteTransaction<'_>,
@@ -497,16 +505,36 @@ impl LiveUi {
         prepared: &Prepared,
     ) {
         let (account, room, thread) = (scope.account.as_str(), scope.room.as_str(), scope.thread());
-        if !prepared.record {
-            self.drafts.drop_uncommitted_pending(account, room, thread, nonce);
-            if !self.undo_added_index(tx, selection, scope, prepared).await {
-                return;
+        if !draft_recovery::still_owned(selection, scope) {
+            if !prepared.record {
+                self.drafts.drop_uncommitted_pending(account, room, thread, nonce);
             }
-            self.queue_draft_write();
             return;
         }
-        if !draft_recovery::still_owned(selection, scope) {
-            return;
+        let unchanged = self.drafts.composer_holds_record(account, room, thread, nonce);
+        if !prepared.record {
+            if unchanged {
+                self.drafts.drop_uncommitted_pending(account, room, thread, nonce);
+                if !self.undo_added_index(tx, selection, scope, prepared).await {
+                    return;
+                }
+                self.queue_draft_write();
+                return;
+            }
+            // The submission exists only in the cache and the composer moved
+            // on: make it durable before it can be kept.
+            if tx.persist_scoped(&self.manager, account, room, thread).await.is_err() {
+                // The store is not reachable now. The text stays in the cache
+                // for review; the account-bound flush writes it as the
+                // enqueuing record it is and the next discovery reports it as
+                // unconfirmed. Nothing is dropped.
+                self.drafts
+                    .set_pending_status(account, room, thread, nonce, PendingStatus::Unconfirmed);
+                return;
+            }
+            if !draft_recovery::still_owned(selection, scope) {
+                return;
+            }
         }
         if self
             .manager
@@ -514,7 +542,7 @@ impl LiveUi {
             .await
             .is_err()
         {
-            // No exact authority to drop it: the record stays in cache and
+            // No exact authority to change it: the record stays in cache and
             // row alike, and the next discovery reports it as unconfirmed.
             return;
         }
@@ -523,7 +551,11 @@ impl LiveUi {
         if !draft_recovery::still_owned(selection, scope) {
             return;
         }
-        self.drafts.abandon_pending(account, room, thread, nonce);
+        if unchanged {
+            self.drafts.abandon_pending(account, room, thread, nonce);
+        } else {
+            self.drafts.keep_pending(account, room, thread, nonce);
+        }
         #[cfg(test)]
         self.pauses.reach("rollback.before_write").await;
         // Best effort: the release outlives this write, so a failed write is
@@ -604,8 +636,9 @@ impl LiveUi {
     ) {
         // Both steps reached the row before the SDK boundary refused. The
         // cache is not touched here: the rollback removes the committed record
-        // only under the core's exact release, while the selection still owns
-        // the scope; otherwise the record stays for the next discovery.
+        // (or keeps its text, if the composer moved on meanwhile) only under
+        // the core's exact release, while the selection still owns the scope;
+        // otherwise the record stays for the next discovery.
         if !draft_recovery::still_owned(selection, scope)
             || self
                 .drafts
@@ -4203,6 +4236,133 @@ mod stale_observer_tests {
 
         manager.logout_account(&a_account.id).await.expect("Cannot remove first account");
         manager.logout_account(&b_account.id).await.expect("Cannot remove second account");
+        manager.stop().await;
+        drop(manager);
+        close_profile(directory, live).await;
+    }
+
+    fn typed_with_mention(prefix: &str, user_id: &str) -> ComposeText {
+        let body = format!("{prefix} {user_id} **soon**");
+        let start = body.find(user_id).unwrap();
+        ComposeText::new(body, TextFormat::Markdown)
+            .insert_mention(start..start + user_id.len(), morpheus_matrix::MentionTarget::User(user_id.to_owned()))
+            .expect("Cannot encode the mention")
+            .0
+    }
+
+    /// Forced interleaving: the user keeps typing while a preparation awaits,
+    /// then the send fails definitely before enqueue. The submitted text, with
+    /// its format and mention, is kept beside the newer composer text through
+    /// the core's exact release; the newer text is untouched. With the
+    /// composer unchanged the record is simply dropped and nothing is
+    /// duplicated.
+    #[tokio::test]
+    async fn a_submission_typed_over_during_preparation_is_kept_on_a_definite_failure() {
+        let Some((alice, _carol, a_room)) = fixture() else {
+            eprintln!("Skipped retention regression; set MORPHEUS_MATRIX_TEST_ACCOUNTS to opt in.");
+            return;
+        };
+        let (directory, manager, live, a_account, selection) = prepared_live(&alice, &a_room).await;
+        let scope = SendScope {
+            account: a_account.id.clone(),
+            room: a_room.clone(),
+            thread: None,
+        };
+        let submitted = typed_with_mention("mention", &a_account.user_id);
+        live.drafts.set_composed_scoped(&a_account.id, &a_room, None, submitted.clone()).unwrap();
+        let revision = live.drafts.revision(&a_account.id, &a_room).unwrap();
+        let point = live.pauses.install("prepare.after_begin");
+        let (prep_live, prep_selection, prep_scope, prep_text) = (live.clone(), selection.clone(), scope.clone(), submitted.clone());
+        let prepare = tokio::spawn(async move {
+            prep_live.prepare_pending_send(&prep_selection, &prep_scope, &prep_text, revision).await
+        });
+        point.entered().await;
+        // Typing continues while the preparation awaits its write.
+        live.drafts.set(&a_account.id, &a_room, "typed over it meanwhile");
+        point.proceed();
+        let handle = tokio::time::timeout(Duration::from_secs(30), prepare)
+            .await
+            .expect("the preparation must finish")
+            .unwrap()
+            .expect("the preparation succeeds");
+        let nonce = handle.nonce().clone();
+        // A definite pre-enqueue failure: the controller abandons the send.
+        live.abandon_pending_send(&selection, &scope, &nonce).await;
+        assert_eq!(live.drafts.record_status(&a_account.id, &a_room, None, &nonce), Some(PendingStatus::Kept));
+        assert_eq!(live.drafts.record_text(&a_account.id, &a_room, None, &nonce), Some(submitted.clone()), "the exact typed submission, format and mention, is kept");
+        assert_eq!(live.drafts.get(&a_account.id, &a_room), "typed over it meanwhile", "the newer text is untouched");
+        let row = manager.load_composed_draft_for(&a_account.id, &a_room, None).await.unwrap();
+        let record = row.envelope.find(&nonce).expect("the kept record is in the row");
+        assert!(record.is_kept());
+        assert_eq!(record.text().to_compose().unwrap(), submitted);
+        assert_eq!(row.text.body, "typed over it meanwhile");
+        live.flush_drafts().await.unwrap();
+        assert!(live.drafts.dirty_keys().is_empty());
+        // Unchanged composer: the record is dropped, the text stays once.
+        live.drafts.set(&a_account.id, &a_room, "unchanged submission");
+        let revision = live.drafts.revision(&a_account.id, &a_room).unwrap();
+        let again = live
+            .prepare_pending_send(&selection, &scope, &ComposeText::plain("unchanged submission"), revision)
+            .await
+            .expect("the second preparation succeeds");
+        let second = again.nonce().clone();
+        live.abandon_pending_send(&selection, &scope, &second).await;
+        assert!(live.drafts.record_status(&a_account.id, &a_room, None, &second).is_none(), "dropped, not kept");
+        assert_eq!(live.drafts.get(&a_account.id, &a_room), "unchanged submission");
+        let row = manager.load_composed_draft_for(&a_account.id, &a_room, None).await.unwrap();
+        assert!(row.envelope.find(&second).is_none());
+        assert!(row.envelope.find(&nonce).is_some_and(|record| record.is_kept()), "the earlier kept text remains");
+
+        manager.logout_account(&a_account.id).await.expect("Cannot remove the account");
+        manager.stop().await;
+        drop(manager);
+        close_profile(directory, live).await;
+    }
+
+    /// The same for a thread: the kept record keeps its room index entry, so
+    /// discovery still finds it.
+    #[tokio::test]
+    async fn a_thread_submission_typed_over_during_preparation_is_kept_with_its_index() {
+        let Some((alice, _carol, a_room)) = fixture() else {
+            eprintln!("Skipped thread retention regression; set MORPHEUS_MATRIX_TEST_ACCOUNTS to opt in.");
+            return;
+        };
+        let (directory, manager, live, a_account, selection) = prepared_live(&alice, &a_room).await;
+        let root = "$kept-thread:fixture.invalid";
+        let scope = SendScope {
+            account: a_account.id.clone(),
+            room: a_room.clone(),
+            thread: Some(root.to_owned()),
+        };
+        let submitted = typed_with_mention("thread mention", &a_account.user_id);
+        live.drafts.set_composed_scoped(&a_account.id, &a_room, Some(root), submitted.clone()).unwrap();
+        let revision = live.drafts.scoped_revision(&a_account.id, &a_room, Some(root)).unwrap();
+        let point = live.pauses.install("prepare.after_begin");
+        let (prep_live, prep_selection, prep_scope, prep_text) = (live.clone(), selection.clone(), scope.clone(), submitted.clone());
+        let prepare = tokio::spawn(async move {
+            prep_live.prepare_pending_send(&prep_selection, &prep_scope, &prep_text, revision).await
+        });
+        point.entered().await;
+        live.drafts.set_scoped(&a_account.id, &a_room, Some(root), "newer thread text");
+        point.proceed();
+        let handle = tokio::time::timeout(Duration::from_secs(30), prepare)
+            .await
+            .expect("the preparation must finish")
+            .unwrap()
+            .expect("the preparation succeeds");
+        let nonce = handle.nonce().clone();
+        live.abandon_pending_send(&selection, &scope, &nonce).await;
+        assert_eq!(live.drafts.record_status(&a_account.id, &a_room, Some(root), &nonce), Some(PendingStatus::Kept));
+        assert_eq!(live.drafts.record_text(&a_account.id, &a_room, Some(root), &nonce), Some(submitted.clone()));
+        let thread_row = manager.load_composed_draft_for(&a_account.id, &a_room, Some(root)).await.unwrap();
+        assert!(thread_row.envelope.find(&nonce).is_some_and(|record| record.is_kept()));
+        assert_eq!(thread_row.text.body, "newer thread text");
+        let room_row = manager.load_composed_draft_for(&a_account.id, &a_room, None).await.unwrap();
+        assert!(room_row.envelope.threads().iter().any(|known| known == root), "a thread with kept text keeps its index entry");
+        live.flush_drafts().await.unwrap();
+        assert!(live.drafts.dirty_keys().is_empty());
+
+        manager.logout_account(&a_account.id).await.expect("Cannot remove the account");
         manager.stop().await;
         drop(manager);
         close_profile(directory, live).await;

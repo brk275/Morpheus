@@ -970,6 +970,44 @@ impl DraftStore {
             .map(|pending| pending.text.clone())
     }
 
+    /// Whether the composer of this scope still holds exactly the typed
+    /// submission a record was created from (body, format and mentions).
+    pub fn composer_holds_record(
+        &self,
+        account: &str,
+        room: &str,
+        thread: Option<&str>,
+        nonce: &Generation,
+    ) -> bool {
+        let drafts = self.by_room.lock().expect("draft mutex poisoned");
+        let Some(draft) = drafts.get(&key(account, room, thread)) else {
+            return false;
+        };
+        draft
+            .pending
+            .iter()
+            .any(|pending| pending.nonce == *nonce && pending.text == draft.text)
+    }
+
+    /// Turn an awaiting record that never received an id into kept text, so a
+    /// submission the composer no longer holds stays recoverable beside the
+    /// newer text. This changes the row (the caller writes it under the
+    /// core's exact release); `set_pending_status` deliberately refuses it.
+    pub fn keep_pending(&self, account: &str, room: &str, thread: Option<&str>, nonce: &Generation) -> bool {
+        let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
+        let Some(draft) = drafts.get_mut(&key(account, room, thread)) else {
+            return false;
+        };
+        let Some(pending) = draft.pending.iter_mut().find(|pending| {
+            pending.nonce == *nonce && pending.awaits_send() && pending.transaction_id.is_none()
+        }) else {
+            return false;
+        };
+        pending.status = PendingStatus::Kept;
+        draft.changed();
+        true
+    }
+
     /// Explicitly discard kept text. Only kept records can be discarded; a
     /// record that still represents a send is resolved by its outcome.
     pub fn discard_kept(
@@ -1879,6 +1917,35 @@ mod tests {
         frozen.set_scoped("a", "frozen", Some(root), "reply");
         assert!(matches!(frozen.index_thread("a", "frozen", root), Err(PendingError::Unreadable)));
         assert!(frozen.snapshot("a", "frozen", Some(root)).unwrap().1.pending().is_empty());
+    }
+
+    #[test]
+    fn a_record_is_kept_only_when_the_composer_no_longer_holds_its_exact_submission() {
+        let drafts = DraftStore::default();
+        let typed = typed();
+        let handle = begin_typed(&drafts, "a", "room", None, typed.clone());
+        assert!(drafts.composer_holds_record("a", "room", None, handle.nonce()));
+        // The same body in another format is not the same submission.
+        drafts.set_composed_scoped("a", "room", None, ComposeText::plain(typed.body.clone())).unwrap();
+        assert!(!drafts.composer_holds_record("a", "room", None, handle.nonce()));
+        drafts.set_composed_scoped("a", "room", None, typed.clone()).unwrap();
+        assert!(drafts.composer_holds_record("a", "room", None, handle.nonce()));
+        drafts.set("a", "room", "something newer");
+        assert!(!drafts.composer_holds_record("a", "room", None, handle.nonce()));
+        // Keeping turns the id-less awaiting record into kept text with its
+        // exact typed submission, dirties the scope, and leaves the newer
+        // composer text alone; a record with an id is never kept this way.
+        drafts.clear_dirty_like_a_write_would("a", "room", None);
+        assert!(drafts.keep_pending("a", "room", None, handle.nonce()));
+        assert!(drafts.dirty_keys().contains(&key("a", "room", None)));
+        assert_eq!(drafts.record_status("a", "room", None, handle.nonce()), Some(PendingStatus::Kept));
+        assert_eq!(drafts.record_text("a", "room", None, handle.nonce()), Some(typed));
+        assert_eq!(drafts.get("a", "room"), "something newer");
+        assert!(!drafts.keep_pending("a", "room", None, handle.nonce()), "kept once");
+        let queued = begin(&drafts, "a", "room", None, "something newer");
+        drafts.mark_pending_queued("a", "room", None, &queued, &"5".repeat(32));
+        assert!(!drafts.keep_pending("a", "room", None, queued.nonce()));
+        assert_eq!(drafts.pending_summary("a", "room", None).kept, 1);
     }
 
     #[test]

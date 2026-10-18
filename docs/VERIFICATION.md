@@ -2941,7 +2941,15 @@ exact release (nonce, no transaction id) and ownership was re-checked, so a
 revocation during the rollback write cannot leave the cache without a record
 the row keeps: the release, not fresh ownership, authorizes the drop, the
 account-bound flush completes a failed write, and a refused release leaves
-cache and row alike for discovery. `persist_scope_and_index` re-checks before
+cache and row alike for discovery. The typed submission is never lost by a
+definite pre-enqueue failure: the composer stays editable during the
+preparation, and if the user typed on meanwhile the record becomes kept text
+(through the same exact release, the core's one path from enqueuing to kept)
+beside the newer composer text, with a thread keeping its index entry; a
+never-written record that must be kept is first made durable, and if even that
+write fails it stays in the cache for review rather than being dropped. An
+unchanged composer simply drops the record, so nothing is duplicated.
+`persist_scope_and_index` re-checks before
 touching the room index and before scheduling a retry. Re-seeding
 a scope the cache kept across an account switch marks every awaiting record
 restored (queued only where discovery attached the exact request, otherwise
