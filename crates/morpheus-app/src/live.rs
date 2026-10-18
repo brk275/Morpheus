@@ -86,6 +86,17 @@ pub struct LiveUi {
     space_scan_epoch: AtomicU64,
 }
 
+/// Which steps of one send preparation reached the encrypted row. Steps that
+/// did not are the cache's alone and may be dropped without a write; steps
+/// that did are durable and survive the selection that created them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Prepared {
+    /// The enqueuing record was written to its scope's row.
+    record: bool,
+    /// The thread root was written into the room's index row.
+    index: bool,
+}
+
 impl LiveUi {
     pub fn new(
         manager: Arc<AccountManager>,
@@ -298,8 +309,9 @@ impl LiveUi {
         text: &ComposeText,
         revision: u64,
     ) -> Result<PendingHandle, PrepareError> {
-        if !selection.is_current() || selection.account_id() != scope.account {
-            return Err(PrepareError::Store(MatrixCoreError::SelectedAccountChanged));
+        let revoked = || PrepareError::Store(MatrixCoreError::SelectedAccountChanged);
+        if !draft_recovery::still_owned(selection, scope) {
+            return Err(revoked());
         }
         let (account, room, thread) = (scope.account.as_str(), scope.room.as_str(), scope.thread());
         if thread.is_some() {
@@ -309,23 +321,35 @@ impl LiveUi {
                 .load_if_missing(&self.manager, account, room)
                 .await
                 .map_err(PrepareError::Store)?;
+            // Nothing of ours exists yet; a selection that ended during the
+            // read simply stops here.
+            if !draft_recovery::still_owned(selection, scope) {
+                return Err(revoked());
+            }
         }
         let handle = self
             .drafts
             .begin_pending(account, room, thread, text, revision)
             .map_err(PrepareError::Record)?;
+        let mut prepared = Prepared::default();
         if let Err(error) = self
             .drafts
             .persist_scoped(&self.manager, account, room, thread)
             .await
         {
-            self.drafts
-                .abandon_pending(account, room, thread, handle.nonce());
+            self.rollback_pending(selection, scope, handle.nonce(), &prepared).await;
             return Err(PrepareError::Store(error));
+        }
+        prepared.record = true;
+        // From here the enqueuing record is durable. If the selection ended
+        // while it was written, the row keeps it for the next discovery to
+        // review; nothing of the departed account's cache is touched.
+        if !draft_recovery::still_owned(selection, scope) {
+            return Err(revoked());
         }
         if let Some(root) = thread {
             if let Err(error) = self.drafts.index_thread(account, room, root) {
-                self.rollback_pending(scope, handle.nonce()).await;
+                self.rollback_pending(selection, scope, handle.nonce(), &prepared).await;
                 return Err(PrepareError::Record(error));
             }
             if let Err(error) = self
@@ -333,23 +357,57 @@ impl LiveUi {
                 .persist_scoped(&self.manager, account, room, None)
                 .await
             {
-                self.rollback_pending(scope, handle.nonce()).await;
+                self.rollback_pending(selection, scope, handle.nonce(), &prepared).await;
                 return Err(PrepareError::Store(error));
             }
+            prepared.index = true;
+            if !draft_recovery::still_owned(selection, scope) {
+                return Err(revoked());
+            }
         }
-        if let Err(error) = self
+        match self
             .manager
             .grant_enqueue_for(selection, room, thread, handle.nonce())
             .await
         {
-            self.rollback_pending(scope, handle.nonce()).await;
-            return Err(PrepareError::Store(error));
+            Ok(()) if draft_recovery::still_owned(selection, scope) => Ok(handle),
+            // The core refused because the selection ended (or it ended right
+            // after): the durable record stays for review.
+            Ok(()) | Err(MatrixCoreError::SelectedAccountChanged) => Err(revoked()),
+            Err(error) => {
+                self.rollback_pending(selection, scope, handle.nonce(), &prepared).await;
+                Err(PrepareError::Store(error))
+            }
         }
-        Ok(handle)
     }
 
-    async fn rollback_pending(&self, scope: &SendScope, nonce: &Generation) {
+    /// Undo a failed preparation. Only this call's own steps are undone, and
+    /// only as far as the selection still owns them: a step that never reached
+    /// the row is dropped from the cache (the cache is otherwise ahead of the
+    /// row), a committed step is rolled back with a write only while the
+    /// selection is current, and after the selection ended nothing committed
+    /// is touched, nothing is unindexed and no write is scheduled. The
+    /// durable enqueuing record then belongs to the next discovery, which
+    /// restores it as unconfirmed.
+    async fn rollback_pending(
+        &self,
+        selection: &AccountSelection,
+        scope: &SendScope,
+        nonce: &Generation,
+        prepared: &Prepared,
+    ) {
         let (account, room, thread) = (scope.account.as_str(), scope.room.as_str(), scope.thread());
+        if !draft_recovery::still_owned(selection, scope) {
+            if !prepared.record {
+                self.drafts.drop_uncommitted_pending(account, room, thread, nonce);
+            }
+            if let Some(root) = thread
+                && !prepared.index
+            {
+                self.drafts.drop_uncommitted_index(account, room, root);
+            }
+            return;
+        }
         self.drafts.abandon_pending(account, room, thread, nonce);
         if let Some(root) = thread {
             self.drafts.unindex_thread_if_idle(account, room, root);
@@ -407,12 +465,19 @@ impl LiveUi {
         scope: &SendScope,
         nonce: &Generation,
     ) {
+        // Both steps reached the row before the SDK boundary refused; while
+        // the selection still owns the scope the fresh record is rolled back
+        // exactly, otherwise it stays for the next discovery.
         if draft_recovery::still_owned(selection, scope)
             && self
                 .drafts
                 .abandon_pending(&scope.account, &scope.room, scope.thread(), nonce)
         {
-            self.rollback_pending(scope, nonce).await;
+            let prepared = Prepared {
+                record: true,
+                index: scope.thread().is_some(),
+            };
+            self.rollback_pending(selection, scope, nonce, &prepared).await;
         }
     }
 
@@ -454,8 +519,15 @@ impl LiveUi {
             self.queue_draft_write();
             return;
         }
+        // The index is touched only while the selection still owns the scope;
+        // a switch during the write leaves the room row to the background
+        // flush and the next activation.
+        if !draft_recovery::still_owned(selection, scope) {
+            return;
+        }
         if let Some(root) = thread
             && self.drafts.unindex_thread_if_idle(account, room, root)
+            && draft_recovery::still_owned(selection, scope)
             && self
                 .drafts
                 .persist_scoped(&self.manager, account, room, None)
@@ -3254,6 +3326,116 @@ mod stale_observer_tests {
         manager.logout_account(&b_account.id).await.expect("Cannot remove second account");
         manager.stop().await;
         drop(live);
+        drop(manager);
+        directory.close().unwrap();
+    }
+
+    /// A send preparation interrupted by an account switch. The enqueuing
+    /// record it committed stays in the row for discovery; the stale
+    /// continuation's rollback changes nothing in the departed cache and
+    /// schedules no write; the renewed selection re-seeds the record as
+    /// unconfirmed; and the account-bound flush still succeeds afterwards, so
+    /// the cache and the row never diverge.
+    #[tokio::test]
+    async fn interrupted_prepare_keeps_its_committed_record_for_discovery_and_leaves_the_cache_consistent() {
+        let Some((alice, carol, a_room)) = fixture() else {
+            eprintln!("Skipped interrupted prepare regression; set MORPHEUS_MATRIX_TEST_ACCOUNTS to opt in.");
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let manager = Arc::new(AccountManager::open(directory.path().join("profile")).unwrap());
+        let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
+            directory.path().join("config.toml"),
+        )));
+        let live = LiveUi::new(manager.clone(), Handle::current(), Weak::default(), voices);
+        let a_account = manager
+            .add_password_account(&alice.homeserver_url, &alice.username, &alice.password)
+            .await
+            .expect("First login failed");
+        wait_for_room(&manager, &a_room).await;
+        let selection = manager.account_selection(&a_account.id).expect("Selection missing");
+        manager.take_recovered_drafts(&selection).await.unwrap();
+        live.is_live.store(true, Ordering::Release);
+        *live.selected_room.lock().await = Some(a_room.clone());
+        let scope = SendScope {
+            account: a_account.id.clone(),
+            room: a_room.clone(),
+            thread: None,
+        };
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let text = ComposeText::plain(format!("interrupted-prepare-{unique}"));
+        live.drafts.set(&a_account.id, &a_room, &text.body);
+        let revision = live.drafts.revision(&a_account.id, &a_room).unwrap();
+        // The preparation completes under the first selection: the enqueuing
+        // record is in the row and granted, but the send never happens.
+        let handle = live
+            .prepare_pending_send(&selection, &scope, &text, revision)
+            .await
+            .expect("the record is durable before enqueue");
+        let nonce = handle.nonce().clone();
+        let status = || live.drafts.record_status(&a_account.id, &a_room, None, &nonce);
+        assert_eq!(status(), Some(PendingStatus::Enqueuing));
+        let in_row = || async {
+            manager
+                .load_composed_draft_for(&a_account.id, &a_room, None)
+                .await
+                .unwrap()
+                .envelope
+                .find(&nonce)
+                .map(|record| record.is_queued())
+        };
+        assert_eq!(in_row().await, Some(false), "committed as enqueuing");
+
+        // A -> B -> A while the preparation's continuation is still pending.
+        let b_account = manager
+            .add_password_account(&carol.homeserver_url, &carol.username, &carol.password)
+            .await
+            .expect("Second login failed");
+        assert!(!selection.is_current());
+        manager.switch_to(&a_account.id).await.expect("Cannot switch back");
+        let renewed = manager.account_selection(&a_account.id).expect("Renewed selection missing");
+        // A late preparation under the old selection is refused at entry.
+        assert!(matches!(
+            live.prepare_pending_send(&selection, &scope, &text, revision).await,
+            Err(PrepareError::Store(MatrixCoreError::SelectedAccountChanged))
+        ));
+        // The stale continuation's rollback (its grant having failed with the
+        // selection) touches nothing committed and writes nothing.
+        let dirty_before = live.drafts.dirty_keys();
+        live.rollback_pending(&selection, &scope, &nonce, &Prepared { record: true, index: false }).await;
+        assert_eq!(status(), Some(PendingStatus::Enqueuing), "the departed cache is left alone");
+        assert_eq!(live.drafts.dirty_keys(), dirty_before, "no write was scheduled");
+        assert_eq!(in_row().await, Some(false), "the committed record is preserved for discovery");
+        // The renewed selection re-seeds the scope: the id-less record is now
+        // an unconfirmed record awaiting the user's review, the row is still
+        // writable, and the account-bound flush does not get stuck.
+        live.adopt_recovered_sends(renewed.clone(), Weak::default()).await;
+        assert_eq!(status(), Some(PendingStatus::Unconfirmed));
+        assert_eq!(in_row().await, Some(false));
+        live.drafts.set(&a_account.id, &a_room, "typed after the switch");
+        live.flush_drafts().await.expect("the cache flushes without dropping the restored record");
+        assert_eq!(in_row().await, Some(false), "a flush keeps the restored record");
+        assert!(live.drafts.dirty_keys().is_empty());
+        // Nothing of ours may replay it under the new selection.
+        assert!(matches!(
+            manager.grant_enqueue_for(&renewed, &a_room, None, &nonce).await,
+            Err(MatrixCoreError::PendingSendUnknown)
+        ));
+
+        manager.logout_account(&a_account.id).await.expect("Cannot remove first account");
+        manager.logout_account(&b_account.id).await.expect("Cannot remove second account");
+        manager.stop().await;
+        drop(live);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while Arc::strong_count(&manager) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the draft worker must release the profile");
         drop(manager);
         directory.close().unwrap();
     }

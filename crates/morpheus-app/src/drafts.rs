@@ -659,6 +659,45 @@ impl DraftStore {
         true
     }
 
+    /// Drop an enqueuing record that never reached the row: the cache was
+    /// ahead of the row, so removing it reconciles the two. No write is
+    /// scheduled and the dirty flag is left as it was, because this is a
+    /// reconciliation of the cache, not a change the row has to learn.
+    pub fn drop_uncommitted_pending(
+        &self,
+        account: &str,
+        room: &str,
+        thread: Option<&str>,
+        nonce: &Generation,
+    ) -> bool {
+        let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
+        let Some(draft) = drafts.get_mut(&key(account, room, thread)) else {
+            return false;
+        };
+        let Some(index) = draft.pending.iter().position(|pending| {
+            pending.nonce == *nonce
+                && pending.transaction_id.is_none()
+                && pending.status == PendingStatus::Enqueuing
+        }) else {
+            return false;
+        };
+        draft.pending.remove(index);
+        true
+    }
+
+    /// Drop a thread root from the room's cached index when the index entry
+    /// never reached the room row. Like `drop_uncommitted_pending`, this
+    /// reconciles the cache without scheduling a write.
+    pub fn drop_uncommitted_index(&self, account: &str, room: &str, root: &str) -> bool {
+        let mut drafts = self.by_room.lock().expect("draft mutex poisoned");
+        let Some(draft) = drafts.get_mut(&key(account, room, None)) else {
+            return false;
+        };
+        let before = draft.threads.len();
+        draft.threads.retain(|known| known != root);
+        draft.threads.len() != before
+    }
+
     /// Record the exact SDK transaction id. Returns whether the submission was
     /// cleared from the composer, which happens only when the composer is
     /// unchanged since `begin_pending`; the record keeps the text either way.
@@ -1133,11 +1172,19 @@ impl DraftStore {
                 let Some(attached) = attached else {
                     return;
                 };
+                // A re-selection re-seeds a scope the cache kept across the
+                // switch. Every awaiting record from before it is a restored
+                // record now: queued only where discovery attached the exact
+                // SDK request, otherwise unconfirmed, including a record that
+                // never received its id (its grant died with the old epoch).
+                // Kept text stays kept.
                 for pending in &mut entry.get_mut().pending {
-                    if pending.transaction_id.is_none() || !pending.awaits_send() {
+                    if !pending.awaits_send() {
                         continue;
                     }
-                    pending.status = if attached.contains(&pending.nonce) {
+                    pending.status = if pending.transaction_id.is_some()
+                        && attached.contains(&pending.nonce)
+                    {
                         PendingStatus::Queued
                     } else {
                         PendingStatus::Unconfirmed
@@ -1691,6 +1738,76 @@ mod tests {
         assert!(drafts.discard_quarantine("a", "room", None, &revision));
         assert!(drafts.clear_dirty_like_a_write_would("a", "room", None), "writes resume after the explicit discard");
         assert!(!drafts.pending_summary("a", "room", None).blocks_sends());
+    }
+
+    #[test]
+    fn re_seeding_a_kept_scope_marks_every_awaiting_record_restored_and_keeps_kept_text() {
+        let drafts = DraftStore::default();
+        drafts.set("a", "room", "first");
+        let enqueuing = begin(&drafts, "a", "room", None, "first");
+        drafts.set("a", "room", "second");
+        let queued = begin(&drafts, "a", "room", None, "second");
+        drafts.mark_pending_queued("a", "room", None, &queued, &"1".repeat(32));
+        drafts.set("a", "room", "third");
+        let lost = begin(&drafts, "a", "room", None, "third");
+        drafts.mark_pending_queued("a", "room", None, &lost, &"2".repeat(32));
+        drafts.set("a", "room", "fourth");
+        let kept = begin(&drafts, "a", "room", None, "fourth");
+        drafts.mark_pending_queued("a", "room", None, &kept, &"3".repeat(32));
+        drafts.set("a", "room", "typed over");
+        let kept_txn = "3".repeat(32);
+        assert!(drafts.resolve_pending("a", "room", None, kept.nonce(), Some(kept_txn.as_str()), false).unwrap().kept);
+        assert_eq!(
+            statuses(&drafts, "a", "room", None),
+            [PendingStatus::Enqueuing, PendingStatus::Queued, PendingStatus::Queued, PendingStatus::Kept]
+        );
+        // The cache survived an account switch; the renewed selection seeds
+        // the same scope with the exact requests discovery attached.
+        let (saved, envelope) = drafts.snapshot("a", "room", None).unwrap();
+        let html = saved.encode_draft(&envelope).unwrap();
+        let restored = ComposeText::restore_draft(saved.body.clone(), Some(&html));
+        drafts.seed_recovered("a", "room", None, restored, &[queued.nonce().clone()], drafts.account_epoch("a"));
+        assert_eq!(
+            statuses(&drafts, "a", "room", None),
+            [PendingStatus::Unconfirmed, PendingStatus::Queued, PendingStatus::Unconfirmed, PendingStatus::Kept],
+            "an id-less record is unconfirmed, an unattached queued one too, kept text stays kept"
+        );
+        assert_eq!(drafts.get("a", "room"), "typed over", "the live text is not replaced");
+        assert!(matches!(
+            drafts.begin_pending("a", "room", None, &text("typed over"), drafts.revision("a", "room").unwrap()),
+            Err(PendingError::Unconfirmed)
+        ));
+        let _ = enqueuing;
+    }
+
+    #[test]
+    fn uncommitted_steps_are_dropped_without_scheduling_a_write() {
+        let drafts = DraftStore::default();
+        drafts.set("a", "room", "text");
+        assert!(drafts.clear_dirty_like_a_write_would("a", "room", None));
+        let handle = begin(&drafts, "a", "room", None, "text");
+        assert!(drafts.is_dirty("a", "room", None), "beginning a record dirties the scope");
+        assert!(drafts.clear_dirty_like_a_write_would("a", "room", None), "the write was attempted");
+        // The write failed: the record never reached the row. Dropping it
+        // reconciles the cache and leaves the dirty flag as it is.
+        assert!(drafts.drop_uncommitted_pending("a", "room", None, handle.nonce()));
+        assert!(!drafts.is_dirty("a", "room", None));
+        assert!(drafts.pending_items("a", "room", None).is_empty());
+        assert!(!drafts.drop_uncommitted_pending("a", "room", None, handle.nonce()));
+        // A record that has an id is never dropped this way.
+        let queued = begin(&drafts, "a", "room", None, "text");
+        drafts.mark_pending_queued("a", "room", None, &queued, &"4".repeat(32));
+        assert!(!drafts.drop_uncommitted_pending("a", "room", None, queued.nonce()));
+        // An index entry that never reached the room row is dropped the same
+        // way; one the row already has is left for the exact idle rule.
+        drafts.clear_dirty_like_a_write_would("a", "room", None);
+        drafts.index_thread("a", "room", "$root:example.org").unwrap();
+        assert!(drafts.is_dirty("a", "room", None));
+        drafts.clear_dirty_like_a_write_would("a", "room", None);
+        assert!(drafts.drop_uncommitted_index("a", "room", "$root:example.org"));
+        assert!(!drafts.is_dirty("a", "room", None));
+        assert!(!drafts.drop_uncommitted_index("a", "room", "$root:example.org"));
+        assert!(drafts.snapshot("a", "room", None).unwrap().1.threads().is_empty());
     }
 
     #[test]
