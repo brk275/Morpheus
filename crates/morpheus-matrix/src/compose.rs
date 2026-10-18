@@ -874,7 +874,7 @@ mod tests {
         assert!(envelope.mark_queued(&nonce, "abcdef0123456789abcdef0123456789"));
         envelope.index_thread("$root:example.org").unwrap();
         // The live text moves on; the record keeps the submitted text.
-        let live = ComposeText::new("something newer".into(), TextFormat::Markdown);
+        let live = ComposeText::new("something newer", TextFormat::Markdown);
         envelope.set_generation(Generation::fresh());
         let html = live.encode_draft(&envelope).unwrap();
         assert!(html.contains("data-morpheus-compose=\"2\""));

@@ -1682,12 +1682,24 @@ mod tests {
                 .transaction_id,
             TXN_ONE
         );
-        // Cancelling the first with an empty composer restores its exact text.
+        // The second submission owns a newer generation, even after its text
+        // left the composer. Keep the first text until an explicit restore.
         let resolution = drafts
             .resolve_pending("a", "room", None, first.nonce(), Some(TXN_ONE), false)
             .unwrap();
-        assert_eq!(resolution.restored.unwrap(), typed());
-        assert!(!resolution.kept);
+        assert!(resolution.restored.is_none() && resolution.kept);
+        assert_eq!(drafts.get("a", "room"), "");
+        assert_eq!(
+            drafts
+                .record_text("a", "room", None, first.nonce())
+                .unwrap(),
+            typed()
+        );
+        let revision = drafts.scoped_revision("a", "room", None).unwrap();
+        let restored = drafts
+            .restore_record_text("a", "room", None, first.nonce(), revision)
+            .unwrap();
+        assert_eq!(restored.restored.unwrap(), typed());
         assert_eq!(drafts.get_composed_scoped("a", "room", None), typed());
         assert_eq!(
             drafts.pending_summary("a", "room", None),
@@ -2081,12 +2093,22 @@ mod tests {
                 )
                 .is_err()
         );
-        // Reviewing the first as not sent restores its own text; the second
-        // record is untouched.
+        // The newer queued submission owns the empty composer generation.
+        // Review keeps the first text; restoring it is a separate user action.
         let resolution = drafts
             .review_unconfirmed("a", "room", None, first.nonce(), false)
             .unwrap();
-        assert_eq!(resolution.restored.unwrap().body, "first");
+        assert!(resolution.restored.is_none() && resolution.kept);
+        assert_eq!(drafts.get("a", "room"), "");
+        assert_eq!(
+            statuses(&drafts, "a", "room", None),
+            [PendingStatus::Kept, PendingStatus::Queued]
+        );
+        let revision = drafts.scoped_revision("a", "room", None).unwrap();
+        let restored = drafts
+            .restore_record_text("a", "room", None, first.nonce(), revision)
+            .unwrap();
+        assert_eq!(restored.restored.unwrap().body, "first");
         assert_eq!(
             statuses(&drafts, "a", "room", None),
             [PendingStatus::Queued]

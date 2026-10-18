@@ -1527,6 +1527,7 @@ mod tests {
                         room_id,
                         None,
                         &ComposeText::plain("delayed draft"),
+                        &DraftEnvelope::fresh(),
                     )
                     .await,
                 Err(MatrixCoreError::AccountRemovalPending)
@@ -1789,6 +1790,11 @@ mod tests {
                 client: client.clone(),
                 timelines: Mutex::new(HashMap::new()),
                 composed_edits: Mutex::new(HashMap::new()),
+                pending_sends: Mutex::new(HashMap::new()),
+                originals: Mutex::new(HashMap::new()),
+                recovered: Mutex::new(Vec::new()),
+                recovery_gate: Mutex::new(RecoveryGate::default()),
+                recovery_ready: watch::channel(false).0,
                 incoming_verification_tx,
                 notification_handler_registered: Mutex::new(false),
                 token_task: Mutex::new(Some(SyncTask {
