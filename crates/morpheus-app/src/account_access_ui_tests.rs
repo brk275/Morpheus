@@ -1945,6 +1945,64 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
     settle(ui).await;
     assert_eq!(std::fs::read_to_string(store.path()).unwrap(), before);
 
+    // One color is a direct result: typing its ID or a word of its name, then
+    // Down and Enter, selects exactly that token and focuses its hex field.
+    // Choosing it saves nothing.
+    for (query, token) in [
+        ("presence_online", "presence_online"),
+        ("online", "presence_online"),
+        ("links", "link"),
+    ] {
+        ui.set_settings_search_query("".into());
+        ui.invoke_settings_search("".into());
+        settle(ui).await;
+        click_control_once(ui, "Search settings");
+        type_text(ui, query);
+        settle(ui).await;
+        let results = ui.get_settings_search_results();
+        assert!(results.row_count() <= registry::MAX_SEARCH_RESULTS);
+        let id = format!("{}{token}", registry::COLOR_RESULT_PREFIX);
+        let row = (0..results.row_count())
+            .find(|row| results.row_data(*row).unwrap().id == id.as_str())
+            .unwrap_or_else(|| panic!("{query} does not offer {token}"));
+        for _ in 0..row {
+            key(ui, Key::DownArrow);
+        }
+        key(ui, Key::Return);
+        settle(ui).await;
+        assert_eq!(ui.get_color_selected_id(), token, "{query}");
+        assert_eq!(
+            ui.get_settings_revealed_id(),
+            crate::settings_search::COLOR_HEX_REVEAL,
+            "{query}"
+        );
+        let label = registry::color_token(token).unwrap().label;
+        assert!(
+            focused_control_has_label(ui, &format!("Hex color for {label}, #RRGGBB or #RRGGBBAA")),
+            "{query}: the hex field of {token} is not focused"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(store.path()).unwrap(),
+        before,
+        "choosing a color result saved"
+    );
+    ui.set_settings_search_query("".into());
+    ui.invoke_settings_search("".into());
+    settle(ui).await;
+
+    // Lengths keep their px unit; the unitless sender weight shows none.
+    let weight = match ui.get_sender_font_weight() {
+        0 => 650,
+        weight => weight,
+    };
+    assert!(!control_bounds(ui, &weight.to_string()).is_empty());
+    assert!(
+        control_bounds(ui, &format!("{weight} px")).is_empty(),
+        "the sender weight is shown as a length"
+    );
+    assert!(!control_bounds(ui, &format!("{} px", ui.get_message_font_size())).is_empty());
+
     // At the smallest window, at 100% and 200% text, the token list is a
     // bounded region and choosing a token by keyboard brings its editor into
     // view with the hex field focused.
@@ -2039,7 +2097,13 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
     );
     key(ui, Key::Return);
     settle(ui).await;
-    assert_eq!(ui.get_settings_revealed_id(), last.id);
+    // A color result reveals its token's hex field.
+    let expected = if registry::color_result(last.id.as_str()).is_some() {
+        crate::settings_search::COLOR_HEX_REVEAL.to_owned()
+    } else {
+        last.id.to_string()
+    };
+    assert_eq!(ui.get_settings_revealed_id(), expected.as_str());
 
     ui.set_manage_accounts_open(false);
     ui.set_update_can_check(false);
