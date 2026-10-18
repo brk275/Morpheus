@@ -1,12 +1,12 @@
 # TEMPORARY focused native offline app checks. NEVER MERGE this workflow.
 name: Reviewed sticker timeout diagnostics
-run-name: Sticker timeout phase diagnosis - e1bcb7c
+run-name: Sticker catalog await diagnosis - ecccac2
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: sticker-media-diagnostics-e1bcb7c
+  group: sticker-catalog-awaits-ecccac2
   cancel-in-progress: false
 jobs:
   contracts:
@@ -17,11 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: e1bcb7ce02f0c0b93c281822762e938e82a626a2
+          ref: ecccac280d43ee7a4ce0da4f6a016012b9afb4f0
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact reviewed source
-        run: test "$(git rev-parse HEAD)" = e1bcb7ce02f0c0b93c281822762e938e82a626a2
+        run: test "$(git rev-parse HEAD)" = ecccac280d43ee7a4ce0da4f6a016012b9afb4f0
       - name: Scan source before executing reviewed native tests
         shell: bash
         run: |
@@ -121,7 +121,7 @@ jobs:
           output=log.read_text(errors='replace')
           passed=reason is None and code==0 and re.search(r'^Ran 7 tests in ',output,re.MULTILINE) is not None and re.search(r'^OK$',output,re.MULTILINE) is not None
           print(json.dumps({'check':'sticker_diagnostic_contracts','status':'passed' if passed else 'failed',
-              'source':'e1bcb7ce02f0c0b93c281822762e938e82a626a2','failure':reason,
+              'source':'ecccac280d43ee7a4ce0da4f6a016012b9afb4f0','failure':reason,
               'tests_passed':7 if passed else None,'raw_logs_public':False,
               'accounts_generated':False,'app_executed':False},sort_keys=True),flush=True)
           if not passed: raise SystemExit(1)
