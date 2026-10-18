@@ -30,6 +30,7 @@ mod room_settings;
 mod security;
 mod shortcuts;
 mod sso;
+mod timeline_delivery;
 mod timeline_model;
 mod update_controller;
 mod updater;

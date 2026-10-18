@@ -2180,31 +2180,44 @@ impl LiveUi {
         let feed_room_id = room_id;
         let handle = tokio::spawn(async move {
             let _feed = feed;
+            let delivery = Arc::new(crate::timeline_delivery::Latest::new());
             loop {
                 let messages = updates.borrow_and_update().clone();
-                let ui_for_update = ui.clone();
-                let current_generation = feed_generation.clone();
-                let current_navigation_epoch = feed_navigation_epoch.clone();
-                let live_flag = is_live.clone();
-                let account_id = feed_account_id.clone();
-                let room_id = feed_room_id.clone();
-                let _ = ui_for_update.upgrade_in_event_loop(move |ui| {
-                    if live_flag.load(Ordering::Acquire)
-                        && current_generation.load(Ordering::Acquire) == generation
-                        && current_navigation_epoch.load(Ordering::Acquire) == navigation_epoch
-                        && visible_feed_target(
-                            ui.get_active_account_local_id().as_str(),
-                            ui.get_active_room_id().as_str(),
-                            &account_id,
-                            &room_id,
-                        )
+                if delivery.submit(messages) {
+                    let ui_for_update = ui.clone();
+                    let current_generation = feed_generation.clone();
+                    let current_navigation_epoch = feed_navigation_epoch.clone();
+                    let live_flag = is_live.clone();
+                    let account_id = feed_account_id.clone();
+                    let room_id = feed_room_id.clone();
+                    let pending = delivery.clone();
+                    if ui_for_update
+                        .upgrade_in_event_loop(move |ui| {
+                            let Some(messages) = pending.take() else {
+                                return;
+                            };
+                            if live_flag.load(Ordering::Acquire)
+                                && current_generation.load(Ordering::Acquire) == generation
+                                && current_navigation_epoch.load(Ordering::Acquire)
+                                    == navigation_epoch
+                                && visible_feed_target(
+                                    ui.get_active_account_local_id().as_str(),
+                                    ui.get_active_room_id().as_str(),
+                                    &account_id,
+                                    &room_id,
+                                )
+                            {
+                                ui.set_messages(crate::timeline_model::update_shared(
+                                    ui.get_messages(),
+                                    messages.as_ref().clone(),
+                                ));
+                            }
+                        })
+                        .is_err()
                     {
-                        ui.set_messages(crate::timeline_model::update_shared(
-                            ui.get_messages(),
-                            messages.as_ref().clone(),
-                        ));
+                        break;
                     }
-                });
+                }
                 if updates.changed().await.is_err() {
                     break;
                 }
@@ -2293,34 +2306,46 @@ impl LiveUi {
         let is_live = self.is_live.clone();
         let handle = tokio::spawn(async move {
             let _feed = feed;
+            let delivery = Arc::new(crate::timeline_delivery::Latest::new());
             loop {
                 let messages = updates.borrow_and_update().clone();
-                let ui_for_update = ui.clone();
-                let current_generation = current_generation.clone();
-                let is_live = is_live.clone();
-                let account_id = account_id.clone();
-                let room_id = room_id.clone();
-                let root_event_id = root_event_id.clone();
-                let _ = ui_for_update.upgrade_in_event_loop(move |ui| {
-                    if is_live.load(Ordering::Acquire)
-                        && current_generation.load(Ordering::Acquire) == generation
-                        && ui.get_active_account_local_id().as_str() == account_id
-                        && ui.get_active_room_id().as_str() == room_id
-                        && ui.get_thread_root_id().as_str() == root_event_id
+                if delivery.submit(messages) {
+                    let ui_for_update = ui.clone();
+                    let current_generation = current_generation.clone();
+                    let is_live = is_live.clone();
+                    let account_id = account_id.clone();
+                    let room_id = room_id.clone();
+                    let root_event_id = root_event_id.clone();
+                    let pending = delivery.clone();
+                    if ui_for_update
+                        .upgrade_in_event_loop(move |ui| {
+                            let Some(messages) = pending.take() else {
+                                return;
+                            };
+                            if is_live.load(Ordering::Acquire)
+                                && current_generation.load(Ordering::Acquire) == generation
+                                && ui.get_active_account_local_id().as_str() == account_id
+                                && ui.get_active_room_id().as_str() == room_id
+                                && ui.get_thread_root_id().as_str() == root_event_id
+                            {
+                                let replies = messages
+                                    .iter()
+                                    .filter(|message| {
+                                        message.event_id.as_deref() != Some(root_event_id.as_str())
+                                    })
+                                    .cloned()
+                                    .collect();
+                                ui.set_thread_messages(crate::timeline_model::update_shared(
+                                    ui.get_thread_messages(),
+                                    replies,
+                                ));
+                            }
+                        })
+                        .is_err()
                     {
-                        let replies = messages
-                            .iter()
-                            .filter(|message| {
-                                message.event_id.as_deref() != Some(root_event_id.as_str())
-                            })
-                            .cloned()
-                            .collect();
-                        ui.set_thread_messages(crate::timeline_model::update_shared(
-                            ui.get_thread_messages(),
-                            replies,
-                        ));
+                        break;
                     }
-                });
+                }
                 if updates.changed().await.is_err() {
                     break;
                 }
