@@ -115,7 +115,10 @@ func permissions() {
 }
 
 func attach(_ command: [String: Any]) {
-    guard let pidValue = command["pid"] as? Int, pidValue > 0,
+    // A failed new attachment must never leave the previous target usable.
+    target = nil
+    elements = []
+    guard let pidValue = command["pid"] as? Int, pidValue > 0, pidValue <= Int(Int32.max),
           let executable = command["executable"] as? String, !executable.isEmpty,
           let bundle = command["bundle"] as? String, !bundle.isEmpty else {
         fail("invalid_command")
@@ -123,13 +126,19 @@ func attach(_ command: [String: Any]) {
     }
     let pid = pid_t(pidValue)
     guard let running = NSRunningApplication(processIdentifier: pid) else {
-        fail("attach_mismatch")
+        fail("attach_application_missing")
         return
     }
-    guard running.bundleIdentifier == bundle,
-          let url = running.executableURL,
-          url.standardizedFileURL.resolvingSymlinksInPath().path == executable else {
-        fail("attach_mismatch")
+    guard running.bundleIdentifier == bundle else {
+        fail("attach_bundle_mismatch")
+        return
+    }
+    guard let url = running.executableURL else {
+        fail("attach_executable_missing")
+        return
+    }
+    guard url.standardizedFileURL.resolvingSymlinksInPath().path == executable else {
+        fail("attach_executable_mismatch")
         return
     }
     target = Target(pid: pid, executable: executable, bundle: bundle)

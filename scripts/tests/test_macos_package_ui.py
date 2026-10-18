@@ -1259,6 +1259,13 @@ class SwiftSourceTests(unittest.TestCase):
         attach = self.source.split("func attach(")[1].split("func windows()")[0]
         self.assertIn("running.bundleIdentifier == bundle", attach)
         self.assertIn("resolvingSymlinksInPath().path == executable", attach)
+        self.assertIn("pidValue <= Int(Int32.max)", attach)
+        self.assertLess(attach.index("target = nil"), attach.index('command["pid"]'))
+        self.assertLess(attach.index("elements = []"), attach.index('command["pid"]'))
+        for token in ("attach_application_missing", "attach_bundle_mismatch",
+                      "attach_executable_missing", "attach_executable_mismatch"):
+            self.assertIn('fail("' + token + '")', attach)
+            self.assertIn(token, smoke.MACOS_BRIDGE_ERRORS)
         close = self.source.split("func close()")[1].split('reply(["ready": true])')[0]
         self.assertIn("list.count == 1, owner(list[0]) == target.pid", close)
         self.assertIn("owner(button) == target.pid", close)
