@@ -168,7 +168,8 @@ class WaylandWorkflowTests(unittest.TestCase):
         allowed = [line.strip().rsplit("/", 1)[-1] for line in upload.splitlines() if "${{ runner.temp }}" in line]
         self.assertEqual(allowed, ["desktop-preview.png", "account-switcher.png", "sign-in.png", "incoming-call.png",
             "room-settings.png", "paper-preview.png", "manage-accounts.png", "account-password.png",
-            "account-password-large.png", "sign-in-large.png", "terminal-sidebar.png", "terminal-space-labels.png", "provenance.json"])
+            "account-password-large.png", "sign-in-large.png", "terminal-sidebar.png", "terminal-space-labels.png",
+            "send-recovery.png", "send-recovery-thread-large.png", "provenance.json"])
         self.assertIn("retention-days: 1", upload)
         self.assertIn("include-hidden-files: false", upload)
         self.assertNotIn("pull_request_target:", source)
