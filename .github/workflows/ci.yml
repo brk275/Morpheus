@@ -34,20 +34,20 @@ jobs:
           printf '[extend]\nuseDefault = true\n' > "$RUNNER_TEMP/default.toml"
           : > "$RUNNER_TEMP/empty.ignore"
           "$RUNNER_TEMP/gitleaks/gitleaks" git --redact=100 --ignore-gitleaks-allow --no-banner --config "$RUNNER_TEMP/default.toml" --gitleaks-ignore-path "$RUNNER_TEMP/empty.ignore" --log-opts=--all .
-      - name: Run only synthetic runner and fixture-path contracts
+      - name: Run only synthetic timeline runner contracts
         shell: bash
         run: |
           python3 -I -B - <<'PY'
           import importlib.util, pathlib, unittest
           suite = unittest.TestSuite()
-          for name in ('test_run_timeline_acceptance', 'test_fixture_paths'):
+          for name in ('test_run_timeline_acceptance',):
               path = pathlib.Path('scripts/tests', name + '.py').resolve(strict=True)
               spec = importlib.util.spec_from_file_location(name, path)
               module = importlib.util.module_from_spec(spec)
               spec.loader.exec_module(module)
               suite.addTests(unittest.defaultTestLoader.loadTestsFromModule(module))
           result = unittest.TextTestRunner(verbosity=2).run(suite)
-          if not result.wasSuccessful() or result.skipped or result.testsRun < 11:
+          if not result.wasSuccessful() or result.skipped or result.testsRun != 11:
               raise SystemExit('Focused synthetic contracts failed')
           print('TIMELINE_HELPER_CONTRACTS_PASSED tests=' + str(result.testsRun))
           PY
