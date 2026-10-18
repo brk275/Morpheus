@@ -768,15 +768,22 @@ def enter_preview(ui):
 
 def menu_keyboard(ui):
     trigger = "Account menu for "
+    # Fixed stages distinguish native focus/keyboard failures without exposing
+    # the account label or the focused element's name in public diagnostics.
+    ui.diagnostics.step("menu_focus_trigger")
     ui.focus(trigger, prefix=True)
+    ui.diagnostics.step("menu_open_return")
     ui.key("Return")
     ui.expect_focus("Switch to ", prefix=True)
     ui.wait("Manage accounts")
+    ui.diagnostics.step("menu_close_escape")
     ui.key("Escape")
     ui.wait_for(lambda: ui.find("Manage accounts") is None)
     ui.expect_focus(trigger, prefix=True)
+    ui.diagnostics.step("menu_reopen_space")
     ui.key("Space")
     ui.expect_focus("Switch to ", prefix=True)
+    ui.diagnostics.step("menu_tab_manage")
     for _ in range(16):
         focused = ui.focused_name()
         if focused == "Manage accounts":
@@ -787,13 +794,16 @@ def menu_keyboard(ui):
         ui.wait_for(lambda: (name := ui.focused_name()) is not None and name != focused)
     else:
         raise RuntimeError("Account menu target was not keyboard reachable")
+    ui.diagnostics.step("menu_open_manage")
     ui.key("Return")
     ui.wait("Manage saved Matrix accounts")
     ui.expect_focus("Done")
+    ui.diagnostics.step("menu_dialog_tabs")
     ui.key("Tab")
     ui.expect_focus("Add account")
     ui.key("ShiftTab")
     ui.expect_focus("Done")
+    ui.diagnostics.step("menu_close_dialog")
     ui.key("Escape")
     ui.wait_for(lambda: ui.find("Manage saved Matrix accounts") is None)
     ui.expect_focus(trigger, prefix=True)

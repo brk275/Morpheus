@@ -564,3 +564,10 @@ Settings, reaching the scale control, reading the seeded value, increasing it,
 reading the changed value and persisting it. Only successful persistence marks
 this stage complete; the overall installed check still requires normal close
 and cleanup. Unknown stage strings are rejected rather than included in reports.
+
+The macOS account-menu check also identifies its fixed keyboard boundary:
+focusing the trigger, opening with Return, closing with Escape, reopening with
+Space, tabbing to Manage accounts, opening that dialog, its Tab/Shift-Tab order,
+and closing it. These tokens contain no account labels or focused control text.
+A timeout at one boundary remains a failed installed check; these diagnostics
+do not substitute for keyboard or screen-reader acceptance.

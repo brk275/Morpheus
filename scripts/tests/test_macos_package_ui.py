@@ -787,6 +787,47 @@ class FocusAndKeyTests(unittest.TestCase):
         self.assertLessEqual(sum(1 for command in bridge.commands if command["op"] == "key"), ui.SETTINGS_TAB_BOUND + 1)
 
 
+class AccountMenuStageTests(unittest.TestCase):
+    def test_each_native_menu_boundary_keeps_a_closed_failure_position(self):
+        stages = ("menu_focus_trigger", "menu_open_return", "menu_close_escape",
+                  "menu_reopen_space", "menu_tab_manage", "menu_open_manage",
+                  "menu_dialog_tabs", "menu_close_dialog")
+        for expected in stages:
+            with self.subTest(stage=expected):
+                diagnostics = ui.Diagnostics({})
+                instance = Mock()
+                instance.diagnostics = diagnostics
+
+                def operation(*arguments):
+                    diagnostics.operation("focused_element")
+                    if diagnostics.value["step"] == expected:
+                        raise ui.DiagnosticFailure("wait_timeout")
+                    return "Manage accounts"
+
+                for method in ("focus", "key", "expect_focus", "wait", "wait_for", "focused_name"):
+                    getattr(instance, method).side_effect = operation
+                with self.assertRaises(ui.DiagnosticFailure) as error:
+                    ui.menu_keyboard(instance)
+                diagnostics.failed(error.exception)
+                diagnostics.value["cleanup"] = "passed"
+                self.assertEqual(diagnostics.value["step"], expected)
+                self.assertEqual(diagnostics.value["failure"], "wait_timeout")
+                self.assertNotIn("Manage accounts", repr(diagnostics.value))
+                smoke.validate_macos_keyboard_diagnostic(diagnostic(step=expected), False)
+
+    def test_completed_menu_keeps_the_final_boundary_until_the_next_check(self):
+        instance = Mock()
+        diagnostics = ui.Diagnostics({})
+        instance.diagnostics = diagnostics
+        instance.focused_name.return_value = "Manage accounts"
+        ui.menu_keyboard(instance)
+        self.assertEqual(diagnostics.value["step"], "menu_close_dialog")
+        instance.expect_focus.assert_called_with("Account menu for ", prefix=True)
+        # A completed menu cannot stand in for completion of all acceptance.
+        with self.assertRaises(RuntimeError):
+            smoke.validate_macos_keyboard_diagnostic(diagnostic(step="menu_close_dialog"), True)
+
+
 class AppearanceStageTests(unittest.TestCase):
     def test_failure_stage_survives_lower_level_operations_and_cleanup(self):
         cases = [("focus", "Open settings", "open_settings"),

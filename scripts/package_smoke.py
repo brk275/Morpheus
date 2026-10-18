@@ -668,6 +668,8 @@ WINDOWS_KEYBOARD_FAILURES = frozenset({
 WINDOWS_KEYBOARD_STEPS = frozenset({
     "setup", "profile", "launch", "window", "bridge", "homeserver", "username", "password",
     "password_semantics", "preview", "account_menu", "appearance", "config_persisted",
+    "menu_focus_trigger", "menu_open_return", "menu_close_escape", "menu_reopen_space",
+    "menu_tab_manage", "menu_open_manage", "menu_dialog_tabs", "menu_close_dialog",
     "normal_close", "cleanup", "complete",
 })
 WINDOWS_KEYBOARD_OPERATIONS = frozenset({
