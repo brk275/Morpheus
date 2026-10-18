@@ -13,7 +13,51 @@ import subprocess
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from run_matrix_acceptance import Acceptance, OAUTH_PHASES, fixture_from_output, oauth_diagnostics, oauth_evidence, passed_tests
 import run_matrix_acceptance as acceptance_module
+import run_timeline_acceptance as timeline_module
 from run_element_acceptance import CHECKS as ELEMENT_CHECKS
+
+
+class TimelineFailureForwardingTests(unittest.TestCase):
+    def invoke(self, output, *, scanner_code=0, label="timeline_10k"):
+        visible = io.StringIO()
+        process = Mock(returncode=1)
+        with tempfile.TemporaryDirectory() as folder:
+            runner = Acceptance(Path(folder), "verified-scanner")
+            def child(_args, **kwargs):
+                kwargs["stdout"].write(output.encode())
+                return process
+            def scanned(*args, **kwargs):
+                self.assertNotIn(timeline_module.SUMMARY_PREFIX, visible.getvalue())
+                return subprocess.CompletedProcess([], scanner_code)
+            with (patch.object(acceptance_module.subprocess, "Popen", side_effect=child),
+                  patch.object(acceptance_module.subprocess, "run", side_effect=scanned) as scan,
+                  contextlib.redirect_stdout(visible), self.assertRaises(RuntimeError)):
+                runner.run(label, ["synthetic-child"])
+            scan.assert_called_once()
+        return visible.getvalue()
+
+    def test_failed_command_forwards_only_the_validated_record_after_scanning(self):
+        value = timeline_module.StepFailure("enroll", "sliding", "first_render", "first_render").summary()
+        raw = "private child text\n" + timeline_module.SUMMARY_PREFIX + json.dumps(value) + "\n"
+        output = self.invoke(raw)
+        records = [line for line in output.splitlines() if line.startswith(timeline_module.SUMMARY_PREFIX)]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(json.loads(records[0][len(timeline_module.SUMMARY_PREFIX):]), value)
+        self.assertNotIn("private child text", output)
+
+    def test_failed_scanner_withholds_the_summary(self):
+        value = timeline_module.StepFailure("enroll", "sliding", "first_render", "first_render").summary()
+        output = self.invoke(timeline_module.SUMMARY_PREFIX + json.dumps(value), scanner_code=1)
+        self.assertNotIn(timeline_module.SUMMARY_PREFIX, output)
+
+    def test_other_commands_unknown_values_duplicate_records_and_success_are_not_forwarded(self):
+        value = timeline_module.StepFailure("enroll", "sliding", "first_render", "first_render").summary()
+        valid = timeline_module.SUMMARY_PREFIX + json.dumps(value)
+        for raw in (timeline_module.SUMMARY_PREFIX + json.dumps(value | {"failure": "privatepassword"}),
+                    timeline_module.SUMMARY_PREFIX + json.dumps(value | {"status": "passed"}),
+                    valid + "\n" + valid):
+            self.assertNotIn(timeline_module.SUMMARY_PREFIX, self.invoke(raw))
+        self.assertNotIn(timeline_module.SUMMARY_PREFIX, self.invoke(valid, label="other_command"))
 
 
 class FocusedSuiteTests(unittest.TestCase):

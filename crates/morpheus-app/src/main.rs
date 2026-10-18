@@ -30,6 +30,9 @@ mod room_settings;
 mod security;
 mod shortcuts;
 mod sso;
+// Instrumented release builds only (see build.rs); unit tests cover its pure checks.
+#[cfg(any(test, morpheus_timeline_acceptance))]
+mod timeline_acceptance;
 mod timeline_delivery;
 mod timeline_model;
 mod update_controller;
@@ -1193,8 +1196,13 @@ fn room_join_target(
     }
 }
 
+// The instrumented acceptance build measures the optimized profile only.
+#[cfg(all(morpheus_timeline_acceptance, debug_assertions))]
+compile_error!("The timeline acceptance build requires the release profile");
+
 /// Development-only account and config root for disposable desktop QA. The
 /// normal application paths are unchanged when this variable is absent.
+#[cfg_attr(morpheus_timeline_acceptance, allow(dead_code))]
 fn qa_profile_root() -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
     #[cfg(debug_assertions)]
     {
@@ -1478,6 +1486,10 @@ fn continue_account_action(ui: &AppWindow, action: i32) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // An instrumented acceptance build refuses to start without a valid run
+    // file, so it never runs as an ordinary app. See tests/TIMELINE_10K.md.
+    #[cfg(morpheus_timeline_acceptance)]
+    let mut acceptance = timeline_acceptance::Acceptance::from_environment()?;
     // Screenshot generation uses only the in-memory offline preview. Dispatch
     // before updater, configuration, credential vault or account initialization.
     #[cfg(debug_assertions)]
@@ -1501,11 +1513,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ui = AppWindow::new()?;
     ui.set_login_loading(true);
     ui.show()?;
+    #[cfg(morpheus_timeline_acceptance)]
+    acceptance.mark_window_shown();
     update_session
         .lock()
         .map_err(|_| updater::UpdateError::RecoveryRequired)?
         .acknowledge_before_store()?;
+    #[cfg(not(morpheus_timeline_acceptance))]
     let qa_profile = qa_profile_root()?;
+    // The run's generated, isolated profile replaces the standard app paths.
+    #[cfg(morpheus_timeline_acceptance)]
+    let qa_profile = Some(acceptance.profile_root().to_path_buf());
     let data_dir = if let Some(root) = &qa_profile {
         root.join("data")
     } else {
@@ -1514,7 +1532,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .data_dir()
             .to_path_buf()
     };
+    #[cfg(not(morpheus_timeline_acceptance))]
     let manager = Arc::new(AccountManager::open(data_dir)?);
+    // A sliding run keeps the shipping automatic policy; a classic run forces
+    // the same classic /sync loop that policy falls back to.
+    #[cfg(morpheus_timeline_acceptance)]
+    let manager = Arc::new(AccountManager::open_with_sync_policy(
+        data_dir,
+        acceptance.sync_policy(),
+    )?);
     let store = if let Some(root) = &qa_profile {
         ConfigStore::at(root.join("config.toml"))
     } else {
@@ -1524,6 +1550,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    // Subscribed before the startup restore below can start a sync.
+    #[cfg(morpheus_timeline_acceptance)]
+    acceptance.observe_sync(&manager, runtime.handle());
     let live = LiveUi::new(
         manager.clone(),
         runtime.handle().clone(),
@@ -4810,6 +4839,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    #[cfg(morpheus_timeline_acceptance)]
+    let acceptance = acceptance.start(&ui, live.clone(), runtime.handle().clone())?;
     let ui_result = ui.run();
     room_settings.shutdown(&ui);
     image_previews.shutdown(&ui);
@@ -4847,6 +4878,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("Could not save drafts during shutdown: {error}");
         return Err(Box::new(error));
     }
+    #[cfg(morpheus_timeline_acceptance)]
+    acceptance.finish()?;
     Ok(())
 }
 
