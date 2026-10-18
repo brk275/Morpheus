@@ -147,7 +147,8 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(classify([".github/workflows/ci.yml"])["native_matrix"]["os"], list(PLATFORMS))
 
     def test_manual_capture_driver_changes_do_not_rerun_system_native_acceptance(self):
-        for path in ("packaging/linux/appimage_capture.py",
+        for path in ("packaging/linux/package_appimage.py",
+                     "packaging/linux/appimage_capture.py",
                      "packaging/linux/appimage_capture_worker.py",
                      "packaging/linux/appimage_diagnostics.py",
                      "packaging/linux/appimage_notices.py",

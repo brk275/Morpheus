@@ -47,6 +47,7 @@ WAYLAND_UNRELATED_THEME_INPUTS = {
 # Ordinary native CI cannot exercise them; its always-on helper suite covers
 # their pure/mocked contracts. Unknown package inputs still select Linux.
 MANUAL_LINUX_PACKAGE_INPUTS = {
+    "packaging/linux/package_appimage.py",
     "packaging/linux/appimage_capture.py",
     "packaging/linux/appimage_capture_worker.py",
     "packaging/linux/appimage_diagnostics.py",

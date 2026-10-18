@@ -1,7 +1,8 @@
 # Morpheus
 
 A native Matrix client for macOS, Linux and Windows. Built in Rust, with
-multiple accounts and an interface you can shape around your setup.
+multiple accounts for separate aliases and an interface you can shape around
+your setup.
 
 ![Morpheus running the Terminal theme with text navigation](docs/screenshots/terminal-sidebar.png)
 
@@ -19,11 +20,11 @@ Start with **Nocturne**, **Terminal** or **Paper**, then change the details:
 Settings and `config.toml` control the same preferences. Changes reload live;
 invalid edits keep the last working configuration and explain the error.
 
-## Keep accounts separate
+## Your accounts and aliases
 
-Switch accounts from the bottom-left profile menu. Each account has its own
-session, encryption store, drafts and credential-vault entry. Inactive accounts
-pause by default.
+Keep different Matrix aliases in one app and switch from the bottom-left
+profile menu. Each account has its own session, encryption store, drafts and
+credential-vault entry. Inactive accounts pause by default.
 
 One optional local app password protects account switching and startup restore.
 Manage accounts includes direct removal and cleanup retries.

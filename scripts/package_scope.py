@@ -4,6 +4,11 @@
 import json
 import os
 
+if __package__:
+    from .package_revision import select_revision
+else:
+    from package_revision import select_revision
+
 
 def package_matrix(platform, linux_formats, appimage_updates=False, appimage_capture=False):
     if appimage_capture and (platform != "linux" or linux_formats != "appimage" or appimage_updates):
@@ -39,8 +44,14 @@ def main():
     matrix = package_matrix(
         os.environ["PACKAGE_PLATFORM"], os.environ["LINUX_FORMATS"], update_input == "true", capture_input == "true"
     )
+    # Resolve/validate before emitting any runner or cache outputs. Only a
+    # complete commit ID is accepted; branches and abbreviated refs can move.
+    workflow_revision = os.environ["GITHUB_SHA"]
+    source_revision = select_revision(os.environ.get("PACKAGE_SOURCE_REVISION", ""), workflow_revision)
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
         output.write("matrix=" + json.dumps(matrix) + "\n")
+        output.write("source_revision=" + source_revision + "\n")
+        output.write("cache_write=" + ("true" if source_revision == workflow_revision else "false") + "\n")
 
 
 if __name__ == "__main__":
