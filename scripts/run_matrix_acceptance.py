@@ -87,6 +87,14 @@ LIVE_STAGES = frozenset((
     'sync_restored',
 ))
 LIVE_STAGE = re.compile(r"^MORPHEUS_LIVE_STAGE ([a-z_]+)$", re.MULTILINE)
+DRAFTS_STAGES = frozenset((
+    "fixture", "login_alice", "room_alice", "drafts_alice", "legacy_seed",
+    "tracked_enqueue", "tracked_outcome", "login_carol", "room_carol", "drafts_carol",
+    "stop_primary", "plaintext_scan", "reopen", "restore_carol", "switch_alice",
+    "verify_alice", "clear_alice", "logout_alice", "switch_carol", "verify_carol",
+    "logout_carol", "stop_final", "cleanup", "complete",
+))
+DRAFTS_STAGE = re.compile(r"^MORPHEUS_DRAFTS_STAGE ([a-z_]{1,48})$", re.MULTILINE)
 LATE_JOIN_EVIDENCE = re.compile(r"^MORPHEUS_RTC_LATE_JOIN historical_member=(true|false)$", re.MULTILINE)
 LATE_JOIN_DECRYPT_RESULTS = frozenset((
     "decrypted", "MissingMegolmSession", "UnknownMegolmMessageIndex", "otherUTD", "unavailable",
@@ -345,6 +353,17 @@ def live_diagnostics(output: str) -> dict:
     result = {"test_entered": "fixture" in stages}
     if stages:
         result["stage"] = stages[-1]
+    return result
+
+
+def drafts_diagnostics(output: str) -> dict:
+    """Publish only recognized source tokens, never captured draft/server data."""
+    result = {"test_entered": False}
+    for match in DRAFTS_STAGE.finditer(output):
+        stage = match[1]
+        if stage in DRAFTS_STAGES:
+            result["test_entered"] |= stage == "fixture"
+            result["stage"] = stage
     return result
 
 
@@ -756,6 +775,11 @@ class Acceptance:
                 evidence["native_process"] = native_process_diagnostics(output, observed_returncode, timed_out)
                 if timed_out:
                     evidence["live_diagnostics"]["failure"] = "deadline"
+            if label == "drafts_local":
+                evidence["drafts_diagnostics"] = drafts_diagnostics(output)
+                evidence["native_process"] = native_process_diagnostics(output, observed_returncode, timed_out)
+                if timed_out:
+                    evidence["drafts_diagnostics"]["failure"] = "deadline"
             if fixture_diagnostics := matrix_fixture_diagnostics(output):
                 if timed_out:
                     fixture_diagnostics["failure"] = "deadline"
@@ -833,6 +857,12 @@ class Acceptance:
                 print(json.dumps({"check": label, "live_diagnostics": diagnostics}), flush=True)
                 raise RuntimeError("Live Matrix acceptance completion evidence is incomplete")
             record["live_diagnostics"] = diagnostics
+        if label == "drafts_local":
+            diagnostics = drafts_diagnostics(output)
+            if not diagnostics["test_entered"] or diagnostics.get("stage") != "complete":
+                print(json.dumps({"check": label, "drafts_diagnostics": diagnostics}), flush=True)
+                raise RuntimeError("Draft restart acceptance completion evidence is incomplete")
+            record["drafts_diagnostics"] = diagnostics
         if label == "moderation_local":
             # A green moderation result must exercise an existing, unverified
             # account identity on this fresh device without changing trust.

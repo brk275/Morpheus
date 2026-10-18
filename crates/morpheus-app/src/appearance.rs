@@ -204,6 +204,8 @@ fn font_family_with_resolver(
 }
 
 pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
+    ui.global::<StyleTokens>()
+        .set_reduced_motion(config.appearance.reduce_motion);
     // Move only a focused, disappearing navigation control before changing its
     // conditional subtree. Other input and modal focus remains untouched.
     ui.invoke_apply_navigation_mode(match config.layout.navigation {
@@ -266,6 +268,15 @@ pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
 }
 
 pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
+    let weak = ui.as_weak();
+    let store_for_motion = store.clone();
+    ui.on_set_reduce_motion(move |reduced| {
+        if let Some(ui) = weak.upgrade() {
+            let _ = save_config_change(&ui, &store_for_motion, |config| {
+                config.appearance.reduce_motion = reduced;
+            });
+        }
+    });
     let weak = ui.as_weak();
     let store_for_navigation = store.clone();
     ui.on_choose_navigation_mode(move |index| {

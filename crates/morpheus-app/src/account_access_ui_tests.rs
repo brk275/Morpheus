@@ -388,6 +388,142 @@ fn focused_control_has_label(ui: &AppWindow, expected: &str) -> bool {
     .is_some()
 }
 
+fn control_with_label(
+    ui: &AppWindow,
+    label: &str,
+) -> slint::private_unstable_api::re_exports::ItemRc {
+    use slint::private_unstable_api::re_exports::{AccessibleStringProperty, ItemRc, WindowInner};
+    use std::ops::ControlFlow;
+
+    let window = WindowInner::from_pub(ui.window());
+    let root = ItemRc::new_root(window.component());
+    let mut matches = Vec::new();
+    root.visit_descendants(|item| {
+        if item
+            .accessible_string_property(AccessibleStringProperty::Label)
+            .as_deref()
+            == Some(label)
+        {
+            matches.push(item.clone());
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    assert_eq!(matches.len(), 1, "the requested control must be unique");
+    matches.pop().unwrap()
+}
+
+fn request_bridge_focus(ui: &AppWindow, label: &str) {
+    use slint::private_unstable_api::re_exports::{FocusReason, FocusScope, WindowInner};
+
+    // This is the exact pinned AccessKit SetFocus path, including its reason.
+    // Calling the generated component's .focus() would use Programmatic and
+    // miss the installed AT-SPI regression.
+    let target = control_with_label(ui, label);
+    let window = WindowInner::from_pub(ui.window());
+    window.set_focus_item(&target, true, FocusReason::PointerClick);
+    assert!(
+        focused_control_has_label(ui, label),
+        "accessible focus did not reach the requested control: {label}"
+    );
+    let focused = window.focus_item.borrow().upgrade().unwrap();
+    let scope = focused
+        .downcast::<FocusScope>()
+        .expect("a live action scope");
+    assert!(scope.as_pin_ref().has_focus());
+    assert!(focused.is_visible());
+    assert!(focused.geometry().size.width > 0.0 && focused.geometry().size.height > 0.0);
+    assert_eq!(focused.geometry().size, target.geometry().size);
+}
+
+fn click_control_once(ui: &AppWindow, label: &str) {
+    let target = control_with_label(ui, label);
+    // map_to_window takes a point in the item's parent coordinates; it does
+    // not add the item's own x/y. Pass the full geometry's center so an action
+    // positioned at the bottom of a layout is actually the one we click.
+    let center = target.map_to_window(target.geometry().center());
+    let position = slint::LogicalPosition::new(center.x, center.y);
+    let window_size = ui.window().size().to_logical(ui.window().scale_factor());
+    assert!(position.x > 0.0 && position.x < window_size.width);
+    assert!(position.y > 0.0 && position.y < window_size.height);
+    assert!(
+        !focused_control_has_label(ui, label),
+        "click an unfocused action"
+    );
+    ui.window()
+        .dispatch_event(WindowEvent::PointerMoved { position });
+    ui.window().dispatch_event(WindowEvent::PointerPressed {
+        position,
+        button: slint::platform::PointerEventButton::Left,
+    });
+    ui.window().dispatch_event(WindowEvent::PointerReleased {
+        position,
+        button: slint::platform::PointerEventButton::Left,
+    });
+}
+
+async fn assert_accessible_action_focus_and_first_click(ui: &AppWindow) {
+    use std::{cell::Cell, rc::Rc};
+
+    let settings = Rc::new(Cell::new(0));
+    let observed = settings.clone();
+    ui.on_open_security(move || observed.set(observed.get() + 1));
+    let profile = format!(
+        "Account menu for {}, {}",
+        ui.get_active_account_name(),
+        ui.get_active_account_handle()
+    );
+    for scale in [100, 200] {
+        ui.set_font_scale_percent(scale);
+        ui.set_page(0);
+        settle(ui).await;
+        ui.invoke_focus_composer(false);
+        settle(ui).await;
+        assert!(!focused_control_has_label(ui, &profile));
+        request_bridge_focus(ui, &profile);
+        key(ui, Key::Return);
+        assert!(
+            ui.get_account_menu_open(),
+            "accessible focus must support Return"
+        );
+        ui.set_account_menu_open(false);
+        settle(ui).await;
+        ui.invoke_focus_composer(false);
+        settle(ui).await;
+        click_control_once(ui, &profile);
+        assert!(
+            ui.get_account_menu_open(),
+            "one click must open the account menu"
+        );
+        ui.set_account_menu_open(false);
+        settle(ui).await;
+
+        // IconAction uses the same focus reason and hit-testing contract.
+        ui.invoke_focus_composer(false);
+        settle(ui).await;
+        request_bridge_focus(ui, "Open settings");
+        let before = settings.get();
+        key(ui, Key::Space);
+        assert_eq!(settings.get(), before + 1);
+        assert_eq!(ui.get_page(), 1);
+        ui.set_page(0);
+        settle(ui).await;
+        ui.invoke_focus_composer(false);
+        settle(ui).await;
+        let before = settings.get();
+        click_control_once(ui, "Open settings");
+        assert_eq!(
+            settings.get(),
+            before + 1,
+            "one click must activate exactly once"
+        );
+        assert_eq!(ui.get_page(), 1);
+    }
+    ui.on_open_security(|| {});
+    ui.set_font_scale_percent(100);
+    ui.set_page(0);
+    settle(ui).await;
+}
+
 fn tab_to_control(ui: &AppWindow, label: &str) {
     use slint::private_unstable_api::re_exports::{FocusScope, TextInput, WindowInner};
 
@@ -420,6 +556,202 @@ fn tab_to_control(ui: &AppWindow, label: &str) {
         }
     }
     panic!("Appearance control is not keyboard reachable: {label}");
+}
+
+fn settings_hover_opacity(ui: &AppWindow) -> f32 {
+    use slint::private_unstable_api::re_exports::Opacity;
+    use std::ops::ControlFlow;
+
+    let control = control_with_label(ui, "Open settings");
+    let mut levels = Vec::new();
+    control.visit_descendants(|item| {
+        if let Some(opacity) = item.downcast::<Opacity>() {
+            levels.push(opacity.as_pin_ref().opacity());
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    // The decorative layer is the only changing opacity in this non-quiet
+    // action. Read real generated items, not an assumed animation progress.
+    assert!(!levels.is_empty(), "the hover surface must exist");
+    assert!(levels.iter().all(|level| (0.0..=1.0).contains(level)));
+    assert!(levels.iter().filter(|level| **level != 1.0).count() <= 1);
+    levels.into_iter().product()
+}
+
+async fn assert_native_motion_and_preference(ui: &AppWindow, config_path: &std::path::Path) {
+    use morpheus_config::ConfigStore;
+
+    let defaults = Config::default();
+    apply_config(ui, &defaults, None);
+    ui.set_page(0);
+    settle(ui).await;
+    request_bridge_focus(ui, "Open settings");
+    ui.window().dispatch_event(WindowEvent::PointerExited);
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
+    assert_eq!(settings_hover_opacity(ui), 0.0);
+
+    let control = control_with_label(ui, "Open settings");
+    let bounds = control.geometry();
+    let center = control.map_to_window(bounds.center());
+    let position = slint::LogicalPosition::new(center.x, center.y);
+    ui.window()
+        .dispatch_event(WindowEvent::PointerMoved { position });
+    assert_eq!(settings_hover_opacity(ui), 0.0);
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(30));
+    let during = settings_hover_opacity(ui);
+    assert!(
+        during > 0.0 && during < 1.0,
+        "native hover must interpolate"
+    );
+    assert!(focused_control_has_label(ui, "Open settings"));
+    assert_eq!(control_with_label(ui, "Open settings").geometry(), bounds);
+
+    let mut reduced = defaults.clone();
+    reduced.appearance.reduce_motion = true;
+    apply_config(ui, &reduced, None);
+    assert_eq!(
+        ui.global::<crate::StyleTokens>().get_interaction_duration(),
+        0
+    );
+    assert_eq!(
+        settings_hover_opacity(ui),
+        1.0,
+        "live preference interrupts visible motion"
+    );
+    assert_eq!(control_with_label(ui, "Open settings").geometry(), bounds);
+    assert!(focused_control_has_label(ui, "Open settings"));
+    ui.window().dispatch_event(WindowEvent::PointerExited);
+    assert_eq!(
+        settings_hover_opacity(ui),
+        0.0,
+        "reduced feedback has no delay"
+    );
+
+    apply_config(ui, &defaults, None);
+    assert_eq!(
+        ui.global::<crate::StyleTokens>().get_interaction_duration(),
+        90
+    );
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
+    assert_eq!(settings_hover_opacity(ui), 0.0);
+    ui.window()
+        .dispatch_event(WindowEvent::PointerMoved { position });
+    assert_eq!(settings_hover_opacity(ui), 0.0);
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
+    assert_eq!(settings_hover_opacity(ui), 1.0);
+    assert!(
+        !ui.window().has_active_animations(),
+        "settled feedback must become idle"
+    );
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(500));
+    assert_eq!(settings_hover_opacity(ui), 1.0);
+    assert!(!ui.window().has_active_animations());
+    ui.window().dispatch_event(WindowEvent::PointerExited);
+    i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(200));
+    assert_eq!(settings_hover_opacity(ui), 0.0);
+
+    let store = ConfigStore::at(config_path);
+    crate::appearance::install_callbacks(ui, &store);
+    for scale in [100, 200] {
+        let mut config = defaults.clone();
+        config.appearance.scale_percent = scale;
+        store.save(&config).unwrap();
+        apply_config(ui, &config, None);
+        ui.set_page(1);
+        settle(ui).await;
+        tab_to_control(ui, "Reduce motion, off");
+        key(ui, Key::Space);
+        assert!(store.load().unwrap().appearance.reduce_motion);
+        assert!(ui.global::<crate::StyleTokens>().get_reduced_motion());
+        assert_eq!(
+            ui.global::<crate::StyleTokens>().get_interaction_duration(),
+            0
+        );
+        assert!(focused_control_has_label(ui, "Reduce motion, on"));
+        key(ui, Key::Return);
+        assert!(!store.load().unwrap().appearance.reduce_motion);
+        assert!(!ui.global::<crate::StyleTokens>().get_reduced_motion());
+        assert!(focused_control_has_label(ui, "Reduce motion, off"));
+    }
+    let invalid = "[appearance\nreduce_motion = true\n";
+    std::fs::write(config_path, invalid).unwrap();
+    key(ui, Key::Space);
+    assert_eq!(std::fs::read_to_string(config_path).unwrap(), invalid);
+    assert!(!ui.global::<crate::StyleTokens>().get_reduced_motion());
+    assert!(!ui.get_config_error().is_empty());
+    store.save(&defaults).unwrap();
+    apply_config(ui, &store.load().unwrap(), None);
+    ui.set_config_error("".into());
+    ui.on_set_reduce_motion(|_| {});
+    ui.set_page(0);
+    settle(ui).await;
+}
+
+async fn assert_lazy_timeline_view(ui: &AppWindow) {
+    use crate::timeline_model::{projection_count, tests::fixture, update};
+    use slint::private_unstable_api::re_exports::{AccessibleStringProperty, ItemRc, WindowInner};
+    use std::ops::ControlFlow;
+
+    let has_label = |label: &str| {
+        let window = WindowInner::from_pub(ui.window());
+        ItemRc::new_root(window.component())
+            .visit_descendants(|item| {
+                if item
+                    .accessible_string_property(AccessibleStringProperty::Label)
+                    .as_deref()
+                    == Some(label)
+                {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .is_some()
+    };
+    ui.set_page(0);
+    ui.set_font_scale_percent(100);
+    let mut rows: Vec<_> = (0..10_000).map(fixture).collect();
+    let original = rows[0].body.clone();
+    let model = update(ModelRc::default(), rows.clone());
+    assert_eq!(projection_count(&model), 0);
+    ui.set_messages(model.clone());
+    settle(ui).await;
+    let initial = projection_count(&model);
+    assert!(
+        initial > 0 && initial < 1_000,
+        "the real ListView must project a bounded visible subset: {initial}"
+    );
+    assert!(has_label(&original));
+
+    rows[0].body = "Updated visible timeline fixture".into();
+    rows[0].rich_markdown = Some(rows[0].body.clone());
+    rows[0].rich_accessible = Some(rows[0].body.clone());
+    let changed = update(ui.get_messages(), rows.clone());
+    assert_eq!(changed, model, "an edit must retain the live model");
+    ui.set_messages(changed);
+    settle(ui).await;
+    assert!(has_label(&rows[0].body));
+    assert!(!has_label(&original));
+    let after_edit = projection_count(&model);
+    assert!(
+        after_edit - initial < 1_000,
+        "editing one row must not format the entire history"
+    );
+
+    rows.push(fixture(10_000));
+    let appended = update(ui.get_messages(), rows);
+    assert_eq!(appended, model);
+    ui.set_messages(appended);
+    settle(ui).await;
+    assert_eq!(ui.get_messages().row_count(), 10_001);
+    assert!(
+        projection_count(&model) - after_edit < 1_000,
+        "appending must not format the entire history"
+    );
+    ui.set_messages(ModelRc::new(VecModel::<MessageItem>::default()));
+    settle(ui).await;
+    assert_eq!(ui.get_messages().row_count(), 0);
+    assert!(!has_label("Updated visible timeline fixture"));
 }
 
 async fn assert_palette_and_density_keyboard(ui: &AppWindow) {
@@ -1151,6 +1483,9 @@ async fn exercise_account_ui(runtime: Handle) {
     assert_sign_in_keyboard(&ui).await;
     settle(&ui).await;
     assert_navigation_projection_and_focus(&ui).await;
+    assert_accessible_action_focus_and_first_click(&ui).await;
+    assert_native_motion_and_preference(&ui, &directory.path().join("appearance.toml")).await;
+    assert_lazy_timeline_view(&ui).await;
     assert_palette_and_density_keyboard(&ui).await;
     assert_scale_keyboard_and_focus_bounds(&ui).await;
     assert_message_role_precedence_and_thread_metadata(&ui).await;

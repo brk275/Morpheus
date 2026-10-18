@@ -238,6 +238,25 @@ weights, line-height controls, background images and arbitrary pane arrangements
 remain future work. The pinned rich-text component does not expose body-weight
 or line-height controls. Theme packs cannot execute code.
 
+### Motion
+
+Buttons and navigation use a short native fade for decorative hover feedback.
+Selection colors, focus outlines, click targets and account contents change
+immediately. Effects settle after 90 ms and do not use a repeating animation timer.
+
+Choose **Appearance → Reduce motion** for immediate hover feedback, or set:
+
+```toml
+[appearance]
+reduce_motion = true
+```
+
+The setting applies live, including an effect already in progress. The setting
+currently covers Morpheus's own hover effects. Transitions inherited from standard
+controls and scrollbars, and automatic OS motion preferences, still need separate
+accessibility work. This is not complete reduced-motion or display-performance
+acceptance.
+
 ### Preferences awaiting implementation
 
 The following older fields can be stored in TOML but currently have no runtime
@@ -245,7 +264,6 @@ consumer. Changing them does not enable the described behavior:
 
 | Field | Pending behavior |
 | --- | --- |
-| `appearance.reduce_motion` | Motion preference; current UI has no explicit animations to reduce |
 | `media.camera_device` | Saved camera selection |
 | `media.noise_suppression` | Configurable noise suppression |
 | `media.autoplay_animated_media` | Animated-media autoplay policy |
