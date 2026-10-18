@@ -334,8 +334,12 @@ PLANNED_CHECKS = (*CHAT_CHECKS, APP_RECOVERY_LABEL, "recovery_local", *OAUTH_LAB
 # runs every app recovery guard. It cannot stand in for full acceptance.
 DRAFT_RECOVERY_CHECKS = ("drafts_local", "formatted_local", "moderation_local", APP_RECOVERY_LABEL)
 DRAFT_ONLY_CHECKS = ("drafts_local",)
+# These fixtures call snapshot/room/thread feed reads. Preserve the formatting
+# prerequisite for moderation, both search sync paths and real key recovery.
+TIMELINE_READ_TESTS = ("live_local", "formatted_local", "media_local", "moderation_local", "search_local")
+TIMELINE_READ_CHECKS = (*TIMELINE_READ_TESTS, "search_local-classic", "recovery_local")
 SUITES = {"full": PLANNED_CHECKS, "draft-recovery": DRAFT_RECOVERY_CHECKS,
-          "drafts-only": DRAFT_ONLY_CHECKS}
+          "drafts-only": DRAFT_ONLY_CHECKS, "timeline-reads": TIMELINE_READ_CHECKS}
 # Leave a full minute before the workflow's 55-minute hard kill. Work stops
 # with eleven minutes left: up to three for nested OAuth/Element cleanup, then
 # eight for both shared-service cleanups, checked inventories and log scans.
@@ -975,6 +979,24 @@ class Acceptance:
                               "reason": "dependency_failed"}), flush=True)
         self.group((APP_RECOVERY_LABEL,), lambda: self.app_recovery(fixture))
 
+    def timeline_read_cases(self, fixture: Path):
+        formatted_passed = False
+        for name in TIMELINE_READ_TESTS:
+            if name == "moderation_local" and not formatted_passed:
+                self.not_run[name] = "dependency_failed"
+                print(json.dumps({"check": name, "status": "not_run", "reason": "dependency_failed"}), flush=True)
+                continue
+            succeeded = self.group((name,), lambda name=name: self.test(name, fixture))
+            if name == "formatted_local":
+                formatted_passed = succeeded
+        self.group(("search_local-classic",), lambda: self.test(
+            "search_local", fixture, extra={"MORPHEUS_MATRIX_SEARCH_CLASSIC": "1"}))
+
+        def recovery_case():
+            recovery = fixture_from_output(self.script("local_matrix_env", "recovery-fixture"), self.root)
+            self.test("recovery_local", recovery, extra={"MORPHEUS_MATRIX_TEST_RECOVERY": "1"})
+        self.group(("recovery_local",), recovery_case)
+
     def rtc_cases(self):
         # Every run gets different users/room: existing devices and keys would
         # hide a regression in either encrypted sticky membership dialect.
@@ -1113,6 +1135,10 @@ class Acceptance:
                 if self.suite == "full":
                     output.write("Full suite: real Synapse, Matrix Authentication Service, OS Secret Service and LiveKit; "
                                  "synthetic call media and OAuth browser-form protocol automation.\n\n")
+                elif self.suite == "timeline-reads":
+                    output.write("Focused timeline-read checks: real Synapse and an ephemeral OS Secret Service. "
+                                 "Includes encrypted messages/threads, formatting, media, moderation, both search sync paths and key recovery. "
+                                 "No OAuth, RTC or installed-app checks; this is not full acceptance.\n\n")
                 elif self.suite == "drafts-only":
                     output.write("Focused drafts-only rerun: real Synapse and an ephemeral OS Secret Service. "
                                  "Only the draft persistence/recovery cases ran. "
@@ -1198,6 +1224,10 @@ def main():
             return
         if args.suite == "draft-recovery":
             acceptance.draft_recovery_cases(fixture)
+            acceptance.finish_checks()
+            return
+        if args.suite == "timeline-reads":
+            acceptance.timeline_read_cases(fixture)
             acceptance.finish_checks()
             return
         # Each selector owns its local profile, fresh devices and unique test

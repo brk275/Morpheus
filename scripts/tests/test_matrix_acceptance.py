@@ -53,6 +53,72 @@ class FocusedSuiteTests(unittest.TestCase):
             self.assertIn("No app recovery, moderation, OAuth or RTC checks", summary.read_text())
             self.assertIn("not full acceptance", summary.read_text())
 
+    def test_timeline_read_completion_requires_all_selected_checks_and_reports_partial_scope(self):
+        expected = ("live_local", "formatted_local", "media_local", "moderation_local",
+                    "search_local", "search_local-classic", "recovery_local")
+        self.assertEqual(acceptance_module.TIMELINE_READ_CHECKS, expected)
+        self.assertEqual(acceptance_module.SUITES["full"], acceptance_module.PLANNED_CHECKS)
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="timeline-reads")
+            for missing in expected:
+                runner.results = [{"check": label} for label in expected if label != missing]
+                with self.subTest(missing=missing), self.assertRaises(RuntimeError):
+                    runner.finish_checks()
+            runner.results = [{"check": label, "passed": 1, "seconds": 1} for label in expected]
+            runner.finish_checks()
+            full = Acceptance(root, "scanner")
+            full.results = list(runner.results)
+            with self.assertRaises(RuntimeError):
+                full.finish_checks()
+            summary = root / "summary.md"
+            with patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": str(summary)}):
+                runner.summary()
+            report = json.loads((root / "outcomes.json").read_text())
+            self.assertEqual(report["suite"], "timeline-reads")
+            self.assertEqual(report["not_run"], {})
+            self.assertIn("not full acceptance", summary.read_text())
+            self.assertNotIn("Full suite:", summary.read_text())
+
+    def test_timeline_read_order_keeps_both_sync_paths_and_recovery_fixture(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="timeline-reads")
+            fixture, recovery = root / "fixture.json", root / "recovery.json"
+            with patch.object(runner, "test") as test, \
+                    patch.object(runner, "script", return_value="private-fixture") as script, \
+                    patch.object(acceptance_module, "fixture_from_output", return_value=recovery) as read:
+                runner.timeline_read_cases(fixture)
+            self.assertEqual([call.args for call in test.call_args_list], [
+                ("live_local", fixture), ("formatted_local", fixture), ("media_local", fixture),
+                ("moderation_local", fixture), ("search_local", fixture),
+                ("search_local", fixture), ("recovery_local", recovery),
+            ])
+            self.assertEqual([call.kwargs for call in test.call_args_list], [
+                {}, {}, {}, {}, {}, {"extra": {"MORPHEUS_MATRIX_SEARCH_CLASSIC": "1"}},
+                {"extra": {"MORPHEUS_MATRIX_TEST_RECOVERY": "1"}},
+            ])
+            script.assert_called_once_with("local_matrix_env", "recovery-fixture")
+            read.assert_called_once_with("private-fixture", root)
+            self.assertEqual(runner.not_run, {})
+
+    def test_timeline_failed_formatting_skips_moderation_without_hiding_failure(self):
+        with tempfile.TemporaryDirectory() as folder, contextlib.redirect_stdout(io.StringIO()):
+            root = Path(folder)
+            runner = Acceptance(root, "scanner", suite="timeline-reads")
+            failure = acceptance_module.CheckFailure("formatted_local", "test_failed")
+            with patch.object(runner, "test", side_effect=[None, failure, None, None, None, None]) as test, \
+                    patch.object(runner, "script", return_value="private-fixture"), \
+                    patch.object(acceptance_module, "fixture_from_output", return_value=root / "recovery.json"):
+                runner.timeline_read_cases(root / "fixture.json")
+            self.assertEqual([call.args[0] for call in test.call_args_list], [
+                "live_local", "formatted_local", "media_local", "search_local", "search_local", "recovery_local",
+            ])
+            self.assertEqual(runner.not_run, {"moderation_local": "dependency_failed"})
+            self.assertEqual(runner.failures, [{"check": "formatted_local", "reason": "test_failed"}])
+            with self.assertRaises(RuntimeError):
+                runner.finish_checks()
+
     def test_unknown_suite_rejected_before_creating_directories(self):
         with patch.object(acceptance_module, "private_directory") as directory:
             with self.assertRaisesRegex(ValueError, "Unknown acceptance suite"):
@@ -238,6 +304,33 @@ class FinalizationTests(unittest.TestCase):
         runner.rtc_cases.assert_not_called()
         runner.outgoing_ring_cases.assert_not_called()
         runner.element_case.assert_not_called()
+        self.assert_both_cleanups(runner)
+
+    def test_timeline_read_main_uses_only_selected_checks_and_preserves_cleanup(self):
+        with self.mocked_main() as (runner, _):
+            with patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner",
+                                           "--suite", "timeline-reads"]):
+                self.assertIsNone(acceptance_module.main())
+        runner.timeline_read_cases.assert_called_once()
+        runner.finish_checks.assert_called_once()
+        runner.test.assert_not_called()
+        runner.draft_recovery_cases.assert_not_called()
+        runner.app_recovery.assert_not_called()
+        runner.oauth_cases.assert_not_called()
+        runner.rtc_cases.assert_not_called()
+        runner.outgoing_ring_cases.assert_not_called()
+        runner.element_case.assert_not_called()
+        self.assert_both_cleanups(runner)
+
+    def test_timeline_read_incomplete_results_still_fail_after_owned_cleanup(self):
+        original = RuntimeError("fixed incomplete timeline result")
+        with self.mocked_main() as (runner, _):
+            runner.finish_checks.side_effect = original
+            with patch.object(sys, "argv", ["acceptance", "--gitleaks", "mock-scanner",
+                                           "--suite", "timeline-reads"]):
+                with self.assertRaises(RuntimeError) as caught:
+                    acceptance_module.main()
+        self.assertIs(caught.exception, original)
         self.assert_both_cleanups(runner)
 
     def test_focused_suite_failure_cannot_become_success_and_still_cleans_up(self):
