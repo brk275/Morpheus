@@ -859,8 +859,154 @@ component EmojiPopup inherits Rectangle {
     }
 }
 
+// The sticker search field. It owns the arrows, Return and Escape so the list
+// can be driven without leaving the field.
+component StickerSearchField inherits Rectangle {
+    in-out property <string> query;
+    in property <bool> can-send;
+    in property <bool> has-current;
+    in property <color> elevated;
+    in property <color> ink;
+    in property <color> muted;
+    in property <float> text-scale: 1;
+    callback searched(string);
+    callback navigate(int);
+    callback send-current();
+    callback dismiss();
+    background: root.elevated; border-radius: StyleTokens.radius * 0.6;
+    if root.query == "" : Text {
+        x: 8px; width: parent.width - 16px; height: parent.height;
+        text: "Search stickers"; color: root.muted; font-size: 12px * root.text-scale;
+        vertical-alignment: center;
+    }
+    sticker-search := ThemedTextInput {
+        x: 8px; width: parent.width - 16px; height: parent.height;
+        text <=> root.query; color: root.ink; font-size: 12px * root.text-scale;
+        single-line: true; vertical-alignment: center;
+        accessible-label: "Search stickers by description, shortcode or pack";
+        init => { self.focus(); }
+        edited => { root.searched(self.text); }
+        key-pressed(event) => {
+            if !event.modifiers.control && !event.modifiers.meta && !event.modifiers.alt {
+                if event.text == Key.Escape { root.dismiss(); accept }
+                else if event.text == Key.UpArrow { root.navigate(-1); accept }
+                else if event.text == Key.DownArrow { root.navigate(1); accept }
+                else if event.text == Key.Return {
+                    if root.has-current && root.can-send { root.send-current(); }
+                    accept
+                } else { reject }
+            } else { reject }
+        }
+    }
+}
+
+// The explicit public-media consent. Its height is measured from the wrapped
+// message and actions at the allocated width, side by side or stacked.
+component StickerConsent inherits Rectangle {
+    in property <bool> stacked;
+    in property <bool> ready;
+    in property <color> elevated;
+    in property <color> outline;
+    in property <color> surface;
+    in property <color> hover;
+    in property <color> ink;
+    in property <color> muted;
+    in property <float> text-scale: 1;
+    callback consent(bool);
+    height: root.stacked
+        ? decline.y + decline.height + 8px
+        : allow.y + max(allow.height, decline.height) + 8px;
+    background: root.elevated; border-radius: StyleTokens.radius * 0.6;
+    border-width: 1px; border-color: root.outline;
+    message := Text {
+        x: 8px; y: 8px; width: root.width - 16px; height: self.preferred-height;
+        text: "This conversation is encrypted, but sticker images are not. Your homeserver can see which sticker images you load and send here. Labels stay available without images.";
+        color: root.ink; font-size: 11px * root.text-scale; wrap: word-wrap;
+        accessible-live-region: polite;
+    }
+    allow := TextAction {
+        x: 8px; y: message.y + message.height + 6px;
+        width: root.stacked ? root.width - 16px : self.preferred-width;
+        height: self.preferred-height;
+        wrap-caption: root.stacked;
+        text: "Allow sticker images here"; ink: root.ink; muted: root.muted;
+        surface: root.surface; hover-surface: root.hover; outline: root.outline; text-scale: root.text-scale;
+        enabled: root.ready;
+        activated => { root.consent(true); }
+    }
+    decline := TextAction {
+        x: root.stacked ? 8px : allow.x + allow.width + 8px;
+        y: root.stacked ? allow.y + allow.height + 6px : allow.y;
+        width: root.stacked ? root.width - 16px : self.preferred-width;
+        height: self.preferred-height;
+        wrap-caption: root.stacked;
+        text: "Cancel"; ink: root.ink; muted: root.muted;
+        surface: root.surface; hover-surface: root.hover; outline: root.outline; text-scale: root.text-scale;
+        accessible-label: "Cancel and close the sticker picker";
+        activated => { root.consent(false); }
+    }
+}
+
+component StickerPreviewBox inherits Rectangle {
+    in property <image> preview;
+    in property <bool> loaded;
+    in property <string> status;
+    in property <string> label;
+    in property <color> elevated;
+    in property <color> muted;
+    in property <float> text-scale: 1;
+    background: root.elevated; border-radius: StyleTokens.radius * 0.6;
+    if root.loaded : Image {
+        x: 6px; y: 6px; width: parent.width - 12px; height: parent.height - 12px;
+        source: root.preview; image-fit: contain;
+        accessible-role: image;
+        accessible-label: root.label != "" ? "Sticker preview: " + root.label : "Sticker preview";
+    }
+    if !root.loaded : Text {
+        x: 8px; width: parent.width - 16px; height: parent.height;
+        text: root.status; color: root.muted; font-size: 11px * root.text-scale;
+        wrap: word-wrap; horizontal-alignment: center; vertical-alignment: center;
+    }
+}
+
+component StickerList inherits Rectangle {
+    in property <[StickerItem]> items;
+    in property <int> current;
+    in property <length> row-height;
+    in property <color> surface;
+    in property <color> hover;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> accent;
+    in property <float> text-scale: 1;
+    callback highlight(string);
+    callback dismiss();
+    sticker-list := ListView {
+        width: parent.width; height: parent.height;
+        horizontal-scrollbar-policy: always-off;
+        content-y: -max(0px, (root.current + 1) * root.row-height - self.height);
+        for item[index] in root.items : ActionRect {
+            width: sticker-list.visible-width; height: root.row-height;
+            label: "Sticker " + item.label + " from " + item.pack + (index == root.current ? ", selected" : "");
+            background: index == root.current || self.has-hover ? root.hover : root.surface;
+            border-radius: StyleTokens.radius * 0.5; focus-color: root.accent; cancel-on-escape: true;
+            cancelled => { root.dismiss(); }
+            activated => { root.highlight(item.key); }
+            VerticalLayout {
+                padding-left: 7px; padding-right: 7px; padding-top: 2px; padding-bottom: 2px; spacing: 1px;
+                Text { text: item.label; color: root.ink; font-size: 12px * root.text-scale; overflow: elide; vertical-alignment: center; }
+                Text { text: item.pack; color: root.muted; font-size: 10px * root.text-scale; overflow: elide; }
+            }
+        }
+    }
+}
+
 // Labels stay usable before any image loads. Images of an encrypted
-// conversation appear only after the explicit consent in this popup.
+// conversation appear only after the explicit consent in this popup. A narrow
+// pane or large text stacks the controls in a bounded scrolling area above the
+// list; it scrolls each focused control into view, so search, pack choice,
+// consent, Send and Close stay reachable in the thread pane at 200% text. The
+// popup never claims more height than the space above its composer.
 component StickerPopup inherits Rectangle {
     in property <[StickerItem]> items;
     in property <[string]> packs;
@@ -876,6 +1022,8 @@ component StickerPopup inherits Rectangle {
     in property <bool> preview-loaded;
     in property <string> preview-status;
     in property <bool> can-send;
+    // Space above the composer this popup may cover inside the window.
+    in property <length> available-height: 470px;
     in property <color> surface;
     in property <color> elevated;
     in property <color> hover;
@@ -892,8 +1040,15 @@ component StickerPopup inherits Rectangle {
     callback consent(bool);
     callback dismiss();
     property <bool> has-current: root.current >= 0 && root.current < root.items.length;
+    property <bool> narrow: root.width < 340px * root.text-scale;
     property <length> row-height: 34px * root.text-scale + 6px;
-    height: min(470px, 330px * root.text-scale + 130px);
+    property <length> field-height: 34px * root.text-scale;
+    property <string> current-label: root.has-current ? root.items[root.current].label : "";
+    property <string> selected-text: root.notice != "" ? root.notice
+        : root.phase != 1 ? root.status
+        : root.has-current ? "Selected sticker: " + root.items[root.current].label + ", from " + root.items[root.current].pack
+        : root.status;
+    height: max(140px, min(root.available-height, root.narrow ? 620px : min(470px, 330px * root.text-scale + 130px)));
     background: surface; border-radius: StyleTokens.radius * 0.9; border-width: 1px; border-color: accent;
     accessible-role: region; accessible-label: "Sticker picker";
     FocusScope {
@@ -901,36 +1056,18 @@ component StickerPopup inherits Rectangle {
         key-pressed(event) => {
             if event.text == Key.Escape { root.dismiss(); accept } else { reject }
         }
-        VerticalLayout {
+        if !root.narrow : VerticalLayout {
             padding: 8px; spacing: 6px;
             HorizontalLayout {
-                height: 34px * root.text-scale; spacing: 6px;
-                Rectangle {
-                    horizontal-stretch: 1; background: root.elevated; border-radius: StyleTokens.radius * 0.6;
-                    if root.query == "" : Text {
-                        x: 8px; width: parent.width - 16px; height: parent.height;
-                        text: "Search stickers"; color: root.muted; font-size: 12px * root.text-scale;
-                        vertical-alignment: center;
-                    }
-                    sticker-search := ThemedTextInput {
-                        x: 8px; width: parent.width - 16px; height: parent.height;
-                        text <=> root.query; color: root.ink; font-size: 12px * root.text-scale;
-                        single-line: true; vertical-alignment: center;
-                        accessible-label: "Search stickers by description, shortcode or pack";
-                        init => { self.focus(); }
-                        edited => { root.searched(self.text); }
-                        key-pressed(event) => {
-                            if !event.modifiers.control && !event.modifiers.meta && !event.modifiers.alt {
-                                if event.text == Key.Escape { root.dismiss(); accept }
-                                else if event.text == Key.UpArrow { root.navigate(-1); accept }
-                                else if event.text == Key.DownArrow { root.navigate(1); accept }
-                                else if event.text == Key.Return {
-                                    if root.has-current && root.can-send { root.send(root.items[root.current].key); }
-                                    accept
-                                } else { reject }
-                            } else { reject }
-                        }
-                    }
+                height: root.field-height; spacing: 6px;
+                StickerSearchField {
+                    horizontal-stretch: 1;
+                    query <=> root.query; can-send: root.can-send; has-current: root.has-current;
+                    elevated: root.elevated; ink: root.ink; muted: root.muted; text-scale: root.text-scale;
+                    searched(text) => { root.searched(text); }
+                    navigate(offset) => { root.navigate(offset); }
+                    send-current => { root.send(root.items[root.current].key); }
+                    dismiss => { root.dismiss(); }
                 }
                 if root.packs.length > 1 : ComboBox {
                     width: 160px * root.text-scale;
@@ -945,72 +1082,31 @@ component StickerPopup inherits Rectangle {
                     activated => { root.dismiss(); }
                 }
             }
-            if root.needs-consent : Rectangle {
-                background: root.elevated; border-radius: StyleTokens.radius * 0.6;
-                border-width: 1px; border-color: root.outline;
-                VerticalLayout {
-                    padding: 8px; spacing: 6px;
-                    Text {
-                        text: "This conversation is encrypted, but sticker images are not. Your homeserver can see which sticker images you load and send here. Labels stay available without images.";
-                        color: root.ink; font-size: 11px * root.text-scale; wrap: word-wrap;
-                        accessible-live-region: polite;
-                    }
-                    HorizontalLayout {
-                        spacing: 8px; alignment: start;
-                        TextAction {
-                            text: "Allow sticker images here"; ink: root.ink; muted: root.muted;
-                            surface: root.surface; hover-surface: root.hover; outline: root.outline; text-scale: root.text-scale;
-                            enabled: root.phase == 1;
-                            activated => { root.consent(true); }
-                        }
-                        TextAction {
-                            text: "Cancel"; ink: root.ink; muted: root.muted;
-                            surface: root.surface; hover-surface: root.hover; outline: root.outline; text-scale: root.text-scale;
-                            activated => { root.consent(false); }
-                        }
-                    }
-                }
+            if root.needs-consent : StickerConsent {
+                stacked: false; ready: root.phase == 1;
+                elevated: root.elevated; outline: root.outline; surface: root.surface; hover: root.hover;
+                ink: root.ink; muted: root.muted; text-scale: root.text-scale;
+                consent(allowed) => { root.consent(allowed); }
             }
             Text {
-                text: root.notice != "" ? root.notice
-                    : root.phase != 1 ? root.status
-                    : root.has-current ? "Selected sticker: " + root.items[root.current].label + ", from " + root.items[root.current].pack
-                    : root.status;
+                text: root.selected-text;
                 color: root.ink; font-size: 11px * root.text-scale; wrap: word-wrap;
                 accessible-live-region: polite;
             }
             HorizontalLayout {
                 vertical-stretch: 1; spacing: 8px;
-                sticker-list := ListView {
-                    horizontal-stretch: 1; horizontal-scrollbar-policy: always-off;
-                    viewport-y: -max(0px, (root.current + 1) * root.row-height - self.height);
-                    for item[index] in root.items : ActionRect {
-                        width: sticker-list.visible-width; height: root.row-height;
-                        label: "Sticker " + item.label + " from " + item.pack + (index == root.current ? ", selected" : "");
-                        background: index == root.current || self.has-hover ? root.hover : root.surface;
-                        border-radius: StyleTokens.radius * 0.5; focus-color: root.accent; cancel-on-escape: true;
-                        cancelled => { root.dismiss(); }
-                        activated => { root.highlight(item.key); }
-                        VerticalLayout {
-                            padding-left: 7px; padding-right: 7px; padding-top: 2px; padding-bottom: 2px; spacing: 1px;
-                            Text { text: item.label; color: root.ink; font-size: 12px * root.text-scale; overflow: elide; vertical-alignment: center; }
-                            Text { text: item.pack; color: root.muted; font-size: 10px * root.text-scale; overflow: elide; }
-                        }
-                    }
+                StickerList {
+                    horizontal-stretch: 1;
+                    items: root.items; current: root.current; row-height: root.row-height;
+                    surface: root.surface; hover: root.hover; ink: root.ink; muted: root.muted; accent: root.accent;
+                    text-scale: root.text-scale;
+                    highlight(key) => { root.highlight(key); }
+                    dismiss => { root.dismiss(); }
                 }
-                Rectangle {
-                    width: 132px * root.text-scale; background: root.elevated; border-radius: StyleTokens.radius * 0.6;
-                    if root.preview-loaded : Image {
-                        x: 6px; y: 6px; width: parent.width - 12px; height: parent.height - 12px;
-                        source: root.preview; image-fit: contain;
-                        accessible-role: image;
-                        accessible-label: root.has-current ? "Sticker preview: " + root.items[root.current].label : "Sticker preview";
-                    }
-                    if !root.preview-loaded : Text {
-                        x: 8px; width: parent.width - 16px; height: parent.height;
-                        text: root.preview-status; color: root.muted; font-size: 11px * root.text-scale;
-                        wrap: word-wrap; horizontal-alignment: center; vertical-alignment: center;
-                    }
+                StickerPreviewBox {
+                    width: 132px * root.text-scale;
+                    preview: root.preview; loaded: root.preview-loaded; status: root.preview-status;
+                    label: root.current-label; elevated: root.elevated; muted: root.muted; text-scale: root.text-scale;
                 }
             }
             HorizontalLayout {
@@ -1027,46 +1123,138 @@ component StickerPopup inherits Rectangle {
                 }
             }
         }
+        if root.narrow : VerticalLayout {
+            padding: 6px; spacing: 6px;
+            controls := ScrollView {
+                height: min(controls-content.preferred-height, root.height * 0.6);
+                content-width: self.visible-width;
+                content-height: controls-content.preferred-height;
+                content-x: 0px;
+                horizontal-scrollbar-policy: always-off;
+                controls-content := VerticalLayout {
+                    x: 0px; y: 0px;
+                    width: controls.visible-width;
+                    height: self.preferred-height;
+                    // Leave room for styles whose vertical scrollbar overlays the viewport.
+                    padding-right: 12px;
+                    spacing: 6px;
+                    HorizontalLayout {
+                        height: root.field-height; spacing: 6px;
+                        StickerSearchField {
+                            horizontal-stretch: 1;
+                            query <=> root.query; can-send: root.can-send; has-current: root.has-current;
+                            elevated: root.elevated; ink: root.ink; muted: root.muted; text-scale: root.text-scale;
+                            searched(text) => { root.searched(text); }
+                            navigate(offset) => { root.navigate(offset); }
+                            send-current => { root.send(root.items[root.current].key); }
+                            dismiss => { root.dismiss(); }
+                        }
+                        IconAction {
+                            width: 30px * root.text-scale; icon: "×"; label: "Close sticker picker";
+                            ink: root.muted; surface: root.surface; hover-surface: root.hover;
+                            activated => { root.dismiss(); }
+                        }
+                    }
+                    if root.packs.length > 1 : ComboBox {
+                        height: root.field-height;
+                        model: root.packs;
+                        current-index <=> root.pack-index;
+                        accessible-label: "Sticker pack";
+                        selected(value) => { root.choose-pack(self.current-index); }
+                    }
+                    if root.needs-consent : StickerConsent {
+                        stacked: true; ready: root.phase == 1;
+                        elevated: root.elevated; outline: root.outline; surface: root.surface; hover: root.hover;
+                        ink: root.ink; muted: root.muted; text-scale: root.text-scale;
+                        consent(allowed) => { root.consent(allowed); }
+                    }
+                    // Measured at its allocated width, so the scroll extent
+                    // covers the wrapped text and the controls below it.
+                    Rectangle {
+                        height: narrow-status.height;
+                        narrow-status := Text {
+                            width: parent.width; height: self.preferred-height;
+                            text: root.selected-text;
+                            color: root.ink; font-size: 11px * root.text-scale; wrap: word-wrap;
+                            accessible-live-region: polite;
+                        }
+                    }
+                    StickerPreviewBox {
+                        height: min(96px, 56px * root.text-scale);
+                        preview: root.preview; loaded: root.preview-loaded; status: root.preview-status;
+                        label: root.current-label; elevated: root.elevated; muted: root.muted; text-scale: root.text-scale;
+                    }
+                    TextAction {
+                        wrap-caption: true;
+                        text: "Send sticker"; ink: root.ink; muted: root.muted;
+                        surface: root.surface; hover-surface: root.hover; outline: root.outline; text-scale: root.text-scale;
+                        enabled: root.has-current && root.can-send;
+                        activated => { root.send(root.items[root.current].key); }
+                    }
+                }
+            }
+            StickerList {
+                vertical-stretch: 1; min-height: root.row-height;
+                items: root.items; current: root.current; row-height: root.row-height;
+                surface: root.surface; hover: root.hover; ink: root.ink; muted: root.muted; accent: root.accent;
+                text-scale: root.text-scale;
+                highlight(key) => { root.highlight(key); }
+                dismiss => { root.dismiss(); }
+            }
+        }
     }
 }
 
 // The one tracked sticker send for the visible composer. Cancel and Retry act
-// on the exact queued request; nothing here enqueues a second sticker.
+// on the exact queued request; nothing here enqueues a second sticker. The
+// status wraps rather than eliding, and an uncertain send is lifted only by
+// confirming the conversation was checked, never by a plain dismissal.
 component StickerSendStatus inherits Rectangle {
     in property <string> status;
     in property <bool> can-cancel;
     in property <bool> can-retry;
+    in property <bool> uncertain;
     in property <color> surface;
     in property <color> hover;
     in property <color> ink;
     in property <color> muted;
     in property <color> accent;
+    in property <color> outline;
     in property <float> text-scale: 1;
     callback cancel();
     callback retry();
     callback dismiss();
-    height: max(30px, 22px * root.text-scale + 8px);
+    property <length> action-height: max(30px, 32px * root.text-scale);
+    height: message.y + message.height + 4px + root.action-height + 6px;
     background: surface; border-radius: StyleTokens.radius * 0.6;
+    message := Text {
+        x: 8px; y: 6px; width: root.width - 16px; height: self.preferred-height;
+        text: root.status; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+        accessible-label: "Sticker send status: " + root.status; accessible-live-region: polite;
+    }
     HorizontalLayout {
-        padding-left: 8px; padding-right: 4px; spacing: 6px;
-        Text {
-            text: root.status; color: root.muted; font-size: 11px * root.text-scale;
-            vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
-            accessible-label: "Sticker send status: " + root.status; accessible-live-region: polite;
-        }
+        x: 8px; y: message.y + message.height + 4px;
+        width: root.width - 16px; height: root.action-height;
+        alignment: end; spacing: 6px;
         if root.can-retry : IconAction {
-            width: 27px; height: 26px; icon: "↻"; label: "Retry this sticker";
+            width: 27px * root.text-scale; icon: "↻"; label: "Retry this sticker";
             ink: root.accent; surface: transparent; hover-surface: root.hover;
             activated => { root.retry(); }
         }
         if root.can-cancel : IconAction {
-            width: 27px; height: 26px; icon: "×"; label: "Cancel this sticker";
+            width: 27px * root.text-scale; icon: "×"; label: "Cancel this sticker";
             ink: root.muted; surface: transparent; hover-surface: root.hover;
             activated => { root.cancel(); }
         }
-        if !root.can-cancel : IconAction {
-            width: 27px; height: 26px; icon: "✓"; label: "Dismiss sticker status";
+        if !root.can-cancel && !root.uncertain : IconAction {
+            width: 27px * root.text-scale; icon: "✓"; label: "Dismiss sticker status";
             ink: root.muted; surface: transparent; hover-surface: root.hover;
+            activated => { root.dismiss(); }
+        }
+        if root.uncertain : TextAction {
+            text: "I checked"; ink: root.ink; muted: root.muted;
+            surface: root.surface; hover-surface: root.hover; outline: root.outline; text-scale: root.text-scale;
+            accessible-label: "I checked the conversation: allow sending stickers again";
             activated => { root.dismiss(); }
         }
     }
@@ -1834,6 +2022,7 @@ export component AppWindow inherits Window {
     in-out property <string> sticker-send-status;
     in-out property <bool> sticker-send-can-cancel: false;
     in-out property <bool> sticker-send-can-retry: false;
+    in-out property <bool> sticker-send-uncertain: false;
     // The destination the picker and send status belong to; any change closes
     // or hides them before a stale choice can act.
     property <string> sticker-scope: root.active-account-local-id + "\n" + root.active-room-id + "\n" + root.thread-root-id + "\n" + root.composer-mode + "\n" + root.side-panel-tab;
@@ -3180,6 +3369,7 @@ export component AppWindow inherits Window {
                             phase: root.sticker-phase; status: root.sticker-status; notice: root.sticker-notice;
                             needs-consent: root.sticker-needs-consent; can-send: root.sticker-can-send;
                             preview: root.sticker-preview-image; preview-loaded: root.sticker-preview-loaded; preview-status: root.sticker-preview-status;
+                            available-height: max(140px, parent.absolute-position.y - 8px);
                             surface: root.panel; elevated: root.elevated; hover: root.hover; ink: root.ink; muted: root.muted; accent: root.accent;
                             outline: root.divider; text-scale: root.text-scale;
                             searched(query) => { root.sticker-query(query); }
@@ -3193,6 +3383,7 @@ export component AppWindow inherits Window {
                         if root.sticker-send-visible && !root.sticker-send-threaded && !root.sticker-open && !root.emoji-open && root.composer-mentions.length == 0 : StickerSendStatus {
                             x: root.content-inset; y: -self.height; width: max(0px, parent.width - 2 * root.content-inset);
                             status: root.sticker-send-status; can-cancel: root.sticker-send-can-cancel; can-retry: root.sticker-send-can-retry;
+                            uncertain: root.sticker-send-uncertain; outline: root.divider;
                             surface: root.panel; hover: root.hover; ink: root.ink; muted: root.muted; accent: root.accent; text-scale: root.text-scale;
                             cancel => { root.sticker-send-cancel(); }
                             retry => { root.sticker-send-retry(); }
@@ -4888,6 +5079,7 @@ export component AppWindow inherits Window {
                             phase: root.sticker-phase; status: root.sticker-status; notice: root.sticker-notice;
                             needs-consent: root.sticker-needs-consent; can-send: root.sticker-can-send;
                             preview: root.sticker-preview-image; preview-loaded: root.sticker-preview-loaded; preview-status: root.sticker-preview-status;
+                            available-height: max(140px, parent.absolute-position.y - 8px);
                             surface: root.panel; elevated: root.elevated; hover: root.hover; ink: root.ink; muted: root.muted; accent: root.accent;
                             outline: root.divider; text-scale: root.text-scale;
                             searched(query) => { root.sticker-query(query); }
@@ -4901,6 +5093,7 @@ export component AppWindow inherits Window {
                         if root.sticker-send-visible && root.sticker-send-threaded && !root.sticker-open && !root.emoji-open && root.thread-mentions.length == 0 : StickerSendStatus {
                             x: 4px; y: -self.height; width: parent.width - 8px;
                             status: root.sticker-send-status; can-cancel: root.sticker-send-can-cancel; can-retry: root.sticker-send-can-retry;
+                            uncertain: root.sticker-send-uncertain; outline: root.divider;
                             surface: root.panel; hover: root.hover; ink: root.ink; muted: root.muted; accent: root.accent; text-scale: root.text-scale;
                             cancel => { root.sticker-send-cancel(); }
                             retry => { root.sticker-send-retry(); }

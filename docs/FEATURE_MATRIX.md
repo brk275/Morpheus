@@ -24,7 +24,7 @@ See [account access](ACCOUNT_ACCESS.md) for password and removal behavior.
 | Area | Implemented | Still required for beta |
 | --- | --- | --- |
 | Navigation | DMs, Spaces, rooms in multiple Spaces, discovery, invites, private room/Space creation and alias/ID joining. | Full navigation QA, federation and installed interaction across platforms. |
-| Composer | Plain text and optional Markdown, mentions, replies, edits, reactions, encrypted room/thread drafts, saved-send recovery review and attachment controls. | Live thread and attachment UI, retry/cancel behavior, restart reconciliation, sticker composition and IME coverage. |
+| Composer | Plain text and optional Markdown, mentions, replies, edits, reactions, encrypted room/thread drafts, saved-send recovery review and attachment controls. | Live thread and attachment UI, retry/cancel behavior, restart reconciliation, sticker composition (a source-only picker and gated send exist; see [stickers](STICKERS.md)) and IME coverage. |
 | Timeline | Bounded native rich text, threads and virtualized message rows. | Rendered encrypted-message UI and a real 10,000-message room with variable-height content. |
 | Emoji and images | Offline Unicode emoji search; explicit, bounded PNG/baseline-JPEG attachment viewer; encrypted image previews off by default. | Full picker interaction, platform font coverage and viewer accessibility. |
 | Search | Account-scoped encrypted local index, room/cross-room queries and event context. | All-room UI, large histories and cross-platform interaction. |
