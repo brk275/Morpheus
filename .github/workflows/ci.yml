@@ -1,12 +1,12 @@
 # TEMPORARY combined interface compiler check. NEVER MERGE this workflow.
 name: Reviewed combined customization interface
-run-name: Diagnose combined search layout warnings - d5f3d55
+run-name: Verify search layout without compiler warnings - 7424db0
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: customization-ui-compile-d5f3d55
+  group: customization-ui-compile-7424db0
   cancel-in-progress: false
 jobs:
   contracts:
@@ -17,11 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: d5f3d55cd37801ee4daf4db87c2ff95ff116f88a
+          ref: 7424db066d9c4ba0bfdb6c4924ee8b3b49b88f31
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact reviewed source
-        run: test "$(git rev-parse HEAD)" = d5f3d55cd37801ee4daf4db87c2ff95ff116f88a
+        run: test "$(git rev-parse HEAD)" = 7424db066d9c4ba0bfdb6c4924ee8b3b49b88f31
       - name: Scan source before executing the reviewed UI compiler hook
         shell: bash
         run: |
@@ -115,13 +115,15 @@ jobs:
           # or credential vault is executed. The complete log stayed private
           # and passed the independent default scan before this extraction.
           clean = re.sub(r'\x1b\[[0-9;]*m', '', output)
+          warnings = re.findall(r'^warning: morpheus-ui-check@[0-9.]+: ([^\r\n]{1,240})',clean,re.MULTILINE)[:100]
+          passed = passed and not warnings
           errors = re.findall(r'^\s*error: ([^\r\n]{1,200})', clean, re.MULTILINE)[:8]
           print(json.dumps({'check':'customization_slint_compile',
-              'source':'d5f3d55cd37801ee4daf4db87c2ff95ff116f88a',
+              'source':'7424db066d9c4ba0bfdb6c4924ee8b3b49b88f31',
               'status':'passed' if passed else 'failed','failure':reason,
               'error_codes':sorted(set(re.findall(r'error\[(E[0-9]{4})\]',clean))),
               'compiler_messages':errors,
-              'ui_compiler_warnings':re.findall(r'^warning: morpheus-ui-check@[0-9.]+: ([^\r\n]{1,240})',clean,re.MULTILINE)[:100],
+              'ui_compiler_warnings':warnings,
               'source_locations':sorted(set(re.findall(r'(?:crates/[A-Za-z0-9_./-]+\.(?:rs|slint):[0-9]+(?::[0-9]+)?)',clean))),
               'app_executed':False,'real_accounts':False,'physical_devices':False,
               'raw_logs_public':False},sort_keys=True),flush=True)
