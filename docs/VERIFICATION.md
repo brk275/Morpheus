@@ -2922,7 +2922,12 @@ error cannot be forced by the fixture and are covered by unit tests of the
 registry only; a persisted SDK request whose record never received its id
 sends on its own once its room resumes, and its record stays unconfirmed for
 the user's review; a read-only row larger than the hold bound (64 MiB per row,
-256 MiB per account) cannot be discarded from this build because its complete
+256 MiB per account, counted as the complete retained row: the row, attachment
+and thumbnail structs, both text columns, the draft kind's event id and every
+attachment and thumbnail field including file names, MIME types, BlurHashes and
+payloads, with checked arithmetic, and the same count charged to the discovery
+budget; this bounds what Morpheus retains, not the SDK's own decode of the row
+on load) cannot be discarded from this build because its complete
 identity cannot be verified without a stronger digest, and adding one (for
 example the `sha2` crate already present through the pinned SDK) is a
 dependency edge for root review rather than a change made here; the

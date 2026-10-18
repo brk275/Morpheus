@@ -61,7 +61,8 @@ use std::{
 use eyeball_im::Vector;
 use futures_util::StreamExt;
 use matrix_sdk::{
-    Client, ComposerDraft, ComposerDraftType, DraftAttachmentContent, RoomState, StateStore,
+    Client, ComposerDraft, ComposerDraftType, DraftAttachment, DraftAttachmentContent,
+    DraftThumbnail, RoomState, StateStore,
     authentication::matrix::MatrixSession,
     config::SyncSettings,
     encryption::{
@@ -515,36 +516,108 @@ struct HeldOriginal {
     bytes: usize,
 }
 
-/// Bytes of a complete stored row: both text columns and every attachment and
-/// thumbnail payload. Charged to the discovery budget and the hold bound.
-fn row_bytes(draft: &ComposerDraft) -> usize {
-    let attachments: usize = draft
-        .attachments
-        .iter()
-        .map(|attachment| {
-            attachment.filename.len()
-                + match &attachment.content {
-                    DraftAttachmentContent::Image { data, thumbnail, .. }
-                    | DraftAttachmentContent::Video { data, thumbnail, .. } => {
-                        data.len() + thumbnail.as_ref().map_or(0, |thumb| thumb.data.len())
-                    }
-                    DraftAttachmentContent::Audio { data, .. }
-                    | DraftAttachmentContent::File { data, .. } => data.len(),
-                }
-        })
-        .sum();
-    draft.plain_text.len() + draft.html_text.as_ref().map_or(0, String::len) + attachments
+/// Bytes a complete stored row retains once decoded and cloned: the row and
+/// every attachment and thumbnail struct itself, both text columns, the draft
+/// kind's event id, and every owned variable field of every attachment (file
+/// name, MIME type, BlurHash, payload) and thumbnail (file name, MIME type,
+/// payload). Charged to the discovery budget and the hold bound before any
+/// clone, so metadata-only rows and rows with many empty attachments count
+/// what they occupy. Checked arithmetic: an overflowing sum is `None`, which
+/// every caller treats as over any bound. This bounds what Morpheus retains;
+/// the pinned SDK already decodes the complete row when it is loaded.
+fn row_bytes(draft: &ComposerDraft) -> Option<usize> {
+    fn opt_len(value: &Option<String>) -> usize {
+        value.as_ref().map_or(0, String::len)
+    }
+    fn thumbnail_bytes(thumbnail: &Option<DraftThumbnail>) -> Option<usize> {
+        let Some(thumbnail) = thumbnail else {
+            return Some(0);
+        };
+        std::mem::size_of::<DraftThumbnail>()
+            .checked_add(thumbnail.filename.len())?
+            .checked_add(thumbnail.data.len())?
+            .checked_add(opt_len(&thumbnail.mimetype))
+    }
+    fn attachment_bytes(attachment: &DraftAttachment) -> Option<usize> {
+        let content = match &attachment.content {
+            DraftAttachmentContent::Image {
+                data,
+                mimetype,
+                blurhash,
+                thumbnail,
+                ..
+            }
+            | DraftAttachmentContent::Video {
+                data,
+                mimetype,
+                blurhash,
+                thumbnail,
+                ..
+            } => data
+                .len()
+                .checked_add(opt_len(mimetype))?
+                .checked_add(opt_len(blurhash))?
+                .checked_add(thumbnail_bytes(thumbnail)?)?,
+            DraftAttachmentContent::Audio { data, mimetype, .. }
+            | DraftAttachmentContent::File { data, mimetype, .. } => {
+                data.len().checked_add(opt_len(mimetype))?
+            }
+        };
+        std::mem::size_of::<DraftAttachment>()
+            .checked_add(attachment.filename.len())?
+            .checked_add(content)
+    }
+    let kind = match &draft.draft_type {
+        ComposerDraftType::NewMessage => 0,
+        ComposerDraftType::Reply { event_id } | ComposerDraftType::Edit { event_id } => {
+            event_id.as_str().len()
+        }
+    };
+    let mut total = std::mem::size_of::<ComposerDraft>()
+        .checked_add(draft.plain_text.len())?
+        .checked_add(opt_len(&draft.html_text))?
+        .checked_add(kind)?;
+    for attachment in &draft.attachments {
+        total = total.checked_add(attachment_bytes(attachment)?)?;
+    }
+    Some(total)
+}
+
+/// Sum of the bytes already held; `None` when the sum itself overflows, which
+/// callers treat as a full account.
+fn held_total(originals: &HashMap<PendingScope, HeldOriginal>) -> Option<usize> {
+    originals
+        .values()
+        .try_fold(0usize, |total, held| total.checked_add(held.bytes))
+}
+
+/// Whether one more held row of `bytes` fits beside the rows already held.
+fn fits_held_total(originals: &HashMap<PendingScope, HeldOriginal>, bytes: usize) -> bool {
+    held_total(originals)
+        .and_then(|total| total.checked_add(bytes))
+        .is_some_and(|total| total <= MAX_HELD_ORIGINAL_TOTAL_BYTES)
 }
 
 /// The original to hold for a restored row: only read-only scopes need one
 /// (a carried original is compared through its carry), and only when the
-/// complete row fits the per-row bound.
+/// complete row fits the per-row bound. The size is computed on the borrowed
+/// row before anything is cloned.
 fn held_original_for(draft: &ComposerDraft, restored: &RestoredCompose) -> Option<HeldOriginal> {
+    held_original_within(draft, restored, MAX_HELD_ORIGINAL_BYTES)
+}
+
+/// `held_original_for` under an explicit per-row bound; the production bound
+/// is `MAX_HELD_ORIGINAL_BYTES`. A row whose size overflows is never held.
+fn held_original_within(
+    draft: &ComposerDraft,
+    restored: &RestoredCompose,
+    max_bytes: usize,
+) -> Option<HeldOriginal> {
     if restored.read_only.is_none() {
         return None;
     }
-    let bytes = row_bytes(draft);
-    if bytes > MAX_HELD_ORIGINAL_BYTES {
+    let bytes = row_bytes(draft)?;
+    if bytes > max_bytes {
         return None;
     }
     Some(HeldOriginal {
@@ -579,8 +652,7 @@ fn hold_original(
     let Some(held) = held_original_for(draft, restored) else {
         return;
     };
-    let total: usize = originals.values().map(|held| held.bytes).sum();
-    if total.saturating_add(held.bytes) <= MAX_HELD_ORIGINAL_TOTAL_BYTES {
+    if fits_held_total(originals, held.bytes) {
         originals.insert(scope.clone(), held);
     }
 }
@@ -3523,9 +3595,13 @@ struct ScanBudget {
 }
 
 impl ScanBudget {
-    fn charge(&mut self, bytes: usize) -> Result<(), ScanError> {
-        self.scopes += 1;
-        self.bytes = self.bytes.saturating_add(bytes);
+    /// Charge one complete row (`row_bytes`); a row whose size overflows
+    /// spends the whole budget.
+    fn charge(&mut self, bytes: Option<usize>) -> Result<(), ScanError> {
+        self.scopes = self.scopes.saturating_add(1);
+        self.bytes = bytes
+            .and_then(|bytes| self.bytes.checked_add(bytes))
+            .unwrap_or(usize::MAX);
         if self.scopes > MAX_RECOVERY_SCOPES || self.bytes > MAX_RECOVERY_BYTES {
             return Err(ScanError::Budget);
         }
@@ -3569,11 +3645,11 @@ async fn adopt_scanned(loaded: &LoadedAccount, scanned: Vec<ScannedRoom>) -> Vec
                 fresh = true;
                 ScopeRecovery::from_restored(&draft.restored)
             });
-            if fresh && let Some(original) = held.remove(&scope) {
-                let total: usize = originals.values().map(|held| held.bytes).sum();
-                if total.saturating_add(original.bytes) <= MAX_HELD_ORIGINAL_TOTAL_BYTES {
-                    originals.insert(scope, original);
-                }
+            if fresh
+                && let Some(original) = held.remove(&scope)
+                && fits_held_total(&originals, original.bytes)
+            {
+                originals.insert(scope, original);
             }
             draft.restored.revision = entry.block().map(|block| block.revision().clone());
             recovered.push(draft);
@@ -4455,6 +4531,113 @@ mod tests {
         );
         assert!(source.exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn held_originals_are_bounded_by_the_complete_row_they_retain() {
+        fn attachment(filename: &str, mimetype: Option<&str>, blurhash: Option<&str>, thumbnail: Option<DraftThumbnail>) -> DraftAttachment {
+            DraftAttachment {
+                filename: filename.into(),
+                content: DraftAttachmentContent::Image {
+                    data: vec![1, 2, 3],
+                    mimetype: mimetype.map(str::to_owned),
+                    size: Some(3),
+                    width: None,
+                    height: None,
+                    blurhash: blurhash.map(str::to_owned),
+                    thumbnail,
+                },
+            }
+        }
+        fn thumbnail(filename: &str) -> DraftThumbnail {
+            DraftThumbnail {
+                filename: filename.into(),
+                data: vec![9],
+                mimetype: Some("image/png".into()),
+                width: None,
+                height: None,
+                size: Some(1),
+            }
+        }
+        let row = |attachments: Vec<DraftAttachment>, draft_type: ComposerDraftType| ComposerDraft {
+            plain_text: "shown but preserved".into(),
+            html_text: None,
+            draft_type,
+            attachments,
+        };
+        let base = row(vec![attachment("a.png", Some("image/png"), Some("LEHV6nWB"), Some(thumbnail("t.png")))], ComposerDraftType::NewMessage);
+        let base_bytes = row_bytes(&base).unwrap();
+        // Every owned variable field is counted, not only payload bytes: a
+        // longer MIME type, BlurHash or thumbnail name grows the row by exactly
+        // the extra characters, and a reply target by its event id.
+        let mime = row(vec![attachment("a.png", Some("image/png;charset=binary"), Some("LEHV6nWB"), Some(thumbnail("t.png")))], ComposerDraftType::NewMessage);
+        assert_eq!(row_bytes(&mime).unwrap(), base_bytes + ";charset=binary".len());
+        let blur = row(vec![attachment("a.png", Some("image/png"), Some("LEHV6nWB-longer"), Some(thumbnail("t.png")))], ComposerDraftType::NewMessage);
+        assert_eq!(row_bytes(&blur).unwrap(), base_bytes + "-longer".len());
+        let thumb = row(vec![attachment("a.png", Some("image/png"), Some("LEHV6nWB"), Some(thumbnail("thumbnail.png")))], ComposerDraftType::NewMessage);
+        assert_eq!(row_bytes(&thumb).unwrap(), base_bytes + "thumbnail.png".len() - "t.png".len());
+        let reply = row(vec![attachment("a.png", Some("image/png"), Some("LEHV6nWB"), Some(thumbnail("t.png")))], ComposerDraftType::Reply { event_id: EventId::parse("$reply:example.org").unwrap().to_owned() });
+        assert_eq!(row_bytes(&reply).unwrap(), base_bytes + "$reply:example.org".len());
+        // Struct overhead is counted per attachment and per thumbnail, so many
+        // empty attachments cannot hide below a bound.
+        let empties: Vec<DraftAttachment> = (0..64)
+            .map(|_| DraftAttachment {
+                filename: String::new(),
+                content: DraftAttachmentContent::File { data: Vec::new(), mimetype: None, size: None },
+            })
+            .collect();
+        let many = row(empties, ComposerDraftType::NewMessage);
+        let many_bytes = row_bytes(&many).unwrap();
+        assert!(many_bytes >= std::mem::size_of::<ComposerDraft>() + 64 * std::mem::size_of::<DraftAttachment>());
+        assert_eq!(
+            row_bytes(&row(Vec::new(), ComposerDraftType::NewMessage)).unwrap(),
+            std::mem::size_of::<ComposerDraft>() + "shown but preserved".len()
+        );
+        // Boundary checks under a small explicit bound: exactly the row fits;
+        // one more metadata byte does not, and nothing is cloned for it.
+        let restored = restore_stored_row(&base);
+        assert_eq!(restored.blocked(), Some(QuarantineReason::UnsupportedFields));
+        let held = held_original_within(&base, &restored, base_bytes).expect("exactly the row fits");
+        assert_eq!(held.bytes, base_bytes);
+        assert_eq!(held.draft, base);
+        assert!(held_original_within(&base, &restored, base_bytes - 1).is_none());
+        assert!(held_original_within(&mime, &restore_stored_row(&mime), base_bytes).is_none(), "a metadata-only growth is refused by the same bound");
+        assert!(held_original_within(&many, &restore_stored_row(&many), many_bytes - 1).is_none(), "many empty attachments are not free");
+        assert!(held_original_within(&many, &restore_stored_row(&many), many_bytes).is_some());
+        // A writable row is never held, whatever the bound.
+        let plain = row(Vec::new(), ComposerDraftType::NewMessage);
+        assert!(held_original_within(&plain, &restore_stored_row(&plain), usize::MAX).is_none());
+        // Account total: the same accounting decides whether another row fits,
+        // and an unverifiable (unheld) row erases nothing already held.
+        let mut originals: HashMap<PendingScope, HeldOriginal> = HashMap::new();
+        let scope_a = ("!a:example.org".to_owned(), None);
+        let scope_b = ("!b:example.org".to_owned(), None);
+        originals.insert(scope_a.clone(), held_original_within(&base, &restored, usize::MAX).unwrap());
+        assert_eq!(held_total(&originals), Some(base_bytes));
+        assert!(fits_held_total(&originals, MAX_HELD_ORIGINAL_TOTAL_BYTES - base_bytes));
+        assert!(!fits_held_total(&originals, MAX_HELD_ORIGINAL_TOTAL_BYTES - base_bytes + 1));
+        assert!(!fits_held_total(&originals, usize::MAX), "an overflowing sum never fits");
+        // Exact identity preservation: the identical complete row keeps the
+        // identity the controller already has; a metadata-only change (MIME
+        // type) is another row with another identity, with the held original
+        // replaced, and the unchanged scope is untouched.
+        let mut again = restore_stored_row(&base);
+        hold_original(&mut originals, &scope_a, &base, &mut again);
+        assert_eq!(again.revision.as_ref(), Some(&held.revision));
+        let mut changed = restore_stored_row(&mime);
+        let fresh = changed.revision.clone().unwrap();
+        hold_original(&mut originals, &scope_a, &mime, &mut changed);
+        assert_eq!(changed.revision, Some(fresh));
+        assert_eq!(originals.get(&scope_a).map(|held| &held.draft), Some(&mime));
+        let mut other = restore_stored_row(&thumb);
+        hold_original(&mut originals, &scope_b, &thumb, &mut other);
+        assert_eq!(held_total(&originals), Some(row_bytes(&mime).unwrap() + row_bytes(&thumb).unwrap()));
+        // The scan budget charges the same complete size and treats an
+        // overflowing row as spending everything, keeping the row untouched.
+        let mut budget = ScanBudget::default();
+        assert!(budget.charge(row_bytes(&many)).is_ok());
+        assert_eq!(budget.bytes, many_bytes);
+        assert!(matches!(budget.charge(None), Err(ScanError::Budget)));
     }
 
     #[test]
