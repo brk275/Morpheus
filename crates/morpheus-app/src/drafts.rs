@@ -1678,6 +1678,7 @@ mod tests {
             discarded_rich_intent: false,
             envelope: DraftEnvelope::fresh(),
             read_only: None,
+            revision: None,
         };
         drafts.seed_recovered("a", "room", None, restored, &[second.nonce().clone()], drafts.account_epoch("a"));
         assert_eq!(

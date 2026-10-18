@@ -1573,12 +1573,26 @@ struct Bounds {
     bottom: f32,
 }
 
+/// Window-relative bounds of one real item. Pinned Slint's `map_to_window`
+/// maps a point given in the item's parent coordinate system and does not add
+/// the item's own x and y, so the item's `geometry()` (which is in that parent
+/// system) is mapped by its origin, never by the zero point: mapping zero
+/// would report the parent's origin and under-report every offset control.
+fn item_bounds(item: &slint::private_unstable_api::re_exports::ItemRc) -> Bounds {
+    let geometry = item.geometry();
+    let origin = item.map_to_window(geometry.origin);
+    Bounds {
+        left: origin.x,
+        top: origin.y,
+        right: origin.x + geometry.size.width,
+        bottom: origin.y + geometry.size.height,
+    }
+}
+
 /// Where the real generated controls with a given accessible label sit, as
 /// window-relative bounds. Empty when none is instantiated.
 fn control_bounds(ui: &AppWindow, label: &str) -> Vec<Bounds> {
-    use slint::private_unstable_api::re_exports::{
-        AccessibleStringProperty, ItemRc, LogicalPoint, WindowInner,
-    };
+    use slint::private_unstable_api::re_exports::{AccessibleStringProperty, ItemRc, WindowInner};
     use std::ops::ControlFlow;
 
     let window = WindowInner::from_pub(ui.window());
@@ -1590,18 +1604,46 @@ fn control_bounds(ui: &AppWindow, label: &str) -> Vec<Bounds> {
             .as_deref()
             == Some(label)
         {
-            let origin = item.map_to_window(LogicalPoint::default());
-            let size = item.geometry().size;
-            bounds.push(Bounds {
-                left: origin.x,
-                top: origin.y,
-                right: origin.x + size.width,
-                bottom: origin.y + size.height,
-            });
+            bounds.push(item_bounds(item));
         }
         ControlFlow::<()>::Continue(())
     });
     bounds
+}
+
+/// Proof that the bounds helpers map the item's own origin: for every
+/// labelled control whose own x or y is nonzero, the reported bounds differ
+/// from a zero-point mapping by exactly that offset, and at least one such
+/// control exists among the given labels (otherwise the check proves nothing).
+fn assert_bounds_use_item_origin(ui: &AppWindow, labels: &[&str]) {
+    use slint::private_unstable_api::re_exports::{
+        AccessibleStringProperty, ItemRc, LogicalPoint, WindowInner,
+    };
+    use std::ops::ControlFlow;
+
+    let window = WindowInner::from_pub(ui.window());
+    let root = ItemRc::new_root(window.component());
+    let mut offset_controls = 0;
+    let _ = root.visit_descendants(|item| {
+        let label = item.accessible_string_property(AccessibleStringProperty::Label);
+        if !labels.iter().any(|wanted| label.as_deref() == Some(wanted)) {
+            return ControlFlow::<()>::Continue(());
+        }
+        let geometry = item.geometry();
+        let naive = item.map_to_window(LogicalPoint::default());
+        let bounds = item_bounds(item);
+        assert!((bounds.left - (naive.x + geometry.origin.x)).abs() < 0.01);
+        assert!((bounds.top - (naive.y + geometry.origin.y)).abs() < 0.01);
+        if geometry.origin.x.abs() > 0.5 || geometry.origin.y.abs() > 0.5 {
+            offset_controls += 1;
+            assert!(
+                (bounds.left - naive.x).abs() > 0.5 || (bounds.top - naive.y).abs() > 0.5,
+                "a control with its own offset must not report its parent's origin: {bounds:?}"
+            );
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    assert!(offset_controls > 0, "at least one checked control must have a nonzero own x or y");
 }
 
 /// Left and right edges only, for callers that check the horizontal axis.
@@ -1614,18 +1656,11 @@ fn control_extents(ui: &AppWindow, label: &str) -> Vec<(f32, f32)> {
 
 /// Bounds of the control that currently has keyboard focus, if any.
 fn focused_control_bounds(ui: &AppWindow) -> Option<Bounds> {
-    use slint::private_unstable_api::re_exports::{LogicalPoint, WindowInner};
+    use slint::private_unstable_api::re_exports::WindowInner;
 
     let window = WindowInner::from_pub(ui.window());
     let focused = window.focus_item.borrow().upgrade()?;
-    let origin = focused.map_to_window(LogicalPoint::default());
-    let size = focused.geometry().size;
-    Some(Bounds {
-        left: origin.x,
-        top: origin.y,
-        right: origin.x + size.width,
-        bottom: origin.y + size.height,
-    })
+    Some(item_bounds(&focused))
 }
 
 fn window_size(ui: &AppWindow) -> (f32, f32) {
@@ -1878,8 +1913,15 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
     // when it receives focus, so the deepest record is reachable by keyboard
     // alone. Without a bounded viewport the lower records would sit below the
     // window.
+    // The thread strip still shows the projection fixture's two records
+    // (unconfirmed and kept, neither owning a request), so only the four room
+    // records with a request offer Cancel.
     let cancels = control_bounds(ui, CANCEL_LABEL);
-    assert_eq!(cancels.len(), 4 + 1, "four room records and one thread record still own a request");
+    assert_eq!(cancels.len(), 4, "four room records own a request; the inherited thread records do not");
+    // The bounds used for every clipping and focus check below map each
+    // control's own origin; a control offset inside its row or stack must not
+    // report its parent's position.
+    assert_bounds_use_item_origin(ui, &[CANCEL_LABEL, COPY_LABEL, RESTORE_LABEL, &composer_label]);
     let strip_labels = [
         KEEP_LABEL,
         SENT_LABEL,
