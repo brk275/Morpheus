@@ -1,10 +1,10 @@
 //! UI-thread timeline storage with lazy rich-text projection and stable models.
 //!
-//! SDK snapshots still arrive as owned plain data. Comparing them here avoids
+//! SDK snapshots share immutable rows. Comparing them here avoids
 //! rebuilding unchanged Slint rows; only row_data formats a requested row.
 //! Account, room and feed-generation guards remain at the publication callers.
 
-use std::{any::Any, cell::RefCell};
+use std::{any::Any, cell::RefCell, sync::Arc};
 
 use morpheus_matrix::MessageInfo;
 use slint::{Model, ModelNotify, ModelRc, ModelTracker};
@@ -16,17 +16,21 @@ use crate::MessageItem;
 const MAX_ROW_NOTIFICATIONS: usize = 128;
 
 struct TimelineModel {
-    rows: RefCell<Vec<MessageInfo>>,
+    rows: RefCell<Vec<Arc<MessageInfo>>>,
     notify: ModelNotify,
     #[cfg(test)]
     projected: std::cell::Cell<usize>,
 }
 
 impl TimelineModel {
-    fn replace(&self, next: Vec<MessageInfo>) {
+    fn replace(&self, next: Vec<Arc<MessageInfo>>) {
         let (prefix, removed, added) = {
             let old = self.rows.borrow();
-            let prefix = old.iter().zip(&next).take_while(|(a, b)| a == b).count();
+            let prefix = old
+                .iter()
+                .zip(&next)
+                .take_while(|(a, b)| same_row(a, b))
+                .count();
             if prefix == old.len() && prefix == next.len() {
                 return;
             }
@@ -34,7 +38,7 @@ impl TimelineModel {
                 .iter()
                 .rev()
                 .zip(next[prefix..].iter().rev())
-                .take_while(|(a, b)| a == b)
+                .take_while(|(a, b)| same_row(a, b))
                 .count();
             (
                 prefix,
@@ -78,6 +82,10 @@ impl TimelineModel {
     }
 }
 
+fn same_row(a: &Arc<MessageInfo>, b: &Arc<MessageInfo>) -> bool {
+    Arc::ptr_eq(a, b) || a.as_ref() == b.as_ref()
+}
+
 impl Model for TimelineModel {
     type Data = MessageItem;
 
@@ -104,9 +112,9 @@ impl Model for TimelineModel {
 
 /// Apply a snapshot to an existing timeline model or replace a non-timeline
 /// model (including an account-detach/room-change blank) with a fresh one.
-pub(crate) fn update(
+pub(crate) fn update_shared(
     current: ModelRc<MessageItem>,
-    rows: Vec<MessageInfo>,
+    rows: Vec<Arc<MessageInfo>>,
 ) -> ModelRc<MessageItem> {
     if let Some(model) = current.as_any().downcast_ref::<TimelineModel>() {
         model.replace(rows);
@@ -119,6 +127,16 @@ pub(crate) fn update(
             projected: std::cell::Cell::new(0),
         })
     }
+}
+
+// Owned fixtures also exercise the value-equality fallback: a rebuilt row can
+// be equal even when it has a different allocation from the previous snapshot.
+#[cfg(test)]
+pub(crate) fn update(
+    current: ModelRc<MessageItem>,
+    rows: Vec<MessageInfo>,
+) -> ModelRc<MessageItem> {
+    update_shared(current, rows.into_iter().map(Arc::new).collect())
 }
 
 #[cfg(test)]
@@ -216,7 +234,14 @@ pub(crate) mod tests {
 
     fn assert_rows(model: &ModelRc<MessageItem>, expected: &[MessageInfo]) {
         let actual = model.as_any().downcast_ref::<TimelineModel>().unwrap();
-        assert_eq!(actual.rows.borrow().as_slice(), expected);
+        assert!(
+            actual
+                .rows
+                .borrow()
+                .iter()
+                .map(|row| row.as_ref())
+                .eq(expected.iter())
+        );
         assert_eq!(model.row_count(), expected.len());
     }
 
@@ -234,6 +259,59 @@ pub(crate) mod tests {
         let same = update(model.clone(), rows);
         assert_eq!(same, model);
         assert_eq!(projection_count(&same), 1);
+    }
+
+    #[test]
+    fn shared_history_retains_payload_allocations_across_append_and_edit() {
+        let original: Vec<_> = (0..10_000).map(|i| Arc::new(fixture(i))).collect();
+        let model = update_shared(ModelRc::default(), original.clone());
+        let observer = Box::pin(ModelChangeListenerContainer::new(Observer {
+            model: model.clone(),
+            changes: RefCell::new(Vec::new()),
+        }));
+        model
+            .model_tracker()
+            .attach_peer(observer.as_ref().model_peer());
+
+        let mut next = original.clone();
+        next.push(Arc::new(fixture(10_000)));
+        assert_eq!(update_shared(model.clone(), next.clone()), model);
+        let mut edited = next[0].as_ref().clone();
+        edited.body = "Edited shared row".into();
+        edited.rich_markdown = Some(edited.body.clone());
+        edited.rich_accessible = Some(edited.body.clone());
+        next[0] = Arc::new(edited);
+        update_shared(model.clone(), next.clone());
+
+        let stored = model.as_any().downcast_ref::<TimelineModel>().unwrap();
+        {
+            let rows = stored.rows.borrow();
+            assert_eq!(rows.len(), 10_001);
+            assert!(
+                rows.iter().zip(&next).all(|(a, b)| Arc::ptr_eq(a, b)),
+                "the UI must retain published row allocations, not copy payloads"
+            );
+            assert!(
+                rows[1..10_000]
+                    .iter()
+                    .zip(&original[1..])
+                    .all(|(a, b)| Arc::ptr_eq(a, b))
+            );
+        }
+        assert_ne!(original[0].body, "Edited shared row");
+        assert_eq!(
+            model.row_data(0).unwrap().body.as_str(),
+            "Edited shared row"
+        );
+        assert_eq!(
+            *observer.as_ref().get().changes.borrow(),
+            [Change::Added(10_000, 1, 10_001), Change::Changed(0, 10_001)]
+        );
+        assert_eq!(
+            projection_count(&model),
+            3,
+            "only two reentrant observer reads and one explicit read project text"
+        );
     }
 
     #[test]

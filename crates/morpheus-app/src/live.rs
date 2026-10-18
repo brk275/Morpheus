@@ -2199,7 +2199,10 @@ impl LiveUi {
                             &room_id,
                         )
                     {
-                        ui.set_messages(crate::timeline_model::update(ui.get_messages(), messages));
+                        ui.set_messages(crate::timeline_model::update_shared(
+                            ui.get_messages(),
+                            messages.as_ref().clone(),
+                        ));
                     }
                 });
                 if updates.changed().await.is_err() {
@@ -2306,12 +2309,13 @@ impl LiveUi {
                         && ui.get_thread_root_id().as_str() == root_event_id
                     {
                         let replies = messages
-                            .into_iter()
+                            .iter()
                             .filter(|message| {
                                 message.event_id.as_deref() != Some(root_event_id.as_str())
                             })
+                            .cloned()
                             .collect();
-                        ui.set_thread_messages(crate::timeline_model::update(
+                        ui.set_thread_messages(crate::timeline_model::update_shared(
                             ui.get_thread_messages(),
                             replies,
                         ));

@@ -737,22 +737,30 @@ async fn next_queued_send_update(
     }
 }
 
+/// Immutable timeline snapshot. Cloning it shares rows and message payloads.
+pub type MessageSnapshot = Arc<Vec<Arc<MessageInfo>>>;
+
 /// A selected account's live message list. Drop it when the room or account
 /// changes; the underlying SDK timeline subscriber is then stopped.
 pub struct MessageFeed {
     pub account_id: String,
     pub room_id: String,
-    updates: watch::Receiver<Vec<MessageInfo>>,
+    updates: watch::Receiver<MessageSnapshot>,
     task: JoinHandle<()>,
 }
 
 impl MessageFeed {
-    pub fn subscribe(&self) -> watch::Receiver<Vec<MessageInfo>> {
+    pub fn subscribe(&self) -> watch::Receiver<MessageSnapshot> {
         self.updates.clone()
     }
 
+    /// Explicit owned export; live subscribers use shared snapshots instead.
     pub fn snapshot(&self) -> Vec<MessageInfo> {
-        self.updates.borrow().clone()
+        self.updates
+            .borrow()
+            .iter()
+            .map(|row| row.as_ref().clone())
+            .collect()
     }
 }
 
@@ -3254,16 +3262,21 @@ async fn message_feed_from_timeline(
     timeline: Arc<Timeline>,
 ) -> MessageFeed {
     let (items, mut stream) = timeline.subscribe().await;
-    let mut mapped: Vector<Option<MessageInfo>> =
-        items.iter().map(|item| message_info(item)).collect();
-    let initial = mapped.iter().filter_map(Clone::clone).collect();
+    let mut mapped: Vector<Option<Arc<MessageInfo>>> = items
+        .iter()
+        .map(|item| message_info(item).map(Arc::new))
+        .collect();
+    let initial: MessageSnapshot = Arc::new(mapped.iter().filter_map(Clone::clone).collect());
     let (updates, receiver) = watch::channel(initial);
     let task = tokio::spawn(async move {
         while let Some(diffs) = stream.next().await {
             for diff in diffs {
-                diff.map(|item| message_info(&item)).apply(&mut mapped);
+                diff.map(|item| message_info(&item).map(Arc::new))
+                    .apply(&mut mapped);
             }
-            updates.send_replace(mapped.iter().filter_map(Clone::clone).collect());
+            // Unchanged rows retain their allocations. Publication copies only
+            // row handles; subscribers clone the outer Arc, not message text.
+            updates.send_replace(Arc::new(mapped.iter().filter_map(Clone::clone).collect()));
         }
     });
     MessageFeed {
