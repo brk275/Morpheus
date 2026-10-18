@@ -882,12 +882,26 @@ pub enum SaveRejected {
     RecordReplayed,
 }
 
-/// A record this process created: the selection epoch it belongs to and
-/// whether its one enqueue capability has been issued.
+/// Where a record this process created stands with respect to its single
+/// enqueue capability. Only a record that has not crossed the SDK boundary
+/// may be abandoned without an exact release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FreshState {
+    /// Saved as enqueuing; no capability issued yet.
+    Saved,
+    /// The capability was issued to the controller and not yet used.
+    Granted,
+    /// The capability was consumed at the SDK boundary: a request may exist
+    /// even though no transaction id is in the row yet.
+    Consumed,
+}
+
+/// A record this process created: the selection epoch it belongs to and the
+/// state of its one enqueue capability.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FreshIntent {
     epoch: u64,
-    issued: bool,
+    state: FreshState,
 }
 
 /// Authoritative per-scope recovery state, mirrored from the last encrypted
@@ -906,8 +920,11 @@ pub struct ScopeRecovery {
     /// them. Pruned once they leave the row.
     released: HashSet<Generation>,
     /// Records created by this process under a selection epoch. Only these
-    /// may receive a transaction id or be abandoned without a resolution, and
-    /// each gets exactly one enqueue capability; restored records never do.
+    /// may receive a transaction id, and each gets exactly one enqueue
+    /// capability; restored records never do. Only one whose capability was
+    /// never consumed may be abandoned without a resolution: once the SDK
+    /// boundary was crossed, a request may exist and the record stays until
+    /// its exact release.
     fresh: HashMap<Generation, FreshIntent>,
     /// Issued, not yet consumed enqueue capabilities.
     grants: HashSet<Generation>,
@@ -1032,9 +1049,15 @@ impl ScopeRecovery {
         }
         for current in &self.records {
             let Some(next) = incoming.find(&current.nonce) else {
+                // A fresh enqueuing record may be abandoned only while its
+                // capability was never consumed; after the SDK boundary the
+                // request may exist and only an exact release lets it go.
                 let abandoned_fresh = !current.is_queued()
                     && !current.is_kept()
-                    && self.fresh.contains_key(&current.nonce);
+                    && self
+                        .fresh
+                        .get(&current.nonce)
+                        .is_some_and(|intent| intent.state != FreshState::Consumed);
                 if self.released.contains(&current.nonce) || abandoned_fresh {
                     continue;
                 }
@@ -1082,7 +1105,7 @@ impl ScopeRecovery {
                     next.nonce.clone(),
                     FreshIntent {
                         epoch,
-                        issued: false,
+                        state: FreshState::Saved,
                     },
                 );
             }
@@ -1155,21 +1178,27 @@ impl ScopeRecovery {
         let Some(intent) = self.fresh.get_mut(nonce) else {
             return false;
         };
-        if !enqueuing || intent.epoch != epoch || intent.issued {
+        if !enqueuing || intent.epoch != epoch || intent.state != FreshState::Saved {
             return false;
         }
-        intent.issued = true;
+        intent.state = FreshState::Granted;
         self.grants.insert(nonce.clone());
         true
     }
 
     /// Consume the capability at the SDK boundary under the same selection
     /// epoch. False means no fresh intent of this selection owns this enqueue.
+    /// From here the record cannot leave the row without an exact release,
+    /// even before its transaction id is persisted.
     pub fn consume_grant(&mut self, nonce: &Generation, epoch: u64) -> bool {
-        if self.fresh.get(nonce).is_none_or(|intent| intent.epoch != epoch) {
+        let Some(intent) = self.fresh.get_mut(nonce) else {
+            return false;
+        };
+        if intent.epoch != epoch || !self.grants.remove(nonce) {
             return false;
         }
-        self.grants.remove(nonce)
+        intent.state = FreshState::Consumed;
+        true
     }
 
     /// A new selection epoch: every capability and every fresh ownership of
@@ -1634,11 +1663,47 @@ mod tests {
         scope.apply_saved(&queued, EPOCH);
         assert!(!scope.grant(&nonce, EPOCH), "a queued record needs no grant");
         assert_eq!(scope.check_save(&row), Err(SaveRejected::RecordRegressed), "a queued record cannot go back to enqueuing");
-        // Abandoning is allowed only while the fresh record never got an id.
-        let mut again = ScopeRecovery::default();
-        again.apply_saved(&row, EPOCH);
+        // Abandoning is allowed only while the fresh record never crossed the
+        // SDK boundary: before the grant, and after the grant while it is
+        // unused. Once consumed, the record stays until its exact release,
+        // even though no transaction id is in the row yet.
         let empty = DraftEnvelope::fresh();
-        assert_eq!(again.check_save(&empty), Ok(()));
+        let mut before_grant = ScopeRecovery::default();
+        before_grant.apply_saved(&row, EPOCH);
+        assert_eq!(before_grant.check_save(&empty), Ok(()), "never granted: the caller may abandon");
+        let mut granted = ScopeRecovery::default();
+        granted.apply_saved(&row, EPOCH);
+        assert!(granted.grant(&nonce, EPOCH));
+        assert_eq!(granted.check_save(&empty), Ok(()), "granted but unused: preparation may still fail and abandon");
+        let mut consumed = ScopeRecovery::default();
+        consumed.apply_saved(&row, EPOCH);
+        assert!(consumed.grant(&nonce, EPOCH));
+        assert!(consumed.consume_grant(&nonce, EPOCH));
+        assert_eq!(
+            consumed.check_save(&empty),
+            Err(SaveRejected::RecordDropped),
+            "consumed: a save before the id is persisted cannot drop the record"
+        );
+        let mut stale_without_record = DraftEnvelope::fresh();
+        stale_without_record.set_generation(Generation::fresh());
+        assert_eq!(consumed.check_save(&stale_without_record), Err(SaveRejected::RecordDropped));
+        // The exact queued assignment is still the one allowed transition,
+        // and the exact release (no id yet) is the one way out.
+        assert_eq!(consumed.check_save(&queued), Ok(()));
+        assert!(!consumed.release(&nonce, Some(TXN)), "a release must name the record's exact id, here none");
+        assert!(consumed.release(&nonce, None));
+        assert_eq!(consumed.check_save(&empty), Ok(()));
+        // Wrong epoch and revocation: the consumed record is as protected as
+        // a restored one.
+        let mut other_epoch = ScopeRecovery::default();
+        other_epoch.apply_saved(&row, EPOCH);
+        assert!(other_epoch.grant(&nonce, EPOCH));
+        assert!(!other_epoch.consume_grant(&nonce, EPOCH + 1));
+        assert_eq!(other_epoch.check_save(&empty), Ok(()), "an unconsumed grant still allows abandonment");
+        assert!(other_epoch.consume_grant(&nonce, EPOCH));
+        other_epoch.revoke_process_ownership();
+        assert_eq!(other_epoch.check_save(&empty), Err(SaveRejected::RecordDropped));
+        assert_eq!(other_epoch.check_save(&queued), Err(SaveRejected::RecordReplayed));
         assert_eq!(scope.check_save(&empty), Err(SaveRejected::RecordDropped));
         // Account A -> B -> A: the new selection epoch revokes the old fresh
         // ownership. The old enqueuing record can be neither granted nor
