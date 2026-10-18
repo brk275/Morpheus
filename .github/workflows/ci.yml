@@ -1,27 +1,27 @@
 # TEMPORARY focused native offline app checks. NEVER MERGE this workflow.
-name: Reviewed sticker timeout diagnostics
-run-name: Sticker timeout phase diagnosis - e1bcb7c
+name: Reviewed timeline device contracts
+run-name: Timeline device contracts - 239cb44
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: sticker-media-diagnostics-e1bcb7c
+  group: timeline-device-contracts-239cb44
   cancel-in-progress: false
 jobs:
   contracts:
-    name: Verify private timeout diagnostics then encrypted sticker fixture
+    name: Verify exact enrolled-device and private-file contracts
     if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: e1bcb7ce02f0c0b93c281822762e938e82a626a2
+          ref: 239cb446e82389117bfab7906e272ed1d4e7fb87
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact reviewed source
-        run: test "$(git rev-parse HEAD)" = e1bcb7ce02f0c0b93c281822762e938e82a626a2
+        run: test "$(git rev-parse HEAD)" = 239cb446e82389117bfab7906e272ed1d4e7fb87
       - name: Scan source before executing reviewed native tests
         shell: bash
         run: |
@@ -50,7 +50,7 @@ jobs:
         with:
           key: verified-sdk-archives-v1
           save-if: false
-      - name: Verify seven privacy and scanner-order diagnostic contracts
+      - name: Verify nineteen bounded supervisor and privacy contracts
         timeout-minutes: 5
         env:
           CARGO_BUILD_JOBS: "2"
@@ -79,7 +79,7 @@ jobs:
           reason = None
           code = None
           with log.open('xb') as output:
-              child = subprocess.Popen(['python3','-I','-B','-c',"import sys,unittest; sys.path.insert(0,'scripts/tests'); suite=unittest.defaultTestLoader.loadTestsFromNames(['test_sticker_diagnostics.StickerDiagnosticTests','test_matrix_acceptance.StickerFailureForwardingTests']); result=unittest.TextTestRunner(verbosity=2).run(suite); raise SystemExit(not result.wasSuccessful() or result.testsRun != 7 or bool(result.skipped))"],
+              child = subprocess.Popen(['python3','-I','-B','-c',"import sys,unittest; sys.path.insert(0,'scripts/tests'); suite=unittest.defaultTestLoader.loadTestsFromNames(['test_run_timeline_acceptance']); result=unittest.TextTestRunner(verbosity=2).run(suite); raise SystemExit(not result.wasSuccessful() or result.testsRun != 19 or bool(result.skipped))"],
                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                   env=environment, start_new_session=True)
               deadline = time.monotonic()+90
@@ -119,29 +119,93 @@ jobs:
           if scan.returncode!=0:
               print('OFFLINE_NATIVE_LOG_WITHHELD',flush=True); raise SystemExit(1)
           output=log.read_text(errors='replace')
-          passed=reason is None and code==0 and re.search(r'^Ran 7 tests in ',output,re.MULTILINE) is not None and re.search(r'^OK$',output,re.MULTILINE) is not None
-          print(json.dumps({'check':'sticker_diagnostic_contracts','status':'passed' if passed else 'failed',
-              'source':'e1bcb7ce02f0c0b93c281822762e938e82a626a2','failure':reason,
-              'tests_passed':7 if passed else None,'raw_logs_public':False,
+          passed=reason is None and code==0 and re.search(r'^Ran 19 tests in ',output,re.MULTILINE) is not None and re.search(r'^OK$',output,re.MULTILINE) is not None
+          print(json.dumps({'check':'timeline_device_supervisor_contracts','status':'passed' if passed else 'failed',
+              'source':'239cb446e82389117bfab7906e272ed1d4e7fb87','failure':reason,
+              'tests_passed':19 if passed else None,'raw_logs_public':False,
               'accounts_generated':False,'app_executed':False},sort_keys=True),flush=True)
           if not passed: raise SystemExit(1)
           PY
-      - name: Compile the reviewed media fixture before generated accounts exist
-        timeout-minutes: 25
+      - name: Verify four pure exact-device and file-boundary Rust contracts
+        timeout-minutes: 40
         env:
           CARGO_BUILD_JOBS: "2"
           CARGO_INCREMENTAL: "0"
           CARGO_PROFILE_DEV_DEBUG: "0"
           CARGO_PROFILE_TEST_DEBUG: "0"
-        run: cargo test --locked -p morpheus-matrix --test media_local --no-run
-      - name: Verify encrypted sticker catalog send and receive with disposable accounts
-        timeout-minutes: 55
-        env:
-          CARGO_BUILD_JOBS: "2"
-          CARGO_INCREMENTAL: "0"
-          CARGO_PROFILE_DEV_DEBUG: "0"
-          CARGO_PROFILE_TEST_DEBUG: "0"
-        run: >-
-          dbus-run-session -- python3 scripts/run_matrix_acceptance.py
-          --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks" --suite media-only
-      # Fresh hosted synthetic vault only; no owner data, signing material or artifacts.
+          CARGO_TERM_COLOR: never
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -I -B - <<'PY'
+          import json, os, pathlib, re, select, signal, subprocess, tempfile, time
+          assert os.environ.get('GITHUB_ACTIONS') == 'true'
+          assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+          assert os.environ.get('ImageOS') == 'ubuntu24'
+          names = ('PATH','HOME','LANG','LC_ALL','TMPDIR','CARGO_HOME','RUSTUP_HOME','RUSTUP_TOOLCHAIN',
+              'PKG_CONFIG_PATH','LD_LIBRARY_PATH','SSL_CERT_FILE','SSL_CERT_DIR','CARGO_BUILD_JOBS',
+              'CARGO_INCREMENTAL','CARGO_PROFILE_DEV_DEBUG','CARGO_PROFILE_TEST_DEBUG','CARGO_TERM_COLOR',
+              'GITHUB_ACTIONS','RUNNER_ENVIRONMENT','RUNNER_OS','ImageOS','RUNNER_TEMP','RUNNER_TRACKING_ID')
+          environment = {name:os.environ[name] for name in names if name in os.environ}
+          root = pathlib.Path(tempfile.mkdtemp(prefix='morpheus-offline-app-',dir=os.environ['RUNNER_TEMP']))
+          root.chmod(0o700)
+          logs = root/'logs'; logs.mkdir(mode=0o700)
+          log = logs/'cargo.log'
+          reason = None
+          code = None
+          with log.open('xb') as output:
+              child = subprocess.Popen(['cargo','test','--locked','-p','morpheus-matrix','--test','timeline_10k_local','--','--test-threads=1','--skip','seed_ten_thousand_event_encrypted_room'],
+                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                  env=environment, start_new_session=True)
+              deadline = time.monotonic()+35*60
+              size = 0
+              try:
+                  while True:
+                      remaining = deadline-time.monotonic()
+                      if remaining<=0:
+                          reason='deadline'; break
+                      ready,_,_=select.select([child.stdout],[],[],remaining)
+                      if not ready:
+                          reason='deadline'; break
+                      block=os.read(child.stdout.fileno(),65536)
+                      if not block: break
+                      size+=len(block)
+                      if size>50*1024*1024:
+                          reason='output_limit'; break
+                      output.write(block)
+                  if reason is None:
+                      code=child.wait(timeout=10)
+              except (OSError,subprocess.SubprocessError):
+                  reason='process_error'
+              finally:
+                  # Never signal an already-reaped PID/group. Timeout and
+                  # overflow keep our child anchored until after group kill.
+                  if child.returncode is None:
+                      try: os.killpg(child.pid,signal.SIGKILL)
+                      except ProcessLookupError: pass
+                      child.wait(timeout=10)
+                  child.stdout.close()
+          with (root/'scan.log').open('wb') as output:
+              scan=subprocess.run([os.environ['RUNNER_TEMP']+'/gitleaks/gitleaks','dir',str(logs),
+                  '--redact=100','--ignore-gitleaks-allow','--no-banner','--max-target-megabytes','0',
+                  '--config',os.environ['RUNNER_TEMP']+'/default.toml',
+                  '--gitleaks-ignore-path',os.environ['RUNNER_TEMP']+'/empty.ignore'],
+                  stdout=output,stderr=subprocess.STDOUT,timeout=60)
+          if scan.returncode!=0:
+              print('OFFLINE_NATIVE_LOG_WITHHELD',flush=True); raise SystemExit(1)
+          output=log.read_text(errors='replace')
+          needed={'every_message_carries_one_marker_and_heights_vary',
+              'only_distinct_plausible_enrolled_device_ids_are_accepted',
+              'sending_waits_for_the_join_and_the_exact_devices_in_a_fixed_order',
+              'enrolled_device_records_are_private_bounded_regular_files_outside_checkout'}
+          ok=set(re.findall(r'^test ([A-Za-z0-9_]+) \.\.\. ok$',output,re.MULTILINE))
+          summaries=re.findall(r'^test result: ok\. 4 passed; 0 failed; 0 ignored; [0-9]+ measured; 1 filtered out;',output,re.MULTILINE)
+          passed=reason is None and code==0 and needed==ok and len(summaries)==1
+          print(json.dumps({'check':'timeline_device_rust_contracts','status':'passed' if passed else 'failed',
+              'source':'239cb446e82389117bfab7906e272ed1d4e7fb87','failure':reason,
+              'tests_passed':4 if passed else None,'raw_logs_public':False,
+              'accounts_generated':False,'app_executed':False},sort_keys=True),flush=True)
+          if not passed: raise SystemExit(1)
+          PY
+      # No live fixture, installed app, accounts, signing material or artifact uploads.
