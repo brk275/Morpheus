@@ -37,6 +37,12 @@ The only added dependency is the already-locked `sha2` 0.10.9. The upstream
 generated lockfile, changelog and registry metadata are omitted from this local
 workspace package; their original hashes remain in the provenance inventory.
 
+CI jobs that build the native SDK use the `verified-sdk-archives-v1` cache
+key. The pinned cache action includes this key in both exact and fallback
+prefixes, so pre-patch target caches cannot restore an unverified SDK extraction.
+The configuration-only and account-vault jobs keep their existing keys.
+Cache writes remain restricted to trusted `main` runs.
+
 ## Verification status
 
 Guarded tests cover download identity/length rejection, cache receipts, unsafe
@@ -44,8 +50,11 @@ paths and link entries, oversized entries, non-overwrite behavior, Unix special
 permission removal and refusal to traverse an existing directory link. They
 exercise the new extractor rather than an unpatched reproducer.
 
-These tests and actual archive downloads/extraction on Apple Silicon, Intel
-Mac, Windows and Linux are **not yet verified**. The ordinary CI vendor gate
+The six archive guard tests passed on Linux in
+[run 39103257117](https://github.com/brk275/Morpheus/actions/runs/39103257117),
+at source revision `519feec284500b20dfd2909ab4a0ed9e77f0ebdc`.
+Actual SDK downloads/extraction and platform-specific guard behavior on Apple
+Silicon, Intel Mac, Windows and Linux are **not yet verified**. The ordinary CI vendor gate
 includes this crate's unit tests. No source review or checksum alone establishes
 beta readiness, and version-only ZIP advisory matches must still be assessed
 against actual callers; do not suppress ZIP advisories globally.

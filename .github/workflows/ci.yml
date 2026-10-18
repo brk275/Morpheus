@@ -161,6 +161,9 @@ jobs:
         with:
           # Preserve compiled dependencies when a later acceptance check fails.
           # The save guard still makes untrusted/PR executions restore-only.
+          # Older SDK extractions lack the verified downloader's receipt.
+          # The key separates both primary and fallback cache namespaces.
+          key: verified-sdk-archives-v1
           cache-on-failure: true
           save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
       - name: Check formatting
