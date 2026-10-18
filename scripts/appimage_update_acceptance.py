@@ -31,6 +31,7 @@ import urllib.request
 import uuid
 
 from fixture_paths import external_path, private_directory, write_private
+from package_revision import expected_revision, SourceRevisionError
 from element_process_namespace import namespace_command, stop_owned, wait_owned
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -278,7 +279,12 @@ class Commands:
 def export_source(commands, source):
     commands.mark("source_export")
     revision = commands.run(["git", "rev-parse", "HEAD"], cwd=source).strip()
-    require(re.fullmatch(r"[0-9a-f]{40}", revision) and revision == os.environ.get("GITHUB_SHA"))
+    try:
+        expected = expected_revision(os.environ)
+    except SourceRevisionError:
+        raise QAError("artifact_identity", operation="source_revision") from None
+    if revision != expected:
+        raise QAError("artifact_identity", operation="source_revision")
     archive = commands.root / "source.tar"
     commands.run(["git", "archive", "--format=tar", "--output=" + str(archive), revision], cwd=source)
     destination = private_directory(commands.root / "source")

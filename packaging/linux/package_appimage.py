@@ -30,6 +30,7 @@ import appimage_diagnostics as diagnostics
 import element_process_namespace as containment
 from package import package_config
 from prepare_appimage_update import prepare_appimage, validate_metadata
+from package_revision import expected_revision, verify_checkout, SourceRevisionError
 
 
 # Source-review gate only, never an environment bypass or runtime proof. The
@@ -71,7 +72,8 @@ def controlled_environment(environment):
     # dynamic-loader, package plugin and inherited signing/capture override.
     allowed = {"HOME", "USER", "LOGNAME", "TMPDIR", "CARGO_HOME", "RUSTUP_HOME", "RUNNER_TEMP",
                "GITHUB_ACTIONS", "RUNNER_ENVIRONMENT", "RUNNER_OS", "GITHUB_REPOSITORY", "GITHUB_REF",
-               "GITHUB_EVENT_NAME", "GITHUB_EVENT_PATH", "GITHUB_SHA", "MORPHEUS_ELEMENT_NAMESPACE_CONTROL"}
+               "GITHUB_EVENT_NAME", "GITHUB_EVENT_PATH", "GITHUB_SHA", "MORPHEUS_PACKAGE_SOURCE_REVISION",
+               "MORPHEUS_ELEMENT_NAMESPACE_CONTROL"}
     result = client.R.clean_environment({name: value for name, value in environment.items() if name in allowed})
     result["APPIMAGE_EXTRACT_AND_RUN"] = "1"
     result["RUSTUP_TOOLCHAIN"] = "1.99.0"
@@ -202,7 +204,7 @@ def build_unsigned(runner, root, *, tools, environment, notices):
     prepare_appimage(artifact, metadata)
     final_bytes = client.read_regular(artifact, MAX_APPIMAGE)
     record = {"schema": 1, "format": FORMAT, "unsigned": True,
-              "source_revision": os.environ["GITHUB_SHA"], "appimage_sha256": hashlib.sha256(final_bytes).hexdigest(),
+              "source_revision": expected_revision(os.environ), "appimage_sha256": hashlib.sha256(final_bytes).hexdigest(),
               "native_executable_sha256": hashlib.sha256(binary_bytes).hexdigest(),
               "pipewire": shipped, "packager_tools": tool_receipts, "inventory": inventory,
               "installed_capture_passed": False, "distribution_ready": inventory.get("distribution_ready") is True,
@@ -375,10 +377,16 @@ def main():
     public_hosted_environment(os.environ)
     environment = controlled_environment(os.environ)
     if args.cleanup:
+        # Source/diagnostic failures must never prevent owned-service cleanup.
+        # This path retains hosted, containment and private-directory guards.
         containment.assert_contained()
         client.private_directory(args.cleanup)
         import appimage_capture as capture
         return capture.cleanup(OwnedRunner(args.cleanup / "cleanup-command-logs"), args.cleanup, environment)
+    try:
+        verify_checkout(ROOT, expected_revision(os.environ))
+    except SourceRevisionError:
+        raise PackageFailure("identity") from None
     if args.inside:
         containment.assert_contained()
         tools = {"cargo": owned_tool(args.cargo), "curl": owned_tool("/usr/bin/curl", root_owned=True),

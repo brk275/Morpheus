@@ -9,6 +9,29 @@ python3 scripts/package.py
 
 The package output goes to `dist/`. This command does not make a public release. The packaged call feature still needs real MatrixRTC interoperability and device testing before a beta can be distributed.
 
+## Selecting a reviewed package source
+
+The manual **Package validation** workflow runs from `main`. Leave
+`source_revision` blank to build that workflow revision, or enter a complete,
+lowercase 40-character commit ID that has received source and dependency review.
+Branch names, tags and shortened hashes are rejected. This input does not grant
+source-review approval; follow [the contribution review policy](../AGENTS.md#review-externally-submitted-code-before-execution)
+before dispatching it.
+
+Package workers check out the selected commit and verify its identity and clean
+tracked source before installing the toolchain or building. The source is scanned
+with independently pinned default secret rules before workers execute its code.
+Candidates must include the current package QA tools, including
+`scripts/package_revision.py`. Package receipts and update-source exports identify
+the selected source; `GITHUB_SHA` continues to identify the workflow itself.
+
+Candidate revisions restore caches without writing shared entries. Only the
+workflow's own `main` revision can populate the trusted cache. Package cache
+namespaces include the root manifest and lockfile hashes, separating the verified
+SDK downloader from legacy extraction caches. Select only the
+affected platforms and check active runs first. QA installers remain on the
+runner; signing, licensing and installed-package release gates still apply.
+
 ## Unsigned package validation
 
 The Windows job prepares [verified NSIS tools](../packaging/windows/NSIS_TOOLS.md)

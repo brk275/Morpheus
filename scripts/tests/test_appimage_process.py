@@ -154,11 +154,44 @@ class DownloadAndEnvironmentTests(unittest.TestCase):
 
     def test_environment_preserves_home_and_removes_secrets_loader_and_signer(self):
         result = P.controlled_environment({"HOME": "/home/runner", "GITHUB_SHA": "a" * 40,
+                   "MORPHEUS_PACKAGE_SOURCE_REVISION": "b" * 40,
                    "LD_LIBRARY_PATH": "private", "RUSTFLAGS": "private", "LDAI_SIGN": "private",
                    "GITHUB_TOKEN": "private", "CARGO_REGISTRY_TOKEN": "private", "RUSTC_WRAPPER": "private"})
         self.assertEqual(result["HOME"], "/home/runner")
+        self.assertEqual(result["GITHUB_SHA"], "a" * 40)
+        self.assertEqual(result["MORPHEUS_PACKAGE_SOURCE_REVISION"], "b" * 40)
         self.assertEqual(result["RUSTUP_TOOLCHAIN"], "1.99.0")
         self.assertNotIn("private", result.values())
+
+    def test_source_mismatch_stops_before_tool_selection_or_build(self):
+        with mock.patch.object(P.sys, "argv", ["package_appimage", "--gitleaks", "/scanner"]), \
+                mock.patch.object(P, "public_hosted_environment"), \
+                mock.patch.object(P, "expected_revision", return_value="b" * 40), \
+                mock.patch.object(P, "verify_checkout", side_effect=P.SourceRevisionError("checkout")), \
+                mock.patch.object(P, "command_tools") as tools, \
+                mock.patch.object(P, "contained") as contained, \
+                self.assertRaises(P.PackageFailure) as error:
+            P.main()
+        self.assertEqual(error.exception.reason, "identity")
+        tools.assert_not_called()
+        contained.assert_not_called()
+
+    def test_source_failure_cannot_block_guarded_owned_cleanup(self):
+        cleanup = mock.Mock(return_value="cleaned")
+        with mock.patch.object(P.sys, "argv", ["package_appimage", "--cleanup", "/private/case"]), \
+                mock.patch.object(P, "public_hosted_environment") as hosted, \
+                mock.patch.object(P, "controlled_environment", return_value={}), \
+                mock.patch.object(P.containment, "assert_contained") as contained, \
+                mock.patch.object(P.client, "private_directory") as private, \
+                mock.patch.object(P, "verify_checkout", side_effect=P.SourceRevisionError("dirty")) as verify, \
+                mock.patch.object(P, "OwnedRunner"), \
+                mock.patch.dict(sys.modules, {"appimage_capture": SimpleNamespace(cleanup=cleanup)}):
+            self.assertEqual(P.main(), "cleaned")
+        hosted.assert_called_once()
+        contained.assert_called_once()
+        private.assert_called_once_with(Path("/private/case"))
+        verify.assert_not_called()
+        cleanup.assert_called_once()
 
     def test_readiness_cannot_be_enabled_by_environment(self):
         self.assertTrue(P.INSTALLED_CAPTURE_READY)  # Source review only.

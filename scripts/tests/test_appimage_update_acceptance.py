@@ -6,6 +6,7 @@ from pathlib import Path
 import struct
 import sys
 import tempfile
+import tarfile
 import unittest
 from unittest import mock
 
@@ -50,6 +51,41 @@ class AppImageAcceptanceTests(unittest.TestCase):
             for key in env:
                 with self.subTest(missing=key), mock.patch.dict(os.environ, {key: ""}), self.assertRaises(RuntimeError):
                     target.hosted_guard(True)
+
+    def test_export_rejects_wrong_source_before_archiving_without_reflecting_output(self):
+        commands = mock.Mock()
+        commands.run.return_value = "b" * 40
+        with mock.patch.dict(os.environ, {"GITHUB_SHA": "a" * 40,
+                                          "MORPHEUS_PACKAGE_SOURCE_REVISION": "c" * 40}), \
+                self.assertRaises(target.QAError) as error:
+            target.export_source(commands, Path("source"))
+        self.assertEqual(error.exception.facts(), {"reason": "artifact_identity", "operation": "source_revision"})
+        self.assertEqual(commands.run.call_count, 1)
+        self.assertEqual(commands.run.call_args.args[0], ["git", "rev-parse", "HEAD"])
+
+    def test_export_uses_selected_commit_without_changing_workflow_identity(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            commands = mock.Mock()
+            commands.root = root
+            def command(args, **_kwargs):
+                if args == ["git", "rev-parse", "HEAD"]:
+                    return "b" * 40
+                self.assertEqual(args[:3], ["git", "archive", "--format=tar"])
+                self.assertEqual(args[-1], "b" * 40)
+                archive = Path(args[3].removeprefix("--output="))
+                with tarfile.open(archive, "w") as output:
+                    output.addfile(tarfile.TarInfo("marker"))
+                return ""
+            commands.run.side_effect = command
+            with mock.patch.dict(os.environ, {"GITHUB_SHA": "a" * 40,
+                                              "MORPHEUS_PACKAGE_SOURCE_REVISION": "b" * 40}):
+                destination, exported_revision = target.export_source(commands, root)
+                self.assertEqual(exported_revision, "b" * 40)
+                self.assertEqual(os.environ["GITHUB_SHA"], "a" * 40)
+            self.assertTrue((destination / "marker").is_file())
+            self.assertFalse((root / "source.tar").exists())
+            self.assertEqual(commands.run.call_count, 2)
 
     def test_only_explicit_app_versions_change(self):
         with tempfile.TemporaryDirectory() as folder:

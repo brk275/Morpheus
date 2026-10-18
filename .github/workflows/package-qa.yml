@@ -3,6 +3,11 @@ name: Package validation
 on:
   workflow_dispatch:
     inputs:
+      source_revision:
+        description: Full reviewed commit ID (blank builds this workflow's main revision)
+        type: string
+        required: false
+        default: ""
       platform:
         description: Platforms affected by this package change (all for release candidates)
         type: choice
@@ -45,9 +50,11 @@ jobs:
     name: Select package platforms
     if: github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event.repository.private == false
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.scope.outputs.matrix }}
+      source_revision: ${{ steps.scope.outputs.source_revision }}
+      cache_write: ${{ steps.scope.outputs.cache_write }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -55,11 +62,36 @@ jobs:
       - name: Select requested standard runners
         id: scope
         env:
+          PACKAGE_SOURCE_REVISION: ${{ inputs.source_revision }}
           PACKAGE_PLATFORM: ${{ inputs.platform }}
           LINUX_FORMATS: ${{ inputs.linux_formats }}
           APPIMAGE_UPDATES: ${{ inputs.appimage_updates }}
           APPIMAGE_CAPTURE: ${{ inputs.appimage_capture }}
         run: python3 scripts/package_scope.py
+      - name: Check out selected source for independent scanning
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ steps.scope.outputs.source_revision }}
+          path: selected-source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan selected source before any package worker executes it
+        working-directory: selected-source
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/package-source-gitleaks.tar.gz"
+          curl --fail --silent --show-error --location \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output "$archive"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
+          mkdir "$RUNNER_TEMP/package-source-scanner"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/package-source-scanner" gitleaks
+          printf '[extend]\nuseDefault = true\n' > "$RUNNER_TEMP/package-source-default.toml"
+          : > "$RUNNER_TEMP/package-source-empty.ignore"
+          "$RUNNER_TEMP/package-source-scanner/gitleaks" git --redact=100 --ignore-gitleaks-allow --no-banner \
+            --config "$RUNNER_TEMP/package-source-default.toml" \
+            --gitleaks-ignore-path "$RUNNER_TEMP/package-source-empty.ignore" --log-opts=--all .
 
   package:
     name: Package validation (${{ matrix.label }})
@@ -68,16 +100,22 @@ jobs:
     runs-on: ${{ matrix.os }}
     # CI and packaging for the same platform/candidate share this lock.
     concurrency:
-      group: native-${{ github.sha }}-${{ matrix.os }}
+      group: native-${{ needs.scope.outputs.source_revision }}-${{ matrix.os }}
       cancel-in-progress: false
     timeout-minutes: 150
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.scope.outputs.matrix) }}
+    env:
+      MORPHEUS_PACKAGE_SOURCE_REVISION: ${{ needs.scope.outputs.source_revision }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ needs.scope.outputs.source_revision }}
+          fetch-depth: 0
           persist-credentials: false
+      - name: Verify exact reviewed source checkout
+        run: python3 scripts/package_revision.py --verify-checkout .
       - name: Require reviewed installed capture adapter
         if: runner.os == 'Linux' && inputs.appimage_capture
         run: python3 packaging/linux/package_appimage.py --check-readiness
@@ -98,9 +136,12 @@ jobs:
           toolchain: 1.99.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
+          # Separate source/dependency cohorts before RustCache fallback keys.
+          # In particular, legacy SDK extractions have no verified receipt.
+          key: package-inputs-${{ hashFiles('Cargo.toml', 'Cargo.lock') }}
           # Preserve trusted build dependencies when a later install check fails.
           cache-on-failure: true
-          save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
+          save-if: ${{ needs.scope.outputs.cache_write == 'true' && github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' }}
       - name: Install pinned Cargo Packager
         run: cargo install cargo-packager --version 0.11.8 --locked
       - name: Linux installed update QA dependencies
