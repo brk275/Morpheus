@@ -571,7 +571,10 @@ mod tests {
             let sdk_open = future_size(|| loaded.timeline(room))
                 .min(future_size(|| loaded.thread_timeline(room, root)));
             let reads = [
-                ("messages_snapshot", future_size(|| manager.messages_snapshot(room))),
+                (
+                    "messages_snapshot",
+                    future_size(|| manager.messages_snapshot(room)),
+                ),
                 ("message_feed", future_size(|| manager.message_feed(room))),
                 (
                     "message_feed_selected",
@@ -585,7 +588,10 @@ mod tests {
                     "thread_message_feed_selected",
                     future_size(|| manager.thread_message_feed_selected(&selection, room, root)),
                 ),
-                ("paginate_backwards", future_size(|| manager.paginate_backwards(room, 50))),
+                (
+                    "paginate_backwards",
+                    future_size(|| manager.paginate_backwards(room, 50)),
+                ),
                 (
                     "paginate_backwards_for",
                     future_size(|| manager.paginate_backwards_for(id, room, 50)),
