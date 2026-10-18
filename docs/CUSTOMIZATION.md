@@ -11,6 +11,9 @@ while the app runs. A broken edit produces an error, and the last valid
 configuration remains active. The file never contains Matrix access tokens or
 recovery keys.
 
+For assistant-assisted edits, see the [editing guide](EDITING_APPEARANCE.md)
+and its sparse, validated configuration example.
+
 Settings edits appearance presets, interface/message/monospace fonts, message
 layout, avatars, timestamps, sender colors, spacing, corner radius and rail
 width. Existing controls cover font scale (75–200%), room/message density,
@@ -382,7 +385,7 @@ also include `[roles]` and `[senders]`. These belong in the theme TOML beside
 | `presence_online` | The online dot beside member names; omitted keeps `#64C9A7` |
 | `avatar_ink` | Initials on avatar backgrounds, whose colors stay identity colors; omitted keeps `#FFFFFF` |
 
-Every shipped theme sets every role explicitly.
+Every built-in preset theme sets every role explicitly.
 
 For example, keep the `[colors]` table from the dark Nocturne theme and set
 these optional sections in that theme file:
