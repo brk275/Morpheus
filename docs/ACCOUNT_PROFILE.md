@@ -29,11 +29,14 @@ It never switches, logs out or removes an account. Ordinary edits use the sessio
   - the request in flight.
 - **Choose image...** previews the image locally. It isn't public until you Save.
 - **Remove avatar** stages a removal, and **Keep current** drops the avatar change.
-- **Save to public profile** sends each changed field as its own request:
-  - Each outcome is reported separately. For example: "Display name saved. The avatar was not confirmed; Save again to retry only the avatar."
+- **Save to public profile** sends each changed field as its own request. Each request is sent exactly once (SDK retries off), and then the profile is read back:
+  - A field counts as saved only when the read-back shows exactly the change.
+  - If a send fails, or the editor closes while it is in flight, the outcome is *unknown*. The editor reads the profile back once, says what the server shows, and never resends on its own.
+  - Each outcome is reported separately, followed by what the server shows. For example: "Display name saved. Avatar not confirmed; the server may or may not have it. The server now shows the name "..." and no avatar. Save again to retry only what still differs."
   - The chosen image is kept after a failed upload, so a retry doesn't need the file chosen again.
   - A request that already reached the server is never described as cancelled or undone. After a timeout, **Refresh** shows what the server holds.
-- Display names are trimmed and must be 1 to 256 characters and at most 1 KiB, on a single line, without control or direction-override characters. Clearing a name isn't supported.
+- Display names are trimmed, and runs of spaces collapse to one. They must be 1 to 256 characters and at most 1 KiB, on a single line, without control or direction-override characters.
+- **Remove display name...** asks first. The confirmation names the exact Matrix account and says its public profile will have no display name. Removal is its own single-send request, and its outcome is reported the same way as for Save.
 - Images go through the existing room-avatar path:
   - one guarded native chooser, reading a regular file of at most 8 MiB;
   - the pinned PNG or baseline-JPEG decoder, at most 4096 px per side and 4 megapixels;
@@ -42,7 +45,14 @@ It never switches, logs out or removes an account. Ordinary edits use the sessio
 
 ## Account switcher
 
-After the server confirms a profile, the account switcher shows the confirmed display name and its initials, for that account only. These names are kept in memory only; nothing goes to configuration or any other store. A removed account's name is forgotten the next time the account list is shown.
+After the server confirms a profile, the account switcher shows the confirmed display name and its initials, for that account only.
+
+The switcher also refreshes its label without opening the editor. It makes one bounded read of the **active** account's own profile in two cases:
+
+- after an account snapshot is accepted, once per account selection, which covers protected activation and restore;
+- each time Manage accounts opens.
+
+Only one read runs at a time. Each read is fenced by the exact selection, so A -> B -> A never lets an old read relabel anything. Inactive accounts are never read, and nothing syncs in the background. These names are kept in memory only; nothing goes to configuration or any other store. A removed account's name is forgotten the next time the account list is shown.
 
 ## Fences
 
@@ -72,7 +82,7 @@ After the server confirms a profile, the account switcher shows the confirmed di
 ## Known limits
 
 - **No device or remote preview of other aliases.** The editor edits the current account only.
-- **No profile read on switch.** The switcher shows a confirmed name only after the editor has read or saved in this session. Otherwise it shows the user ID's localpart, as before.
+- **No avatar in the switcher.** Root owns that geometry. The handoff proposes an interface for it.
 - **Shared cancellation token type.** The cancellation token is the existing `RoomSettingsCancellation`, reused as a generic token.
-- **Shared chooser and decoder.** Only one image chooser and one decoder run at a time, process-wide; they are shared with the room settings form.
+- **Shared chooser and decoder.** Only one image chooser and one decoder run at a time, process-wide; they are shared with the room settings form. When Room settings holds either one, the editor says so ("The image picker is in use by Room settings...") instead of waiting, and Close stays available.
 - **Error wording.** Some decoder error texts are worded generically ("Choose an image...").

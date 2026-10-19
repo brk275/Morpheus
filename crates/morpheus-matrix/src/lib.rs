@@ -60,7 +60,7 @@ mod room_settings;
 mod own_profile;
 pub use own_profile::{
     MAX_DISPLAY_NAME_BYTES, MAX_DISPLAY_NAME_CHARS, MAX_OWN_AVATAR_PREVIEW_BYTES, OwnProfile,
-    ProfileError, ProfileResult, validate_display_name,
+    ProfileError, ProfileResult, WriteReport, validate_display_name,
 };
 pub use room_settings::{
     AvatarPng, CurrentJoinRule, EditableJoinRule, JoinRuleKind, MAX_RESTRICTED_ALLOW_ROOMS,

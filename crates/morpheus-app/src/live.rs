@@ -3888,6 +3888,9 @@ pub(crate) fn apply_account_menu(ui: &AppWindow, accounts: &[AccountInfo], activ
     ui.set_active_account_initials(account.initials.clone());
     ui.set_active_account_status(account.status.clone());
     ui.set_active_account_accent(account.accent);
+    // Once per account selection: read the visible account's own public
+    // profile for this label (never an inactive account's).
+    crate::account_identity::refresh_active_label(ui, false);
 }
 
 fn account_item(account: &AccountInfo, selected: bool) -> AccountItem {

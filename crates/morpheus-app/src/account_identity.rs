@@ -29,7 +29,8 @@ use std::{
 };
 
 use morpheus_matrix::{
-    AccountSelection, OwnProfile, ProfileError, RoomSettingsCancellation, validate_display_name,
+    AccountSelection, OwnProfile, ProfileError, RoomSettingsCancellation, WriteReport,
+    validate_display_name,
 };
 use slint::{ComponentHandle, Model};
 use tokio::runtime::Handle;
@@ -37,18 +38,23 @@ use zeroize::Zeroizing;
 
 use crate::{
     AppWindow,
-    image_previews::avatar::{AvatarPrepareError, PreparedAvatar, prepare_avatar},
+    image_previews::avatar::{
+        AvatarConsumer, AvatarPrepareError, PreparedAvatar, prepare_avatar_for, preparation_owner,
+    },
     live::LiveUi,
 };
 
 const READING: &str = "Reading your public profile from the homeserver…";
 const SAVING: &str = "Saving to your public Matrix profile…";
 const PREPARING: &str = "Preparing the image…";
-const SAVED: &str = "Saved to your public Matrix profile.";
 const NOTHING_TO_SAVE: &str = "Nothing differs from the saved profile.";
 const PICK_CANCELLED: &str = "This editor is no longer active.";
 const CHOSEN: &str = "New avatar preview. It is not public until you Save.";
 const REMOVE_STAGED: &str = "The avatar will be removed when you Save.";
+const PICKER_IN_USE: &str =
+    "The image picker is in use by Room settings. Finish or cancel it there, then choose again.";
+const DECODER_IN_USE: &str =
+    "The image decoder is busy with Room settings. Try again when it finishes.";
 
 /// Server-confirmed display names by local account ID; memory only.
 static CONFIRMED_NAMES: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
@@ -132,6 +138,21 @@ fn record_confirmed(profile: &OwnProfile) {
 
 /// Install the editor callbacks.
 pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, runtime: Handle) {
+    CONTEXT.with(|context| *context.borrow_mut() = Some((live.clone(), runtime.clone())));
+    let weak = ui.as_weak();
+    ui.on_account_profile_label_refresh(move || {
+        if let Some(ui) = weak.upgrade() {
+            refresh_active_label(&ui, true);
+        }
+    });
+    let weak = ui.as_weak();
+    let clear_live = live.clone();
+    let clear_runtime = runtime.clone();
+    ui.on_account_profile_clear_name(move || {
+        if let Some(ui) = weak.upgrade() {
+            clear_name(&ui, &clear_live, &clear_runtime);
+        }
+    });
     let weak = ui.as_weak();
     let open_live = live.clone();
     let open_runtime = runtime.clone();
@@ -222,6 +243,7 @@ pub(crate) fn clear_presentation(ui: &AppWindow) {
     ui.set_account_profile_image_visible(false);
     ui.set_account_profile_status("".into());
     ui.set_account_profile_error("".into());
+    ui.set_account_profile_confirm_clear(false);
 }
 
 /// No account, security, call or dialog flow is in the way.
@@ -378,7 +400,8 @@ async fn avatar_preview(live: &LiveUi, scope: &Scope, profile: &OwnProfile) -> O
         .own_avatar_bytes_for(&scope.selection, &scope.cancellation, profile)
         .await
         .ok()??;
-    prepare_avatar(
+    prepare_avatar_for(
+        AvatarConsumer::AccountProfile,
         Zeroizing::new(bytes),
         scope.selection.clone(),
         scope.cancellation.clone(),
@@ -468,6 +491,12 @@ fn show_dirty(ui: &AppWindow) {
 }
 
 fn choose(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
+    // Say who holds the shared chooser instead of waiting silently; Close
+    // and every other control stay available.
+    if crate::room_settings::chooser_owner() == Some(AvatarConsumer::RoomSettings) {
+        ui.set_account_profile_error(PICKER_IN_USE.into());
+        return;
+    }
     let Some(scope) = begin(ui, live) else {
         return;
     };
@@ -481,10 +510,15 @@ fn choose(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
         let selection = scope.selection.clone();
         let cancellation = scope.cancellation.clone();
         let active = Arc::new(move || selection.is_current() && !cancellation.is_cancelled());
-        let chosen =
-            crate::room_settings::choose_avatar_file("Choose your public avatar", active).await;
+        let chosen = crate::room_settings::choose_avatar_file(
+            AvatarConsumer::AccountProfile,
+            "Choose your public avatar",
+            active,
+        )
+        .await;
         let prepared = match chosen {
-            Ok(Some(bytes)) => prepare_avatar(
+            Ok(Some(bytes)) => prepare_avatar_for(
+                AvatarConsumer::AccountProfile,
                 bytes,
                 scope.selection.clone(),
                 scope.cancellation.clone(),
@@ -493,7 +527,7 @@ fn choose(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
             .map(Some)
             .map_err(prepare_error),
             Ok(None) => Ok(None),
-            Err(message) => Err(message),
+            Err(message) => Err(chooser_error(message)),
         };
         let _ = weak.upgrade_in_event_loop(move |ui| {
             if !scope.current(&ui) || with(|editor| editor.picker != picker) {
@@ -519,7 +553,21 @@ fn choose(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
 fn prepare_error(error: AvatarPrepareError) -> &'static str {
     match error {
         AvatarPrepareError::Cancelled => PICK_CANCELLED,
+        AvatarPrepareError::Busy
+            if preparation_owner() == Some(AvatarConsumer::RoomSettings) =>
+        {
+            DECODER_IN_USE
+        }
         other => other.text(),
+    }
+}
+
+/// A chooser refusal, naming Room settings when it holds the chooser.
+fn chooser_error(message: &'static str) -> &'static str {
+    if crate::room_settings::chooser_owner() == Some(AvatarConsumer::RoomSettings) {
+        PICKER_IN_USE
+    } else {
+        message
     }
 }
 
@@ -555,20 +603,83 @@ fn keep_avatar(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
     }
 }
 
-/// What one Save did, field by field. `None` for a field means it was not
-/// sent; `profile` is the last profile the server returned.
+/// How one field's change ended, as far as the server shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FieldOutcome {
+    /// The read-back shows exactly the change.
+    Saved,
+    /// Refused before anything was sent; the server is unchanged by it.
+    NotSent(ProfileError),
+    /// Sent (or possibly sent) but the read-back does not show it. It may
+    /// or may not have reached the server; it is never resent automatically.
+    Unknown,
+}
+
+impl FieldOutcome {
+    fn from_report(result: &Result<WriteReport, ProfileError>) -> Self {
+        match result {
+            Ok(report) if report.confirmed() => Self::Saved,
+            Ok(_) => Self::Unknown,
+            Err(error) => Self::NotSent(*error),
+        }
+    }
+
+    fn error(self) -> Option<ProfileError> {
+        match self {
+            Self::NotSent(error) => Some(error),
+            Self::Saved | Self::Unknown => None,
+        }
+    }
+}
+
+/// What one Save (or Remove display name) did, field by field. `None` for a
+/// field means nothing was attempted; `profile` is the last profile the
+/// server returned.
 struct Outcome {
-    name: Option<Result<(), ProfileError>>,
-    avatar: Option<Result<(), ProfileError>>,
+    name: Option<FieldOutcome>,
+    avatar: Option<FieldOutcome>,
     profile: Option<OwnProfile>,
+    /// The first send error a field reported, for the error line.
+    send_error: Option<ProfileError>,
     /// The chosen image, returned so a failed upload can be retried.
     image: Option<PreparedAvatar>,
+}
+
+impl Outcome {
+    fn new() -> Self {
+        Self {
+            name: None,
+            avatar: None,
+            profile: None,
+            send_error: None,
+            image: None,
+        }
+    }
+
+    /// Record one field's report; keep the newest profile the server showed.
+    fn record(&mut self, result: &Result<WriteReport, ProfileError>) -> FieldOutcome {
+        if let Ok(report) = result {
+            if report.profile.is_some() {
+                self.profile = report.profile.clone();
+            }
+            if self.send_error.is_none() {
+                self.send_error = report.send_error;
+            }
+        }
+        FieldOutcome::from_report(result)
+    }
 }
 
 enum AvatarSave {
     Keep,
     Set(PreparedAvatar),
     Remove,
+}
+
+enum NameSave {
+    Keep,
+    Set(String),
+    Clear,
 }
 
 fn save(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
@@ -591,25 +702,61 @@ fn save(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
         ui.set_account_profile_status(NOTHING_TO_SAVE.into());
         return;
     }
+    let name = name.map_or(NameSave::Keep, NameSave::Set);
+    start_save(ui, live, runtime, name, true);
+}
+
+/// Remove the display name after the user confirmed it for this account.
+/// The confirmation names the identity; the request is its own change.
+fn clear_name(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
+    ui.set_account_profile_confirm_clear(false);
+    let has_name = with(|editor| {
+        editor
+            .server
+            .as_ref()
+            .is_some_and(|server| server.display_name.is_some())
+    });
+    if !has_name {
+        return;
+    }
+    start_save(ui, live, runtime, NameSave::Clear, false);
+}
+
+/// Run one save: the name change (if any) and, when `with_avatar`, the
+/// drafted avatar change, each as its own single-send request.
+fn start_save(
+    ui: &AppWindow,
+    live: &Arc<LiveUi>,
+    runtime: &Handle,
+    name: NameSave,
+    with_avatar: bool,
+) {
     let Some(scope) = begin(ui, live) else {
         return;
     };
     // The chosen image moves into the save and comes back with the outcome.
-    let avatar = with(|editor| {
-        match std::mem::replace(&mut editor.avatar, AvatarDraft::Keep) {
-            AvatarDraft::Keep => AvatarSave::Keep,
-            AvatarDraft::Chosen(image) => AvatarSave::Set(image),
-            AvatarDraft::Remove => AvatarSave::Remove,
-        }
-    });
+    let avatar = if with_avatar {
+        with(|editor| {
+            match std::mem::replace(&mut editor.avatar, AvatarDraft::Keep) {
+                AvatarDraft::Keep => AvatarSave::Keep,
+                AvatarDraft::Chosen(image) => AvatarSave::Set(image),
+                AvatarDraft::Remove => AvatarSave::Remove,
+            }
+        })
+    } else {
+        AvatarSave::Keep
+    };
     let removing = matches!(avatar, AvatarSave::Remove);
+    let clearing = matches!(name, NameSave::Clear);
     ui.set_account_profile_status(SAVING.into());
     let weak = ui.as_weak();
     let live = live.clone();
     runtime.spawn(async move {
         let outcome = save_fields(&live, &scope, name, avatar).await;
         let preview = match (&outcome.avatar, &outcome.profile) {
-            (Some(Ok(())), Some(profile)) => avatar_preview(&live, &scope, profile).await,
+            (Some(FieldOutcome::Saved), Some(profile)) => {
+                avatar_preview(&live, &scope, profile).await
+            }
             _ => None,
         };
         let _ = weak.upgrade_in_event_loop(move |ui| {
@@ -617,101 +764,90 @@ fn save(ui: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
                 return;
             }
             end(&ui);
-            finish_save(&ui, outcome, preview, removing);
+            finish_save(&ui, outcome, preview, removing, clearing);
         });
     });
 }
 
-/// Send each changed field as its own request. A field is skipped once the
-/// editor or account is gone; an earlier field's success is kept.
+/// Send each changed field as its own single-send request. A later field is
+/// skipped once the editor or account is gone; an earlier field's result is
+/// kept and reported.
 async fn save_fields(
     live: &LiveUi,
     scope: &Scope,
-    name: Option<String>,
+    name: NameSave,
     avatar: AvatarSave,
 ) -> Outcome {
     let manager = &live.manager;
-    let mut outcome = Outcome {
-        name: None,
-        avatar: None,
-        profile: None,
-        image: None,
+    let mut outcome = Outcome::new();
+    let name_result = match name {
+        NameSave::Keep => None,
+        NameSave::Set(name) => Some(
+            manager
+                .set_own_display_name_for(&scope.selection, &scope.cancellation, &name)
+                .await,
+        ),
+        NameSave::Clear => Some(
+            manager
+                .clear_own_display_name_for(&scope.selection, &scope.cancellation)
+                .await,
+        ),
     };
-    if let Some(name) = name {
-        match manager
-            .set_own_display_name_for(&scope.selection, &scope.cancellation, &name)
-            .await
-        {
-            Ok(profile) => {
-                outcome.name = Some(Ok(()));
-                outcome.profile = Some(profile);
-            }
-            Err(error) => outcome.name = Some(Err(error)),
-        }
+    if let Some(result) = &name_result {
+        outcome.name = Some(outcome.record(result));
     }
-    let gone = matches!(
-        outcome.name,
-        Some(Err(ProfileError::Cancelled | ProfileError::AccountChanged))
-    );
+    let gone = !scope.selection.is_current() || scope.cancellation.is_cancelled();
     match avatar {
         AvatarSave::Keep => {}
+        AvatarSave::Set(image) if gone => outcome.image = Some(image),
         AvatarSave::Set(image) => {
-            if gone {
+            let result = match image.upload_copy() {
+                Ok(png) => {
+                    manager
+                        .set_own_avatar_for(&scope.selection, &scope.cancellation, png)
+                        .await
+                }
+                Err(_) => Err(ProfileError::InvalidAvatar),
+            };
+            let field = outcome.record(&result);
+            if field != FieldOutcome::Saved {
                 outcome.image = Some(image);
-            } else {
-                let result = match image.upload_copy() {
-                    Ok(png) => {
-                        manager
-                            .set_own_avatar_for(&scope.selection, &scope.cancellation, png)
-                            .await
-                    }
-                    Err(_) => Err(ProfileError::InvalidAvatar),
-                };
-                match result {
-                    Ok(profile) => {
-                        outcome.avatar = Some(Ok(()));
-                        outcome.profile = Some(profile);
-                    }
-                    Err(error) => {
-                        outcome.avatar = Some(Err(error));
-                        outcome.image = Some(image);
-                    }
-                }
             }
+            outcome.avatar = Some(field);
         }
-        AvatarSave::Remove if !gone => {
-            match manager
+        AvatarSave::Remove if gone => {}
+        AvatarSave::Remove => {
+            let result = manager
                 .remove_own_avatar_for(&scope.selection, &scope.cancellation)
-                .await
-            {
-                Ok(profile) => {
-                    outcome.avatar = Some(Ok(()));
-                    outcome.profile = Some(profile);
-                }
-                Err(error) => outcome.avatar = Some(Err(error)),
-            }
+                .await;
+            outcome.avatar = Some(outcome.record(&result));
         }
-        AvatarSave::Remove => {}
     }
     outcome
 }
 
-fn finish_save(ui: &AppWindow, outcome: Outcome, preview: Option<PreparedAvatar>, removing: bool) {
+fn finish_save(
+    ui: &AppWindow,
+    outcome: Outcome,
+    preview: Option<PreparedAvatar>,
+    removing: bool,
+    clearing: bool,
+) {
     let Outcome {
         name,
         avatar,
         profile,
+        send_error,
         image,
     } = outcome;
     if let Some(profile) = &profile {
-        // The field keeps what the user typed; it now matches the server
-        // when the name saved.
-        apply_server(ui, profile, false);
+        // What the server shows now replaces the confirmed copy. The name
+        // field keeps what the user typed unless the name was cleared.
+        apply_server(ui, profile, clearing && name == Some(FieldOutcome::Saved));
         with(|editor| editor.server = Some(profile.clone()));
     }
-    // A failed or unsent avatar change stays drafted for a retry.
-    let avatar_saved = matches!(avatar, Some(Ok(())));
-    if avatar_saved {
+    // A failed, unknown or unsent avatar change stays drafted for a retry.
+    if avatar == Some(FieldOutcome::Saved) {
         ui.set_account_profile_avatar_state(0);
         show_image(ui, preview.as_ref());
     } else if let Some(image) = image {
@@ -720,36 +856,160 @@ fn finish_save(ui: &AppWindow, outcome: Outcome, preview: Option<PreparedAvatar>
         with(|editor| editor.avatar = AvatarDraft::Remove);
     }
     show_dirty(ui);
-    ui.set_account_profile_status(summary(&name, &avatar).into());
-    let failure = [&name, &avatar]
-        .into_iter()
-        .find_map(|field| field.as_ref().and_then(|result| result.err()));
+    ui.set_account_profile_status(summary(name, avatar, profile.as_ref()).into());
+    let failure = name
+        .and_then(FieldOutcome::error)
+        .or_else(|| avatar.and_then(FieldOutcome::error))
+        .or(send_error);
     ui.set_account_profile_error(failure.map(|error| error.to_string()).unwrap_or_default().into());
 }
 
-/// The exact per-field outcome in plain words. Never "saved" for a field
-/// that was not confirmed.
-fn summary(
-    name: &Option<Result<(), ProfileError>>,
-    avatar: &Option<Result<(), ProfileError>>,
-) -> String {
-    match (name, avatar) {
-        (Some(Ok(())), Some(Ok(()))) | (Some(Ok(())), None) | (None, Some(Ok(()))) => {
-            SAVED.to_owned()
+fn field_words(label: &str, outcome: FieldOutcome) -> String {
+    match outcome {
+        FieldOutcome::Saved => format!("{label} saved."),
+        FieldOutcome::NotSent(_) => format!("{label} not sent."),
+        FieldOutcome::Unknown => {
+            format!("{label} not confirmed; the server may or may not have it.")
         }
-        (Some(Ok(())), Some(Err(_))) => {
-            "Display name saved. The avatar was not confirmed; Save again to retry only the avatar."
-                .to_owned()
-        }
-        (Some(Err(_)), Some(Ok(()))) => {
-            "Avatar saved. The display name was not confirmed; Save again to retry only the name."
-                .to_owned()
-        }
-        (Some(Err(_)), _) | (None, Some(Err(_))) => {
-            "Nothing was confirmed saved. Refresh to see what the server holds.".to_owned()
-        }
-        (None, None) => NOTHING_TO_SAVE.to_owned(),
     }
+}
+
+/// The exact per-field outcome and what the server shows now, in plain
+/// words. Never "saved" for a field the read-back did not confirm.
+fn summary(
+    name: Option<FieldOutcome>,
+    avatar: Option<FieldOutcome>,
+    shown: Option<&OwnProfile>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(name) = name {
+        parts.push(field_words("Display name", name));
+    }
+    if let Some(avatar) = avatar {
+        parts.push(field_words("Avatar", avatar));
+    }
+    if parts.is_empty() {
+        return NOTHING_TO_SAVE.to_owned();
+    }
+    let all_saved = [name, avatar]
+        .into_iter()
+        .flatten()
+        .all(|field| field == FieldOutcome::Saved);
+    match shown {
+        Some(profile) => parts.push(format!(
+            "The server now shows {} and {}.",
+            profile
+                .display_name
+                .as_deref()
+                .map_or_else(|| "no display name".to_owned(), |name| format!("the name \u{201c}{name}\u{201d}")),
+            if profile.has_avatar() { "an avatar" } else { "no avatar" }
+        )),
+        None => parts.push(
+            "The profile could not be read back; Refresh to see what the server holds.".to_owned(),
+        ),
+    }
+    if !all_saved {
+        parts.push("Save again to retry only what still differs.".to_owned());
+    }
+    parts.join(" ")
+}
+
+/// The active account's switcher label: one bounded read of its own public
+/// profile per account selection (after an activation or restore makes it
+/// the visible account), and one more each time Manage accounts opens. Never
+/// for an inactive account and never in the background otherwise.
+#[derive(Default)]
+struct LabelRefresh {
+    selection: Option<AccountSelection>,
+    cancellation: Option<RoomSettingsCancellation>,
+    in_flight: bool,
+    generation: u64,
+}
+
+thread_local! {
+    static CONTEXT: RefCell<Option<(Arc<LiveUi>, Handle)>> = const { RefCell::new(None) };
+    static LABEL: RefCell<LabelRefresh> = RefCell::new(LabelRefresh::default());
+}
+
+/// Whether a label read should start for `account` now: not while one is in
+/// flight, and once per selection unless `force` (Manage accounts opened).
+fn label_read_needed(
+    refresh: &LabelRefresh,
+    account: &str,
+    force: bool,
+) -> bool {
+    if refresh.in_flight {
+        return false;
+    }
+    force
+        || !refresh
+            .selection
+            .as_ref()
+            .is_some_and(|done| done.is_current() && done.account_id() == account)
+}
+
+/// Read the visible account's profile once for its switcher label. Called
+/// after an accepted account snapshot (`force` false) and when Manage
+/// accounts opens (`force` true).
+pub(crate) fn refresh_active_label(ui: &AppWindow, force: bool) {
+    let Some((live, runtime)) = CONTEXT.with(|context| context.borrow().clone()) else {
+        return;
+    };
+    if !ui.get_live_session() || !live.is_live.load(Ordering::Acquire) {
+        return;
+    }
+    let account = ui.get_active_account_local_id().to_string();
+    if account.is_empty() {
+        return;
+    }
+    let Some(selection) = live.manager.account_selection(&account) else {
+        return;
+    };
+    let started = LABEL.with(|label| {
+        let mut label = label.borrow_mut();
+        if !label_read_needed(&label, &account, force) {
+            return None;
+        }
+        if let Some(previous) = label.cancellation.take() {
+            previous.cancel();
+        }
+        let cancellation = RoomSettingsCancellation::new();
+        label.selection = Some(selection.clone());
+        label.cancellation = Some(cancellation.clone());
+        label.in_flight = true;
+        label.generation = label.generation.wrapping_add(1);
+        Some((label.generation, cancellation))
+    });
+    let Some((generation, cancellation)) = started else {
+        return;
+    };
+    let weak = ui.as_weak();
+    runtime.spawn(async move {
+        let profile = live.manager.own_profile_for(&selection, &cancellation).await;
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            let current = LABEL.with(|label| {
+                let mut label = label.borrow_mut();
+                if label.generation != generation {
+                    return false;
+                }
+                label.in_flight = false;
+                true
+            });
+            // Only the same visible account under the same selection.
+            if !current
+                || !selection.is_current()
+                || ui.get_active_account_local_id().as_str() != selection.account_id()
+            {
+                return;
+            }
+            if let Ok(profile) = profile
+                && profile.account_id == selection.account_id()
+            {
+                record_confirmed(&profile);
+                project_switcher(&ui, &profile);
+            }
+        });
+    });
 }
 
 #[cfg(test)]
@@ -765,6 +1025,7 @@ mod tests {
         runtime.block_on(async {
             // A closed editor or changed account never opens the dialog.
             let chosen = crate::room_settings::choose_avatar_file(
+                AvatarConsumer::AccountProfile,
                 "Choose your public avatar",
                 Arc::new(|| false),
             )
@@ -790,18 +1051,74 @@ mod tests {
         );
     }
 
+    fn profile(name: Option<&str>) -> OwnProfile {
+        OwnProfile::synthetic(
+            "synthetic-a",
+            "@synthetic-a:example.org",
+            "https://example.org",
+            name,
+        )
+    }
+
     #[test]
-    fn partial_outcomes_are_reported_per_field() {
-        let failed = Some(Err(ProfileError::TimedOut));
-        let saved = Some(Ok(()));
-        assert_eq!(summary(&saved, &saved), SAVED);
-        assert_eq!(summary(&saved, &None), SAVED);
-        assert!(summary(&saved, &failed).starts_with("Display name saved."));
-        assert!(summary(&saved, &failed).contains("retry only the avatar"));
-        assert!(summary(&failed, &saved).starts_with("Avatar saved."));
-        assert!(summary(&failed, &failed).starts_with("Nothing was confirmed saved"));
-        assert!(summary(&None, &failed).starts_with("Nothing was confirmed saved"));
-        assert!(summary(&failed, &None).starts_with("Nothing was confirmed saved"));
+    fn partial_outcomes_are_reported_per_field_with_what_the_server_shows() {
+        use FieldOutcome::*;
+        let shown = profile(Some("Synthetic"));
+        let both = summary(Some(Saved), Some(Saved), Some(&shown));
+        assert!(both.starts_with("Display name saved. Avatar saved."));
+        assert!(both.contains("the name \u{201c}Synthetic\u{201d}"));
+        assert!(!both.contains("retry"));
+        let partial = summary(Some(Saved), Some(Unknown), Some(&shown));
+        assert!(partial.starts_with("Display name saved. Avatar not confirmed"));
+        assert!(partial.contains("may or may not"));
+        assert!(partial.ends_with("Save again to retry only what still differs."));
+        let refused = summary(Some(NotSent(ProfileError::AccountChanged)), None, None);
+        assert!(refused.starts_with("Display name not sent."));
+        assert!(refused.contains("could not be read back"));
+        let cleared = summary(Some(Saved), None, Some(&profile(None)));
+        assert!(cleared.contains("no display name"));
+        assert_eq!(summary(None, None, None), NOTHING_TO_SAVE);
+    }
+
+    #[test]
+    fn a_send_is_saved_only_when_the_read_back_shows_it() {
+        let shown = Some(profile(Some("Synthetic")));
+        let confirmed: Result<WriteReport, ProfileError> = Ok(WriteReport {
+            profile: shown.clone(),
+            applied: true,
+            send_error: Some(ProfileError::TimedOut),
+        });
+        assert_eq!(FieldOutcome::from_report(&confirmed), FieldOutcome::Saved);
+        let unknown: Result<WriteReport, ProfileError> = Ok(WriteReport {
+            profile: shown,
+            applied: false,
+            send_error: Some(ProfileError::TimedOut),
+        });
+        assert_eq!(FieldOutcome::from_report(&unknown), FieldOutcome::Unknown);
+        let refused: Result<WriteReport, ProfileError> = Err(ProfileError::Cancelled);
+        assert_eq!(
+            FieldOutcome::from_report(&refused),
+            FieldOutcome::NotSent(ProfileError::Cancelled)
+        );
+        // The outcome keeps the server's latest profile and first send error.
+        let mut outcome = Outcome::new();
+        outcome.record(&unknown);
+        assert_eq!(outcome.send_error, Some(ProfileError::TimedOut));
+        assert!(outcome.profile.is_some());
+    }
+
+    #[test]
+    fn label_reads_run_once_per_selection_and_never_concurrently() {
+        let idle = LabelRefresh::default();
+        // Nothing read yet: read the visible account once.
+        assert!(label_read_needed(&idle, "synthetic-a", false));
+        let busy = LabelRefresh {
+            in_flight: true,
+            ..LabelRefresh::default()
+        };
+        assert!(!label_read_needed(&busy, "synthetic-a", true));
+        // Opening Manage accounts forces one more read.
+        assert!(label_read_needed(&idle, "synthetic-a", true));
     }
 
     #[test]

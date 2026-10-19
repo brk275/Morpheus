@@ -113,11 +113,13 @@ fn own_profile_changes_only_the_exact_selected_identity() {
             before
         );
 
-        // A server-confirmed change reads back exactly.
-        let saved = manager
+        // A single send, confirmed only by the read-back that follows it.
+        let report = manager
             .set_own_display_name_for(&selection, &editor, &marker)
             .await
             .unwrap();
+        assert!(report.confirmed() && report.send_error.is_none());
+        let saved = report.profile.clone().expect("read back after the send");
         assert_eq!(saved.display_name.as_deref(), Some(marker.as_str()));
         assert_eq!(
             manager.own_profile_for(&selection, &editor).await.unwrap(),
@@ -128,8 +130,56 @@ fn own_profile_changes_only_the_exact_selected_identity() {
             .remove_own_avatar_for(&selection, &editor)
             .await
             .unwrap();
+        assert!(removed.confirmed());
+        let removed = removed.profile.unwrap();
         assert!(!removed.has_avatar());
         assert_eq!(removed.display_name.as_deref(), Some(marker.as_str()));
+
+        // Clearing the name is explicit and reads back as no display name.
+        let cleared = manager
+            .clear_own_display_name_for(&selection, &editor)
+            .await
+            .unwrap();
+        assert!(cleared.confirmed());
+        assert_eq!(cleared.profile.as_ref().unwrap().display_name, None);
+        let saved = manager
+            .set_own_display_name_for(&selection, &editor, &marker)
+            .await
+            .unwrap()
+            .profile
+            .unwrap();
+
+        // An editor closed while its send may be in flight: the report is
+        // either confirmed by the read-back or unknown, never resent, and
+        // whatever it says matches what the server holds afterwards.
+        let racing = RoomSettingsCancellation::new();
+        let racing_name = format!("{marker} race");
+        let (report, ()) = tokio::join!(
+            manager.set_own_display_name_for(&selection, &racing, &racing_name),
+            async {
+                tokio::task::yield_now().await;
+                racing.cancel();
+            }
+        );
+        let held = manager.own_profile_for(&selection, &editor).await.unwrap();
+        match report {
+            Ok(report) if report.confirmed() => {
+                assert_eq!(held.display_name.as_deref(), Some(racing_name.as_str()));
+            }
+            // Unknown or refused before sending: the server keeps one value
+            // and nothing sends it again.
+            Ok(_) | Err(_) => {
+                let again = manager.own_profile_for(&selection, &editor).await.unwrap();
+                assert_eq!(again, held, "no hidden resend changed the profile");
+            }
+        }
+        let saved = manager
+            .set_own_display_name_for(&selection, &editor, &marker)
+            .await
+            .unwrap()
+            .profile
+            .unwrap_or(saved);
+        assert_eq!(saved.display_name.as_deref(), Some(marker.as_str()));
 
         // A closed editor sends nothing more.
         let closed = RoomSettingsCancellation::new();
@@ -173,6 +223,25 @@ fn own_profile_changes_only_the_exact_selected_identity() {
         assert_ne!(b_profile.display_name.as_deref(), Some("Synthetic stale"));
         manager.switch_to(&a_account.id).await.unwrap();
         assert!(!selection.is_current());
+        // The switcher label read is for the active account only: once A is
+        // active again, B's selection reads nothing.
+        assert_eq!(
+            manager
+                .own_profile_for(&b_selection, &RoomSettingsCancellation::new())
+                .await
+                .unwrap_err(),
+            ProfileError::AccountChanged
+        );
+        let active = manager.account_selection(&a_account.id).unwrap();
+        assert_eq!(
+            manager
+                .own_profile_for(&active, &RoomSettingsCancellation::new())
+                .await
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some(marker.as_str())
+        );
         assert_eq!(
             manager
                 .remove_own_avatar_for(&selection, &editor)

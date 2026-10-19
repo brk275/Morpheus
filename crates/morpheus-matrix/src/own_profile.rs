@@ -23,8 +23,14 @@ use matrix_sdk::{
     config::RequestConfig,
     ruma::{
         OwnedMxcUri, OwnedUserId,
-        api::client::profile::{AvatarUrl, DisplayName},
-        api::error::ErrorKind,
+        api::{
+            Metadata,
+            client::profile::{
+                AvatarUrl, DisplayName, ProfileFieldName, delete_profile_field, set_avatar_url,
+                set_display_name,
+            },
+            error::ErrorKind,
+        },
         events::room::MediaSource,
     },
 };
@@ -65,6 +71,43 @@ pub enum ProfileError {
 }
 
 pub type ProfileResult<T> = std::result::Result<T, ProfileError>;
+
+/// What one public profile change did, as far as the server shows.
+///
+/// A change is sent exactly once. `applied` is true only when the profile
+/// read back afterwards shows exactly the requested value. `send_error` is
+/// the send's own failure: with `applied` the change reached the server
+/// anyway; without it the outcome is unknown and `profile` (when it could
+/// be read) is what the server holds now. Nothing is resent automatically.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriteReport {
+    pub profile: Option<OwnProfile>,
+    pub applied: bool,
+    pub send_error: Option<ProfileError>,
+}
+
+impl WriteReport {
+    /// The server confirmed the change.
+    pub fn confirmed(&self) -> bool {
+        self.applied
+    }
+
+    /// The send reported a failure and the read-back does not show the
+    /// change: it may or may not have reached the server.
+    pub fn unknown(&self) -> bool {
+        !self.applied
+    }
+}
+
+/// How one single-send request ended.
+enum Sent {
+    /// Refused before anything was handed to the homeserver.
+    NotSent(ProfileError),
+    /// The homeserver accepted it.
+    Sent,
+    /// Handed to the homeserver (or possibly so) but no success was seen.
+    Unknown(ProfileError),
+}
 
 /// The profile as the homeserver reported it, with the identity it belongs
 /// to so the editor can say exactly which account it changes.
@@ -127,7 +170,9 @@ pub fn validate_display_name(input: &str) -> ProfileResult<String> {
     {
         return Err(ProfileError::InvalidName);
     }
-    Ok(name.to_owned())
+    // Runs of spaces collapse, as the editor shows a server name, so the
+    // read-back of a saved name compares equal.
+    Ok(name.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 /// A name the server returned, made safe to show: one bounded line, or
@@ -193,6 +238,83 @@ async fn guarded<T>(
     }?;
     ensure_scope(selection, cancellation)?;
     Ok(result)
+}
+
+/// The request settings of every public profile change: sent once, never
+/// retried by the SDK, bounded in time.
+fn single_send() -> RequestConfig {
+    RequestConfig::new().retry_limit(0).timeout(WRITE_TIMEOUT)
+}
+
+/// Run one profile request (built with `single_send`) exactly once. Only a
+/// refusal before the request leaves (closed editor, changed account) is
+/// reported as not sent; any later failure means the outcome is unknown.
+async fn send_once(
+    selection: &AccountSelection,
+    cancellation: &RoomSettingsCancellation,
+    request: impl Future<Output = Result<(), HttpError>>,
+) -> Sent {
+    if let Err(error) = ensure_scope(selection, cancellation) {
+        return Sent::NotSent(error);
+    }
+    let result = guarded(selection, cancellation, WRITE_TIMEOUT, async {
+        request.await.map_err(|error| request_failure(&error))
+    })
+    .await;
+    match result {
+        Ok(()) => Sent::Sent,
+        // The request may already have left when the editor or account ended.
+        Err(error) => Sent::Unknown(error),
+    }
+}
+
+/// Remove one profile field with a single request: the delete endpoint when
+/// the server supports it, else the legacy setter with no value. Learning
+/// which endpoint applies is a read; only the chosen request is a change.
+async fn clear_field(
+    owned: &Owned,
+    selection: &AccountSelection,
+    cancellation: &RoomSettingsCancellation,
+    field: ProfileFieldName,
+) -> Sent {
+    let versions = match guarded(selection, cancellation, READ_TIMEOUT, async {
+        owned
+            .client
+            .supported_versions()
+            .await
+            .map_err(|error| request_failure(&error))
+    })
+    .await
+    {
+        Ok(versions) => versions,
+        Err(error) => return Sent::NotSent(error),
+    };
+    let client = &owned.client;
+    if delete_profile_field::v3::Request::PATH_BUILDER.is_supported(&versions) {
+        let request = delete_profile_field::v3::Request::new(owned.user.clone(), field);
+        return send_once(selection, cancellation, async {
+            client.send(request).with_request_config(single_send()).await.map(|_| ())
+        })
+        .await;
+    }
+    match field {
+        ProfileFieldName::DisplayName => {
+            #[allow(deprecated)]
+            let request = set_display_name::v3::Request::new(owned.user.clone(), None);
+            send_once(selection, cancellation, async {
+                client.send(request).with_request_config(single_send()).await.map(|_| ())
+            })
+            .await
+        }
+        _ => {
+            #[allow(deprecated)]
+            let request = set_avatar_url::v3::Request::new(owned.user.clone(), None);
+            send_once(selection, cancellation, async {
+                client.send(request).with_request_config(single_send()).await.map(|_| ())
+            })
+            .await
+        }
+    }
 }
 
 struct Owned {
@@ -292,38 +414,54 @@ impl AccountManager {
         Self::read_profile(&owned, selection, cancellation).await
     }
 
-    /// Publish a new display name, then read the profile back. An error after
-    /// the request was sent means only that the outcome is unknown.
+    /// Publish a new display name: one single-send request, then a read-back.
     pub async fn set_own_display_name_for(
         &self,
         selection: &AccountSelection,
         cancellation: &RoomSettingsCancellation,
         name: &str,
-    ) -> ProfileResult<OwnProfile> {
+    ) -> ProfileResult<WriteReport> {
         let name = validate_display_name(name)?;
         let owned = self.own_client(selection, cancellation).await?;
-        guarded(selection, cancellation, WRITE_TIMEOUT, async {
-            owned
-                .client
-                .account()
-                .set_display_name(Some(&name))
-                .await
-                .map_err(|error| sdk_failure(&error))
+        #[allow(deprecated)]
+        let request = set_display_name::v3::Request::new(owned.user.clone(), Some(name.clone()));
+        let client = &owned.client;
+        let sent = send_once(selection, cancellation, async {
+            client.send(request).with_request_config(single_send()).await.map(|_| ())
         })
-        .await?;
-        Self::read_profile(&owned, selection, cancellation).await
+        .await;
+        Self::confirm(&owned, selection, cancellation, sent, |profile| {
+            profile.display_name.as_deref() == Some(name.as_str())
+        })
+        .await
     }
 
-    /// Upload a prepared, bounded PNG and publish it as the avatar, then read
-    /// the profile back. The upload and the profile change are two requests:
-    /// a closed editor or account change between them leaves only an unused
-    /// upload and never starts the profile change.
+    /// Remove the display name from the public profile, so it has none:
+    /// one single-send request, then a read-back.
+    pub async fn clear_own_display_name_for(
+        &self,
+        selection: &AccountSelection,
+        cancellation: &RoomSettingsCancellation,
+    ) -> ProfileResult<WriteReport> {
+        let owned = self.own_client(selection, cancellation).await?;
+        let sent = clear_field(&owned, selection, cancellation, ProfileFieldName::DisplayName).await;
+        Self::confirm(&owned, selection, cancellation, sent, |profile| {
+            profile.display_name.is_none()
+        })
+        .await
+    }
+
+    /// Upload a prepared, bounded PNG, then publish it as the avatar with one
+    /// single-send request and read the profile back. The upload is not a
+    /// public change: if it fails, nothing was published and this returns an
+    /// error. A closed editor or account change after the upload leaves only
+    /// an unused upload and never starts the profile change.
     pub async fn set_own_avatar_for(
         &self,
         selection: &AccountSelection,
         cancellation: &RoomSettingsCancellation,
         image: AvatarPng,
-    ) -> ProfileResult<OwnProfile> {
+    ) -> ProfileResult<WriteReport> {
         let owned = self.own_client(selection, cancellation).await?;
         let (bytes, _, _) = image.into_parts();
         let upload = guarded(selection, cancellation, UPLOAD_TIMEOUT, async {
@@ -341,35 +479,55 @@ impl AccountManager {
         .await?;
         crate::media::validate_media_address(&upload.content_uri)
             .map_err(|_| ProfileError::InvalidResponse)?;
-        guarded(selection, cancellation, WRITE_TIMEOUT, async {
-            owned
-                .client
-                .account()
-                .set_avatar_url(Some(&upload.content_uri))
-                .await
-                .map_err(|error| sdk_failure(&error))
+        let uri = upload.content_uri;
+        #[allow(deprecated)]
+        let request = set_avatar_url::v3::Request::new(owned.user.clone(), Some(uri.clone()));
+        let client = &owned.client;
+        let sent = send_once(selection, cancellation, async {
+            client.send(request).with_request_config(single_send()).await.map(|_| ())
         })
-        .await?;
-        Self::read_profile(&owned, selection, cancellation).await
+        .await;
+        Self::confirm(&owned, selection, cancellation, sent, |profile| {
+            profile.avatar.as_ref() == Some(&uri)
+        })
+        .await
     }
 
-    /// Remove the avatar from the public profile, then read it back.
+    /// Remove the avatar from the public profile: one single-send request,
+    /// then a read-back.
     pub async fn remove_own_avatar_for(
         &self,
         selection: &AccountSelection,
         cancellation: &RoomSettingsCancellation,
-    ) -> ProfileResult<OwnProfile> {
+    ) -> ProfileResult<WriteReport> {
         let owned = self.own_client(selection, cancellation).await?;
-        guarded(selection, cancellation, WRITE_TIMEOUT, async {
-            owned
-                .client
-                .account()
-                .set_avatar_url(None)
-                .await
-                .map_err(|error| sdk_failure(&error))
+        let sent = clear_field(&owned, selection, cancellation, ProfileFieldName::AvatarUrl).await;
+        Self::confirm(&owned, selection, cancellation, sent, |profile| !profile.has_avatar())
+        .await
+    }
+
+    /// Turn one send into a report. A refusal before anything was sent is
+    /// returned as an error; after a send (successful or not) the profile is
+    /// read back once and the report says what the server shows. A failed
+    /// send is never retried here.
+    async fn confirm(
+        owned: &Owned,
+        selection: &AccountSelection,
+        cancellation: &RoomSettingsCancellation,
+        sent: Sent,
+        applied: impl Fn(&OwnProfile) -> bool,
+    ) -> ProfileResult<WriteReport> {
+        let send_error = match sent {
+            Sent::NotSent(error) => return Err(error),
+            Sent::Sent => None,
+            Sent::Unknown(error) => Some(error),
+        };
+        let profile = Self::read_profile(owned, selection, cancellation).await.ok();
+        Ok(WriteReport {
+            applied: profile.as_ref().is_some_and(&applied),
+            profile,
+            send_error,
         })
-        .await?;
-        Self::read_profile(&owned, selection, cancellation).await
     }
 
     /// The bytes of the avatar `profile` names, bounded, for a local preview
@@ -409,6 +567,7 @@ mod tests {
     #[test]
     fn display_names_are_one_bounded_line() {
         assert_eq!(validate_display_name("  Synthetic Name  ").unwrap(), "Synthetic Name");
+        assert_eq!(validate_display_name("Synthetic   Spaced").unwrap(), "Synthetic Spaced");
         for invalid in [
             "",
             "   ",
@@ -425,6 +584,31 @@ mod tests {
             validate_display_name(&"\u{1f600}".repeat(MAX_DISPLAY_NAME_BYTES / 4 + 1)),
             Err(ProfileError::InvalidName)
         );
+    }
+
+    #[test]
+    fn a_send_without_a_matching_read_back_is_unknown() {
+        let shown = OwnProfile::synthetic("synthetic-a", "@synthetic-a:example.org", "https://example.org", None);
+        let confirmed = WriteReport {
+            profile: Some(shown.clone()),
+            applied: true,
+            send_error: Some(ProfileError::TimedOut),
+        };
+        // The send timed out but the server shows the change: confirmed.
+        assert!(confirmed.confirmed() && !confirmed.unknown());
+        let unknown = WriteReport {
+            profile: Some(shown),
+            applied: false,
+            send_error: Some(ProfileError::TimedOut),
+        };
+        assert!(unknown.unknown() && !unknown.confirmed());
+        // Nothing could be read back: still unknown, never "saved".
+        let unread = WriteReport {
+            profile: None,
+            applied: false,
+            send_error: None,
+        };
+        assert!(unread.unknown());
     }
 
     #[test]

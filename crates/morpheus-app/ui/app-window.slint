@@ -3386,6 +3386,15 @@ export component AppWindow inherits Window {
     in-out property <bool> account-profile-image-visible: false;
     in-out property <string> account-profile-status;
     in-out property <string> account-profile-error;
+    // The explicit Remove display name confirmation is showing.
+    in-out property <bool> account-profile-confirm-clear: false;
+    callback account-profile-clear-name();
+    // One bounded read of the active account's own profile for its switcher
+    // label; Rust runs it when Manage accounts opens (see below).
+    callback account-profile-label-refresh();
+    changed manage-accounts-open => {
+        if root.manage-accounts-open { root.account-profile-label-refresh(); }
+    }
     callback open-account-profile();
     callback close-account-profile();
     callback account-profile-name-edited();
@@ -11143,7 +11152,10 @@ export component AppWindow inherits Window {
         focus-on-tab-navigation: false;
         init => { profile-name-input.focus(); }
         capture-key-pressed(event) => {
-            if event.text == Key.Escape {
+            if event.text == Key.Escape && root.account-profile-confirm-clear {
+                root.account-profile-confirm-clear = false;
+                accept
+            } else if event.text == Key.Escape {
                 root.close-account-profile();
                 account-trigger.focus();
                 accept
@@ -11231,8 +11243,43 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-                    if root.account-profile-server-name != "" : Text {
-                        text: "Saved name: " + root.account-profile-server-name; color: root.muted; font-size: 11px * root.text-scale; overflow: elide; vertical-stretch: 0;
+                    if root.account-profile-server-name != "" : HorizontalLayout {
+                        spacing: 8px; vertical-stretch: 0;
+                        Text {
+                            text: "Saved name: " + root.account-profile-server-name; color: root.muted; font-size: 11px * root.text-scale;
+                            overflow: elide; vertical-alignment: center; horizontal-stretch: 1;
+                        }
+                        if !root.account-profile-confirm-clear : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                            text: "Remove display name…"; label: "Remove the display name from the public profile of " + root.account-profile-user-id;
+                            enabled: root.account-profile-loaded && !root.account-profile-busy;
+                            activated => { root.account-profile-confirm-clear = true; }
+                        }
+                    }
+                    if root.account-profile-confirm-clear : Rectangle {
+                        vertical-stretch: 0;
+                        background: root.elevated; border-radius: StyleTokens.radius * 0.8;
+                        border-color: root.accent; border-width: StyleTokens.line-width;
+                        init => { profile-clear-keep.focus(); }
+                        VerticalLayout {
+                            padding: 10px; spacing: 8px;
+                            Text {
+                                text: "Remove the display name from the public profile of " + root.account-profile-user-id + "? It will have no display name until you set one.";
+                                color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap;
+                                accessible-live-region: assertive;
+                            }
+                            HorizontalLayout {
+                                spacing: 8px; alignment: end;
+                                profile-clear-keep := TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                                    text: "Keep the name";
+                                    activated => { root.account-profile-confirm-clear = false; profile-name-input.focus(); }
+                                }
+                                TokenButton { colors: root.button-colors; text-scale: root.text-scale;
+                                    text: "Remove display name"; label: "Confirm removing the display name of " + root.account-profile-user-id;
+                                    enabled: !root.account-profile-busy;
+                                    activated => { root.account-profile-clear-name(); profile-name-input.focus(); }
+                                }
+                            }
+                        }
                     }
                     if root.account-profile-status != "" : Text {
                         text: root.account-profile-status; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; vertical-stretch: 0;

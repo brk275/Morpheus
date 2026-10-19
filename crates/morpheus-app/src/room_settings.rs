@@ -23,6 +23,14 @@ use tokio::{runtime::Handle, sync::Notify};
 use zeroize::Zeroizing;
 
 static FILE_WORKER: AtomicBool = AtomicBool::new(false);
+/// Which form holds the chooser (an `AvatarConsumer` as u8, 0 none), only so
+/// a waiting form can say who has it. Never used for admission.
+static FILE_WORKER_OWNER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The form holding the native image chooser or its file read now.
+pub(crate) fn chooser_owner() -> Option<crate::image_previews::avatar::AvatarConsumer> {
+    crate::image_previews::avatar::AvatarConsumer::from_u8(FILE_WORKER_OWNER.load(Ordering::Acquire))
+}
 const REFRESH_FIRST: &str = "The change may have reached your homeserver. Refresh room details before making another change.";
 const UNAVAILABLE: &str = "Room settings are unavailable. Close this form and reopen it.";
 
@@ -958,6 +966,14 @@ fn settings_error(error: RoomSettingsError) -> &'static str {
         }
     }
 }
+/// Clears the chooser owner before the permit is released (declared after
+/// the permit, so it drops first).
+struct ChooserOwnerMark;
+impl Drop for ChooserOwnerMark {
+    fn drop(&mut self) {
+        FILE_WORKER_OWNER.store(0, Ordering::Release);
+    }
+}
 struct FilePermit<'a>(&'a AtomicBool);
 impl<'a> FilePermit<'a> {
     fn acquire(gate: &'a AtomicBool) -> Option<Self> {
@@ -973,22 +989,30 @@ impl Drop for FilePermit<'_> {
 }
 async fn choose_file(form: Arc<Form>) -> Result<Option<Zeroizing<Vec<u8>>>, &'static str> {
     let active = Arc::new(move || form.selection.is_current() && !form.cancellation.is_cancelled());
-    choose_avatar_file("Choose room avatar", active).await
+    choose_avatar_file(
+        crate::image_previews::avatar::AvatarConsumer::RoomSettings,
+        "Choose room avatar",
+        active,
+    )
+    .await
 }
 /// The one guarded native image chooser and bounded file read, shared by the
 /// room-avatar form and the account's own public-profile editor. One chooser
 /// or read runs process-wide; `active` is checked before and after the dialog
 /// and between reads, so a closed form or changed account reads nothing more.
 pub(crate) async fn choose_avatar_file(
+    consumer: crate::image_previews::avatar::AvatarConsumer,
     title: &'static str,
     active: Arc<dyn Fn() -> bool + Send + Sync>,
 ) -> Result<Option<Zeroizing<Vec<u8>>>, &'static str> {
     let permit = FilePermit::acquire(&FILE_WORKER).ok_or("A native image chooser or file read is still active. Finish it before choosing another image.")?;
+    FILE_WORKER_OWNER.store(consumer as u8, Ordering::Release);
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
         .name("morpheus-avatar-file".into())
         .spawn(move || {
             let _permit = permit;
+            let _owner = ChooserOwnerMark;
             let active = || active();
             let result = (|| {
                 if !active() {
@@ -1023,7 +1047,10 @@ pub(crate) async fn choose_avatar_file(
             })();
             let _ = tx.send(result);
         })
-        .map_err(|_| "The native image chooser could not start.")?;
+        .map_err(|_| {
+            FILE_WORKER_OWNER.store(0, Ordering::Release);
+            "The native image chooser could not start."
+        })?;
     rx.await
         .map_err(|_| "The selected file could not be read.")?
 }
