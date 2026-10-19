@@ -3738,6 +3738,36 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     ui.set_image_preview_has_next(false);
     ui.set_image_preview_event_id("".into());
     ui.set_image_preview_image(slint::Image::default());
+
+    // Measure the queue's real captions at large text too. These are inert
+    // in-memory presentation rows; no file, upload or action is submitted.
+    let previous_page = ui.get_page();
+    ui.set_page(0);
+    ui.set_font_scale_percent(200);
+    ui.set_attachment_items(ModelRc::new(VecModel::from(vec![crate::AttachmentItem {
+        id: 1,
+        name: "synthetic queued file".into(),
+        detail: "1 KiB".into(),
+        status: "Ready".into(),
+        progress: -1.0,
+        can_remove: true,
+        ..Default::default()
+    }])));
+    ui.set_attachment_ready_count(1);
+    settle(&ui).await;
+    let row = control_bounds(&ui, "synthetic queued file, 1 KiB, Ready");
+    assert_eq!(row.len(), 1);
+    assert!(row[0].bottom - row[0].top >= 49.5);
+    for label in ["Send the ready attachment", "Remove synthetic queued file"] {
+        let bounds = control_bounds(&ui, label);
+        assert_eq!(bounds.len(), 1, "{label}");
+        assert!(bounds[0].bottom - bounds[0].top >= 29.5, "{label}");
+        assert!(inside_window(&ui, bounds[0]), "{label} at 200%");
+    }
+    ui.set_attachment_items(ModelRc::new(VecModel::default()));
+    ui.set_attachment_ready_count(0);
+    ui.set_font_scale_percent(100);
+    ui.set_page(previous_page);
     ui.set_show_sign_in(true);
     settle(&ui).await;
 
