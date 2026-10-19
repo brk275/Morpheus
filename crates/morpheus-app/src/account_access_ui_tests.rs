@@ -3229,6 +3229,22 @@ async fn assert_live_preview(ui: &AppWindow) {
     click_control_once(ui, "Unpin the compact preview");
     settle(ui).await;
     assert!(!ui.get_appearance_preview_pinned());
+
+    // At the smallest window and 200% text the card keeps a bounded, stable
+    // height (its samples scroll inside it), so it never fills the page.
+    ui.window().set_size(slint::PhysicalSize::new(940, 620));
+    for (scale, expected) in [(100, 340.0f32), (200, 408.0)] {
+        ui.set_font_scale_percent(scale);
+        settle(ui).await;
+        let card = control_with_label(ui, "Live preview with sample content");
+        let height = card.geometry().size.height;
+        assert!(
+            (height - expected).abs() < 1.0,
+            "{scale}%: the preview card is {height} px, not {expected}"
+        );
+    }
+    ui.set_font_scale_percent(100);
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
     ui.set_page(0);
     settle(ui).await;
 }
