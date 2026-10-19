@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from scripts.ci_scope import (MACOS, PLATFORMS, WAYLAND_UNRELATED_NATIVE_INPUTS,
                               WAYLAND_UNRELATED_THEME_INPUTS,
-                              WAYLAND_UNRELATED_MATRIX_DIAGNOSTIC_INPUTS, changed_paths, classify)
+                              WAYLAND_UNRELATED_MATRIX_DIAGNOSTIC_INPUTS, changed_paths, classify, scanner_step_only)
 
 
 class ScopeTests(unittest.TestCase):
@@ -249,6 +249,26 @@ class ScopeTests(unittest.TestCase):
         self.assertEqual(paths, ["docs/a file.md", "packaging/linux.toml"])
         self.assertFalse(all_platforms)
         self.assertEqual(run.call_args.args[0][-1], "a" * 40 + "..." + "b" * 40)
+
+
+class ScannerScopeTests(unittest.TestCase):
+    @patch("scripts.ci_scope.subprocess.run")
+    def test_only_scanner_step_edits_omit_native_matrix(self, run):
+        from types import SimpleNamespace
+        start = b"      - name: Scan committed history for credentials\n"
+        end = b"      - name: Select checks from changed inputs using reviewed classifier\n"
+        original = b"same preamble\n" + start + b"old scan\n" + end + b"same native jobs\n"
+        updated = original.replace(b"old scan", b"new isolated scan")
+        run.side_effect = [SimpleNamespace(stdout=original), SimpleNamespace(stdout=updated)]
+        self.assertTrue(scanner_step_only("a" * 40, "b" * 40))
+        run.side_effect = [SimpleNamespace(stdout=original), SimpleNamespace(stdout=updated + b"native change\n")]
+        self.assertFalse(scanner_step_only("a" * 40, "b" * 40))
+        run.side_effect = [SimpleNamespace(stdout=original), SimpleNamespace(stdout=updated + start)]
+        self.assertFalse(scanner_step_only("a" * 40, "b" * 40))
+
+    def test_fixture_manifest_is_security_helper_input(self):
+        self.assertFalse(classify(["scripts/public-fixtures.json", "scripts/scan_history.py"])["native"])
+        self.assertEqual(classify(["scripts/public-fixtures.json", "Cargo.lock"])["native_matrix"]["os"], list(PLATFORMS))
 
 
 if __name__ == "__main__":

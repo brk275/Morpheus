@@ -105,7 +105,7 @@ def classify(paths, force_all=False):
         path = str(PurePosixPath(raw))
         if (path.endswith(".md")
                 or (path.startswith("docs/screenshots/") and path.endswith(".png"))
-                or path in {"LICENSE", ".gitignore", ".gitleaksignore"}):
+                or path in {"LICENSE", ".gitignore", ".gitleaksignore", "scripts/public-fixtures.json"}):
             continue
         if path not in (WAYLAND_UNRELATED_NATIVE_INPUTS | WAYLAND_UNRELATED_THEME_INPUTS
                         | WAYLAND_UNRELATED_MATRIX_DIAGNOSTIC_INPUTS):
@@ -133,7 +133,7 @@ def classify(paths, force_all=False):
         elif path.startswith(("scripts/", "tests/")):
             # Scope job checks Python and JavaScript without external accounts.
             continue
-        elif path in {".github/workflows/package-qa.yml", ".github/workflows/wayland-startup-probe.yml"}:
+        elif path in {".github/workflows/package-qa.yml", ".github/workflows/wayland-startup-probe.yml", ".github/workflows/history-security.yml"}:
             # This workflow is manual-only. CI compiles do not exercise its
             # package/install/diagnostic steps; explicitly dispatch the affected
             # platforms after review instead of rebuilding every desktop here.
@@ -150,6 +150,31 @@ def classify(paths, force_all=False):
         "config": config and not native,
         "wayland": "ubuntu-24.04" in native and wayland_affected,
     }
+
+
+def scanner_step_only(before, after):
+    """Exclude CI scanner-only edits from native builds; compare all other bytes.
+
+    Unknown layouts and any change outside the single bounded scanner step keep
+    the full native matrix. Source/security helper checks still run normally.
+    """
+    start = b"      - name: Scan committed history for credentials\n"
+    end = b"      - name: Select checks from changed inputs using reviewed classifier\n"
+    def outside(revision):
+        content = subprocess.run(
+            ["git", "show", revision + ":.github/workflows/ci.yml"],
+            check=True, capture_output=True,
+        ).stdout
+        if len(content) > 1024 * 1024 or content.count(start) != 1 or content.count(end) != 1:
+            raise ValueError("unrecognized scanner step boundaries")
+        a, z = content.index(start), content.index(end)
+        if z <= a:
+            raise ValueError("invalid scanner step order")
+        return content[:a], content[z:]
+    try:
+        return outside(before) == outside(after)
+    except (ValueError, subprocess.CalledProcessError):
+        return False
 
 
 def changed_paths(event, event_name):
@@ -176,7 +201,10 @@ def changed_paths(event, event_name):
     except subprocess.CalledProcessError:
         # Missing history must widen verification, never silently skip it.
         return [], True
-    return [p.decode("utf-8", errors="surrogateescape") for p in result.stdout.split(b"\0") if p], False
+    paths = [p.decode("utf-8", errors="surrogateescape") for p in result.stdout.split(b"\0") if p]
+    if ".github/workflows/ci.yml" in paths and scanner_step_only(before, after):
+        paths.remove(".github/workflows/ci.yml")
+    return paths, False
 
 
 def main():

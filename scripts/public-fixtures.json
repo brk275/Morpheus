@@ -1,0 +1,190 @@
+{
+  "version": 1,
+  "fixtures": [
+    {
+      "fingerprint": "6888d131799dd715a24f79dd5e03696441d78f05:vendor/livekit-api/src/test_token.txt:jwt:1",
+      "blob_sha256": "45fb9c7ff611f830d96b61c071a3b4d6b6b034442e424acef10566fb705838d0",
+      "provenance": "Public livekit-api 0.5.3 test fixture; registry archive SHA256 c4d063f66ee1faf1c654a2bd59eba2e3f3eefc63772d957f2702c0724903db8a"
+    },
+    {
+      "fingerprint": "6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/client/tests.rs:generic-api-key:166",
+      "blob_sha256": "491c6ab21475df2cc2edae150194199b9d94cfa06c804e14c282ae2c6dd673d4",
+      "provenance": "Public RTC fixture, byte-exact upstream 53880ef1ef66b62df555ce71ccd1d6c85b813596 at crates/matrix-rtc-core/src/client/tests.rs"
+    },
+    {
+      "fingerprint": "6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/room_state.rs:generic-api-key:1062",
+      "blob_sha256": "084b4ace74155f9d189af91a1a3cab06383fc7dc312491c899091a1c14439d63",
+      "provenance": "Public RTC fixture, byte-exact upstream 53880ef1ef66b62df555ce71ccd1d6c85b813596 at crates/matrix-rtc-core/src/compat/room_state.rs"
+    },
+    {
+      "fingerprint": "6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/room_state.rs:generic-api-key:1074",
+      "blob_sha256": "084b4ace74155f9d189af91a1a3cab06383fc7dc312491c899091a1c14439d63",
+      "provenance": "Public RTC fixture, byte-exact upstream 53880ef1ef66b62df555ce71ccd1d6c85b813596 at crates/matrix-rtc-core/src/compat/room_state.rs"
+    },
+    {
+      "fingerprint": "6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/sticky_2025.rs:generic-api-key:628",
+      "blob_sha256": "8ec2d4339e0c850833594c088e005f365773a44683b7c142492c5128bb86759f",
+      "provenance": "Public RTC fixture, byte-exact upstream 53880ef1ef66b62df555ce71ccd1d6c85b813596 at crates/matrix-rtc-core/src/compat/sticky_2025.rs"
+    },
+    {
+      "fingerprint": "6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/sticky_2025.rs:generic-api-key:633",
+      "blob_sha256": "8ec2d4339e0c850833594c088e005f365773a44683b7c142492c5128bb86759f",
+      "provenance": "Public RTC fixture, byte-exact upstream 53880ef1ef66b62df555ce71ccd1d6c85b813596 at crates/matrix-rtc-core/src/compat/sticky_2025.rs"
+    },
+    {
+      "fingerprint": "6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/sticky_2025.rs:generic-api-key:644",
+      "blob_sha256": "8ec2d4339e0c850833594c088e005f365773a44683b7c142492c5128bb86759f",
+      "provenance": "Public RTC fixture, byte-exact upstream 53880ef1ef66b62df555ce71ccd1d6c85b813596 at crates/matrix-rtc-core/src/compat/sticky_2025.rs"
+    },
+    {
+      "fingerprint": "6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/sticky_2025.rs:generic-api-key:738",
+      "blob_sha256": "8ec2d4339e0c850833594c088e005f365773a44683b7c142492c5128bb86759f",
+      "provenance": "Public RTC fixture, byte-exact upstream 53880ef1ef66b62df555ce71ccd1d6c85b813596 at crates/matrix-rtc-core/src/compat/sticky_2025.rs"
+    },
+    {
+      "fingerprint": "6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/sticky_2025.rs:generic-api-key:752",
+      "blob_sha256": "8ec2d4339e0c850833594c088e005f365773a44683b7c142492c5128bb86759f",
+      "provenance": "Public RTC fixture, byte-exact upstream 53880ef1ef66b62df555ce71ccd1d6c85b813596 at crates/matrix-rtc-core/src/compat/sticky_2025.rs"
+    },
+    {
+      "fingerprint": "6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/sticky_2025.rs:generic-api-key:771",
+      "blob_sha256": "8ec2d4339e0c850833594c088e005f365773a44683b7c142492c5128bb86759f",
+      "provenance": "Public RTC fixture, byte-exact upstream 53880ef1ef66b62df555ce71ccd1d6c85b813596 at crates/matrix-rtc-core/src/compat/sticky_2025.rs"
+    },
+    {
+      "fingerprint": "6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/sticky_2025.rs:generic-api-key:772",
+      "blob_sha256": "8ec2d4339e0c850833594c088e005f365773a44683b7c142492c5128bb86759f",
+      "provenance": "Public RTC fixture, byte-exact upstream 53880ef1ef66b62df555ce71ccd1d6c85b813596 at crates/matrix-rtc-core/src/compat/sticky_2025.rs"
+    },
+    {
+      "fingerprint": "6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/sticky_2025.rs:generic-api-key:773",
+      "blob_sha256": "8ec2d4339e0c850833594c088e005f365773a44683b7c142492c5128bb86759f",
+      "provenance": "Public RTC fixture, byte-exact upstream 53880ef1ef66b62df555ce71ccd1d6c85b813596 at crates/matrix-rtc-core/src/compat/sticky_2025.rs"
+    },
+    {
+      "fingerprint": "6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/sticky_2025.rs:generic-api-key:790",
+      "blob_sha256": "8ec2d4339e0c850833594c088e005f365773a44683b7c142492c5128bb86759f",
+      "provenance": "Public RTC fixture, byte-exact upstream 53880ef1ef66b62df555ce71ccd1d6c85b813596 at crates/matrix-rtc-core/src/compat/sticky_2025.rs"
+    },
+    {
+      "fingerprint": "6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/compat/sticky_2025.rs:generic-api-key:801",
+      "blob_sha256": "8ec2d4339e0c850833594c088e005f365773a44683b7c142492c5128bb86759f",
+      "provenance": "Public RTC fixture, byte-exact upstream 53880ef1ef66b62df555ce71ccd1d6c85b813596 at crates/matrix-rtc-core/src/compat/sticky_2025.rs"
+    },
+    {
+      "fingerprint": "6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/host/event.rs:generic-api-key:454",
+      "blob_sha256": "f61742a9622ceecd1a36c38b0e454da66be7920e911b3fd267380146462dfe5a",
+      "provenance": "Public RTC fixture, byte-exact upstream 53880ef1ef66b62df555ce71ccd1d6c85b813596 at crates/matrix-rtc-core/src/host/event.rs"
+    },
+    {
+      "fingerprint": "6d62e5758a611abe051363e7d8f56d17755de13e:vendor/matrix-rtc-core/src/host/event.rs:generic-api-key:514",
+      "blob_sha256": "f61742a9622ceecd1a36c38b0e454da66be7920e911b3fd267380146462dfe5a",
+      "provenance": "Public RTC fixture, byte-exact upstream 53880ef1ef66b62df555ce71ccd1d6c85b813596 at crates/matrix-rtc-core/src/host/event.rs"
+    },
+    {
+      "fingerprint": "a5074a35d0f8f48bb2f76d4afbbb0dd2418765cd:scripts/element_call_peer.mjs:generic-api-key:225",
+      "blob_sha256": "7d50c482cab240ce45df069ad74bc5c9974da3c5996c43181762467b3d3e9c3c",
+      "provenance": "Reviewed Object.keys(event.getContent()).every key-name equality comparison; no credential assignment"
+    },
+    {
+      "fingerprint": "e34578a7cd28b1461f871cf9683f466e017c95bc:vendor/matrix-sdk/src/authentication/oauth/qrcode/login.rs:generic-api-key:547",
+      "blob_sha256": "61860576411931aa186952bd568433a2164320dd7e193b84034e9a823877c740",
+      "provenance": "Public Matrix SDK fixture, byte-exact upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd at crates/matrix-sdk/src/authentication/oauth/qrcode/login.rs"
+    },
+    {
+      "fingerprint": "e34578a7cd28b1461f871cf9683f466e017c95bc:vendor/matrix-sdk/src/authentication/oauth/qrcode/login.rs:generic-api-key:548",
+      "blob_sha256": "61860576411931aa186952bd568433a2164320dd7e193b84034e9a823877c740",
+      "provenance": "Public Matrix SDK fixture, byte-exact upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd at crates/matrix-sdk/src/authentication/oauth/qrcode/login.rs"
+    },
+    {
+      "fingerprint": "e34578a7cd28b1461f871cf9683f466e017c95bc:vendor/matrix-sdk/src/authentication/oauth/qrcode/login.rs:generic-api-key:549",
+      "blob_sha256": "61860576411931aa186952bd568433a2164320dd7e193b84034e9a823877c740",
+      "provenance": "Public Matrix SDK fixture, byte-exact upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd at crates/matrix-sdk/src/authentication/oauth/qrcode/login.rs"
+    },
+    {
+      "fingerprint": "e34578a7cd28b1461f871cf9683f466e017c95bc:vendor/matrix-sdk/src/authentication/oauth/qrcode/messages.rs:generic-api-key:268",
+      "blob_sha256": "10f8a5c1867979e41554ec703deb0e1417c93c0c098b7c27ab70ebf4d616dbf7",
+      "provenance": "Public Matrix SDK fixture, byte-exact upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd at crates/matrix-sdk/src/authentication/oauth/qrcode/messages.rs"
+    },
+    {
+      "fingerprint": "e34578a7cd28b1461f871cf9683f466e017c95bc:vendor/matrix-sdk/src/authentication/oauth/qrcode/messages.rs:generic-api-key:269",
+      "blob_sha256": "10f8a5c1867979e41554ec703deb0e1417c93c0c098b7c27ab70ebf4d616dbf7",
+      "provenance": "Public Matrix SDK fixture, byte-exact upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd at crates/matrix-sdk/src/authentication/oauth/qrcode/messages.rs"
+    },
+    {
+      "fingerprint": "e34578a7cd28b1461f871cf9683f466e017c95bc:vendor/matrix-sdk/src/authentication/oauth/qrcode/messages.rs:generic-api-key:270",
+      "blob_sha256": "10f8a5c1867979e41554ec703deb0e1417c93c0c098b7c27ab70ebf4d616dbf7",
+      "provenance": "Public Matrix SDK fixture, byte-exact upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd at crates/matrix-sdk/src/authentication/oauth/qrcode/messages.rs"
+    },
+    {
+      "fingerprint": "e34578a7cd28b1461f871cf9683f466e017c95bc:vendor/matrix-sdk/src/authentication/oauth/qrcode/messages.rs:generic-api-key:283",
+      "blob_sha256": "10f8a5c1867979e41554ec703deb0e1417c93c0c098b7c27ab70ebf4d616dbf7",
+      "provenance": "Public Matrix SDK fixture, byte-exact upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd at crates/matrix-sdk/src/authentication/oauth/qrcode/messages.rs"
+    },
+    {
+      "fingerprint": "e34578a7cd28b1461f871cf9683f466e017c95bc:vendor/matrix-sdk/src/authentication/oauth/qrcode/messages.rs:generic-api-key:284",
+      "blob_sha256": "10f8a5c1867979e41554ec703deb0e1417c93c0c098b7c27ab70ebf4d616dbf7",
+      "provenance": "Public Matrix SDK fixture, byte-exact upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd at crates/matrix-sdk/src/authentication/oauth/qrcode/messages.rs"
+    },
+    {
+      "fingerprint": "e34578a7cd28b1461f871cf9683f466e017c95bc:vendor/matrix-sdk/src/authentication/oauth/qrcode/messages.rs:generic-api-key:285",
+      "blob_sha256": "10f8a5c1867979e41554ec703deb0e1417c93c0c098b7c27ab70ebf4d616dbf7",
+      "provenance": "Public Matrix SDK fixture, byte-exact upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd at crates/matrix-sdk/src/authentication/oauth/qrcode/messages.rs"
+    },
+    {
+      "fingerprint": "e34578a7cd28b1461f871cf9683f466e017c95bc:vendor/matrix-sdk/src/encryption/backups/mod.rs:generic-api-key:1156",
+      "blob_sha256": "87dc1f8094d5cc5b799e7081ff4a85559531f45d65946819225186b36cff09da",
+      "provenance": "Public Matrix SDK fixture, byte-exact upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd at crates/matrix-sdk/src/encryption/backups/mod.rs"
+    },
+    {
+      "fingerprint": "e34578a7cd28b1461f871cf9683f466e017c95bc:vendor/matrix-sdk/src/encryption/mod.rs:generic-api-key:2734",
+      "blob_sha256": "76dda611878740d636170358e8ad140a1dd62a6d997b984f7280ba8c37394d4d",
+      "provenance": "Public Matrix SDK fixture, byte-exact upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd at crates/matrix-sdk/src/encryption/mod.rs"
+    },
+    {
+      "fingerprint": "e34578a7cd28b1461f871cf9683f466e017c95bc:vendor/matrix-sdk/src/encryption/mod.rs:generic-api-key:2737",
+      "blob_sha256": "76dda611878740d636170358e8ad140a1dd62a6d997b984f7280ba8c37394d4d",
+      "provenance": "Public Matrix SDK fixture, byte-exact upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd at crates/matrix-sdk/src/encryption/mod.rs"
+    },
+    {
+      "fingerprint": "e34578a7cd28b1461f871cf9683f466e017c95bc:vendor/matrix-sdk/src/encryption/tasks.rs:generic-api-key:638",
+      "blob_sha256": "d5330a90d017448bc50d05760264b310f28b78568aae8b717886a3e4c54c3583",
+      "provenance": "Public Matrix SDK fixture, byte-exact upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd at crates/matrix-sdk/src/encryption/tasks.rs"
+    },
+    {
+      "fingerprint": "e34578a7cd28b1461f871cf9683f466e017c95bc:vendor/matrix-sdk/tests/integration/encryption/backups.rs:generic-api-key:1365",
+      "blob_sha256": "66e2da6594baa57d3393a382697e5a731e603fadff9a4a31b231024a3e513850",
+      "provenance": "Public Matrix SDK fixture, byte-exact upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd at crates/matrix-sdk/tests/integration/encryption/backups.rs"
+    },
+    {
+      "fingerprint": "e34578a7cd28b1461f871cf9683f466e017c95bc:vendor/matrix-sdk/tests/integration/encryption/backups.rs:generic-api-key:942",
+      "blob_sha256": "66e2da6594baa57d3393a382697e5a731e603fadff9a4a31b231024a3e513850",
+      "provenance": "Public Matrix SDK fixture, byte-exact upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd at crates/matrix-sdk/tests/integration/encryption/backups.rs"
+    },
+    {
+      "fingerprint": "e34578a7cd28b1461f871cf9683f466e017c95bc:vendor/matrix-sdk/tests/integration/encryption/secret_storage.rs:generic-api-key:266",
+      "blob_sha256": "8edc075edc11de3d30fceef1a7a8d4c8cddca282dabb6ea9302b251c2c599b8c",
+      "provenance": "Public Matrix SDK fixture, byte-exact upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd at crates/matrix-sdk/tests/integration/encryption/secret_storage.rs"
+    },
+    {
+      "fingerprint": "e34578a7cd28b1461f871cf9683f466e017c95bc:vendor/matrix-sdk/tests/integration/encryption/to_device.rs:generic-api-key:113",
+      "blob_sha256": "4c29df4a1aa56b899c9fa461f659367ac227af6bae7572275d300dc17b1a6b07",
+      "provenance": "Public Matrix SDK fixture, byte-exact upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd at crates/matrix-sdk/tests/integration/encryption/to_device.rs"
+    },
+    {
+      "fingerprint": "e34578a7cd28b1461f871cf9683f466e017c95bc:vendor/matrix-sdk/tests/integration/encryption/to_device.rs:generic-api-key:181",
+      "blob_sha256": "4c29df4a1aa56b899c9fa461f659367ac227af6bae7572275d300dc17b1a6b07",
+      "provenance": "Public Matrix SDK fixture, byte-exact upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd at crates/matrix-sdk/tests/integration/encryption/to_device.rs"
+    },
+    {
+      "fingerprint": "e34578a7cd28b1461f871cf9683f466e017c95bc:vendor/matrix-sdk/tests/integration/encryption/to_device.rs:generic-api-key:244",
+      "blob_sha256": "4c29df4a1aa56b899c9fa461f659367ac227af6bae7572275d300dc17b1a6b07",
+      "provenance": "Public Matrix SDK fixture, byte-exact upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd at crates/matrix-sdk/tests/integration/encryption/to_device.rs"
+    },
+    {
+      "fingerprint": "e34578a7cd28b1461f871cf9683f466e017c95bc:vendor/matrix-sdk/tests/integration/encryption/to_device.rs:generic-api-key:58",
+      "blob_sha256": "4c29df4a1aa56b899c9fa461f659367ac227af6bae7572275d300dc17b1a6b07",
+      "provenance": "Public Matrix SDK fixture, byte-exact upstream c6ad52ecc09eaa36601f55effb0a48a533eb87dd at crates/matrix-sdk/tests/integration/encryption/to_device.rs"
+    }
+  ]
+}
