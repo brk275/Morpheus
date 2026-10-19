@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
 name: Reviewed beta four-platform native checks
-run-name: Reviewed pinned integration - 21ab453 - ${{ inputs.platform }}
+run-name: Reviewed pinned integration - 2e02557 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: beta-native-21ab453-${{ github.ref }}
+  group: beta-native-2e02557-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 21ab453deb817a324045664a90007ace2293f54a
+          ref: 2e0255772ef3f2d2dfc80c2c12fd806849372272
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -135,7 +135,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='21ab453deb817a324045664a90007ace2293f54a'
+          source='2e0255772ef3f2d2dfc80c2c12fd806849372272'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -379,7 +379,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='21ab453deb817a324045664a90007ace2293f54a'
+          source='2e0255772ef3f2d2dfc80c2c12fd806849372272'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -576,7 +576,33 @@ jobs:
                   resolved_link=shutil.which('link.exe',path=environment.get('PATH','')) if os.name=='nt' else None
                   locked_names={package for package,version in locked}
                   failed_packages=set(re.findall(r'could not compile `([A-Za-z0-9_-]+)`',normalized))
+                  # Only reviewed public filenames and numeric compiler spans.
+                  # Missing identifiers are admitted only if already in those public sources.
+                  source_files=('crates/morpheus-app/src/main.rs',
+                      'crates/morpheus-app/src/live.rs',
+                      'crates/morpheus-app/src/timeline_model.rs',
+                      'crates/morpheus-app/src/pinned_messages/mod.rs',
+                      'crates/morpheus-app/src/pinned_messages/view.rs',
+                      'crates/morpheus-app/src/message_search.rs',
+                      'crates/morpheus-app/src/polls/mod.rs',
+                      'crates/morpheus-app/ui/app-window.slint',
+                      'crates/morpheus-app/ui/pinned-messages.slint',
+                      'crates/morpheus-matrix/src/lib.rs',
+                      'crates/morpheus-matrix/src/pinned_messages.rs')
+                  locations=[]; public_identifiers=set()
+                  for path in source_files:
+                      file=workspace/path
+                      if not file.is_file(): continue
+                      text=file.read_text()
+                      public_identifiers.update(re.findall(r'\b[A-Za-z_][A-Za-z0-9_]{0,127}\b',text))
+                      line_limit=len(text.splitlines())+1
+                      spans={(int(line),int(column)) for line,column in re.findall(re.escape(path)+r':([0-9]{1,7}):([0-9]{1,5})',normalized)
+                          if 0<int(line)<=line_limit and 0<int(column)<=4096}
+                      locations.extend({'file':path,'line':line,'column':column} for line,column in sorted(spans)[:32])
+                  missing=set(re.findall(r'cannot find (?:value|function|type|struct) `([A-Za-z_][A-Za-z0-9_]{0,127})`',normalized))
                   record['failure_diagnostics']={
+                      'source_locations':locations,
+                      'missing_public_identifiers':sorted(missing & public_identifiers)[:32],
                       'linker_failures':[{'tool':tool_family(tool),'exit_code':int(code)} for tool,code in linker_failures[:8]],
                       'path_link_family':tool_family(resolved_link) if resolved_link else 'not_resolved',
                       'locked_failed_packages':sorted(failed_packages & locked_names),
