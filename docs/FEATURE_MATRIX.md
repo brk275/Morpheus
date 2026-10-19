@@ -71,6 +71,10 @@ when call services are unavailable.
 | Voice spaces | Shared/local room designation, navigation, participant roster and quiet join. | Complete drop-in UI behavior across platforms. |
 | Screen sharing | Window/display selection, Start/Stop controls and encrypted picture transport alongside microphone audio. | Remote unpublish after Stop, native received tiles, packaged permissions and cross-platform interoperability. |
 
+Calls stay joined while they recover: media reconnects inside the join,
+outgoing audio and video pause while signaling reconnects (up to 25 seconds),
+and a lost join is left and rejoined at most four times within 60 seconds.
+This recovery is implemented but has not been exercised against a real outage.
 Disposable encrypted-call fixtures cover participant departure, key rotation,
 signaling reconnect and selected browser-peer scenarios. Full network outage,
 SFU restart, physical-device behavior and current interoperability remain open.
