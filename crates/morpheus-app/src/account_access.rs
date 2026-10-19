@@ -36,7 +36,24 @@ pub(crate) struct AccountAccessUi {
     pending: Mutex<Option<Pending>>,
     generation: Arc<AtomicU64>,
     accounts_refresh_generation: Arc<AtomicU64>,
+    switch_generation: AtomicU64,
     busy: AtomicBool,
+}
+
+// Declared before the transition/security guards in request(): its completion
+// runs after those guards have dropped, including early returns or cancellation.
+// The generation controls presentation only; core activation grants remain the
+// authority for protected accounts.
+struct SwitchCompletion {
+    access: Arc<AccountAccessUi>,
+    generation: u64,
+}
+
+impl Drop for SwitchCompletion {
+    fn drop(&mut self) {
+        self.access.busy.store(false, Ordering::Release);
+        self.access.show_switch_pending(self.generation, false);
+    }
 }
 
 impl AccountAccessUi {
@@ -54,6 +71,7 @@ impl AccountAccessUi {
             pending: Mutex::new(None),
             generation: Arc::new(AtomicU64::new(0)),
             accounts_refresh_generation: Arc::new(AtomicU64::new(0)),
+            switch_generation: AtomicU64::new(0),
             busy: AtomicBool::new(false),
         });
         let access = this.clone();
@@ -181,28 +199,53 @@ impl AccountAccessUi {
         });
     }
 
+    fn show_switch_pending(self: &Arc<Self>, generation: u64, pending: bool) {
+        if let Some(ui) = self.ui.upgrade() {
+            if self.switch_generation.load(Ordering::Acquire) == generation {
+                ui.set_account_switch_pending(pending);
+            }
+        } else {
+            let access = self.clone();
+            let _ = self.ui.upgrade_in_event_loop(move |ui| {
+                // A completed request must not re-enable a newer switch.
+                if access.switch_generation.load(Ordering::Acquire) == generation {
+                    ui.set_account_switch_pending(pending);
+                }
+            });
+        }
+    }
+
     pub(crate) fn request(self: &Arc<Self>, id: String) {
         if self.busy.swap(true, Ordering::AcqRel) {
             return;
         }
+        let generation = self
+            .switch_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        self.show_switch_pending(generation, true);
+        let completion = SwitchCompletion {
+            access: self.clone(),
+            generation,
+        };
         let access = self.clone();
         self.runtime.spawn(async move {
+            // Captured before spawn so even an unpolled, dropped future clears
+            // presentation; initialized before either operation guard below.
+            let _completion = completion;
             let _transition = access.live.account_transition.lock().await;
             if !access.allowed() {
                 access.report(
                     "Leave the call and finish any security operation before changing accounts.",
                 );
-                access.busy.store(false, Ordering::Release);
                 return;
             }
             let Some(_security) = access.live.security_gate.try_account_access() else {
                 access.report("Finish the current security operation before changing accounts.");
-                access.busy.store(false, Ordering::Release);
                 return;
             };
             if let Err(error) = access.live.flush_drafts().await {
                 access.report(error.to_string());
-                access.busy.store(false, Ordering::Release);
                 return;
             }
             let result = access.live.manager.switch_to(&id).await;
@@ -236,7 +279,6 @@ impl AccountAccessUi {
             {
                 access.live.account_detached(access.ui.clone()).await;
             }
-            access.busy.store(false, Ordering::Release);
             access.refresh_accounts().await;
         });
     }

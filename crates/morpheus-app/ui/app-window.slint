@@ -2237,6 +2237,8 @@ export component AppWindow inherits Window {
     in-out property <color> custom-accent;
     in-out property <color> custom-accent-ink;
 
+    // Cached account content may arrive before activation releases its guards.
+    in-out property <bool> account-switch-pending: false;
     callback switch-account(int);
     callback select-space(string);
     callback open-room(string);
@@ -3101,7 +3103,7 @@ export component AppWindow inherits Window {
                     padding: 8px;
                     spacing: 2px;
                     Text {
-                        text: "SWITCH ACCOUNT";
+                        text: root.account-switch-pending ? "SWITCHING…" : "SWITCH ACCOUNT";
                         color: root.muted;
                         font-size: 10px * root.text-scale;
                         font-weight: 750;
@@ -3122,6 +3124,7 @@ export component AppWindow inherits Window {
                         focus-color: root.accent;
                         cancel-on-escape: true;
                         label: "Switch to " + account.name + ", " + account.handle;
+                        enabled: !root.account-switch-pending;
                         // Repeater children become focusable after initialization; defer one tick.
                         Timer {
                             interval: 1ms;
@@ -7547,7 +7550,7 @@ export component AppWindow inherits Window {
                                             TextAction {
                                 reveal-full-control: true;
                                                 height: 36px * root.text-scale; vertical-stretch: 0;
-                                                text: root.app-password-enabled ? "Unlock" : "Open"; enabled: !account.removal-pending;
+                                                text: root.app-password-enabled ? "Unlock" : "Open"; enabled: !account.removal-pending && !root.account-switch-pending;
                                                 label: "Open " + account.handle;
                                                 ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
                                                 activated => { root.activate-saved-account(account.id); }
@@ -7556,6 +7559,7 @@ export component AppWindow inherits Window {
                                 reveal-full-control: true;
                                                 height: 36px * root.text-scale; vertical-stretch: 0;
                                                 text: account.removal-pending ? "Retry removal" : "Remove"; label: "Remove " + account.handle + " from this app";
+                                                enabled: !root.account-switch-pending;
                                                 ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
                                                 activated => { root.remove-saved-account(account.id); }
                                             }

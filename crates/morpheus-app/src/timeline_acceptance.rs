@@ -989,7 +989,11 @@ impl Context {
     }
 
     fn active(&self, local_id: &str) -> bool {
-        self.ui.get_live_session() && self.ui.get_active_account_local_id().as_str() == local_id
+        // Observe the actual enabled switch control, not only cached profile
+        // publication while the previous activation still owns its guards.
+        self.ui.get_live_session()
+            && self.ui.get_active_account_local_id().as_str() == local_id
+            && !self.ui.get_account_switch_pending()
     }
 
     fn showing(&self, room: &str) -> bool {

@@ -2226,6 +2226,71 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
     settle(ui).await;
 }
 
+// A cached profile alone must not make a second switch actionable while the
+// first request is still waiting to own the production transition lock.
+async fn assert_switch_readiness(
+    ui: &AppWindow,
+    live: &Arc<LiveUi>,
+    access: &Arc<AccountAccessUi>,
+) {
+    use slint::private_unstable_api::re_exports::{AccessibilityAction, AccessibleStringProperty};
+    use std::{cell::Cell, rc::Rc};
+
+    let options = ui.get_account_options();
+    ui.set_account_options(ModelRc::new(VecModel::from(vec![crate::AccountOption {
+        index: 0,
+        local_id: "presentation-only".into(),
+        name: "Rowan".into(),
+        handle: "@rowan:example.org".into(),
+        ..Default::default()
+    }])));
+    let activations = Rc::new(Cell::new(0));
+    let recorded = activations.clone();
+    ui.on_switch_account(move |_| recorded.set(recorded.get() + 1));
+    let transition = live.account_transition.lock().await;
+    access.request("presentation-only".into());
+    assert!(ui.get_account_switch_pending());
+    assert!(access.busy.load(Ordering::Acquire));
+    ui.set_account_menu_open(true);
+    settle(ui).await;
+    let label = "Switch to Rowan, @rowan:example.org";
+    let choice = control_with_label(ui, label);
+    assert_eq!(
+        choice
+            .accessible_string_property(AccessibleStringProperty::Enabled)
+            .as_deref(),
+        Some("false")
+    );
+    choice.accessible_action(&AccessibilityAction::Default);
+    assert_eq!(activations.get(), 0);
+    assert!(ui.get_account_menu_open());
+    drop(transition);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while ui.get_account_switch_pending() {
+            settle(ui).await;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a rejected switch releases presentation readiness");
+    assert!(!access.busy.load(Ordering::Acquire));
+    assert!(!live.security_gate.blocked());
+    let choice = control_with_label(ui, label);
+    assert_eq!(
+        choice
+            .accessible_string_property(AccessibleStringProperty::Enabled)
+            .as_deref(),
+        Some("true")
+    );
+    choice.accessible_action(&AccessibilityAction::Default);
+    assert_eq!(activations.get(), 1);
+    ui.set_account_menu_open(false);
+    ui.set_account_options(options);
+    ui.on_switch_account(|_| {});
+    ui.set_account_access_notice("".into());
+    settle(ui).await;
+}
+
 async fn exercise_account_ui(runtime: Handle) {
     #[cfg(not(morpheus_timeline_acceptance))]
     exercise_startup_recovery();
@@ -2257,6 +2322,7 @@ async fn exercise_account_ui(runtime: Handle) {
     // A denied account-change guard also prevents any mistaken key sequence
     // from starting policy writes, account activation, or local deletion.
     let access = AccountAccessUi::register(&ui, live.clone(), runtime.clone(), || false);
+    assert_switch_readiness(&ui, &live, &access).await;
     ui.set_composer_text("untouched conversation draft".into());
     settle(&ui).await;
 
