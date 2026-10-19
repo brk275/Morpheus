@@ -279,10 +279,10 @@ const BOUNDED_BODY_INITIAL_CAPACITY: usize = 64 * 1024;
 ///
 /// A declared length over the limit is refused before reading. Each chunk is
 /// then counted with checked arithmetic before the buffer grows, and the
-/// buffer never reserves more than the limit, so an oversized body is refused
-/// while holding at most `limit` bytes of it. The count covers the bytes as
-/// they arrive after any content decoding, so neither a missing length, a
-/// chunked body nor decompression can exceed the limit.
+/// requested buffer capacity never exceeds the limit. Transport/decoder
+/// buffers and the current chunk exist separately; allocator rounding may also
+/// add overhead. The accumulated body length is bounded, not total memory.
+/// Counting happens after content decoding, including chunked responses.
 #[derive(Debug)]
 struct BoundedBody {
     limit: u64,
@@ -601,6 +601,51 @@ mod tests {
         send(None).await.unwrap();
         assert_matches!(send(Some(255)).await, Err(HttpError::ResponseTooLarge { limit: 255 }));
         server.verify().await;
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[async_test]
+    async fn test_response_limit_counts_chunked_transport_before_appending() {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        // A real HTTP body without Content-Length exercises reqwest's native
+        // chunk reader, rather than only feeding the accumulator directly.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut byte = [0];
+                assert_eq!(stream.read(&mut byte).await.unwrap(), 1);
+                request.push(byte[0]);
+                assert!(request.len() <= 4096);
+                if request.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream.write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4\r\nabcd\r\n4\r\nefgh\r\n0\r\n\r\n"
+            ).await.unwrap();
+        });
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap()
+            .get(format!("http://{address}/synthetic-chunks"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.content_length(), None);
+        assert_matches!(
+            super::response_to_http_response(response, Some(7)).await,
+            Err(HttpError::ResponseTooLarge { limit: 7 })
+        );
+        server.await.unwrap();
     }
 
     #[async_test]

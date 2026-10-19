@@ -156,8 +156,10 @@ What changed, narrowly:
   `HttpError`. With a limit, `BoundedBody` refuses a declared length over the
   limit before reading, then counts each decoded chunk (after gzip
   decompression) with checked arithmetic before the buffer grows. The buffer is
-  reserved exactly, growing geometrically but never past the limit; a declared
-  length is never trusted for more than a 64 KiB first allocation. Returning
+  requested to grow geometrically without requesting capacity past the limit;
+  allocator overhead, transport/decoder buffers and the current chunk remain
+  additional memory. This bounds accumulated body bytes, not process memory.
+  A declared length is trusted for at most a 64 KiB first allocation. Returning
   the error drops the response, which stops the transfer.
 - Native `execute_request` takes the limit from the request's `RequestConfig`
   on every attempt; the wasm `send_request` passes it the same way.
@@ -190,15 +192,16 @@ classification and redacted message; per-request limit through `Client::send`
 with a mock that would see any retry; a dropped request that leaves nothing
 running; and the unlimited default. The integration case uses a mock with a
 declared length (wiremock sends one); the streamed path is covered directly
-through `BoundedBody`.
+through `BoundedBody`; a root-added native loopback HTTP fixture additionally
+exercises a chunked response with no Content-Length through reqwest.
 
 Additionally modified vendored files (upstream c6ad52e blob -> current blob):
 
 | File | Upstream git blob | Current git blob |
 | --- | --- | --- |
-| src/config/request.rs | c2a8e3067413203b49221fd1b2d685aa19cb5340 | f813a2195e7d74c0b12a0b11d0b74d7cf1679472 |
-| src/error.rs | 41b387d55ad3184cbbc0daee68f4ef3d5c4b0ba4 | 6f5d690d03d25d4ee51d932c4cc096f2de00fada |
-| src/http_client/mod.rs | 9224c8826604f4e8b8e670806efef111ba93edd6 | 799d37a84ac0f503006dca5913b8bb03dad435c4 |
+| src/config/request.rs | c2a8e3067413203b49221fd1b2d685aa19cb5340 | 33b48c41bfc8cc2d2d5485a03029becb6f379342 |
+| src/error.rs | 41b387d55ad3184cbbc0daee68f4ef3d5c4b0ba4 | 1e5d866fcf045096893095a1d4ce671f8a64d810 |
+| src/http_client/mod.rs | 9224c8826604f4e8b8e670806efef111ba93edd6 | 75970fc6ff29dd0ac480fe9da736459a3182c6b6 |
 | src/http_client/native.rs | 58321de8f1ba7435a6dd22c93bef77437c22fad7 | ee5d9d819e909b7354c77e0b1fedc58e676d3ede |
 | src/http_client/wasm.rs | f08346b3093a9dda63b30fcde81d2525cfdf0dc6 | 651e1ad551e97e805105249a586f4279d128a5fa |
 
@@ -207,3 +210,9 @@ The upstream blobs are the `git_blob` values recorded in
 `LICENSE` and the upstream headers are kept. No manifest, feature, lock,
 build script or dependency changed. `crates/morpheus-app/build.rs` hashes
 `vendor/`, so the persistence cohort changes with this patch.
+
+Root integration adds an 8 MiB per-request cap to device roster reads and
+rename/sign-out responses (including UIAA). Existing selection, operation,
+password and cancellation fences remain intact. Oversized responses map to
+the fixed unavailable result; ambiguous destructive requests are not resent.
+Source only; no hosted or installed-device acceptance is claimed yet.

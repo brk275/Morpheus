@@ -73,6 +73,9 @@ const MAX_DEVICE_NAME_INPUT_BYTES: usize = 4096;
 const MAX_AUTH_SESSION_BYTES: usize = 4096;
 const MAX_AUTH_FLOWS: usize = 32;
 const MAX_BROWSER_PAGE_BYTES: usize = 16 * 1024;
+// Bound raw device-list and UIAA JSON before SDK deserialization, separately
+// from the roster/field limits below. Sync and media keep their own policies.
+const MAX_DEVICE_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -571,7 +574,14 @@ impl DeviceSessions {
 
     /// The homeserver's list of this account's sessions, without addresses.
     async fn server_sessions(&self) -> Result<Vec<ServerSession>> {
-        let request = self.client.send(get_devices::v3::Request::new());
+        let request = self
+            .client
+            .send(get_devices::v3::Request::new())
+            .with_request_config(
+                self.client
+                    .request_config()
+                    .max_response_bytes(MAX_DEVICE_RESPONSE_BYTES),
+            );
         let response = request.await.map_err(|error| request_error(&error))?;
         checked_server_sessions(response.devices)
     }
@@ -930,7 +940,10 @@ fn parse_device_id(device_id: &str) -> Result<OwnedDeviceId> {
 /// Destructive and naming requests are sent once; a failure after sending
 /// is followed by a fresh read, never by a resend.
 fn single_send() -> RequestConfig {
-    RequestConfig::new().retry_limit(0).timeout(WRITE_TIMEOUT)
+    RequestConfig::new()
+        .retry_limit(0)
+        .timeout(WRITE_TIMEOUT)
+        .max_response_bytes(MAX_DEVICE_RESPONSE_BYTES)
 }
 
 fn request_error(error: &HttpError) -> DeviceSessionError {

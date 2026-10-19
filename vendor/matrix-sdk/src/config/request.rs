@@ -204,7 +204,9 @@ impl RequestConfig {
     /// A response that declares a larger length is refused before its body
     /// is read. Otherwise the body is counted as it arrives, after any
     /// content decoding, and the response is dropped as soon as it would
-    /// exceed the limit; at most `limit` bytes of it are ever held. The
+    /// exceed the limit. The accumulated body has at most `limit` bytes;
+    /// transport/decoder buffers and the current incoming chunk are additional.
+    /// This is not a bound on total process memory. The
     /// request then fails with
     /// [`HttpError::ResponseTooLarge`](crate::HttpError::ResponseTooLarge),
     /// which is never retried.

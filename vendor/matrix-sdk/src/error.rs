@@ -92,8 +92,8 @@ pub enum HttpError {
     /// The response body exceeded the limit set for this request with
     /// [`RequestConfig::max_response_bytes`](crate::config::RequestConfig::max_response_bytes).
     ///
-    /// The response was dropped without reading past the limit, and none of
-    /// it is kept or reported. The request is not retried.
+    /// The response was dropped before appending a chunk that would cross
+    /// the limit; no body is returned or reported. The request is not retried.
     // Morpheus patch: bounded response bodies.
     #[error("the response exceeded the {limit}-byte limit set for this request")]
     ResponseTooLarge {
