@@ -163,6 +163,18 @@ export component MediaViewer inherits Rectangle {
         }
     }
 
+    // Zoom so the picture point at (x, y), measured from the stage centre,
+    // stays under the pointer.
+    function zoom-at(factor: float, x: length, y: length) {
+        if root.loaded {
+            let before = root.zoom;
+            root.zoom = clamp(root.zoom * factor, 1, 8);
+            let ratio = root.zoom / before;
+            root.pan-to(x - (x - root.pan-x) * ratio, y - (y - root.pan-y) * ratio);
+            root.keep-focus();
+        }
+    }
+
     function keep-focus() {
         let current = root.focused-action();
         if !root.action-enabled(current) {
@@ -423,14 +435,18 @@ export component MediaViewer inherits Rectangle {
                             }
                         }
                         double-clicked => {
-                            if root.zoom > 1 { root.reset-view(); } else { root.zoom-by(2); }
+                            if root.zoom > 1 {
+                                root.reset-view();
+                            } else {
+                                root.zoom-at(2, self.mouse-x - self.width / 2, self.mouse-y - self.height / 2);
+                            }
                         }
                         scroll-event(event) => {
                             if event.delta-y > 0px {
-                                root.zoom-by(1.25);
+                                root.zoom-at(1.25, self.mouse-x - self.width / 2, self.mouse-y - self.height / 2);
                                 accept
                             } else if event.delta-y < 0px {
-                                root.zoom-by(0.8);
+                                root.zoom-at(0.8, self.mouse-x - self.width / 2, self.mouse-y - self.height / 2);
                                 accept
                             } else {
                                 reject
