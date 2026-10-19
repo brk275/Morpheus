@@ -3365,6 +3365,23 @@ async fn assert_themed_select(ui: &AppWindow) {
     settle(ui).await;
     assert_eq!(ui.get_audio_microphone_index(), 1, "wheel up");
 
+    // Long externally supplied labels stay within the settings panel rather
+    // than increasing its minimum width. The visible caption may elide.
+    ui.set_audio_microphone_choices(ModelRc::new(VecModel::from(vec![
+        "System default".into(),
+        slint::SharedString::from("Long device label ".repeat(128)),
+        "Headset".into(),
+    ])));
+    let previous_scale = ui.get_font_scale_percent();
+    ui.set_font_scale_percent(200);
+    settle(ui).await;
+    let bounds = control_bounds(ui, label);
+    assert_eq!(bounds.len(), 1);
+    let logical_width = ui.window().size().width as f32 / ui.window().scale_factor();
+    assert!(bounds[0].left >= -0.5 && bounds[0].right <= logical_width + 0.5);
+    ui.set_font_scale_percent(previous_scale);
+    settle(ui).await;
+
     ui.set_audio_devices_busy(true);
     settle(ui).await;
     key(ui, Key::UpArrow);

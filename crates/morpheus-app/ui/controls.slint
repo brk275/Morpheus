@@ -399,7 +399,10 @@ export component TokenSelect inherits Rectangle {
         if !root.enabled { popup.close(); }
     }
 
-    min-width: max(160px, caption.preferred-width + 2 * StyleTokens.input-padding + 24px);
+    // Remote pack names and device labels must not determine the panel's
+    // minimum width. Reserve space for the arrow and padding; elide text
+    // inside whatever width the containing layout gives us.
+    min-width: max(160px, 24px * root.text-scale + 2 * StyleTokens.input-padding + 24px);
     min-height: max(32px, 16px * root.text-scale + 14px);
     preferred-height: self.min-height;
     horizontal-stretch: 1;
