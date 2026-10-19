@@ -73,6 +73,13 @@ pub use room_tags::{
     ConfirmedTags, FavouriteOrder, MAX_TAG_ORDER_WRITES, RoomTagChange, RoomTagError, TagKnowledge,
     TagOrder,
 };
+mod device_sessions;
+pub use device_sessions::{
+    CrossSigningState, DeviceSession, DeviceSessionCancellation, DeviceSessionError,
+    DeviceSessionSnapshot, DeviceSessions, DeviceTrust, MAX_DEVICE_NAME_CHARS, MAX_DEVICE_SESSIONS,
+    RenameOutcome, SignOutBlocker, SignOutChallenge, SignOutMethod, SignOutStep,
+    bounded_device_name,
+};
 
 use std::{
     collections::{HashMap, HashSet},
