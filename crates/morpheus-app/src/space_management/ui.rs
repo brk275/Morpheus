@@ -949,7 +949,8 @@ impl SpaceManagerUi {
         } else {
             typed_topic.as_str()
         };
-        let change = super::about_change(&typed_name, typed_topic, (&name, &topic));
+        let current = (name.as_str(), topic.as_str());
+        let change = super::about_change(&typed_name, typed_topic, current);
         let change = match change {
             Ok(change) => change,
             Err(message) => return self.reject(ui, &panel, message),
