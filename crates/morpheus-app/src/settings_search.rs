@@ -233,6 +233,8 @@ pub(super) fn reveal(ui: &AppWindow, id: &str) -> bool {
     ui.set_settings_reveal_id(SharedString::from(target.id));
     match target.route {
         Route::Settings => request_settings_reveal(ui),
+        // Presentation only: the panel shows what is already there.
+        Route::Transfers => ui.invoke_show_transfer_panel(),
         Route::ManageAccounts(focus) => {
             ui.set_manage_accounts_focus(
                 match focus {

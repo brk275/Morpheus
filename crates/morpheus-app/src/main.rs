@@ -796,9 +796,9 @@ fn finish_composer_submission(
 
 fn reset_attachment_view(ui: &AppWindow) {
     ui.invoke_close_image_preview();
-    // An unfinished save of this room's attachment stops downloading; its
-    // late result cannot appear in the next room.
-    ui.invoke_cancel_attachment_save();
+    // An unfinished save keeps downloading in the account's transfer center;
+    // leaving the account stops it. Bumping the operation below keeps its
+    // late notice out of the next room.
     // Uploads continue in their room after navigation and staged files stay
     // with it. The workbench shows the next room's queue once the active
     // account or room changes; nothing of this one remains meanwhile.

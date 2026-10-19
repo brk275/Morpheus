@@ -20,6 +20,10 @@ export struct AttachmentItem {
     can-remove: bool,
     can-cancel: bool,
     can-retry: bool,
+    // A ready file can move among the room's ready files, which are sent
+    // in the order shown.
+    can-move-up: bool,
+    can-move-down: bool,
 }
 
 export struct AttachmentPalette {
@@ -119,7 +123,7 @@ export component AttachmentQueue inherits Rectangle {
     in property <AttachmentStyle> style;
     in property <float> text-scale: 1;
     callback send();
-    // (item id, 0 remove, 1 cancel, 2 retry)
+    // (item id, 0 remove, 1 cancel, 2 retry, 4 move up, 5 move down)
     callback action(int, int);
 
     // Heights follow the natural line heights of the queue's own captions in
@@ -236,6 +240,22 @@ export component AttachmentQueue inherits Rectangle {
                             }
                         }
                     }
+                }
+                if item.can-move-up : QueueAction {
+                    text: "Up";
+                    label: "Send " + item.name + " earlier";
+                    palette: root.palette;
+                    style: root.style;
+                    text-scale: root.text-scale;
+                    activated => { root.action(item.id, 4); }
+                }
+                if item.can-move-down : QueueAction {
+                    text: "Down";
+                    label: "Send " + item.name + " later";
+                    palette: root.palette;
+                    style: root.style;
+                    text-scale: root.text-scale;
+                    activated => { root.action(item.id, 5); }
                 }
                 if item.can-retry : QueueAction {
                     text: "Retry";

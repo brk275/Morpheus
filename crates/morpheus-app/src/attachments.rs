@@ -90,6 +90,13 @@ pub fn safe_file_name(name: &str) -> String {
 /// A same-directory temporary file prevents a failed write from truncating a
 /// destination that the user chose in the native Save dialog.
 pub fn save_download(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+    save_download_as(path, bytes, true)
+}
+
+/// As `save_download`, replacing an existing destination only with `replace`.
+/// Without it a file that already exists is left untouched and the write
+/// fails with `AlreadyExists`; the temporary file is removed either way.
+pub fn save_download_as(path: &Path, bytes: &[u8], replace: bool) -> io::Result<PathBuf> {
     let directory = path
         .parent()
         .filter(|directory| !directory.as_os_str().is_empty())
@@ -97,7 +104,13 @@ pub fn save_download(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
     temporary.write_all(bytes)?;
     temporary.as_file().sync_all()?;
-    temporary.persist(path).map_err(|error| error.error)?;
+    if replace {
+        temporary.persist(path).map_err(|error| error.error)?;
+    } else {
+        temporary
+            .persist_noclobber(path)
+            .map_err(|error| error.error)?;
+    }
     Ok(path.to_path_buf())
 }
 
@@ -119,6 +132,22 @@ pub(crate) fn begin_download_save(
     }))
 }
 
+/// As `begin_download_save`, with `save_download_as`'s replace rule.
+pub(crate) fn begin_download_save_as(
+    path: PathBuf,
+    bytes: Vec<u8>,
+    replace: bool,
+    cancelled: &tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<io::Result<PathBuf>>> {
+    let stopped = cancelled.borrow();
+    if *stopped || cancelled.has_changed().is_err() {
+        return None;
+    }
+    Some(tokio::task::spawn_blocking(move || {
+        save_download_as(&path, &bytes, replace)
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,6 +159,15 @@ mod tests {
         std::fs::write(&target, b"previous").unwrap();
         save_download(&target, b"decrypted media").unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"decrypted media");
+        // Without the Save dialog's confirmation an existing file is never
+        // replaced, and no temporary file is left behind.
+        let kept = save_download_as(&target, b"unconfirmed", false).unwrap_err();
+        assert_eq!(kept.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&target).unwrap(), b"decrypted media");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        let fresh = dir.path().join("fresh.bin");
+        assert_eq!(save_download_as(&fresh, b"new file", false).unwrap(), fresh);
+        assert_eq!(std::fs::read(&fresh).unwrap(), b"new file");
         assert_eq!(mime_type_for(Path::new("photo.png")), "image/png");
         assert_eq!(
             mime_type_for(Path::new("unknown.oddextension")),

@@ -1645,6 +1645,9 @@ pub enum Route {
     Settings,
     /// Open Manage accounts and focus one of its controls.
     ManageAccounts(AccountsFocus),
+    /// Show the transfer center of the account on screen and focus its
+    /// heading. Nothing is started, cancelled or retried.
+    Transfers,
 }
 
 pub struct SettingTarget {
@@ -1686,6 +1689,11 @@ const fn live(mut setting: SettingTarget) -> SettingTarget {
 
 const fn accounts(mut setting: SettingTarget, focus: AccountsFocus) -> SettingTarget {
     setting.route = Route::ManageAccounts(focus);
+    setting
+}
+
+const fn transfers(mut setting: SettingTarget) -> SettingTarget {
+    setting.route = Route::Transfers;
     setting
 }
 
@@ -2122,6 +2130,22 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
             "call",
         ],
     ),
+    live(transfers(target(
+        "files.transfers",
+        "Files",
+        "Conversation › Files",
+        "Transfers",
+        "Uploads, saved attachments and what recently ended for this account.",
+        &[
+            "transfer",
+            "upload",
+            "download",
+            "attachment",
+            "saved attachment",
+            "progress",
+            "cancel upload",
+        ],
+    ))),
     target(
         "shortcuts",
         "Shortcuts",

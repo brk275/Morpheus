@@ -1,21 +1,38 @@
-//! Per-room composer attachment queue. Chosen files wait as local paths only,
-//! with no bytes read, until the user sends them. Each sent file then has its
-//! own task and small command channel. The core reads it with the 25 MiB cap
-//! into the SDK's encrypted per-account media store and persistent room send
-//! queue, so this module keeps no second copy of any content. Rows are
-//! projected into Slint only for the account and room on screen.
+//! Attachment transfers: the per-room composer queue and the account's
+//! transfer center.
+//!
+//! Chosen files wait as local paths only, with no bytes read, until the user
+//! sends them, in the order shown (staged files can be reordered or removed).
+//! Each sent file then has its own task and small command channel. The core
+//! reads it with the 25 MiB cap, and the homeserver's own upload limit when
+//! it reports one, into the SDK's encrypted per-account media store and
+//! persistent room send queue, so this module keeps no second copy of any
+//! content. At most two files are read and prepared at once.
 //!
 //! No item is ever sent twice automatically. A file that failed before it was
-//! queued can be retried once by the user. A paused upload is retried in place
-//! with the SDK's unwedge, never re-enqueued. An upload whose outcome is
-//! unknown can only be dismissed.
+//! queued can be retried once by the user, and starts again from the
+//! beginning. A paused upload is retried in place with the SDK's unwedge,
+//! never re-enqueued. An upload whose outcome is unknown can only be
+//! dismissed.
 //!
-//! Saving a received attachment asks for the location every time and can be
-//! cancelled while it downloads. The bounded local write, guarded by the core
-//! against navigation, is never interrupted halfway, so the reported outcome
-//! is always what happened on disk.
+//! Saving a received attachment asks for the location every time, then
+//! waits in the account's download queue: one download is in memory at a
+//! time, each can be cancelled, and one that failed can be tried again (the
+//! location is asked again). Downloads continue while the user moves between
+//! the account's rooms; leaving the account stops them. The bounded local
+//! write, guarded by the core against account changes, is never interrupted
+//! halfway, so the reported outcome is always what happened on disk. A file
+//! is replaced only when the user chose it in the Save dialog, which asked
+//! first. Nothing is opened afterwards.
+//!
+//! The transfer center lists the visible account's uploads in every room,
+//! its downloads and the transfers that recently ended, by name only: no
+//! path, URL or server text is shown. Composer rows are projected only for
+//! the account and room on screen.
 
 use std::{
+    collections::{HashMap, VecDeque},
+    io,
     path::PathBuf,
     sync::{
         Arc, Mutex, MutexGuard,
@@ -34,7 +51,7 @@ use tokio::{
 };
 
 use crate::{
-    AppWindow, AttachmentItem,
+    AppWindow, AttachmentItem, TransferItem,
     attachments::{mime_type_for, safe_file_name},
     live::LiveUi,
 };
@@ -45,6 +62,14 @@ const MAX_ROOM_ITEMS: usize = 10;
 const MAX_ITEMS: usize = 64;
 /// Bound simultaneous file reads and SDK preparation across all rooms.
 const MAX_PREPARING: usize = 2;
+/// Downloads waiting or running across every account.
+const MAX_DOWNLOADS: usize = 8;
+/// Downloads held in memory at once; each is bounded by the 25 MiB cap.
+const MAX_DOWNLOADING: usize = 1;
+/// Ended transfers remembered for the transfer center, across accounts.
+const MAX_FINISHED: usize = 24;
+/// Rows the transfer center lists at once.
+const MAX_TRANSFER_ROWS: usize = 40;
 /// Minimum spacing of one upload's progress updates.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
 /// Commands are user clicks; a full channel drops a repeated click.
@@ -54,6 +79,19 @@ const TOO_LARGE: &str = "Too large: attachments are limited to 25 MiB.";
 const ACTION_REMOVE: i32 = 0;
 const ACTION_CANCEL: i32 = 1;
 const ACTION_RETRY: i32 = 2;
+const ACTION_OPEN_ROOM: i32 = 3;
+const ACTION_MOVE_UP: i32 = 4;
+const ACTION_MOVE_DOWN: i32 = 5;
+
+/// Transfer center row kinds, as the window reports them back.
+const KIND_UPLOAD: i32 = 0;
+const KIND_DOWNLOAD: i32 = 1;
+const KIND_FINISHED: i32 = 2;
+
+/// Transfer center groups, in display order.
+const GROUP_ACTIVE: i32 = 0;
+const GROUP_ATTENTION: i32 = 1;
+const GROUP_FINISHED: i32 = 2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Command {
@@ -110,6 +148,8 @@ struct Item {
     id: u64,
     account_id: String,
     room_id: String,
+    /// The room's name when the file was chosen, for the transfer center.
+    room_name: String,
     path: PathBuf,
     filename: String,
     mime_type: String,
@@ -134,9 +174,11 @@ struct Job {
     selection: AccountSelection,
     account_id: String,
     room_id: String,
+    room_name: String,
     path: PathBuf,
     mime_type: String,
     filename: String,
+    size: Option<u64>,
 }
 
 enum Outcome {
@@ -148,23 +190,132 @@ enum Outcome {
     Uncertain,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DownloadPhase {
+    /// Chosen; waiting for the one download slot.
+    Waiting,
+    /// Downloading and decrypting; the SDK reports no byte progress.
+    Downloading,
+    /// Writing to the chosen location.
+    Saving,
+    Cancelling,
+    /// Nothing was written; it can be tried again.
+    Failed(String),
+}
+
+impl DownloadPhase {
+    fn running(&self) -> bool {
+        !matches!(self, Self::Failed(_))
+    }
+
+    /// Whether a cancel can still stop it: an admitted write finishes.
+    fn cancellable(&self) -> bool {
+        matches!(self, Self::Waiting | Self::Downloading)
+    }
+}
+
+/// One save of a received attachment. The chosen location stays here and
+/// is never shown; only its final file name is.
+struct Download {
+    id: u64,
+    account_id: String,
+    room_id: String,
+    room_name: String,
+    event_id: String,
+    /// The sanitized name suggested to the Save dialog.
+    filename: String,
+    phase: DownloadPhase,
+    cancel: Option<watch::Sender<bool>>,
+}
+
+/// What one download task owns.
+struct DownloadJob {
+    id: u64,
+    selection: AccountSelection,
+    account_id: String,
+    room_id: String,
+    event_id: String,
+    path: PathBuf,
+    /// The Save dialog confirmed replacing a file that already existed.
+    replace: bool,
+    operation: i32,
+}
+
+enum SaveOutcome {
+    /// Saved under this final file name.
+    Saved(String),
+    /// Stopped before anything was written.
+    Cancelled,
+    Failed(String),
+}
+
+/// A transfer that ended, kept for the transfer center only: names and what
+/// happened, never content, a path or server text.
+struct Finished {
+    id: u64,
+    account_id: String,
+    room_id: String,
+    room_name: String,
+    filename: String,
+    upload: bool,
+    outcome: String,
+}
+
 #[derive(Default)]
 struct State {
     next_id: u64,
     items: Vec<Item>,
+    downloads: Vec<Download>,
+    /// Oldest first.
+    finished: VecDeque<Finished>,
 }
 
-/// The save in progress. Replacing or dropping it cancels its download.
-struct SaveJob {
-    operation: i32,
-    cancel: watch::Sender<bool>,
-}
+impl State {
+    fn next_id(&mut self) -> u64 {
+        self.next_id += 1;
+        self.next_id
+    }
 
-enum SaveOutcome {
-    Saved(PathBuf),
-    /// Stopped before anything was written.
-    Cancelled,
-    Failed(String),
+    fn remember(&mut self, finished: Finished) {
+        while self.finished.len() >= MAX_FINISHED {
+            self.finished.pop_front();
+        }
+        self.finished.push_back(finished);
+    }
+
+    /// Move a staged item one place up or down among the staged items of
+    /// its room, which are sent in this order.
+    fn move_staged(&mut self, account_id: &str, id: u64, up: bool) -> bool {
+        let Some(index) = self
+            .items
+            .iter()
+            .position(|item| item.id == id && item.account_id == account_id)
+        else {
+            return false;
+        };
+        if self.items[index].phase != Phase::Staged {
+            return false;
+        }
+        let room_id = self.items[index].room_id.clone();
+        let staged_here = |item: &Item| {
+            item.account_id == account_id && item.room_id == room_id && item.phase == Phase::Staged
+        };
+        let neighbour = if up {
+            self.items[..index].iter().rposition(staged_here)
+        } else {
+            self.items[index + 1..]
+                .iter()
+                .position(staged_here)
+                .map(|offset| index + 1 + offset)
+        };
+        match neighbour {
+            Some(neighbour) => {
+                self.items.swap(index, neighbour);
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 pub struct Workbench {
@@ -174,23 +325,18 @@ pub struct Workbench {
     state: Mutex<State>,
     /// A projection is already waiting on the event loop.
     queued: AtomicBool,
-    save: Mutex<Option<SaveJob>>,
     preparing: Semaphore,
+    downloading: Semaphore,
+    /// Each account's homeserver upload limit, once it was read.
+    limits: Mutex<HashMap<String, u64>>,
 }
 
 impl Workbench {
-    /// Install the composer attachment callbacks. The returned owner is also
-    /// held by those callbacks for the window's lifetime.
+    /// Install the composer attachment and transfer center callbacks. The
+    /// returned owner is also held by those callbacks for the window's
+    /// lifetime.
     pub fn register(ui: &AppWindow, live: Arc<LiveUi>, runtime: Handle) -> Arc<Self> {
-        let owner = Arc::new(Self {
-            live,
-            runtime,
-            window: ui.as_weak(),
-            state: Mutex::new(State::default()),
-            queued: AtomicBool::new(false),
-            save: Mutex::new(None),
-            preparing: Semaphore::new(MAX_PREPARING),
-        });
+        let owner = Arc::new(Self::new(ui, live, runtime, State::default()));
         {
             let owner = owner.clone();
             ui.on_attach_file(move || owner.choose_files());
@@ -209,11 +355,28 @@ impl Workbench {
                 let (Some(ui), Ok(id)) = (owner.window.upgrade(), u64::try_from(id)) else {
                     return;
                 };
-                match action {
-                    ACTION_REMOVE => owner.remove(&ui, id),
-                    ACTION_CANCEL => owner.cancel(&ui, id),
-                    ACTION_RETRY => owner.retry(&ui, id),
+                owner.upload_action(&ui, id, action);
+            });
+        }
+        {
+            let owner = owner.clone();
+            ui.on_transfer_action(move |kind, id, action| {
+                let (Some(ui), Ok(id)) = (owner.window.upgrade(), u64::try_from(id)) else {
+                    return;
+                };
+                match kind {
+                    KIND_UPLOAD => owner.upload_action(&ui, id, action),
+                    KIND_DOWNLOAD => owner.download_action(&ui, id, action),
+                    KIND_FINISHED => owner.finished_action(&ui, id, action),
                     _ => {}
+                }
+            });
+        }
+        {
+            let owner = owner.clone();
+            ui.on_clear_finished_transfers(move || {
+                if let Some(ui) = owner.window.upgrade() {
+                    owner.clear_finished(&ui);
                 }
             });
         }
@@ -237,6 +400,19 @@ impl Workbench {
         owner
     }
 
+    fn new(ui: &AppWindow, live: Arc<LiveUi>, runtime: Handle, state: State) -> Self {
+        Self {
+            live,
+            runtime,
+            window: ui.as_weak(),
+            state: Mutex::new(state),
+            queued: AtomicBool::new(false),
+            preparing: Semaphore::new(MAX_PREPARING),
+            downloading: Semaphore::new(MAX_DOWNLOADING),
+            limits: Mutex::new(HashMap::new()),
+        }
+    }
+
     // Used by the existing real generated-UI detach regression. No picker,
     // file read, client, or transfer is started: only the production refresh
     // is posted, with a private row belonging to the still-shown old IDs.
@@ -250,6 +426,7 @@ impl Workbench {
             id: 1,
             account_id: ui.get_active_account_local_id().to_string(),
             room_id: ui.get_active_room_id().to_string(),
+            room_name: "synthetic room".into(),
             path: PathBuf::from("synthetic-never-opened.png"),
             filename: "synthetic-private-file.png".into(),
             mime_type: "image/png".into(),
@@ -264,18 +441,12 @@ impl Workbench {
         ui.set_attachment_ready_count(1);
         ui.set_attachment_can_add(true);
         ui.set_attachment_status("private staged file".into());
-        let owner = Arc::new(Self {
-            live,
-            runtime,
-            window: ui.as_weak(),
-            state: Mutex::new(State {
-                next_id: 1,
-                items: vec![item],
-            }),
-            queued: AtomicBool::new(false),
-            save: Mutex::new(None),
-            preparing: Semaphore::new(MAX_PREPARING),
-        });
+        let state = State {
+            next_id: 1,
+            items: vec![item],
+            ..State::default()
+        };
+        let owner = Arc::new(Self::new(ui, live, runtime, state));
         owner.refresh();
     }
 
@@ -283,147 +454,421 @@ impl Workbench {
         self.state.lock().unwrap_or_else(|error| error.into_inner())
     }
 
-    fn lock_save(&self) -> MutexGuard<'_, Option<SaveJob>> {
-        self.save.lock().unwrap_or_else(|error| error.into_inner())
+    fn lock_limits(&self) -> MutexGuard<'_, HashMap<String, u64>> {
+        self.limits.lock().unwrap_or_else(|error| error.into_inner())
     }
 
+    /// Save an attachment of the room on screen.
     fn save(self: &Arc<Self>, event_id: &str, filename: &str) {
         let Some(ui) = self.window.upgrade() else {
             return;
         };
-        if !self.live.is_live.load(Ordering::Acquire)
-            || event_id.is_empty()
-            || !ui.get_downloading_event_id().is_empty()
-        {
-            return;
-        }
         let account_id = ui.get_active_account_local_id().to_string();
         let room_id = ui.get_active_room_id().to_string();
-        let Some(selection) = self.live.manager.account_selection(&account_id) else {
-            return;
+        let room_name = ui.get_active_room_name().to_string();
+        self.request_download(&ui, &account_id, &room_id, &room_name, event_id, filename);
+    }
+
+    /// Ask where to save one attachment, then queue its download. The
+    /// account, and the room it was asked from, must still be on screen
+    /// when the dialog closes.
+    fn request_download(
+        self: &Arc<Self>,
+        ui: &AppWindow,
+        account_id: &str,
+        room_id: &str,
+        room_name: &str,
+        event_id: &str,
+        filename: &str,
+    ) -> bool {
+        if !self.live.is_live.load(Ordering::Acquire)
+            || !ui.get_live_session()
+            || event_id.is_empty()
+            || room_id.is_empty()
+            || ui.get_active_account_local_id().as_str() != account_id
+        {
+            return false;
+        }
+        let Some(selection) = self.live.manager.account_selection(account_id) else {
+            return false;
         };
+        {
+            let state = self.lock();
+            let same = state.downloads.iter().any(|download| {
+                download.account_id == account_id
+                    && download.event_id == event_id
+                    && download.phase.running()
+            });
+            if same {
+                ui.set_transfer_notice("This attachment is already being saved.".into());
+                return false;
+            }
+            let running = state
+                .downloads
+                .iter()
+                .filter(|download| download.phase.running())
+                .count();
+            if running >= MAX_DOWNLOADS {
+                ui.set_transfer_notice(
+                    format!("Up to {MAX_DOWNLOADS} downloads can wait; let one finish first.")
+                        .into(),
+                );
+                return false;
+            }
+        }
+        let visible_room = ui.get_active_room_id().to_string();
         // The sender chose this name: suggest only a sanitized final
         // component, and let the user pick the folder explicitly.
+        let suggested = safe_file_name(filename);
         let mut dialog = rfd::FileDialog::new()
             .set_title("Save attachment")
-            .set_file_name(safe_file_name(filename));
+            .set_file_name(&suggested);
         if let Some(downloads) = directories::UserDirs::new()
             .and_then(|dirs| dirs.download_dir().map(|dir| dir.to_path_buf()))
         {
             dialog = dialog.set_directory(downloads);
         }
         let Some(path) = dialog.save_file() else {
-            return;
+            return false;
         };
         if ui.get_active_account_local_id().as_str() != account_id
-            || ui.get_active_room_id().as_str() != room_id
+            || ui.get_active_room_id().as_str() != visible_room
             || !selection.is_current()
             || path.file_name().is_none()
         {
-            return;
+            return false;
         }
+        // The dialog asked before letting the user pick an existing file.
+        // One that appears after it closed is never replaced.
+        let replace = path.exists();
         let operation = ui.get_download_operation().wrapping_add(1);
         ui.set_download_operation(operation);
-        ui.set_downloading_event_id(event_id.into());
-        ui.set_transfer_notice("Downloading and decrypting attachment…".into());
+        if room_id == visible_room {
+            ui.set_downloading_event_id(event_id.into());
+        }
+        ui.set_transfer_notice(format!("Saving {}…", plain(&suggested, 120)).into());
         let (cancel, cancelled) = watch::channel(false);
-        // Dropping an older job's sender cancels that save's download.
-        *self.lock_save() = Some(SaveJob { operation, cancel });
+        let id = {
+            let mut state = self.lock();
+            let id = state.next_id();
+            state.downloads.push(Download {
+                id,
+                account_id: account_id.to_owned(),
+                room_id: room_id.to_owned(),
+                room_name: room_name.to_owned(),
+                event_id: event_id.to_owned(),
+                filename: suggested,
+                phase: DownloadPhase::Waiting,
+                cancel: Some(cancel),
+            });
+            id
+        };
+        let job = DownloadJob {
+            id,
+            selection,
+            account_id: account_id.to_owned(),
+            room_id: room_id.to_owned(),
+            event_id: event_id.to_owned(),
+            path,
+            replace,
+            operation,
+        };
         let owner = self.clone();
-        let event_id = event_id.to_owned();
         self.runtime.spawn(async move {
             let mut cancelled = cancelled;
-            let outcome = owner
-                .download_and_save(&selection, &room_id, &event_id, path, &mut cancelled)
-                .await;
-            {
-                let mut save = owner.lock_save();
-                if save.as_ref().is_some_and(|job| job.operation == operation) {
-                    *save = None;
-                }
-            }
-            let _ = owner.window.upgrade_in_event_loop(move |ui| {
-                if !selection.is_current()
-                    || !ui.get_live_session()
-                    || ui.get_active_account_local_id().as_str() != account_id
-                    || ui.get_active_room_id().as_str() != room_id
-                    || ui.get_download_operation() != operation
-                    || ui.get_downloading_event_id().as_str() != event_id
-                {
-                    return;
-                }
-                ui.set_downloading_event_id("".into());
-                match outcome {
-                    SaveOutcome::Saved(path) => {
-                        let name = path.file_name().unwrap_or_default().to_string_lossy();
-                        let folder = path
-                            .parent()
-                            .map(|folder| folder.display().to_string())
-                            .unwrap_or_default();
-                        let notice = format!("Saved {name} to {folder}");
-                        ui.set_transfer_notice(crate::directory_plain_text(&notice, 300).into());
-                    }
-                    SaveOutcome::Cancelled => {
-                        ui.set_transfer_notice("Save cancelled; nothing was written.".into());
-                    }
-                    SaveOutcome::Failed(error) => {
-                        ui.set_transfer_notice("".into());
-                        ui.set_session_error(format!("Could not save attachment: {error}").into());
-                    }
-                }
-            });
+            let outcome = owner.run_download(&job, &mut cancelled).await;
+            owner.finish_download(&job, outcome);
         });
+        self.project(ui);
+        true
     }
 
-    async fn download_and_save(
-        &self,
-        selection: &AccountSelection,
-        room_id: &str,
-        event_id: &str,
-        path: PathBuf,
+    async fn run_download(
+        self: &Arc<Self>,
+        job: &DownloadJob,
         cancelled: &mut watch::Receiver<bool>,
     ) -> SaveOutcome {
-        let downloaded = tokio::select! {
+        let _slot = tokio::select! {
             biased;
-            // A cancel, or a newer save replacing this one, drops the download.
-            () = async {
-                let _ = cancelled.wait_for(|cancelled| *cancelled).await;
-            } => return SaveOutcome::Cancelled,
-            _ = selection.revoked() => return SaveOutcome::Cancelled,
-            downloaded = self.live.download_attachment(selection.account_id(), room_id, event_id) => match downloaded {
-                Ok(downloaded) => downloaded,
-                Err(error) => return SaveOutcome::Failed(error.to_string()),
+            () = wait_for_cancel(cancelled) => return SaveOutcome::Cancelled,
+            _ = job.selection.revoked() => return SaveOutcome::Cancelled,
+            permit = self.downloading.acquire() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return SaveOutcome::Failed("Downloads are unavailable.".into()),
             },
         };
-        if !selection.is_current() || *cancelled.borrow() || cancelled.has_changed().is_err() {
+        self.set_download_phase(job.id, DownloadPhase::Downloading);
+        let downloaded = tokio::select! {
+            biased;
+            // A cancel, or leaving the account, drops the download.
+            () = wait_for_cancel(cancelled) => return SaveOutcome::Cancelled,
+            _ = job.selection.revoked() => return SaveOutcome::Cancelled,
+            downloaded = self.live.download_attachment_selected(&job.selection, &job.room_id, &job.event_id) => match downloaded {
+                Ok(downloaded) => downloaded,
+                Err(error) => return SaveOutcome::Failed(download_failure(&error).into()),
+            },
+        };
+        if !job.selection.is_current() || *cancelled.borrow() || cancelled.has_changed().is_err() {
             return SaveOutcome::Cancelled;
         }
-        // The final account and room guard is held through the local write,
-        // so navigation cannot race the plaintext save. Once it starts, the
-        // bounded write finishes and its real outcome is reported.
+        self.set_download_phase(job.id, DownloadPhase::Saving);
+        // The account guard is held through the local write, so an account
+        // change cannot race the plaintext save. Once it starts, the bounded
+        // write finishes and its real outcome is reported.
         match self
             .live
-            .save_download_to(selection, room_id, path, downloaded.bytes, cancelled)
+            .save_download_selected(
+                &job.selection,
+                job.path.clone(),
+                downloaded.bytes,
+                job.replace,
+                cancelled,
+            )
             .await
         {
-            Ok(Some(path)) => SaveOutcome::Saved(path),
+            Ok(Some(path)) => SaveOutcome::Saved(
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            ),
             Ok(None) => SaveOutcome::Cancelled,
-            Err(error) => SaveOutcome::Failed(error.to_string()),
+            Err(error) => SaveOutcome::Failed(download_failure(&error).into()),
         }
     }
 
-    fn cancel_save(&self) {
+    fn finish_download(self: &Arc<Self>, job: &DownloadJob, outcome: SaveOutcome) {
+        let notice = {
+            let mut state = self.lock();
+            let Some(index) = state
+                .downloads
+                .iter()
+                .position(|download| download.id == job.id)
+            else {
+                return;
+            };
+            match outcome {
+                SaveOutcome::Failed(reason) => {
+                    let download = &mut state.downloads[index];
+                    download.cancel = None;
+                    let notice = format!("Could not save {}: {reason}", download.filename);
+                    download.phase = DownloadPhase::Failed(reason);
+                    notice
+                }
+                SaveOutcome::Saved(name) => {
+                    let download = state.downloads.remove(index);
+                    let notice = format!("Saved {name}");
+                    state.remember(Finished {
+                        id: download.id,
+                        account_id: download.account_id,
+                        room_id: download.room_id,
+                        room_name: download.room_name,
+                        filename: name,
+                        upload: false,
+                        outcome: "Saved".into(),
+                    });
+                    notice
+                }
+                SaveOutcome::Cancelled => {
+                    let download = state.downloads.remove(index);
+                    state.remember(Finished {
+                        id: download.id,
+                        account_id: download.account_id,
+                        room_id: download.room_id,
+                        room_name: download.room_name,
+                        filename: download.filename,
+                        upload: false,
+                        outcome: "Save cancelled; nothing was written".into(),
+                    });
+                    "Save cancelled; nothing was written.".to_owned()
+                }
+            }
+        };
+        let (account_id, room_id, event_id) = (
+            job.account_id.clone(),
+            job.room_id.clone(),
+            job.event_id.clone(),
+        );
+        let selection = job.selection.clone();
+        let operation = job.operation;
+        let _ = self.window.upgrade_in_event_loop(move |ui| {
+            // Only the account the file came from may show its name, and only
+            // the latest save may replace the notice.
+            if !selection.is_current()
+                || !ui.get_live_session()
+                || ui.get_active_account_local_id().as_str() != account_id
+            {
+                return;
+            }
+            if ui.get_downloading_event_id().as_str() == event_id
+                && ui.get_active_room_id().as_str() == room_id
+            {
+                ui.set_downloading_event_id("".into());
+            }
+            if ui.get_download_operation() == operation {
+                ui.set_transfer_notice(plain(&notice, 300).into());
+            }
+        });
+        self.refresh();
+    }
+
+    fn set_download_phase(self: &Arc<Self>, id: u64, phase: DownloadPhase) {
+        {
+            let mut state = self.lock();
+            let Some(download) = state.downloads.iter_mut().find(|download| download.id == id)
+            else {
+                return;
+            };
+            // A pending cancel keeps showing until the task ends.
+            if download.phase != DownloadPhase::Cancelling {
+                download.phase = phase;
+            }
+        }
+        self.refresh();
+    }
+
+    /// The composer notice's Cancel: the save of the attachment it names.
+    fn cancel_save(self: &Arc<Self>) {
         let Some(ui) = self.window.upgrade() else {
             return;
         };
-        let operation = ui.get_download_operation();
-        let sent = self
-            .lock_save()
-            .as_ref()
-            .is_some_and(|job| job.operation == operation && job.cancel.send(true).is_ok());
-        if sent && !ui.get_downloading_event_id().is_empty() {
-            ui.set_transfer_notice("Cancelling save…".into());
+        let account_id = ui.get_active_account_local_id().to_string();
+        let event_id = ui.get_downloading_event_id().to_string();
+        if event_id.is_empty() {
+            return;
         }
+        let id = self
+            .lock()
+            .downloads
+            .iter()
+            .find(|download| {
+                download.account_id == account_id
+                    && download.event_id == event_id
+                    && download.phase.running()
+            })
+            .map(|download| download.id);
+        if let Some(id) = id {
+            self.download_action(&ui, id, ACTION_CANCEL);
+        }
+    }
+
+    fn download_action(self: &Arc<Self>, ui: &AppWindow, id: u64, action: i32) {
+        let account_id = ui.get_active_account_local_id().to_string();
+        match action {
+            ACTION_CANCEL => {
+                let sent = {
+                    let mut state = self.lock();
+                    // An admitted write finishes; only a wait or a download
+                    // in progress can still be stopped.
+                    let Some(download) = state.downloads.iter_mut().find(|download| {
+                        download.id == id
+                            && download.account_id == account_id
+                            && download.phase.cancellable()
+                    }) else {
+                        return;
+                    };
+                    let sent = download
+                        .cancel
+                        .as_ref()
+                        .is_some_and(|cancel| cancel.send(true).is_ok());
+                    if sent {
+                        download.phase = DownloadPhase::Cancelling;
+                    }
+                    sent
+                };
+                if sent {
+                    ui.set_transfer_notice("Cancelling save…".into());
+                    self.refresh();
+                }
+            }
+            ACTION_RETRY => {
+                // Tried again from the start, with the location asked again;
+                // the failed row stays until a new download is queued.
+                let failed = self
+                    .lock()
+                    .downloads
+                    .iter()
+                    .find(|download| {
+                        download.id == id
+                            && download.account_id == account_id
+                            && !download.phase.running()
+                    })
+                    .map(|download| {
+                        (
+                            download.room_id.clone(),
+                            download.room_name.clone(),
+                            download.event_id.clone(),
+                            download.filename.clone(),
+                        )
+                    });
+                if let Some((room_id, room_name, event_id, filename)) = failed
+                    && self.request_download(
+                        ui,
+                        &account_id,
+                        &room_id,
+                        &room_name,
+                        &event_id,
+                        &filename,
+                    )
+                {
+                    self.lock().downloads.retain(|download| download.id != id);
+                    self.project(ui);
+                }
+            }
+            ACTION_REMOVE => {
+                self.lock().downloads.retain(|download| {
+                    download.id != id
+                        || download.account_id != account_id
+                        || download.phase.running()
+                });
+                self.project(ui);
+            }
+            ACTION_OPEN_ROOM => {
+                let room = self
+                    .lock()
+                    .downloads
+                    .iter()
+                    .find(|download| download.id == id && download.account_id == account_id)
+                    .map(|download| download.room_id.clone());
+                if let Some(room_id) = room {
+                    open_room(ui, &account_id, &room_id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finished_action(&self, ui: &AppWindow, id: u64, action: i32) {
+        let account_id = ui.get_active_account_local_id().to_string();
+        match action {
+            ACTION_REMOVE => {
+                self.lock()
+                    .finished
+                    .retain(|finished| finished.id != id || finished.account_id != account_id);
+                self.project(ui);
+            }
+            ACTION_OPEN_ROOM => {
+                let room = self
+                    .lock()
+                    .finished
+                    .iter()
+                    .find(|finished| finished.id == id && finished.account_id == account_id)
+                    .map(|finished| finished.room_id.clone());
+                if let Some(room_id) = room {
+                    open_room(ui, &account_id, &room_id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Forget the visible account's ended transfers. Failed ones stay until
+    /// each is tried again or removed.
+    fn clear_finished(&self, ui: &AppWindow) {
+        let account_id = ui.get_active_account_local_id().to_string();
+        self.lock()
+            .finished
+            .retain(|finished| finished.account_id != account_id);
+        self.project(ui);
     }
 
     fn choose_files(self: &Arc<Self>) {
@@ -452,10 +897,18 @@ impl Workbench {
         {
             return;
         }
-        self.stage(&ui, &account_id, &room_id, paths);
+        let room_name = ui.get_active_room_name().to_string();
+        self.stage(&ui, &account_id, &room_id, &room_name, paths);
     }
 
-    fn stage(&self, ui: &AppWindow, account_id: &str, room_id: &str, paths: Vec<PathBuf>) {
+    fn stage(
+        &self,
+        ui: &AppWindow,
+        account_id: &str,
+        room_id: &str,
+        room_name: &str,
+        paths: Vec<PathBuf>,
+    ) {
         let mut skipped = 0_usize;
         {
             let mut state = self.lock();
@@ -485,12 +938,12 @@ impl Workbench {
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "attachment".into());
-                state.next_id += 1;
-                let id = state.next_id;
+                let id = state.next_id();
                 state.items.push(Item {
                     id,
                     account_id: account_id.to_owned(),
                     room_id: room_id.to_owned(),
+                    room_name: room_name.to_owned(),
                     mime_type: mime_type_for(&path),
                     path,
                     filename,
@@ -521,6 +974,7 @@ impl Workbench {
         }
         let account_id = ui.get_active_account_local_id();
         let room_id = ui.get_active_room_id();
+        // In the order shown; the room queue sends them in this order.
         let staged: Vec<u64> = self
             .lock()
             .items
@@ -561,9 +1015,11 @@ impl Workbench {
                 selection,
                 account_id: item.account_id.clone(),
                 room_id: item.room_id.clone(),
+                room_name: item.room_name.clone(),
                 path: item.path.clone(),
                 mime_type: item.mime_type.clone(),
                 filename: item.filename.clone(),
+                size: item.size,
             };
             (job, receiver, cancelled)
         };
@@ -575,6 +1031,23 @@ impl Workbench {
         });
     }
 
+    /// The account's homeserver upload limit, read once per account. `None`
+    /// when it can't be read now; the SDK still enforces the server's limit.
+    async fn upload_limit(&self, selection: &AccountSelection) -> Option<u64> {
+        if let Some(limit) = self.lock_limits().get(selection.account_id()) {
+            return Some(*limit);
+        }
+        let limit = self
+            .live
+            .manager
+            .attachment_upload_limit_selected(selection)
+            .await
+            .ok()?;
+        self.lock_limits()
+            .insert(selection.account_id().to_owned(), limit);
+        Some(limit)
+    }
+
     async fn upload(
         self: &Arc<Self>,
         job: &Job,
@@ -583,6 +1056,18 @@ impl Workbench {
     ) -> Outcome {
         let mut listening = true;
         let mut cancel = false;
+        // Refuse what the homeserver would refuse before any file is read.
+        let limit = tokio::select! {
+            biased;
+            _ = wait_for_cancel(cancelled) => return Outcome::Cancelled,
+            _ = job.selection.revoked() => return Outcome::Failed("Select this account before sending its attachments.".into()),
+            limit = self.upload_limit(&job.selection) => limit,
+        };
+        if let (Some(limit), Some(size)) = (limit, job.size)
+            && size > limit
+        {
+            return Outcome::Rejected(server_too_large(limit));
+        }
         let queued = {
             // Waiting tasks own only paths and small bounded command channels.
             let _preparation = tokio::select! {
@@ -628,7 +1113,7 @@ impl Workbench {
             Err(MatrixCoreError::MediaTooLarge { .. }) => {
                 return Outcome::Rejected(TOO_LARGE.into());
             }
-            Err(error) => return Outcome::Failed(error.to_string()),
+            Err(error) => return Outcome::Failed(upload_failure(&error).into()),
         };
         // Cancellation before SDK admission returned None above. Once SDK
         // commit began, withdraw the returned handle and report its outcome.
@@ -648,19 +1133,19 @@ impl Workbench {
                         self.set_phase(job.id, Phase::Cancelling, "");
                         match abort(&queued).await {
                             Ok(outcome) => return outcome,
-                            Err(error) => self.set_phase(
+                            Err(_) => self.set_phase(
                                 job.id,
                                 Phase::Paused,
-                                &format!("Could not cancel: {error}"),
+                                "Could not cancel; it may still send",
                             ),
                         }
                     }
                     Some(Command::Retry) => match queued.retry_wedged().await {
                         Ok(()) => self.set_phase(job.id, Phase::Uploading(0), ""),
-                        Err(error) => self.set_phase(
+                        Err(_) => self.set_phase(
                             job.id,
                             Phase::Paused,
-                            &format!("Could not retry: {error}"),
+                            "Could not retry",
                         ),
                     },
                     None => listening = false,
@@ -693,19 +1178,13 @@ impl Workbench {
             item.commands = None;
             item.cancel = None;
             item.note.clear();
-            match outcome {
-                Outcome::Sent => {
-                    state.items.remove(index);
-                    Some(format!("Sent {}", job.filename))
-                }
-                Outcome::Cancelled => {
-                    state.items.remove(index);
-                    Some(format!("Cancelled {}", job.filename))
-                }
-                Outcome::AlreadySent => {
-                    state.items.remove(index);
-                    Some(format!("{} was already sent", job.filename))
-                }
+            let ended = match outcome {
+                Outcome::Sent => Some(("Sent", format!("Sent {}", job.filename))),
+                Outcome::Cancelled => Some(("Cancelled", format!("Cancelled {}", job.filename))),
+                Outcome::AlreadySent => Some((
+                    "Already sent before the cancel",
+                    format!("{} was already sent", job.filename),
+                )),
                 Outcome::Failed(error) => {
                     item.phase = Phase::Failed(error);
                     None
@@ -718,7 +1197,20 @@ impl Workbench {
                     item.phase = Phase::Uncertain;
                     None
                 }
-            }
+            };
+            ended.map(|(outcome, notice)| {
+                state.items.remove(index);
+                state.remember(Finished {
+                    id: job.id,
+                    account_id: job.account_id.clone(),
+                    room_id: job.room_id.clone(),
+                    room_name: job.room_name.clone(),
+                    filename: job.filename.clone(),
+                    upload: true,
+                    outcome: outcome.into(),
+                });
+                notice
+            })
         };
         if let Some(notice) = notice {
             let (account_id, room_id) = (job.account_id.clone(), job.room_id.clone());
@@ -730,7 +1222,7 @@ impl Workbench {
                     && ui.get_active_account_local_id().as_str() == account_id
                     && ui.get_active_room_id().as_str() == room_id
                 {
-                    ui.set_transfer_notice(crate::directory_plain_text(&notice, 200).into());
+                    ui.set_transfer_notice(plain(&notice, 200).into());
                 }
             });
         }
@@ -767,27 +1259,63 @@ impl Workbench {
         self.refresh();
     }
 
+    /// A choice on one upload, from the composer queue or the transfer
+    /// center. Only the visible account's uploads can be acted on, in any of
+    /// its rooms; each keeps the room it was chosen for.
+    fn upload_action(self: &Arc<Self>, ui: &AppWindow, id: u64, action: i32) {
+        match action {
+            ACTION_REMOVE => self.remove(ui, id),
+            ACTION_CANCEL => self.cancel(ui, id),
+            ACTION_RETRY => self.retry(ui, id),
+            ACTION_OPEN_ROOM => {
+                let account_id = ui.get_active_account_local_id().to_string();
+                let room = self
+                    .lock()
+                    .items
+                    .iter()
+                    .find(|item| item.id == id && item.account_id == account_id)
+                    .map(|item| item.room_id.clone());
+                if let Some(room_id) = room {
+                    open_room(ui, &account_id, &room_id);
+                }
+            }
+            ACTION_MOVE_UP | ACTION_MOVE_DOWN => {
+                let account_id = ui.get_active_account_local_id().to_string();
+                let moved = self
+                    .lock()
+                    .move_staged(&account_id, id, action == ACTION_MOVE_UP);
+                if moved {
+                    self.project(ui);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn remove(&self, ui: &AppWindow, id: u64) {
-        let account_id = ui.get_active_account_local_id();
-        let room_id = ui.get_active_room_id();
+        let account_id = ui.get_active_account_local_id().to_string();
         {
             let mut state = self.lock();
             state.items.retain(|item| {
-                item.id != id || !item.in_room(&account_id, &room_id) || item.phase.running()
+                item.id != id
+                    || account_id.is_empty()
+                    || item.account_id != account_id
+                    || item.phase.running()
             });
         }
         self.project(ui);
     }
 
     fn cancel(self: &Arc<Self>, ui: &AppWindow, id: u64) {
-        let account_id = ui.get_active_account_local_id();
-        let room_id = ui.get_active_room_id();
+        let account_id = ui.get_active_account_local_id().to_string();
         let sent = {
             let state = self.lock();
             state
                 .items
                 .iter()
-                .find(|item| item.id == id && item.in_room(&account_id, &room_id))
+                .find(|item| {
+                    item.id == id && !account_id.is_empty() && item.account_id == account_id
+                })
                 .is_some_and(|item| {
                     let sent = item
                         .cancel
@@ -805,18 +1333,20 @@ impl Workbench {
     }
 
     fn retry(self: &Arc<Self>, ui: &AppWindow, id: u64) {
-        let account_id = ui.get_active_account_local_id();
-        let room_id = ui.get_active_room_id();
+        let account_id = ui.get_active_account_local_id().to_string();
         let phase = {
             let state = self.lock();
             state
                 .items
                 .iter()
-                .find(|item| item.id == id && item.in_room(&account_id, &room_id))
+                .find(|item| {
+                    item.id == id && !account_id.is_empty() && item.account_id == account_id
+                })
                 .map(|item| (item.phase.clone(), item.commands.clone()))
         };
         match phase {
-            // Never queued: one new send cannot duplicate it.
+            // Never queued: one new send, from the beginning, cannot
+            // duplicate it. It still goes to the room it was chosen for.
             Some((Phase::Failed(_), None)) if self.live.is_live.load(Ordering::Acquire) => {
                 self.start(id);
                 self.project(ui);
@@ -831,27 +1361,33 @@ impl Workbench {
         }
     }
 
-    /// Drop items of accounts that are no longer saved on this device.
+    /// Drop transfers of accounts that are no longer saved on this device.
+    /// Their tasks already stopped when the account's selection ended.
     fn forget_removed_accounts(self: &Arc<Self>) {
         let owner = self.clone();
         self.runtime.spawn(async move {
             let accounts = owner.live.manager.accounts().await;
+            let saved = |account_id: &String| {
+                accounts.iter().any(|account| &account.id == account_id)
+            };
             let removed = {
                 let mut state = owner.lock();
-                let before = state.items.len();
-                state
-                    .items
-                    .retain(|item| accounts.iter().any(|account| account.id == item.account_id));
-                before != state.items.len()
+                let before = state.items.len() + state.downloads.len() + state.finished.len();
+                state.items.retain(|item| saved(&item.account_id));
+                // Dropping a download's cancel sender stops it too.
+                state.downloads.retain(|download| saved(&download.account_id));
+                state.finished.retain(|finished| saved(&finished.account_id));
+                before != state.items.len() + state.downloads.len() + state.finished.len()
             };
+            owner.lock_limits().retain(|account_id, _| saved(account_id));
             if removed {
                 owner.refresh();
             }
         });
     }
 
-    /// Queue one projection of the room on screen; repeated requests made
-    /// while one waits on the event loop share it.
+    /// Queue one projection of the account and room on screen; repeated
+    /// requests made while one waits on the event loop share it.
     fn refresh(self: &Arc<Self>) {
         if self.queued.swap(true, Ordering::AcqRel) {
             return;
@@ -869,16 +1405,17 @@ impl Workbench {
         }
     }
 
-    /// Show the queue of the account and room on screen, and nothing else.
+    /// Show the composer queue of the account and room on screen and the
+    /// transfer center of that account, and nothing else.
     fn project(&self, ui: &AppWindow) {
         let account_id = ui.get_active_account_local_id();
         let room_id = ui.get_active_room_id();
-        if !ui.get_live_session()
-            || !self.live.is_live.load(Ordering::Acquire)
-            || account_id.is_empty()
-            || room_id.is_empty()
-            || self.live.manager.account_selection(&account_id).is_none()
-        {
+        let account_live = ui.get_live_session()
+            && self.live.is_live.load(Ordering::Acquire)
+            && !account_id.is_empty()
+            && self.live.manager.account_selection(&account_id).is_some();
+        self.project_transfers(ui, account_live.then_some(account_id.as_str()));
+        if !account_live || room_id.is_empty() {
             // A queued refresh must not restore private rows after detach or
             // revocation while the old presentation strings still exist.
             ui.set_attachment_items(ModelRc::new(VecModel::<AttachmentItem>::default()));
@@ -900,29 +1437,119 @@ impl Workbench {
                 running += i32::from(item.phase.running());
                 rows.push(row(item));
             }
+            // Staged rows can move among themselves, never past the ends.
+            let staged: Vec<usize> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.state == 0)
+                .map(|(index, _)| index)
+                .collect();
+            for (rank, index) in staged.iter().enumerate() {
+                rows[*index].can_move_up = rank > 0;
+                rows[*index].can_move_down = rank + 1 < staged.len();
+            }
             let in_room = rows.len();
             (rows, ready, running, in_room)
         };
-        let model = ui.get_attachment_items();
-        let same = model.row_count() == rows.len()
-            && rows.iter().enumerate().all(|(index, row)| {
-                model
-                    .row_data(index)
-                    .is_some_and(|shown| shown.id == row.id)
-            });
-        if same {
-            for (index, row) in rows.into_iter().enumerate() {
-                if model.row_data(index).as_ref() != Some(&row) {
-                    model.set_row_data(index, row);
-                }
-            }
-        } else {
-            ui.set_attachment_items(ModelRc::new(VecModel::from(rows)));
-        }
+        update_model(
+            &ui.get_attachment_items(),
+            rows,
+            |shown, row| shown.id == row.id,
+            |model| ui.set_attachment_items(model),
+        );
         ui.set_attachment_ready_count(ready);
         ui.set_attachment_can_add(in_room < MAX_ROOM_ITEMS);
         ui.set_attachment_status(summary(in_room, ready, running).into());
     }
+
+    /// The visible account's transfers in every room: work in progress
+    /// first, then what needs a choice, then what ended, newest first.
+    fn project_transfers(&self, ui: &AppWindow, account_id: Option<&str>) {
+        let Some(account_id) = account_id else {
+            ui.set_transfer_items(ModelRc::new(VecModel::<TransferItem>::default()));
+            ui.set_transfer_active_count(0);
+            ui.set_transfer_summary("".into());
+            return;
+        };
+        let mut rows = {
+            let state = self.lock();
+            let mut rows = Vec::new();
+            for item in state
+                .items
+                .iter()
+                .filter(|item| item.account_id == account_id)
+            {
+                rows.push(upload_transfer(item));
+            }
+            for download in state
+                .downloads
+                .iter()
+                .filter(|download| download.account_id == account_id)
+            {
+                rows.push(download_transfer(download));
+            }
+            for finished in state
+                .finished
+                .iter()
+                .rev()
+                .filter(|finished| finished.account_id == account_id)
+            {
+                rows.push(finished_transfer(finished));
+            }
+            rows
+        };
+        // A stable sort keeps the order within each group.
+        rows.sort_by_key(|row| row.group);
+        let active = rows.iter().filter(|row| row.group == GROUP_ACTIVE).count();
+        let attention = rows
+            .iter()
+            .filter(|row| row.group == GROUP_ATTENTION)
+            .count();
+        let finished = rows.len() - active - attention;
+        rows.truncate(MAX_TRANSFER_ROWS);
+        update_model(
+            &ui.get_transfer_items(),
+            rows,
+            |shown, row| shown.kind == row.kind && shown.id == row.id,
+            |model| ui.set_transfer_items(model),
+        );
+        ui.set_transfer_active_count(i32::try_from(active).unwrap_or(i32::MAX));
+        ui.set_transfer_summary(transfer_summary(active, attention, finished).into());
+    }
+}
+
+/// Update a model in place while its rows are the same, else replace it, so
+/// focus stays on a row whose state changes.
+fn update_model<T: Clone + PartialEq + 'static>(
+    model: &ModelRc<T>,
+    rows: Vec<T>,
+    same: impl Fn(&T, &T) -> bool,
+    replace: impl FnOnce(ModelRc<T>),
+) {
+    let unchanged = model.row_count() == rows.len()
+        && rows
+            .iter()
+            .enumerate()
+            .all(|(index, row)| model.row_data(index).is_some_and(|shown| same(&shown, row)));
+    if unchanged {
+        for (index, row) in rows.into_iter().enumerate() {
+            if model.row_data(index).as_ref() != Some(&row) {
+                model.set_row_data(index, row);
+            }
+        }
+    } else {
+        replace(ModelRc::new(VecModel::from(rows)));
+    }
+}
+
+/// Open a transfer's room in the visible account, with its composer, the
+/// way a room-list click does: drafts and replies stay with their rooms.
+fn open_room(ui: &AppWindow, account_id: &str, room_id: &str) {
+    if !ui.get_live_session() || ui.get_active_account_local_id().as_str() != account_id {
+        return;
+    }
+    ui.invoke_open_conversation(account_id.into(), room_id.into(), "".into(), "".into());
+    ui.invoke_focus_composer(false);
 }
 
 async fn wait_for_cancel(signal: &watch::Receiver<bool>) {
@@ -947,7 +1574,49 @@ fn percent(current: usize, total: usize) -> u8 {
     u8::try_from(value).unwrap_or(100)
 }
 
-fn row(item: &Item) -> AttachmentItem {
+fn server_too_large(limit: u64) -> String {
+    format!("Too large: this homeserver accepts files up to {}.", human_size(limit))
+}
+
+/// Fixed wording for a file that was never queued. Server text, paths and
+/// SDK details are never shown.
+fn upload_failure(error: &MatrixCoreError) -> &'static str {
+    match error {
+        MatrixCoreError::SelectedAccountChanged | MatrixCoreError::AccountNotFound(_) => {
+            "Select this account before sending its attachments."
+        }
+        MatrixCoreError::RoomNotFound(_) => "This room is no longer available.",
+        MatrixCoreError::Io(_) => "This file can't be read; it may have moved.",
+        MatrixCoreError::InvalidMedia(_) => "This file can't be sent as an attachment.",
+        _ => "The file could not be prepared. Try again.",
+    }
+}
+
+/// Fixed wording for a download or save that wrote nothing.
+fn download_failure(error: &MatrixCoreError) -> &'static str {
+    match error {
+        MatrixCoreError::MediaTooLarge { .. } => TOO_LARGE,
+        MatrixCoreError::SelectedAccountChanged
+        | MatrixCoreError::SelectedRoomChanged
+        | MatrixCoreError::AccountNotFound(_) => "The account changed; nothing was written.",
+        MatrixCoreError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            "A file with that name appeared in the folder; it was not replaced."
+        }
+        MatrixCoreError::Io(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            "That folder can't be written to; nothing was saved."
+        }
+        MatrixCoreError::Io(_) => "The file could not be written; nothing was saved.",
+        MatrixCoreError::RoomNotFound(_) => "This room is no longer available.",
+        MatrixCoreError::InvalidMedia(_) => "This attachment can't be downloaded.",
+        _ => "The attachment could not be downloaded. Try again later.",
+    }
+}
+
+fn plain(text: &str, max_chars: usize) -> String {
+    crate::directory_plain_text(text, max_chars)
+}
+
+fn upload_status(item: &Item) -> String {
     let status = match &item.phase {
         Phase::Staged => "Ready to send".to_owned(),
         Phase::Preparing => "Preparing…".to_owned(),
@@ -962,21 +1631,27 @@ fn row(item: &Item) -> AttachmentItem {
                 .to_owned()
         }
     };
-    let status = if item.note.is_empty() {
+    if item.note.is_empty() {
         status
     } else {
         format!("{} · {status}", item.note)
-    };
-    let detail = match item.size {
+    }
+}
+
+fn upload_detail(item: &Item) -> String {
+    match item.size {
         Some(size) => format!("{} · {}", human_size(size), item.mime_type),
         None => item.mime_type.clone(),
-    };
+    }
+}
+
+fn row(item: &Item) -> AttachmentItem {
     AttachmentItem {
         // Zero is never an item ID, so an unrepresentable one has no actions.
         id: i32::try_from(item.id).unwrap_or_default(),
-        name: crate::directory_plain_text(&item.filename, 160).into(),
-        detail: crate::directory_plain_text(&detail, 120).into(),
-        status: crate::directory_plain_text(&status, 240).into(),
+        name: plain(&item.filename, 160).into(),
+        detail: plain(&upload_detail(item), 120).into(),
+        status: plain(&upload_status(item), 240).into(),
         progress: match item.phase {
             Phase::Uploading(value) => f32::from(value) / 100.0,
             _ => -1.0,
@@ -995,6 +1670,92 @@ fn row(item: &Item) -> AttachmentItem {
             Phase::Paused => item.commands.is_some(),
             _ => false,
         },
+        // Set by the projection, which knows the room's staged order.
+        can_move_up: false,
+        can_move_down: false,
+    }
+}
+
+fn upload_transfer(item: &Item) -> TransferItem {
+    let shown = row(item);
+    let group = match item.phase {
+        Phase::Preparing | Phase::Uploading(_) | Phase::Waiting | Phase::Cancelling => GROUP_ACTIVE,
+        _ => GROUP_ATTENTION,
+    };
+    TransferItem {
+        kind: KIND_UPLOAD,
+        id: shown.id,
+        name: shown.name,
+        room: plain(&item.room_name, 80).into(),
+        direction: "Upload".into(),
+        detail: shown.detail,
+        status: shown.status,
+        progress: shown.progress,
+        busy: matches!(
+            item.phase,
+            Phase::Preparing | Phase::Waiting | Phase::Cancelling
+        ),
+        group,
+        can_cancel: shown.can_cancel,
+        can_retry: shown.can_retry,
+        can_remove: shown.can_remove,
+        can_open: shown.id != 0,
+    }
+}
+
+fn download_transfer(download: &Download) -> TransferItem {
+    let status = match &download.phase {
+        DownloadPhase::Waiting => "Waiting for the previous download".to_owned(),
+        DownloadPhase::Downloading => "Downloading and decrypting…".to_owned(),
+        DownloadPhase::Saving => "Saving…".to_owned(),
+        DownloadPhase::Cancelling => "Cancelling…".to_owned(),
+        DownloadPhase::Failed(reason) => format!("Not saved: {reason}"),
+    };
+    let id = i32::try_from(download.id).unwrap_or_default();
+    TransferItem {
+        kind: KIND_DOWNLOAD,
+        id,
+        name: plain(&download.filename, 160).into(),
+        room: plain(&download.room_name, 80).into(),
+        direction: "Download".into(),
+        detail: "".into(),
+        status: plain(&status, 240).into(),
+        // The download reports no byte progress; never invent one.
+        progress: -1.0,
+        busy: download.phase.running(),
+        group: if download.phase.running() {
+            GROUP_ACTIVE
+        } else {
+            GROUP_ATTENTION
+        },
+        can_cancel: download.phase.cancellable(),
+        can_retry: !download.phase.running(),
+        can_remove: !download.phase.running(),
+        can_open: id != 0,
+    }
+}
+
+fn finished_transfer(finished: &Finished) -> TransferItem {
+    let id = i32::try_from(finished.id).unwrap_or_default();
+    TransferItem {
+        kind: KIND_FINISHED,
+        id,
+        name: plain(&finished.filename, 160).into(),
+        room: plain(&finished.room_name, 80).into(),
+        direction: if finished.upload {
+            "Upload".into()
+        } else {
+            "Download".into()
+        },
+        detail: "".into(),
+        status: plain(&finished.outcome, 240).into(),
+        progress: -1.0,
+        busy: false,
+        group: GROUP_FINISHED,
+        can_cancel: false,
+        can_retry: false,
+        can_remove: id != 0,
+        can_open: id != 0,
     }
 }
 
@@ -1016,6 +1777,23 @@ fn summary(total: usize, ready: i32, running: i32) -> String {
     }
     if ready == 0 && running == 0 {
         parts.push("needs attention".to_owned());
+    }
+    parts.join(" · ")
+}
+
+fn transfer_summary(active: usize, attention: usize, finished: usize) -> String {
+    if active + attention + finished == 0 {
+        return "No transfers for this account".to_owned();
+    }
+    let mut parts = Vec::new();
+    if active > 0 {
+        parts.push(format!("{active} in progress"));
+    }
+    if attention > 0 {
+        parts.push(format!("{attention} waiting for you"));
+    }
+    if finished > 0 {
+        parts.push(format!("{finished} ended"));
     }
     parts.join(" · ")
 }
@@ -1043,6 +1821,7 @@ mod tests {
             id: 3,
             account_id: "a".into(),
             room_id: "r".into(),
+            room_name: "Room".into(),
             path: PathBuf::from("photo.png"),
             filename: "photo.png".into(),
             mime_type: "image/png".into(),
@@ -1052,6 +1831,28 @@ mod tests {
             commands: commands.then(|| mpsc::channel(COMMAND_CAPACITY).0),
             cancel: None,
             progress_at: None,
+        }
+    }
+
+    fn staged(id: u64, account_id: &str, room_id: &str) -> Item {
+        Item {
+            id,
+            account_id: account_id.into(),
+            room_id: room_id.into(),
+            ..item(Phase::Staged, false)
+        }
+    }
+
+    fn download(id: u64, phase: DownloadPhase) -> Download {
+        Download {
+            id,
+            account_id: "a".into(),
+            room_id: "r".into(),
+            room_name: "Room".into(),
+            event_id: "$event".into(),
+            filename: "report.pdf".into(),
+            phase,
+            cancel: None,
         }
     }
 
@@ -1096,5 +1897,95 @@ mod tests {
         assert_eq!(summary(3, 1, 2), "3 attachments · 1 ready · 2 sending");
         assert_eq!(human_size(999), "999 B");
         assert_eq!(human_size(25_000_000), "25.0 MB");
+    }
+
+    #[test]
+    fn staged_files_reorder_only_among_their_room_and_account() {
+        let mut state = State {
+            items: vec![
+                staged(1, "a", "r"),
+                staged(2, "a", "s"),
+                staged(3, "a", "r"),
+                staged(4, "b", "r"),
+            ],
+            ..State::default()
+        };
+        // Down past another room's file, onto the next file of its room.
+        assert!(state.move_staged("a", 1, false));
+        let order: Vec<u64> = state.items.iter().map(|item| item.id).collect();
+        assert_eq!(order, [3, 2, 1, 4]);
+        // Never past the ends, never another account's file.
+        assert!(!state.move_staged("a", 1, false));
+        assert!(!state.move_staged("a", 3, true));
+        assert!(!state.move_staged("b", 1, true));
+        // A file that is already sending keeps its place.
+        state.items[0].phase = Phase::Preparing;
+        assert!(!state.move_staged("a", 1, true));
+    }
+
+    #[test]
+    fn ended_transfers_are_bounded_and_keep_no_path() {
+        let mut state = State::default();
+        for id in 0..(MAX_FINISHED as u64 + 5) {
+            state.remember(Finished {
+                id,
+                account_id: "a".into(),
+                room_id: "r".into(),
+                room_name: "Room".into(),
+                filename: format!("file-{id}.txt"),
+                upload: true,
+                outcome: "Sent".into(),
+            });
+        }
+        assert_eq!(state.finished.len(), MAX_FINISHED);
+        assert_eq!(state.finished.front().map(|finished| finished.id), Some(5));
+        let shown = finished_transfer(state.finished.back().unwrap());
+        assert_eq!(shown.group, GROUP_FINISHED);
+        assert!(shown.can_remove && shown.can_open && !shown.can_retry && !shown.can_cancel);
+    }
+
+    #[test]
+    fn transfer_rows_never_invent_progress_or_resend_unknown_uploads() {
+        // A download reports no byte progress: shown as busy, never as a
+        // percentage, and retried only once it has failed.
+        let running = download_transfer(&download(7, DownloadPhase::Downloading));
+        assert!(running.progress < 0.0 && running.busy && running.can_cancel);
+        assert!(!running.can_retry && !running.can_remove && running.group == GROUP_ACTIVE);
+        let saving = download_transfer(&download(7, DownloadPhase::Saving));
+        // An admitted write finishes; it can no longer be cancelled.
+        assert!(!saving.can_cancel);
+        let failed = download_transfer(&download(7, DownloadPhase::Failed("x".into())));
+        assert!(failed.can_retry && failed.can_remove && failed.group == GROUP_ATTENTION);
+        // An upload whose delivery is unknown is never offered again.
+        let uncertain = upload_transfer(&item(Phase::Uncertain, false));
+        assert!(!uncertain.can_retry && uncertain.group == GROUP_ATTENTION);
+        let uploading = upload_transfer(&item(Phase::Uploading(40), true));
+        assert!(uploading.group == GROUP_ACTIVE && !uploading.busy);
+        assert_eq!(uploading.progress, 0.4);
+        assert_eq!(transfer_summary(0, 0, 0), "No transfers for this account");
+        assert_eq!(transfer_summary(1, 2, 3), "1 in progress · 2 waiting for you · 3 ended");
+    }
+
+    #[test]
+    fn failures_use_fixed_wording_without_paths_or_server_text() {
+        let secret = "https://example.org/_matrix/media/v3/download?access_token=SECRET /home/user";
+        let shown = [
+            upload_failure(&MatrixCoreError::Sdk(secret.into())),
+            upload_failure(&MatrixCoreError::Io(io::Error::other(secret))),
+            download_failure(&MatrixCoreError::Sdk(secret.into())),
+            download_failure(&MatrixCoreError::Io(io::Error::other(secret))),
+        ];
+        for text in shown {
+            assert!(!text.contains("SECRET") && !text.contains("/home") && !text.contains("http"));
+        }
+        let exists = io::Error::new(io::ErrorKind::AlreadyExists, secret);
+        assert_eq!(
+            download_failure(&MatrixCoreError::Io(exists)),
+            "A file with that name appeared in the folder; it was not replaced."
+        );
+        assert_eq!(
+            server_too_large(10_000_000),
+            "Too large: this homeserver accepts files up to 10.0 MB."
+        );
     }
 }

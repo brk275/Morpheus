@@ -54,6 +54,8 @@ pub const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 /// Explicit native image previews have a smaller input budget than Save.
 pub const MAX_IMAGE_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
 const MEDIA_TIMEOUT: Duration = Duration::from_secs(300);
+/// Bound on asking a homeserver for its upload limit.
+const UPLOAD_LIMIT_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_MEDIA_REDIRECTS: usize = 5;
 const MAX_MATRIX_ERROR_BYTES: usize = 4096;
 // Bound secondary parsing of untrusted attachment events.
@@ -358,6 +360,44 @@ impl AccountManager {
             updates,
             finished: false,
         }))
+    }
+
+    /// The largest attachment the selected account can send: the upload size
+    /// its homeserver reports (cached by the SDK after the first request),
+    /// never more than `MAX_ATTACHMENT_BYTES`. No file is read.
+    pub async fn attachment_upload_limit_selected(
+        &self,
+        selection: &crate::AccountSelection,
+    ) -> Result<u64> {
+        let client = {
+            let state = tokio::select! {
+                biased;
+                _ = selection.revoked() => return Err(MatrixCoreError::SelectedAccountChanged),
+                state = self.state.lock() => state,
+            };
+            if !self.attachment_selection_is_current(selection)
+                || state.active_account_id.as_deref() != Some(selection.account_id())
+            {
+                return Err(MatrixCoreError::SelectedAccountChanged);
+            }
+            state
+                .loaded
+                .get(selection.account_id())
+                .ok_or_else(|| MatrixCoreError::AccountNotFound(selection.account_id().into()))?
+                .client
+                .clone()
+        };
+        let limit = tokio::select! {
+            biased;
+            _ = selection.revoked() => return Err(MatrixCoreError::SelectedAccountChanged),
+            limit = tokio::time::timeout(UPLOAD_LIMIT_TIMEOUT, client.load_or_fetch_max_upload_size()) => limit
+                .map_err(|_| MatrixCoreError::Sdk("the homeserver did not answer in time".into()))?
+                .map_err(|_| MatrixCoreError::Sdk("the homeserver's upload limit is unavailable".into()))?,
+        };
+        if !self.attachment_selection_is_current(selection) {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        Ok(u64::from(limit).min(MAX_ATTACHMENT_BYTES as u64))
     }
 
     fn attachment_selection_is_current(&self, selection: &crate::AccountSelection) -> bool {
