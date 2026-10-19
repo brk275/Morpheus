@@ -3222,7 +3222,7 @@ fn display_user(id: &str) -> String {
         .to_owned()
 }
 
-fn initials(name: &str) -> String {
+pub(crate) fn initials(name: &str) -> String {
     name.chars()
         .filter(|character| character.is_alphanumeric())
         .take(2)
@@ -3230,7 +3230,7 @@ fn initials(name: &str) -> String {
         .collect()
 }
 
-fn accent(value: &str) -> Color {
+pub(crate) fn accent(value: &str) -> Color {
     const COLORS: [(u8, u8, u8); 5] = [
         (168, 140, 255),
         (120, 200, 177),

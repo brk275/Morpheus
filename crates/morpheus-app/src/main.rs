@@ -10,6 +10,8 @@ mod audio_devices;
 #[cfg(feature = "native-calls")]
 mod call_membership;
 #[cfg(feature = "native-calls")]
+mod call_stage;
+#[cfg(feature = "native-calls")]
 mod calls;
 mod composer_mentions;
 mod config_cli;
@@ -79,8 +81,6 @@ use crate::live::{LiveUi, RoomAction, show_error};
 #[cfg(feature = "native-calls")]
 use crate::local_video::{CaptureKind, CapturePhase, CaptureSource, LocalVideoStatus};
 use crate::notifications::DesktopNotifications;
-#[cfg(feature = "native-calls")]
-use crate::video_render::VideoUpdate;
 use crate::voice_spaces::VoiceSpaces;
 
 slint::include_modules!();
@@ -1341,13 +1341,6 @@ fn call_participant_item(participant: morpheus_rtc::ParticipantInfo) -> CallPart
 }
 
 #[cfg(feature = "native-calls")]
-fn clear_native_video(ui: &AppWindow) {
-    ui.set_native_video_visible(false);
-    ui.set_native_video_frame(slint::Image::default());
-    ui.set_native_video_source(SharedString::default());
-}
-
-#[cfg(feature = "native-calls")]
 fn clear_native_capture(ui: &AppWindow) {
     ui.set_native_camera_active(false);
     ui.set_native_screen_active(false);
@@ -1809,43 +1802,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     #[cfg(feature = "native-calls")]
-    {
-        let calls = calls.clone();
-        let weak = ui.as_weak();
-        let applied_token = Arc::new(AtomicU64::new(0));
-        runtime.spawn(async move {
-            let mut video = calls.subscribe_video();
-            loop {
-                let update = video.borrow_and_update().clone();
-                let calls_for_ui = calls.clone();
-                let applied_token = applied_token.clone();
-                let closed = weak
-                    .upgrade_in_event_loop(move |ui| {
-                        let current = calls_for_ui.video_token();
-                        if update.token() != current {
-                            if applied_token.load(Ordering::SeqCst) != current {
-                                clear_native_video(&ui);
-                                applied_token.store(current, Ordering::SeqCst);
-                            }
-                            return;
-                        }
-                        match update {
-                            VideoUpdate::Clear { .. } => clear_native_video(&ui),
-                            VideoUpdate::Frame { pixels, source, .. } => {
-                                ui.set_native_video_frame(slint::Image::from_rgb8(pixels));
-                                ui.set_native_video_source(source.into());
-                                ui.set_native_video_visible(true);
-                            }
-                        }
-                        applied_token.store(current, Ordering::SeqCst);
-                    })
-                    .is_err();
-                if closed || video.changed().await.is_err() {
-                    break;
-                }
-            }
-        });
-    }
+    call_stage::bind(&ui, runtime.handle(), calls.clone());
     #[cfg(feature = "native-calls")]
     {
         let calls = calls.clone();

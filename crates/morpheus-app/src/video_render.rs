@@ -1,42 +1,179 @@
-//! One native remote video tile for the active MatrixRTC call.
+//! Native multi-source call stage for the active MatrixRTC call.
 //!
-//! Slint only receives owned RGB buffers. The RTC task owns the decoded I420
-//! stream and samples its newest frame at most fifteen times per second. A
-//! screen share takes precedence over a camera when both are available.
+//! The RTC task plans one featured tile (a pinned tile, otherwise the first
+//! live remote screen share) plus one page of participant tiles. Only remote
+//! video on that plan is subscribed with a size cap and opened as a frame
+//! stream; every other remote video stream is paused at the SFU. Each open
+//! stream keeps only its newest decoded frame. One blocking worker at a time
+//! converts a bounded batch of them to scaled RGB, at most fifteen times per
+//! second. Slint receives owned pixel buffers in fixed frame slots beside a
+//! revisioned layout, inside one latest-value watch channel, so a picture is
+//! never shown against another tile's layout.
 
 use std::{
-    sync::atomic::{AtomicU64, Ordering},
+    collections::{HashMap, HashSet},
+    future::poll_fn,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    task::{Context, Poll},
     time::Duration,
 };
 
 use futures_util::{StreamExt, stream::BoxStream};
 use morpheus_rtc::{
-    MediaStreamKind, ParticipantInfo, RtcCallEvent, RtcService, RtcStreamKind, VideoFrame,
-    VideoRotation,
+    Dimensions, MediaConstraints, MediaStreamKind, ParticipantInfo, RemoteTrackHandle,
+    RtcCallEvent, RtcService, RtcStreamKind, VideoDetail, VideoFrame, VideoRotation,
 };
 use slint::{Rgb8Pixel, SharedPixelBuffer};
-use tokio::{sync::watch, time::MissedTickBehavior};
+use tokio::{
+    sync::watch,
+    task::JoinHandle,
+    time::{Instant, MissedTickBehavior},
+};
 
-const MAX_EDGE: u32 = 1920;
-const MAX_PIXELS: usize = 1920 * 1080;
+/// Frame slots shared with the UI. Every planned layout fits in them.
+pub const FRAME_SLOTS: usize = 9;
+/// Participant tiles on one page when nothing is featured.
+const GRID_PAGE: usize = 9;
+/// Participant tiles beside a featured tile.
+const FILMSTRIP_PAGE: usize = 4;
+const FEATURED_SIZE: (u32, u32) = (1920, 1080);
+const FILMSTRIP_SIZE: (u32, u32) = (320, 180);
+/// Largest decoded frame accepted for scaling. Conversion work follows the
+/// scaled output size, not the source size.
+const SOURCE_MAX_EDGE: u32 = 4096;
+const SOURCE_MAX_PIXELS: usize = 4096 * 2304;
 const FRAME_INTERVAL: Duration = Duration::from_millis(67);
+const THUMBNAIL_INTERVAL: Duration = Duration::from_millis(133);
+const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// How long a pinned tile reports that its participant left or its share ended.
+const DEPARTED_PLACEHOLDER: Duration = Duration::from_secs(8);
+/// Frames taken from one stream in a single wakeup before yielding.
+const MAX_DRAIN: usize = 8;
+
+const _: () = assert!(GRID_PAGE <= FRAME_SLOTS && FILMSTRIP_PAGE < FRAME_SLOTS);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TileMedium {
+    Camera,
+    Screen,
+}
+
+impl TileMedium {
+    fn stream(self) -> MediaStreamKind {
+        match self {
+            Self::Camera => MediaStreamKind::Camera,
+            Self::Screen => MediaStreamKind::ScreenShare,
+        }
+    }
+
+    fn roster_stream(self) -> RtcStreamKind {
+        match self {
+            Self::Camera => RtcStreamKind::Camera,
+            Self::Screen => RtcStreamKind::ScreenShare,
+        }
+    }
+
+    fn from_stream(kind: MediaStreamKind) -> Option<Self> {
+        match kind {
+            MediaStreamKind::Camera => Some(Self::Camera),
+            MediaStreamKind::ScreenShare => Some(Self::Screen),
+            _ => None,
+        }
+    }
+}
+
+/// One video medium of one membership. `member_id` is unique for each join,
+/// so a participant who leaves and rejoins gets new tiles.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct TileKey {
+    pub member_id: String,
+    pub medium: TileMedium,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TileState {
+    /// Subscribed and presented; `frame_slot` holds its newest picture.
+    Live,
+    /// Published and unmuted, but no subscribed track is available yet.
+    Connecting,
+    /// The publisher paused this stream.
+    Muted,
+    /// No camera is published.
+    Off,
+    /// No transport this client supports reaches this participant.
+    Unavailable,
+    /// Their frames are not decrypting with the media keys this client holds.
+    Undecryptable,
+    /// A pinned participant left the call.
+    Left,
+    /// A pinned screen share stopped.
+    Ended,
+    /// This device's own membership, not publishing this medium.
+    Local,
+    /// This device publishes this medium. Local capture is not shown here.
+    LocalPublishing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TileView {
+    /// Stable while this tile stays in the call.
+    pub id: u64,
+    pub key: TileKey,
+    pub user_id: String,
+    pub state: TileState,
+    pub is_local: bool,
+    pub pinned: bool,
+    pub microphone_muted: bool,
+    pub speaking: bool,
+    pub frame_slot: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StageLayout {
+    pub featured: Option<TileView>,
+    /// The current page of screen-share and participant tiles.
+    pub tiles: Vec<TileView>,
+    pub page: usize,
+    pub pages: usize,
+    /// Tiles across every page, excluding the featured tile.
+    pub tile_count: usize,
+}
+
+#[derive(Clone, Default)]
+pub struct FrameSlot {
+    /// Changes whenever this slot is released or given to another stream.
+    pub epoch: u64,
+    /// Changes with every presented picture.
+    pub sequence: u64,
+    pub pixels: Option<SharedPixelBuffer<Rgb8Pixel>>,
+}
+
+#[derive(Clone)]
+pub struct StageSnapshot {
+    /// Changes only when `layout` changes; new pictures keep it.
+    pub revision: u64,
+    pub layout: Arc<StageLayout>,
+    pub frames: [FrameSlot; FRAME_SLOTS],
+}
 
 #[derive(Clone)]
 pub enum VideoUpdate {
     Clear {
         token: u64,
     },
-    Frame {
+    Stage {
         token: u64,
-        source: String,
-        pixels: SharedPixelBuffer<Rgb8Pixel>,
+        stage: Arc<StageSnapshot>,
     },
 }
 
 impl VideoUpdate {
     pub fn token(&self) -> u64 {
         match self {
-            Self::Clear { token } | Self::Frame { token, .. } => *token,
+            Self::Clear { token } | Self::Stage { token, .. } => *token,
         }
     }
 }
@@ -47,52 +184,45 @@ pub struct RosterUpdate {
     pub members: Vec<ParticipantInfo>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct Source {
-    member_id: String,
-    user_id: String,
-    kind: MediaStreamKind,
+/// What the UI asks of the stage. `pinned` and `page` belong to the call
+/// generation in `token`; `presented` says whether the stage is on screen.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StageRequest {
+    pub token: u64,
+    pub pinned: Option<TileKey>,
+    pub page: usize,
+    pub presented: bool,
 }
 
-type Conversion = (
-    Source,
-    tokio::task::JoinHandle<Result<SharedPixelBuffer<Rgb8Pixel>, FrameError>>,
-);
-
-impl Source {
-    fn affected_by(&self, event: &RtcCallEvent) -> bool {
-        match event {
-            RtcCallEvent::StreamStarted { member_id, kind }
-            | RtcCallEvent::StreamStopped { member_id, kind }
-            | RtcCallEvent::StreamMuted { member_id, kind }
-            | RtcCallEvent::StreamUnmuted { member_id, kind } => {
-                self.member_id == *member_id && self.kind == *kind
-            }
-            RtcCallEvent::ParticipantLeft { member_id } => self.member_id == *member_id,
-            RtcCallEvent::Ended { .. } => true,
-            _ => false,
+impl StageRequest {
+    /// Apply a pin or page choice for `token`, discarding another call's.
+    pub fn choose(&mut self, token: u64, change: impl FnOnce(&mut Self)) {
+        if self.token != token {
+            self.token = token;
+            self.pinned = None;
+            self.page = 0;
         }
+        change(self);
     }
 
-    fn label(&self) -> String {
-        let medium = match self.kind {
-            MediaStreamKind::ScreenShare => "Screen",
-            MediaStreamKind::Camera => "Camera",
-            _ => unreachable!("only video sources are selected"),
-        };
-        format!("{medium} · {}", self.user_id)
+    /// Returns whether visibility changed.
+    pub fn present(&mut self, presented: bool) -> bool {
+        let changed = self.presented != presented;
+        self.presented = presented;
+        changed
     }
 }
 
-/// Run beside the audio future. Dropping this future drops its stream, pending
-/// frame, and converter result. The controller checks the call token again
-/// before any queued Slint update is applied.
+/// Run beside the audio future. Dropping this future drops every frame
+/// stream, pending frame and conversion result. The controller checks the
+/// call token again before any queued Slint update is applied.
 pub async fn run_remote_video(
     rtc: &RtcService,
     room_id: &str,
     token: u64,
     updates: watch::Sender<VideoUpdate>,
     roster_updates: watch::Sender<RosterUpdate>,
+    mut requests: watch::Receiver<StageRequest>,
     active_token: &AtomicU64,
 ) {
     let Some(call) = rtc.call(room_id) else {
@@ -100,145 +230,90 @@ pub async fn run_remote_video(
     };
     let mut roster = call.subscribe_participants();
     let mut events = call.subscribe_call_events();
-    let mut refresh = tokio::time::interval(Duration::from_secs(2));
+    let mut refresh = tokio::time::interval(REFRESH_INTERVAL);
     refresh.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut presentation = tokio::time::interval(FRAME_INTERVAL);
     presentation.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut selected: Option<Source> = None;
-    let mut frames: Option<BoxStream<'static, VideoFrame>> = None;
-    let mut newest: Option<VideoFrame> = None;
-    let mut conversion: Option<Conversion> = None;
-    let select_track = |participants: &[ParticipantInfo], current: &Option<Source>| {
-        let mut candidates = Vec::new();
-        for participant in participants.iter().filter(|member| !member.is_local) {
-            for (stream_kind, kind) in [
-                (RtcStreamKind::ScreenShare, MediaStreamKind::ScreenShare),
-                (RtcStreamKind::Camera, MediaStreamKind::Camera),
-            ] {
-                if participant
-                    .streams
-                    .iter()
-                    .any(|stream| stream.kind == stream_kind && !stream.muted)
-                {
-                    candidates.push(Source {
-                        member_id: participant.member_id.clone(),
-                        user_id: participant.user_id.clone(),
-                        kind,
-                    });
-                }
-            }
-        }
-        candidates.sort_by(|a, b| {
-            let priority = |kind| {
-                if kind == MediaStreamKind::ScreenShare {
-                    0
-                } else {
-                    1
-                }
-            };
-            priority(a.kind)
-                .cmp(&priority(b.kind))
-                .then_with(|| a.member_id.cmp(&b.member_id))
-        });
-        candidates.into_iter().find_map(|source| {
-            if current.as_ref() == Some(&source) {
-                return Some((source, None));
-            }
-            call.remote_track(&source.member_id, source.kind)
-                .and_then(|track| track.video_frames())
-                .map(|frames| (source, Some(frames)))
-        })
-    };
+    let mut stage = Stage::new(CallMedia { rtc, room_id }, token);
+    stage.request(&requests.borrow_and_update());
+    stage.reload(&roster_updates, active_token);
+    stage.replan();
+    stage.publish(&updates, active_token);
+    let mut requests_open = true;
+    let mut conversion: Option<ConversionBatch> = None;
 
     loop {
         tokio::select! {
-            // Apply queued stop/mute/roster changes before presenting a
-            // conversion that completed at the same time.
+            // Apply queued stop/mute/leave events before presenting a
+            // conversion or frame that became ready at the same time.
             biased;
             event = events.recv() => {
                 use tokio::sync::broadcast::error::RecvError;
-                let invalidate = match event {
+                let reload = match event {
                     Ok(RtcCallEvent::Ended { .. }) | Err(RecvError::Closed) => break,
-                    Err(RecvError::Lagged(_)) => true,
-                    Ok(ref event) => selected.as_ref().is_some_and(|source| source.affected_by(event)),
+                    Err(RecvError::Lagged(_)) => {
+                        // Stop events may be lost; never keep a stream that
+                        // might have been unpublished meanwhile.
+                        stage.presenter.release_all();
+                        true
+                    }
+                    Ok(ref event) => stage.event(event),
                 };
-                if invalidate {
-                    discard_conversion(&mut conversion);
-                    // A republished track has the same membership and kind,
-                    // but a different decoder stream. The roster's latest
-                    // snapshot can coalesce Stop/Start into an unchanged row.
-                    // Release the old stream and its frozen frame immediately.
-                    change_source(None, &mut selected, &mut frames, &mut newest, token, &updates, active_token);
+                if reload {
+                    stage.reload(&roster_updates, active_token);
                 }
-                let participants = rtc.participants(room_id).unwrap_or_default();
-                publish_roster(&roster_updates, token, participants.clone(), active_token);
-                let next = select_track(&participants, &selected);
-                if change_source(next, &mut selected, &mut frames, &mut newest, token, &updates, active_token) {
-                    discard_conversion(&mut conversion);
-                }
+                stage.replan();
             }
-            _ = refresh.tick() => {
-                let participants = rtc.participants(room_id).unwrap_or_default();
-                publish_roster(&roster_updates, token, participants.clone(), active_token);
-                let next = select_track(&participants, &selected);
-                if change_source(next, &mut selected, &mut frames, &mut newest, token, &updates, active_token) {
-                    discard_conversion(&mut conversion);
-                }
+            changed = requests.changed(), if requests_open => {
+                requests_open = changed.is_ok();
+                stage.request(&requests.borrow_and_update());
+                stage.replan();
             }
             changed = roster.changed() => {
-                if changed.is_err() { break; }
-                let participants = rtc.participants(room_id).unwrap_or_default();
-                publish_roster(&roster_updates, token, participants.clone(), active_token);
-                let next = select_track(&participants, &selected);
-                if change_source(next, &mut selected, &mut frames, &mut newest, token, &updates, active_token) {
-                    discard_conversion(&mut conversion);
+                if changed.is_err() {
+                    break;
+                }
+                stage.reload(&roster_updates, active_token);
+                stage.replan();
+            }
+            _ = refresh.tick() => {
+                stage.presenter.cooling.clear();
+                stage.reload(&roster_updates, active_token);
+                stage.replan();
+            }
+            converted = async { conversion.as_mut().expect("guarded conversion").await }, if conversion.is_some() => {
+                conversion = None;
+                if let Ok(converted) = converted {
+                    stage.presenter.accept(converted);
                 }
             }
-            converted = async { (&mut conversion.as_mut().expect("guarded conversion").1).await }, if conversion.is_some() => {
-                let (source, _) = conversion.take().expect("completed conversion");
-                if selected.as_ref() == Some(&source)
-                    && active_token.load(Ordering::SeqCst) == token
-                    && let Ok(Ok(pixels)) = converted
-                {
-                    updates.send_replace(VideoUpdate::Frame { token, source: source.label(), pixels });
-                }
-            }
-            frame = async { frames.as_mut().expect("guarded stream").next().await }, if frames.is_some() => {
-                match frame {
-                    Some(frame) => newest = Some(frame), // overwrite, never queue decoded frames
-                    None => {
-                        selected = None;
-                        frames = None;
-                        newest = None;
-                        discard_conversion(&mut conversion);
-                        if active_token.load(Ordering::SeqCst) == token {
-                            updates.send_replace(VideoUpdate::Clear { token });
-                        }
-                    }
-                }
-            }
-            _ = presentation.tick(), if conversion.is_none() => {
-                if let (Some(source), Some(frame)) = (selected.as_ref(), newest.take()) {
+            // Before draining frames, so constantly arriving frames can
+            // never starve presentation.
+            now = presentation.tick(), if conversion.is_none() => {
+                let batch = stage.presenter.take_due_frames(now);
+                if !batch.is_empty() {
                     // RGB conversion can be expensive at 1080p. Never block
-                    // receiving stop/mute/leave events while it runs. Source
-                    // changes drop its handle so its result cannot repaint a
-                    // stale screen share, even within the same call token.
-                    conversion = Some((source.clone(), tokio::task::spawn_blocking(move || rgb_buffer(&frame))));
+                    // receiving stop/mute/leave events while it runs. A
+                    // released slot changes its epoch, so a late result for
+                    // it is discarded even within the same call token.
+                    conversion = Some(tokio::task::spawn_blocking(move || convert_batch(batch)));
+                }
+            }
+            () = poll_fn(|cx| stage.presenter.poll_frames(cx)), if stage.presenter.decoding() => {
+                if std::mem::take(&mut stage.presenter.ended) {
+                    stage.replan();
                 }
             }
         }
+        stage.publish(&updates, active_token);
     }
-    discard_conversion(&mut conversion);
-    if active_token.load(Ordering::SeqCst) == token {
-        updates.send_replace(VideoUpdate::Clear { token });
-    }
-}
-
-fn discard_conversion(conversion: &mut Option<Conversion>) {
-    if let Some((_, worker)) = conversion.take() {
+    if let Some(conversion) = conversion.take() {
         // Cancel queued work; an already running converter may finish but no
         // longer has a receiver that can publish its result.
-        worker.abort();
+        conversion.abort();
+    }
+    if active_token.load(Ordering::SeqCst) == token {
+        updates.send_replace(VideoUpdate::Clear { token });
     }
 }
 
@@ -261,26 +336,763 @@ fn publish_roster(
     });
 }
 
-fn change_source(
-    next: Option<(Source, Option<BoxStream<'static, VideoFrame>>)>,
-    selected: &mut Option<Source>,
-    frames: &mut Option<BoxStream<'static, VideoFrame>>,
-    newest: &mut Option<VideoFrame>,
+/// The call operations the stage needs, kept narrow so the stage's
+/// bookkeeping does not depend on a live call.
+trait StageMedia {
+    fn participants(&self) -> Vec<ParticipantInfo>;
+    fn track(&self, key: &TileKey) -> Option<Arc<dyn RemoteTrackHandle>>;
+    fn constrain(&self, key: &TileKey, constraints: MediaConstraints);
+}
+
+#[derive(Clone, Copy)]
+struct CallMedia<'a> {
+    rtc: &'a RtcService,
+    room_id: &'a str,
+}
+
+impl StageMedia for CallMedia<'_> {
+    fn participants(&self) -> Vec<ParticipantInfo> {
+        self.rtc.participants(self.room_id).unwrap_or_default()
+    }
+
+    fn track(&self, key: &TileKey) -> Option<Arc<dyn RemoteTrackHandle>> {
+        self.rtc
+            .call(self.room_id)?
+            .remote_track(&key.member_id, key.medium.stream())
+    }
+
+    fn constrain(&self, key: &TileKey, constraints: MediaConstraints) {
+        if let Some(call) = self.rtc.call(self.room_id) {
+            call.set_constraints(&key.member_id, key.medium.stream(), constraints);
+        }
+    }
+}
+
+/// Paused at the SFU: still subscribed, so it resumes instantly, but no
+/// media is sent or decoded.
+fn paused() -> MediaConstraints {
+    MediaConstraints {
+        visible: false,
+        ..MediaConstraints::default()
+    }
+}
+
+/// Presented, with the SFU asked for the smallest layer covering `size`.
+fn sized((width, height): (u32, u32)) -> MediaConstraints {
+    MediaConstraints {
+        detail: VideoDetail::Dimensions(Dimensions { width, height }),
+        ..MediaConstraints::default()
+    }
+}
+
+/// Output size and cadence for each tile of a grid page with `tiles` tiles.
+fn grid_quality(tiles: usize) -> ((u32, u32), Duration) {
+    match tiles {
+        0 | 1 => ((1280, 720), FRAME_INTERVAL),
+        2 => ((960, 540), FRAME_INTERVAL),
+        3 | 4 => ((640, 360), FRAME_INTERVAL),
+        _ => ((480, 270), THUMBNAIL_INTERVAL),
+    }
+}
+
+fn video_key(member_id: &str, kind: MediaStreamKind) -> Option<TileKey> {
+    TileMedium::from_stream(kind).map(|medium| TileKey {
+        member_id: member_id.to_owned(),
+        medium,
+    })
+}
+
+struct Stage<M> {
+    media: M,
     token: u64,
-    updates: &watch::Sender<VideoUpdate>,
-    active_token: &AtomicU64,
-) -> bool {
-    let new_source = next.as_ref().map(|(source, _)| source);
-    if selected.as_ref() == new_source {
-        return false;
+    participants: Vec<ParticipantInfo>,
+    pinned: Option<TileKey>,
+    page: usize,
+    presented: bool,
+    speaking: HashSet<String>,
+    undecryptable: HashSet<String>,
+    planner: Planner,
+    presenter: Presenter,
+    /// Last constraints sent for each remote video stream on the roster.
+    constraints: HashMap<TileKey, MediaConstraints>,
+    layout: Arc<StageLayout>,
+    revision: u64,
+}
+
+impl<M: StageMedia> Stage<M> {
+    fn new(media: M, token: u64) -> Self {
+        Self {
+            media,
+            token,
+            participants: Vec::new(),
+            pinned: None,
+            page: 0,
+            presented: false,
+            speaking: HashSet::new(),
+            undecryptable: HashSet::new(),
+            planner: Planner::default(),
+            presenter: Presenter::default(),
+            constraints: HashMap::new(),
+            layout: Arc::new(StageLayout::default()),
+            revision: 0,
+        }
     }
-    *selected = next.as_ref().map(|(source, _)| source.clone());
-    *frames = next.and_then(|(_, frames)| frames);
-    *newest = None;
-    if active_token.load(Ordering::SeqCst) == token {
-        updates.send_replace(VideoUpdate::Clear { token });
+
+    fn request(&mut self, request: &StageRequest) {
+        self.presented = request.presented;
+        if request.token == self.token {
+            self.pinned = request.pinned.clone();
+            self.page = request.page;
+        } else {
+            self.pinned = None;
+            self.page = 0;
+        }
     }
-    true
+
+    fn reload(&mut self, roster_updates: &watch::Sender<RosterUpdate>, active_token: &AtomicU64) {
+        self.participants = self.media.participants();
+        publish_roster(
+            roster_updates,
+            self.token,
+            self.participants.clone(),
+            active_token,
+        );
+    }
+
+    /// Release presented streams an event invalidated. Returns whether the
+    /// roster must be read again.
+    fn event(&mut self, event: &RtcCallEvent) -> bool {
+        match event {
+            RtcCallEvent::StreamStarted { member_id, kind } => {
+                if let Some(key) = video_key(member_id, *kind) {
+                    self.presenter.cooling.remove(&key);
+                    // A republished track has the same membership and kind
+                    // but a different decoder stream. The roster's latest
+                    // snapshot can coalesce Stop/Start into an unchanged row,
+                    // so compare the track itself and release a replaced one
+                    // together with its frozen picture.
+                    if let Some(slot) = self.presenter.slot_of(&key) {
+                        let current = self.media.track(&key);
+                        if !self.presenter.is_track(slot, current.as_ref()) {
+                            self.presenter.release(slot);
+                        }
+                    }
+                }
+                true
+            }
+            RtcCallEvent::StreamStopped { member_id, kind }
+            | RtcCallEvent::StreamMuted { member_id, kind } => {
+                if let Some(key) = video_key(member_id, *kind)
+                    && let Some(slot) = self.presenter.slot_of(&key)
+                {
+                    self.presenter.release(slot);
+                }
+                true
+            }
+            RtcCallEvent::StreamUnmuted { .. } | RtcCallEvent::ParticipantJoined { .. } => true,
+            RtcCallEvent::ParticipantLeft { member_id } => {
+                self.presenter.release_member(member_id);
+                self.speaking.remove(member_id);
+                self.undecryptable.remove(member_id);
+                true
+            }
+            RtcCallEvent::ActiveSpeakers { speakers } => {
+                self.speaking.clear();
+                self.speaking
+                    .extend(speakers.iter().map(|speaker| speaker.member_id.clone()));
+                false
+            }
+            RtcCallEvent::FrameEncryptionState {
+                member_id, state, ..
+            } => {
+                if !state.is_failure() {
+                    self.undecryptable.remove(member_id);
+                } else if self.undecryptable.insert(member_id.clone()) {
+                    self.presenter.release_member(member_id);
+                }
+                false
+            }
+            // A new key may decrypt their media again; a remaining failure
+            // reports itself with another encryption-state event.
+            RtcCallEvent::KeyImported { member_id, .. } => {
+                self.undecryptable.remove(member_id);
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Recompute the layout from the cached roster and requests, open and
+    /// close streams to match it, and update SFU constraints.
+    fn replan(&mut self) {
+        let input = PlanInput {
+            participants: &self.participants,
+            pinned: self.pinned.as_ref(),
+            page: self.page,
+            presented: self.presented,
+            speaking: &self.speaking,
+            undecryptable: &self.undecryptable,
+            now: Instant::now(),
+        };
+        let Plan { mut layout, decode } = self
+            .planner
+            .plan(&input, |key| self.media.track(key).is_some());
+        self.open_planned(&decode);
+        self.constrain(&decode);
+        for tile in layout.featured.iter_mut().chain(layout.tiles.iter_mut()) {
+            tile.frame_slot = self.presenter.slot_of(&tile.key);
+        }
+        if *self.layout != layout {
+            self.layout = Arc::new(layout);
+            self.revision += 1;
+            self.presenter.dirty = true;
+        }
+    }
+
+    /// Keep exactly the planned streams open, each in a stable slot.
+    fn open_planned(&mut self, decode: &[DecodeRequest]) {
+        for slot in 0..FRAME_SLOTS {
+            if !self.presenter.decoders[slot].as_ref().is_some_and(|decoder| {
+                decode.iter().any(|request| request.key == decoder.key)
+            }) {
+                self.presenter.release(slot);
+            }
+        }
+        for request in decode {
+            if let Some(decoder) = self
+                .presenter
+                .decoders
+                .iter_mut()
+                .flatten()
+                .find(|decoder| decoder.key == request.key)
+            {
+                decoder.size = request.size;
+                decoder.interval = request.interval;
+                continue;
+            }
+            if self.presenter.cooling.contains(&request.key) {
+                continue;
+            }
+            let Some(slot) = self.presenter.free_slot() else {
+                break;
+            };
+            let Some(track) = self.media.track(&request.key) else {
+                continue;
+            };
+            let Some(frames) = track.video_frames() else {
+                continue;
+            };
+            self.presenter.open(slot, request, track, frames);
+        }
+    }
+
+    /// Pause every remote video stream the plan does not present, so the
+    /// SFU stops sending it, and cap each presented stream at its tile size.
+    fn constrain(&mut self, decode: &[DecodeRequest]) {
+        for participant in self
+            .participants
+            .iter()
+            .filter(|participant| !participant.is_local)
+        {
+            for medium in [TileMedium::Camera, TileMedium::Screen] {
+                if !participant
+                    .streams
+                    .iter()
+                    .any(|stream| stream.kind == medium.roster_stream())
+                {
+                    continue;
+                }
+                let key = TileKey {
+                    member_id: participant.member_id.clone(),
+                    medium,
+                };
+                let wanted = decode
+                    .iter()
+                    .find(|request| request.key == key)
+                    .map_or_else(paused, |request| sized(request.size));
+                if self.constraints.get(&key) != Some(&wanted) {
+                    self.media.constrain(&key, wanted);
+                    self.constraints.insert(key, wanted);
+                }
+            }
+        }
+        // The SDK forgets a departed membership's constraints with it.
+        let participants = &self.participants;
+        self.constraints.retain(|key, _| {
+            participants
+                .iter()
+                .any(|participant| participant.member_id == key.member_id)
+        });
+    }
+
+    fn publish(&mut self, updates: &watch::Sender<VideoUpdate>, active_token: &AtomicU64) {
+        if !std::mem::take(&mut self.presenter.dirty)
+            || active_token.load(Ordering::SeqCst) != self.token
+        {
+            return;
+        }
+        updates.send_replace(VideoUpdate::Stage {
+            token: self.token,
+            stage: Arc::new(StageSnapshot {
+                revision: self.revision,
+                layout: Arc::clone(&self.layout),
+                frames: self.presenter.frames.clone(),
+            }),
+        });
+    }
+}
+
+struct PlanInput<'a> {
+    participants: &'a [ParticipantInfo],
+    pinned: Option<&'a TileKey>,
+    page: usize,
+    presented: bool,
+    speaking: &'a HashSet<String>,
+    undecryptable: &'a HashSet<String>,
+    now: Instant,
+}
+
+struct DecodeRequest {
+    key: TileKey,
+    size: (u32, u32),
+    interval: Duration,
+}
+
+struct Plan {
+    layout: StageLayout,
+    decode: Vec<DecodeRequest>,
+}
+
+struct TileIdentity {
+    id: u64,
+    user_id: String,
+    seen: u64,
+}
+
+struct Departed {
+    tile: TileView,
+    until: Instant,
+}
+
+#[derive(Default)]
+struct Planner {
+    identities: HashMap<TileKey, TileIdentity>,
+    next_id: u64,
+    generation: u64,
+    departed: Option<Departed>,
+}
+
+impl Planner {
+    fn plan(&mut self, input: &PlanInput<'_>, has_track: impl Fn(&TileKey) -> bool) -> Plan {
+        self.generation += 1;
+        let mut tiles = Vec::with_capacity(input.participants.len() + 1);
+        for participant in input.participants {
+            if participant
+                .streams
+                .iter()
+                .any(|stream| stream.kind == RtcStreamKind::ScreenShare)
+            {
+                tiles.push(self.tile(participant, TileMedium::Screen, input, &has_track));
+            }
+            tiles.push(self.tile(participant, TileMedium::Camera, input, &has_track));
+        }
+        // Screen shares first, then remote people, then this device, each in
+        // the order they first appeared.
+        tiles.sort_by_key(|tile| {
+            let person = tile.key.medium == TileMedium::Camera;
+            (person, tile.is_local, tile.id)
+        });
+        let featured = self.featured(&mut tiles, input);
+
+        let capacity = if featured.is_some() {
+            FILMSTRIP_PAGE
+        } else {
+            GRID_PAGE
+        };
+        let tile_count = tiles.len();
+        let pages = tile_count.div_ceil(capacity).max(1);
+        let page = input.page.min(pages - 1);
+        let tiles: Vec<_> = tiles
+            .into_iter()
+            .skip(page * capacity)
+            .take(capacity)
+            .collect();
+
+        let mut decode = Vec::new();
+        if input.presented {
+            if let Some(tile) = featured
+                .as_ref()
+                .filter(|tile| tile.state == TileState::Live)
+            {
+                decode.push(DecodeRequest {
+                    key: tile.key.clone(),
+                    size: FEATURED_SIZE,
+                    interval: FRAME_INTERVAL,
+                });
+            }
+            let (size, interval) = if featured.is_some() {
+                (FILMSTRIP_SIZE, THUMBNAIL_INTERVAL)
+            } else {
+                grid_quality(tiles.len())
+            };
+            decode.extend(
+                tiles
+                    .iter()
+                    .filter(|tile| tile.state == TileState::Live)
+                    .map(|tile| DecodeRequest {
+                        key: tile.key.clone(),
+                        size,
+                        interval,
+                    }),
+            );
+        }
+
+        let generation = self.generation;
+        let departed = self.departed.as_ref().map(|departed| &departed.tile.key);
+        self.identities
+            .retain(|key, identity| identity.seen == generation || Some(key) == departed);
+        Plan {
+            layout: StageLayout {
+                featured,
+                tiles,
+                page,
+                pages,
+                tile_count,
+            },
+            decode,
+        }
+    }
+
+    fn tile(
+        &mut self,
+        participant: &ParticipantInfo,
+        medium: TileMedium,
+        input: &PlanInput<'_>,
+        has_track: &impl Fn(&TileKey) -> bool,
+    ) -> TileView {
+        let key = TileKey {
+            member_id: participant.member_id.clone(),
+            medium,
+        };
+        let id = match self.identities.get_mut(&key) {
+            Some(identity) => {
+                identity.seen = self.generation;
+                identity.id
+            }
+            None => {
+                self.next_id += 1;
+                self.identities.insert(
+                    key.clone(),
+                    TileIdentity {
+                        id: self.next_id,
+                        user_id: participant.user_id.clone(),
+                        seen: self.generation,
+                    },
+                );
+                self.next_id
+            }
+        };
+        let stream = participant
+            .streams
+            .iter()
+            .find(|stream| stream.kind == medium.roster_stream());
+        let state = if participant.is_local {
+            if stream.is_some_and(|stream| !stream.muted) {
+                TileState::LocalPublishing
+            } else {
+                TileState::Local
+            }
+        } else if !participant.reachable {
+            TileState::Unavailable
+        } else {
+            match stream {
+                None => TileState::Off,
+                Some(stream) if stream.muted => TileState::Muted,
+                Some(_) if input.undecryptable.contains(&participant.member_id) => {
+                    TileState::Undecryptable
+                }
+                Some(_) if has_track(&key) => TileState::Live,
+                Some(_) => TileState::Connecting,
+            }
+        };
+        let person = medium == TileMedium::Camera;
+        TileView {
+            id,
+            pinned: input.pinned == Some(&key),
+            user_id: participant.user_id.clone(),
+            state,
+            is_local: participant.is_local,
+            microphone_muted: person
+                && participant.streams.iter().any(|stream| {
+                    stream.kind == RtcStreamKind::Microphone && stream.muted
+                }),
+            speaking: person && input.speaking.contains(&participant.member_id),
+            frame_slot: None,
+            key,
+        }
+    }
+
+    /// The pinned tile, a placeholder saying it left, or the first live
+    /// remote screen share. A featured tile is removed from `tiles`.
+    fn featured(&mut self, tiles: &mut Vec<TileView>, input: &PlanInput<'_>) -> Option<TileView> {
+        let stale = self.departed.as_ref().is_some_and(|departed| {
+            input.pinned != Some(&departed.tile.key)
+                || departed.until <= input.now
+                || tiles.iter().any(|tile| tile.key == departed.tile.key)
+        });
+        if stale {
+            self.departed = None;
+        }
+        if let Some(pinned) = input.pinned {
+            if let Some(index) = tiles.iter().position(|tile| &tile.key == pinned) {
+                return Some(tiles.remove(index));
+            }
+            // Report only a tile that was in the previous plan. An expired
+            // placeholder's identity is older and is never reported again.
+            if self.departed.is_none()
+                && let Some(identity) = self.identities.get(pinned)
+                && identity.seen + 1 == self.generation
+            {
+                let left = !input
+                    .participants
+                    .iter()
+                    .any(|participant| participant.member_id == pinned.member_id);
+                self.departed = Some(Departed {
+                    tile: TileView {
+                        id: identity.id,
+                        key: pinned.clone(),
+                        user_id: identity.user_id.clone(),
+                        state: if left {
+                            TileState::Left
+                        } else {
+                            TileState::Ended
+                        },
+                        is_local: false,
+                        pinned: true,
+                        microphone_muted: false,
+                        speaking: false,
+                        frame_slot: None,
+                    },
+                    until: input.now + DEPARTED_PLACEHOLDER,
+                });
+            }
+            if let Some(departed) = &self.departed {
+                return Some(departed.tile.clone());
+            }
+        }
+        tiles
+            .iter()
+            .position(|tile| {
+                tile.key.medium == TileMedium::Screen
+                    && matches!(tile.state, TileState::Live | TileState::Connecting)
+            })
+            .map(|index| tiles.remove(index))
+    }
+}
+
+struct Decoder {
+    key: TileKey,
+    track: Arc<dyn RemoteTrackHandle>,
+    frames: BoxStream<'static, VideoFrame>,
+    /// Overwritten by each decoded frame; decoded frames are never queued.
+    newest: Option<VideoFrame>,
+    size: (u32, u32),
+    interval: Duration,
+    due: Instant,
+}
+
+struct Conversion {
+    slot: usize,
+    epoch: u64,
+    frame: VideoFrame,
+    size: (u32, u32),
+}
+
+struct Converted {
+    slot: usize,
+    epoch: u64,
+    pixels: Result<SharedPixelBuffer<Rgb8Pixel>, FrameError>,
+}
+
+type ConversionBatch = JoinHandle<Vec<Converted>>;
+
+/// Open frame streams and the pictures last converted from them.
+#[derive(Default)]
+struct Presenter {
+    decoders: [Option<Decoder>; FRAME_SLOTS],
+    frames: [FrameSlot; FRAME_SLOTS],
+    next_epoch: u64,
+    /// Streams whose frame stream ended; retried after a refresh or restart.
+    cooling: HashSet<TileKey>,
+    /// A snapshot must be published.
+    dirty: bool,
+    /// A frame stream ended since the last plan.
+    ended: bool,
+}
+
+impl Presenter {
+    fn decoding(&self) -> bool {
+        self.decoders.iter().any(Option::is_some)
+    }
+
+    fn slot_of(&self, key: &TileKey) -> Option<usize> {
+        self.decoders
+            .iter()
+            .position(|decoder| decoder.as_ref().is_some_and(|decoder| &decoder.key == key))
+    }
+
+    fn free_slot(&self) -> Option<usize> {
+        self.decoders.iter().position(Option::is_none)
+    }
+
+    fn is_track(&self, slot: usize, track: Option<&Arc<dyn RemoteTrackHandle>>) -> bool {
+        match (&self.decoders[slot], track) {
+            (Some(decoder), Some(track)) => Arc::ptr_eq(&decoder.track, track),
+            _ => false,
+        }
+    }
+
+    fn open(
+        &mut self,
+        slot: usize,
+        request: &DecodeRequest,
+        track: Arc<dyn RemoteTrackHandle>,
+        frames: BoxStream<'static, VideoFrame>,
+    ) {
+        self.next_epoch += 1;
+        self.frames[slot] = FrameSlot {
+            epoch: self.next_epoch,
+            sequence: 0,
+            pixels: None,
+        };
+        self.decoders[slot] = Some(Decoder {
+            key: request.key.clone(),
+            track,
+            frames,
+            newest: None,
+            size: request.size,
+            interval: request.interval,
+            due: Instant::now(),
+        });
+        self.dirty = true;
+    }
+
+    /// Close a slot's stream and drop its picture immediately.
+    fn release(&mut self, slot: usize) {
+        if self.decoders[slot].take().is_some() || self.frames[slot].pixels.is_some() {
+            self.next_epoch += 1;
+            self.frames[slot] = FrameSlot {
+                epoch: self.next_epoch,
+                sequence: 0,
+                pixels: None,
+            };
+            self.dirty = true;
+        }
+    }
+
+    fn release_member(&mut self, member_id: &str) {
+        for slot in 0..FRAME_SLOTS {
+            if self.decoders[slot]
+                .as_ref()
+                .is_some_and(|decoder| decoder.key.member_id == member_id)
+            {
+                self.release(slot);
+            }
+        }
+    }
+
+    fn release_all(&mut self) {
+        for slot in 0..FRAME_SLOTS {
+            self.release(slot);
+        }
+    }
+
+    /// Keep only the newest decoded frame of every open stream. Ready when
+    /// any frame arrived or any stream ended.
+    fn poll_frames(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        let mut progressed = false;
+        for slot in 0..FRAME_SLOTS {
+            let Some(decoder) = self.decoders[slot].as_mut() else {
+                continue;
+            };
+            let mut ended = false;
+            for _ in 0..MAX_DRAIN {
+                match decoder.frames.poll_next_unpin(cx) {
+                    Poll::Ready(Some(frame)) => {
+                        decoder.newest = Some(frame);
+                        progressed = true;
+                    }
+                    Poll::Ready(None) => {
+                        ended = true;
+                        break;
+                    }
+                    Poll::Pending => break,
+                }
+            }
+            if ended {
+                let key = decoder.key.clone();
+                self.cooling.insert(key);
+                self.release(slot);
+                self.ended = true;
+                progressed = true;
+            }
+        }
+        if progressed {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }
+
+    fn take_due_frames(&mut self, now: Instant) -> Vec<Conversion> {
+        let mut batch = Vec::new();
+        for (slot, decoder) in self.decoders.iter_mut().enumerate() {
+            let Some(decoder) = decoder else {
+                continue;
+            };
+            if decoder.due > now {
+                continue;
+            }
+            let Some(frame) = decoder.newest.take() else {
+                continue;
+            };
+            // Allow half a tick of timer jitter so a stream keeps its cadence.
+            decoder.due = now + decoder.interval.saturating_sub(FRAME_INTERVAL / 2);
+            batch.push(Conversion {
+                slot,
+                epoch: self.frames[slot].epoch,
+                frame,
+                size: decoder.size,
+            });
+        }
+        batch
+    }
+
+    fn accept(&mut self, converted: Vec<Converted>) {
+        for result in converted {
+            let Ok(pixels) = result.pixels else {
+                continue;
+            };
+            // A released or reassigned slot has a new epoch; drop late pictures.
+            let frame = &mut self.frames[result.slot];
+            if self.decoders[result.slot].is_some() && frame.epoch == result.epoch {
+                frame.sequence += 1;
+                frame.pixels = Some(pixels);
+                self.dirty = true;
+            }
+        }
+    }
+}
+
+fn convert_batch(batch: Vec<Conversion>) -> Vec<Converted> {
+    batch
+        .into_iter()
+        .map(|conversion| Converted {
+            slot: conversion.slot,
+            epoch: conversion.epoch,
+            pixels: rgb_buffer(&conversion.frame, conversion.size),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,8 +1101,29 @@ enum FrameError {
     InvalidPlane,
 }
 
-/// Convert BT.601 limited-range I420 to RGB, applying clockwise rotation.
-fn rgb_buffer(frame: &VideoFrame) -> Result<SharedPixelBuffer<Rgb8Pixel>, FrameError> {
+/// The largest size within `bounds` with the source aspect ratio.
+/// Pictures are never enlarged.
+fn fitted_size((width, height): (u32, u32), (max_width, max_height): (u32, u32)) -> (u32, u32) {
+    if width <= max_width && height <= max_height {
+        return (width, height);
+    }
+    let (width, height) = (u64::from(width), u64::from(height));
+    let (bound_width, bound_height) = (u64::from(max_width), u64::from(max_height));
+    if width * bound_height >= height * bound_width {
+        let scaled = (height * bound_width / width).max(1);
+        (max_width, u32::try_from(scaled).unwrap_or(max_height))
+    } else {
+        let scaled = (width * bound_height / height).max(1);
+        (u32::try_from(scaled).unwrap_or(max_width), max_height)
+    }
+}
+
+/// Convert BT.601 limited-range I420 to RGB, applying clockwise rotation and
+/// nearest-sample scaling into `bounds`. Work is proportional to the output.
+fn rgb_buffer(
+    frame: &VideoFrame,
+    bounds: (u32, u32),
+) -> Result<SharedPixelBuffer<Rgb8Pixel>, FrameError> {
     let source = &frame.buffer;
     let width = usize::try_from(source.width).map_err(|_| FrameError::InvalidDimensions)?;
     let height = usize::try_from(source.height).map_err(|_| FrameError::InvalidDimensions)?;
@@ -299,9 +1132,9 @@ fn rgb_buffer(frame: &VideoFrame) -> Result<SharedPixelBuffer<Rgb8Pixel>, FrameE
         .ok_or(FrameError::InvalidDimensions)?;
     if width == 0
         || height == 0
-        || source.width > MAX_EDGE
-        || source.height > MAX_EDGE
-        || pixels > MAX_PIXELS
+        || source.width > SOURCE_MAX_EDGE
+        || source.height > SOURCE_MAX_EDGE
+        || pixels > SOURCE_MAX_PIXELS
     {
         return Err(FrameError::InvalidDimensions);
     }
@@ -310,26 +1143,38 @@ fn rgb_buffer(frame: &VideoFrame) -> Result<SharedPixelBuffer<Rgb8Pixel>, FrameE
     let stride_y = checked_plane(&source.data_y, source.stride_y, width, height)?;
     let stride_u = checked_plane(&source.data_u, source.stride_u, chroma_width, chroma_height)?;
     let stride_v = checked_plane(&source.data_v, source.stride_v, chroma_width, chroma_height)?;
-    let (output_width, output_height) = match frame.rotation {
-        VideoRotation::Deg0 | VideoRotation::Deg180 => (source.width, source.height),
-        VideoRotation::Deg90 | VideoRotation::Deg270 => (source.height, source.width),
+    let quarter_turn = matches!(frame.rotation, VideoRotation::Deg90 | VideoRotation::Deg270);
+    let (display_width, display_height) = if quarter_turn {
+        (height, width)
+    } else {
+        (width, height)
     };
+    let display = if quarter_turn {
+        (source.height, source.width)
+    } else {
+        (source.width, source.height)
+    };
+    let (output_width, output_height) = fitted_size(display, bounds);
     let mut output = SharedPixelBuffer::<Rgb8Pixel>::new(output_width, output_height);
     let output_bytes = output.make_mut_bytes();
     let output_width = output_width as usize;
-    for y in 0..height {
-        for x in 0..width {
+    let output_height = output_height as usize;
+    for output_y in 0..output_height {
+        // Sample the centre of the source area each output pixel covers.
+        let display_y = (output_y * 2 + 1) * display_height / (output_height * 2);
+        for output_x in 0..output_width {
+            let display_x = (output_x * 2 + 1) * display_width / (output_width * 2);
+            let (x, y) = match frame.rotation {
+                VideoRotation::Deg0 => (display_x, display_y),
+                VideoRotation::Deg90 => (display_y, height - 1 - display_x),
+                VideoRotation::Deg180 => (width - 1 - display_x, height - 1 - display_y),
+                VideoRotation::Deg270 => (width - 1 - display_y, display_x),
+            };
             let luma = source.data_y[y * stride_y + x];
             let chroma_u = source.data_u[(y / 2) * stride_u + x / 2];
             let chroma_v = source.data_v[(y / 2) * stride_v + x / 2];
             let rgb = yuv_to_rgb(luma, chroma_u, chroma_v);
-            let (display_x, display_y) = match frame.rotation {
-                VideoRotation::Deg0 => (x, y),
-                VideoRotation::Deg90 => (height - 1 - y, x),
-                VideoRotation::Deg180 => (width - 1 - x, height - 1 - y),
-                VideoRotation::Deg270 => (y, width - 1 - x),
-            };
-            let offset = (display_y * output_width + display_x) * 3;
+            let offset = (output_y * output_width + output_x) * 3;
             output_bytes[offset..offset + 3].copy_from_slice(&rgb);
         }
     }
@@ -364,8 +1209,10 @@ fn yuv_to_rgb(y: u8, u: u8, v: u8) -> [u8; 3] {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
-    use morpheus_rtc::I420Buffer;
+    use morpheus_rtc::{I420Buffer, ParticipantStreamInfo};
 
     fn padded_frame(rotation: VideoRotation) -> VideoFrame {
         VideoFrame {
@@ -384,9 +1231,115 @@ mod tests {
         }
     }
 
+    fn participant(member: &str, streams: &[(RtcStreamKind, bool)]) -> ParticipantInfo {
+        ParticipantInfo {
+            member_id: member.into(),
+            user_id: format!("@{member}:example.org"),
+            device_id: None,
+            is_local: false,
+            reachable: true,
+            streams: streams
+                .iter()
+                .map(|&(kind, muted)| ParticipantStreamInfo { kind, muted })
+                .collect(),
+            hand_raised_at_ms: None,
+            joined_at_ms: None,
+        }
+    }
+
+    fn camera(member: &str) -> TileKey {
+        TileKey {
+            member_id: member.into(),
+            medium: TileMedium::Camera,
+        }
+    }
+
+    fn screen(member: &str) -> TileKey {
+        TileKey {
+            member_id: member.into(),
+            medium: TileMedium::Screen,
+        }
+    }
+
+    struct Track;
+
+    impl RemoteTrackHandle for Track {
+        fn kind(&self) -> MediaStreamKind {
+            MediaStreamKind::Camera
+        }
+
+        fn video_frames(&self) -> Option<BoxStream<'static, VideoFrame>> {
+            Some(futures_util::stream::pending().boxed())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeMedia {
+        participants: Vec<ParticipantInfo>,
+        tracks: Mutex<HashMap<TileKey, Arc<dyn RemoteTrackHandle>>>,
+        constraints: Mutex<Vec<(TileKey, MediaConstraints)>>,
+    }
+
+    impl FakeMedia {
+        fn publish(&self, key: TileKey) -> Arc<dyn RemoteTrackHandle> {
+            let track: Arc<dyn RemoteTrackHandle> = Arc::new(Track);
+            self.tracks.lock().unwrap().insert(key, Arc::clone(&track));
+            track
+        }
+
+        fn last_constraint(&self, key: &TileKey) -> Option<MediaConstraints> {
+            self.constraints
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(constrained, _)| constrained == key)
+                .map(|(_, constraints)| *constraints)
+        }
+    }
+
+    impl StageMedia for FakeMedia {
+        fn participants(&self) -> Vec<ParticipantInfo> {
+            self.participants.clone()
+        }
+
+        fn track(&self, key: &TileKey) -> Option<Arc<dyn RemoteTrackHandle>> {
+            self.tracks.lock().unwrap().get(key).cloned()
+        }
+
+        fn constrain(&self, key: &TileKey, constraints: MediaConstraints) {
+            self.constraints
+                .lock()
+                .unwrap()
+                .push((key.clone(), constraints));
+        }
+    }
+
+    fn plan(
+        planner: &mut Planner,
+        participants: &[ParticipantInfo],
+        pinned: Option<&TileKey>,
+        now: Instant,
+    ) -> Plan {
+        let speaking = HashSet::new();
+        let undecryptable = HashSet::new();
+        planner.plan(
+            &PlanInput {
+                participants,
+                pinned,
+                page: 0,
+                presented: true,
+                speaking: &speaking,
+                undecryptable: &undecryptable,
+                now,
+            },
+            |_| true,
+        )
+    }
+
     #[test]
     fn respects_padding_and_limited_range() {
-        let image = rgb_buffer(&padded_frame(VideoRotation::Deg0)).unwrap();
+        let image = rgb_buffer(&padded_frame(VideoRotation::Deg0), FEATURED_SIZE).unwrap();
         assert_eq!((image.width(), image.height()), (2, 3));
         assert_eq!(
             &image.as_bytes()[..9],
@@ -396,125 +1349,244 @@ mod tests {
 
     #[test]
     fn applies_clockwise_quarter_turn() {
-        let image = rgb_buffer(&padded_frame(VideoRotation::Deg90)).unwrap();
+        let image = rgb_buffer(&padded_frame(VideoRotation::Deg90), FEATURED_SIZE).unwrap();
         assert_eq!((image.width(), image.height()), (3, 2));
         assert_eq!(&image.as_bytes()[..3], &[29, 29, 29]);
+    }
+
+    #[test]
+    fn scales_to_the_tile_bound_by_sampling_pixel_centres() {
+        let frame = VideoFrame {
+            buffer: I420Buffer {
+                width: 4,
+                height: 2,
+                data_y: vec![16, 16, 16, 16, 16, 235, 16, 81],
+                stride_y: 4,
+                data_u: vec![128, 128],
+                stride_u: 2,
+                data_v: vec![128, 128],
+                stride_v: 2,
+            },
+            rotation: VideoRotation::Deg0,
+            timestamp_us: 0,
+        };
+        let image = rgb_buffer(&frame, (2, 2)).unwrap();
+        assert_eq!((image.width(), image.height()), (2, 1));
+        assert_eq!(image.as_bytes(), &[255, 255, 255, 76, 76, 76]);
+        assert_eq!(fitted_size((3840, 2160), FEATURED_SIZE), FEATURED_SIZE);
+        assert_eq!(fitted_size((1080, 1920), FEATURED_SIZE), (607, 1080));
+        assert_eq!(fitted_size((640, 360), FEATURED_SIZE), (640, 360));
     }
 
     #[test]
     fn rejects_short_planes_and_excessive_dimensions() {
         let mut frame = padded_frame(VideoRotation::Deg0);
         frame.buffer.data_u.pop();
-        assert_eq!(rgb_buffer(&frame).unwrap_err(), FrameError::InvalidPlane);
-        frame.buffer.width = MAX_EDGE + 1;
         assert_eq!(
-            rgb_buffer(&frame).unwrap_err(),
+            rgb_buffer(&frame, FEATURED_SIZE).unwrap_err(),
+            FrameError::InvalidPlane
+        );
+        frame.buffer.width = SOURCE_MAX_EDGE + 1;
+        assert_eq!(
+            rgb_buffer(&frame, FEATURED_SIZE).unwrap_err(),
             FrameError::InvalidDimensions
         );
     }
 
     #[test]
-    fn republished_video_discards_old_decoder_and_frozen_frame() {
-        let source = Source {
-            member_id: "bob-device-call".into(),
-            user_id: "@bob:example.org".into(),
-            kind: MediaStreamKind::Camera,
-        };
-        let restarted = RtcCallEvent::StreamStarted {
-            member_id: source.member_id.clone(),
-            kind: source.kind,
-        };
-        let token = 9;
-        let active_token = AtomicU64::new(token);
-        let pixels = rgb_buffer(&padded_frame(VideoRotation::Deg0)).unwrap();
-        let (updates, receiver) = watch::channel(VideoUpdate::Frame {
-            token,
-            source: source.label(),
-            pixels,
-        });
-        let mut selected = Some(source.clone());
-        let mut frames: Option<BoxStream<'static, VideoFrame>> =
-            Some(futures_util::stream::pending().boxed());
-        let mut newest = Some(padded_frame(VideoRotation::Deg0));
-        assert!(source.affected_by(&restarted));
-        change_source(
-            None,
-            &mut selected,
-            &mut frames,
-            &mut newest,
-            token,
-            &updates,
-            &active_token,
-        );
-        assert!(selected.is_none() && frames.is_none() && newest.is_none());
-        assert!(matches!(
-            *receiver.borrow(),
-            VideoUpdate::Clear { token: 9 }
-        ));
-        // An identical roster row must now subscribe to the replacement.
-        change_source(
-            Some((source, Some(futures_util::stream::pending().boxed()))),
-            &mut selected,
-            &mut frames,
-            &mut newest,
-            token,
-            &updates,
-            &active_token,
-        );
-        assert!(selected.is_some() && frames.is_some());
+    fn screen_share_is_featured_while_cameras_stay_in_a_bounded_filmstrip() {
+        let mut planner = Planner::default();
+        let mut participants = vec![participant(
+            "alice",
+            &[
+                (RtcStreamKind::Camera, false),
+                (RtcStreamKind::ScreenShare, false),
+            ],
+        )];
+        participants.extend((0..10).map(|index| {
+            participant(&format!("m{index}"), &[(RtcStreamKind::Camera, false)])
+        }));
+        let plan = plan(&mut planner, &participants, None, Instant::now());
+        let featured = plan.layout.featured.as_ref().unwrap();
+        assert_eq!(featured.key, screen("alice"));
+        assert_eq!(plan.layout.tiles[0].key, camera("alice"));
+        assert_eq!(plan.layout.tiles.len(), FILMSTRIP_PAGE);
+        assert_eq!(plan.layout.pages, 11_usize.div_ceil(FILMSTRIP_PAGE));
+        assert!(plan.decode.len() <= FRAME_SLOTS);
+        assert_eq!(plan.decode[0].size, FEATURED_SIZE);
+        assert!(plan.decode[1..].iter().all(|request| request.size == FILMSTRIP_SIZE));
     }
 
     #[test]
-    fn other_tracks_do_not_interrupt_selected_video() {
-        let source = Source {
-            member_id: "bob-device-call".into(),
-            user_id: "@bob:example.org".into(),
-            kind: MediaStreamKind::ScreenShare,
-        };
-        assert!(!source.affected_by(&RtcCallEvent::StreamStopped {
-            member_id: source.member_id.clone(),
-            kind: MediaStreamKind::Microphone,
-        }));
-        assert!(!source.affected_by(&RtcCallEvent::ParticipantLeft {
-            member_id: "someone-else".into(),
-        }));
-        assert!(source.affected_by(&RtcCallEvent::StreamMuted {
-            member_id: source.member_id.clone(),
-            kind: source.kind,
-        }));
-        assert!(source.affected_by(&RtcCallEvent::ParticipantLeft {
-            member_id: source.member_id.clone(),
-        }));
+    fn placeholders_describe_muted_absent_unreachable_and_local_media() {
+        let mut planner = Planner::default();
+        let mut unreachable = participant("carol", &[(RtcStreamKind::Camera, false)]);
+        unreachable.reachable = false;
+        let mut local = participant("me", &[(RtcStreamKind::Camera, false)]);
+        local.is_local = true;
+        let participants = [
+            participant(
+                "alice",
+                &[
+                    (RtcStreamKind::Camera, true),
+                    (RtcStreamKind::Microphone, true),
+                ],
+            ),
+            participant("bob", &[(RtcStreamKind::Microphone, false)]),
+            unreachable,
+            local,
+        ];
+        let plan = plan(&mut planner, &participants, None, Instant::now());
+        let states: Vec<_> = plan
+            .layout
+            .tiles
+            .iter()
+            .map(|tile| (tile.key.member_id.as_str(), tile.state, tile.microphone_muted))
+            .collect();
+        assert_eq!(
+            states,
+            [
+                ("alice", TileState::Muted, true),
+                ("bob", TileState::Off, false),
+                ("carol", TileState::Unavailable, false),
+                ("me", TileState::LocalPublishing, false),
+            ]
+        );
+        assert!(plan.decode.is_empty());
     }
 
-    #[tokio::test]
-    async fn stopped_track_discards_an_already_running_conversion() {
-        let source = Source {
-            member_id: "bob-device-call".into(),
-            user_id: "@bob:example.org".into(),
-            kind: MediaStreamKind::ScreenShare,
+    #[test]
+    fn pinned_participant_who_leaves_is_reported_then_released() {
+        let mut planner = Planner::default();
+        let now = Instant::now();
+        let bob = camera("bob");
+        let both = [
+            participant("alice", &[(RtcStreamKind::Camera, false)]),
+            participant("bob", &[(RtcStreamKind::Camera, false)]),
+        ];
+        let first = plan(&mut planner, &both, Some(&bob), now);
+        let pinned_id = first.layout.featured.as_ref().unwrap().id;
+        let alice_id = first.layout.tiles[0].id;
+
+        let left = plan(&mut planner, &both[..1], Some(&bob), now);
+        let placeholder = left.layout.featured.as_ref().unwrap();
+        assert_eq!((placeholder.id, placeholder.state), (pinned_id, TileState::Left));
+        assert!(left.decode.iter().all(|request| request.key != bob));
+        assert_eq!(left.layout.tiles[0].id, alice_id);
+
+        let later = plan(&mut planner, &both[..1], Some(&bob), now + DEPARTED_PLACEHOLDER);
+        assert!(later.layout.featured.is_none());
+        assert_eq!(later.layout.tiles[0].id, alice_id);
+    }
+
+    #[test]
+    fn hidden_stage_pauses_every_remote_stream_and_drops_pictures() {
+        let media = FakeMedia {
+            participants: vec![
+                participant("alice", &[(RtcStreamKind::ScreenShare, false)]),
+                participant("bob", &[(RtcStreamKind::Camera, false)]),
+            ],
+            ..FakeMedia::default()
         };
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
-        let worker = tokio::task::spawn_blocking(move || {
-            let _ = started_tx.send(());
-            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-            let pixels = rgb_buffer(&padded_frame(VideoRotation::Deg0));
-            let _ = finished_tx.send(());
-            pixels
+        media.publish(screen("alice"));
+        media.publish(camera("bob"));
+        let mut stage = Stage::new(media, 4);
+        stage.participants = stage.media.participants();
+        stage.request(&StageRequest {
+            presented: true,
+            ..StageRequest::default()
         });
-        let mut conversion = Some((source, worker));
-        started_rx.await.unwrap();
-        // Stop must remain responsive even while a converter is running.
-        discard_conversion(&mut conversion);
-        assert!(conversion.is_none());
-        release_tx.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(5), finished_rx)
-            .await
-            .unwrap()
-            .unwrap();
-        // There is no retained result to present after this late completion.
-        assert!(conversion.is_none());
+        stage.replan();
+        assert_eq!(stage.media.last_constraint(&screen("alice")), Some(sized(FEATURED_SIZE)));
+        assert_eq!(stage.media.last_constraint(&camera("bob")), Some(sized(FILMSTRIP_SIZE)));
+        let slot = stage.presenter.slot_of(&camera("bob")).unwrap();
+        stage.presenter.frames[slot].pixels =
+            Some(rgb_buffer(&padded_frame(VideoRotation::Deg0), FILMSTRIP_SIZE).unwrap());
+
+        stage.request(&StageRequest::default());
+        stage.replan();
+        assert!(!stage.presenter.decoding());
+        assert!(stage.presenter.frames.iter().all(|frame| frame.pixels.is_none()));
+        assert_eq!(stage.media.last_constraint(&screen("alice")), Some(paused()));
+        assert_eq!(stage.media.last_constraint(&camera("bob")), Some(paused()));
+    }
+
+    #[test]
+    fn stopped_muted_or_republished_tracks_release_their_slot() {
+        let media = FakeMedia {
+            participants: vec![participant("bob", &[(RtcStreamKind::Camera, false)])],
+            ..FakeMedia::default()
+        };
+        media.publish(camera("bob"));
+        let mut stage = Stage::new(media, 9);
+        stage.participants = stage.media.participants();
+        stage.request(&StageRequest {
+            presented: true,
+            ..StageRequest::default()
+        });
+        stage.replan();
+        let slot = stage.presenter.slot_of(&camera("bob")).unwrap();
+        let started = RtcCallEvent::StreamStarted {
+            member_id: "bob".into(),
+            kind: MediaStreamKind::Camera,
+        };
+        // The same subscribed track announced again keeps its stream.
+        stage.event(&started);
+        assert_eq!(stage.presenter.slot_of(&camera("bob")), Some(slot));
+        // A replacement track must never keep the old decoder or picture.
+        stage.media.publish(camera("bob"));
+        stage.presenter.frames[slot].pixels =
+            Some(rgb_buffer(&padded_frame(VideoRotation::Deg0), FILMSTRIP_SIZE).unwrap());
+        stage.event(&started);
+        assert!(stage.presenter.slot_of(&camera("bob")).is_none());
+        assert!(stage.presenter.frames[slot].pixels.is_none());
+        stage.replan();
+        assert!(stage.presenter.slot_of(&camera("bob")).is_some());
+        stage.event(&RtcCallEvent::StreamMuted {
+            member_id: "bob".into(),
+            kind: MediaStreamKind::Camera,
+        });
+        assert!(!stage.presenter.decoding());
+        stage.replan();
+        stage.event(&RtcCallEvent::ParticipantLeft {
+            member_id: "bob".into(),
+        });
+        assert!(!stage.presenter.decoding());
+    }
+
+    #[test]
+    fn released_slot_discards_a_late_conversion() {
+        let mut presenter = Presenter::default();
+        let request = DecodeRequest {
+            key: camera("bob"),
+            size: FILMSTRIP_SIZE,
+            interval: FRAME_INTERVAL,
+        };
+        let track: Arc<dyn RemoteTrackHandle> = Arc::new(Track);
+        let frames = track.video_frames().unwrap();
+        presenter.open(0, &request, track, frames);
+        presenter.decoders[0].as_mut().unwrap().newest = Some(padded_frame(VideoRotation::Deg0));
+        let batch = presenter.take_due_frames(Instant::now());
+        assert_eq!(batch.len(), 1);
+        let converted = convert_batch(batch);
+        // Stop arrives while the converter runs.
+        presenter.release(0);
+        presenter.accept(converted);
+        assert!(presenter.frames[0].pixels.is_none());
+        assert!(!presenter.decoding());
+    }
+
+    #[test]
+    fn stage_requests_from_another_call_are_ignored() {
+        let mut request = StageRequest::default();
+        request.choose(3, |request| request.pinned = Some(camera("bob")));
+        request.present(true);
+        let mut stage = Stage::new(FakeMedia::default(), 4);
+        stage.request(&request);
+        assert!(stage.pinned.is_none() && stage.presented);
+        request.choose(4, |request| request.page = 2);
+        assert!(request.pinned.is_none());
+        stage.request(&request);
+        assert_eq!(stage.page, 2);
     }
 }

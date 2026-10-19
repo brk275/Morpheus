@@ -50,6 +50,10 @@ pub use matrix_rtc_call_sdk::CallEvent as RtcCallEvent;
 pub use matrix_rtc_transport::{
     AudioFrame, I420Buffer, MediaStreamKind, VideoFrame, VideoRotation,
 };
+// Receive-side presentation: frame-stream handles and per-stream
+// subscription constraints (pause or size cap) for a native call stage.
+#[cfg(feature = "native-rtc")]
+pub use matrix_rtc_transport::{Dimensions, MediaConstraints, RemoteTrackHandle, VideoDetail};
 #[cfg(feature = "native-rtc")]
 pub use media::{MediaError, Publication};
 #[cfg(feature = "native-rtc")]

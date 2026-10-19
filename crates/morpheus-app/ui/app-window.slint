@@ -1,4 +1,5 @@
 import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView, Slider, SpinBox } from "std-widgets.slint";
+import { CallParticipantItem, CallStage, CallTileItem } from "call-stage.slint";
 
 // Optional overrides retain each control's existing color when absent.
 export struct ColorRole {
@@ -250,12 +251,6 @@ export struct IncomingCallItem {
     caller: string,
     room: string,
     account: string,
-}
-
-export struct CallParticipantItem {
-    name: string,
-    detail: string,
-    is-local: bool,
 }
 
 export struct CallCaptureSourceItem {
@@ -2173,9 +2168,17 @@ export component AppWindow inherits Window {
     in-out property <bool> native-audio-failed: false;
     in-out property <string> native-audio-error;
     in-out property <bool> native-leave-unconfirmed: false;
-    in-out property <bool> native-video-visible: false;
-    in-out property <image> native-video-frame;
-    in-out property <string> native-video-source;
+    // Native call stage; see call-stage.slint and src/call_stage.rs.
+    in-out property <[CallTileItem]> native-call-tiles;
+    in-out property <CallTileItem> native-call-featured;
+    in-out property <bool> native-call-featured-visible: false;
+    in-out property <[image]> native-call-frames;
+    in-out property <int> native-call-page: 0;
+    in-out property <int> native-call-pages: 1;
+    in-out property <int> native-call-tile-count: 0;
+    callback pin-native-call-tile(int);
+    callback page-native-call-tiles(int);
+    callback native-call-stage-presented(bool);
     in-out property <[CallParticipantItem]> native-call-participants;
     in-out property <[CallCaptureSourceItem]> native-capture-sources;
     in-out property <bool> native-capture-source-loading: false;
@@ -2472,6 +2475,8 @@ export component AppWindow inherits Window {
             root.notification-highlight-error = "";
         }
         if root.page != 2 { root.native-capture-picker-open = false; }
+        // A hidden stage pauses and stops decoding every remote video stream.
+        root.native-call-stage-presented(root.page == 2);
     }
     changed native-call-joined => {
         if !root.native-call-joined { root.native-capture-picker-open = false; }
@@ -5557,91 +5562,40 @@ export component AppWindow inherits Window {
                             accessible-live-region: polite;
                         }
                     }
-                    if root.live-session : Rectangle {
-                        vertical-stretch: 1; background: root.elevated; border-radius: 14px;
-                        if root.native-video-visible : Image {
-                            x: 12px; y: 12px;
-                            width: parent.width - 248px; height: parent.height - 24px;
-                            source: root.native-video-frame;
-                            image-fit: contain;
-                        }
-                        if root.native-video-visible : Rectangle {
-                            x: 20px; y: 20px; width: 330px; height: 32px;
-                            background: root.panel; border-radius: 8px;
-                            Text {
-                                x: 10px; width: parent.width - 20px; height: parent.height;
-                                text: root.native-video-source;
-                                color: root.ink; font-size: 12px * root.text-scale;
-                                vertical-alignment: center; overflow: elide;
-                            }
-                        }
-                        if !root.native-video-visible : VerticalLayout {
-                            x: 28px; y: (parent.height - 132px) / 2;
-                            width: parent.width - 276px; height: 132px;
-                            alignment: center; spacing: 12px;
-                            Text {
-                                text: root.call-connected ? "Waiting for participant video" : (root.room-call-mode == 2 ? "Join the legacy room call" : "Join the room call");
-                                color: root.ink; font-size: 19px * root.text-scale;
-                                font-weight: 700; horizontal-alignment: center;
-                            }
-                            Text {
-                                text: root.native-call-enabled
-                                    ? "Remote cameras and screen shares appear here when a participant publishes them."
-                                    : "This build does not include the native media backend.";
-                                color: root.muted; font-size: 13px * root.text-scale; wrap: word-wrap;
-                                horizontal-alignment: center;
-                            }
-                        }
-                        Rectangle {
-                            x: parent.width - 224px; y: 12px;
-                            width: 212px; height: parent.height - 24px;
-                            background: root.panel; border-radius: 11px;
-                            Text {
-                                x: 12px; y: 10px; width: parent.width - 24px; height: 24px;
-                                text: "PARTICIPANTS · " + root.native-call-participants.length;
-                                color: root.muted; font-size: 10px * root.text-scale;
-                                font-weight: 750; letter-spacing: 1px;
-                                accessible-live-region: polite;
-                            }
-                            if root.native-call-participants.length == 0 : Text {
-                                x: 12px; y: 44px; width: parent.width - 24px;
-                                text: "Nobody is in this call yet";
-                                color: root.muted; font-size: 11px * root.text-scale;
-                                wrap: word-wrap;
-                            }
-                            call-roster := ListView {
-                                x: 10px; y: 42px;
-                                width: parent.width - 20px; height: parent.height - 52px;
-                                horizontal-scrollbar-policy: always-off;
-                                for participant in root.native-call-participants : Rectangle {
-                                    width: call-roster.visible-width; height: 52px;
-                                    background: transparent;
-                                    VerticalLayout {
-                                        padding-left: 4px; padding-right: 4px;
-                                        alignment: center; spacing: 3px;
-                                        Text {
-                                            text: participant.is-local ? "You · " + participant.name : participant.name;
-                                            color: root.ink; font-size: 11px * root.text-scale;
-                                            font-weight: 700; overflow: elide;
-                                        }
-                                        Text {
-                                            text: participant.detail;
-                                            color: root.muted; font-size: 10px * root.text-scale;
-                                            overflow: elide;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if root.native-call-enabled && !root.call-connected && !root.native-call-request-pending && root.room-call-mode != 2 : ActionRect {
-                            x: (parent.width - 220px - 176px) / 2; y: parent.height - 76px;
-                            width: 176px; height: 42px; border-radius: 9px;
-                            background: root.hover; border-color: root.divider; border-width: 1px;
-                            focus-color: root.accent;
-                            label: "Open MatrixRTC call in selected room";
-                            activated => { root.open-native-call-slot(); }
-                            Text { text: "Open room call"; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
-                        }
+                    if root.live-session : CallStage {
+                        vertical-stretch: 1;
+                        tiles: root.native-call-tiles;
+                        featured: root.native-call-featured;
+                        featured-visible: root.native-call-featured-visible;
+                        frames: root.native-call-frames;
+                        page: root.native-call-page;
+                        pages: root.native-call-pages;
+                        tile-count: root.native-call-tile-count;
+                        participants: root.native-call-participants;
+                        call-connected: root.call-connected;
+                        calls-enabled: root.native-call-enabled;
+                        legacy-mode: root.room-call-mode == 2;
+                        can-open-slot: root.native-call-enabled && !root.call-connected && !root.native-call-request-pending && root.room-call-mode != 2;
+                        text-scale: root.text-scale;
+                        corner: StyleTokens.radius;
+                        motion: StyleTokens.interaction-duration;
+                        palette: {
+                            ink: root.ink,
+                            muted: root.muted,
+                            panel: root.panel,
+                            elevated: root.elevated,
+                            hover: root.hover,
+                            accent: root.accent,
+                            accent-ink: root.accent-ink,
+                            divider: root.divider,
+                            backdrop: StyleTokens.roles.media-backdrop.present ? StyleTokens.roles.media-backdrop.color : #11131b,
+                            focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent,
+                            voice: StyleTokens.roles.voice.present ? StyleTokens.roles.voice.color : #78c8b1,
+                            avatar-ink: StyleTokens.roles.avatar-ink.present ? StyleTokens.roles.avatar-ink.color : #ffffff
+                        };
+                        pin-tile(id) => { root.pin-native-call-tile(id); }
+                        page-tiles(delta) => { root.page-native-call-tiles(delta); }
+                        open-slot => { root.open-native-call-slot(); }
                     }
                     if !root.live-session : HorizontalLayout {
                         vertical-stretch: 1;
