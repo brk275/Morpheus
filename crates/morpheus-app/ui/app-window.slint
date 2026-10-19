@@ -4926,7 +4926,7 @@ export component AppWindow inherits Window {
                         }
                         Rectangle { height: 1px; background: root.divider; }
                         Text { text: "Notifications"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
-                        Text { text: "Notifications are shown for the active account while Morpheus runs. These preferences are shared by all accounts; room rules still come from Matrix."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                        Text { text: "Notifications are shown for the active account while Morpheus runs. Notifications, sounds, previews, highlight words and room and sender names apply to all accounts. This account, default levels, keywords and room levels belong to the active account; levels and keywords are its Matrix push rules."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         ActionRect {
                             height: 68px; border-radius: 10px; background: root.elevated; focus-color: root.accent;
                             property <int> reveal-request: root.reveal-request("notifications.desktop");

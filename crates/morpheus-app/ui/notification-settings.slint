@@ -187,6 +187,9 @@ component DefaultLevelRow inherits Rectangle {
     // 0 unknown, 1 all messages, 2 mentions and keywords.
     in property <int> level;
     in property <bool> mixed;
+    // Signed in: the choices take focus, so search can reveal them while
+    // rules load. A choice is reported only while `choosable`.
+    in property <bool> live;
     in property <bool> choosable;
     out property <bool> first-focused: all-option.has-focus;
     callback choose(int);
@@ -231,12 +234,14 @@ component DefaultLevelRow inherits Rectangle {
                 text: "All";
                 label: "All messages by default in " + root.kind-name;
                 selected: root.level == 1;
-                enabled: root.choosable;
+                enabled: root.live;
                 focused-at(offset) => {
                     root.focused-at(offset);
                 }
                 activated => {
-                    root.choose(1);
+                    if root.choosable {
+                        root.choose(1);
+                    }
                 }
             }
             RuleOption {
@@ -245,12 +250,14 @@ component DefaultLevelRow inherits Rectangle {
                 text: "Mentions";
                 label: "Only mentions and keywords by default in " + root.kind-name;
                 selected: root.level == 2;
-                enabled: root.choosable;
+                enabled: root.live;
                 focused-at(offset) => {
                     root.focused-at(offset);
                 }
                 activated => {
-                    root.choose(2);
+                    if root.choosable {
+                        root.choose(2);
+                    }
                 }
             }
         }
@@ -598,6 +605,7 @@ export component NotificationRules inherits VerticalLayout {
         text-scale: root.text-scale;
         radius: root.radius;
         direct: false;
+        live: root.live;
         level: NotificationRulesState.default-group;
         mixed: NotificationRulesState.default-group-mixed;
         choosable: root.rules-ready && !NotificationRulesState.defaults-busy;
@@ -613,6 +621,7 @@ export component NotificationRules inherits VerticalLayout {
         text-scale: root.text-scale;
         radius: root.radius;
         direct: true;
+        live: root.live;
         level: NotificationRulesState.default-direct;
         mixed: NotificationRulesState.default-direct-mixed;
         choosable: root.rules-ready && !NotificationRulesState.defaults-busy;
@@ -652,7 +661,8 @@ export component NotificationRules inherits VerticalLayout {
                 vertical-alignment: center;
                 single-line: true;
                 text <=> NotificationRulesState.keyword-input;
-                enabled: root.keywords-ready;
+                // Typing is fine while rules load; adding waits for them.
+                enabled: root.live;
                 color: root.palette.ink;
                 font-size: 12px * root.text-scale;
                 accessible-label: "New Matrix keyword";
