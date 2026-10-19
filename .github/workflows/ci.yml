@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
-name: Reviewed beta four-platform native checks
-run-name: Reviewed native candidate - 2ce16b4 - ${{ inputs.platform }}
+name: Reviewed Windows SDK SQLite check
+run-name: Windows SDK SQLite check - 2ce16b4 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,12 +14,12 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: beta-native-2ce16b4-${{ github.ref }}
+  group: windows-sdk-sqlite-2ce16b4-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
     name: Native ${{ matrix.name }}
-    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false && contains(fromJSON('["all","macos-arm64","macos-intel","windows","linux"]'), inputs.platform)
+    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false && inputs.platform == 'windows'
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(inputs.platform == 'macos-arm64' && '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"}]}' || inputs.platform == 'macos-intel' && '{"include":[{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"}]}' || inputs.platform == 'windows' && '{"include":[{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"}]}' || inputs.platform == 'linux' && '{"include":[{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}' || '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"},{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"},{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"},{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}') }}
@@ -417,6 +417,8 @@ jobs:
           locked={(package['name'],package['version']) for package in
               tomllib.loads((workspace/'Cargo.lock').read_text())['package']}
           failure_markers={
+              'sqlite_missing_input':"cannot open input file 'sqlite3.lib'",
+              'rustc_sigkill':'signal: 9, SIGKILL',
               'custom_build_command':'failed to run custom build command',
               'cxx_bridge':'cxxbridge',
               'cc_tool_missing':'ToolNotFound',
@@ -453,46 +455,15 @@ jobs:
               'sdk_extraction':'Cannot unpack native SDK archive entry',
               'sdk_cache_publish':'Cannot publish verified native SDK cache',
           }
-          needed_app={
-              'polls::card::tests::withheld_results_show_no_counts_or_bars',
-              'polls::card::tests::ended_polls_show_final_results_and_offer_no_actions',
-              'polls::card::tests::only_sent_polls_can_be_voted_on_and_only_their_creator_ends_them',
-              'style_profiles::tests::summaries_describe_the_look_without_files_or_paths',
-              'style_profiles::tests::the_dialog_permit_admits_one_operation_at_a_time',
-              'kept_replies::tests::a_queued_restore_cannot_outlive_a_clear_or_a_room_change',
-              'live::account_presentation_tests::a_focused_view_loaded_out_of_order_never_replaces_the_shown_one',
-              'live::account_presentation_tests::a_withdrawn_search_navigation_held_at_its_commit_changes_nothing',
-              'live::account_presentation_tests::no_refresh_samples_a_reveal_until_it_is_decided_or_given_back',
-              'message_search::tests::context_keeps_the_hit_near_the_top_and_stays_bounded',
-              'message_search::tests::search_result_display_sanitizes_untrusted_text_without_changing_ids',
-              'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
-              'discovery_tests::timeline_link_handler_accepts_only_browser_urls',
-              'discovery_tests::call_stage_uses_joined_room_even_after_chat_navigation',
-              'timeline_model::tests::sparse_edits_across_ten_thousand_shared_rows_notify_only_changed_rows',
-              'video_render::tests::screen_share_is_featured_while_cameras_stay_in_a_bounded_filmstrip',
-              'video_render::tests::hidden_stage_pauses_every_remote_stream_and_drops_pictures',
-              'video_render::tests::released_slot_discards_a_late_conversion',
-              'local_video::tests::signaling_gate_withholds_frames_without_an_owner_or_stop',
-              'local_video::tests::transmission_pause_serializes_with_pushes_and_stale_resumes',
-              'call_recovery::tests::only_running_sticky_sync_may_transmit',
-              'calls::tests::recovering_calls_keep_blocking_account_switches',
-              'calls::tests::late_recovery_status_cannot_overwrite_a_leave',
-          }
-          allowed_app_ignore={'outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction'}
-          needed_matrix={'polls::tests::votes_must_be_known_unique_within_the_limit_and_open', 'polls::tests::projection_bounds_text_answers_and_selection_limit', 'polls::tests::end_text_names_the_leaders_or_no_votes', 'polls::tests::start_content_uses_the_aggregated_msc3381_shape', 'polls::tests::drafts_are_cleaned_and_bounded_before_anything_is_built', 'history::tests::a_focused_view_is_owned_only_by_the_selection_that_loaded_it', 'tests::homeserver_must_not_send_password_over_plain_http', 'polls::tests::unsupported_remote_answer_ids_are_not_truncated_into_vote_targets', 'polls::tests::revoked_poll_actions_release_pending_work_and_report_uncertain_sends', 'history::tests::search_rejects_an_aba_selection_and_keeps_the_current_one', 'polls::tests::undisclosed_results_stay_withheld_until_the_poll_ends'}
           needed_sdk={'timeline::tests::polls::test_only_the_last_vote_from_a_user_is_counted', 'timeline::tests::polls::test_morpheus_pending_invalid_end_does_not_drop_a_pending_vote', 'timeline::tests::polls::test_morpheus_earliest_valid_end_wins_even_when_received_later', 'timeline::tests::polls::test_ending_a_poll_sets_end_time_to_results', 'timeline::tests::polls::test_votes_after_end_are_discarded', 'timeline::tests::polls::test_adding_response_doesnt_clear_latest_json_edit', 'timeline::tests::polls::test_morpheus_duplicate_pending_ends_do_not_stop_later_pending_votes', 'timeline::tests::polls::test_morpheus_unauthorized_poll_end_keeps_poll_open_and_creator_can_end', 'timeline::tests::polls::test_ending_poll_doesnt_clear_latest_json_edit', 'timeline::tests::polls::test_events_received_before_start_are_not_lost', 'timeline::tests::polls::test_edited_poll_is_displayed', 'timeline::tests::polls::test_poll_contains_relations', 'timeline::tests::polls::test_morpheus_known_moderator_may_end_another_users_poll', 'timeline::tests::polls::test_poll_is_displayed', 'timeline::tests::polls::test_a_somewhat_complex_voting_session_yields_the_expected_outcome', 'timeline::tests::polls::test_voting_adds_the_vote_to_the_results', 'timeline::tests::polls::test_morpheus_pending_moderator_end_is_checked_when_start_arrives', 'timeline::tests::polls::test_multiple_end_events_are_discarded'}
+          # The SDK-only graph omits Morpheus's Windows bundled-sqlite edge.
+          # Enable the same pinned SQLite amalgamation rather than requiring an
+          # unprovided system sqlite3.lib. No app/core/platform repeats.
           checks=[
-              ('native_app_build',['cargo','build','--locked','-p','morpheus-app','--features','native-calls'],70*60,None,set()),
-              ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
-                  '--bin','morpheus-app','--','--test-threads=1'],40*60,needed_app,allowed_app_ignore),
-              ('matrix_unit',['cargo','test','--locked','-p','morpheus-matrix','--lib','--','--test-threads=1'],20*60,needed_matrix,set()),
+              ('sdk_poll',['cargo','test','--locked','-p','matrix-sdk-ui',
+                  '--features','matrix-sdk/bundled-sqlite','--lib',
+                  'timeline::tests::polls::','--','--test-threads=1'],70*60,needed_sdk,set()),
           ]
-          # Config/RTC platform evidence is unchanged. SDK source and its own
-          # resolved graph are identical to accepted Linux18 case run39217737364;
-          # only the unrelated config crate's already locked libc edge differs.
-          if os.environ['RUNNER_OS']!='Linux':
-              checks.append(('sdk_poll',['cargo','test','--locked','-p','matrix-sdk-ui','--lib',
-                  'timeline::tests::polls::','--','--test-threads=1'],70*60,needed_sdk,set()))
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
               result=bounded(args,name,seconds)
