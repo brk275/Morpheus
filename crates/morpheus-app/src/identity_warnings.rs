@@ -171,6 +171,28 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
     });
 
     let weak = ui.as_weak();
+    let verify_live = live.clone();
+    let verify_handle = handle.clone();
+    ui.on_verify_identity_warning(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        if scope(&ui).is_none() || ui.get_identity_warning_busy() {
+            return;
+        }
+        // Verify exactly the member the banner names.
+        let user_id = ui.get_identity_warning_user().to_string();
+        let name = ui.get_identity_warning_name().to_string();
+        if !user_id.is_empty() {
+            crate::verification::request_user(
+                &ui,
+                verify_live.clone(),
+                &verify_handle,
+                user_id,
+                name,
+            );
+        }
+    });
+
+    let weak = ui.as_weak();
     ui.on_acknowledge_identity_warning(move || {
         if let Some(ui) = weak.upgrade() {
             acknowledge(&ui, &live, &handle);

@@ -71,6 +71,8 @@ export component SasVerificationPanel inherits Rectangle {
     in property <bool> active;
     in property <int> stage;
     in property <bool> busy;
+    // The other person in a user verification; empty when verifying devices.
+    in property <string> peer;
     in property <bool> request-initiator;
     // Set only by the person, after comparing both devices.
     in-out property <bool> compared;
@@ -131,10 +133,16 @@ export component SasVerificationPanel inherits Rectangle {
         padding: 14px;
         spacing: 7px;
         Text {
-            text: "Verify this device";
+            text: root.peer == "" ? "Verify this device" : "Verify " + root.peer;
             color: root.palette.ink;
             font-size: 13px * root.text-scale;
             font-weight: 700;
+        }
+        if root.peer != "" && root.stage != 0 : Text {
+            text: "Compare the values with " + root.peer + " in person or on a call you trust. Confirm only if every value matches.";
+            color: root.palette.muted;
+            font-size: 11px * root.text-scale;
+            wrap: word-wrap;
         }
         if root.stage == 0 : Text {
             text: "Start here, then approve on another signed-in, verified device of this account. Compare the values on both devices before confirming.";
@@ -323,7 +331,10 @@ export component IdentityWarningBanner inherits Rectangle {
     in property <int> others;
     in property <bool> busy;
     in property <string> error;
+    // Disabled while another verification or security action is running.
+    in property <bool> can-verify: true;
     callback acknowledge();
+    callback verify();
 
     background: root.palette.panel;
     height: row.preferred-height;
@@ -355,6 +366,12 @@ export component IdentityWarningBanner inherits Rectangle {
                 wrap: word-wrap;
                 accessible-live-region: polite;
             }
+        }
+        Button {
+            text: "Verify";
+            enabled: !root.busy && root.can-verify;
+            accessible-label: "Verify the identity of " + root.name + " by comparing emoji or numbers";
+            clicked => { root.verify(); }
         }
         Button {
             text: root.busy ? "Saving…" : root.kind == 2 ? "Withdraw verification" : "Accept change";

@@ -1,14 +1,14 @@
 //! Account-fenced device trust and verification controls for the native
 //! encryption center. Every call names the account the UI showed; a switched
 //! account is rejected before the SDK is touched. Nothing here verifies or
-//! trusts a device by itself: trust changes only through a SAS flow the user
-//! compared and confirmed on both devices.
+//! trusts a device or person by itself: trust changes only through a SAS flow
+//! the user compared and confirmed on both sides.
 
 use std::{path::PathBuf, time::Duration};
 
 use futures_util::{StreamExt, stream::BoxStream};
 use matrix_sdk::{
-    Client,
+    Client, Room, RoomMemberships,
     encryption::{
         recovery::RecoveryState,
         verification::{SasVerification, VerificationRequest},
@@ -28,6 +28,8 @@ use crate::{
 
 /// Bound for one device-list snapshot shown in Settings.
 const MAX_OWN_DEVICES: usize = 200;
+/// Direct chats with one user checked before asking them to verify.
+const MAX_DIRECT_CHATS: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -304,6 +306,53 @@ impl AccountManager {
         Ok(verification_info(&request))
     }
 
+    /// Ask another user to verify identities with this account by comparing
+    /// emoji or numbers. Morpheus never creates a direct chat or invites
+    /// anyone for this: every direct chat with them must already include
+    /// them, so the SDK neither invites them back nor creates a room.
+    pub async fn request_user_verification_for(
+        &self,
+        expected_account_id: &str,
+        user_id: &str,
+    ) -> Result<VerificationInfo> {
+        let client = self.encryption_client_for(expected_account_id).await?;
+        let user = parse_user_id(user_id)?;
+        if client.user_id() == Some(&*user) {
+            return Err(MatrixCoreError::Sdk(
+                "Verify your own devices from Verify this device.".into(),
+            ));
+        }
+        let rooms: Vec<Room> = client.get_dm_rooms(&user).take(MAX_DIRECT_CHATS).collect();
+        if rooms.is_empty() {
+            return Err(MatrixCoreError::Sdk(
+                "Start a direct chat with them first, then verify.".into(),
+            ));
+        }
+        for room in &rooms {
+            let members = room
+                .members(RoomMemberships::ACTIVE)
+                .await
+                .map_err(|_| MatrixCoreError::Sdk("Room members are unavailable.".into()))?;
+            if !members.iter().any(|member| member.user_id() == &*user) {
+                return Err(MatrixCoreError::Sdk(
+                    "A direct chat with them no longer includes them. Invite them back first."
+                        .into(),
+                ));
+            }
+        }
+        let identity = client
+            .encryption()
+            .get_user_identity(&user)
+            .await
+            .map_err(|_| MatrixCoreError::Sdk("Their identity is unavailable.".into()))?
+            .ok_or_else(|| MatrixCoreError::Sdk("Their identity is not known yet.".into()))?;
+        let request = identity
+            .request_verification_with_methods(vec![VerificationMethod::SasV1])
+            .await
+            .map_err(|_| MatrixCoreError::Sdk("The verification request was not sent.".into()))?;
+        Ok(verification_info(&request))
+    }
+
     /// Report that the compared SAS values differ. The SDK cancels the flow
     /// with a mismatch reason on both devices; nothing is signed.
     pub async fn sas_mismatch_for(
@@ -314,7 +363,6 @@ impl AccountManager {
     ) -> Result<()> {
         let state = self.state.lock().await;
         let client = &selected_loaded_for(&state, expected_account_id)?.client;
-        ensure_own_user(client, user_id)?;
         find_sas(client, user_id, flow_id)
             .await?
             .mismatch()
@@ -332,7 +380,6 @@ impl AccountManager {
     ) -> Result<VerificationOutcome> {
         let state = self.state.lock().await;
         let client = &selected_loaded_for(&state, expected_account_id)?.client;
-        ensure_own_user(client, user_id)?;
         let request = find_verification_request(client, user_id, flow_id).await?;
         let info = verification_info(&request);
         let cancel_info = match request.cancel_info() {
@@ -362,7 +409,6 @@ impl AccountManager {
         limit: Duration,
     ) -> Result<VerificationSnapshot> {
         let client = self.encryption_client_for(expected_account_id).await?;
-        ensure_own_user(&client, user_id)?;
         let user_id = parse_user_id(user_id)?;
         let deadline = tokio::time::Instant::now() + limit;
         loop {
@@ -407,17 +453,6 @@ async fn next_change(changes: &mut Option<BoxStream<'static, ()>>) -> Option<()>
         Some(changes) => changes.next().await,
         None => std::future::pending().await,
     }
-}
-
-/// Encryption-center flows verify devices of the signed-in account only.
-fn ensure_own_user(client: &Client, user_id: &str) -> Result<()> {
-    let user_id = parse_user_id(user_id)?;
-    if client.user_id() != Some(&*user_id) {
-        return Err(MatrixCoreError::Sdk(
-            "verification belongs to another user".into(),
-        ));
-    }
-    Ok(())
 }
 
 fn cancel_kind(code: &CancelCode) -> VerificationCancelKind {

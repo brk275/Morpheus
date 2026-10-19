@@ -2157,6 +2157,8 @@ export component AppWindow inherits Window {
     in-out property <bool> sas-compared: false;
     in-out property <string> sas-flow-id;
     in-out property <string> sas-other-user-id;
+    // Name of the other person in a user verification; empty for devices.
+    in-out property <string> sas-peer;
     in-out property <string> sas-emoji;
     in-out property <string> sas-decimals;
     in-out property <string> sas-error;
@@ -2501,6 +2503,7 @@ export component AppWindow inherits Window {
     callback cancel-device-signout();
     callback identity-scope-changed();
     callback acknowledge-identity-warning();
+    callback verify-identity-warning();
 
     in-out property <bool> account-menu-open: false;
     in-out property <bool> manage-accounts-open: false;
@@ -3476,7 +3479,14 @@ export component AppWindow inherits Window {
                     others: root.identity-warning-others;
                     busy: root.identity-warning-busy;
                     error: root.identity-warning-error;
+                    can-verify: root.sas-stage == 0 && !root.sas-busy && !root.security-busy && root.security-recovery-key == "";
                     acknowledge => { root.acknowledge-identity-warning(); }
+                    // The comparison runs in the verification panel in Security settings.
+                    verify => {
+                        root.verify-identity-warning();
+                        root.open-security();
+                        root.settings-search-choose("security.recovery");
+                    }
                 }
                 if root.config-error != "" : Rectangle {
                     height: 39px;
@@ -5206,6 +5216,7 @@ export component AppWindow inherits Window {
                                 active: root.page == 1;
                                 stage: root.sas-stage;
                                 busy: root.sas-busy;
+                                peer: root.sas-peer;
                                 request-initiator: root.sas-request-initiator;
                                 compared <=> root.sas-compared;
                                 emoji: root.sas-emoji;

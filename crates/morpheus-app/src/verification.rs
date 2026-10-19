@@ -255,6 +255,7 @@ pub(crate) fn clear_ui(ui: &AppWindow) {
     ui.set_sas_request_initiator(false);
     ui.set_sas_flow_id("".into());
     ui.set_sas_other_user_id("".into());
+    ui.set_sas_peer("".into());
     ui.set_sas_emoji("".into());
     ui.set_sas_decimals("".into());
     ui.set_sas_error("".into());
@@ -322,6 +323,70 @@ pub(crate) fn request_device(
     });
 }
 
+/// Ask another person to verify identities with this account, from an
+/// explicit Verify on their identity warning. The flow then runs like a
+/// device flow in the verification panel, labelled with their name; nothing
+/// is trusted until both people compare the values and confirm.
+pub(crate) fn request_user(
+    ui: &AppWindow,
+    live: Arc<LiveUi>,
+    handle: &Handle,
+    user_id: String,
+    name: String,
+) {
+    if !ui.get_live_session()
+        || ui.get_sas_stage() != IDLE
+        || ui.get_sas_busy()
+        || ui.get_security_busy()
+        || !ui.get_security_recovery_key().is_empty()
+        || live.security_gate.blocked()
+    {
+        return;
+    }
+    let account_id = ui.get_active_account_local_id().to_string();
+    if account_id.is_empty() || user_id.is_empty() {
+        return;
+    }
+    let operation = next_operation(ui);
+    ui.set_sas_busy(true);
+    ui.set_sas_incoming_loading(false);
+    ui.set_sas_error("".into());
+    ui.set_sas_notice(format!("Sending a verification request to {name}…").into());
+    let weak = ui.as_weak();
+    let flow_live = live.clone();
+    let flow_handle = handle.clone();
+    handle.spawn(async move {
+        let _transition = live.account_transition.lock().await;
+        let result = live
+            .manager
+            .request_user_verification_for(&account_id, &user_id)
+            .await;
+        let _ = weak.upgrade_in_event_loop(move |window| {
+            if !same_account(&window, &account_id, operation) {
+                return;
+            }
+            window.set_sas_busy(false);
+            match result {
+                Ok(info) => {
+                    let notice = format!("Ask {name} to accept, then compare the values.");
+                    begin_flow(&window, &flow_live, &flow_handle, info, notice);
+                    window.set_sas_peer(name.into());
+                }
+                Err(error) => {
+                    // The core's request messages are fixed text; anything
+                    // else gets a fixed fallback.
+                    let message = match error {
+                        MatrixCoreError::Sdk(message) => message,
+                        _ => "Could not send a verification request. Try again.".into(),
+                    };
+                    window.set_sas_notice("".into());
+                    window.set_sas_error(message.into());
+                }
+            }
+        });
+    });
+}
+
 /// Check the visible flow's progress. The watcher passes the flow it saw
 /// finish: that check runs even while another action is pending, because a
 /// finished flow must retire at once; every other check waits for pending
@@ -349,6 +414,9 @@ fn refresh_flow(window: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, finishe
     if account_id.is_empty() || user_id.is_empty() || flow_id.is_empty() {
         return;
     }
+    // A flow with another person: this device's own status says nothing
+    // about whether it completed.
+    let person = !window.get_sas_peer().is_empty();
     let operation = next_operation(window);
     window.set_sas_busy(true);
     let live = live.clone();
@@ -391,15 +459,16 @@ fn refresh_flow(window: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, finishe
         };
         // The SDK can remove a finished request before this poll sees
         // `is_done`. In that case, trust status is the durable result.
-        let device_status = if stage == WAITING_FOR_COMPLETION && request_was_pruned(&info) {
-            live.manager
-                .security_info()
-                .await
-                .ok()
-                .map(|status| status.device_verification)
-        } else {
-            None
-        };
+        let device_status =
+            if !person && stage == WAITING_FOR_COMPLETION && request_was_pruned(&info) {
+                live.manager
+                    .security_info()
+                    .await
+                    .ok()
+                    .map(|status| status.device_verification)
+            } else {
+                None
+            };
         let pruned_and_verified = verified_after_pruned_completion(stage, &info, device_status);
         let _ = weak.upgrade_in_event_loop(move |window| {
             if !same_flow(&window, &account_id, operation, &flow_id) {
@@ -413,7 +482,12 @@ fn refresh_flow(window: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, finishe
                 }
                 Ok(info) if info.is_done => {
                     clear_ui(&window);
-                    window.set_sas_notice("Device verification completed.".into());
+                    let done = if person {
+                        "Verification completed. Their identity is now verified."
+                    } else {
+                        "Device verification completed."
+                    };
+                    window.set_sas_notice(done.into());
                     window.invoke_refresh_security();
                     window.invoke_refresh_encryption_devices();
                 }
