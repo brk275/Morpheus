@@ -1,62 +1,89 @@
-//! Native attachment dialogs and local transfer state. Decrypted bytes are
-//! only written to a path selected by the user; nothing is opened or run.
+//! Local attachment file helpers. Decrypted bytes are only written to a path
+//! selected by the user; nothing is opened or run. The composer's upload
+//! queue lives in `attachment_workbench`.
 
 use std::{
-    collections::HashMap,
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
 };
-
-use tokio::sync::mpsc;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum UploadCommand {
-    Cancel,
-    Retry,
-}
-
-#[derive(Default)]
-pub struct UploadController {
-    current: Mutex<HashMap<i32, mpsc::UnboundedSender<UploadCommand>>>,
-}
-
-impl UploadController {
-    pub fn begin(&self, operation: i32) -> mpsc::UnboundedReceiver<UploadCommand> {
-        let (sender, receiver) = mpsc::unbounded_channel();
-        let mut current = self.current.lock().expect("Upload controller poisoned");
-        if let Some(old) = current.insert(operation, sender) {
-            let _ = old.send(UploadCommand::Cancel);
-        }
-        receiver
-    }
-
-    pub fn cancel(&self, operation: i32) -> bool {
-        self.send(operation, UploadCommand::Cancel)
-    }
-
-    pub fn retry(&self, operation: i32) -> bool {
-        self.send(operation, UploadCommand::Retry)
-    }
-
-    fn send(&self, operation: i32, command: UploadCommand) -> bool {
-        self.current
-            .lock()
-            .expect("Upload controller poisoned")
-            .get(&operation)
-            .is_some_and(|sender| sender.send(command).is_ok())
-    }
-
-    pub fn finish(&self, operation: i32) {
-        let mut current = self.current.lock().expect("Upload controller poisoned");
-        current.remove(&operation);
-    }
-}
 
 pub fn mime_type_for(path: &Path) -> String {
     mime_guess::from_path(path)
         .first_or_octet_stream()
         .to_string()
+}
+
+/// The name suggested to the native Save dialog for a name chosen by the
+/// sender. Only the last path component is kept; control, direction and
+/// zero-width characters and those Windows forbids become `_`; leading and
+/// trailing dots and spaces are trimmed; reserved device names are prefixed;
+/// and the result is bounded with its extension kept. The user still picks
+/// the location, and nothing is opened or run.
+pub fn safe_file_name(name: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    const MAX_EXTENSION_CHARS: usize = 16;
+    let last = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    let cleaned: String = last
+        .chars()
+        .map(|character| {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '<' | '>'
+                        | ':'
+                        | '"'
+                        | '|'
+                        | '?'
+                        | '*'
+                        | '\u{061c}'
+                        | '\u{200b}'..='\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2060}'..='\u{206f}'
+                        | '\u{feff}'
+                )
+            {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect();
+    let trimmed =
+        cleaned.trim_matches(|character: char| character == '.' || character.is_whitespace());
+    let mut name = if trimmed.is_empty() {
+        "attachment".to_owned()
+    } else {
+        trimmed.to_owned()
+    };
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let numbered = stem.len() == 4
+        && (stem.starts_with("COM") || stem.starts_with("LPT"))
+        && stem.as_bytes()[3].is_ascii_digit();
+    if numbered || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        name.insert(0, '_');
+    }
+    if name.chars().count() > MAX_CHARS {
+        let extension = name
+            .rsplit_once('.')
+            .map(|(_, extension)| extension.to_owned())
+            .filter(|extension| {
+                !extension.is_empty() && extension.chars().count() <= MAX_EXTENSION_CHARS
+            });
+        let reserved = extension
+            .as_ref()
+            .map_or(0, |extension| extension.chars().count() + 1);
+        let keep = MAX_CHARS - reserved;
+        let stem: String = name.chars().take(keep).collect();
+        name = match extension {
+            Some(extension) => format!("{stem}.{extension}"),
+            None => stem,
+        };
+    }
+    name
 }
 
 /// Called on the blocking pool after the account and room are checked again.
@@ -74,23 +101,27 @@ pub fn save_download(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+/// Submit a guarded plaintext save. A cancelled or abandoned operation never
+/// starts a write; an admitted write must finish and report its real result.
+/// Call only after account/room/selection guards have all been acquired.
+pub(crate) fn begin_download_save(
+    path: PathBuf,
+    bytes: Vec<u8>,
+    cancelled: &tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<io::Result<PathBuf>>> {
+    let stopped = cancelled.borrow();
+    if *stopped || cancelled.has_changed().is_err() {
+        return None;
+    }
+    // The read guard orders cancellation with submitting the real write.
+    Some(tokio::task::spawn_blocking(move || {
+        save_download(&path, &bytes)
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn upload_commands_target_matching_operation() {
-        let controller = UploadController::default();
-        let mut old = controller.begin(1);
-        let mut new = controller.begin(2);
-        assert!(old.try_recv().is_err());
-        assert!(controller.cancel(2));
-        assert_eq!(new.try_recv(), Ok(UploadCommand::Cancel));
-        assert!(controller.cancel(1));
-        assert_eq!(old.try_recv(), Ok(UploadCommand::Cancel));
-        assert!(controller.retry(1));
-        assert_eq!(old.try_recv(), Ok(UploadCommand::Retry));
-    }
 
     #[test]
     fn download_save_replaces_only_after_complete_write() {
@@ -104,5 +135,58 @@ mod tests {
             mime_type_for(Path::new("unknown.oddextension")),
             "application/octet-stream"
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_waiting_for_a_save_guard_never_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("chosen.bin");
+        std::fs::write(&target, b"original").unwrap();
+        let gate = tokio::sync::Mutex::new(());
+        let (cancel, signal) = tokio::sync::watch::channel(false);
+        {
+            let held = gate.lock().await;
+            let delayed = async {
+                let _guard = gate.lock().await;
+                begin_download_save(target.clone(), b"cancelled plaintext".to_vec(), &signal)
+            };
+            tokio::pin!(delayed);
+            assert!(futures_util::poll!(delayed.as_mut()).is_pending());
+            cancel.send(true).unwrap();
+            drop(held);
+            assert!(delayed.await.is_none());
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        let (abandoned, signal) = tokio::sync::watch::channel(false);
+        drop(abandoned);
+        assert!(
+            begin_download_save(target.clone(), b"abandoned plaintext".to_vec(), &signal).is_none()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        // After admission cancellation cannot turn a real write into a claim
+        // that nothing was written. Its caller must await this exact result.
+        let (cancel, signal) = tokio::sync::watch::channel(false);
+        let admitted =
+            begin_download_save(target.clone(), b"admitted plaintext".to_vec(), &signal).unwrap();
+        cancel.send(true).unwrap();
+        assert_eq!(admitted.await.unwrap().unwrap(), target);
+        assert_eq!(std::fs::read(&target).unwrap(), b"admitted plaintext");
+    }
+
+    #[test]
+    fn suggested_save_names_cannot_escape_or_disguise_the_chosen_folder() {
+        assert_eq!(safe_file_name("../../etc/passwd"), "passwd");
+        assert_eq!(safe_file_name("C:\\Users\\me\\evil.exe"), "evil.exe");
+        assert_eq!(safe_file_name("a<b>:c|d?.png"), "a_b__c_d_.png");
+        assert_eq!(safe_file_name("report\u{202e}fdp.exe"), "report_fdp.exe");
+        assert_eq!(safe_file_name(".bashrc"), "bashrc");
+        assert_eq!(safe_file_name(" . "), "attachment");
+        assert_eq!(safe_file_name(""), "attachment");
+        assert_eq!(safe_file_name("con.txt"), "_con.txt");
+        assert_eq!(safe_file_name("COM3"), "_COM3");
+        let long = format!("{}.jpeg", "x".repeat(300));
+        let bounded = safe_file_name(&long);
+        assert_eq!(bounded.chars().count(), 120);
+        assert!(bounded.ends_with(".jpeg"));
     }
 }

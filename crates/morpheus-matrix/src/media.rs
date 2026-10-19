@@ -40,7 +40,10 @@ use matrix_sdk::{
 use matrix_sdk_crypto::AttachmentDecryptor;
 use mime::Mime;
 use serde::{Deserialize, Serialize};
-use tokio::{sync::broadcast, task};
+use tokio::{
+    sync::{broadcast, watch},
+    task,
+};
 use url::{Host, Url};
 
 use crate::{AccountManager, MatrixCoreError, QueuedSendOutcome, Result, account_room};
@@ -57,6 +60,9 @@ const MAX_MATRIX_ERROR_BYTES: usize = 4096;
 const MAX_ATTACHMENT_EVENT_BYTES: usize = 1024 * 1024;
 const MAX_MEDIA_ADDRESS_BYTES: usize = 64 * 1024;
 const MAX_MEDIA_SERVER_BYTES: usize = 512;
+// A cancelled blocking read keeps its permit until its worker exits. Repeated
+// cancellation must not bypass the two-reader bound or grow the blocking pool.
+static ATTACHMENT_READERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -219,6 +225,11 @@ impl QueuedAttachment {
     }
 }
 
+async fn attachment_cancelled(signal: &watch::Receiver<bool>) {
+    let mut signal = signal.clone();
+    let _ = signal.wait_for(|stopped| *stopped).await;
+}
+
 struct ResolvedAttachment {
     metadata: AttachmentMetadata,
     source: MediaSource,
@@ -238,36 +249,95 @@ impl AccountManager {
         path: impl AsRef<Path>,
         mime_type: &str,
     ) -> Result<QueuedAttachment> {
+        let selection = self
+            .account_selection(expected_account_id)
+            .ok_or(MatrixCoreError::SelectedAccountChanged)?;
+        let (_keep_open, cancelled) = watch::channel(false);
+        self.send_attachment_selected_for(&selection, room_id, path, mime_type, &cancelled)
+            .await?
+            .ok_or(MatrixCoreError::SelectedAccountChanged)
+    }
+
+    /// Prepare a file for one exact account selection. Cancellation before the
+    /// SDK commit returns None and never queues a new upload. Once handed to
+    /// the SDK, await its real handle; callers can then explicitly abort it.
+    pub async fn send_attachment_selected_for(
+        &self,
+        selection: &crate::AccountSelection,
+        room_id: &str,
+        path: impl AsRef<Path>,
+        mime_type: &str,
+        cancelled: &watch::Receiver<bool>,
+    ) -> Result<Option<QueuedAttachment>> {
+        if !self.attachment_selection_is_current(selection) {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        if *cancelled.borrow() || cancelled.has_changed().is_err() {
+            return Ok(None);
+        }
         let mime_type = parse_mime(mime_type)?;
         let path = path.as_ref().to_path_buf();
-        let (filename, bytes) = task::spawn_blocking(move || read_bounded_file(&path))
-            .await
-            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))??;
+        let reader = tokio::select! {
+            biased;
+            _ = attachment_cancelled(cancelled) => return Ok(None),
+            _ = selection.revoked() => return Err(MatrixCoreError::SelectedAccountChanged),
+            permit = ATTACHMENT_READERS.acquire() => permit.map_err(|_| MatrixCoreError::InvalidMedia("attachment preparation is unavailable".into()))?,
+        };
+        let read = task::spawn_blocking(move || {
+            let _reader = reader;
+            read_bounded_file(&path)
+        });
+        let (filename, bytes) = tokio::select! {
+            biased;
+            _ = attachment_cancelled(cancelled) => return Ok(None),
+            _ = selection.revoked() => return Err(MatrixCoreError::SelectedAccountChanged),
+            value = read => value.map_err(|error| MatrixCoreError::Sdk(error.to_string()))??,
+        };
         let size = UInt::try_from(bytes.len() as u64)
             .map_err(|_| MatrixCoreError::InvalidMedia("attachment size is invalid".into()))?;
         let info = attachment_info(&mime_type, size);
-
-        // Hold the switch lock through queueing. If the user changed accounts
-        // while the file was read, no upload can be directed to the old room.
-        let state = self.state.lock().await;
-        if state.active_account_id.as_deref() != Some(expected_account_id) {
+        // Cancellation remains effective while waiting for the switch lock,
+        // authorization, and the subscription. None of these queues this file.
+        let state = tokio::select! {
+            biased;
+            _ = attachment_cancelled(cancelled) => return Ok(None),
+            _ = selection.revoked() => return Err(MatrixCoreError::SelectedAccountChanged),
+            state = self.state.lock() => state,
+        };
+        if !self.attachment_selection_is_current(selection)
+            || state.active_account_id.as_deref() != Some(selection.account_id())
+        {
             return Err(MatrixCoreError::SelectedAccountChanged);
         }
-        let room = account_room(&state, expected_account_id, room_id)?;
+        let room = account_room(&state, selection.account_id(), room_id)?;
         let loaded = state
             .loaded
-            .get(expected_account_id)
-            .ok_or_else(|| MatrixCoreError::AccountNotFound(expected_account_id.into()))?;
-        // Attachments enter the same room queue; the discovery gate decides
-        // whether that queue may run.
-        crate::resume_room_queue(loaded, &room).await?;
+            .get(selection.account_id())
+            .ok_or_else(|| MatrixCoreError::AccountNotFound(selection.account_id().into()))?;
+        tokio::select! {
+            biased;
+            _ = attachment_cancelled(cancelled) => return Ok(None),
+            _ = selection.revoked() => return Err(MatrixCoreError::SelectedAccountChanged),
+            result = crate::resume_room_queue(loaded, &room) => result?,
+        }
         let queue = room.send_queue();
-        let (_, updates) = queue
-            .subscribe()
-            .await
-            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
-        let handle = queue
-            .send_attachment(
+        let (_, updates) = tokio::select! {
+            biased;
+            _ = attachment_cancelled(cancelled) => return Ok(None),
+            _ = selection.revoked() => return Err(MatrixCoreError::SelectedAccountChanged),
+            result = queue.subscribe() => result.map_err(|error| MatrixCoreError::Sdk(error.to_string()))?,
+        };
+        if !self.attachment_selection_is_current(selection) {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        // Order the last cancellation check with handing the send to the SDK.
+        // Never drop an entered enqueue future and pretend it did not send.
+        let send = {
+            let stopped = cancelled.borrow();
+            if *stopped || cancelled.has_changed().is_err() {
+                return Ok(None);
+            }
+            queue.send_attachment(
                 filename,
                 mime_type,
                 bytes,
@@ -276,14 +346,25 @@ impl AccountManager {
                     ..Default::default()
                 },
             )
+        };
+        let handle = send
             .await
-            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
-        Ok(QueuedAttachment {
+            // An entered SDK enqueue may have persisted before an error.
+            // Never advertise this as a safe-to-resend preparation failure.
+            .map_err(|_| MatrixCoreError::AttachmentSendUncertain)?;
+        Ok(Some(QueuedAttachment {
             transaction_id: handle.transaction_id().to_string(),
             handle,
             updates,
             finished: false,
-        })
+        }))
+    }
+
+    fn attachment_selection_is_current(&self, selection: &crate::AccountSelection) -> bool {
+        selection.is_current()
+            && self
+                .account_selection(selection.account_id())
+                .is_some_and(|current| current.same_epoch(selection))
     }
 
     /// Inspect media metadata from an event without handing its encrypted
@@ -1412,6 +1493,101 @@ mod tests {
             .unwrap(),
             b"within limit"
         );
+    }
+
+    // Real public admission path, fresh synthetic profile, no client or vault
+    // credentials. Nonexistent paths prove rejected work never reads a file.
+    #[tokio::test]
+    async fn owned_upload_rejects_cancelled_closed_and_aba_selections_before_io() {
+        let root =
+            std::env::temp_dir().join(format!("morpheus-owned-upload-{}", uuid::Uuid::new_v4()));
+        let manager = AccountManager::open(&root).unwrap();
+        manager.selections.replace(Some("synthetic-account"));
+        let original = manager.account_selection("synthetic-account").unwrap();
+        let missing = root.join("must-not-be-read.png");
+        let (cancel, signal) = watch::channel(true);
+        let result = manager
+            .send_attachment_selected_for(
+                &original,
+                "!room:example.org",
+                &missing,
+                "image/png",
+                &signal,
+            )
+            .await;
+        assert!(matches!(result, Ok(None)));
+        cancel.send(false).unwrap();
+        drop(cancel);
+        assert!(matches!(
+            manager
+                .send_attachment_selected_for(
+                    &original,
+                    "!room:example.org",
+                    &missing,
+                    "image/png",
+                    &signal
+                )
+                .await,
+            Ok(None)
+        ));
+        let (_cancel, live) = watch::channel(false);
+        manager.selections.replace(Some("other-account"));
+        manager.selections.replace(Some("synthetic-account"));
+        assert!(matches!(
+            manager
+                .send_attachment_selected_for(
+                    &original,
+                    "!room:example.org",
+                    &missing,
+                    "image/png",
+                    &live
+                )
+                .await,
+            Err(MatrixCoreError::SelectedAccountChanged)
+        ));
+        let current = manager.account_selection("synthetic-account").unwrap();
+        assert!(!original.is_current() && current.is_current());
+        // A foreign manager's matching account string confers no authority.
+        let foreign = crate::account_selection::Selections::default();
+        foreign.replace(Some("synthetic-account"));
+        let foreign = foreign.for_account("synthetic-account").unwrap();
+        assert!(matches!(
+            manager
+                .send_attachment_selected_for(
+                    &foreign,
+                    "!room:example.org",
+                    &missing,
+                    "image/png",
+                    &live
+                )
+                .await,
+            Err(MatrixCoreError::SelectedAccountChanged)
+        ));
+        // Cancellation also wins while waiting for actual read admission.
+        {
+            let readers = ATTACHMENT_READERS.acquire_many(2).await.unwrap();
+            let (cancel, signal) = watch::channel(false);
+            let waiting = manager.send_attachment_selected_for(
+                &current,
+                "!room:example.org",
+                &missing,
+                "image/png",
+                &signal,
+            );
+            tokio::pin!(waiting);
+            assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+            cancel.send(true).unwrap();
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(2), waiting)
+                    .await
+                    .unwrap(),
+                Ok(None)
+            ));
+            drop(readers);
+        }
+        assert!(!missing.exists());
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

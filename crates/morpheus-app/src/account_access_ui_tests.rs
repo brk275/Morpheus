@@ -3656,6 +3656,28 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
 
     assert_account_theme_follows_accepted_snapshot(&ui);
 
+    // A queued production attachment refresh cannot restore old private rows
+    // while presentation IDs survive a revoked/detached live context.
+    ui.set_active_account_local_id("old-account".into());
+    ui.set_active_room_id("!private:example.org".into());
+    assert!(!live.is_live.load(std::sync::atomic::Ordering::Acquire));
+    for shown_live in [false, true] {
+        ui.set_live_session(shown_live);
+        crate::attachment_workbench::Workbench::queue_private_projection_for_test(
+            &ui,
+            live.clone(),
+            runtime.clone(),
+        );
+        assert_eq!(ui.get_attachment_items().row_count(), 1);
+        settle(&ui).await;
+        assert_eq!(ui.get_active_account_local_id().as_str(), "old-account");
+        assert_eq!(ui.get_active_room_id().as_str(), "!private:example.org");
+        assert_eq!(ui.get_attachment_items().row_count(), 0);
+        assert_eq!(ui.get_attachment_ready_count(), 0);
+        assert!(!ui.get_attachment_can_add());
+        assert!(ui.get_attachment_status().is_empty());
+    }
+
     // Seed private information in distinct user-visible surfaces, then use the
     // production detach adapter with a real Weak<AppWindow>, not Weak::default.
     ui.set_live_session(true);
@@ -3789,6 +3811,15 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     ui.set_pinned_can_edit(true);
     ui.set_pinned_state_loaded(true);
     crate::pinned_messages::seed_row_pins_for_test(&["$pinned:example.org"]);
+    // Reseed after the last settle so the independent real detach path, not
+    // the queued-refresh check above, must clear this private surface.
+    ui.set_attachment_items(ModelRc::new(VecModel::from(vec![crate::AttachmentItem {
+        name: "private attachment".into(),
+        ..Default::default()
+    }])));
+    ui.set_attachment_ready_count(1);
+    ui.set_attachment_can_add(true);
+    ui.set_attachment_status("private upload name".into());
     live.account_detached(ui.as_weak()).await;
     settle(&ui).await;
     assert!(!ui.get_live_session());
@@ -3799,6 +3830,9 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     assert!(!crate::pinned_messages::row_pinned(Some(
         "$pinned:example.org"
     )));
+    assert_eq!(ui.get_attachment_items().row_count(), 0);
+    assert_eq!(ui.get_attachment_ready_count(), 0);
+    assert!(!ui.get_attachment_can_add());
     // Both saved-send strips are cleared by the real detach path; no departed
     // scope's records, flags or notices survive.
     assert_eq!(ui.get_composer_pending_items().row_count(), 0);

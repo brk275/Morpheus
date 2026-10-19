@@ -173,6 +173,8 @@ pub enum MatrixCoreError {
     SelectedAccountChanged,
     #[error("the selected room changed before this action could run")]
     SelectedRoomChanged,
+    #[error("This attachment may already be queued. Check the room before sending it again.")]
+    AttachmentSendUncertain,
     #[error(
         "The message may already be queued. Keep the draft and check the send queue before retrying."
     )]

@@ -6,6 +6,8 @@ import { PollCreateDialog } from "poll-dialog.slint";
 // Rust drives poll drafts, pending actions and the create dialog through this global.
 export { PollOptionItem, PollUiState } from "poll-card.slint";
 import { PinnedMessageItem, PinnedMessagesPanel } from "pinned-messages.slint";
+import { AttachmentItem, AttachmentQueue } from "attachment-workbench.slint";
+import { MediaViewer } from "media-viewer.slint";
 
 // Optional overrides retain each control's existing color when absent.
 export struct ColorRole {
@@ -3452,10 +3454,14 @@ export component AppWindow inherits Window {
     callback respond-invite(string, bool);
     callback send-message(string);
     callback open-message-link(string);
+    // Composer attachment queue; see attachment-workbench.slint and
+    // src/attachment_workbench.rs.
     callback attach-file();
-    callback cancel-attachment();
-    callback retry-attachment();
+    callback send-attachments();
+    callback attachment-action(int, int);
+    callback attachment-context-changed();
     callback save-attachment(string, string);
+    callback cancel-attachment-save();
     callback preview-image-attachment(string, string);
     callback close-image-preview();
     callback dismiss-image-preview();
@@ -3464,11 +3470,21 @@ export component AppWindow inherits Window {
         shortcut-scope.focus();
     }
     callback set-encrypted-image-previews(bool);
+    // Media viewer; see media-viewer.slint and src/image_previews.rs.
+    callback preview-adjacent-image(int);
+    callback retry-image-preview();
+    callback cancel-image-preview-loading();
     in-out property <bool> image-preview-open: false;
     in-out property <bool> image-preview-loaded: false;
+    in-out property <bool> image-preview-loading: false;
+    in-out property <bool> image-preview-failed: false;
     in-out property <image> image-preview-image;
     in-out property <string> image-preview-title;
     in-out property <string> image-preview-status;
+    in-out property <string> image-preview-event-id;
+    in-out property <string> image-preview-position;
+    in-out property <bool> image-preview-has-previous: false;
+    in-out property <bool> image-preview-has-next: false;
     in-out property <string> image-preview-token;
     in-out property <string> image-preview-account-id;
     in-out property <string> image-preview-room-id;
@@ -3786,10 +3802,11 @@ export component AppWindow inherits Window {
     in-out property <bool> composer-markdown: false;
     in-out property <bool> composer-saved-markdown: false;
     in-out property <bool> composer-busy: false;
-    in-out property <bool> attachment-busy: false;
-    in-out property <bool> attachment-needs-retry: false;
+    in-out property <[AttachmentItem]> attachment-items;
+    in-out property <int> attachment-ready-count: 0;
+    in-out property <bool> attachment-can-add: true;
+    out property <bool> composer-sends-attachments: root.composer-text == "" && root.composer-mode == 0 && root.attachment-ready-count > 0;
     in-out property <string> attachment-status;
-    in-out property <int> attachment-operation: 0;
     in-out property <string> downloading-event-id;
     in-out property <int> download-operation: 0;
     in-out property <int> composer-operation: 0;
@@ -3842,10 +3859,10 @@ export component AppWindow inherits Window {
         if root.room-admin-mode != 0 { root.cancel-room-settings(); }
     }
     changed active-account-local-id => {
-        root.cancel-room-settings(); root.close-image-preview(); root.quick-switcher-open = false; root.incoming-call-notice = ""; root.mention-context-changed(); }
+        root.cancel-room-settings(); root.close-image-preview(); root.quick-switcher-open = false; root.incoming-call-notice = ""; root.mention-context-changed(); root.attachment-context-changed(); }
     changed active-account-index => { root.quick-switcher-open = false; root.mention-context-changed(); }
     changed active-room-id => {
-        root.cancel-room-settings(); root.close-image-preview(); root.mention-context-changed(); }
+        root.cancel-room-settings(); root.close-image-preview(); root.mention-context-changed(); root.attachment-context-changed(); }
     changed thread-root-id => {
         root.close-image-preview(); root.mention-context-changed();
         // A page request for the previous thread can no longer publish here.
@@ -4797,16 +4814,26 @@ export component AppWindow inherits Window {
                     }
                 }
                 if root.transfer-notice != "" : Rectangle {
+                    property <color> notice-ink: StyleTokens.roles.success-ink.present ? StyleTokens.roles.success-ink.color : #ffffff;
                     height: 30px;
                     background: StyleTokens.roles.success-surface.present ? StyleTokens.roles.success-surface.color : #214a46;
                     Text {
-                        x: 16px; width: parent.width - 32px;
+                        x: 16px; width: parent.width - 32px - (root.downloading-event-id != "" ? save-cancel.width + 8px : 0px);
                         text: root.transfer-notice;
                         accessible-live-region: polite;
-                        color: StyleTokens.roles.success-ink.present ? StyleTokens.roles.success-ink.color : #ffffff;
+                        color: parent.notice-ink;
                         font-size: 11px * root.text-scale;
                         vertical-alignment: center;
                         overflow: elide;
+                    }
+                    save-cancel := TextAction {
+                        visible: root.downloading-event-id != "";
+                        enabled: root.downloading-event-id != "";
+                        x: parent.width - self.width - 12px; y: 3px; width: self.preferred-width; height: 24px;
+                        text: "Cancel"; label: "Cancel saving the attachment";
+                        ink: parent.notice-ink; muted: parent.notice-ink; surface: transparent;
+                        hover-surface: root.hover; outline: parent.notice-ink; text-scale: root.text-scale;
+                        activated => { root.cancel-attachment-save(); }
                     }
                 }
                 // A style profile preview stays visible on every page until it
@@ -5292,10 +5319,10 @@ export component AppWindow inherits Window {
                     }
                     Rectangle {
                         property <length> status-height: root.composer-status-visible ? composer-status.height + 10px : 0px;
-                        height: root.composer-box-height + (root.composer-mode == 0 ? 20px : 51px) + (root.attachment-busy ? 29px : 0px) + self.status-height;
+                        height: root.composer-box-height + (root.composer-mode == 0 ? 20px : 51px) + attachment-queue.needed-height + self.status-height;
                         background: transparent;
                         composer-status := PendingSendStrip {
-                            x: 22px; y: (root.composer-mode == 0 ? 2px : 33px) + (root.attachment-busy ? 29px : 0px);
+                            x: 22px; y: (root.composer-mode == 0 ? 2px : 33px) + attachment-queue.needed-height;
                             width: parent.width - 44px;
                             items: root.composer-pending-items; blocked-notice: root.composer-blocked-notice;
                             composer-empty: root.composer-text == "";
@@ -5309,28 +5336,27 @@ export component AppWindow inherits Window {
                             discard(key) => { root.discard-record-text(false, key); }
                             discard-unreadable => { root.discard-unreadable-status(false); }
                         }
-                        if root.attachment-busy : HorizontalLayout {
-                            x: 22px; y: (root.composer-mode == 0 ? 2px : 33px) + parent.status-height;
-                            width: parent.width - 44px; height: 28px; spacing: 8px;
-                            Text {
-                                text: root.attachment-status;
-                                color: root.muted;
-                                font-size: 11px * root.text-scale;
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
-                                overflow: elide;
-                                accessible-live-region: polite;
-                            }
-                            if root.attachment-needs-retry : IconAction {
-                                width: 27px; height: 26px; icon: "↻"; label: "Retry queued attachment";
-                                ink: root.icon-active-ink; surface: transparent; hover-surface: root.hover;
-                                activated => { root.retry-attachment(); }
-                            }
-                            IconAction {
-                                width: 27px; height: 26px; icon: "×"; label: "Cancel attachment upload";
-                                ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
-                                activated => { root.cancel-attachment(); }
-                            }
+                        // The queue sits first; the saved-send strip follows it.
+                        attachment-queue := AttachmentQueue {
+                            x: 22px; y: root.composer-mode == 0 ? 2px : 33px;
+                            width: parent.width - 44px;
+                            items: root.attachment-items;
+                            ready-count: root.attachment-ready-count;
+                            status: root.attachment-status;
+                            text-scale: root.text-scale;
+                            palette: {
+                                ink: root.ink,
+                                muted: root.muted,
+                                accent: root.accent,
+                                accent-ink: root.accent-ink,
+                                surface: root.panel,
+                                hover: root.hover,
+                                divider: root.divider,
+                                focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent,
+                                error: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b
+                            };
+                            send => { root.send-attachments(); }
+                            action(id, kind) => { root.attachment-action(id, kind); }
                         }
                         if root.composer-mode != 0 : HorizontalLayout {
                             x: 20px; y: 4px; width: parent.width - 40px; height: 27px; spacing: 8px;
@@ -5348,7 +5374,7 @@ export component AppWindow inherits Window {
                         }
                         Rectangle {
                             x: root.content-inset;
-                            y: (root.composer-mode == 0 ? 7px : 38px) + (root.attachment-busy ? 29px : 0px) + parent.status-height;
+                            y: (root.composer-mode == 0 ? 7px : 38px) + attachment-queue.needed-height + parent.status-height;
                             width: max(0px, parent.width - 2 * root.content-inset);
                             height: root.composer-box-height;
                             border-radius: StyleTokens.composer-radius >= 0px ? StyleTokens.composer-radius : StyleTokens.radius * 1.1;
@@ -5362,8 +5388,8 @@ export component AppWindow inherits Window {
                                 padding-bottom: 11px;
                                 spacing: 6px;
                                 IconAction {
-                                    icon: "+"; label: "Attach file"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
-                                    enabled: root.live-session && root.active-room-id != "" && root.composer-mode == 0 && !root.attachment-busy;
+                                    icon: "+"; label: "Attach files"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                                    enabled: root.live-session && root.active-room-id != "" && root.composer-mode == 0 && root.attachment-can-add;
                                     activated => { root.attach-file(); }
                                 }
                                 IconAction {
@@ -5455,16 +5481,17 @@ export component AppWindow inherits Window {
                                             root.mention-cursor(false, self.caret-bytes, self.anchor-bytes, self.composing);
                                         }
                                         accepted => {
-                                            root.send-message(root.composer-text);
+                                            // An empty composer sends the room's ready attachments.
+                                            if root.composer-sends-attachments { root.send-attachments(); } else { root.send-message(root.composer-text); }
                                         }
                                     }
                                 }
                                 IconAction {
-                                    icon: "➤"; label: root.composer-mode == 2 ? "Save edit" : root.composer-mode == 1 ? "Send reply" : "Send message"; ink: root.icon-active-ink;
+                                    icon: "➤"; label: root.composer-sends-attachments ? "Send ready attachments" : root.composer-mode == 2 ? "Save edit" : root.composer-mode == 1 ? "Send reply" : "Send message"; ink: root.icon-active-ink;
                                     surface: transparent; hover-surface: root.hover;
                                     activated => {
                                         root.composer-caret = message-input.caret-bytes; root.composer-anchor = message-input.anchor-bytes; root.composer-preedit = message-input.composing;
-                                        root.send-message(root.composer-text);
+                                        if root.composer-sends-attachments { root.send-attachments(); } else { root.send-message(root.composer-text); }
                                     }
                                 }
                             }
@@ -8253,41 +8280,36 @@ export component AppWindow inherits Window {
             }
         }
 
-    if root.image-preview-open && root.image-preview-account-id == root.active-account-local-id && root.image-preview-room-id == root.active-room-id : FocusScope {
-        focus-on-tab-navigation: false;
-        init => { image-preview-close.focus(); }
-        capture-key-pressed(event) => {
-            if event.text == Key.Escape { root.dismiss-image-preview(); accept }
-            else if event.text == Key.Tab || event.text == Key.Backtab { image-preview-close.focus(); accept }
-            else { reject }
-        }
-        Rectangle {
-            background: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000cc;
-            TouchArea { width: parent.width; height: parent.height; }
-            Rectangle {
-                x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2;
-                width: min(980px, parent.width - 48px); height: min(760px, parent.height - 48px);
-                border-radius: 14px; border-width: 1px; border-color: root.accent; background: root.dialog-surface;
-                accessible-role: region; accessible-label: "Image preview " + root.image-preview-title;
-                VerticalLayout {
-                    padding: 16px; spacing: 12px;
-                    HorizontalLayout {
-                        Text { text: root.image-preview-title; color: root.ink; font-size: 15px * root.text-scale; font-weight: 700; overflow: elide; horizontal-stretch: 1; }
-                        image-preview-close := Button { text: "Close"; accessible-label: "Close image preview"; clicked => { root.dismiss-image-preview(); } }
-                    }
-                    Rectangle {
-                        background: StyleTokens.roles.media-backdrop.present ? StyleTokens.roles.media-backdrop.color : #11131b; vertical-stretch: 1; border-radius: 9px;
-                        if root.image-preview-loaded : Image {
-                            width: parent.width; height: parent.height; source: root.image-preview-image; image-fit: contain;
-                            accessible-role: image; accessible-label: "Attachment " + root.image-preview-title;
-                        }
-                        if !root.image-preview-loaded : Text { text: "▧"; color: root.muted; font-size: 54px; horizontal-alignment: center; vertical-alignment: center; }
-                    }
-                    Text { text: root.image-preview-status; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap;
-                        accessible-label: "Image preview status: " + root.image-preview-status; accessible-live-region: polite; }
-                }
-            }
-        }
+    if root.image-preview-open && root.image-preview-account-id == root.active-account-local-id && root.image-preview-room-id == root.active-room-id : MediaViewer {
+        image: root.image-preview-image;
+        loaded: root.image-preview-loaded;
+        loading: root.image-preview-loading;
+        failed: root.image-preview-failed;
+        title: root.image-preview-title;
+        status: root.image-preview-status;
+        position: root.image-preview-position;
+        has-previous: root.image-preview-has-previous;
+        has-next: root.image-preview-has-next;
+        can-save: root.image-preview-event-id != "" && root.downloading-event-id == "";
+        text-scale: root.text-scale;
+        palette: {
+            ink: root.ink,
+            muted: root.muted,
+            accent: root.accent,
+            accent-ink: root.accent-ink,
+            surface: root.dialog-surface,
+            backdrop: StyleTokens.roles.media-backdrop.present ? StyleTokens.roles.media-backdrop.color : #11131b,
+            scrim: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000cc,
+            hover: root.hover,
+            focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent,
+            error: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b
+        };
+        close => { root.dismiss-image-preview(); }
+        previous => { root.preview-adjacent-image(-1); }
+        next => { root.preview-adjacent-image(1); }
+        cancel-loading => { root.cancel-image-preview-loading(); }
+        retry => { root.retry-image-preview(); }
+        save => { root.save-attachment(root.image-preview-event-id, root.image-preview-title); }
     }
 
     if root.quick-switcher-open : FocusScope {
