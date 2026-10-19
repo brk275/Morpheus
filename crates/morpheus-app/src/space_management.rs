@@ -31,6 +31,10 @@ const JOIN_BODY: &str = "You join only this one, not the rest of the Space. Memb
 const MOVE_BODY: &str = "Everyone in the Space sees the new order.";
 const CREATE_BODY: &str = "Nobody else is invited, and nothing already in the Space changes.";
 pub(crate) const NOTHING_PICKED: &str = "Choose at least one room to add.";
+pub(crate) const BAD_USER_ID: &str = "Enter a full Matrix user ID, like @name:example.org.";
+const INVITE_BODY_START: &str = "They can join";
+const INVITE_BODY_END: &str =
+    "and see the rooms it lists. Each room keeps its own rules for who can join it.";
 pub(crate) const NOTHING_TO_REMOVE: &str = "Choose at least one entry to remove.";
 const UNLINK_MANY_BODY: &str = "Only these links are removed. Nobody leaves, no room is deleted, \
      and other Spaces keep them. They are removed one at a time, and the first failure stops \
@@ -392,6 +396,8 @@ pub(crate) enum Change {
         via: Vec<String>,
         is_space: bool,
     },
+    /// Invite one person to the Space itself.
+    Invite { user_id: String },
     /// Create a new room, or a sub-Space, inside the Space and list it there.
     Create {
         name: String,
@@ -423,6 +429,7 @@ impl Intent {
             Change::Join { room_id, .. } => room_id.as_str(),
             // New entries are not rows yet, and several entries mark none.
             Change::Create { .. } | Change::LinkMany { .. } | Change::UnlinkMany { .. } => "",
+            Change::Invite { .. } => "",
         }
     }
     /// Every reviewed link is still listed unchanged by a fresher load.
@@ -437,6 +444,7 @@ impl Intent {
             Change::Link { .. }
             | Change::LinkMany { .. }
             | Change::Join { .. }
+            | Change::Invite { .. }
             | Change::Create { .. } => true,
         }
     }
@@ -590,6 +598,12 @@ pub(crate) fn confirmation(intent: &Intent) -> Confirmation {
                 destructive: false,
             }
         }
+        Change::Invite { .. } => Confirmation {
+            title: format!("Invite {name} to {space}?"),
+            body: format!("{INVITE_BODY_START} {space} {INVITE_BODY_END}"),
+            action: "Invite",
+            destructive: false,
+        },
         Change::Join { is_space, .. } => {
             let kind = if *is_space { "Space" } else { "room" };
             Confirmation {
@@ -640,6 +654,7 @@ pub(crate) fn pending_text(intent: &Intent) -> String {
         Change::Replace { .. } => "Replacing",
         Change::Reorder { .. } => "Moving",
         Change::Join { .. } => "Joining",
+        Change::Invite { .. } => "Inviting",
         Change::Create { .. } => "Creating",
     };
     format!("{verb} {}… Waiting for the homeserver.", intent.name)
@@ -676,6 +691,10 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: SpaceWriteOutcome) -> Strin
         Change::Replace { .. } => replaced_text(name, &intent.space, outcome),
         Change::Reorder { .. } => format!("Moved {name}. The homeserver confirmed the order."),
         Change::Join { .. } => format!("Joined {name}."),
+        Change::Invite { .. } => {
+            let space = &intent.space;
+            format!("Invited {name} to {space}. The homeserver confirmed it.")
+        }
         Change::Create { .. } => format!("Created {name}."),
     }
 }
@@ -716,6 +735,21 @@ fn unlinked_text(name: &str, space: &str, outcome: SpaceWriteOutcome) -> String 
         );
     }
     format!("Removed {name} from {space}; the rooms themselves are unchanged.")
+}
+
+/// A full Matrix user ID as typed, trimmed; the session parses it exactly.
+pub(crate) fn parse_user_id(input: &str) -> Result<String, String> {
+    let user_id = input.trim();
+    let shaped = user_id.len() <= 255
+        && user_id.starts_with('@')
+        && user_id.contains(':')
+        && !user_id.chars().any(char::is_whitespace)
+        && !user_id.chars().any(char::is_control);
+    if shaped {
+        Ok(user_id.to_owned())
+    } else {
+        Err(BAD_USER_ID.to_owned())
+    }
 }
 
 /// "1 entry" or "N entries", for a removal of several.
@@ -889,12 +923,13 @@ pub(crate) fn error_text(error: RoomAdminError) -> String {
             "Moving it needs too many order keys at once. Give nearby entries order keys first."
         }
         RoomAdminError::InvalidName => "Enter a room name of up to 255 bytes, on one line.",
+        // Invitations to the Space.
+        RoomAdminError::AlreadyJoined => "They are already a member of this Space.",
+        RoomAdminError::AlreadyInvited => "They already have a pending invitation.",
+        RoomAdminError::TargetBanned => "They are banned from this Space. Unban them first.",
+        RoomAdminError::InvalidUserId => BAD_USER_ID,
         RoomAdminError::CreatorProtected
         | RoomAdminError::SelfTarget
-        | RoomAdminError::AlreadyJoined
-        | RoomAdminError::AlreadyInvited
-        | RoomAdminError::TargetBanned
-        | RoomAdminError::InvalidUserId
         | RoomAdminError::InvalidPowerLevel
         | RoomAdminError::InvalidReason => "This change cannot be made here.",
     };
@@ -1054,6 +1089,36 @@ mod tests {
         let confirmation = confirmation(&intent);
         assert!(confirmation.destructive);
         assert!(confirmation.body.contains("Nobody leaves"));
+    }
+
+    #[test]
+    fn inviting_to_the_space_is_reviewed_and_membership_refusals_are_named() {
+        let kim = parse_user_id(" @kim:example.org ").unwrap();
+        assert_eq!(kim, "@kim:example.org");
+        for invalid in ["kim", "@kim", "@ki m:example.org", ""] {
+            assert_eq!(parse_user_id(invalid), Err(BAD_USER_ID.to_owned()));
+        }
+        let intent = Intent {
+            change: Change::Invite {
+                user_id: "@kim:example.org".to_owned(),
+            },
+            name: "@kim:example.org".to_owned(),
+            space: "Crew".to_owned(),
+        };
+        assert_eq!(intent.room_id(), "");
+        let review = confirmation(&intent);
+        assert!(!review.destructive && review.title == "Invite @kim:example.org to Crew?");
+        assert!(review.body.contains("Each room keeps its own rules"));
+        let invited = SpaceWriteOutcome {
+            accepted: 1,
+            requested: 1,
+            confirmed: true,
+            stopped: None,
+        };
+        let text = outcome_text(&intent, invited);
+        assert!(text.starts_with("Invited @kim:example.org to Crew."));
+        let already = error_text(RoomAdminError::AlreadyJoined);
+        assert_eq!(already, "They are already a member of this Space.");
     }
 
     #[test]

@@ -11,10 +11,10 @@ use std::sync::{
 };
 
 use morpheus_matrix::{
-    AccountSelection, ChildKind, CreatedChild, HierarchyPage, MAX_CHILD_NAME_BYTES,
-    MAX_HIERARCHY_PAGES, MAX_LINKS_AT_ONCE, MatrixLinkTarget, RoomAdminError, RoomMembership,
-    RoomSettingsCancellation, SpaceChildLink, SpaceNode, SpacePermissions, SpaceSession,
-    SpaceTarget, SpaceWriteOutcome,
+    AccountSelection, AdminAction, AdminRequest, ChildKind, CreatedChild, HierarchyPage,
+    MAX_CHILD_NAME_BYTES, MAX_HIERARCHY_PAGES, MAX_LINKS_AT_ONCE, MatrixLinkTarget,
+    MemberExpectation, RoomAdminError, RoomMembership, RoomSettingsCancellation, SpaceChildLink,
+    SpaceNode, SpacePermissions, SpaceSession, SpaceTarget, SpaceWriteOutcome,
 };
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use tokio::{runtime::Handle, sync::Notify};
@@ -46,6 +46,7 @@ pub(crate) const ADD_PICKED: i32 = 16;
 pub(crate) const CLOSE_ROOMS: i32 = 17;
 pub(crate) const CHOOSE_REMOVALS: i32 = 18;
 pub(crate) const REMOVE_PICKED: i32 = 19;
+pub(crate) const INVITE: i32 = 20;
 /// Spaces remembered for Back, newest last.
 const MAX_TRAIL: usize = 8;
 
@@ -470,6 +471,7 @@ impl SpaceManagerUi {
             CLOSE_ROOMS => self.close_rooms(ui, &panel),
             CHOOSE_REMOVALS => self.choose_removals(ui, &panel),
             REMOVE_PICKED => self.review_removals(ui, panel),
+            INVITE => self.review_invite(ui, panel),
             _ => {}
         }
     }
@@ -857,6 +859,21 @@ impl SpaceManagerUi {
         }
     }
 
+    fn review_invite(self: &Arc<Self>, ui: &AppWindow, panel: Arc<Panel>) {
+        let allowed = panel.lock().permissions.is_some_and(|p| p.invite);
+        if !self.idle(&panel) || !allowed {
+            return;
+        }
+        let input = ui.get_space_manager_invite_input();
+        match super::parse_user_id(input.as_str()) {
+            Ok(user_id) => {
+                let name = crate::directory_plain_text(&user_id, 260);
+                self.review(ui, panel, Change::Invite { user_id }, name);
+            }
+            Err(message) => self.reject(ui, &panel, message),
+        }
+    }
+
     fn review_replace(self: &Arc<Self>, ui: &AppWindow, panel: Arc<Panel>) {
         if !self.idle(&panel) {
             return;
@@ -992,6 +1009,14 @@ impl SpaceManagerUi {
                         Change::Link { target, suggested, order } => session.link(&target, suggested, order.as_deref()).await?,
                         Change::LinkMany { targets, suggested } => session.link_many(&targets, suggested).await?,
                         Change::UnlinkMany { links } => session.unlink_many(&links).await?,
+                        Change::Invite { user_id } => {
+                            // The room-administration path: fresh membership and levels, one send, a read-back.
+                            let admin = this.live.manager.open_room_admin_for(&panel.selection, &panel.space, panel.cancellation.clone()).await?;
+                            let expected = MemberExpectation { membership: None, power: None };
+                            let request = AdminRequest { action: AdminAction::Invite, user_id, expected, reason: None };
+                            let invited = admin.apply(request).await?;
+                            SpaceWriteOutcome { accepted: 1, requested: 1, confirmed: invited.confirmed, stopped: None }
+                        }
                         Change::Update { link, suggested, order } => session.update(&link, suggested, order.as_deref()).await?,
                         Change::Unlink { link } => session.unlink(&link).await?,
                         Change::Replace { link, .. } => session.replace(&link).await?,
@@ -1240,6 +1265,7 @@ fn reset_inputs(ui: &AppWindow, intent: &Intent) {
         Change::LinkMany { .. } | Change::UnlinkMany { .. } => {
             ui.set_space_manager_pick_query("".into());
         }
+        Change::Invite { .. } => ui.set_space_manager_invite_input("".into()),
         Change::Create { .. } => {
             ui.set_space_manager_create_name("".into());
             ui.set_space_manager_create_is_space(false);
@@ -1372,6 +1398,7 @@ fn render(
         target_ready: state.target.is_some() && can_manage,
         ..SpaceManagerView::default()
     };
+    view.can_invite = state.permissions.is_some_and(|granted| granted.invite);
     view.rooms_open = state.rooms.is_some();
     view.removing_open = state.removing;
     view.picked = i32::try_from(state.picked.len()).unwrap_or(i32::MAX);
@@ -1420,6 +1447,7 @@ pub(crate) fn clear_presentation(ui: &AppWindow) {
     ui.set_space_manager_removals(ModelRc::new(VecModel::<SpacePick>::default()));
     ui.set_space_manager_query("".into());
     ui.set_space_manager_pick_query("".into());
+    ui.set_space_manager_invite_input("".into());
     ui.set_space_manager_target_input("".into());
     ui.set_space_manager_target_order("".into());
     ui.set_space_manager_target_suggested(false);

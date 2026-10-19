@@ -76,6 +76,8 @@ export struct SpaceManagerView {
     // The list of this Space's entries to remove several of is open; it
     // shares the picked count.
     removing-open: bool,
+    // The account may invite people to the Space.
+    can-invite: bool,
     confirm-open: bool,
     confirm-title: string,
     confirm-body: string,
@@ -187,6 +189,8 @@ export component SpaceManagerPage inherits VerticalLayout {
     in property <[SpacePick]> removals;
     // Narrows the list of joined rooms offered for adding.
     in-out property <string> pick-query;
+    // The Matrix user ID typed to invite to the Space.
+    in-out property <string> invite-input;
     in-out property <string> query;
     in-out property <string> target-input;
     in-out property <bool> target-suggested;
@@ -204,7 +208,7 @@ export component SpaceManagerPage inherits VerticalLayout {
     // 12 create a room here, 13 back to the previous Space, 14 list an upgraded
     // room's replacement in its place, 15 list your joined rooms, 16 add the
     // picked rooms, 17 close either pick list, 18 list entries to remove,
-    // 19 remove the picked entries
+    // 19 remove the picked entries, 20 invite the typed user to the Space
     callback action(int);
     callback select(string);
     // Pick or unpick one listed joined room by its room ID.
@@ -687,6 +691,35 @@ export component SpaceManagerPage inherits VerticalLayout {
                             primary: true;
                             enabled: !root.view.busy && root.create-name != "";
                             activated => { root.action(12); }
+                        }
+                    }
+                }
+            }
+            if root.ready && root.view.can-invite : Rectangle {
+                background: root.palette.elevated;
+                border-color: root.palette.divider; border-width: 1px; border-radius: 10px;
+                accessible-role: groupbox;
+                accessible-label: "Invite people to this Space";
+                VerticalLayout {
+                    padding: 12px; spacing: 6px;
+                    Text { text: "INVITE PEOPLE"; color: root.palette.muted; font-size: 9px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
+                    HorizontalLayout {
+                        spacing: 5px;
+                        RosterField {
+                            horizontal-stretch: 1;
+                            palette: root.palette; text-scale: root.text-scale;
+                            placeholder: "@name:example.org";
+                            label: "Matrix user ID to invite to this Space";
+                            enabled: !root.view.busy;
+                            text <=> root.invite-input;
+                            accepted => { if !root.view.busy && root.invite-input != "" { root.action(20); } }
+                        }
+                        RosterButton {
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: "Invite…";
+                            label: "Review inviting this Matrix user to the Space";
+                            enabled: !root.view.busy && root.invite-input != "";
+                            activated => { root.action(20); }
                         }
                     }
                 }

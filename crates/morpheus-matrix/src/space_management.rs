@@ -142,6 +142,8 @@ pub struct SpacePermissions {
     /// The level needed to change child links.
     pub required_level: i64,
     pub own_power: MemberPower,
+    /// The account may invite people to the Space.
+    pub invite: bool,
 }
 
 /// Where the route servers of a new link came from.
@@ -293,6 +295,7 @@ impl SpaceSession {
             manage_children: levels.user_can_send_state(own, StateEventType::SpaceChild),
             required_level: levels.for_state(StateEventType::SpaceChild).into(),
             own_power: room_admin::member_power(&levels, own),
+            invite: levels.user_can_invite(own),
         })
     }
     async fn require_manage(&self) -> Result<()> {
