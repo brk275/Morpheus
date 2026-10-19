@@ -64,7 +64,7 @@ fn hint(poll: &PollInfo) -> String {
     if poll.ended {
         "Poll ended".into()
     } else if poll.max_selections == 0 {
-        "This poll does not accept votes".into()
+        "Voting is unavailable for this poll".into()
     } else if poll.max_selections == 1 {
         "Choose one option, then vote".into()
     } else {

@@ -278,8 +278,11 @@ async fn morpheus_pending_invalid_end_does_not_drop_a_pending_vote() {
     let poll_id = event_id!("$pending_poll");
     timeline.send_poll_end(&BOB, "invalid", poll_id).await;
     timeline.send_poll_response(&ALICE, vec!["id_up"], poll_id).await;
-    let start = UnstablePollStartEventContent::from(NewUnstablePollStartEventContent::new(fakes::poll_a()));
-    timeline.handle_live_event(timeline.factory.event(start).sender(&ALICE).event_id(poll_id)).await;
+    let start =
+        UnstablePollStartEventContent::from(NewUnstablePollStartEventContent::new(fakes::poll_a()));
+    timeline
+        .handle_live_event(timeline.factory.event(start).sender(&ALICE).event_id(poll_id))
+        .await;
     let results = timeline.poll_state().await.results();
     assert!(results.end_time.is_none());
     assert_eq!(results.votes["id_up"], vec![ALICE.to_string()]);
@@ -291,8 +294,11 @@ async fn morpheus_pending_moderator_end_is_checked_when_start_arrives() {
     let timeline = super::TestTimelineBuilder::new().provider(provider).build().await;
     let poll_id = event_id!("$pending_moderated_poll");
     timeline.send_poll_end(&BOB, "moderated", poll_id).await;
-    let start = UnstablePollStartEventContent::from(NewUnstablePollStartEventContent::new(fakes::poll_a()));
-    timeline.handle_live_event(timeline.factory.event(start).sender(&ALICE).event_id(poll_id)).await;
+    let start =
+        UnstablePollStartEventContent::from(NewUnstablePollStartEventContent::new(fakes::poll_a()));
+    timeline
+        .handle_live_event(timeline.factory.event(start).sender(&ALICE).event_id(poll_id))
+        .await;
     assert!(timeline.poll_state().await.results().end_time.is_some());
 }
 
@@ -301,10 +307,22 @@ async fn morpheus_earliest_valid_end_wins_even_when_received_later() {
     let timeline = TestTimeline::new().await;
     timeline.send_poll_start(&ALICE, fakes::poll_a()).await;
     let poll_id = timeline.poll_event().await.event_id().unwrap().to_owned();
-    timeline.handle_live_event(timeline.factory.poll_response(vec!["id_up"], &poll_id).sender(&ALICE).server_ts(75u64)).await;
-    timeline.handle_live_event(timeline.factory.poll_end("later", &poll_id).sender(&ALICE).server_ts(100u64)).await;
+    timeline
+        .handle_live_event(
+            timeline.factory.poll_response(vec!["id_up"], &poll_id).sender(&ALICE).server_ts(75u64),
+        )
+        .await;
+    timeline
+        .handle_live_event(
+            timeline.factory.poll_end("later", &poll_id).sender(&ALICE).server_ts(100u64),
+        )
+        .await;
     assert_eq!(timeline.poll_state().await.results().votes["id_up"], vec![ALICE.to_string()]);
-    timeline.handle_live_event(timeline.factory.poll_end("earlier", &poll_id).sender(&ALICE).server_ts(50u64)).await;
+    timeline
+        .handle_live_event(
+            timeline.factory.poll_end("earlier", &poll_id).sender(&ALICE).server_ts(50u64),
+        )
+        .await;
     let results = timeline.poll_state().await.results();
     assert_eq!(results.end_time.unwrap().0.get(), 50);
     assert!(results.votes.values().all(Vec::is_empty));
@@ -314,11 +332,26 @@ async fn morpheus_earliest_valid_end_wins_even_when_received_later() {
 async fn morpheus_duplicate_pending_ends_do_not_stop_later_pending_votes() {
     let timeline = TestTimeline::new().await;
     let poll_id = event_id!("$pending_duplicate_end");
-    timeline.handle_live_event(timeline.factory.poll_end("first", poll_id).sender(&ALICE).server_ts(100u64)).await;
-    timeline.handle_live_event(timeline.factory.poll_end("duplicate", poll_id).sender(&ALICE).server_ts(200u64)).await;
-    timeline.handle_live_event(timeline.factory.poll_response(vec!["id_up"], poll_id).sender(&ALICE).server_ts(50u64)).await;
-    let start = UnstablePollStartEventContent::from(NewUnstablePollStartEventContent::new(fakes::poll_a()));
-    timeline.handle_live_event(timeline.factory.event(start).sender(&ALICE).event_id(poll_id)).await;
+    timeline
+        .handle_live_event(
+            timeline.factory.poll_end("first", poll_id).sender(&ALICE).server_ts(100u64),
+        )
+        .await;
+    timeline
+        .handle_live_event(
+            timeline.factory.poll_end("duplicate", poll_id).sender(&ALICE).server_ts(200u64),
+        )
+        .await;
+    timeline
+        .handle_live_event(
+            timeline.factory.poll_response(vec!["id_up"], poll_id).sender(&ALICE).server_ts(50u64),
+        )
+        .await;
+    let start =
+        UnstablePollStartEventContent::from(NewUnstablePollStartEventContent::new(fakes::poll_a()));
+    timeline
+        .handle_live_event(timeline.factory.event(start).sender(&ALICE).event_id(poll_id))
+        .await;
     let results = timeline.poll_state().await.results();
     assert_eq!(results.end_time.unwrap().0.get(), 100);
     assert_eq!(results.votes["id_up"], vec![ALICE.to_string()]);

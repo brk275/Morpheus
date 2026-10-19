@@ -171,9 +171,10 @@ pub(super) trait RoomDataProvider:
 impl RoomDataProvider for Room {
     async fn user_can_redact_others<'a>(&'a self, user_id: &'a UserId) -> bool {
         // Do not turn a store/parse failure into guessed moderator powers.
-        (**self).power_levels().await.is_ok_and(|levels| {
-            levels.user_can_redact_event_of_other(user_id)
-        })
+        (**self)
+            .power_levels()
+            .await
+            .is_ok_and(|levels| levels.user_can_redact_event_of_other(user_id))
     }
 
     fn room_id(&self) -> &RoomId {

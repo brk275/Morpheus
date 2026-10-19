@@ -63,6 +63,7 @@ pub const MIN_POLL_ANSWER_COUNT: usize = 2;
 pub const MAX_POLL_ANSWER_COUNT: usize = 20;
 
 const MAX_POLL_EVENT_BYTES: usize = 16 * 1024;
+const MAX_POLL_ANSWER_ID_BYTES: usize = 1024;
 const MAX_POWER_EVENT_BYTES: usize = 512 * 1024;
 const SEND_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -483,9 +484,20 @@ fn check_vote(
     if chosen.is_empty() || count > max_selections {
         return Err(PollError::InvalidChoice);
     }
+    let mut known_ids = HashSet::new();
+    if known.len() > MAX_POLL_ANSWER_COUNT
+        || known.iter().any(|id| {
+            id.is_empty() || id.len() > MAX_POLL_ANSWER_ID_BYTES || !known_ids.insert(*id)
+        })
+    {
+        return Err(PollError::InvalidChoice);
+    }
     let mut seen = HashSet::new();
     for id in chosen {
-        if !seen.insert(id.as_str()) || !known.contains(&id.as_str()) {
+        if id.len() > MAX_POLL_ANSWER_ID_BYTES
+            || !seen.insert(id.as_str())
+            || !known_ids.contains(id.as_str())
+        {
             return Err(PollError::InvalidChoice);
         }
     }
@@ -560,8 +572,8 @@ fn core_failure(error: MatrixCoreError) -> PollError {
     }
 }
 
-// Keep only a fixed category. A server answer means nothing was accepted;
-// anything else may have reached the server.
+// Keep only a fixed category. A gateway timeout or server failure can follow
+// acceptance, so only a definite client rejection claims nothing was sent.
 fn send_failure(error: &matrix_sdk::Error) -> PollError {
     match error.as_client_api_error() {
         Some(error)
@@ -570,8 +582,13 @@ fn send_failure(error: &matrix_sdk::Error) -> PollError {
         {
             PollError::RateLimited
         }
-        Some(_) => PollError::Rejected,
-        None => PollError::Uncertain,
+        Some(error)
+            if (400..500).contains(&error.status_code.as_u16())
+                && error.status_code.as_u16() != 408 =>
+        {
+            PollError::Rejected
+        }
+        _ => PollError::Uncertain,
     }
 }
 
@@ -664,18 +681,33 @@ fn project(
         .flat_map(|(id, _)| voters_of(votes, id).iter().map(String::as_str))
         .collect();
     let own = own_user_id.map(UserId::as_str);
-    let limit = max_selections.min(u64::try_from(answers.len()).unwrap_or(0));
+    let mut ids = HashSet::new();
+    let usable_ids = answers
+        .iter()
+        .all(|(id, _)| !id.is_empty() && id.len() <= MAX_POLL_ANSWER_ID_BYTES && ids.insert(*id));
+    let limit = if usable_ids {
+        max_selections.min(u64::try_from(answers.len()).unwrap_or(0))
+    } else {
+        0
+    };
     PollInfo {
         question: display_text(question, MAX_POLL_QUESTION_CHARS),
         answers: answers
             .iter()
             .zip(&counts)
             .map(|((id, text), count)| PollAnswerInfo {
-                id: (*id).to_owned(),
+                // Never truncate an opaque ID into a different vote target.
+                // An unsupported poll stays readable but offers no vote.
+                id: if usable_ids {
+                    (*id).to_owned()
+                } else {
+                    String::new()
+                },
                 text: display_text(text, MAX_POLL_ANSWER_CHARS),
                 votes: visible.then_some(*count),
                 leading: visible && top > 0 && *count == top,
-                chosen: own.is_some_and(|own| voters_of(votes, id).iter().any(|user| user == own)),
+                chosen: usable_ids
+                    && own.is_some_and(|own| voters_of(votes, id).iter().any(|user| user == own)),
             })
             .collect(),
         max_selections: u32::try_from(limit).unwrap_or(0),
@@ -713,6 +745,7 @@ fn clean_text(text: &str) -> String {
 /// Remote text as one bounded display line.
 fn display_text(text: &str, max_chars: usize) -> String {
     let line: String = text
+        .trim()
         .chars()
         .filter(|character| !hidden_character(*character))
         .map(|character| {
@@ -722,6 +755,8 @@ fn display_text(text: &str, max_chars: usize) -> String {
                 character
             }
         })
+        // Remote text is never copied in full merely to display a short line.
+        .take(max_chars.saturating_add(1))
         .collect();
     let line = line.trim();
     if line.chars().count() <= max_chars {
@@ -920,6 +955,41 @@ mod tests {
         assert_eq!(info.answers[0].text.chars().count(), MAX_POLL_ANSWER_CHARS);
         assert_eq!(info.voters, Some(0));
         assert!(info.edited && info.answers.iter().all(|answer| !answer.chosen));
+    }
+
+    #[test]
+    fn unsupported_remote_answer_ids_are_not_truncated_into_vote_targets() {
+        let huge = "i".repeat(MAX_POLL_ANSWER_ID_BYTES + 1);
+        for answers in [
+            vec![(huge.as_str(), "A"), ("b", "B")],
+            vec![("same", "A"), ("same", "B")],
+        ] {
+            let info = project(
+                "Question",
+                &PollKind::Disclosed,
+                1,
+                &answers,
+                &HashMap::new(),
+                (false, false),
+                None,
+            );
+            assert_eq!(info.max_selections, 0);
+            assert!(
+                info.answers
+                    .iter()
+                    .all(|answer| answer.id.is_empty() && !answer.chosen)
+            );
+            let known: Vec<_> = answers.iter().map(|(id, _)| *id).collect();
+            assert_eq!(
+                check_vote(&known, 1, false, &["b".to_owned()]),
+                Err(PollError::InvalidChoice)
+            );
+        }
+        let long = "x".repeat(1_000_000);
+        assert_eq!(
+            display_text(&long, MAX_POLL_QUESTION_CHARS).chars().count(),
+            MAX_POLL_QUESTION_CHARS
+        );
     }
 
     #[test]

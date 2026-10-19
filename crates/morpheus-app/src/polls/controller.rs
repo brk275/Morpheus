@@ -419,11 +419,16 @@ fn publish_dialog(ui: &AppWindow) {
 fn edit_dialog(ui: &AppWindow, edit: impl FnOnce(&mut PollDraft)) {
     let edited = STATE.with_borrow_mut(|state| match state.dialog.as_mut() {
         Some(dialog) if !dialog.busy => {
+            let previous = dialog.draft.clone();
             edit(&mut dialog.draft);
-            // A different draft is a different poll; never dedupe it away.
-            dialog.key = PollSendKey::new();
             let count = dialog.draft.answers.len().max(1);
             dialog.draft.max_selections = dialog.draft.max_selections.clamp(1, count);
+            if dialog.draft == previous {
+                // Re-entering identical text or a clamped step is still the
+                // same poll. Preserve its retry transaction after uncertainty.
+                return false;
+            }
+            dialog.key = PollSendKey::new();
             true
         }
         _ => false,

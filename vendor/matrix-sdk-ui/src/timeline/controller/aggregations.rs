@@ -1276,9 +1276,6 @@ enum ApplyAggregationResult {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum AggregationError {
-    #[error("trying to end a poll twice")]
-    PollAlreadyEnded,
-
     #[error("a poll end can't be unapplied")]
     CantUndoPollEnd,
 
