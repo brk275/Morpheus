@@ -686,11 +686,20 @@ impl RoomAdminUi {
         let this = self.clone();
         self.runtime.spawn(async move {
             let request = intent.request();
+            let sweep = intent.sweep_request();
             let result = tokio::select! { biased;
                 _ = panel.cancelled() => return,
                 result = async {
                     let session = session.ok_or(RoomAdminError::Unavailable)?;
-                    session.apply(request).await
+                    let outcome = session.apply(request).await?;
+                    // A sweep removes messages only after the ban was confirmed.
+                    match sweep {
+                        Some(sweep) if outcome.confirmed => {
+                            let removal = super::removal_after(session.apply(sweep).await);
+                            Ok(AdminOutcome { removal: Some(removal), ..outcome })
+                        }
+                        _ => Ok(outcome),
+                    }
                 } => result,
             };
             this.finish_write(panel, generation, intent, result);

@@ -43,6 +43,8 @@ const UNBAN_BODY: &str =
     "They can join again if the room's access rules allow it. This does not invite them.";
 const REMOVE_BODY: &str = "including files and reactions, are removed for everyone, newest \
      first. This cannot be undone. Older messages and their changes to the room stay.";
+const SWEEP_NOT_STARTED: &str =
+    "Removing their messages did not start; use Remove recent messages to try again.";
 const REMOVE_UNFINISHED: &str =
     "Removing messages did not finish. Some may already be gone; check the conversation.";
 const LEAVE_INSTEAD: &str = "Use Leave room to remove yourself.";
@@ -108,6 +110,8 @@ pub(crate) const REMOVE_MESSAGES: i32 = 7;
 pub(crate) const BAN_ID: i32 = 8;
 /// Remove the recent messages of the Matrix user ID typed in the invite field.
 pub(crate) const REMOVE_ID: i32 = 9;
+/// Ban the selected member, then remove their recent messages.
+pub(crate) const BAN_SWEEP: i32 = 10;
 
 /// Access rows in the permissions view: history visibility, guest access and
 /// end-to-end encryption.
@@ -569,6 +573,7 @@ pub(crate) fn address_intent(input: &str, snapshot: &RoomAdminSnapshot) -> Resul
         },
         reason: None,
         knock: false,
+        sweep: false,
     })
 }
 
@@ -666,6 +671,7 @@ pub(crate) fn server_intent(
         },
         reason: None,
         knock: false,
+        sweep: false,
     })
 }
 
@@ -823,6 +829,7 @@ pub(crate) fn access_intent(
         },
         reason: None,
         knock: false,
+        sweep: false,
     })
 }
 
@@ -860,6 +867,7 @@ pub(crate) fn permission_intent(
         },
         reason: None,
         knock: false,
+        sweep: false,
     })
 }
 
@@ -874,9 +882,27 @@ pub(crate) struct Intent {
     pub(crate) reason: Option<String>,
     /// Approving or denying a request to join.
     pub(crate) knock: bool,
+    /// A ban followed, once confirmed, by removing the member's recent
+    /// messages.
+    pub(crate) sweep: bool,
 }
 
 impl Intent {
+    /// The message removal that follows a confirmed ban, for a sweep.
+    pub(crate) fn sweep_request(&self) -> Option<AdminRequest> {
+        if !self.sweep || self.action != AdminAction::Ban {
+            return None;
+        }
+        Some(AdminRequest {
+            action: AdminAction::RemoveMessages,
+            user_id: self.user_id.clone(),
+            expected: MemberExpectation {
+                membership: Some(AdminMembership::Ban),
+                power: self.expected.power,
+            },
+            reason: self.reason.clone(),
+        })
+    }
     pub(crate) fn request(&self) -> AdminRequest {
         AdminRequest {
             action: self.action,
@@ -962,6 +988,7 @@ pub(crate) fn member_intent(
         KICK if actions.kick && !knocking => AdminAction::Kick,
         DENY if actions.kick && knocking => AdminAction::Kick,
         BAN if actions.ban => AdminAction::Ban,
+        BAN_SWEEP if actions.ban && actions.remove_messages => AdminAction::Ban,
         UNBAN if actions.unban => AdminAction::Unban,
         APPROVE if actions.approve => AdminAction::Invite,
         REMOVE_MESSAGES if actions.remove_messages => AdminAction::RemoveMessages,
@@ -1000,6 +1027,7 @@ pub(crate) fn member_intent(
         },
         reason,
         knock: kind == APPROVE || kind == DENY,
+        sweep: kind == BAN_SWEEP,
     })
 }
 
@@ -1026,6 +1054,7 @@ pub(crate) fn invite_intent(input: &str, snapshot: &RoomAdminSnapshot) -> Result
             },
             reason: None,
             knock: listed.is_some(),
+            sweep: false,
         }),
     }
 }
@@ -1105,6 +1134,7 @@ fn by_id_intent(
         expected,
         reason: None,
         knock: false,
+        sweep: false,
     })
 }
 
@@ -1157,6 +1187,15 @@ pub(crate) fn confirmation(intent: &Intent, snapshot: &RoomAdminSnapshot) -> Opt
             title: format!("Kick {name}?"),
             body: KICK_BODY.to_owned(),
             action: "Kick",
+            destructive: true,
+        },
+        AdminAction::Ban if intent.sweep => Confirmation {
+            title: format!("Ban {name} and remove their messages?"),
+            body: format!(
+                "{BAN_BODY} Then up to their {MAX_REMOVED_MESSAGES} latest messages here, \
+                 {REMOVE_BODY}"
+            ),
+            action: "Ban and remove",
             destructive: true,
         },
         AdminAction::Ban => {
@@ -1361,6 +1400,7 @@ pub(crate) fn pending_text(intent: &Intent) -> String {
         AdminAction::Kick if intent.knock => "Denying",
         AdminAction::Kick if revokes_invite(intent) => "Revoking the invitation of",
         AdminAction::Kick => "Kicking",
+        AdminAction::Ban if intent.sweep => "Banning and removing the messages of",
         AdminAction::Ban => "Banning",
         AdminAction::Unban => "Unbanning",
         AdminAction::RemoveMessages => "Removing recent messages from",
@@ -1397,6 +1437,9 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: &AdminOutcome) -> String {
                  point to it yet. Refresh before trying again."
             )
         };
+    }
+    if intent.sweep && intent.action == AdminAction::Ban {
+        return sweep_text(intent, outcome);
     }
     if let Some(removal) = outcome.removal {
         return removal_text(name, removal);
@@ -1506,6 +1549,37 @@ fn removal_text(name: &str, removal: MessageRemoval) -> String {
         text.push_str(" They may have older messages; remove again to reach them.");
     }
     text
+}
+
+/// What a ban followed by message removal did. The removal runs only after
+/// the ban was confirmed.
+fn sweep_text(intent: &Intent, outcome: &AdminOutcome) -> String {
+    let name = &intent.name;
+    match outcome.removal {
+        Some(removal) if removal.found == 0 && removal.stopped.is_some() => {
+            format!("Banned {name}. {SWEEP_NOT_STARTED}")
+        }
+        Some(removal) => format!("Banned {name}. {}", removal_text(name, removal)),
+        None => {
+            let ban = Intent {
+                sweep: false,
+                ..intent.clone()
+            };
+            let text = outcome_text(&ban, outcome);
+            format!("{text} Their messages were not removed.")
+        }
+    }
+}
+
+/// The removal after a confirmed ban: what it did, or why it never started.
+pub(crate) fn removal_after(result: Result<AdminOutcome, RoomAdminError>) -> MessageRemoval {
+    match result {
+        Ok(outcome) => outcome.removal.unwrap_or_default(),
+        Err(error) => MessageRemoval {
+            stopped: Some(error),
+            ..MessageRemoval::default()
+        },
+    }
 }
 
 fn messages_text(count: usize) -> String {
@@ -1779,6 +1853,7 @@ mod tests {
             },
             reason: None,
             knock,
+            sweep: false,
         }
     }
 
@@ -1958,6 +2033,55 @@ mod tests {
             "Removing others' messages needs level 50; you have level 0. Ask someone with a \
              higher level."
         );
+    }
+
+    #[test]
+    fn a_ban_with_message_removal_is_one_review_and_reports_both_steps() {
+        let mut jules = member("@jules:example.org", None, AdminMembership::Join);
+        let snapshot = roster(vec![jules.clone()], 50);
+        jules.actions = MemberActions {
+            ban: true,
+            ..MemberActions::default()
+        };
+        assert!(member_intent(BAN_SWEEP, &jules, "", "", &snapshot).is_err());
+        jules.actions.remove_messages = true;
+        let sweep = member_intent(BAN_SWEEP, &jules, "", " spam ", &snapshot).unwrap();
+        assert!(sweep.action == AdminAction::Ban && sweep.sweep);
+        let follow = sweep.sweep_request().unwrap();
+        assert_eq!(follow.action, AdminAction::RemoveMessages);
+        assert_eq!(follow.expected.membership, Some(AdminMembership::Ban));
+        assert_eq!(follow.reason.as_deref(), Some("spam"));
+        let plain = member_intent(BAN, &jules, "", "", &snapshot).unwrap();
+        assert!(plain.sweep_request().is_none());
+        let review = confirmation(&sweep, &snapshot).unwrap();
+        assert!(review.destructive && review.title.ends_with("and remove their messages?"));
+        assert!(pending_text(&sweep).starts_with("Banning and removing the messages of"));
+
+        let outcome = |removal| AdminOutcome {
+            observed: Some(ObservedTarget {
+                membership: ObservedMembership::Ban,
+                power: MemberPower::Level(0),
+            }),
+            confirmed: true,
+            snapshot: std::sync::Arc::new(snapshot.clone()),
+            replacement: None,
+            removal,
+        };
+        let both = MessageRemoval {
+            found: 2,
+            removed: 2,
+            verified: Some(2),
+            ..MessageRemoval::default()
+        };
+        let name = &sweep.name;
+        let done = outcome_text(&sweep, &outcome(Some(both)));
+        let expected = format!("Banned {name}. Removed 2 recent messages from {name}.");
+        assert_eq!(done, expected);
+        let failed = removal_after(Err(RoomAdminError::RateLimited));
+        let failed = outcome_text(&sweep, &outcome(Some(failed)));
+        assert!(failed.ends_with(SWEEP_NOT_STARTED));
+        let skipped = outcome_text(&sweep, &outcome(None));
+        assert!(skipped.starts_with("Banned ") && skipped.ends_with("were not removed."));
     }
 
     #[test]

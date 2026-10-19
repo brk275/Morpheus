@@ -259,7 +259,8 @@ export component RoomMembersPanel inherits VerticalLayout {
     callback invite();
     // 1 kick, 2 ban, 3 unban, 4 set level, 5 approve request, 6 deny request,
     // 7 remove recent messages, 8 ban the user ID in the invite field,
-    // 9 remove the recent messages of the user ID in the invite field
+    // 9 remove the recent messages of the user ID in the invite field,
+    // 10 ban and remove recent messages
     callback request(int);
     // A permission's key and the requested level text.
     callback request-permission(int, string);
@@ -634,13 +635,20 @@ export component RoomMembersPanel inherits VerticalLayout {
                     }
                 }
                 if root.selected.can-remove-messages : HorizontalLayout {
-                    alignment: start;
+                    spacing: 5px; alignment: start;
                     RosterButton {
                         palette: root.palette; text-scale: root.text-scale;
                         text: "Remove recent messages…"; destructive: true;
                         label: "Review removing the recent messages of " + root.selected.name;
                         enabled: !root.busy;
                         activated => { root.request(7); }
+                    }
+                    if root.selected.can-ban : RosterButton {
+                        palette: root.palette; text-scale: root.text-scale;
+                        text: "Ban and remove…"; destructive: true;
+                        label: "Review banning " + root.selected.name + " and removing their recent messages";
+                        enabled: !root.busy;
+                        activated => { root.request(10); }
                     }
                 }
             }
