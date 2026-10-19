@@ -282,6 +282,8 @@ struct Controller {
     navigation: Option<(NavigationAuthority, bool)>,
     /// Generation of the latest activation (`open_conversation`).
     activation: u64,
+    /// The latest Load newer request of a focused view.
+    newer_request: u64,
     pending: Option<PendingTarget>,
 }
 
@@ -860,7 +862,9 @@ pub(crate) fn open_conversation(
         controller.activation
     });
     if window.get_active_account_local_id().as_str() == target.account_id {
-        activate(window, live, runtime, target, generation);
+        if let Some(selection) = live.manager.account_selection(&target.account_id) {
+            activate(window, live, runtime, target, generation, selection);
+        }
         return;
     }
     let options = window.get_account_options();
@@ -893,6 +897,12 @@ pub(crate) fn account_shown(window: &AppWindow) {
     {
         return;
     }
+    // The exact selection this snapshot shows. A later A -> B -> A makes it
+    // stale, so the deferred open below can never revive this target.
+    let manager = &pending.live.manager;
+    let Some(selection) = manager.account_selection(&pending.target.account_id) else {
+        return;
+    };
     // Open after the snapshot that made the account visible is applied.
     let weak = window.as_weak();
     Timer::single_shot(Duration::ZERO, move || {
@@ -907,23 +917,24 @@ pub(crate) fn account_shown(window: &AppWindow) {
             ..
         } = pending;
         let visible = window.get_active_account_local_id().as_str() == target.account_id;
-        if visible && activation_is_current(generation) {
-            activate(&window, &live, &runtime, target, generation);
+        if visible && selection.is_current() && activation_is_current(generation) {
+            activate(&window, &live, &runtime, target, generation, selection);
         }
     });
 }
 
-/// Open a target in the visible account.
+/// Open a target in the visible account under its exact `selection`.
 fn activate(
     window: &AppWindow,
     live: &Arc<LiveUi>,
     runtime: &Handle,
     target: ConversationTarget,
     generation: u64,
+    selection: AccountSelection,
 ) {
-    let Some(selection) = live.manager.account_selection(&target.account_id) else {
+    if !selection.is_current() || selection.account_id() != target.account_id {
         return;
-    };
+    }
     let elsewhere = window.get_active_room_id().as_str() != target.room_id;
     if elsewhere && unsent_edit(window) {
         window.set_session_error(KEEP_COMPOSER.into());
@@ -1183,6 +1194,12 @@ fn return_to_live(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
     if !window.get_conversation_focused() || account.is_empty() || room.is_empty() {
         return;
     }
+    // The selection and the view shown at this click: a stale request
+    // (A -> B -> A, a view shown since) ends nothing.
+    let Some(selection) = live.manager.account_selection(&account) else {
+        return;
+    };
+    let shown = live.focused_view(&room);
     with(|controller| {
         if let Some((navigation, _)) = controller.navigation.take() {
             navigation.withdraw();
@@ -1191,7 +1208,7 @@ fn return_to_live(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
     reset_history(window);
     let live = live.clone();
     let weak = window.as_weak();
-    runtime.spawn(async move { live.return_to_live_for(&account, room, weak).await });
+    runtime.spawn(async move { live.return_to_live_for(selection, room, shown, weak).await });
 }
 
 /// Page a focused conversation view towards the latest messages. Once it
@@ -1209,26 +1226,34 @@ fn load_newer(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
     let Some(view) = live.focused_view(&room) else {
         return;
     };
-    // Focusing again or returning to live bumps the history operation, so
-    // a late result never lands on another view.
-    let operation = window.get_history_operation();
+    // Each request supersedes the last; focusing again or returning to live
+    // (reset_history) supersedes them all.
+    let request = with(|controller| {
+        controller.newer_request = controller.newer_request.wrapping_add(1);
+        controller.newer_request
+    });
     window.set_focus_newer_loading(true);
     window.set_history_error("".into());
-    let manager = live.manager.clone();
+    let task_live = live.clone();
     let weak = window.as_weak();
     runtime.spawn(async move {
+        let manager = &task_live.manager;
         let newer = manager.paginate_focused_selected(&selection, &view, false, NEWER_PAGE);
         let result = tokio::time::timeout(FOCUS_TIMEOUT, newer).await;
         let _ = weak.upgrade_in_event_loop(move |window| {
-            if window.get_active_account_local_id().as_str() != account
+            // Only the latest request, for the same selection, account, room
+            // and shown view, touches the loading state or its result.
+            let latest = with(|controller| controller.newer_request == request);
+            let shown = task_live.focused_view(&room);
+            if !latest
+                || !selection.is_current()
+                || window.get_active_account_local_id().as_str() != account
                 || window.get_active_room_id().as_str() != room
+                || !shown.is_some_and(|shown| shown.same_view(&view))
             {
                 return;
             }
             window.set_focus_newer_loading(false);
-            if !selection.is_current() || window.get_history_operation() != operation {
-                return;
-            }
             match result {
                 Ok(Ok(true)) => window.invoke_return_to_live(),
                 Ok(Ok(false)) => {}
@@ -1241,6 +1266,7 @@ fn load_newer(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
 /// Load earlier messages pages whichever view is shown, live or focused; a
 /// result for the other view no longer applies.
 fn reset_history(window: &AppWindow) {
+    with(|controller| controller.newer_request = controller.newer_request.wrapping_add(1));
     window.set_history_operation(window.get_history_operation().wrapping_add(1));
     window.set_history_loading(false);
     window.set_history_at_start(false);

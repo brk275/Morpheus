@@ -2519,11 +2519,18 @@ impl LiveUi {
             .manager
             .focused_view_selected(&selection, &room_id, event_id, FOCUS_CONTEXT_EVENTS)
             .await?;
+        // Take every lock the install needs before the commit, in open_room's
+        // order (key, then feed), and check every fence after the last wait.
+        // From the commit on nothing suspends, so cancelling this future
+        // (the caller's timeout) never leaves a committed view without its
+        // feed, nor the old feed ended for nothing.
         let _transition = self.account_transition.lock().await;
-        if !selection.is_current()
-            || !self.navigation_is_current(navigation_epoch)
-            || self.require_active_account(account_id).await.is_err()
+        let mut key_slot = self.feed_key.lock().await;
+        let mut feed_slot = self.feed.lock().await;
+        if self.require_active_account(account_id).await.is_err()
             || self.selected_room.lock().await.as_deref() != Some(room_id.as_str())
+            || !selection.is_current()
+            || !self.navigation_is_current(navigation_epoch)
         {
             return Ok(false);
         }
@@ -2537,10 +2544,10 @@ impl LiveUi {
         let Some(generation) = committed else {
             return Ok(false);
         };
-        if let Some(previous) = self.feed.lock().await.take() {
+        if let Some(previous) = feed_slot.take() {
             previous.abort();
         }
-        *self.feed_key.lock().await = Some((account_id.to_owned(), room_id.clone()));
+        *key_slot = Some((account_id.to_owned(), room_id.clone()));
         let mut updates = feed.subscribe();
         let current_generation = self.generation.clone();
         let navigation_now = self.navigation_epoch.clone();
@@ -2590,34 +2597,52 @@ impl LiveUi {
                 }
             }
         });
-        *self.feed.lock().await = Some(handle);
+        *feed_slot = Some(handle);
         Ok(true)
     }
 
-    /// Leave a focused conversation view: end its feed and show the open
-    /// room's latest messages again. Drafts and an open thread are kept.
+    /// Leave the focused conversation view `shown` (`None`: no view was
+    /// installed any more when the user asked): end its feed and show the
+    /// open room's latest messages again. A stale request — another
+    /// selection of the account (A -> B -> A), another room, or a view shown
+    /// since — changes nothing. Drafts and an open thread are kept.
     pub(crate) async fn return_to_live_for(
         self: &Arc<Self>,
-        account_id: &str,
+        selection: AccountSelection,
         room_id: String,
+        shown: Option<morpheus_matrix::FocusedView>,
         ui: Weak<AppWindow>,
     ) {
+        let account_id = selection.account_id().to_owned();
         {
             let _transition = self.account_transition.lock().await;
-            if self.require_active_account(account_id).await.is_err()
+            let mut key_slot = self.feed_key.lock().await;
+            let mut feed_slot = self.feed.lock().await;
+            if self.require_active_account(&account_id).await.is_err()
                 || self.selected_room.lock().await.as_deref() != Some(room_id.as_str())
+                || !selection.is_current()
             {
                 return;
             }
+            let current = self.focused_view(&room_id);
+            let still_shown = match (&shown, &current) {
+                (Some(shown), Some(view)) => view.same_view(shown),
+                (None, None) => true,
+                _ => false,
+            };
+            if !still_shown {
+                return;
+            }
+            // No suspension from here to the end of the block.
             self.generation.fetch_add(1, Ordering::AcqRel);
             self.drop_stale_focus();
-            if let Some(task) = self.feed.lock().await.take() {
+            if let Some(task) = feed_slot.take() {
                 task.abort();
             }
-            *self.feed_key.lock().await = None;
+            *key_slot = None;
         }
         let navigation_epoch = self.current_navigation_epoch();
-        self.open_room(account_id, room_id, navigation_epoch, ui)
+        self.open_room(&account_id, room_id, navigation_epoch, ui)
             .await;
     }
 

@@ -35,6 +35,12 @@ impl FocusedView {
         &self.room_id
     }
 
+    /// Whether both handles are the same loaded view (not merely the same
+    /// room or event).
+    pub fn same_view(&self, other: &FocusedView) -> bool {
+        Arc::ptr_eq(&self.timeline, &other.timeline)
+    }
+
     /// Only the selection that loaded the view, while current, may act on
     /// it; a later selection of the same account ID may not.
     pub(crate) fn owned_by(&self, selection: &AccountSelection) -> bool {
