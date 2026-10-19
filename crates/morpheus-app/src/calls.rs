@@ -45,8 +45,8 @@ use morpheus_matrix::{
 pub use morpheus_rtc::CallInfo;
 use morpheus_rtc::{
     AudioControls, AudioDeviceSelection, AudioState, CallOptions, LocalRtcSupport, MediaError,
-    ReconnectBackoff, ReconnectPolicy, RtcCallEnd, RtcConnectionSignal, RtcError, RtcService,
-    TransportSupport, local_device_support, local_support,
+    ReconnectBackoff, ReconnectPolicy, ReconnectWindow, RtcCallEnd, RtcConnectionSignal, RtcError,
+    RtcService, TransportSupport, local_device_support, local_support,
 };
 use tokio::{
     sync::{Mutex, broadcast, mpsc, oneshot, watch},
@@ -186,17 +186,10 @@ impl CallStatus {
         )
     }
 
-    /// The current join is alive, possibly while its media or signalling
-    /// reconnects, so its media controls apply. False while rejoining.
-    pub fn has_live_join(&self) -> bool {
-        matches!(
-            self,
-            Self::Joined { .. }
-                | Self::Reconnecting {
-                    interruption: CallInterruption::Media | CallInterruption::Signaling,
-                    ..
-                }
-        )
+    /// Joined or recovering, so the call's media controls are offered.
+    /// While a lost join is replaced, capture can be stopped but not started.
+    pub fn controls_available(&self) -> bool {
+        matches!(self, Self::Joined { .. } | Self::Reconnecting { .. })
     }
 }
 
@@ -733,7 +726,7 @@ impl CallController {
                 || running.account_id != account.id
                 || running.cancel.is_none()
                 || running.capture_stop.requested()
-                || !self.status().has_live_join()
+                || !self.status().controls_available()
             {
                 return Err(CallControllerError::StaleCall);
             }
@@ -1390,6 +1383,14 @@ enum JoinAttemptError {
     Failed(CallControllerError),
 }
 
+/// What a rejoin keeps serving while no join is installed: Stop for running
+/// captures, and the account and sync watches that can cancel it.
+struct RecoveryInputs<'a> {
+    outgoing: &'a mut LocalVideoSession,
+    active: &'a mut watch::Receiver<Option<AccountInfo>>,
+    sync: &'a mut watch::Receiver<SyncStatus>,
+}
+
 /// How a finished call is reported to the UI.
 enum CallOutcome {
     Idle,
@@ -1615,6 +1616,7 @@ impl CallWorker {
         let mut invitation_pending = self.intent == CallStartIntent::Notify;
         let mut invitation_deadline = None;
         let mut invitation_receipt = None;
+        let mut recoveries = ReconnectWindow::per_call();
         if invitation_pending {
             self.shared
                 .send_invitation(self.presentation, &self.selection, "Preparing invitation…");
@@ -1815,6 +1817,13 @@ impl CallWorker {
                 let error = CallControllerError::AccountChanged;
                 break (CallOutcome::Failed(error.to_string()), Ok(()));
             }
+            if !recoveries.try_start(std::time::Instant::now()) {
+                let error = CallControllerError::ConnectionLost(format!(
+                    "{}; it kept dropping after rejoining",
+                    cause.message()
+                ));
+                break (CallOutcome::Failed(error.to_string()), Ok(()));
+            }
             if invitation_pending {
                 // The invitation named the lost membership. It is never resent.
                 invitation_pending = false;
@@ -1831,8 +1840,13 @@ impl CallWorker {
             }
             let requested = controls.requested_state();
             let guards = self.spawn_capture_guards(&active, &sync, None, None);
+            let mut inputs = RecoveryInputs {
+                outgoing: &mut outgoing,
+                active: &mut active,
+                sync: &mut sync,
+            };
             let rejoined = self
-                .rejoin(&mut rtc, cause, &info, requested, &mut active, &mut sync)
+                .rejoin(&mut rtc, cause, &info, requested, &mut inputs)
                 .await;
             drop(guards);
             match rejoined {
@@ -2215,15 +2229,14 @@ impl CallWorker {
     /// Returns false when `until` passed while still waiting for sync.
     async fn recovery_pause(
         &mut self,
-        active: &mut watch::Receiver<Option<AccountInfo>>,
-        sync: &mut watch::Receiver<SyncStatus>,
+        inputs: &mut RecoveryInputs<'_>,
         until: tokio::time::Instant,
         need_signaling: bool,
     ) -> Result<bool, RejoinEnd> {
         let sleep = tokio::time::sleep_until(until);
         tokio::pin!(sleep);
         loop {
-            let state = sync.borrow_and_update().clone();
+            let state = inputs.sync.borrow_and_update().clone();
             match signaling_health(&state) {
                 SignalingHealth::Ready if need_signaling => return Ok(true),
                 SignalingHealth::Unavailable => {
@@ -2237,20 +2250,23 @@ impl CallWorker {
                 _ = self.selection.revoked() => {
                     return Err(RejoinEnd::Stopped(Err(CallControllerError::AccountChanged)));
                 }
-                changed = active.changed() => {
+                changed = inputs.active.changed() => {
                     if changed.is_err()
                         || !self.selection.is_current()
-                        || active.borrow().as_ref().map(|account| account.id.as_str())
+                        || inputs.active.borrow().as_ref().map(|account| account.id.as_str())
                             != Some(self.account_id.as_str())
                     {
                         return Err(RejoinEnd::Stopped(Err(CallControllerError::AccountChanged)));
                     }
                 }
-                changed = sync.changed() => {
+                changed = inputs.sync.changed() => {
                     if changed.is_err() {
-                        let state = sync.borrow().clone();
+                        let state = inputs.sync.borrow().clone();
                         return Err(RejoinEnd::Stopped(Err(sticky_sync_required(state))));
                     }
+                }
+                event = inputs.outgoing.next_event() => {
+                    inputs.outgoing.handle_detached_event(event).await;
                 }
                 () = &mut sleep => return Ok(!need_signaling),
             }
@@ -2260,16 +2276,26 @@ impl CallWorker {
     /// One fresh join with the original options. Cancellation observes but
     /// never drops a join already in flight; a join that completes after
     /// Leave or an account change is left again before returning.
-    async fn join_attempt(&mut self, rtc: &mut RtcService) -> Result<CallInfo, JoinAttemptError> {
+    async fn join_attempt(
+        &mut self,
+        rtc: &mut RtcService,
+        outgoing: &mut LocalVideoSession,
+    ) -> Result<CallInfo, JoinAttemptError> {
         let room_id = self.room_id.clone();
         let (joined, cancelled) = {
             let join = timeout(JOIN_TIMEOUT, rtc.join(&room_id, self.options.clone()));
             let cancel = &mut self.cancel;
             let selection = &self.selection;
             let cancelled = async {
-                tokio::select! {
-                    _ = cancel => {},
-                    _ = selection.revoked() => {},
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut *cancel => break,
+                        _ = selection.revoked() => break,
+                        event = outgoing.next_event() => {
+                            outgoing.handle_detached_event(event).await;
+                        }
+                    }
                 }
             };
             settle_owned_join(join, cancelled, || {}).await
@@ -2318,8 +2344,7 @@ impl CallWorker {
         cause: RejoinCause,
         last: &CallInfo,
         requested: AudioState,
-        active: &mut watch::Receiver<Option<AccountInfo>>,
-        sync: &mut watch::Receiver<SyncStatus>,
+        inputs: &mut RecoveryInputs<'_>,
     ) -> Result<(CallInfo, AudioControls), RejoinEnd> {
         let started = std::time::Instant::now();
         let mut backoff = ReconnectBackoff::new(ReconnectPolicy::rejoin(), started);
@@ -2328,9 +2353,9 @@ impl CallWorker {
         let waiting = self.reconnecting(last, CallInterruption::WaitingForNetwork);
         // Confirm the old departure before any fresh membership is published,
         // so peers never see two joins from this device.
-        if !signaling_ready(sync) {
+        if !signaling_ready(inputs.sync) {
             self.publish_recovery(waiting.clone()).await;
-            if !self.recovery_pause(active, sync, deadline, true).await? {
+            if !self.recovery_pause(inputs, deadline, true).await? {
                 let error = rejoin_exhausted(cause, 0, None);
                 return Err(RejoinEnd::Stopped(Err(error)));
             }
@@ -2341,7 +2366,19 @@ impl CallWorker {
         };
         let starting = self.reconnecting(last, first);
         self.publish_recovery(starting).await;
-        match leave_with_timeout(rtc, &self.room_id).await {
+        let left = {
+            let leave = leave_with_timeout(rtc, &self.room_id);
+            tokio::pin!(leave);
+            loop {
+                tokio::select! {
+                    result = &mut leave => break result,
+                    event = inputs.outgoing.next_event() => {
+                        inputs.outgoing.handle_detached_event(event).await;
+                    }
+                }
+            }
+        };
+        match left {
             Ok(()) | Err(CallControllerError::Rtc(RtcError::NotJoined)) => {}
             Err(error) => {
                 return Err(RejoinEnd::CleanupFailed(format!(
@@ -2363,18 +2400,18 @@ impl CallWorker {
             let rejoining = self.reconnecting(last, interruption);
             self.publish_recovery(rejoining.clone()).await;
             let attempt_at = tokio::time::Instant::now() + delay;
-            self.recovery_pause(active, sync, attempt_at, false).await?;
-            if !signaling_ready(sync) {
+            self.recovery_pause(inputs, attempt_at, false).await?;
+            if !signaling_ready(inputs.sync) {
                 self.publish_recovery(waiting.clone()).await;
-                if !self.recovery_pause(active, sync, deadline, true).await? {
+                if !self.recovery_pause(inputs, deadline, true).await? {
                     let attempts = backoff.attempts().saturating_sub(1);
                     let error = rejoin_exhausted(cause, attempts, last_error);
                     return Err(RejoinEnd::Stopped(Err(error)));
                 }
                 self.publish_recovery(rejoining).await;
             }
-            match self.join_attempt(rtc).await {
-                Ok(info) => return self.install_rejoined(rtc, info, requested, sync).await,
+            match self.join_attempt(rtc, inputs.outgoing).await {
+                Ok(info) => return self.install_join(rtc, info, requested, inputs).await,
                 Err(JoinAttemptError::Stopped(end)) => return Err(end),
                 Err(JoinAttemptError::Failed(CallControllerError::Cleanup(reason))) => {
                     return Err(RejoinEnd::CleanupFailed(reason));
@@ -2392,14 +2429,14 @@ impl CallWorker {
     /// Bind fresh audio controls, carrying the requested mute and deafen
     /// state, to the new join and swap them in unless Leave or an account
     /// change won meanwhile; the new join is left again in that case.
-    async fn install_rejoined(
+    async fn install_join(
         &mut self,
         rtc: &mut RtcService,
         info: CallInfo,
         requested: AudioState,
-        sync: &watch::Receiver<SyncStatus>,
+        inputs: &mut RecoveryInputs<'_>,
     ) -> Result<(CallInfo, AudioControls), RejoinEnd> {
-        let controls = match self.new_audio_controls(rtc, &info, None, sync) {
+        let controls = match self.new_audio_controls(rtc, &info, None, inputs.sync) {
             Ok(controls) => controls,
             Err(error) => return Err(leave_after(rtc, &self.room_id, Err(error.into())).await),
         };

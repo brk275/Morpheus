@@ -30,6 +30,7 @@ const CAMERA_INTERVAL: Duration = Duration::from_millis(67);
 const SCREEN_INTERVAL: Duration = Duration::from_millis(125);
 const SCREEN_WIDTH: u32 = 1280;
 const SCREEN_HEIGHT: u32 = 720;
+const RECONNECTING_START: &str = "the call is reconnecting; start video once it has rejoined";
 
 #[derive(Default)]
 pub(crate) struct CaptureStop {
@@ -527,6 +528,35 @@ impl LocalVideoSession {
                     }
                 }
             }
+        }
+    }
+
+    /// Handle capture events while the call has no join to publish on, i.e.
+    /// while it rejoins. Stop always works; Start waits for the new join.
+    /// Frames are dropped because transmission is paused.
+    pub(crate) async fn handle_detached_event(&mut self, event: LocalVideoEvent) {
+        match event {
+            LocalVideoEvent::Command(CaptureCommand::Start { reply, .. }) => {
+                let error = MediaError::Device(RECONNECTING_START.into());
+                let _ = reply.send(Err(error));
+            }
+            LocalVideoEvent::Command(CaptureCommand::Stop { kind, reply }) => {
+                let result = self.stop(kind).await;
+                let _ = reply.send(result);
+            }
+            LocalVideoEvent::Frame(Captured::SourceReady { kind, generation }) => {
+                self.source_ready(kind, generation);
+            }
+            LocalVideoEvent::Frame(Captured::Failed {
+                kind,
+                generation,
+                error,
+            }) => {
+                if self.slot(kind).generation == generation && self.slot(kind).stop.is_some() {
+                    self.fail(kind, error.to_string()).await;
+                }
+            }
+            LocalVideoEvent::Frame(Captured::Frame { .. }) | LocalVideoEvent::Tick => {}
         }
     }
 

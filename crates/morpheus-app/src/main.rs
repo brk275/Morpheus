@@ -1665,7 +1665,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 let current = status.borrow_and_update().clone();
                 let connected = current.blocks_account_switch();
-                let joined = current.has_live_join();
+                let joined = current.controls_available();
                 let leave_unconfirmed = matches!(current, CallStatus::CleanupFailed { .. });
                 let label = call_status_label(&current);
                 let room_id = call_room_id(&current).unwrap_or("").to_owned();

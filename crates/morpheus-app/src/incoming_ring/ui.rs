@@ -145,7 +145,9 @@ impl IncomingUi {
                                 match result {
                                     Ok(info) => {
                                         let current = calls_for_ui.status();
+                                        // A just-answered join may already be recovering.
                                         if matches!(&current, crate::calls::CallStatus::Joined { account_id, call }
+                                            | crate::calls::CallStatus::Reconnecting { account_id, call, .. }
                                             if account_id == selection.account_id() && call == &info)
                                         {
                                             // Show controls for the exact answered call.

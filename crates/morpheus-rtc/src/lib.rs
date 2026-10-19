@@ -62,7 +62,9 @@ pub use native::{
 pub use observer::{ObservedCall, ObservedParticipant, ObserverError, PassiveCallObserver};
 #[cfg(feature = "native-rtc")]
 pub use outgoing_notification::NotificationDialect;
-pub use reconnect::{ReconnectBackoff, ReconnectPolicy, RtcCallEnd, RtcConnectionSignal};
+pub use reconnect::{
+    ReconnectBackoff, ReconnectPolicy, ReconnectWindow, RtcCallEnd, RtcConnectionSignal,
+};
 #[cfg(feature = "device-camera")]
 pub use video_device::CameraCapture;
 #[cfg(feature = "device-screen")]

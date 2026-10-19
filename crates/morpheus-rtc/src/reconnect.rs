@@ -11,7 +11,7 @@
 //! retry reuses an old token, endpoint or membership.
 
 use std::{
-    collections::hash_map::RandomState,
+    collections::{VecDeque, hash_map::RandomState},
     hash::{BuildHasher, Hasher},
     time::{Duration, Instant},
 };
@@ -128,6 +128,46 @@ impl ReconnectBackoff {
     }
 }
 
+/// Bounds how often one call may start recovering, so a connection that
+/// drops again right after each successful rejoin ends instead of cycling.
+#[derive(Clone, Debug)]
+pub struct ReconnectWindow {
+    limit: usize,
+    window: Duration,
+    starts: VecDeque<Instant>,
+}
+
+impl ReconnectWindow {
+    pub fn new(limit: usize, window: Duration) -> Self {
+        Self {
+            limit,
+            window,
+            starts: VecDeque::new(),
+        }
+    }
+
+    /// The native call controller's limit: three recoveries in ten minutes.
+    pub fn per_call() -> Self {
+        Self::new(3, Duration::from_secs(600))
+    }
+
+    /// Record a recovery starting at `now`, or refuse it when `limit`
+    /// recoveries already started within the window.
+    pub fn try_start(&mut self, now: Instant) -> bool {
+        while let Some(&start) = self.starts.front() {
+            if now.saturating_duration_since(start) < self.window {
+                break;
+            }
+            self.starts.pop_front();
+        }
+        if self.starts.len() >= self.limit {
+            return false;
+        }
+        self.starts.push_back(now);
+        true
+    }
+}
+
 fn random_permille(salt: u32) -> u64 {
     // std's per-instance random SipHash keys avoid adding an RNG dependency.
     // Jitter only spreads retries; nothing security-relevant depends on it.
@@ -231,6 +271,17 @@ mod tests {
         let mut random = ReconnectBackoff::new(policy(), start);
         let delay = random.next_attempt(start).unwrap();
         assert!(delay >= Duration::from_millis(800) && delay <= Duration::from_secs(1));
+    }
+
+    #[test]
+    fn recoveries_are_limited_within_the_window() {
+        let start = Instant::now();
+        let mut window = ReconnectWindow::new(2, Duration::from_secs(60));
+        assert!(window.try_start(start));
+        assert!(window.try_start(start + Duration::from_secs(10)));
+        assert!(!window.try_start(start + Duration::from_secs(20)));
+        assert!(window.try_start(start + Duration::from_secs(61)));
+        assert!(!window.try_start(start + Duration::from_secs(62)));
     }
 
     #[test]
