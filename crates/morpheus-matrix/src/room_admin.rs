@@ -19,7 +19,7 @@ use matrix_sdk::{
     deserialized_responses::MemberEvent,
     room::RoomMember,
     ruma::{
-        Int, OwnedEventId, OwnedUserId, RoomId, RoomVersionId, UserId,
+        Int, OwnedEventId, OwnedUserId, RoomId, RoomVersionId, TransactionId, UInt, UserId,
         api::{
             client::{
                 discovery::get_capabilities,
@@ -31,6 +31,8 @@ use matrix_sdk::{
                     },
                     kick_user, unban_user,
                 },
+                message::get_message_events,
+                redact::redact_event,
                 room::upgrade_room,
                 state::send_state_event,
             },
@@ -51,6 +53,7 @@ use matrix_sdk::{
     },
     sync::{RoomUpdate, State as SyncState},
 };
+use serde::{Deserialize, de::IgnoredAny};
 use serde_json::Value;
 use tokio::{
     sync::{Mutex, OnceCell, broadcast},
@@ -72,6 +75,17 @@ const MAX_POWER_LEVELS_BYTES: usize = 60 * 1024;
 // at most this long; the synced store is authoritative again afterwards.
 const OVERRIDE_TTL: Duration = Duration::from_secs(90);
 const MAX_OVERRIDES: usize = 64;
+/// Recent messages of one member that one removal redacts at most.
+pub const MAX_REMOVED_MESSAGES: usize = 100;
+// A removal reads at most this many of the member's latest events, newest
+// first, so running it again reaches older messages past removed ones.
+const REMOVAL_SCAN_EVENTS: usize = 500;
+const REMOVAL_PAGE: u32 = 100;
+// Redactions are paced, and a removal stops starting new ones once the
+// budget since its first read is spent, leaving time for the read-back inside
+// the write timeout. Running it again continues.
+const REMOVAL_SPACING: Duration = Duration::from_millis(250);
+const REMOVAL_BUDGET: Duration = Duration::from_secs(45);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RoomAdminError {
@@ -158,6 +172,8 @@ pub struct MemberActions {
     pub change_power: bool,
     /// Invite a member who knocked.
     pub approve: bool,
+    /// Remove (redact) the member's recent messages.
+    pub remove_messages: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -367,6 +383,9 @@ pub enum AdminAction {
     SetPermission(PermissionKey, i64),
     /// History visibility or guest access. The request's user ID is ignored.
     SetAccess(AccessChange),
+    /// Remove (redact) the member's most recent messages, at most
+    /// `MAX_REMOVED_MESSAGES`, with the request's reason.
+    RemoveMessages,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -419,6 +438,83 @@ pub struct AdminOutcome {
     pub snapshot: Arc<RoomAdminSnapshot>,
     /// The new room that replaced this one, after an upgrade.
     pub replacement: Option<String>,
+    /// What removing a member's recent messages did.
+    pub removal: Option<MessageRemoval>,
+}
+
+/// The result of removing a member's recent messages. Each redaction is sent
+/// once; the first failure stops the removal and leaves the rest in place.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MessageRemoval {
+    /// Recent messages that were still there to remove, newest first.
+    pub found: usize,
+    /// Removals the homeserver accepted.
+    pub removed: usize,
+    /// Accepted removals a fresh read shows as applied; `None` when that
+    /// read failed.
+    pub verified: Option<usize>,
+    /// The member may have older messages than this removal reached.
+    pub more: bool,
+    /// Why the removal stopped before every message it found.
+    pub stopped: Option<RoomAdminError>,
+}
+
+/// One removal's read of a member's latest events.
+#[derive(Debug, Default)]
+struct RecentMessages {
+    /// Not removed yet, newest first; at most `MAX_REMOVED_MESSAGES`.
+    removable: Vec<OwnedEventId>,
+    /// Already removed.
+    removed: HashSet<OwnedEventId>,
+    /// The member may have older messages than this read reached.
+    more: bool,
+}
+
+impl RecentMessages {
+    /// Sort one listed event. State events stay: removing their content would
+    /// not undo their effect. Redactions themselves have nothing to remove.
+    fn note<T>(&mut self, event: &Raw<T>, target: &UserId) {
+        let Ok(event) = event.deserialize_as_unchecked::<ListedEvent>() else {
+            return;
+        };
+        // The sender filter is applied by the server; check it again.
+        if event.sender.as_str() != target.as_str() {
+            return;
+        }
+        if event.unsigned.redacted_because.is_some() {
+            self.removed.insert(event.event_id);
+            return;
+        }
+        if event.state_key.is_some() || event.kind == "m.room.redaction" {
+            return;
+        }
+        if self.removable.len() < MAX_REMOVED_MESSAGES {
+            self.removable.push(event.event_id);
+        } else {
+            self.more = true;
+        }
+    }
+    /// How many of these events this read shows as removed.
+    fn count_removed(&self, ids: &[OwnedEventId]) -> usize {
+        ids.iter().filter(|id| self.removed.contains(*id)).count()
+    }
+}
+
+/// The fields a removal reads from one event; everything else is ignored.
+#[derive(Deserialize)]
+struct ListedEvent {
+    event_id: OwnedEventId,
+    sender: OwnedUserId,
+    #[serde(rename = "type")]
+    kind: String,
+    state_key: Option<IgnoredAny>,
+    #[serde(default)]
+    unsigned: ListedUnsigned,
+}
+
+#[derive(Default, Deserialize)]
+struct ListedUnsigned {
+    redacted_because: Option<IgnoredAny>,
 }
 
 #[derive(Clone)]
@@ -658,6 +754,7 @@ impl RoomAdminSession {
                 observed: None,
                 snapshot: built.unwrap_or_else(|| self.snapshot()),
                 replacement: Some(replacement),
+                removal: None,
             })
         })
         .await
@@ -704,6 +801,9 @@ impl RoomAdminSession {
                 current,
             )?;
             self.check()?;
+            if request.action == AdminAction::RemoveMessages {
+                return self.remove_messages(&target, reason).await;
+            }
             self.send(&target, request.action, reason, &levels, power.as_ref())
                 .await?;
             if request.action == AdminAction::Invite {
@@ -728,9 +828,116 @@ impl RoomAdminSession {
                 observed,
                 snapshot,
                 replacement: None,
+                removal: None,
             })
         })
         .await
+    }
+    /// Redact the member's most recent messages, newest first and one at a
+    /// time. Each redaction is sent once; the first failure, or the time
+    /// budget, stops the removal and leaves the rest in place, and running it
+    /// again skips what was removed. Ends with a fresh read of the same
+    /// events. Runs under the operation lock taken by `apply`.
+    async fn remove_messages(
+        &self,
+        target: &UserId,
+        reason: Option<String>,
+    ) -> Result<AdminOutcome> {
+        let started = Instant::now();
+        let found = self.recent_messages(target).await?;
+        let mut removed = Vec::new();
+        let mut stopped = None;
+        for event_id in &found.removable {
+            if started.elapsed() >= REMOVAL_BUDGET {
+                stopped = Some(RoomAdminError::TimedOut);
+                break;
+            }
+            if !removed.is_empty() {
+                time::sleep(REMOVAL_SPACING).await;
+            }
+            if let Err(error) = self.check() {
+                stopped = Some(error);
+                break;
+            }
+            let room_id = self.room.room_id().to_owned();
+            let mut request =
+                redact_event::v3::Request::new(room_id, event_id.clone(), TransactionId::new());
+            request.reason = reason.clone();
+            let client = self.room.client();
+            let sent = client
+                .send(request)
+                .with_request_config(write_config())
+                .await;
+            match sent {
+                Ok(_) => removed.push(event_id.clone()),
+                Err(error) => {
+                    stopped = Some(write_failure(error));
+                    break;
+                }
+            }
+        }
+        // Nothing reached the homeserver: report the failure itself.
+        if removed.is_empty()
+            && let Some(error) = stopped
+        {
+            return Err(error);
+        }
+        self.check()?;
+        // Accepted by the server; a failed read-back is unconfirmed, not failed.
+        let verified = if removed.is_empty() {
+            Some(0)
+        } else {
+            let seen = self.recent_messages(target).await.ok();
+            seen.map(|seen| seen.count_removed(&removed))
+        };
+        let removal = MessageRemoval {
+            found: found.removable.len(),
+            removed: removed.len(),
+            verified,
+            more: found.more,
+            stopped,
+        };
+        Ok(AdminOutcome {
+            observed: None,
+            confirmed: stopped.is_none() && verified == Some(removal.found),
+            snapshot: self.snapshot(),
+            replacement: None,
+            removal: Some(removal),
+        })
+    }
+    /// The member's latest events from bounded, sender-filtered server reads,
+    /// newest first: those a removal may redact and those already redacted.
+    async fn recent_messages(&self, target: &UserId) -> Result<RecentMessages> {
+        let mut scan = RecentMessages::default();
+        let mut from: Option<String> = None;
+        let mut read = 0;
+        loop {
+            let room_id = self.room.room_id().to_owned();
+            let mut request = get_message_events::v3::Request::backward(room_id);
+            request.from = from;
+            request.limit = UInt::from(REMOVAL_PAGE);
+            request.filter.senders = Some(vec![target.to_owned()]);
+            let client = self.room.client();
+            let response = client
+                .send(request)
+                .with_request_config(write_config())
+                .await
+                .map_err(write_failure)?;
+            self.check()?;
+            read += response.chunk.len();
+            for event in &response.chunk {
+                scan.note(event, target);
+            }
+            let exhausted = response.chunk.is_empty() || response.end.is_none();
+            if exhausted {
+                return Ok(scan);
+            }
+            if scan.more || read >= REMOVAL_SCAN_EVENTS {
+                scan.more = true;
+                return Ok(scan);
+            }
+            from = response.end;
+        }
     }
     /// Change one room-wide threshold. Matrix rejects a change unless the
     /// sender may send power levels and both the current and the new value
@@ -789,6 +996,7 @@ impl RoomAdminSession {
                 observed,
                 snapshot,
                 replacement: None,
+                removal: None,
             })
         })
         .await
@@ -841,6 +1049,7 @@ impl RoomAdminSession {
                 observed,
                 snapshot: built.unwrap_or_else(|| self.snapshot()),
                 replacement: None,
+                removal: None,
             })
         })
         .await
@@ -909,7 +1118,9 @@ impl RoomAdminSession {
                     .await
                     .map(drop)
             }
-            AdminAction::SetPermission(..) | AdminAction::SetAccess(_) => {
+            AdminAction::SetPermission(..)
+            | AdminAction::SetAccess(_)
+            | AdminAction::RemoveMessages => {
                 return Err(RoomAdminError::NotApplicable);
             }
         };
@@ -1115,6 +1326,8 @@ fn member_actions(
         unban: membership == Ban && levels.user_can_unban_user(own, target),
         change_power: assignable,
         approve: membership == Knock && levels.user_can_invite(own),
+        remove_messages: member_power(levels, target) != MemberPower::Creator
+            && levels.user_can_redact_event_of_other(own),
     }
 }
 
@@ -1144,7 +1357,10 @@ fn precondition(
     {
         return Err(RoomAdminError::TargetChanged);
     }
-    let removing = matches!(action, AdminAction::Kick | AdminAction::Ban);
+    let removing = matches!(
+        action,
+        AdminAction::Kick | AdminAction::Ban | AdminAction::RemoveMessages
+    );
     if removing && own == target {
         return Err(RoomAdminError::SelfTarget);
     }
@@ -1179,6 +1395,9 @@ fn precondition(
             levels.user_can_change_user_power_level(own, target)
                 && MemberPower::Level(level) <= member_power(levels, own)
         }
+        // Matrix lets anyone at the redaction level remove others' messages,
+        // whatever their level; only creators stay protected above.
+        AdminAction::RemoveMessages => levels.user_can_redact_event_of_other(own),
         AdminAction::SetPermission(..) | AdminAction::SetAccess(_) => {
             return Err(RoomAdminError::NotApplicable);
         }
@@ -1199,8 +1418,9 @@ fn confirms(action: AdminAction, seen: ObservedTarget) -> bool {
         AdminAction::SetPowerLevel(level) | AdminAction::SetPermission(_, level) => {
             seen.power == MemberPower::Level(level)
         }
-        // Access changes are confirmed from the rebuilt snapshot instead.
-        AdminAction::SetAccess(_) => false,
+        // Access changes are confirmed from the rebuilt snapshot, removals
+        // from their own read-back.
+        AdminAction::SetAccess(_) | AdminAction::RemoveMessages => false,
     }
 }
 
@@ -1811,6 +2031,7 @@ mod tests {
             AdminAction::Kick,
             AdminAction::Ban,
             AdminAction::SetPowerLevel(0),
+            AdminAction::RemoveMessages,
         ] {
             assert_eq!(
                 precondition(&v12, own, creator, action, &expected, join),
@@ -1819,6 +2040,100 @@ mod tests {
         }
         let actions = member_actions(&v12, own, creator, AdminMembership::Join);
         assert_eq!(actions, MemberActions::default());
+    }
+
+    #[test]
+    fn message_removal_needs_the_redaction_level_and_never_targets_self() {
+        let levels = levels(
+            "11",
+            json!({"@mod:example.org": 50, "@admin:example.org": 100}),
+        );
+        let own = user_id!("@mod:example.org");
+        let member = user_id!("@member:example.org");
+        let admin = user_id!("@admin:example.org");
+        let remove = AdminAction::RemoveMessages;
+        let join = ObservedMembership::Join;
+        let joined = expect(Some(AdminMembership::Join), 0);
+        let check = |own: &UserId, target: &UserId, expected: &MemberExpectation, current| {
+            precondition(&levels, own, target, remove, expected, current)
+        };
+        assert_eq!(check(own, member, &joined, join), Ok(()));
+        // Matrix allows it whatever the member's level, and after a ban.
+        let higher = expect(Some(AdminMembership::Join), 100);
+        assert_eq!(check(own, admin, &higher, join), Ok(()));
+        let banned = expect(Some(AdminMembership::Ban), 0);
+        assert_eq!(check(own, member, &banned, ObservedMembership::Ban), Ok(()));
+        assert_eq!(
+            check(own, member, &joined, ObservedMembership::Ban),
+            Err(RoomAdminError::TargetChanged)
+        );
+        let own_row = expect(Some(AdminMembership::Join), 50);
+        assert_eq!(
+            check(own, own, &own_row, join),
+            Err(RoomAdminError::SelfTarget)
+        );
+        assert_eq!(
+            check(member, admin, &higher, join),
+            Err(RoomAdminError::InsufficientPower)
+        );
+        let (joined_row, banned_row) = (AdminMembership::Join, AdminMembership::Ban);
+        let banned_actions = member_actions(&levels, own, member, banned_row);
+        assert!(banned_actions.remove_messages);
+        let peer = member_actions(&levels, member, own, joined_row);
+        let own_actions = member_actions(&levels, own, own, joined_row);
+        assert!(!peer.remove_messages && !own_actions.remove_messages);
+        // Confirmed by the removal's own read-back, never by membership.
+        let left = ObservedTarget {
+            membership: ObservedMembership::Leave,
+            power: MemberPower::Level(0),
+        };
+        assert!(!confirms(remove, left));
+    }
+
+    #[test]
+    fn message_removal_reads_only_the_members_removable_messages_within_its_bound() {
+        let target = user_id!("@spam:example.org");
+        let event = |id: &str, sender: &str, kind: &str, extra: Value| {
+            let mut event = json!({
+                "event_id": id, "sender": sender, "type": kind, "content": {},
+                "origin_server_ts": 1, "room_id": "!admin:example.org"
+            });
+            if let (Some(event), Some(extra)) = (event.as_object_mut(), extra.as_object()) {
+                event.extend(extra.clone());
+            }
+            Raw::new(&event).unwrap()
+        };
+        let spam = "@spam:example.org";
+        let redacted = json!({"unsigned": {"redacted_because": {"type": "m.room.redaction"}}});
+        let events = [
+            event("$new", spam, "m.room.encrypted", json!({})),
+            event("$other", "@peer:example.org", "m.room.message", json!({})),
+            event("$state", spam, "m.room.member", json!({"state_key": spam})),
+            event("$gone", spam, "m.room.message", redacted),
+            event("$redaction", spam, "m.room.redaction", json!({})),
+            event("$old", spam, "m.reaction", json!({"unsigned": {"age": 5}})),
+        ];
+        let mut scan = RecentMessages::default();
+        for event in &events {
+            scan.note(event, target);
+        }
+        // A malformed event is skipped rather than failing the removal.
+        scan.note(&Raw::new(&json!({"event_id": "$bad"})).unwrap(), target);
+        let ids: Vec<&str> = scan.removable.iter().map(|id| id.as_str()).collect();
+        assert_eq!(ids, ["$new", "$old"]);
+        assert_eq!(scan.removed.len(), 1);
+        let gone = [owned_event_id!("$gone"), owned_event_id!("$new")];
+        assert_eq!(scan.count_removed(&gone), 1);
+        assert!(!scan.more);
+
+        let mut full = RecentMessages::default();
+        for index in 0..=MAX_REMOVED_MESSAGES {
+            let id = format!("$spam{index}");
+            full.note(&event(&id, spam, "m.room.message", json!({})), target);
+        }
+        assert_eq!(full.removable.len(), MAX_REMOVED_MESSAGES);
+        assert!(full.more);
+        assert_eq!(full.removable[0].as_str(), "$spam0");
     }
 
     fn levels_v12() -> RoomPowerLevels {

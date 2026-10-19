@@ -22,6 +22,8 @@ export struct RosterMember {
     can-unban: bool,
     can-change-level: bool,
     can-approve: bool,
+    // Remove (redact) their recent messages.
+    can-remove-messages: bool,
     // A change for this member is waiting for the homeserver.
     pending: bool,
 }
@@ -246,7 +248,8 @@ export component RoomMembersPanel inherits VerticalLayout {
     callback refresh();
     callback select(string);
     callback invite();
-    // 1 kick, 2 ban, 3 unban, 4 set level, 5 approve request, 6 deny request
+    // 1 kick, 2 ban, 3 unban, 4 set level, 5 approve request, 6 deny request,
+    // 7 remove recent messages
     callback request(int);
     // A permission's key and the requested level text.
     callback request-permission(int, string);
@@ -541,7 +544,7 @@ export component RoomMembersPanel inherits VerticalLayout {
                         }
                     }
                 }
-                if root.selected.can-kick || root.selected.can-ban || root.selected.can-unban : RosterField {
+                if root.selected.can-kick || root.selected.can-ban || root.selected.can-unban || root.selected.can-remove-messages : RosterField {
                     palette: root.palette;
                     text-scale: root.text-scale;
                     placeholder: "Reason (optional, visible to the room)";
@@ -585,6 +588,16 @@ export component RoomMembersPanel inherits VerticalLayout {
                         label: "Review unbanning " + root.selected.name;
                         enabled: !root.busy;
                         activated => { root.request(3); }
+                    }
+                }
+                if root.selected.can-remove-messages : HorizontalLayout {
+                    alignment: start;
+                    RosterButton {
+                        palette: root.palette; text-scale: root.text-scale;
+                        text: "Remove recent messages…"; destructive: true;
+                        label: "Review removing the recent messages of " + root.selected.name;
+                        enabled: !root.busy;
+                        activated => { root.request(7); }
                     }
                 }
             }

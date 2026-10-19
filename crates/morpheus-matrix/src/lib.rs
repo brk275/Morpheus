@@ -47,10 +47,11 @@ mod admin;
 mod room_admin;
 pub use room_admin::{
     AccessChange, AccessSettings, AdminAction, AdminMember, AdminMembership, AdminOutcome,
-    AdminRequest, HistoryChoice, MAX_ADMIN_REASON_BYTES, MAX_ROSTER_MEMBERS, MemberActions,
-    MemberExpectation, MemberPower, MembershipCounts, ObservedMembership, ObservedTarget,
-    OwnAdminPermissions, PERMISSION_KEYS, PermissionKey, PermissionSetting, PowerThresholds,
-    RoomAdminError, RoomAdminSession, RoomAdminSnapshot, RosterWatch, UpgradeSettings,
+    AdminRequest, HistoryChoice, MAX_ADMIN_REASON_BYTES, MAX_REMOVED_MESSAGES, MAX_ROSTER_MEMBERS,
+    MemberActions, MemberExpectation, MemberPower, MembershipCounts, MessageRemoval,
+    ObservedMembership, ObservedTarget, OwnAdminPermissions, PERMISSION_KEYS, PermissionKey,
+    PermissionSetting, PowerThresholds, RoomAdminError, RoomAdminSession, RoomAdminSnapshot,
+    RosterWatch, UpgradeSettings,
 };
 mod room_settings;
 pub use room_settings::{

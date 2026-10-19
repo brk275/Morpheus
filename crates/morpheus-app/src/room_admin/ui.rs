@@ -823,6 +823,7 @@ fn roster_row(
         can_unban: actions.unban,
         can_change_level: actions.change_power,
         can_approve: actions.approve,
+        can_remove_messages: actions.remove_messages,
         pending: pending_user == Some(member.user_id.as_str()),
         name: name.into(),
     }

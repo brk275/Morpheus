@@ -9,9 +9,10 @@ pub(crate) use ui::clear_presentation;
 
 use morpheus_matrix::{
     AccessChange, AccessSettings, AdminAction, AdminMember, AdminMembership, AdminOutcome,
-    AdminRequest, HistoryChoice, MAX_ADMIN_REASON_BYTES, MemberExpectation, MemberPower,
-    MembershipCounts, ObservedMembership, ObservedTarget, PERMISSION_KEYS, PermissionKey,
-    PermissionSetting, PowerThresholds, RoomAdminError, RoomAdminSnapshot, UpgradeSettings,
+    AdminRequest, HistoryChoice, MAX_ADMIN_REASON_BYTES, MAX_REMOVED_MESSAGES, MemberExpectation,
+    MemberPower, MembershipCounts, MessageRemoval, ObservedMembership, ObservedTarget,
+    PERMISSION_KEYS, PermissionKey, PermissionSetting, PowerThresholds, RoomAdminError,
+    RoomAdminSnapshot, UpgradeSettings,
 };
 
 /// Rows shown at once. Search narrows a larger roster; the count says so.
@@ -35,6 +36,10 @@ const KICK_BODY: &str =
 const BAN_BODY: &str = "They leave the room and cannot rejoin until someone unbans them.";
 const UNBAN_BODY: &str =
     "They can join again if the room's access rules allow it. This does not invite them.";
+const REMOVE_BODY: &str = "including files and reactions, are removed for everyone, newest \
+     first. This cannot be undone. Older messages and their changes to the room stay.";
+const REMOVE_UNFINISHED: &str =
+    "Removing messages did not finish. Some may already be gone; check the conversation.";
 const SELF_DEMOTION: &str =
     "You cannot raise it again yourself; someone with a higher level would have to.";
 const DEMOTION: &str = "They lose permissions that need a higher level.";
@@ -70,6 +75,7 @@ pub(crate) const UNBAN: i32 = 3;
 pub(crate) const SET_LEVEL: i32 = 4;
 pub(crate) const APPROVE: i32 = 5;
 pub(crate) const DENY: i32 = 6;
+pub(crate) const REMOVE_MESSAGES: i32 = 7;
 
 /// Access rows in the permissions view: history visibility, guest access and
 /// end-to-end encryption.
@@ -682,6 +688,7 @@ pub(crate) fn member_intent(
         BAN if actions.ban => AdminAction::Ban,
         UNBAN if actions.unban => AdminAction::Unban,
         APPROVE if actions.approve => AdminAction::Invite,
+        REMOVE_MESSAGES if actions.remove_messages => AdminAction::RemoveMessages,
         SET_LEVEL if actions.change_power => {
             let level = parse_level(level_input)?;
             if MemberPower::Level(level) == member.power {
@@ -763,9 +770,9 @@ pub(crate) struct Confirmation {
     pub(crate) destructive: bool,
 }
 
-/// Kick, ban, unban, denying a request, every level change and every
-/// permission change need a deliberate confirmation. Invitations and
-/// approving a request do not.
+/// Kick, ban, unban, denying a request, removing messages, every level change
+/// and every permission change need a deliberate confirmation. Invitations
+/// and approving a request do not.
 pub(crate) fn confirmation(intent: &Intent, snapshot: &RoomAdminSnapshot) -> Option<Confirmation> {
     let own = snapshot.own_power;
     let own_row = snapshot.members.iter().find(|member| member.is_self);
@@ -796,6 +803,12 @@ pub(crate) fn confirmation(intent: &Intent, snapshot: &RoomAdminSnapshot) -> Opt
             body: UNBAN_BODY.to_owned(),
             action: "Unban",
             destructive: false,
+        },
+        AdminAction::RemoveMessages => Confirmation {
+            title: format!("Remove {name}'s recent messages?"),
+            body: format!("Up to their {MAX_REMOVED_MESSAGES} latest messages here, {REMOVE_BODY}"),
+            action: "Remove messages",
+            destructive: true,
         },
         AdminAction::SetPowerLevel(level) => {
             let current = intent.expected.power.unwrap_or(MemberPower::Level(0));
@@ -913,6 +926,7 @@ pub(crate) fn pending_text(intent: &Intent) -> String {
         AdminAction::Kick => "Kicking",
         AdminAction::Ban => "Banning",
         AdminAction::Unban => "Unbanning",
+        AdminAction::RemoveMessages => "Removing recent messages from",
         AdminAction::SetPowerLevel(_) => "Changing the level of",
         AdminAction::SetPermission(..) | AdminAction::SetAccess(_) => {
             let name = &intent.name;
@@ -947,6 +961,9 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: &AdminOutcome) -> String {
             )
         };
     }
+    if let Some(removal) = outcome.removal {
+        return removal_text(name, removal);
+    }
     let Some(seen) = outcome.observed else {
         return format!("The homeserver accepted the change for {name}. {UNREAD}");
     };
@@ -968,6 +985,7 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: &AdminOutcome) -> String {
         AdminAction::Kick => format!("Kicked {name}. The homeserver confirmed they left."),
         AdminAction::Ban => format!("Banned {name}. The homeserver confirmed the ban."),
         AdminAction::Unban => format!("Unbanned {name}. The homeserver confirmed it."),
+        AdminAction::RemoveMessages => format!("Removed {name}'s recent messages."),
         AdminAction::SetPowerLevel(level) => {
             format!("{name} now has level {level}. The homeserver confirmed it.")
         }
@@ -978,6 +996,60 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: &AdminOutcome) -> String {
             format!("{name} now needs level {level}. The homeserver confirmed it.")
         }
         AdminAction::SetAccess(change) => access_outcome_text(change, outcome.confirmed),
+    }
+}
+
+/// What a removal did: only what the homeserver accepted and what reading
+/// the same events back showed.
+fn removal_text(name: &str, removal: MessageRemoval) -> String {
+    let MessageRemoval {
+        found,
+        removed,
+        verified,
+        more,
+        stopped,
+    } = removal;
+    if found == 0 && more {
+        return format!("{name}'s latest messages here are already removed.");
+    }
+    if found == 0 {
+        return format!("{name} has no recent messages here to remove.");
+    }
+    let mut text = if removed == found {
+        format!("Removed {} from {name}.", messages_text(removed))
+    } else {
+        format!("Removed {removed} of {} from {name}.", messages_text(found))
+    };
+    let next = match stopped {
+        None => "",
+        Some(RoomAdminError::RateLimited) => {
+            " The homeserver is limiting requests; wait, then remove again to continue."
+        }
+        Some(RoomAdminError::TimedOut) => " Remove again to continue.",
+        Some(RoomAdminError::Forbidden) => " The homeserver refused the next one; the rest stay.",
+        Some(_) => " The next one failed, so the rest stay; remove again to continue.",
+    };
+    text.push_str(next);
+    let check = match verified {
+        None => " Reading them back failed; check the conversation.".to_owned(),
+        Some(seen) if seen < removed => {
+            let left = removed - seen;
+            format!(" {left} still show as sent; check the conversation.")
+        }
+        Some(_) => String::new(),
+    };
+    text.push_str(&check);
+    if more && stopped.is_none() {
+        text.push_str(" They may have older messages; remove again to reach them.");
+    }
+    text
+}
+
+fn messages_text(count: usize) -> String {
+    if count == 1 {
+        "1 recent message".to_owned()
+    } else {
+        format!("{count} recent messages")
     }
 }
 
@@ -1028,11 +1100,13 @@ pub(crate) fn permission_text(action: AdminAction, snapshot: &RoomAdminSnapshot)
         AdminAction::Kick => ("Kicking", levels.kick),
         AdminAction::Ban => ("Banning", levels.ban),
         AdminAction::Unban => ("Unbanning", levels.ban.max(levels.kick)),
+        AdminAction::RemoveMessages => ("Removing others' messages", levels.redact),
         AdminAction::SetPowerLevel(_)
         | AdminAction::SetPermission(..)
         | AdminAction::SetAccess(_) => ("Changing levels", levels.change_power_levels),
     };
-    if action == AdminAction::Invite || snapshot.own_power < MemberPower::Level(needed) {
+    let any_member = matches!(action, AdminAction::Invite | AdminAction::RemoveMessages);
+    if any_member || snapshot.own_power < MemberPower::Level(needed) {
         format!("{verb} needs level {needed}; you have {own}. {ASK_HIGHER}")
     } else {
         format!("{verb} this member needs a level above theirs; you have {own}.")
@@ -1103,6 +1177,10 @@ pub(crate) fn error_text(
             }
             _ => {}
         }
+    }
+    let removing = intent.action == AdminAction::RemoveMessages;
+    if removing && matches!(error, RoomAdminError::Unavailable | RoomAdminError::TimedOut) {
+        return REMOVE_UNFINISHED.to_owned();
     }
     let fixed = match error {
         RoomAdminError::Cancelled | RoomAdminError::AccountChanged => CLOSED,
@@ -1317,6 +1395,76 @@ mod tests {
     }
 
     #[test]
+    fn removing_messages_is_confirmed_and_reports_only_what_the_homeserver_did() {
+        let mut jules = member("@jules:example.org", None, AdminMembership::Ban);
+        let snapshot = roster(vec![jules.clone()], 50);
+        assert!(member_intent(REMOVE_MESSAGES, &jules, "", "", &snapshot).is_err());
+        jules.actions = MemberActions {
+            remove_messages: true,
+            ..MemberActions::default()
+        };
+        let remove = member_intent(REMOVE_MESSAGES, &jules, "", " spam ", &snapshot).unwrap();
+        assert_eq!(remove.action, AdminAction::RemoveMessages);
+        assert_eq!(remove.reason.as_deref(), Some("spam"));
+        assert_eq!(remove.expected.membership, Some(AdminMembership::Ban));
+        assert!(remove.still_matches(&snapshot));
+        let review = confirmation(&remove, &snapshot).unwrap();
+        assert!(review.destructive && review.body.contains("cannot be undone"));
+        assert!(review.body.ends_with("Reason, visible to the room: spam"));
+        assert!(pending_text(&remove).starts_with("Removing recent messages from"));
+
+        let outcome = |removal: MessageRemoval| AdminOutcome {
+            observed: None,
+            confirmed: false,
+            snapshot: std::sync::Arc::new(snapshot.clone()),
+            replacement: None,
+            removal: Some(removal),
+        };
+        let text = |removal| outcome_text(&remove, &outcome(removal));
+        let name = &remove.name;
+        let all = MessageRemoval {
+            found: 3,
+            removed: 3,
+            verified: Some(3),
+            ..MessageRemoval::default()
+        };
+        assert_eq!(text(all), format!("Removed 3 recent messages from {name}."));
+        let limited = text(MessageRemoval {
+            found: 40,
+            removed: 12,
+            verified: Some(12),
+            more: true,
+            stopped: Some(RoomAdminError::RateLimited),
+        });
+        assert!(limited.starts_with("Removed 12 of 40 recent messages"));
+        assert!(limited.contains("limiting requests") && !limited.contains("older"));
+        let unread = MessageRemoval {
+            found: 1,
+            removed: 1,
+            ..MessageRemoval::default()
+        };
+        assert!(text(unread).contains("Reading them back failed"));
+        let lagging = MessageRemoval {
+            found: 2,
+            removed: 2,
+            verified: Some(1),
+            ..MessageRemoval::default()
+        };
+        assert!(text(lagging).contains("1 still show as sent"));
+        assert!(text(MessageRemoval::default()).contains("no recent messages"));
+        // A failure that may have removed some never reads as a success.
+        let failed = error_text(RoomAdminError::Unavailable, &remove, Some(&snapshot));
+        assert_eq!(failed, REMOVE_UNFINISHED);
+        let mut member_level = snapshot.clone();
+        member_level.own_power = MemberPower::Level(0);
+        assert_eq!(
+            permission_text(AdminAction::RemoveMessages, &member_level),
+            "Removing others' messages needs level 50; you have level 0. Ask someone with a \
+             higher level."
+        );
+    }
+
+    #[test]
     fn invites_refuse_listed_members_and_need_invite_permission() {
         let members = vec![
             member("@in:example.org", None, AdminMembership::Join),
@@ -1484,6 +1632,7 @@ mod tests {
             confirmed: true,
             snapshot: std::sync::Arc::new(snapshot.clone()),
             replacement: Some("!new:example.org".to_owned()),
+            removal: None,
         };
         let text = outcome_text(&upgrade, &outcome);
         assert!(text.starts_with("Upgraded.") && text.contains("!new:example.org"));
