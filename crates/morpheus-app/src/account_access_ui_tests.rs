@@ -3116,6 +3116,9 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
 
     let store = ConfigStore::at(directory.join("style-check").join("config.toml"));
     let mut config = store.load_or_create().unwrap();
+    // Explicit synthetic opt-in: production message previews default off.
+    // The later live-config regression must exercise a true -> false change.
+    config.notifications.show_message_preview = true;
     config.notifications.highlight_words = vec!["private-word".into()];
     config.typography.message_size = 15;
     store.save(&config).unwrap();
