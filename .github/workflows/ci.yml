@@ -361,6 +361,16 @@ jobs:
               'cc_command_failed':'error occurred in cc-rs',
               'cmake_error':'CMake Error',
               'linker_error':'linking with',
+              'gnu_link_extra_operand':'extra operand',
+              'gnu_link_help':"link --help",
+              'linker_not_found':'linker `link.exe` not found',
+              'linker_unrecognized_option':'unrecognized command-line option',
+              'linker_invalid_argument':'invalid argument',
+              'linker_no_such_file':'No such file or directory',
+              'linker_machine_conflict':'conflicts with target machine',
+              'linker_corrupt':'invalid or corrupt file',
+              'linker_undefined':'undefined reference',
+              'linker_unresolved':'unresolved external symbol',
               'proc_macro_target':'does not support these crate types',
               'locked_resolution':'lock file needs to be updated',
               'tls_certificate':'certificate verify failed',
@@ -453,12 +463,31 @@ jobs:
                       'tests_ignored':c,'required_tests':{fixed:fixed in okay for fixed in sorted(required)}})
               record['error_codes']=sorted(set(re.findall(r'error\[(E[0-9]{4})\]',output)))
               if not passed:
-                  folded_output=output.lower()
                   crates=set(re.findall(r"failed to run custom build command for `([A-Za-z0-9_-]+) v([0-9][A-Za-z0-9.+_-]*)`",output))
+                  # Only fixed tool families and package names from the reviewed lock
+                  # may leave the private log. Normalize NULs for native UTF-16 output.
+                  normalized=output.replace('\x00','')
+                  folded_output=normalized.lower()
+                  linker_failures=re.findall(r'linking with `([^`\r\n]{1,1024})` failed: exit code: ([0-9]{1,10})',normalized)
+                  def tool_family(path):
+                      value=path.replace('\\','/').lower()
+                      name=value.rsplit('/',1)[-1]
+                      if name not in ('link.exe','lld-link.exe','clang-cl.exe','cc','clang','gcc'): return 'other'
+                      if '/git/usr/bin/' in value: return 'git_coreutils_link' if name=='link.exe' else 'other'
+                      if '/vc/tools/msvc/' in value: return 'msvc_link' if name=='link.exe' else 'other'
+                      return {'link.exe':'link','lld-link.exe':'lld_link','clang-cl.exe':'clang_cl',
+                          'cc':'cc','clang':'clang','gcc':'gcc'}[name]
+                  import shutil
+                  resolved_link=shutil.which('link.exe',path=environment.get('PATH','')) if os.name=='nt' else None
+                  locked_names={package for package,version in locked}
+                  failed_packages=set(re.findall(r'could not compile `([A-Za-z0-9_-]+)`',normalized))
                   record['failure_diagnostics']={
+                      'linker_failures':[{'tool':tool_family(tool),'exit_code':int(code)} for tool,code in linker_failures[:8]],
+                      'path_link_family':tool_family(resolved_link) if resolved_link else 'not_resolved',
+                      'locked_failed_packages':sorted(failed_packages & locked_names),
                       'markers':sorted(key for key,value in failure_markers.items() if value.lower() in folded_output),
                       'locked_build_script_crates':sorted(name+'@'+version for name,version in crates if (name,version) in locked),
-                      'native_error_codes':sorted(set(re.findall(r'\b(?:LNK[0-9]{4}|C[0-9]{4})\b',output))),
+                      'native_error_codes':sorted(set(re.findall(r'\b(?:LNK[0-9]{4}|C[0-9]{4})\b',normalized))),
                       'os_error_codes':sorted(set(int(code) for code in re.findall(r'os error ([0-9]{1,5})\b',output))),
                   }
               loops=len(re.findall(r'part of a binding loop',output))
