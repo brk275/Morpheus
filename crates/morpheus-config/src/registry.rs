@@ -1253,6 +1253,14 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
         &["default", "direct messages", "dm", "group", "all messages"],
     )),
     live(target(
+        "notifications.keywords",
+        "Notifications",
+        "Settings › Notifications › Keywords",
+        "Notification keywords",
+        "Matrix keywords that notify in rooms set to mentions and keywords, on all devices.",
+        &["keyword", "keywords", "alert words", "push rules", "mentions and keywords"],
+    )),
+    live(target(
         "notifications.rooms",
         "Notifications",
         "Settings › Notifications › Rooms",

@@ -12,10 +12,10 @@ use std::sync::{Arc, Mutex, MutexGuard, atomic::Ordering};
 
 use morpheus_config::{AccountOverrides, Config, ConfigStore};
 use morpheus_matrix::{
-    AccountSelection, MatrixCoreError, NotificationDefaults, NotificationMode,
-    RoomNotificationRule,
+    AccountSelection, MAX_NOTIFICATION_KEYWORD_CHARS, MAX_NOTIFICATION_KEYWORDS, MatrixCoreError,
+    NotificationDefaults, NotificationMode, RoomNotificationRule,
 };
-use slint::{ComponentHandle, Model, ModelRc, VecModel, Weak};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel, Weak};
 use tokio::runtime::Handle;
 
 use crate::{
@@ -85,6 +85,8 @@ struct State {
     /// Lowercase search text.
     query: String,
     loaded: bool,
+    /// The account's Matrix keywords exactly as stored in its push rules.
+    keywords: Vec<String>,
 }
 
 pub(super) struct Rules {
@@ -138,6 +140,10 @@ impl Rules {
         });
         let account = rules.clone();
         global.on_set_account_enabled(move |enabled| account.set_account_enabled(enabled));
+        let add = rules.clone();
+        global.on_add_keyword(move |keyword| add.add_keyword(&keyword));
+        let remove = rules.clone();
+        global.on_remove_keyword(move |keyword| remove.remove_keyword(&keyword));
         rules
     }
 
@@ -206,11 +212,13 @@ impl Rules {
             state.operation = state.operation.wrapping_add(1);
             state.selection = selection.clone();
             state.rows.clear();
+            state.keywords.clear();
             state.loaded = false;
             if !keep_query {
                 state.query.clear();
             }
             publish(&global, &state);
+            publish_keywords(&global, &state.keywords);
             state.operation
         };
         // The account's own switch follows the file for the newly shown account.
@@ -220,7 +228,10 @@ impl Rules {
         global.set_error("".into());
         global.set_notice("".into());
         global.set_defaults_busy(false);
+        global.set_keywords_busy(false);
+        global.set_keyword_error("".into());
         if !keep_query {
+            global.set_keyword_input("".into());
             global.set_default_group(0);
             global.set_default_direct(0);
             global.set_default_group_mixed(false);
@@ -234,13 +245,14 @@ impl Rules {
         let rules = self.clone();
         self.runtime.spawn(async move {
             let manager = rules.live.manager.clone();
-            let (rooms, defaults) = tokio::join!(
+            let (rooms, defaults, keywords) = tokio::join!(
                 manager.room_notification_rules_selected(&selection),
                 manager.notification_defaults_selected(&selection),
+                manager.notification_keywords_selected(&selection),
             );
             let weak = rules.ui.clone();
             let _ = weak.upgrade_in_event_loop(move |ui| {
-                rules.apply_loaded(&ui, operation, &selection, rooms, defaults);
+                rules.apply_loaded(&ui, operation, &selection, rooms, defaults, keywords);
             });
         });
     }
@@ -252,12 +264,20 @@ impl Rules {
         selection: &AccountSelection,
         rooms: Result<Vec<RoomNotificationRule>, MatrixCoreError>,
         defaults: Result<NotificationDefaults, MatrixCoreError>,
+        keywords: Result<Vec<String>, MatrixCoreError>,
     ) {
         if !self.owns(ui, operation, selection) {
             return;
         }
         let global = ui.global::<NotificationRulesState>();
         global.set_loading(false);
+        match keywords {
+            Ok(keywords) => {
+                self.state().keywords = keywords;
+                publish_keywords(&global, &self.state().keywords);
+            }
+            Err(_) => global.set_keyword_error("Keywords could not be read.".into()),
+        }
         let defaults_read = match defaults {
             Ok(defaults) => {
                 apply_defaults(&global, defaults);
@@ -451,6 +471,185 @@ impl Rules {
     }
 }
 
+impl Rules {
+    fn add_keyword(self: &Arc<Self>, input: &str) {
+        let Some(ui) = self.ui.upgrade() else {
+            return;
+        };
+        let global = ui.global::<NotificationRulesState>();
+        if global.get_keywords_busy() {
+            return;
+        }
+        let keyword = match normalize_keyword(input) {
+            Ok(keyword) => keyword,
+            Err(message) => {
+                global.set_keyword_error(message.into());
+                return;
+            }
+        };
+        let (operation, selection) = {
+            let state = self.state();
+            let Some(selection) = state.selection.clone() else {
+                return;
+            };
+            if !state.loaded
+                || !selection.is_current()
+                || ui.get_active_account_local_id().as_str() != selection.account_id()
+            {
+                return;
+            }
+            let folded = keyword.to_lowercase();
+            if state
+                .keywords
+                .iter()
+                .any(|known| known.to_lowercase() == folded)
+            {
+                global.set_keyword_error("That keyword is already in the list.".into());
+                return;
+            }
+            if state.keywords.len() >= MAX_NOTIFICATION_KEYWORDS {
+                global.set_keyword_error("Add at most 32 keywords.".into());
+                return;
+            }
+            (state.operation, selection)
+        };
+        self.change_keywords(&global, operation, selection, keyword, true);
+    }
+
+    /// `shown` is the sanitized text of a listed keyword; the stored rule it
+    /// was made from is removed.
+    fn remove_keyword(self: &Arc<Self>, shown: &str) {
+        let Some(ui) = self.ui.upgrade() else {
+            return;
+        };
+        let global = ui.global::<NotificationRulesState>();
+        if global.get_keywords_busy() {
+            return;
+        }
+        let (operation, selection, keyword) = {
+            let state = self.state();
+            let Some(selection) = state.selection.clone() else {
+                return;
+            };
+            if !selection.is_current()
+                || ui.get_active_account_local_id().as_str() != selection.account_id()
+            {
+                return;
+            }
+            let Some(keyword) = state
+                .keywords
+                .iter()
+                .find(|keyword| display_keyword(keyword) == shown)
+                .cloned()
+            else {
+                return;
+            };
+            (state.operation, selection, keyword)
+        };
+        self.change_keywords(&global, operation, selection, keyword, false);
+    }
+
+    fn change_keywords(
+        self: &Arc<Self>,
+        global: &NotificationRulesState<'_>,
+        operation: u64,
+        selection: AccountSelection,
+        keyword: String,
+        add: bool,
+    ) {
+        global.set_keywords_busy(true);
+        global.set_keyword_error("".into());
+        global.set_notice("".into());
+        let rules = self.clone();
+        self.runtime.spawn(async move {
+            let manager = rules.live.manager.clone();
+            let result = if add {
+                manager
+                    .add_notification_keyword_selected(&selection, &keyword)
+                    .await
+            } else {
+                manager
+                    .remove_notification_keyword_selected(&selection, &keyword)
+                    .await
+            };
+            let weak = rules.ui.clone();
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                if !rules.owns(&ui, operation, &selection) {
+                    return;
+                }
+                let global = ui.global::<NotificationRulesState>();
+                global.set_keywords_busy(false);
+                match result {
+                    Ok(keywords) => {
+                        rules.state().keywords = keywords;
+                        publish_keywords(&global, &rules.state().keywords);
+                        if add {
+                            global.set_keyword_input("".into());
+                        }
+                        let notice = if add {
+                            "Keyword saved."
+                        } else {
+                            "Keyword removed."
+                        };
+                        global.set_notice(notice.into());
+                    }
+                    Err(_) => global.set_keyword_error(
+                        if add {
+                            "The homeserver did not confirm the keyword; it was not added."
+                        } else {
+                            "The homeserver did not confirm removing the keyword."
+                        }
+                        .into(),
+                    ),
+                }
+            });
+        });
+    }
+}
+
+/// Trim and collapse whitespace; refuse what a push-rule glob or the
+/// notification text could misread.
+fn normalize_keyword(input: &str) -> Result<String, &'static str> {
+    if input.chars().any(|character| {
+        character.is_control()
+            || matches!(
+                character,
+                '\u{061c}'
+                    | '\u{200b}'..='\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2060}'..='\u{206f}'
+                    | '\u{feff}'
+            )
+    }) {
+        return Err("Keywords cannot contain control or direction characters.");
+    }
+    if input.contains(['*', '?', '[', ']']) {
+        return Err("Keywords cannot contain *, ?, [ or ].");
+    }
+    let keyword = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    if keyword.is_empty() {
+        return Err("Enter a word or phrase.");
+    }
+    if keyword.chars().count() > MAX_NOTIFICATION_KEYWORD_CHARS {
+        return Err("A keyword can be at most 64 characters.");
+    }
+    Ok(keyword)
+}
+
+/// Keywords may come from other clients; list them as plain text.
+fn display_keyword(keyword: &str) -> String {
+    crate::directory_plain_text(keyword, MAX_NOTIFICATION_KEYWORD_CHARS)
+}
+
+fn publish_keywords(global: &NotificationRulesState<'_>, keywords: &[String]) {
+    global.set_keywords(ModelRc::new(VecModel::from(
+        keywords
+            .iter()
+            .map(|keyword| SharedString::from(display_keyword(keyword)))
+            .collect::<Vec<_>>(),
+    )));
+}
+
 /// The privacy and account switches follow each accepted configuration.
 pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
     let global = ui.global::<NotificationRulesState>();
@@ -507,6 +706,16 @@ fn update_row(global: &NotificationRulesState<'_>, row: &Row) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keywords_are_plain_bounded_text() {
+        assert_eq!(normalize_keyword("  on   call ").as_deref(), Ok("on call"));
+        for input in ["", "   ", "re*lease", "[urgent]", "who?", "a\u{202e}b", "a\tb"] {
+            assert!(normalize_keyword(input).is_err(), "{input:?}");
+        }
+        let long = "a".repeat(MAX_NOTIFICATION_KEYWORD_CHARS + 1);
+        assert!(normalize_keyword(&long).is_err());
+    }
 
     #[test]
     fn rows_show_sanitized_names_and_the_level_that_applies() {

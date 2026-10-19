@@ -57,8 +57,8 @@ mod rich_text;
 pub use account_selection::AccountSelection;
 pub use admin::RoomMemberInfo;
 pub use notification_rules::{
-    MAX_NOTIFICATION_ROOMS, NotificationDefaults, NotificationMode, RoomNotificationRule,
-    RoomUnreadCounts,
+    MAX_NOTIFICATION_KEYWORDS, MAX_NOTIFICATION_KEYWORD_CHARS, MAX_NOTIFICATION_ROOMS,
+    NotificationDefaults, NotificationMode, RoomNotificationRule, RoomUnreadCounts,
 };
 
 use std::{

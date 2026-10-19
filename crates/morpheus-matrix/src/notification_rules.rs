@@ -23,6 +23,9 @@ use super::*;
 const RULE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Upper bound on rooms described by one listing.
 pub const MAX_NOTIFICATION_ROOMS: usize = 2_000;
+/// Matrix keyword rules Morpheus adds at most, and their length in characters.
+pub const MAX_NOTIFICATION_KEYWORDS: usize = 32;
+pub const MAX_NOTIFICATION_KEYWORD_CHARS: usize = 64;
 
 /// One room or account notification level, as the Matrix push rules define it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -259,6 +262,71 @@ impl AccountManager {
         .await
     }
 
+    /// The account's enabled Matrix keyword rules, sorted without regard to
+    /// case. They notify in every room that is not muted, including rooms set
+    /// to mentions and keywords, on all of the account's devices.
+    pub async fn notification_keywords_selected(
+        &self,
+        selection: &AccountSelection,
+    ) -> Result<Vec<String>> {
+        let client = self.rule_client(selection).await?;
+        self.under_rule_selection(selection, async move {
+            let settings = client.notification_settings().await;
+            Ok(sorted_keywords(&settings).await)
+        })
+        .await
+    }
+
+    /// Add (or re-enable) one plain keyword rule. Glob characters, control or
+    /// direction characters, blank or overlong keywords and more than
+    /// `MAX_NOTIFICATION_KEYWORDS` rules are refused before any request.
+    pub async fn add_notification_keyword_selected(
+        &self,
+        selection: &AccountSelection,
+        keyword: &str,
+    ) -> Result<Vec<String>> {
+        if !valid_keyword(keyword) {
+            return Err(MatrixCoreError::Sdk("invalid notification keyword".into()));
+        }
+        let keyword = keyword.to_owned();
+        let client = self.rule_client(selection).await?;
+        self.under_rule_selection(selection, async move {
+            let settings = client.notification_settings().await;
+            let existing = sorted_keywords(&settings).await;
+            if existing.iter().any(|known| known == &keyword) {
+                return Ok(existing);
+            }
+            if existing.len() >= MAX_NOTIFICATION_KEYWORDS {
+                return Err(MatrixCoreError::Sdk("too many notification keywords".into()));
+            }
+            settings
+                .add_keyword(keyword)
+                .await
+                .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
+            Ok(sorted_keywords(&settings).await)
+        })
+        .await
+    }
+
+    /// Remove every rule for one keyword.
+    pub async fn remove_notification_keyword_selected(
+        &self,
+        selection: &AccountSelection,
+        keyword: &str,
+    ) -> Result<Vec<String>> {
+        let keyword = keyword.to_owned();
+        let client = self.rule_client(selection).await?;
+        self.under_rule_selection(selection, async move {
+            let settings = client.notification_settings().await;
+            settings
+                .remove_keyword(&keyword)
+                .await
+                .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
+            Ok(sorted_keywords(&settings).await)
+        })
+        .await
+    }
+
     /// Mark the room's live timeline read up to its latest event with a
     /// private read receipt, which clears unread counts on this and the
     /// account's other devices without showing other members a read marker.
@@ -323,6 +391,38 @@ impl AccountManager {
         }
         Ok(counts)
     }
+}
+
+/// A keyword is matched as a push-rule glob, so only plain text is accepted.
+fn valid_keyword(keyword: &str) -> bool {
+    let length = keyword.chars().count();
+    length > 0
+        && length <= MAX_NOTIFICATION_KEYWORD_CHARS
+        && keyword.trim() == keyword
+        && !keyword.chars().any(|character| {
+            character.is_control()
+                || matches!(
+                    character,
+                    '*' | '?'
+                        | '['
+                        | ']'
+                        | '\u{061c}'
+                        | '\u{200b}'..='\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2060}'..='\u{206f}'
+                        | '\u{feff}'
+                )
+        })
+}
+
+async fn sorted_keywords(settings: &NotificationSettings) -> Vec<String> {
+    let mut keywords = settings
+        .enabled_keywords()
+        .await
+        .into_iter()
+        .collect::<Vec<String>>();
+    keywords.sort_by_key(|keyword| keyword.to_lowercase());
+    keywords
 }
 
 async fn describe_room(settings: &NotificationSettings, room: &Room) -> RoomNotificationRule {
@@ -392,5 +492,25 @@ mod tests {
         ] {
             assert_eq!(NotificationMode::from(RoomNotificationMode::from(mode)), mode);
         }
+    }
+
+    #[test]
+    fn only_plain_bounded_keywords_become_push_rules() {
+        assert!(valid_keyword("release"));
+        assert!(valid_keyword("on call"));
+        for keyword in [
+            "",
+            " release",
+            "release ",
+            "re*lease",
+            "release?",
+            "[release]",
+            "re\nlease",
+            "re\u{202e}lease",
+        ] {
+            assert!(!valid_keyword(keyword), "{keyword:?}");
+        }
+        assert!(valid_keyword(&"a".repeat(MAX_NOTIFICATION_KEYWORD_CHARS)));
+        assert!(!valid_keyword(&"a".repeat(MAX_NOTIFICATION_KEYWORD_CHARS + 1)));
     }
 }

@@ -40,6 +40,11 @@ export global NotificationRulesState {
     in-out property <bool> default-group-mixed: false;
     in-out property <bool> default-direct-mixed: false;
     in-out property <bool> defaults-busy: false;
+    // The account's Matrix keyword rules, and the keyword being typed.
+    in-out property <[string]> keywords;
+    in-out property <string> keyword-input;
+    in-out property <string> keyword-error;
+    in-out property <bool> keywords-busy: false;
     // Load the visible account's rules again.
     callback refresh();
     // The search text changed.
@@ -50,6 +55,8 @@ export global NotificationRulesState {
     callback choose-default(bool, int);
     callback set-show-room-and-sender(bool);
     callback set-account-enabled(bool);
+    callback add-keyword(string);
+    callback remove-keyword(string);
 }
 
 // The window's resolved theme roles; optional StyleTokens roles are resolved
@@ -387,6 +394,7 @@ export component NotificationRules inherits VerticalLayout {
     in property <int> account-reveal;
     in property <int> identity-reveal;
     in property <int> defaults-reveal;
+    in property <int> keywords-reveal;
     in property <int> rooms-reveal;
     // Scroll so a control at this absolute y is visible.
     callback reveal(length);
@@ -394,6 +402,13 @@ export component NotificationRules inherits VerticalLayout {
     callback revealed(string);
 
     property <bool> rules-ready: root.live && !NotificationRulesState.loading;
+    property <bool> keywords-ready: root.rules-ready && !NotificationRulesState.keywords-busy;
+
+    function submit-keyword() {
+        if root.keywords-ready && NotificationRulesState.keyword-input != "" {
+            NotificationRulesState.add-keyword(NotificationRulesState.keyword-input);
+        }
+    }
 
     pure function status() -> string {
         if !root.live {
@@ -455,6 +470,15 @@ export component NotificationRules inherits VerticalLayout {
             group-defaults.focus-first();
             if group-defaults.first-focused {
                 root.revealed("notifications.defaults");
+            }
+        }
+    }
+    changed keywords-reveal => {
+        if root.keywords-reveal > 0 {
+            root.reveal(keyword-input.absolute-position.y);
+            keyword-input.focus();
+            if keyword-input.has-focus {
+                root.revealed("notifications.keywords");
             }
         }
     }
@@ -597,6 +621,120 @@ export component NotificationRules inherits VerticalLayout {
         }
         choose(choice) => {
             NotificationRulesState.choose-default(true, choice);
+        }
+    }
+
+    Text {
+        text: "Keywords";
+        color: root.palette.ink;
+        font-size: 13px * root.text-scale;
+        font-weight: 700;
+    }
+    Text {
+        text: "Matrix keywords notify in every room that is not muted, including rooms set to mentions and keywords, on all devices of this account.";
+        color: root.palette.muted;
+        font-size: 11px * root.text-scale;
+        wrap: word-wrap;
+    }
+    HorizontalLayout {
+        height: max(38px, 26px * root.text-scale);
+        spacing: 8px;
+        Rectangle {
+            horizontal-stretch: 1;
+            border-radius: 8px;
+            background: root.palette.panel;
+            border-width: 1px;
+            border-color: keyword-input.has-focus ? root.palette.accent : root.palette.divider;
+            keyword-input := TextInput {
+                x: 10px;
+                width: parent.width - 20px;
+                height: parent.height;
+                vertical-alignment: center;
+                single-line: true;
+                text <=> NotificationRulesState.keyword-input;
+                enabled: root.keywords-ready;
+                color: root.palette.ink;
+                font-size: 12px * root.text-scale;
+                accessible-label: "New Matrix keyword";
+                changed has-focus => {
+                    if self.has-focus {
+                        root.reveal(self.absolute-position.y);
+                    }
+                }
+                edited => {
+                    NotificationRulesState.keyword-error = "";
+                }
+                accepted => {
+                    root.submit-keyword();
+                }
+            }
+            if keyword-input.text == "": Text {
+                x: 10px;
+                width: parent.width - 20px;
+                height: parent.height;
+                vertical-alignment: center;
+                text: "Add a keyword";
+                color: root.palette.muted;
+                font-size: 12px * root.text-scale;
+                accessible-role: none;
+            }
+        }
+        RuleOption {
+            palette: root.palette;
+            text-scale: root.text-scale;
+            text: "Add";
+            label: "Add Matrix keyword";
+            selected: false;
+            checkable: false;
+            enabled: root.keywords-ready && NotificationRulesState.keyword-input != "";
+            focused-at(offset) => {
+                root.reveal(offset);
+            }
+            activated => {
+                root.submit-keyword();
+            }
+        }
+    }
+    if NotificationRulesState.keyword-error != "": Text {
+        text: NotificationRulesState.keyword-error;
+        color: root.palette.error;
+        font-size: 11px * root.text-scale;
+        wrap: word-wrap;
+        accessible-live-region: polite;
+    }
+    for keyword in NotificationRulesState.keywords: Rectangle {
+        min-height: max(36px, 26px * root.text-scale);
+        border-radius: 8px;
+        background: root.palette.elevated;
+        HorizontalLayout {
+            padding-left: 12px;
+            padding-right: 6px;
+            padding-top: 3px;
+            padding-bottom: 3px;
+            spacing: 8px;
+            Text {
+                text: keyword;
+                color: root.palette.ink;
+                font-size: 12px * root.text-scale;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+                overflow: elide;
+            }
+            RuleOption {
+                palette: root.palette;
+                text-scale: root.text-scale;
+                text: "Remove";
+                label: "Remove Matrix keyword " + keyword;
+                selected: false;
+                checkable: false;
+                enabled: root.keywords-ready;
+                focused-at(offset) => {
+                    root.reveal(offset);
+                }
+                activated => {
+                    NotificationRulesState.remove-keyword(keyword);
+                }
+            }
         }
     }
 

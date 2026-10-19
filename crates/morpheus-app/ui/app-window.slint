@@ -5086,6 +5086,7 @@ export component AppWindow inherits Window {
                             account-reveal: root.reveal-request("notifications.account");
                             identity-reveal: root.reveal-request("notifications.identity");
                             defaults-reveal: root.reveal-request("notifications.defaults");
+                            keywords-reveal: root.reveal-request("notifications.keywords");
                             rooms-reveal: root.reveal-request("notifications.rooms");
                             reveal(offset) => { settings-scroll.reveal(offset - settings-content.absolute-position.y); }
                             revealed(id) => { root.settings-revealed-id = id; }

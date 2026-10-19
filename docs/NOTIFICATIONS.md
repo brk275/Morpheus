@@ -62,7 +62,14 @@ notification-settings API, so they apply on every device of the account and are
 what the SDK evaluates before an event reaches Morpheus. A change is shown as
 saved only after the homeserver accepts it, and is applied to local delivery at
 once (for two minutes, until sync returns the updated rules). The list shows at
-most 100 matching rooms at a time and reads at most 2,000 rooms. Requests and
+most 100 matching rooms at a time and reads at most 2,000 rooms.
+
+Keywords in the same section are Matrix keyword push rules, unlike local
+highlight words: a message containing one notifies in every room that is not
+muted, including rooms set to mentions and keywords, and the keywords apply on
+all of the account's devices. Morpheus adds at most 32 keywords of at most 64
+characters, plain text only (no `*`, `?`, `[` or `]`, which push rules would
+read as patterns), and lists keywords added elsewhere as plain text. Requests and
 results are bound to the account selection that made them; a switch discards
 their results. Errors use fixed wording.
 
