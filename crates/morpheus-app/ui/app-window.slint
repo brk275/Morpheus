@@ -10,6 +10,7 @@ import { AttachmentItem, AttachmentQueue } from "attachment-workbench.slint";
 import { TransferCenterPanel, TransferItem } from "transfer-center.slint";
 import { MediaViewer } from "media-viewer.slint";
 import { StyleTokens } from "style-tokens.slint";
+import { MorpheusIcon, MorpheusIcons } from "icons.slint";
 import { ActionRect, ControlColors, HoverSurface, TextAction, TokenButton, TokenSelect, TokenSlider } from "controls.slint";
 // Rust projects every accepted configuration into StyleTokens; the screen
 // files import the same global, so one projection reaches every control.
@@ -351,31 +352,6 @@ component AvatarBadge inherits Rectangle {
     }
 }
 
-component InterfaceGlyph inherits Path {
-    in property <string> icon;
-    in property <color> ink;
-    width: 20px;
-    height: 20px;
-    viewbox-width: 20;
-    viewbox-height: 20;
-    stroke: ink;
-    stroke-width: 1.6px;
-    fill: transparent;
-    commands: icon == "S" ? "M 14 8 A 6 6 0 1 1 2 8 A 6 6 0 1 1 14 8 M 12.5 12.5 L 18 18"
-        : icon == "C" ? "M 5 2 L 2.5 3.5 C 1 5 3 10 7 14 C 11 18 15 19 16.5 17.5 L 18 15 L 14 12 L 12 14 C 10 13 7 10 6 8 L 8 6 Z"
-        : icon == "P" ? "M 3 3 L 17 3 L 17 17 L 3 17 Z M 12 3 L 12 17"
-        : icon == "⌂" ? "M 2 9 L 10 2 L 18 9 M 4 7 L 4 17 L 8 17 L 8 12 L 12 12 L 12 17 L 16 17 L 16 7"
-        : icon == "+" ? "M 10 3 L 10 17 M 3 10 L 17 10"
-        : icon == "↓" ? "M 10 2 L 10 13 M 5 8 L 10 13 L 15 8 M 3 13 L 3 17 L 17 17 L 17 13"
-        : icon == "F" ? "M 4 2 L 11 2 L 16 7 L 16 18 L 4 18 Z M 11 2 L 11 7 L 16 7 M 7 11 L 13 11 M 7 14 L 12 14"
-        : icon == "↩" ? "M 8 4 L 2 9 L 8 14 M 2 9 L 12 9 C 16 9 18 12 18 16"
-        : icon == "♥" ? "M 10 17 C 8 15 2 11 2 6.5 C 2 2 8 1 10 5 C 12 1 18 2 18 6.5 C 18 11 12 15 10 17 Z"
-        : icon == "⌫" ? "M 3 5 L 17 5 M 7 5 L 7 2 L 13 2 L 13 5 M 5 5 L 6 18 L 14 18 L 15 5 M 8 8 L 8 15 M 12 8 L 12 15"
-        : icon == "✎" ? "M 4 16 L 8 15 L 16 7 L 13 4 L 5 12 Z M 12 5 L 15 8"
-        : icon == "Pin" ? "M 7 2 L 13 2 L 12 7 L 15 10 L 15 11 L 5 11 L 5 10 L 8 7 Z M 10 11 L 10 18"
-        : "M 3 4 L 17 4 L 17 13 L 10 13 L 6 17 L 6 13 L 3 13 Z M 6 7 L 14 7 M 6 10 L 12 10";
-}
-
 // A pane's resize edge: a subtle line that shows on hover and while
 // dragging. Only the window previews the new width while the pointer moves;
 // `finished` reports the final width once, on release. A cancelled pointer
@@ -545,7 +521,9 @@ component IconAction inherits Rectangle {
     // Reveal the associated value row as well as a small settings action.
     in property <length> reveal-height: root.height;
     out property <bool> has-focus: keyboard-focus.has-focus;
-    property <bool> vector-icon: icon == "S" || icon == "C" || icon == "P" || icon == "⌂" || icon == "+" || icon == "↓" || icon == "F" || icon == "↩" || icon == "♥" || icon == "⌫" || icon == "✎" || icon == "☷" || icon == "Pin";
+    // A stable MorpheusIcons ID, or a legacy one-glyph caption that maps to
+    // one. Anything else keeps the bounded text fallback below.
+    property <string> icon-id: MorpheusIcons.outline(root.icon) != "" ? root.icon : MorpheusIcons.from-legacy(root.icon);
     // The configured icon size. A larger icon stays inside a call site's
     // explicitly smaller button, but never below the built-in 18 px, so the
     // default look is unchanged at every text scale. The button's own size
@@ -577,19 +555,19 @@ component IconAction inherits Rectangle {
     // Disabled, then selected, then the caller's ink.
     property <color> glyph-ink: !root.enabled && StyleTokens.states.control-disabled.present ? StyleTokens.states.control-disabled.color
         : root.selected && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink;
-    if !root.vector-icon : Text {
+    if root.icon-id == "" : Text {
         text: root.icon;
         color: root.glyph-ink;
         font-size: root.icon == "Md" ? root.glyph-size * 13 / 18 : root.glyph-size;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
-    if root.vector-icon : InterfaceGlyph {
+    if root.icon-id != "" : MorpheusIcon {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         width: root.glyph-size;
         height: root.glyph-size;
-        icon: root.icon;
+        icon: root.icon-id;
         ink: root.glyph-ink;
     }
     keyboard-focus := FocusScope {
@@ -1916,9 +1894,9 @@ component SettingsSearchBar inherits VerticalLayout {
         border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.8;
         border-width: input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
         border-color: input.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent) : StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.outline;
-        InterfaceGlyph {
+        MorpheusIcon {
             x: StyleTokens.input-padding; y: (parent.height - self.height) / 2; width: 16px; height: 16px;
-            icon: "S"; ink: root.muted;
+            icon: "search"; ink: root.muted;
         }
         if root.query == "" : Text {
             x: StyleTokens.input-padding + 24px; width: parent.width - 2 * StyleTokens.input-padding - 24px; height: parent.height;
@@ -4515,7 +4493,7 @@ export component AppWindow inherits Window {
                 IconAction {
                     width: root.rail-width-px * 1px - 12px;
                     height: 48px;
-                    icon: "⌂";
+                    icon: "home";
                     focus-state-changed(focused) => { root.navigation-focus-changed(0, "route:home", focused); }
                     label: "Home and all rooms";
                     ink: root.page == 0 && root.active-space-id == "" ? root.icon-active-ink : root.icon-ink;
@@ -4568,7 +4546,7 @@ export component AppWindow inherits Window {
                 IconAction {
                     width: root.rail-width-px * 1px - 12px;
                     height: 48px;
-                    icon: "S";
+                    icon: "explore";
                     focus-state-changed(focused) => { root.navigation-focus-changed(0, "route:discover", focused); }
                     label: "Explore public Matrix rooms";
                     ink: root.page == 3 ? root.icon-active-ink : root.icon-ink;
@@ -4580,7 +4558,7 @@ export component AppWindow inherits Window {
                 IconAction {
                     width: root.rail-width-px * 1px - 12px;
                     height: 48px;
-                    icon: "C";
+                    icon: "calls";
                     focus-state-changed(focused) => { root.navigation-focus-changed(0, "route:calls", focused); }
                     label: "Open call stage";
                     ink: root.page == 2 ? root.icon-active-ink : root.icon-ink;
@@ -4592,7 +4570,7 @@ export component AppWindow inherits Window {
                 IconAction {
                     width: root.rail-width-px * 1px - 12px;
                     height: 48px;
-                    icon: "⚙";
+                    icon: "settings";
                     focus-state-changed(focused) => { root.navigation-focus-changed(0, "route:settings", focused); }
                     label: "Open settings";
                     ink: root.page == 1 ? root.icon-active-ink : root.icon-ink;
@@ -4666,7 +4644,7 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             padding-left: 11px; padding-right: 11px;
                             padding-top: 10px; padding-bottom: 10px; spacing: 9px;
-                            Rectangle { width: 17px; background: transparent; InterfaceGlyph { y: (parent.height - self.height) / 2; width: 17px; height: 17px; icon: "S"; ink: root.muted; } }
+                            Rectangle { width: 17px; background: transparent; MorpheusIcon { y: (parent.height - self.height) / 2; width: 17px; height: 17px; icon: "search"; ink: root.muted; } }
                             Text { text: "Find a conversation"; color: root.muted; font-size: 12px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
                         }
                     }
@@ -5001,7 +4979,7 @@ export component AppWindow inherits Window {
                         if root.page == 0 : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
-                            icon: "⚙"; label: "Edit room settings"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                            icon: "settings"; label: "Edit room settings"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                             enabled: root.live-session && root.active-room-id != "";
                             activated => {
                                 root.open-room-settings();
@@ -5011,7 +4989,7 @@ export component AppWindow inherits Window {
                         if root.page == 0 : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
-                            icon: "S"; label: "Search messages"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                            icon: "search"; label: "Search messages"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                             selected: root.show-side-panel && root.side-panel-tab == 2;
                             enabled: root.live-session;
                             activated => { root.focus-room-search(); }
@@ -5020,7 +4998,7 @@ export component AppWindow inherits Window {
                         if root.page == 0 : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
-                            icon: "Pin"; label: "Show pinned messages"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                            icon: "pin"; label: "Show pinned messages"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                             selected: root.show-side-panel && root.side-panel-tab == 3;
                             enabled: root.live-session && root.active-room-id != "";
                             activated => {
@@ -5033,7 +5011,7 @@ export component AppWindow inherits Window {
                         if root.page == 0 : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
-                            icon: "⇅"; label: root.transfer-active-count > 0 ? "Show transfers, " + root.transfer-active-count + " in progress" : "Show transfers"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                            icon: "transfers"; label: root.transfer-active-count > 0 ? "Show transfers, " + root.transfer-active-count + " in progress" : "Show transfers"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                             selected: root.show-side-panel && root.side-panel-tab == 4;
                             enabled: root.live-session;
                             activated => { root.show-transfer-panel(); }
@@ -5042,14 +5020,14 @@ export component AppWindow inherits Window {
                         if root.page == 0 : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
-                            icon: "C"; label: "Open current room call stage"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                            icon: "calls"; label: "Open current room call stage"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                             activated => { root.page = 2; }
                         }
                         }
                         if root.page == 0 : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;
                             IconAction {
-                            icon: "P"; label: root.show-side-panel ? "Hide details panel" : "Show details panel";
+                            icon: "details-panel"; label: root.show-side-panel ? "Hide details panel" : "Show details panel";
                             ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                             selected: root.show-side-panel;
                             activated => { root.set-side-panel(!root.show-side-panel); }
@@ -5561,11 +5539,11 @@ export component AppWindow inherits Window {
                                             padding-bottom: 12px;
                                             spacing: 10px;
                                             Rectangle { width: 28px; background: transparent;
-                                                InterfaceGlyph { y: (parent.height - self.height) / 2; icon: "F"; ink: root.accent; }
+                                                MorpheusIcon { y: (parent.height - self.height) / 2; icon: "files"; ink: root.accent; }
                                             }
                                             Text { text: message.attachment; color: root.ink; font-size: 12px * root.text-scale; horizontal-stretch: 1; vertical-alignment: center; overflow: elide; }
                                             IconAction {
-                                                icon: "↓";
+                                                icon: "download";
                                                 label: "Save attachment " + message.attachment;
                                                 ink: root.icon-active-ink; surface: transparent; hover-surface: root.hover;
                                                 enabled: root.live-session && message.event-id != "" && message.event-id != root.downloading-event-id;
@@ -5616,7 +5594,7 @@ export component AppWindow inherits Window {
                                 }
                                 if message.event-id != "" : IconAction {
                                     quiet: true; context-hover: message-hover.has-hover;
-                                    width: 28px; height: 26px; icon: "☷"; label: "Open thread for " + message.sender;
+                                    width: 28px; height: 26px; icon: "thread"; label: "Open thread for " + message.sender;
                                     ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                                     activated => {
                                         root.thread-root-id = message.event-id;
@@ -5757,12 +5735,12 @@ export component AppWindow inherits Window {
                                 padding-bottom: 11px;
                                 spacing: 6px;
                                 IconAction {
-                                    icon: "+"; label: "Attach files"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                                    icon: "attach"; label: "Attach files"; ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                                     enabled: root.live-session && root.active-room-id != "" && root.composer-mode == 0 && root.attachment-can-add;
                                     activated => { root.attach-file(); }
                                 }
                                 IconAction {
-                                    width: 32px; icon: "☺"; label: "Open emoji picker for message";
+                                    width: 32px; icon: "emoji"; label: "Open emoji picker for message";
                                     ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                                     enabled: root.mention-ui-allowed && !root.composer-busy;
                                     activated => {
@@ -5772,7 +5750,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 IconAction {
-                                    width: 32px; icon: "✿"; label: "Open sticker picker for this room";
+                                    width: 32px; icon: "sticker"; label: "Open sticker picker for this room";
                                     ink: root.sticker-open && !root.sticker-threaded ? root.icon-active-ink : root.icon-ink;
                                     selected: root.sticker-open && !root.sticker-threaded;
                                     surface: transparent; hover-surface: root.hover;
@@ -5783,7 +5761,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 IconAction {
-                                    width: 32px; icon: "▤"; label: "Create a poll in this room";
+                                    width: 32px; icon: "poll"; label: "Create a poll in this room";
                                     ink: root.poll-dialog-open ? root.accent : root.muted;
                                     selected: root.poll-dialog-open;
                                     surface: transparent; hover-surface: root.hover;
@@ -5856,7 +5834,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 IconAction {
-                                    icon: "➤"; label: root.composer-sends-attachments ? "Send ready attachments" : root.composer-mode == 2 ? "Save edit" : root.composer-mode == 1 ? "Send reply" : "Send message"; ink: root.icon-active-ink;
+                                    icon: "send"; label: root.composer-sends-attachments ? "Send ready attachments" : root.composer-mode == 2 ? "Save edit" : root.composer-mode == 1 ? "Send reply" : "Send message"; ink: root.icon-active-ink;
                                     surface: transparent; hover-surface: root.hover;
                                     activated => {
                                         root.composer-caret = message-input.caret-bytes; root.composer-anchor = message-input.anchor-bytes; root.composer-preedit = message-input.composing;
@@ -6488,7 +6466,7 @@ export component AppWindow inherits Window {
                                                             spacing: 8px;
                                                             VerticalLayout {
                                                                 alignment: center;
-                                                                InterfaceGlyph { width: StyleTokens.icon-size; height: StyleTokens.icon-size; icon: "+"; ink: root.icon-ink; }
+                                                                MorpheusIcon { width: StyleTokens.icon-size; height: StyleTokens.icon-size; icon: "attach"; ink: root.icon-ink; }
                                                             }
                                                             Text {
                                                                 text: "Message Design review";
@@ -6497,7 +6475,7 @@ export component AppWindow inherits Window {
                                                             }
                                                             VerticalLayout {
                                                                 alignment: center;
-                                                                InterfaceGlyph { width: StyleTokens.icon-size; height: StyleTokens.icon-size; icon: "✎"; ink: root.icon-active-ink; }
+                                                                MorpheusIcon { width: StyleTokens.icon-size; height: StyleTokens.icon-size; icon: "edit"; ink: root.icon-active-ink; }
                                                             }
                                                         }
                                                     }
@@ -8535,8 +8513,8 @@ export component AppWindow inherits Window {
                         height: 62px; background: root.panel; border-radius: StyleTokens.radius * 1.2;
                         HorizontalLayout {
                             padding-left: 10px; padding-right: 10px; spacing: 6px; alignment: center;
-                            if !root.live-session : IconAction { width: 43px; height: 43px; icon: root.mic-muted ? "✕" : "♩"; label: root.mic-muted ? "Unmute microphone preview" : "Mute microphone preview"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.mic-muted = !root.mic-muted; } }
-                            if !root.live-session : IconAction { width: 43px; height: 43px; icon: "V"; label: root.camera-off ? "Turn camera preview on" : "Turn camera preview off"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.camera-off = !root.camera-off; } }
+                            if !root.live-session : IconAction { width: 43px; height: 43px; icon: root.mic-muted ? "mic-off" : "mic"; label: root.mic-muted ? "Unmute microphone preview" : "Mute microphone preview"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.mic-muted = !root.mic-muted; } }
+                            if !root.live-session : IconAction { width: 43px; height: 43px; icon: root.camera-off ? "camera-off" : "camera"; label: root.camera-off ? "Turn camera preview on" : "Turn camera preview off"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.camera-off = !root.camera-off; } }
                             if root.live-session : ActionRect {
                                 width: 88px; height: 43px; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.9;
                                 background: root.native-microphone-muted && root.native-audio-ready ? root.hover
@@ -8545,11 +8523,15 @@ export component AppWindow inherits Window {
                                 label: root.native-microphone-muted ? "Unmute microphone" : "Mute microphone";
                                 enabled: root.native-call-enabled && root.native-audio-ready;
                                 activated => { root.toggle-native-microphone(); }
-                                Text {
-                                    text: root.native-microphone-muted ? "Unmute mic" : "Mute mic";
-                                    color: root.native-audio-ready ? root.ink : root.control-disabled-ink;
-                                    font-size: 12px * root.text-scale; font-weight: 700;
-                                    horizontal-alignment: center; vertical-alignment: center;
+                                VerticalLayout {
+                                    alignment: center; spacing: 2px;
+                                    HorizontalLayout { alignment: center; MorpheusIcon { width: 16px; height: 16px; icon: root.native-microphone-muted ? "mic-off" : "mic"; ink: root.native-audio-ready ? root.ink : root.control-disabled-ink; } }
+                                    Text {
+                                        text: root.native-microphone-muted ? "Unmute mic" : "Mute mic";
+                                        color: root.native-audio-ready ? root.ink : root.control-disabled-ink;
+                                        font-size: 12px * root.text-scale; font-weight: 700;
+                                        horizontal-alignment: center; vertical-alignment: center;
+                                    }
                                 }
                             }
                             if root.live-session : ActionRect {
@@ -8560,11 +8542,15 @@ export component AppWindow inherits Window {
                                 label: root.native-deafened ? "Undeafen speaker" : "Deafen speaker";
                                 enabled: root.native-call-enabled && root.native-audio-ready;
                                 activated => { root.toggle-native-deafen(); }
-                                Text {
-                                    text: root.native-deafened ? "Undeafen" : "Deafen";
-                                    color: root.native-audio-ready ? root.ink : root.control-disabled-ink;
-                                    font-size: 12px * root.text-scale; font-weight: 700;
-                                    horizontal-alignment: center; vertical-alignment: center;
+                                VerticalLayout {
+                                    alignment: center; spacing: 2px;
+                                    HorizontalLayout { alignment: center; MorpheusIcon { width: 16px; height: 16px; icon: root.native-deafened ? "headphones-off" : "headphones"; ink: root.native-audio-ready ? root.ink : root.control-disabled-ink; } }
+                                    Text {
+                                        text: root.native-deafened ? "Undeafen" : "Deafen";
+                                        color: root.native-audio-ready ? root.ink : root.control-disabled-ink;
+                                        font-size: 12px * root.text-scale; font-weight: 700;
+                                        horizontal-alignment: center; vertical-alignment: center;
+                                    }
                                 }
                             }
                             if root.live-session : ActionRect {
@@ -8584,11 +8570,15 @@ export component AppWindow inherits Window {
                                         root.refresh-native-capture-sources(0);
                                     }
                                 }
-                                Text {
-                                    text: root.native-camera-stopping ? "Stopping…" : root.native-camera-busy ? "Camera…" : root.native-camera-active ? "Stop camera" : "Camera";
-                                    color: root.native-call-joined ? root.ink : root.control-disabled-ink;
-                                    font-size: 11px * root.text-scale; font-weight: 700;
-                                    horizontal-alignment: center; vertical-alignment: center;
+                                VerticalLayout {
+                                    alignment: center; spacing: 2px;
+                                    HorizontalLayout { alignment: center; MorpheusIcon { width: 16px; height: 16px; icon: root.native-camera-active ? "camera" : "camera-off"; ink: root.native-call-joined ? root.ink : root.control-disabled-ink; } }
+                                    Text {
+                                        text: root.native-camera-stopping ? "Stopping…" : root.native-camera-busy ? "Camera…" : root.native-camera-active ? "Stop camera" : "Camera";
+                                        color: root.native-call-joined ? root.ink : root.control-disabled-ink;
+                                        font-size: 11px * root.text-scale; font-weight: 700;
+                                        horizontal-alignment: center; vertical-alignment: center;
+                                    }
                                 }
                             }
                             if root.live-session : ActionRect {
@@ -8608,11 +8598,15 @@ export component AppWindow inherits Window {
                                         root.refresh-native-capture-sources(1);
                                     }
                                 }
-                                Text {
-                                    text: root.native-screen-stopping ? "Stopping…" : root.native-screen-selecting ? "Cancel selection" : root.native-screen-busy ? "Starting…" : root.native-screen-active ? "Stop share" : "Share screen";
-                                    color: root.native-call-joined ? root.ink : root.control-disabled-ink;
-                                    font-size: 11px * root.text-scale; font-weight: 700;
-                                    horizontal-alignment: center; vertical-alignment: center;
+                                VerticalLayout {
+                                    alignment: center; spacing: 2px;
+                                    HorizontalLayout { alignment: center; MorpheusIcon { width: 16px; height: 16px; icon: root.native-screen-active || root.native-screen-selecting ? "screen-share-stop" : "screen-share"; ink: root.native-call-joined ? root.ink : root.control-disabled-ink; } }
+                                    Text {
+                                        text: root.native-screen-stopping ? "Stopping…" : root.native-screen-selecting ? "Cancel selection" : root.native-screen-busy ? "Starting…" : root.native-screen-active ? "Stop share" : "Share screen";
+                                        color: root.native-call-joined ? root.ink : root.control-disabled-ink;
+                                        font-size: 11px * root.text-scale; font-weight: 700;
+                                        horizontal-alignment: center; vertical-alignment: center;
+                                    }
                                 }
                             }
                             ActionRect {
@@ -8629,9 +8623,13 @@ export component AppWindow inherits Window {
                                         }
                                     } else { root.call-connected = !root.call-connected; }
                                 }
-                                Text { text: root.live-session ? (root.native-call-enabled ? (root.native-leave-unconfirmed ? "Review leave" : (root.call-connected ? "Leave call" : (root.room-call-mode == 2 ? "Join legacy call" : "Join call"))) : "Unavailable") : (root.call-connected ? "End preview" : "Start preview"); color: root.live-session && !root.native-call-enabled ? root.muted : root.call-connected ? (StyleTokens.roles.destructive-ink.present ? StyleTokens.roles.destructive-ink.color : #10131b) : root.accent-ink; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                                VerticalLayout {
+                                    alignment: center; spacing: 2px;
+                                    HorizontalLayout { alignment: center; MorpheusIcon { width: 16px; height: 16px; icon: root.call-connected ? "call-leave" : "calls"; ink: root.live-session && !root.native-call-enabled ? root.muted : root.call-connected ? (StyleTokens.roles.destructive-ink.present ? StyleTokens.roles.destructive-ink.color : #10131b) : root.accent-ink; } }
+                                    Text { text: root.live-session ? (root.native-call-enabled ? (root.native-leave-unconfirmed ? "Review leave" : (root.call-connected ? "Leave call" : (root.room-call-mode == 2 ? "Join legacy call" : "Join call"))) : "Unavailable") : (root.call-connected ? "End preview" : "Start preview"); color: root.live-session && !root.native-call-enabled ? root.muted : root.call-connected ? (StyleTokens.roles.destructive-ink.present ? StyleTokens.roles.destructive-ink.color : #10131b) : root.accent-ink; font-size: 13px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                                }
                             }
-                            IconAction { width: 40px; height: 43px; icon: "R"; label: "Return to chat"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.page = 0; } }
+                            IconAction { width: 40px; height: 43px; icon: "chat"; label: "Return to chat"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.page = 0; } }
                         }
                     }
                 }
@@ -8662,7 +8660,10 @@ export component AppWindow inherits Window {
                 Rectangle {
                     height: max(64px, 40px * root.text-scale + 24px);
                     background: transparent;
-                    HorizontalLayout {
+                    details-tabs := HorizontalLayout {
+                        // Tabs show their caption beside the icon only when every
+                        // tab has room for it; the accessible label never changes.
+                        property <bool> show-captions: self.width >= 440px * root.text-scale;
                         padding-left: 12px; padding-right: 12px; padding-top: 14px; padding-bottom: 14px; spacing: 4px;
                         ActionRect {
                             horizontal-stretch: 1; height: 34px; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.8;
@@ -8672,7 +8673,11 @@ export component AppWindow inherits Window {
                             accessible-checkable: true;
                             accessible-checked: root.side-panel-tab == 0;
                             activated => { root.side-panel-tab = 0; }
-                            Text { text: "Members"; color: root.side-panel-tab == 0 ? root.ink : root.muted; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                            HorizontalLayout {
+                                alignment: center; spacing: 6px;
+                                VerticalLayout { alignment: center; MorpheusIcon { width: 16px * root.text-scale; height: 16px * root.text-scale; icon: "members"; ink: root.side-panel-tab == 0 ? root.ink : root.muted; } }
+                                if details-tabs.show-captions : Text { text: "Members"; color: root.side-panel-tab == 0 ? root.ink : root.muted; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                            }
                         }
                         ActionRect {
                             horizontal-stretch: 1; height: 34px; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.8;
@@ -8682,7 +8687,11 @@ export component AppWindow inherits Window {
                             accessible-checkable: true;
                             accessible-checked: root.side-panel-tab == 1;
                             activated => { root.side-panel-tab = 1; }
-                            Text { text: "Thread"; color: root.side-panel-tab == 1 ? root.ink : root.muted; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                            HorizontalLayout {
+                                alignment: center; spacing: 6px;
+                                VerticalLayout { alignment: center; MorpheusIcon { width: 16px * root.text-scale; height: 16px * root.text-scale; icon: "thread"; ink: root.side-panel-tab == 1 ? root.ink : root.muted; } }
+                                if details-tabs.show-captions : Text { text: "Thread"; color: root.side-panel-tab == 1 ? root.ink : root.muted; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                            }
                         }
                         ActionRect {
                             horizontal-stretch: 1; height: 34px; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.8;
@@ -8693,7 +8702,11 @@ export component AppWindow inherits Window {
                             accessible-checked: root.side-panel-tab == 2;
                             enabled: root.live-session;
                             activated => { root.side-panel-tab = 2; }
-                            Text { text: "Search"; color: root.side-panel-tab == 2 ? root.ink : root.muted; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                            HorizontalLayout {
+                                alignment: center; spacing: 6px;
+                                VerticalLayout { alignment: center; MorpheusIcon { width: 16px * root.text-scale; height: 16px * root.text-scale; icon: "search"; ink: root.side-panel-tab == 2 ? root.ink : root.muted; } }
+                                if details-tabs.show-captions : Text { text: "Search"; color: root.side-panel-tab == 2 ? root.ink : root.muted; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                            }
                         }
                         ActionRect {
                             horizontal-stretch: 1; height: 34px;
@@ -8708,7 +8721,11 @@ export component AppWindow inherits Window {
                                 if !root.pinned-pane-visible { root.pinned-focus-pending = true; }
                                 root.side-panel-tab = 3;
                             }
-                            Text { text: "Pins"; color: root.side-panel-tab == 3 ? root.ink : root.muted; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; overflow: elide; }
+                            HorizontalLayout {
+                                alignment: center; spacing: 6px;
+                                VerticalLayout { alignment: center; MorpheusIcon { width: 16px * root.text-scale; height: 16px * root.text-scale; icon: "pin"; ink: root.side-panel-tab == 3 ? root.ink : root.muted; } }
+                                if details-tabs.show-captions : Text { text: "Pins"; color: root.side-panel-tab == 3 ? root.ink : root.muted; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; overflow: elide; }
+                            }
                         }
                         ActionRect {
                             horizontal-stretch: 1; height: 34px;
@@ -8720,7 +8737,11 @@ export component AppWindow inherits Window {
                             accessible-checked: root.side-panel-tab == 4;
                             enabled: root.live-session;
                             activated => { root.side-panel-tab = 4; }
-                            Text { text: "Files"; color: root.side-panel-tab == 4 ? root.ink : root.muted; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; overflow: elide; }
+                            HorizontalLayout {
+                                alignment: center; spacing: 6px;
+                                VerticalLayout { alignment: center; MorpheusIcon { width: 16px * root.text-scale; height: 16px * root.text-scale; icon: "files"; ink: root.side-panel-tab == 4 ? root.ink : root.muted; } }
+                                if details-tabs.show-captions : Text { text: "Files"; color: root.side-panel-tab == 4 ? root.ink : root.muted; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; overflow: elide; }
+                            }
                         }
                     }
                 }
@@ -8739,7 +8760,7 @@ export component AppWindow inherits Window {
                         }
                         if root.live-session : IconAction {
                             width: 28px; height: 28px;
-                            icon: "↻"; label: "Refresh room members";
+                            icon: "refresh"; label: "Refresh room members";
                             ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                             enabled: !root.member-loading && root.active-room-id != "";
                             activated => { root.refresh-room-members(); }
@@ -8965,7 +8986,7 @@ export component AppWindow inherits Window {
                         }
                         Text { text: "Thread"; color: root.ink; font-size: 17px * root.text-scale; font-weight: 750; horizontal-stretch: 1; vertical-alignment: center; }
                         if root.thread-root-id != "" : IconAction {
-                            width: 28px; height: 28px; icon: "×"; label: "Close thread";
+                            width: 28px; height: 28px; icon: "close"; label: "Close thread";
                             ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                             activated => {
                                 root.thread-root-id = "";
@@ -9174,7 +9195,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                             IconAction {
-                                width: 28px; icon: "☺"; label: "Open emoji picker for thread reply";
+                                width: 28px; icon: "emoji"; label: "Open emoji picker for thread reply";
                                 ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
                                 enabled: root.mention-ui-allowed && !root.thread-send-pending;
                                 activated => {
@@ -9184,7 +9205,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                             IconAction {
-                                width: 28px; icon: "✿"; label: "Open sticker picker for this thread";
+                                width: 28px; icon: "sticker"; label: "Open sticker picker for this thread";
                                 ink: root.sticker-open && root.sticker-threaded ? root.icon-active-ink : root.icon-ink;
                                 selected: root.sticker-open && root.sticker-threaded;
                                 surface: root.panel; hover-surface: root.hover;
@@ -9201,7 +9222,7 @@ export component AppWindow inherits Window {
                                 activated => { root.thread-markdown = !root.thread-markdown; root.thread-formatting-changed(root.thread-markdown); thread-input.focus(); }
                             }
                             IconAction {
-                                icon: "➤"; label: "Send thread reply"; ink: root.icon-active-ink;
+                                icon: "send"; label: "Send thread reply"; ink: root.icon-active-ink;
                                 enabled: !root.thread-send-pending;
                                 surface: transparent; hover-surface: root.hover;
                                 activated => {
@@ -9679,7 +9700,7 @@ export component AppWindow inherits Window {
                             Text { text: account.name; color: root.ink; font-size: 12px * root.text-scale; font-weight: 650; overflow: elide; }
                             Text { text: account.handle; color: root.muted; font-size: 10px * root.text-scale; overflow: elide; }
                         }
-                        if account.index == root.active-account-index : Text { text: "✓"; color: root.accent; font-size: 15px * root.text-scale; vertical-alignment: center; }
+                        if account.index == root.active-account-index : VerticalLayout { alignment: center; MorpheusIcon { width: 16px * root.text-scale; height: 16px * root.text-scale; icon: "check"; ink: root.accent; } }
                     }
                 }
                     }
@@ -9708,7 +9729,11 @@ export component AppWindow inherits Window {
                             root.account-menu-open = false;
                         }
                     }
-                    Text { x: 9px; text: "+   Add an account"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; }
+                    HorizontalLayout {
+                        padding-left: 9px; padding-right: 9px; spacing: 9px;
+                        VerticalLayout { alignment: center; MorpheusIcon { width: 16px * root.text-scale; height: 16px * root.text-scale; icon: "add-account"; ink: root.ink; } }
+                        Text { text: "Add an account"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                    }
                 }
                 ActionRect {
                     height: 35px;
@@ -9719,7 +9744,11 @@ export component AppWindow inherits Window {
                     label: "Manage accounts";
                     cancelled => { root.account-menu-open = false; account-trigger.focus(); }
                     activated => { root.manage-accounts-open = true; root.manage-accounts(); root.account-menu-open = false; }
-                    Text { x: 9px; text: "⚙   Manage accounts"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; }
+                    HorizontalLayout {
+                        padding-left: 9px; padding-right: 9px; spacing: 9px;
+                        VerticalLayout { alignment: center; MorpheusIcon { width: 16px * root.text-scale; height: 16px * root.text-scale; icon: "manage-accounts"; ink: root.ink; } }
+                        Text { text: "Manage accounts"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                    }
                 }
                 ActionRect {
                     height: 35px;
@@ -9734,7 +9763,11 @@ export component AppWindow inherits Window {
                         // a leave-call confirmation or starts async logout.
                         root.log-out(); root.account-menu-open = false;
                     }
-                    Text { x: 9px; text: "↪   Log out"; color: StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : #e47483; font-size: 12px * root.text-scale; vertical-alignment: center; }
+                    HorizontalLayout {
+                        padding-left: 9px; padding-right: 9px; spacing: 9px;
+                        VerticalLayout { alignment: center; MorpheusIcon { width: 16px * root.text-scale; height: 16px * root.text-scale; icon: "log-out"; ink: StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : #e47483; } }
+                        Text { text: "Log out"; color: StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : #e47483; font-size: 12px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                    }
                 }
             }
         }

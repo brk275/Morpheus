@@ -3790,6 +3790,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     assert_themed_select(&ui).await;
     phase.set(26);
     assert_layout_navigation_recovery(&ui, directory.path()).await;
+    phase.set(27);
+    assert_vector_icons(&ui).await;
     phase.set(15);
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),
@@ -5631,6 +5633,197 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
     );
     draft_recovery::publish_thread(ui, &PendingSummary::default(), &[]);
     draft_recovery::publish_room(ui, &PendingSummary::default(), &[]);
+    settle(ui).await;
+}
+
+/// The icon a real control draws: its vector paths (outline commands,
+/// stroke color and width, window bounds) and any Text it shows.
+struct DrawnIcon {
+    commands: Vec<String>,
+    strokes: Vec<slint::Color>,
+    stroke_widths: Vec<f32>,
+    bounds: Vec<Bounds>,
+    texts: Vec<String>,
+}
+
+/// The vector icon inside the first laid-out control labelled `label`.
+fn drawn_icon(ui: &AppWindow, label: &str) -> (Bounds, DrawnIcon) {
+    use slint::private_unstable_api::re_exports::{
+        AccessibleStringProperty, ComplexText, ItemRc, Path, PathData, SimpleText, WindowInner,
+    };
+    use std::ops::ControlFlow;
+
+    let window = WindowInner::from_pub(ui.window());
+    let root = ItemRc::new_root(window.component());
+    let mut control = None;
+    root.visit_descendants(|item| {
+        if item
+            .accessible_string_property(AccessibleStringProperty::Label)
+            .as_deref()
+            == Some(label)
+            && item.geometry().size.width > 0.0
+        {
+            control = Some(item.clone());
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    });
+    let control = control.unwrap_or_else(|| panic!("{label} must be shown"));
+    let mut drawn = DrawnIcon {
+        commands: Vec::new(),
+        strokes: Vec::new(),
+        stroke_widths: Vec::new(),
+        bounds: Vec::new(),
+        texts: Vec::new(),
+    };
+    control.visit_descendants(|item| {
+        if let Some(path) = item.downcast::<Path>() {
+            let path = path.as_pin_ref();
+            if let PathData::Commands(commands) = path.elements() {
+                drawn.commands.push(commands.to_string());
+            }
+            drawn.strokes.push(path.stroke().color());
+            drawn.stroke_widths.push(path.stroke_width().get());
+            drawn.bounds.push(item_bounds(item));
+        } else if let Some(text) = item.downcast::<SimpleText>() {
+            drawn.texts.push(text.as_pin_ref().text().to_string());
+        } else if let Some(text) = item.downcast::<ComplexText>() {
+            drawn.texts.push(text.as_pin_ref().text().to_string());
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    (item_bounds(&control), drawn)
+}
+
+/// The original vector icons on the real generated window: navigation,
+/// header, composer, details tabs and call controls draw one stroked path in
+/// the control's current ink (no glyph text), centred inside the control;
+/// optical size and stroke weight follow the configured icon size, the 16,
+/// 20, 24 and 32 px tab sizes and high contrast; a state change swaps the
+/// drawn outline while the control, label and action stay the same.
+async fn assert_vector_icons(ui: &AppWindow) {
+    let page = ui.get_page();
+    let live = ui.get_live_session();
+    let was_muted = ui.get_mic_muted();
+    let space = ui.get_active_space_id();
+    let side = ui.get_show_side_panel();
+    let tab = ui.get_side_panel_tab();
+    ui.set_page(0);
+    ui.set_show_side_panel(true);
+    ui.set_side_panel_tab(0);
+    settle(ui).await;
+    let tokens = ui.global::<crate::StyleTokens>();
+    let stroke_for = |size: f32, high_contrast: bool| {
+        (size * 0.0625 + 0.5).clamp(1.25, 2.75) + if high_contrast { 0.5 } else { 0.0 }
+    };
+    for icon_size in [18.0_f32, 28.0] {
+        tokens.set_icon_size(icon_size);
+        settle(ui).await;
+        for label in [
+            "Home and all rooms",
+            "Explore public Matrix rooms",
+            "Open call stage",
+            "Edit room settings",
+            "Hide details panel",
+            "Attach files",
+            "Open emoji picker for message",
+        ] {
+            let (control, icon) = drawn_icon(ui, label);
+            assert_eq!(icon.commands.len(), 1, "{label} draws one vector icon");
+            assert!(!icon.commands[0].is_empty(), "{label} has an outline");
+            assert!(icon.texts.is_empty(), "{label} shows no glyph text");
+            let bounds = icon.bounds[0];
+            let (width, height) = (bounds.right - bounds.left, bounds.bottom - bounds.top);
+            assert!((width - height).abs() < 0.01, "{label} icon is square");
+            // IconAction's glyph rule: the configured size, kept inside an
+            // explicitly smaller button, never below the built-in 18 px.
+            let room = (control.right - control.left).min(control.bottom - control.top) - 6.0;
+            let expected = icon_size.min(room.max(18.0));
+            assert!(
+                (width - expected).abs() < 0.5,
+                "{label}: {width} px, expected {expected}"
+            );
+            assert!(
+                (icon.stroke_widths[0] - stroke_for(width, false)).abs() < 0.01,
+                "{label} stroke"
+            );
+            let centre_x =
+                (bounds.left + bounds.right) / 2.0 - (control.left + control.right) / 2.0;
+            let centre_y =
+                (bounds.top + bounds.bottom) / 2.0 - (control.top + control.bottom) / 2.0;
+            assert!(
+                centre_x.abs() < 0.5 && centre_y.abs() < 0.5,
+                "{label} icon is centred"
+            );
+            assert!(
+                bounds.left >= control.left - 0.5 && bounds.right <= control.right + 0.5,
+                "{label} icon stays inside its control"
+            );
+        }
+    }
+    tokens.set_icon_size(18.0);
+    // The selected Home route draws in the active icon ink; Explore does not.
+    ui.set_active_space_id("".into());
+    settle(ui).await;
+    let (_, home) = drawn_icon(ui, "Home and all rooms");
+    let (_, explore) = drawn_icon(ui, "Explore public Matrix rooms");
+    assert_ne!(home.strokes[0], explore.strokes[0], "selected ink differs");
+    assert_ne!(home.commands[0], explore.commands[0], "distinct outlines");
+    // High contrast adds half a pixel of stroke to every icon.
+    tokens.set_high_contrast(true);
+    settle(ui).await;
+    let (_, contrast) = drawn_icon(ui, "Home and all rooms");
+    assert!((contrast.stroke_widths[0] - stroke_for(18.0, true)).abs() < 0.01);
+    tokens.set_high_contrast(false);
+    // Details tabs size their icons with the text scale: 16, 20, 24, 32 px.
+    for (scale, size) in [(100, 16.0_f32), (125, 20.0), (150, 24.0), (200, 32.0)] {
+        ui.set_font_scale_percent(scale);
+        settle(ui).await;
+        let (control, members) = drawn_icon(ui, "Show members");
+        assert_eq!(members.commands.len(), 1);
+        let bounds = members.bounds[0];
+        assert!(
+            (bounds.right - bounds.left - size).abs() < 0.5,
+            "{size} px tab icon"
+        );
+        assert!(
+            (bounds.bottom - bounds.top - size).abs() < 0.5,
+            "{size} px tab icon"
+        );
+        assert!((members.stroke_widths[0] - stroke_for(size, false)).abs() < 0.01);
+        assert!(bounds.top >= control.top - 0.5 && bounds.bottom <= control.bottom + 0.5);
+    }
+    ui.set_font_scale_percent(100);
+    // A preview call control swaps its outline with its state and keeps its
+    // ink; nothing is captured or published.
+    // Use an explicit synthetic preview state; earlier phases may have
+    // left a live-session presentation or a muted preview on the window.
+    ui.set_live_session(false);
+    ui.set_mic_muted(false);
+    ui.set_page(2);
+    settle(ui).await;
+    let (_, unmuted) = drawn_icon(ui, "Mute microphone preview");
+    click_control_once(ui, "Mute microphone preview");
+    settle(ui).await;
+    let (_, muted) = drawn_icon(ui, "Unmute microphone preview");
+    assert_eq!((unmuted.commands.len(), muted.commands.len()), (1, 1));
+    assert_ne!(
+        unmuted.commands[0], muted.commands[0],
+        "muted outline differs"
+    );
+    assert_eq!(unmuted.strokes[0], muted.strokes[0]);
+    let (_, back) = drawn_icon(ui, "Return to chat");
+    assert_eq!(back.commands.len(), 1);
+    assert!(back.texts.is_empty(), "no legacy R caption");
+    // Both preview controls draw in the window's ink.
+    assert_eq!(muted.strokes[0], back.strokes[0]);
+    click_control_once(ui, "Unmute microphone preview");
+    ui.set_live_session(live);
+    ui.set_mic_muted(was_muted);
+    ui.set_active_space_id(space);
+    ui.set_page(page);
+    ui.set_show_side_panel(side);
+    ui.set_side_panel_tab(tab);
     settle(ui).await;
 }
 
