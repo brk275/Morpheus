@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
 name: Reviewed beta four-platform native checks
-run-name: Reviewed native candidate - 7c2d9b4 - ${{ inputs.platform }}
+run-name: Reviewed native candidate - 62b90fc - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: beta-native-7c2d9b4-${{ github.ref }}
+  group: beta-native-62b90fc-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 7c2d9b4968ad1291d787c057ae9f2ea3f6dc2725
+          ref: 62b90fc9aa8f3b011251b25aed8def4cbadbb69c
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -135,7 +135,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='7c2d9b4968ad1291d787c057ae9f2ea3f6dc2725'
+          source='62b90fc9aa8f3b011251b25aed8def4cbadbb69c'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -379,7 +379,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='7c2d9b4968ad1291d787c057ae9f2ea3f6dc2725'
+          source='62b90fc9aa8f3b011251b25aed8def4cbadbb69c'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -458,6 +458,14 @@ jobs:
               'discovery_tests::timeline_link_handler_accepts_only_browser_urls',
               'discovery_tests::call_stage_uses_joined_room_even_after_chat_navigation',
               'timeline_model::tests::sparse_edits_across_ten_thousand_shared_rows_notify_only_changed_rows',
+              'video_render::tests::screen_share_is_featured_while_cameras_stay_in_a_bounded_filmstrip',
+              'video_render::tests::hidden_stage_pauses_every_remote_stream_and_drops_pictures',
+              'video_render::tests::released_slot_discards_a_late_conversion',
+              'local_video::tests::signaling_gate_withholds_frames_without_an_owner_or_stop',
+              'local_video::tests::transmission_pause_serializes_with_pushes_and_stale_resumes',
+              'call_recovery::tests::only_running_sticky_sync_may_transmit',
+              'calls::tests::recovering_calls_keep_blocking_account_switches',
+              'calls::tests::late_recovery_status_cannot_overwrite_a_leave',
           }
           needed_matrix={
               'tests::homeserver_must_not_send_password_over_plain_http',
@@ -466,18 +474,35 @@ jobs:
           }
           needed_rtc={
               'tests::build_capability_matches_feature','tests::device_capability_matches_features',
+              'audio_device::tests::signaling_gate_withholds_audio_without_an_owner_or_revocation',
+              'audio_device::tests::paused_transmission_withholds_audio_and_keeps_the_requested_mute_state',
+              'reconnect::tests::no_attempt_starts_at_or_after_the_budget',
+              'reconnect::tests::deliberate_removals_are_not_treated_as_connection_loss',
               'video_device::tests::cancelled_camera_open_returns_before_native_enumeration',
               'video_device::tests::camera_permission::stop_while_permission_is_pending_drops_late_grant',
           }
           allowed_app_ignore={'outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction'}
-          checks=(
+          needed_config={
+              'tests::pane_composition_and_fades_default_off_round_trip_and_survive_presets',
+              'tests::interaction_states_are_optional_validated_and_absent_from_shipped_presets',
+              'tests::config_sender_palette_is_bounded_round_trips_and_survives_presets',
+              'tests::metric_edits_reject_invalid_files_without_repeating_values_and_recover',
+              'tests::validation_errors_never_repeat_the_rejected_value',
+          }
+          checks=[
               ('native_app_build',['cargo','build','--locked','-p','morpheus-app','--features','native-calls'],70*60,None,set()),
               ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
                   '--bin','morpheus-app','--','--test-threads=1'],40*60,needed_app,allowed_app_ignore),
               ('matrix_unit',['cargo','test','--locked','-p','morpheus-matrix','--lib','--','--test-threads=1'],20*60,needed_matrix,set()),
-              ('rtc_native_unit',['cargo','test','--locked','-p','morpheus-rtc','--features','native-devices',
-                  '--lib','--','--test-threads=1'],20*60,needed_rtc,set()),
-          )
+          ]
+          # Linux RTC/config inputs are identical to accepted40b/812 evidence.
+          # New account-readiness accessors invalidate the older Matrix evidence.
+          if os.environ['RUNNER_OS']!='Linux':
+              checks.extend([
+                  ('config_unit',['cargo','test','--locked','-p','morpheus-config','--lib','--','--test-threads=1'],10*60,needed_config,set()),
+                  ('rtc_native_unit',['cargo','test','--locked','-p','morpheus-rtc','--features','native-devices',
+                      '--lib','--','--test-threads=1'],20*60,needed_rtc,set()),
+              ])
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
               result=bounded(args,name,seconds)
