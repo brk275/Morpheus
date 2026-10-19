@@ -732,7 +732,10 @@ impl RoomAdminSession {
         let read = async {
             let request = get_capabilities::v3::Request::new();
             let client = self.room.client();
-            let response = client.send(request).with_request_config(write_config()).await;
+            let response = client
+                .send(request)
+                .with_request_config(write_config())
+                .await;
             let capabilities = response.ok()?.capabilities;
             Some(capabilities.room_versions.default.as_str().to_owned())
         };
@@ -751,7 +754,8 @@ impl RoomAdminSession {
             let power = self.power_state().await?;
             let levels = room_settings::effective_power_levels(&self.create, power.as_ref())?
                 .ok_or(RoomAdminError::InvalidState)?;
-            if self.optional_state(StateEventType::RoomTombstone).await?.is_some() {
+            let tombstone = self.optional_state(StateEventType::RoomTombstone).await?;
+            if tombstone.is_some() {
                 return Err(RoomAdminError::TargetChanged);
             }
             if !levels.user_can_send_state(&self.own_user, StateEventType::RoomTombstone) {
@@ -773,7 +777,8 @@ impl RoomAdminSession {
             // Accepted by the server; a failed read-back is unconfirmed, not failed.
             let tombstone = self.optional_state(StateEventType::RoomTombstone).await;
             let confirmed = tombstone.ok().flatten().is_some_and(|event| {
-                let points = event.content.get("replacement_room").and_then(Value::as_str);
+                let content = &event.content;
+                let points = content.get("replacement_room").and_then(Value::as_str);
                 points == Some(replacement.as_str())
             });
             let built = match self.build(power.as_ref()).await {
@@ -1124,7 +1129,7 @@ impl RoomAdminSession {
                 Ok(built) => Some(self.publish(built)?),
                 Err(_) => None,
             };
-            let servers = built.as_ref().and_then(|snapshot| snapshot.servers.as_ref());
+            let servers = built.as_ref().and_then(|built| built.servers.as_ref());
             let listed = servers.map(|servers| blocks(&servers.denied, &server));
             let confirmed = listed == Some(block);
             let read_back = ObservedTarget {
@@ -1694,7 +1699,7 @@ fn string_list(value: Option<&Value>) -> Option<Vec<String>> {
 
 /// The block list names this server or pattern; matching ignores case.
 fn blocks(denied: &[String], server: &str) -> bool {
-    denied.iter().any(|entry| entry.eq_ignore_ascii_case(server))
+    denied.iter().any(|item| item.eq_ignore_ascii_case(server))
 }
 
 /// A server name or pattern for the block list: host characters with `*`

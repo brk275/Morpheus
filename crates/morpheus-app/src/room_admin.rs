@@ -424,13 +424,14 @@ pub(crate) fn access_rows(snapshot: &RoomAdminSnapshot) -> Vec<AccessRow> {
         None => "Custom guest setting",
     };
     let encryption = if access.encrypted { "On" } else { "Off" };
+    let history = access.history.map_or(CUSTOM_HISTORY, history_text);
     let mut rows = vec![
         AccessRow {
             kind: ACCESS_HISTORY,
             choice: access.history.map_or(-1, history_rank),
             label: "History visibility",
             description: "Who can read new messages in this room.",
-            summary: access.history.map_or(CUSTOM_HISTORY, history_text).to_owned(),
+            summary: history.to_owned(),
             editable: access.history_editable,
             restriction: access_lock(ACCESS_HISTORY, access, snapshot),
         },
@@ -496,7 +497,7 @@ fn servers_row(servers: &ServerAclSettings, snapshot: &RoomAdminSnapshot) -> Acc
 
 /// The block list names this server or pattern; matching ignores case.
 fn blocks(denied: &[String], server: &str) -> bool {
-    denied.iter().any(|entry| entry.eq_ignore_ascii_case(server))
+    denied.iter().any(|item| item.eq_ignore_ascii_case(server))
 }
 
 /// A server name or pattern as the session accepts it: host characters
@@ -1111,8 +1112,9 @@ pub(crate) fn confirmation(intent: &Intent, snapshot: &RoomAdminSnapshot) -> Opt
         }
     };
     if let Some(reason) = &intent.reason {
-        confirmation.body.push_str("\n\nReason, visible to the room: ");
-        confirmation.body.push_str(reason);
+        let body = &mut confirmation.body;
+        body.push_str("\n\nReason, visible to the room: ");
+        body.push_str(reason);
     }
     Some(confirmation)
 }
