@@ -320,7 +320,13 @@ pub(crate) fn permission_label(key: PermissionKey) -> &'static str {
         PermissionKey::RoomName => "Change the room name",
         PermissionKey::RoomTopic => "Change the topic",
         PermissionKey::RoomAvatar => "Change the room avatar",
+        PermissionKey::PinnedEvents => "Pin messages",
         PermissionKey::JoinRules => "Change who can join",
+        PermissionKey::MainAddress => "Change the main address",
+        PermissionKey::HistoryVisibility => "Change who can read history",
+        PermissionKey::Encryption => "Turn on encryption",
+        PermissionKey::ServerAcl => "Block servers",
+        PermissionKey::RoomUpgrade => "Upgrade the room",
         PermissionKey::PowerLevels => "Change roles and permissions",
         PermissionKey::RoomNotification => "Notify everyone with @room",
     }
@@ -337,7 +343,13 @@ pub(crate) fn permission_description(key: PermissionKey) -> &'static str {
         PermissionKey::RoomName => "Edit the room's name.",
         PermissionKey::RoomTopic => "Edit the room's topic.",
         PermissionKey::RoomAvatar => "Change or remove the room's avatar.",
+        PermissionKey::PinnedEvents => "Pin and unpin messages for everyone.",
         PermissionKey::JoinRules => "Choose whether the room is public, invite-only or knockable.",
+        PermissionKey::MainAddress => "Set the main address and list the room in the directory.",
+        PermissionKey::HistoryVisibility => "Choose who can read new messages.",
+        PermissionKey::Encryption => "Turn on end-to-end encryption, which cannot be undone.",
+        PermissionKey::ServerAcl => "Block homeservers from taking part in this room.",
+        PermissionKey::RoomUpgrade => "Replace the room with one on a newer version.
         PermissionKey::PowerLevels => "Assign levels and change these permissions.",
         PermissionKey::RoomNotification => "Mention everyone in the room at once.",
     }
@@ -1270,6 +1282,9 @@ pub(crate) fn confirmation(intent: &Intent, snapshot: &RoomAdminSnapshot) -> Opt
                     | PermissionKey::Ban
                     | PermissionKey::Redact
                     | PermissionKey::JoinRules
+                    | PermissionKey::HistoryVisibility
+                    | PermissionKey::ServerAcl
+                    | PermissionKey::RoomUpgrade
                     | PermissionKey::PowerLevels
             );
             let raises_default = key == PermissionKey::UsersDefault && !widens;

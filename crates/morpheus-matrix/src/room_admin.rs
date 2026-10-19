@@ -232,14 +232,25 @@ pub enum PermissionKey {
     RoomName,
     RoomTopic,
     RoomAvatar,
+    /// Pinning and unpinning messages.
+    PinnedEvents,
     JoinRules,
+    /// The room's main address (also needed to list it in the directory).
+    MainAddress,
+    HistoryVisibility,
+    /// Turning on end-to-end encryption.
+    Encryption,
+    /// Blocking homeservers.
+    ServerAcl,
+    /// Replacing the room on a newer version.
+    RoomUpgrade,
     PowerLevels,
     /// Notifying everyone with `@room`.
     RoomNotification,
 }
 
 /// Every threshold the room-administration view shows, in display order.
-pub const PERMISSION_KEYS: [PermissionKey; 12] = [
+pub const PERMISSION_KEYS: [PermissionKey; 18] = [
     PermissionKey::UsersDefault,
     PermissionKey::EventsDefault,
     PermissionKey::Invite,
@@ -249,7 +260,13 @@ pub const PERMISSION_KEYS: [PermissionKey; 12] = [
     PermissionKey::RoomName,
     PermissionKey::RoomTopic,
     PermissionKey::RoomAvatar,
+    PermissionKey::PinnedEvents,
     PermissionKey::JoinRules,
+    PermissionKey::MainAddress,
+    PermissionKey::HistoryVisibility,
+    PermissionKey::Encryption,
+    PermissionKey::ServerAcl,
+    PermissionKey::RoomUpgrade,
     PermissionKey::PowerLevels,
     PermissionKey::RoomNotification,
 ];
@@ -2111,7 +2128,13 @@ fn permission_level(levels: &RoomPowerLevels, key: PermissionKey) -> Int {
         PermissionKey::RoomName => levels.for_state(StateEventType::RoomName),
         PermissionKey::RoomTopic => levels.for_state(StateEventType::RoomTopic),
         PermissionKey::RoomAvatar => levels.for_state(StateEventType::RoomAvatar),
+        PermissionKey::PinnedEvents => levels.for_state(StateEventType::RoomPinnedEvents),
         PermissionKey::JoinRules => levels.for_state(StateEventType::RoomJoinRules),
+        PermissionKey::MainAddress => levels.for_state(StateEventType::RoomCanonicalAlias),
+        PermissionKey::HistoryVisibility => levels.for_state(StateEventType::RoomHistoryVisibility),
+        PermissionKey::Encryption => levels.for_state(StateEventType::RoomEncryption),
+        PermissionKey::ServerAcl => levels.for_state(StateEventType::RoomServerAcl),
+        PermissionKey::RoomUpgrade => levels.for_state(StateEventType::RoomTombstone),
         PermissionKey::PowerLevels => levels.for_state(StateEventType::RoomPowerLevels),
         PermissionKey::RoomNotification => levels.notifications.room,
     }
@@ -2130,7 +2153,13 @@ fn permission_field(key: PermissionKey) -> (Option<&'static str>, &'static str) 
         PermissionKey::RoomName => (Some("events"), "m.room.name"),
         PermissionKey::RoomTopic => (Some("events"), "m.room.topic"),
         PermissionKey::RoomAvatar => (Some("events"), "m.room.avatar"),
+        PermissionKey::PinnedEvents => (Some("events"), "m.room.pinned_events"),
         PermissionKey::JoinRules => (Some("events"), "m.room.join_rules"),
+        PermissionKey::MainAddress => (Some("events"), "m.room.canonical_alias"),
+        PermissionKey::HistoryVisibility => (Some("events"), "m.room.history_visibility"),
+        PermissionKey::Encryption => (Some("events"), "m.room.encryption"),
+        PermissionKey::ServerAcl => (Some("events"), "m.room.server_acl"),
+        PermissionKey::RoomUpgrade => (Some("events"), "m.room.tombstone"),
         PermissionKey::PowerLevels => (Some("events"), "m.room.power_levels"),
         PermissionKey::RoomNotification => (Some("notifications"), "room"),
     }
