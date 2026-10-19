@@ -22,6 +22,7 @@ mod live;
 #[cfg(feature = "native-calls")]
 mod local_video;
 mod message_metadata;
+mod message_search;
 mod navigation;
 mod notifications;
 #[cfg(feature = "native-calls")]
@@ -58,14 +59,13 @@ use std::sync::{Arc, Mutex, atomic::Ordering};
 use std::thread;
 use std::time::Duration;
 
-use chrono::{Local, TimeZone};
 use directories::ProjectDirs;
 use morpheus_config::{
     Config, ConfigStore, Density, LoadedConfig, RoomCallMode, ThemeMode, ThemePack,
 };
 use morpheus_matrix::{
-    AccountManager, AttachmentSendUpdate, Generation, MatrixLinkTarget, MessageInfo,
-    MessageSearchResult, PublicRoomInfo, PublicRoomsQuery, TextFormat, parse_matrix_link_target,
+    AccountManager, AttachmentSendUpdate, Generation, MatrixLinkTarget, PublicRoomInfo,
+    PublicRoomsQuery, TextFormat, parse_matrix_link_target,
 };
 use slint::{Color, Model, ModelRc, SharedString, StyledText, VecModel};
 use url::Url;
@@ -1091,67 +1091,9 @@ fn directory_plain_text(value: &str, max_chars: usize) -> String {
     text.trim().to_owned()
 }
 
-fn search_time(timestamp_ms: u64) -> String {
-    i64::try_from(timestamp_ms)
-        .ok()
-        .and_then(|timestamp| Local.timestamp_millis_opt(timestamp).single())
-        .map(|time| time.format("%b %-d, %-I:%M %p").to_string())
-        .unwrap_or_else(|| "Unknown time".into())
-}
-
-fn search_result_item(result: MessageSearchResult) -> MessageSearchItem {
-    let body = directory_plain_text(&result.body, 500);
-    let sender = directory_plain_text(&result.sender, 100);
-    MessageSearchItem {
-        room_id: result.room_id.into(),
-        event_id: result.event_id.into(),
-        sender: if sender.is_empty() {
-            "Unknown sender".into()
-        } else {
-            sender.into()
-        },
-        time: search_time(result.timestamp_ms).into(),
-        preview: body.chars().take(150).collect::<String>().into(),
-        body: body.into(),
-    }
-}
-
-fn search_context_item(info: MessageInfo, room_id: &str) -> MessageSearchItem {
-    let body = directory_plain_text(&info.body, 500);
-    let sender = directory_plain_text(&info.sender, 100);
-    MessageSearchItem {
-        room_id: room_id.into(),
-        event_id: info.event_id.unwrap_or_default().into(),
-        sender: if sender.is_empty() {
-            "Unknown sender".into()
-        } else {
-            sender.into()
-        },
-        time: search_time(info.timestamp_ms).into(),
-        preview: body.chars().take(150).collect::<String>().into(),
-        body: body.into(),
-    }
-}
-
+/// Cancel message search and clear its results (see message_search).
 fn reset_room_search(ui: &AppWindow) {
-    ui.set_room_search_operation(ui.get_room_search_operation().wrapping_add(1));
-    ui.set_room_search_context_operation(ui.get_room_search_context_operation().wrapping_add(1));
-    ui.set_room_search_loading(false);
-    ui.set_room_search_context_loading(false);
-    ui.set_room_search_query("".into());
-    ui.set_room_search_error("".into());
-    ui.set_room_search_context_error("".into());
-    ui.set_room_search_searched(false);
-    ui.set_room_search_results(ModelRc::new(
-        VecModel::from(Vec::<MessageSearchItem>::new()),
-    ));
-    ui.set_room_search_context(ModelRc::new(
-        VecModel::from(Vec::<MessageSearchItem>::new()),
-    ));
-    ui.set_room_search_selected_event_id("".into());
-    ui.set_room_search_selected_sender("".into());
-    ui.set_room_search_selected_time("".into());
-    ui.set_room_search_selected_body("".into());
+    message_search::reset(ui);
 }
 
 fn public_room_item(room: PublicRoomInfo, route_server: &str) -> PublicRoomItem {
@@ -2420,7 +2362,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             window.invoke_cancel_room_settings();
             let navigation_epoch = room_live.invalidate_navigation();
-            reset_room_search(&window);
+            message_search::room_changed(&window, false);
             let live = room_live.clone();
             let ui = weak.clone();
             room_handle.spawn(async move {
@@ -2482,7 +2424,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         window.invoke_cancel_room_settings();
         let navigation_epoch = voice_live.invalidate_navigation();
-        reset_room_search(&window);
+        message_search::room_changed(&window, false);
         let live = voice_live.clone();
         let weak = weak.clone();
         #[cfg(feature = "native-calls")]
@@ -2981,148 +2923,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let weak = ui.as_weak();
-    let search_live = live.clone();
-    let search_handle = runtime.handle().clone();
-    ui.on_query_room_messages(move || {
-        let Some(window) = weak.upgrade() else {
-            return;
-        };
-        if !search_live.is_live.load(Ordering::Acquire) {
-            window.set_room_search_error("Sign in to search messages".into());
-            return;
-        }
-        if window.get_room_search_loading() {
-            return;
-        }
-        let account_id = window.get_active_account_local_id().to_string();
-        let room_id = window.get_active_room_id().to_string();
-        if account_id.is_empty() || room_id.is_empty() {
-            window.set_room_search_error("Choose a Matrix room first".into());
-            return;
-        }
-        let query = window.get_room_search_query().trim().to_owned();
-        if query.is_empty() {
-            window.set_room_search_error("Enter a word or phrase to search".into());
-            return;
-        }
-        let operation = window.get_room_search_operation().wrapping_add(1);
-        window.set_room_search_operation(operation);
-        window.set_room_search_context_operation(
-            window.get_room_search_context_operation().wrapping_add(1),
-        );
-        window.set_room_search_loading(true);
-        window.set_room_search_searched(false);
-        window.set_room_search_error("".into());
-        window.set_room_search_context_error("".into());
-        window.set_room_search_context_loading(false);
-        window.set_room_search_selected_event_id("".into());
-        window.set_room_search_selected_sender("".into());
-        window.set_room_search_selected_time("".into());
-        window.set_room_search_selected_body("".into());
-        window.set_room_search_results(ModelRc::new(VecModel::from(
-            Vec::<MessageSearchItem>::new(),
-        )));
-        window.set_room_search_context(ModelRc::new(VecModel::from(
-            Vec::<MessageSearchItem>::new(),
-        )));
-        let manager = search_live.manager.clone();
-        let weak = weak.clone();
-        search_handle.spawn(async move {
-            let result = tokio::time::timeout(
-                Duration::from_secs(30),
-                manager.search_messages_for(&account_id, &room_id, &query, 25, 0),
-            )
-            .await
-            .map_err(|_| "Message search timed out".to_owned())
-            .and_then(|result| result.map_err(|error| error.to_string()));
-            let _ = weak.upgrade_in_event_loop(move |window| {
-                if window.get_active_account_local_id().as_str() != account_id
-                    || window.get_active_room_id().as_str() != room_id
-                    || window.get_room_search_operation() != operation
-                    || !window.get_live_session()
-                {
-                    return;
-                }
-                window.set_room_search_loading(false);
-                window.set_room_search_searched(true);
-                match result {
-                    Ok(results) => window.set_room_search_results(ModelRc::new(VecModel::from(
-                        results
-                            .into_iter()
-                            .map(search_result_item)
-                            .collect::<Vec<_>>(),
-                    ))),
-                    Err(error) => {
-                        window.set_room_search_error(directory_plain_text(&error, 220).into())
-                    }
-                }
-            });
-        });
-    });
-
-    let weak = ui.as_weak();
-    let context_live = live.clone();
-    let context_handle = runtime.handle().clone();
-    ui.on_open_search_result(move |event_id| {
-        let Some(window) = weak.upgrade() else {
-            return;
-        };
-        if !context_live.is_live.load(Ordering::Acquire) {
-            return;
-        }
-        let account_id = window.get_active_account_local_id().to_string();
-        let room_id = window.get_active_room_id().to_string();
-        if account_id.is_empty()
-            || room_id.is_empty()
-            || !window
-                .get_room_search_results()
-                .iter()
-                .any(|result| result.room_id.as_str() == room_id && result.event_id == event_id)
-        {
-            return;
-        }
-        let event_id = event_id.to_string();
-        let operation = window.get_room_search_context_operation().wrapping_add(1);
-        window.set_room_search_context_operation(operation);
-        window.set_room_search_context_loading(true);
-        window.set_room_search_context_error("".into());
-        window.set_room_search_context(ModelRc::new(VecModel::from(
-            Vec::<MessageSearchItem>::new(),
-        )));
-        let manager = context_live.manager.clone();
-        let weak = weak.clone();
-        context_handle.spawn(async move {
-            let result = tokio::time::timeout(
-                Duration::from_secs(30),
-                manager.search_result_context_for(&account_id, &room_id, &event_id, 3),
-            )
-            .await
-            .map_err(|_| "Message context timed out".to_owned())
-            .and_then(|result| result.map_err(|error| error.to_string()));
-            let _ = weak.upgrade_in_event_loop(move |window| {
-                if window.get_active_account_local_id().as_str() != account_id
-                    || window.get_active_room_id().as_str() != room_id
-                    || window.get_room_search_selected_event_id().as_str() != event_id
-                    || window.get_room_search_context_operation() != operation
-                    || !window.get_live_session()
-                {
-                    return;
-                }
-                window.set_room_search_context_loading(false);
-                match result {
-                    Ok(context) => window.set_room_search_context(ModelRc::new(VecModel::from(
-                        context
-                            .into_iter()
-                            .map(|message| search_context_item(message, &room_id))
-                            .collect::<Vec<_>>(),
-                    ))),
-                    Err(error) => window
-                        .set_room_search_context_error(directory_plain_text(&error, 220).into()),
-                }
-            });
-        });
-    });
+    message_search::register(&ui, live.clone(), runtime.handle().clone());
 
     let weak = ui.as_weak();
     let directory_live = live.clone();
@@ -5033,23 +4834,5 @@ mod discovery_tests {
             "safe evil text"
         );
         assert_eq!(directory_plain_text(&"a".repeat(500), 120).len(), 120);
-    }
-
-    #[test]
-    fn search_result_display_sanitizes_untrusted_text_without_changing_ids() {
-        let item = search_result_item(MessageSearchResult {
-            room_id: "!room:example.org".into(),
-            event_id: "$event:example.org".into(),
-            sender: "@alice\u{202e}:example.org".into(),
-            body: format!("Hello\n\u{200b}world {}", "x".repeat(600)),
-            timestamp_ms: 0,
-            relevance_score: 1.0,
-        });
-        assert_eq!(item.room_id.as_str(), "!room:example.org");
-        assert_eq!(item.event_id.as_str(), "$event:example.org");
-        assert_eq!(item.sender.as_str(), "@alice :example.org");
-        assert!(item.body.as_str().starts_with("Hello  world"));
-        assert!(item.body.as_str().chars().count() <= 500);
-        assert!(item.preview.as_str().chars().count() <= 150);
     }
 }

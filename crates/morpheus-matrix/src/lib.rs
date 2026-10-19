@@ -26,7 +26,7 @@ pub use discovery::{
 };
 mod history;
 mod search;
-pub use search::MessageSearchResult;
+pub use search::{MessageSearchPage, MessageSearchResult};
 mod formatting;
 pub use formatting::TextFormat;
 mod compose;

@@ -37,6 +37,7 @@ use crate::drafts::{
     DraftStore, PendingHandle, PendingItem, PendingStatus, PendingSummary, PendingTarget,
     Reconciled, Resolution, WriteTransaction,
 };
+use crate::message_search;
 use crate::voice_spaces::VoiceSpaces;
 use crate::{
     AccountItem, AccountOption, AppWindow, MemberItem, MessageItem, PublicRoomItem, RoomItem,
@@ -1679,6 +1680,59 @@ impl LiveUi {
         Ok(true)
     }
 
+    /// Open a room chosen from search results, revealing it first: the
+    /// current Space when it lists the room, otherwise the Space that does,
+    /// otherwise Home. Account and navigation checks match select_room_for.
+    pub async fn reveal_room_for(
+        self: &Arc<Self>,
+        account_id: &str,
+        room_id: String,
+        navigation_epoch: u64,
+        ui: Weak<AppWindow>,
+    ) -> Result<bool, MatrixCoreError> {
+        {
+            let _transition = self.account_transition.lock().await;
+            if !self.navigation_is_current(navigation_epoch)
+                || self.require_active_account(account_id).await.is_err()
+            {
+                return Ok(false);
+            }
+            let rooms = self.manager.rooms_snapshot().await?;
+            let Some(room) = rooms.iter().find(|room| room.room_id == room_id) else {
+                return Err(MatrixCoreError::RoomNotFound(room_id));
+            };
+            if room.is_space || room.membership != RoomMembership::Joined {
+                return Err(MatrixCoreError::RoomNotFound(room_id));
+            }
+            // The same visibility rule as refresh: Home lists direct rooms and
+            // rooms outside every scanned Space.
+            let space_children = self.space_children.lock().await.clone();
+            let listing = space_children
+                .iter()
+                .filter(|(_, children)| children.contains(&room_id))
+                .map(|(space, _)| space.clone())
+                .collect::<Vec<_>>();
+            let in_home = room.is_direct || listing.is_empty();
+            let mut selected_space = self.selected_space.lock().await;
+            let visible = match &*selected_space {
+                Some(space) => listing.contains(space),
+                None => in_home,
+            };
+            if !self.navigation_is_current(navigation_epoch) {
+                return Ok(false);
+            }
+            if !visible {
+                *selected_space = if in_home {
+                    None
+                } else {
+                    listing.into_iter().min()
+                };
+            }
+        }
+        self.select_room_for(account_id, room_id, navigation_epoch, ui)
+            .await
+    }
+
     pub async fn select_space_for(
         self: &Arc<Self>,
         account_id: &str,
@@ -2370,6 +2424,7 @@ impl LiveUi {
                                 && ui.get_active_room_id().as_str() == room_id
                                 && ui.get_thread_root_id().as_str() == root_event_id
                             {
+                                message_search::show_thread_root(&ui, &messages, &root_event_id);
                                 let replies = messages
                                     .iter()
                                     .filter(|message| {
@@ -2789,7 +2844,9 @@ fn apply_snapshot(
         ui.set_member_selected_creator(false);
         ui.set_member_confirm_open(false);
         crate::reset_attachment_view(ui);
-        crate::reset_room_search(ui);
+        // All-room results stay with their account across rooms, which is
+        // how opening a hit in another room keeps the list it came from.
+        crate::message_search::room_changed(ui, account_changed);
         ui.set_room_call_mode(0);
         ui.set_composer_text(drafts.get(&view.active.id, next_room_id).into());
         ui.set_composer_markdown(drafts.markdown(&view.active.id, next_room_id));

@@ -356,6 +356,46 @@ mod tests {
     }
 
     #[test]
+    fn search_rejects_an_aba_selection_and_keeps_the_current_one() {
+        runtime().block_on(async {
+            let (directory, manager, account) = fixture(None).await;
+            let stale = manager.account_selection(&account.id).unwrap();
+            // A fresh selection of the same local account is a new epoch.
+            manager.publish_active_account(None);
+            manager.publish_active_account(Some(account.clone()));
+            let (room, event) = ("!unused:example.org", "$event:example.org");
+            assert!(matches!(
+                manager
+                    .search_all_messages_page_selected(&stale, "plans", 10, 0)
+                    .await,
+                Err(MatrixCoreError::SelectedAccountChanged)
+            ));
+            assert!(matches!(
+                manager
+                    .search_messages_page_selected(&stale, room, "plans", 10, 0)
+                    .await,
+                Err(MatrixCoreError::SelectedAccountChanged)
+            ));
+            assert!(matches!(
+                manager
+                    .search_result_context_selected(&stale, room, event, 3)
+                    .await,
+                Err(MatrixCoreError::SelectedAccountChanged)
+            ));
+            // The current selection searches its own (empty) room set and
+            // reports no further page.
+            let current = manager.account_selection(&account.id).unwrap();
+            let page = manager
+                .search_all_messages_page_selected(&current, "plans", 10, 0)
+                .await
+                .unwrap();
+            assert_eq!(page, MessageSearchPage::default());
+            drop(manager);
+            fs::remove_dir_all(directory).unwrap();
+        });
+    }
+
+    #[test]
     fn history_revalidates_selection_after_waiting_for_the_state_lock() {
         runtime().block_on(async {
             let (directory, manager, account) = fixture(None).await;
