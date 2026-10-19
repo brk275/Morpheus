@@ -577,6 +577,9 @@ impl Workbench {
             progress_at: None,
         };
         ui.set_attachment_items(ModelRc::new(VecModel::from(vec![row(&item)])));
+        ui.set_transfer_items(ModelRc::new(VecModel::from(vec![upload_transfer(&item)])));
+        ui.set_transfer_summary("private staged transfer".into());
+        ui.set_transfer_active_count(1);
         ui.set_attachment_ready_count(1);
         ui.set_attachment_can_add(true);
         ui.set_attachment_status("private staged file".into());

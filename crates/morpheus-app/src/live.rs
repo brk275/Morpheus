@@ -3737,6 +3737,12 @@ fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::Securi
     // revoked here. Its call tiles, pictures and roster must not wait for
     // the asynchronous stage presenter.
     crate::call_stage::clear_private_presentation(ui);
+    // Transfer filenames and room labels are private to this account. Do
+    // not wait for a changed-property callback or a queued projection.
+    ui.set_transfer_items(ModelRc::new(VecModel::<crate::TransferItem>::default()));
+    ui.set_transfer_summary("".into());
+    ui.set_transfer_active_count(0);
+    ui.set_transfer_focus_pending(false);
     // Poll drafts, pending votes and the create dialog end with the account.
     crate::polls::clear_presentation(ui);
     // Decrypted pinned rows are account-private and never wait for a task.

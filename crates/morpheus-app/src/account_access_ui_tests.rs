@@ -4169,6 +4169,7 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
             runtime.clone(),
         );
         assert_eq!(ui.get_attachment_items().row_count(), 1);
+        assert_eq!(ui.get_transfer_items().row_count(), 1);
         settle(&ui).await;
         assert_eq!(ui.get_active_account_local_id().as_str(), "old-account");
         assert_eq!(ui.get_active_room_id().as_str(), "!private:example.org");
@@ -4176,6 +4177,9 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
         assert_eq!(ui.get_attachment_ready_count(), 0);
         assert!(!ui.get_attachment_can_add());
         assert!(ui.get_attachment_status().is_empty());
+        assert_eq!(ui.get_transfer_items().row_count(), 0);
+        assert_eq!(ui.get_transfer_active_count(), 0);
+        assert!(ui.get_transfer_summary().is_empty());
     }
 
     // Seed private information in distinct user-visible surfaces, then use the
@@ -4336,6 +4340,17 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     ui.set_attachment_ready_count(1);
     ui.set_attachment_can_add(true);
     ui.set_attachment_status("private upload name".into());
+    // Seed directly after the final settle: the real detach adapter must
+    // clear the transfer pane without relying on Workbench refresh.
+    ui.set_transfer_items(ModelRc::new(VecModel::from(vec![crate::TransferItem {
+        id: 7,
+        name: "private transfer filename".into(),
+        room: "private transfer room".into(),
+        ..Default::default()
+    }])));
+    ui.set_transfer_summary("private transfer summary".into());
+    ui.set_transfer_active_count(1);
+    ui.set_transfer_focus_pending(true);
     live.account_detached(ui.as_weak()).await;
     settle(&ui).await;
     assert!(!ui.get_live_session());
@@ -4349,6 +4364,10 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     assert_eq!(ui.get_attachment_items().row_count(), 0);
     assert_eq!(ui.get_attachment_ready_count(), 0);
     assert!(!ui.get_attachment_can_add());
+    assert_eq!(ui.get_transfer_items().row_count(), 0);
+    assert_eq!(ui.get_transfer_active_count(), 0);
+    assert!(ui.get_transfer_summary().is_empty());
+    assert!(!ui.get_transfer_focus_pending());
     // Both saved-send strips are cleared by the real detach path; no departed
     // scope's records, flags or notices survive.
     assert_eq!(ui.get_composer_pending_items().row_count(), 0);
