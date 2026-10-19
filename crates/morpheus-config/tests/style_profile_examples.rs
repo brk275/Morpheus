@@ -4,9 +4,18 @@ use morpheus_config::BuiltInStylePreset;
 use morpheus_config::style_profiles::StyleProfile;
 
 const EXAMPLES: [(&str, &str); 3] = [
-    ("harbor.toml", include_str!("../../../examples/style-profiles/harbor.toml")),
-    ("lantern.toml", include_str!("../../../examples/style-profiles/lantern.toml")),
-    ("ledger.toml", include_str!("../../../examples/style-profiles/ledger.toml")),
+    (
+        "harbor.toml",
+        include_str!("../../../examples/style-profiles/harbor.toml"),
+    ),
+    (
+        "lantern.toml",
+        include_str!("../../../examples/style-profiles/lantern.toml"),
+    ),
+    (
+        "ledger.toml",
+        include_str!("../../../examples/style-profiles/ledger.toml"),
+    ),
 ];
 
 /// Every example is a valid profile that needs no extra theme file, changes
@@ -34,7 +43,11 @@ fn style_profile_examples_are_valid_importable_profiles() {
                 "{file} needs an extra theme file"
             );
         }
-        assert_ne!(profile, StyleProfile::named(&profile.name), "{file} changes nothing");
+        assert_ne!(
+            profile,
+            StyleProfile::named(&profile.name),
+            "{file} changes nothing"
+        );
         let written = profile.to_toml().unwrap();
         assert_eq!(StyleProfile::parse(&written).unwrap(), profile, "{file}");
     }

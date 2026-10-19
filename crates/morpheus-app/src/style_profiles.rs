@@ -147,7 +147,10 @@ pub(crate) fn register(ui: &AppWindow, store: &ConfigStore) {
         state.profiles = profiles;
     });
     if !available {
-        set_message("Style profiles are unavailable: the settings folder was not found.", true);
+        set_message(
+            "Style profiles are unavailable: the settings folder was not found.",
+            true,
+        );
     }
     refresh(ui);
 
@@ -167,7 +170,10 @@ pub(crate) fn register(ui: &AppWindow, store: &ConfigStore) {
             let row = state.rows.iter().find(|row| row.key == key.as_str())?;
             state.selected = Some(row.file.clone());
             state.confirm = Confirm::None;
-            row.profile.as_ref().ok().map(|profile| profile.name.clone())
+            row.profile
+                .as_ref()
+                .ok()
+                .map(|profile| profile.name.clone())
         });
         if let Some(name) = name {
             ui.set_style_profile_name_input(name.into());
@@ -419,7 +425,10 @@ fn project(ui: &AppWindow) {
             .collect();
         ITEMS.with(|model| {
             let same_rows = model.row_count() == items.len()
-                && model.iter().zip(&items).all(|(shown, item)| shown.key == item.key);
+                && model
+                    .iter()
+                    .zip(&items)
+                    .all(|(shown, item)| shown.key == item.key);
             if same_rows {
                 for (index, item) in items.into_iter().enumerate() {
                     if model.row_data(index).as_ref() != Some(&item) {
@@ -444,7 +453,10 @@ fn project(ui: &AppWindow) {
                     .iter()
                     .find(|row| row.file == *file)
                     .and_then(|row| row.profile.as_ref().ok())
-                    .map_or_else(|| "this profile".to_owned(), |profile| shown_name(&profile.name));
+                    .map_or_else(
+                        || "this profile".to_owned(),
+                        |profile| shown_name(&profile.name),
+                    );
                 format!("Delete {name}? Its file is removed; your current look does not change.")
             }
             Confirm::Replace { profile, .. } => format!(
@@ -589,14 +601,20 @@ fn selected_file(ui: &AppWindow) -> Option<ProfileFile> {
 }
 
 fn rename(ui: &AppWindow) {
-    let Some(file) = selected_file(ui) else { return };
+    let Some(file) = selected_file(ui) else {
+        return;
+    };
     let Some(store) = store() else { return };
     let result = typed_name(ui).and_then(|name| store.rename(&file, &name));
     match result {
         Ok(profile) => {
             // A previewed profile keeps previewing under its new name.
             with_state(|state| {
-                if let Some(preview) = state.preview.as_mut().filter(|preview| preview.file == file) {
+                if let Some(preview) = state
+                    .preview
+                    .as_mut()
+                    .filter(|preview| preview.file == file)
+                {
                     preview.name.clone_from(&profile.name);
                 }
             });
@@ -608,13 +626,12 @@ fn rename(ui: &AppWindow) {
 }
 
 fn duplicate(ui: &AppWindow) {
-    let Some(file) = selected_file(ui) else { return };
+    let Some(file) = selected_file(ui) else {
+        return;
+    };
     let Some(store) = store() else { return };
-    let result = typed_name(ui).and_then(|name| {
-        store
-            .duplicate(&file, &name)
-            .map(|copy| (copy, name))
-    });
+    let result =
+        typed_name(ui).and_then(|name| store.duplicate(&file, &name).map(|copy| (copy, name)));
     match result {
         Ok((copy, name)) => {
             refresh(ui);
@@ -674,8 +691,12 @@ fn theme_problem(error: &ConfigError) -> &'static str {
 }
 
 fn start_preview(ui: &AppWindow) {
-    let Some(file) = selected_file(ui) else { return };
-    let (Some(store), Some(config_store)) = with_state(|state| (state.profiles.clone(), state.config.clone())) else {
+    let Some(file) = selected_file(ui) else {
+        return;
+    };
+    let (Some(store), Some(config_store)) =
+        with_state(|state| (state.profiles.clone(), state.config.clone()))
+    else {
         return;
     };
     let profile = match store.read(&file) {
@@ -702,7 +723,10 @@ fn start_preview(ui: &AppWindow) {
     let theme = match config_store.load_theme(&candidate) {
         Ok(theme) => theme,
         Err(error) => {
-            set_message(format!("{}. Nothing was changed.", theme_problem(&error)), true);
+            set_message(
+                format!("{}. Nothing was changed.", theme_problem(&error)),
+                true,
+            );
             project(ui);
             return;
         }
@@ -712,10 +736,7 @@ fn start_preview(ui: &AppWindow) {
     let shown_theme = theme.clone();
     with_state(|state| {
         state.confirm = Confirm::None;
-        let base = state
-            .preview
-            .take()
-            .map_or(base, |previous| previous.base);
+        let base = state.preview.take().map_or(base, |previous| previous.base);
         state.preview = Some(Preview {
             file,
             name: name.clone(),
@@ -762,14 +783,19 @@ fn apply(ui: &AppWindow, previewed: bool) {
     // The preview bar applies exactly the look it shows, not the file as it
     // is now; the Settings card applies the selected profile's file.
     let profile = if previewed {
-        let Some(profile) =
-            with_state(|state| state.preview.as_ref().map(|preview| preview.profile.clone()))
-        else {
+        let Some(profile) = with_state(|state| {
+            state
+                .preview
+                .as_ref()
+                .map(|preview| preview.profile.clone())
+        }) else {
             return;
         };
         profile
     } else {
-        let Some(file) = selected_file(ui) else { return };
+        let Some(file) = selected_file(ui) else {
+            return;
+        };
         match store.read(&file) {
             Ok(profile) => profile,
             Err(error) => {
@@ -785,7 +811,10 @@ fn apply(ui: &AppWindow, previewed: bool) {
     if let Some((mut candidate, _)) = accepted_look() {
         profile.apply_to(&mut candidate);
         if let Err(error) = config_store.load_theme(&candidate) {
-            set_message(format!("{}. Nothing was changed.", theme_problem(&error)), true);
+            set_message(
+                format!("{}. Nothing was changed.", theme_problem(&error)),
+                true,
+            );
             project(ui);
             return;
         }
@@ -944,7 +973,10 @@ fn finish_import(ui: &AppWindow, result: Option<Result<StyleProfile, String>>) {
     match result {
         None => {}
         Some(Err(problem)) => {
-            set_message(format!("Could not import that file: {problem}. Nothing was added."), true);
+            set_message(
+                format!("Could not import that file: {problem}. Nothing was added."),
+                true,
+            );
             project(ui);
         }
         // Imported, never applied: preview it to see the look.
@@ -953,7 +985,9 @@ fn finish_import(ui: &AppWindow, result: Option<Result<StyleProfile, String>>) {
 }
 
 fn export(ui: &AppWindow) {
-    let Some(file) = selected_file(ui) else { return };
+    let Some(file) = selected_file(ui) else {
+        return;
+    };
     let Some(store) = store() else { return };
     let profile = match store.read(&file) {
         Ok(profile) => profile,
@@ -1003,7 +1037,9 @@ fn finish_export(ui: &AppWindow, name: &str, result: Option<Result<(), String>>)
     match result {
         None => return,
         Some(Ok(())) => set_message(format!("Exported {}.", shown_name(name)), false),
-        Some(Err(problem)) => set_message(format!("Could not export the profile: {problem}."), true),
+        Some(Err(problem)) => {
+            set_message(format!("Could not export the profile: {problem}."), true)
+        }
     }
     project(ui);
 }

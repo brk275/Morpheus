@@ -3113,9 +3113,25 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     store.save(&config).unwrap();
     apply_config(ui, &config, None);
     crate::style_profiles::register(ui, &store);
-    ui.set_page(1);
+    // Search must focus the real filter even when Settings does not exist
+    // until this request. Revealing a section must not create or save a look.
+    ui.set_page(0);
+    ui.set_settings_revealed_id("".into());
     settle(ui).await;
+    let before_reveal = std::fs::read(store.path()).unwrap();
+    assert!(crate::settings_search::reveal(
+        ui,
+        "appearance.style_profiles"
+    ));
+    settle(ui).await;
+    assert_eq!(ui.get_settings_revealed_id(), "appearance.style_profiles");
+    assert!(focused_control_has_label(
+        ui,
+        "Filter style profiles by name or look"
+    ));
+    assert_eq!(std::fs::read(store.path()).unwrap(), before_reveal);
     let profiles = ProfileStore::for_config(&store).unwrap();
+    assert!(profiles.list().unwrap().entries.is_empty());
 
     // Save current look: the look only, sparse, never other settings.
     ui.set_style_profile_name_input("Reading room".into());

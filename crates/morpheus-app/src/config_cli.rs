@@ -498,7 +498,11 @@ mod tests {
             .map(|key| key.as_str().unwrap())
             .collect();
         assert!(keys.contains(&"typography.message_size") && keys.contains(&"colors.<token>"));
-        for private in ["appearance.scale_percent", "geometry.focus_width", "shortcuts.<action>"] {
+        for private in [
+            "appearance.scale_percent",
+            "geometry.focus_width",
+            "shortcuts.<action>",
+        ] {
             assert!(!keys.contains(&private), "{private}");
         }
         assert!(keys.iter().all(|key| !key.starts_with("notifications")

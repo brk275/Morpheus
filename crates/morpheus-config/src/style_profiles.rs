@@ -422,8 +422,7 @@ impl StyleProfile {
         };
         let mut value = encode(self)?;
         let defaults = encode(&Self::named(&self.name))?;
-        if let (toml::Value::Table(table), toml::Value::Table(defaults)) = (&mut value, &defaults)
-        {
+        if let (toml::Value::Table(table), toml::Value::Table(defaults)) = (&mut value, &defaults) {
             remove_defaults(table, defaults, true);
         }
         let body = toml::to_string_pretty(&value)
@@ -545,9 +544,9 @@ impl ProfileFile {
     pub fn parse(stem: &str) -> Option<Self> {
         let valid = !stem.is_empty()
             && stem.len() <= 64
-            && stem
-                .chars()
-                .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+            && stem.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+            })
             && !stem.starts_with('-')
             && !reserved_device_name(stem);
         valid.then(|| Self(stem.to_owned()))
@@ -702,7 +701,9 @@ impl ProfileStore {
         if !folder.is_at(&self.dir) {
             return Err(ProfileError::Folder);
         }
-        listing.entries.sort_by(|left, right| left.file.cmp(&right.file));
+        listing
+            .entries
+            .sort_by(|left, right| left.file.cmp(&right.file));
         Ok(listing)
     }
 
@@ -1012,7 +1013,8 @@ impl Folder {
     /// The entry is a regular file in this folder; a link is not followed.
     fn regular(&self, name: &str) -> Result<(), ProfileError> {
         let entry = c_name(name)?;
-        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // libc may leave reserved fields unwritten on older system versions.
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
         // SAFETY: `entry` is NUL-terminated, `stat` is writable storage of
         // the type fstatat fills, and `self.dir` is an open directory.
         let result = unsafe {
@@ -1029,7 +1031,7 @@ impl Folder {
                 _ => ProfileError::Unreadable,
             });
         }
-        // SAFETY: fstatat succeeded, so it filled `stat`.
+        // SAFETY: fstatat succeeded; all remaining fields started zeroed.
         let stat = unsafe { stat.assume_init() };
         if stat.st_mode & libc::S_IFMT == libc::S_IFREG {
             Ok(())
@@ -1043,11 +1045,8 @@ impl Folder {
     fn read(&self, name: &str) -> Result<String, ProfileError> {
         use std::os::fd::FromRawFd;
         let entry = c_name(name)?;
-        let flags = libc::O_RDONLY
-            | libc::O_NOFOLLOW
-            | libc::O_NONBLOCK
-            | libc::O_NOCTTY
-            | libc::O_CLOEXEC;
+        let flags =
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC;
         // SAFETY: as in `regular`; these flags take no mode argument.
         let fd = unsafe { libc::openat(self.fd(), entry.as_ptr(), flags) };
         if fd < 0 {
@@ -1082,7 +1081,8 @@ impl Folder {
         use std::os::fd::FromRawFd;
         let target = std::ffi::CString::new(name).map_err(|_| WriteError::Failed)?;
         let staging = std::ffi::CString::new(staging_name()).map_err(|_| WriteError::Failed)?;
-        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let flags =
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
         // SAFETY: as in `regular`; O_CREAT takes the mode argument.
         let fd = unsafe { libc::openat(self.fd(), staging.as_ptr(), flags, 0o600 as libc::c_uint) };
         if fd < 0 {
@@ -1243,9 +1243,7 @@ impl Folder {
         let handle = fs::OpenOptions::new()
             .access_mode(win32::FILE_LIST_DIRECTORY | win32::FILE_READ_ATTRIBUTES)
             .share_mode(win32::FILE_SHARE_READ | win32::FILE_SHARE_WRITE)
-            .custom_flags(
-                win32::FILE_FLAG_BACKUP_SEMANTICS | win32::FILE_FLAG_OPEN_REPARSE_POINT,
-            )
+            .custom_flags(win32::FILE_FLAG_BACKUP_SEMANTICS | win32::FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
             .map_err(|error| match error.kind() {
                 ErrorKind::NotFound => ProfileError::Missing,
@@ -1451,7 +1449,11 @@ mod tests {
             match value {
                 toml::Value::Table(table) => {
                     for (key, value) in table {
-                        let key = if path == "colors" { "<token>" } else { key.as_str() };
+                        let key = if path == "colors" {
+                            "<token>"
+                        } else {
+                            key.as_str()
+                        };
                         let child = if path.is_empty() {
                             key.to_owned()
                         } else {
@@ -1491,19 +1493,55 @@ mod tests {
         let cases = [
             ("name = \"A\"\n", "not-a-profile"),
             ("profile_version = 2\nname = \"A\"\n", "profile-version"),
-            ("profile_version = 1\nname = \"A\"\nschema_version = 1\n", "invalid-profile"),
-            ("profile_version = 1\nname = \"A\"\n[notifications]\nenabled = false\n", "invalid-profile"),
-            ("profile_version = 1\nname = \"A\"\n[shortcuts]\nsearch = \"Mod+F\"\n", "invalid-profile"),
-            ("profile_version = 1\nname = \"A\"\n[appearance]\nscale_percent = 150\n", "invalid-profile"),
-            ("profile_version = 1\nname = \"A\"\n[geometry]\nfocus_width = 3\n", "invalid-profile"),
-            ("profile_version = 1\nname = \"A\"\n[typography]\nmessage_size = 999\n", "invalid-profile"),
-            ("profile_version = 1\nname = \"A\"\n[colors]\nlink = \"#zzz-secret\"\n", "invalid-profile"),
-            ("profile_version = 1\nname = \"A\"\n[colors]\nsecret_token = \"#123456\"\n", "invalid-profile"),
-            ("profile_version = 1\nname = \"A\"\n[appearance]\ntheme_pack = \"../secret\"\n", "invalid-profile"),
-            ("profile_version = 1\nname = \"A\"\n[appearance]\ntheme_pack = \"com1\"\n", "invalid-profile"),
+            (
+                "profile_version = 1\nname = \"A\"\nschema_version = 1\n",
+                "invalid-profile",
+            ),
+            (
+                "profile_version = 1\nname = \"A\"\n[notifications]\nenabled = false\n",
+                "invalid-profile",
+            ),
+            (
+                "profile_version = 1\nname = \"A\"\n[shortcuts]\nsearch = \"Mod+F\"\n",
+                "invalid-profile",
+            ),
+            (
+                "profile_version = 1\nname = \"A\"\n[appearance]\nscale_percent = 150\n",
+                "invalid-profile",
+            ),
+            (
+                "profile_version = 1\nname = \"A\"\n[geometry]\nfocus_width = 3\n",
+                "invalid-profile",
+            ),
+            (
+                "profile_version = 1\nname = \"A\"\n[typography]\nmessage_size = 999\n",
+                "invalid-profile",
+            ),
+            (
+                "profile_version = 1\nname = \"A\"\n[colors]\nlink = \"#zzz-secret\"\n",
+                "invalid-profile",
+            ),
+            (
+                "profile_version = 1\nname = \"A\"\n[colors]\nsecret_token = \"#123456\"\n",
+                "invalid-profile",
+            ),
+            (
+                "profile_version = 1\nname = \"A\"\n[appearance]\ntheme_pack = \"../secret\"\n",
+                "invalid-profile",
+            ),
+            (
+                "profile_version = 1\nname = \"A\"\n[appearance]\ntheme_pack = \"com1\"\n",
+                "invalid-profile",
+            ),
             ("profile_version = 1\nname = \"\"\n", "profile-name"),
-            ("profile_version = 1\nname = \"bad\\nname\"\n", "profile-name"),
-            ("profile_version = 1\n[account_overrides.secret]\n", "invalid-profile"),
+            (
+                "profile_version = 1\nname = \"bad\\nname\"\n",
+                "profile-name",
+            ),
+            (
+                "profile_version = 1\n[account_overrides.secret]\n",
+                "invalid-profile",
+            ),
         ];
         for (raw, code) in cases {
             let error = StyleProfile::parse(raw).expect_err(raw);
@@ -1561,12 +1599,23 @@ mod tests {
         assert_eq!(stem_for("✨"), "profile");
         assert!(stem_for(&"a".repeat(200)).len() <= MAX_STEM_CHARS);
         assert_eq!(export_file_name("Reading room"), "reading-room.toml");
-        for stem in ["", "..", "a/b", "a\\b", ".hidden", "-x", "a.b", &"a".repeat(65)] {
+        for stem in [
+            "",
+            "..",
+            "a/b",
+            "a\\b",
+            ".hidden",
+            "-x",
+            "a.b",
+            &"a".repeat(65),
+        ] {
             assert!(ProfileFile::parse(stem).is_none(), "{stem}");
         }
         assert!(ProfileFile::parse("reading-room_2").is_some());
         // Windows device names never name a profile file, in any case.
-        for device in ["con", "CON", "Prn", "aux", "NUL", "com0", "COM9", "lpt1", "Lpt9"] {
+        for device in [
+            "con", "CON", "Prn", "aux", "NUL", "com0", "COM9", "lpt1", "Lpt9",
+        ] {
             assert!(ProfileFile::parse(device).is_none(), "{device}");
         }
         for allowed in ["com10", "console", "con-2", "nul_profile", "lpt"] {
@@ -1590,9 +1639,15 @@ mod tests {
         let store = ProfileStore::at(&dir);
         assert!(store.list().unwrap().entries.is_empty());
         let file = ProfileFile::parse("s").unwrap();
-        assert!(matches!(store.read(&file), Err(ProfileError::NotRegularFile)));
+        assert!(matches!(
+            store.read(&file),
+            Err(ProfileError::NotRegularFile)
+        ));
         assert!(matches!(store.delete(&file), Err(ProfileError::Changed)));
-        assert!(matches!(import_profile(&socket), Err(ProfileError::NotRegularFile)));
+        assert!(matches!(
+            import_profile(&socket),
+            Err(ProfileError::NotRegularFile)
+        ));
         assert!(matches!(
             export_profile(&StyleProfile::named("Export"), &socket),
             Err(ProfileError::Target)
@@ -1605,6 +1660,49 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(open_no_follow(&link).is_err());
         assert!(open_no_follow(&target).is_ok());
+    }
+
+    /// The open itself must not wait for a writer if a FIFO replaced a
+    /// checked regular file. Both read paths must reject its opened handle.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_open_is_nonblocking_and_never_read_as_a_profile() {
+        use std::os::unix::ffi::OsStrExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("pipe.toml");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is NUL-terminated and valid for this call; the path
+        // belongs only to this disposable test directory.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let opened = open_no_follow(&path).expect("nonblocking FIFO open");
+        assert!(matches!(
+            read_opened(opened),
+            Err(ProfileError::NotRegularFile)
+        ));
+        let folder = Folder::open(directory.path()).unwrap();
+        assert!(matches!(
+            folder.read("pipe.toml"),
+            Err(ProfileError::NotRegularFile)
+        ));
+        assert!(matches!(
+            import_profile(&path),
+            Err(ProfileError::NotRegularFile)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_folder_anchor_prevents_replacement_until_released() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("style-profiles");
+        let moved = directory.path().join("moved");
+        fs::create_dir(&path).unwrap();
+        let folder = Folder::open(&path).unwrap();
+        assert!(fs::rename(&path, &moved).is_err());
+        assert!(path.is_dir() && !moved.exists());
+        drop(folder);
+        fs::rename(&path, &moved).unwrap();
+        assert!(!path.exists() && moved.is_dir());
     }
 
     #[cfg(unix)]
@@ -1626,7 +1724,10 @@ mod tests {
             Err(ProfileError::Folder)
         ));
         assert!(matches!(store.delete(&file), Err(ProfileError::Changed)));
-        assert!(matches!(store.create(&StyleProfile::named("New")), Err(ProfileError::Folder)));
+        assert!(matches!(
+            store.create(&StyleProfile::named("New")),
+            Err(ProfileError::Folder)
+        ));
         // The real folder's file is untouched and nothing was added there.
         let moved = elsewhere.join("kept.toml");
         assert_eq!(fs::read_to_string(&moved).unwrap(), kept.to_toml().unwrap());
@@ -1656,15 +1757,27 @@ mod tests {
         assert!(folder.write("written.toml", &raw, false).is_ok());
         assert!(folder.read(&file.file_name()).is_ok());
         folder.remove(&file.file_name()).unwrap();
-        assert_eq!(fs::read_to_string(other.join("kept.toml")).unwrap(), "not yours");
+        assert_eq!(
+            fs::read_to_string(other.join("kept.toml")).unwrap(),
+            "not yours"
+        );
         assert!(!other.join("written.toml").exists());
         assert!(moved.join("written.toml").exists());
         assert!(!moved.join("kept.toml").exists());
         // A link put in place of a file is refused, never followed.
         symlink(other.join("kept.toml"), moved.join("link.toml")).unwrap();
-        assert!(matches!(folder.remove("link.toml"), Err(ProfileError::Changed)));
-        assert!(matches!(folder.read("link.toml"), Err(ProfileError::NotRegularFile)));
-        assert_eq!(fs::read_to_string(other.join("kept.toml")).unwrap(), "not yours");
+        assert!(matches!(
+            folder.remove("link.toml"),
+            Err(ProfileError::Changed)
+        ));
+        assert!(matches!(
+            folder.read("link.toml"),
+            Err(ProfileError::NotRegularFile)
+        ));
+        assert_eq!(
+            fs::read_to_string(other.join("kept.toml")).unwrap(),
+            "not yours"
+        );
         // Exclusive creation never replaces an existing name.
         assert!(matches!(
             folder.write("written.toml", &raw, false),
@@ -1690,7 +1803,10 @@ mod tests {
         assert_eq!(copy.as_str(), "reading-room-2");
         let renamed = store.rename(&copy, "Night").unwrap();
         assert_eq!(renamed.name, "Night");
-        assert!(matches!(store.rename(&copy, "reading room"), Err(ProfileError::NameTaken)));
+        assert!(matches!(
+            store.rename(&copy, "reading room"),
+            Err(ProfileError::NameTaken)
+        ));
         let listing = store.list().unwrap();
         let names: Vec<_> = listing
             .entries
@@ -1710,17 +1826,33 @@ mod tests {
         fs::create_dir_all(dir.join("nested.toml")).unwrap();
         fs::write(dir.join("broken.toml"), "profile_version = 1\nname = 3\n").unwrap();
         fs::write(dir.join("notes.txt"), "not a profile").unwrap();
-        fs::write(dir.join(".hidden.toml"), "profile_version = 1\nname = \"H\"\n").unwrap();
-        fs::write(dir.join("large.toml"), "#".repeat(MAX_PROFILE_BYTES as usize + 1)).unwrap();
+        fs::write(
+            dir.join(".hidden.toml"),
+            "profile_version = 1\nname = \"H\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("large.toml"),
+            "#".repeat(MAX_PROFILE_BYTES as usize + 1),
+        )
+        .unwrap();
         let listing = ProfileStore::at(&dir).list().unwrap();
         let shown: Vec<_> = listing
             .entries
             .iter()
-            .map(|entry| (entry.file.as_str(), entry.profile.as_ref().err().map(ProfileError::code)))
+            .map(|entry| {
+                (
+                    entry.file.as_str(),
+                    entry.profile.as_ref().err().map(ProfileError::code),
+                )
+            })
             .collect();
         assert_eq!(
             shown,
-            [("broken", Some("invalid-profile")), ("large", Some("file-too-large"))]
+            [
+                ("broken", Some("invalid-profile")),
+                ("large", Some("file-too-large"))
+            ]
         );
     }
 
@@ -1737,7 +1869,10 @@ mod tests {
         let store = ProfileStore::at(&dir);
         assert!(store.list().unwrap().entries.is_empty());
         let linked = ProfileFile::parse("linked").unwrap();
-        assert!(matches!(store.read(&linked), Err(ProfileError::NotRegularFile)));
+        assert!(matches!(
+            store.read(&linked),
+            Err(ProfileError::NotRegularFile)
+        ));
         assert!(matches!(store.delete(&linked), Err(ProfileError::Changed)));
         assert!(outside.exists());
         assert!(matches!(
@@ -1754,7 +1889,10 @@ mod tests {
             fs::read_to_string(&outside).unwrap(),
             "profile_version = 1\nname = \"Outside\"\n"
         );
-        assert!(matches!(export_profile(&profile, &dir), Err(ProfileError::Target)));
+        assert!(matches!(
+            export_profile(&profile, &dir),
+            Err(ProfileError::Target)
+        ));
         // A linked profiles folder is not used for writes.
         let linked_dir = directory.path().join("linked-profiles");
         symlink(&dir, &linked_dir).unwrap();

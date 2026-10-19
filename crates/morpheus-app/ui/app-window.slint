@@ -5617,7 +5617,9 @@ export component AppWindow inherits Window {
                                         settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                     }
                                 }
-                                changed reveal-request => {
+                                init => { self.reveal-requested-control(); }
+                                changed reveal-request => { self.reveal-requested-control(); }
+                                function reveal-requested-control() {
                                     if self.reveal-request > 0 {
                                         settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
                                         self.focus();
