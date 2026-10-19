@@ -43,6 +43,7 @@ mod stickers;
 mod timeline_acceptance;
 mod timeline_delivery;
 mod timeline_model;
+mod unread_navigation;
 mod update_controller;
 mod updater;
 mod verification;
@@ -1920,6 +1921,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         store.clone(),
         runtime.handle(),
     );
+    let unread_receipts = unread_navigation::register(&ui, live.clone(), runtime.handle());
 
     let watch = store.watch_with_theme(Duration::from_millis(700));
     let weak = ui.as_weak();
@@ -3741,6 +3743,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui.set_composer_operation(operation);
         ui.set_composer_busy(true);
         if send_live.is_live.load(Ordering::Acquire) {
+            // Sending answers the conversation: show the latest messages.
+            unread_navigation::caught_up(&ui);
             send_composers.send(&ui, &send_live, &send_handle, false);
             return;
         }
@@ -4900,6 +4904,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(morpheus_timeline_acceptance)]
     let acceptance = acceptance.start(&ui, live.clone(), runtime.handle().clone())?;
     let ui_result = ui.run();
+    // Before any shutdown wait below: no read receipt leaves after quitting.
+    unread_receipts.shutdown();
     room_settings.shutdown(&ui);
     image_previews.shutdown(&ui);
     #[cfg(feature = "native-calls")]

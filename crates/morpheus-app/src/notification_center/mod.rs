@@ -5,8 +5,8 @@
 //! - `activation`: opening a clicked banner through the window's
 //!   `open-conversation` navigation seam (exact account, room, event and
 //!   thread behind the protected account switch).
-//! - `read_markers`: private read receipts for the room on screen and
-//!   withdrawal of banners for rooms that were read.
+//! - `read_markers`: withdrawal of banners for rooms read on another device.
+//!   Receipts for the conversation on screen are `crate::unread_navigation`.
 //!
 //! Delivery itself stays in `crate::notifications`. Nothing here keeps
 //! message text, persists notification history or runs after Morpheus quits.
@@ -18,7 +18,6 @@ mod rules;
 use std::sync::Arc;
 
 use morpheus_config::{Config, ConfigStore};
-use slint::ComponentHandle;
 use tokio::runtime::Handle;
 
 use crate::{AppWindow, live::LiveUi, notifications::DesktopNotifications};
@@ -46,7 +45,7 @@ pub(crate) fn register(
         runtime.clone(),
     );
     let activator = Activator::register(ui, runtime.clone(), notifications.take_activations());
-    runtime.spawn(read_markers::run(live, notifications, ui.as_weak()));
+    runtime.spawn(read_markers::run(live, notifications));
     NotificationCenter {
         _activator: activator,
         _rules: rules,

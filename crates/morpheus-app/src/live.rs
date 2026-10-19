@@ -22,7 +22,7 @@ use morpheus_matrix::{
     DownloadedAttachment, EditBaseline, Generation, MatrixCoreError, MatrixLinkTarget, MessageInfo,
     MessageSendState, PublicMediaConsent, QueuedAttachment, QueuedMessage, QueuedSendUpdate,
     RecoveredDraft, RoomInfo, RoomMemberInfo, RoomMembership, StickerCatalog, SyncBackend,
-    SyncStatus, TextFormat,
+    SyncStatus, TextFormat, UnreadStart,
 };
 use slint::{Color, Model, ModelRc, StyledText, VecModel, Weak};
 use tokio::{
@@ -42,6 +42,10 @@ use crate::{
     AccountItem, AccountOption, AppWindow, MemberItem, MessageItem, PublicRoomItem, RoomItem,
     SpaceItem,
 };
+
+/// A room's first rows wait at most this long for where its unread messages
+/// begin (local state only), so it opens there instead of jumping later.
+const UNREAD_START_WAIT: Duration = Duration::from_millis(250);
 
 pub enum MessageTarget {
     Room,
@@ -275,6 +279,12 @@ impl LiveUi {
 
     pub(crate) fn current_navigation_epoch(&self) -> u64 {
         self.navigation_epoch.load(Ordering::Acquire)
+    }
+
+    /// The room feed generation now publishing; an unread view of another
+    /// generation pauses.
+    pub(crate) fn feed_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     pub fn composed_draft(&self, account: &str, room: &str, thread: Option<&str>) -> ComposeText {
@@ -2196,11 +2206,22 @@ impl LiveUi {
         let is_live = self.is_live.clone();
         let feed_account_id = account_id.to_owned();
         let feed_room_id = room_id;
+        let start_manager = self.manager.clone();
         let handle = tokio::spawn(async move {
             let _feed = feed;
             let delivery = Arc::new(crate::timeline_delivery::Latest::new());
+            // Where unread messages begin, read once from the same timeline
+            // before its first rows are shown, so the room opens there. A
+            // queued publication reads it when it runs.
+            let unread_start = Arc::new(std::sync::OnceLock::<Option<UnreadStart>>::new());
             loop {
                 let messages = updates.borrow_and_update().clone();
+                if unread_start.get().is_none() && !messages.is_empty() {
+                    let start =
+                        start_manager.unread_start_selected(&selection, &feed_room_id, None);
+                    let start = tokio::time::timeout(UNREAD_START_WAIT, start).await;
+                    let _ = unread_start.set(start.ok().and_then(Result::ok));
+                }
                 #[cfg(test)]
                 let observed = messages.clone();
                 if delivery.submit(messages) {
@@ -2212,6 +2233,7 @@ impl LiveUi {
                     let room_id = feed_room_id.clone();
                     let pending = delivery.clone();
                     let selected_account = selection.clone();
+                    let unread_start = unread_start.clone();
                     if ui_for_update
                         .upgrade_in_event_loop(move |ui| {
                             let Some(messages) = pending.take() else {
@@ -2233,6 +2255,15 @@ impl LiveUi {
                                     ui.get_messages(),
                                     messages.as_ref().clone(),
                                 ));
+                                let scope = crate::unread_navigation::FeedScope {
+                                    selection: selected_account,
+                                    account_id,
+                                    room_id,
+                                    thread_root: None,
+                                    generation,
+                                };
+                                let start = unread_start.get().cloned().flatten();
+                                crate::unread_navigation::after_publish(&ui, scope, start);
                             }
                         })
                         .is_err()
@@ -2381,6 +2412,14 @@ impl LiveUi {
                                     ui.get_thread_messages(),
                                     replies,
                                 ));
+                                let scope = crate::unread_navigation::FeedScope {
+                                    selection: selected_account,
+                                    account_id,
+                                    room_id,
+                                    thread_root: Some(root_event_id),
+                                    generation,
+                                };
+                                crate::unread_navigation::after_thread_publish(&ui, scope);
                             }
                         })
                         .is_err()
@@ -2790,6 +2829,7 @@ fn apply_snapshot(
         ui.set_member_confirm_open(false);
         crate::reset_attachment_view(ui);
         crate::reset_room_search(ui);
+        crate::unread_navigation::reset(ui);
         ui.set_room_call_mode(0);
         ui.set_composer_text(drafts.get(&view.active.id, next_room_id).into());
         ui.set_composer_markdown(drafts.markdown(&view.active.id, next_room_id));
@@ -2962,6 +3002,7 @@ fn apply_snapshot(
 
 fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::SecurityGate) {
     crate::security::clear_ui(ui, security_gate);
+    crate::unread_navigation::reset(ui);
     ui.set_room_actions_open(false);
     ui.set_room_action_busy(false);
     ui.set_room_action_error("".into());

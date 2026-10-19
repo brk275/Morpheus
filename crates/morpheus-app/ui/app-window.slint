@@ -1,5 +1,6 @@
 import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView, Slider, SpinBox } from "std-widgets.slint";
 import { NotificationRules } from "notification-settings.slint";
+import { UnreadDivider, UnreadView } from "unread-navigation.slint";
 // Rust drives the notification rules through this global.
 export { NotificationRoomItem, NotificationRulesState } from "notification-settings.slint";
 
@@ -2250,6 +2251,16 @@ export component AppWindow inherits Window {
     callback set-shared-voice-space(bool);
     callback choose-room-call-mode(int);
     callback load-older-messages();
+    // Unread navigation (unread_navigation/ui.rs). Rows answer each probe
+    // with their real geometry; the ListView applies Rust's scroll commands
+    // one at a time and acknowledges each.
+    callback timeline-row-report(int, int, string, float, float, float);
+    callback thread-row-report(int, int, string, float, float, float);
+    callback timeline-scroll-applied(int);
+    callback timeline-user-scrolled();
+    callback timeline-moved();
+    callback timeline-view-created();
+    callback jump-to-latest();
     callback refresh-room-members();
     callback submit-member-action(int, string, string);
     callback submit-room-admin(int, string, string);
@@ -2527,6 +2538,10 @@ export component AppWindow inherits Window {
 
     in-out property <int> thread-mention-index: 0;
     out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.access-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open && !root.image-preview-open;
+    // Nothing covers the room timeline (dialogs, or a composer popup over
+    // its bottom rows) or the open thread's replies.
+    out property <bool> timeline-reading-allowed: root.mention-ui-allowed && !(root.emoji-open && !root.emoji-threaded) && !(root.sticker-open && !root.sticker-threaded) && root.composer-mentions.length == 0 && !(root.sticker-send-visible && !root.sticker-send-threaded);
+    out property <bool> thread-reading-allowed: root.mention-ui-allowed && !(root.emoji-open && root.emoji-threaded) && !(root.sticker-open && root.sticker-threaded) && root.thread-mentions.length == 0 && !(root.sticker-send-visible && root.sticker-send-threaded);
     changed mention-ui-allowed => { if !root.mention-ui-allowed { root.mention-context-changed(); root.sticker-context-changed(); } }
     // Input IDs live inside conditional subtrees; callbacks cross that boundary.
     in-out property <int> composer-caret: -1;
@@ -2551,6 +2566,17 @@ export component AppWindow inherits Window {
     in-out property <int> download-operation: 0;
     in-out property <int> composer-operation: 0;
     in-out property <bool> history-loading: false;
+    // Unread navigation. Only Rust writes the probes, and only from timers.
+    in-out property <int> timeline-probe: 0;
+    in-out property <int> thread-probe: 0;
+    in-out property <int> timeline-scroll-serial: 0;
+    // 1 move by `timeline-scroll-amount` pixels, 3 seek near row number
+    // `timeline-scroll-amount`, 4 seek the end.
+    in-out property <int> timeline-scroll-kind: 0;
+    in-out property <float> timeline-scroll-amount: 0;
+    in-out property <string> unread-divider-event-id;
+    in-out property <string> unread-divider-text;
+    in-out property <UnreadView> unread-view;
     in-out property <bool> history-at-start: false;
     in-out property <string> history-error;
     in-out property <int> history-operation: 0;
@@ -3524,8 +3550,32 @@ export component AppWindow inherits Window {
                     timeline-list := ListView {
                         vertical-stretch: 1;
                         horizontal-scrollbar-policy: always-off;
+                        // Unread navigation: apply Rust's scroll command, then acknowledge it.
+                        property <int> unread-scroll-serial: root.timeline-scroll-serial;
+                        changed unread-scroll-serial => {
+                            if root.messages.length > 0 {
+                                if root.timeline-scroll-kind == 1 {
+                                    self.content-y = max(min(0px, self.visible-height - self.content-height), min(0px, self.content-y - root.timeline-scroll-amount * 1px));
+                                } else if root.timeline-scroll-kind == 3 {
+                                    self.content-y = max(min(0px, self.visible-height - self.content-height), min(0px, -root.timeline-scroll-amount * self.content-height / root.messages.length));
+                                } else if root.timeline-scroll-kind == 4 {
+                                    self.content-y = min(0px, self.visible-height - self.content-height);
+                                }
+                            }
+                            root.timeline-scroll-applied(self.unread-scroll-serial);
+                        }
+                        changed content-y => { root.timeline-moved(); }
+                        scrolled => { root.timeline-user-scrolled(); }
+                        init => { root.timeline-view-created(); }
                         for message[index] in root.messages : message-row := Rectangle {
                             width: timeline-list.visible-width;
+                            // Unread navigation: answer each probe with this row's real geometry.
+                            property <int> unread-probe: root.timeline-probe;
+                            changed unread-probe => {
+                                root.timeline-row-report(self.unread-probe, index, message.event-id, (self.y + timeline-list.content-y) / 1px, self.height / 1px, timeline-list.visible-height / 1px);
+                            }
+                            property <bool> unread-divider: message.event-id != "" && message.event-id == root.unread-divider-event-id;
+                            property <length> unread-divider-height: self.unread-divider ? max(24px, 14px * root.text-scale + 10px) : 0px;
                             // The timeline uses time for local delivery status too. Hiding
                             // optional timestamps must keep pending and failed sends visible.
                             property <bool> show-time: root.show-message-timestamps || message.time == "Sending…" || message.time == "Failed to send";
@@ -3542,12 +3592,17 @@ export component AppWindow inherits Window {
                             property <length> body-width: max(0px, self.width - 2 * root.content-inset
                                 - (root.show-message-avatars ? self.avatar-size + (root.message-layout == 0 ? 10px : 7px) : 0px)
                                 - (self.columns ? self.column-width + 7px + (message-row.show-time ? root.timestamp-width-px * 1px * root.text-scale + 7px : 0px) : 0px));
-                            min-height: max(28px + 2 * root.message-row-gap, root.show-message-avatars ? self.avatar-size + 2 * root.message-row-gap : 0px);
+                            min-height: self.unread-divider-height + max(28px + 2 * root.message-row-gap, root.show-message-avatars ? self.avatar-size + 2 * root.message-row-gap : 0px);
                             background: root.row-surface(message-row.selected-message, message-hover.has-hover, message.is-own, transparent);
                             message-hover := TouchArea { mouse-cursor: default; }
+                            if message-row.unread-divider : UnreadDivider {
+                                x: root.content-inset; y: 0px;
+                                width: max(0px, parent.width - 2 * root.content-inset); height: message-row.unread-divider-height;
+                                text: root.unread-divider-text; accent: root.accent; surface: root.panel; text-scale: root.text-scale;
+                            }
                             message-flow := HorizontalLayout {
                                 padding-left: root.content-inset; padding-right: root.content-inset;
-                                padding-top: root.message-row-gap; padding-bottom: root.message-row-gap;
+                                padding-top: root.message-row-gap + message-row.unread-divider-height; padding-bottom: root.message-row-gap;
                                 spacing: root.message-layout == 0 ? 10px : 7px;
                                 cross-axis-alignment: start;
                                 if root.show-message-avatars : AvatarBadge {
@@ -3688,7 +3743,7 @@ export component AppWindow inherits Window {
                             // paths. Reserve their width in the header/column body before overlaying.
                             HorizontalLayout {
                                 x: parent.width - root.content-inset - message-row.action-width;
-                                y: root.message-row-gap + (message-row.tight-header ? max(26px, root.message-font-px * 1.4) : 0px); width: message-row.action-width; height: 26px;
+                                y: root.message-row-gap + message-row.unread-divider-height + (message-row.tight-header ? max(26px, root.message-font-px * 1.4) : 0px); width: message-row.action-width; height: 26px;
                                 spacing: 8px; alignment: end;
                                 if message.event-id != "" : IconAction {
                                     quiet: true; context-hover: message-hover.has-hover;
@@ -3919,6 +3974,21 @@ export component AppWindow inherits Window {
                                         root.send-message(root.composer-text);
                                     }
                                 }
+                            }
+                        }
+                        // Jump to latest floats over the bottom of the timeline like the
+                        // composer popups, and gives way to them.
+                        if root.unread-view.show-jump && root.timeline-reading-allowed : TextAction {
+                            x: parent.width - self.width - root.content-inset - 8px;
+                            y: -self.height - 10px;
+                            width: self.preferred-width; height: max(32px, 30px * root.text-scale);
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                            outline: root.accent; text-scale: root.text-scale;
+                            text: "↓ " + root.unread-view.jump-text;
+                            accessible-label: root.unread-view.jump-label;
+                            activated => {
+                                root.jump-to-latest();
+                                message-input.focus();
                             }
                         }
                         if root.emoji-open && !root.emoji-threaded && root.mention-ui-allowed : EmojiPopup {
@@ -6111,7 +6181,7 @@ export component AppWindow inherits Window {
                         wrap: word-wrap; horizontal-alignment: center; vertical-alignment: center;
                         vertical-stretch: 1;
                     }
-                    if root.thread-root-id != "" : ScrollView {
+                    if root.thread-root-id != "" : thread-scroll := ScrollView {
                         vertical-stretch: 1;
                         horizontal-scrollbar-policy: always-off;
                         VerticalLayout {
@@ -6141,8 +6211,17 @@ export component AppWindow inherits Window {
                             }
                             Rectangle { height: 1px; background: root.divider; }
                             Text { text: "REPLIES · " + root.thread-messages.length; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; vertical-stretch: 0; }
-                            for reply in root.thread-messages : thread-reply := Rectangle {
+                            for reply[reply-index] in root.thread-messages : thread-reply := Rectangle {
                                 property <string> time-label: root.message-time-label(reply);
+                                // Unread navigation: replies are not virtualized, so only
+                                // those on screen answer a probe.
+                                property <int> unread-probe: root.thread-probe;
+                                property <length> screen-top: self.y + thread-scroll.content-y;
+                                changed unread-probe => {
+                                    if self.screen-top < thread-scroll.visible-height && self.screen-top + self.height > 0px {
+                                        root.thread-row-report(self.unread-probe, reply-index, reply.event-id, self.screen-top / 1px, self.height / 1px, thread-scroll.visible-height / 1px);
+                                    }
+                                }
                                 min-height: 43px;
                                 vertical-stretch: 0;
                                 background: root.row-surface(false, false, reply.is-own, root.elevated);

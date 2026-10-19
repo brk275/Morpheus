@@ -1,5 +1,5 @@
-//! Matrix push-rule notification modes and read markers for one account
-//! selection.
+//! Matrix push-rule notification modes and unread counts for one account
+//! selection. Read receipts for the conversation on screen are `unread.rs`.
 //!
 //! Room modes and account defaults are the account's server-side push rules,
 //! read and written through the SDK's notification-settings API; nothing here
@@ -14,7 +14,7 @@ use std::time::Duration;
 use matrix_sdk::{
     Client,
     notification_settings::{IsEncrypted, IsOneToOne, NotificationSettings, RoomNotificationMode},
-    ruma::{RoomId, api::client::receipt::create_receipt::v3::ReceiptType},
+    ruma::RoomId,
 };
 
 use super::*;
@@ -119,7 +119,10 @@ impl AccountManager {
             .clone())
     }
 
-    async fn rule_loaded(&self, selection: &AccountSelection) -> Result<Arc<LoadedAccount>> {
+    pub(crate) async fn rule_loaded(
+        &self,
+        selection: &AccountSelection,
+    ) -> Result<Arc<LoadedAccount>> {
         if !self.owns_rule_selection(selection) {
             return Err(MatrixCoreError::SelectedAccountChanged);
         }
@@ -136,7 +139,7 @@ impl AccountManager {
 
     /// Run one bounded request under `selection`; a revoked selection or a
     /// timeout ends it and its result is never returned.
-    async fn under_rule_selection<T>(
+    pub(crate) async fn under_rule_selection<T>(
         &self,
         selection: &AccountSelection,
         request: impl std::future::Future<Output = Result<T>>,
@@ -323,44 +326,6 @@ impl AccountManager {
                 .await
                 .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
             Ok(sorted_keywords(&settings).await)
-        })
-        .await
-    }
-
-    /// Mark the room's live timeline read up to its latest event with a
-    /// private read receipt, which clears unread counts on this and the
-    /// account's other devices without showing other members a read marker.
-    /// Returns whether a receipt was sent; an already read room sends none.
-    pub async fn mark_room_read_selected(
-        &self,
-        selection: &AccountSelection,
-        room_id: &str,
-    ) -> Result<bool> {
-        let loaded = self.rule_loaded(selection).await?;
-        self.under_rule_selection(selection, async move {
-            let timeline = loaded.timeline(room_id).await?;
-            timeline
-                .mark_as_read(ReceiptType::ReadPrivate)
-                .await
-                .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
-        })
-        .await
-    }
-
-    /// `mark_room_read_selected` for one thread's timeline.
-    pub async fn mark_thread_read_selected(
-        &self,
-        selection: &AccountSelection,
-        room_id: &str,
-        root_event_id: &str,
-    ) -> Result<bool> {
-        let loaded = self.rule_loaded(selection).await?;
-        self.under_rule_selection(selection, async move {
-            let timeline = loaded.thread_timeline(room_id, root_event_id).await?;
-            timeline
-                .mark_as_read(ReceiptType::ReadPrivate)
-                .await
-                .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
         })
         .await
     }

@@ -26,7 +26,7 @@ use matrix_sdk::{
 use morpheus_config::Config;
 use morpheus_matrix::{AccountInfo, AccountManager, AccountSelection, NotificationMode};
 use serde_json::Value;
-use slint::{ComponentHandle, Weak as UiWeak};
+use slint::Weak as UiWeak;
 use tokio::{
     runtime::Handle,
     sync::{mpsc, oneshot},
@@ -319,10 +319,11 @@ impl DesktopNotifications {
                 let account_id = ui.get_active_account_local_id().to_string();
                 let room_id = ui.get_active_room_id().to_string();
                 let live = ui.get_live_session();
+                // Banners for the shown room are held back only while it is
+                // read here: the same active-window rule as read receipts.
                 let visible_room = if live
                     && ui.get_page() == 0
-                    && ui.window().is_visible()
-                    && !ui.window().is_minimized()
+                    && crate::unread_navigation::foreground(&ui)
                     && !account_id.is_empty()
                     && !room_id.is_empty()
                 {

@@ -15,15 +15,34 @@ use crate::MessageItem;
 // removals each use one range notification regardless of the history length.
 const MAX_ROW_NOTIFICATIONS: usize = 128;
 
+/// How the latest snapshot changed a timeline model's rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Applied {
+    /// Nothing changed.
+    #[default]
+    Nothing,
+    /// Every row stayed, by key and in order: `prepended` older rows came
+    /// in front, `appended` newer ones behind, and some changed in place.
+    Aligned { prepended: usize, appended: usize },
+    /// Rows were removed or replaced: what is drawn where may have moved.
+    Spliced,
+}
+
 struct TimelineModel {
     rows: RefCell<Vec<Arc<MessageInfo>>>,
     notify: ModelNotify,
+    applied: std::cell::Cell<Applied>,
     #[cfg(test)]
     projected: std::cell::Cell<usize>,
 }
 
 impl TimelineModel {
     fn replace(&self, next: Vec<Arc<MessageInfo>>) {
+        if let Some(applied) = self.replace_aligned(&next) {
+            self.applied.set(applied);
+            return;
+        }
+        self.applied.set(Applied::Spliced);
         let (prefix, removed, added) = {
             let old = self.rows.borrow();
             let prefix = old
@@ -32,6 +51,7 @@ impl TimelineModel {
                 .take_while(|(a, b)| same_row(a, b))
                 .count();
             if prefix == old.len() && prefix == next.len() {
+                self.applied.set(Applied::Nothing);
                 return;
             }
             let suffix = old[prefix..]
@@ -96,6 +116,79 @@ impl TimelineModel {
     }
 }
 
+impl TimelineModel {
+    /// Apply a snapshot that keeps every current row, by its stable SDK key
+    /// and in order, with older rows in front, newer rows behind or rows
+    /// changed in place. Each part is announced as exactly that, so the
+    /// ListView keeps the reader's rows in place when older history is
+    /// inserted above them and a change above never rewinds it. Returns
+    /// `None`, changing nothing, for any other snapshot.
+    fn replace_aligned(&self, next: &[Arc<MessageInfo>]) -> Option<Applied> {
+        let (prepended, appended, changed) = {
+            let old = self.rows.borrow();
+            let first = old.first()?;
+            let prepended = next.iter().position(|row| row.key == first.key)?;
+            let appended = next.len().checked_sub(prepended + old.len())?;
+            let kept = &next[prepended..prepended + old.len()];
+            if old.iter().zip(kept).any(|(old, new)| old.key != new.key) {
+                return None;
+            }
+            let changed = old
+                .iter()
+                .zip(kept)
+                .enumerate()
+                .filter(|(_, (old, new))| !same_row(old, new))
+                .map(|(offset, _)| prepended + offset)
+                .take(MAX_ROW_NOTIFICATIONS + 1)
+                .collect::<Vec<_>>();
+            (prepended, appended, changed)
+        };
+        if changed.len() > MAX_ROW_NOTIFICATIONS {
+            *self.rows.borrow_mut() = next.to_vec();
+            self.notify.reset();
+            // A reset redraws the same indices in place; older rows in front
+            // shifted them.
+            return Some(if prepended == 0 {
+                Applied::Aligned {
+                    prepended,
+                    appended,
+                }
+            } else {
+                Applied::Spliced
+            });
+        }
+        let nothing = prepended == 0 && appended == 0 && changed.is_empty();
+        // Release each borrow before notifying, as `replace` does.
+        if prepended > 0 {
+            let older = next[..prepended].iter().cloned();
+            drop(self.rows.borrow_mut().splice(0..0, older));
+            self.notify.row_added(0, prepended);
+        }
+        {
+            let mut rows = self.rows.borrow_mut();
+            for &row in &changed {
+                rows[row] = next[row].clone();
+            }
+        }
+        for row in changed {
+            self.notify.row_changed(row);
+        }
+        if appended > 0 {
+            let start = next.len() - appended;
+            self.rows.borrow_mut().extend(next[start..].iter().cloned());
+            self.notify.row_added(start, appended);
+        }
+        Some(if nothing {
+            Applied::Nothing
+        } else {
+            Applied::Aligned {
+                prepended,
+                appended,
+            }
+        })
+    }
+}
+
 fn same_row(a: &Arc<MessageInfo>, b: &Arc<MessageInfo>) -> bool {
     Arc::ptr_eq(a, b) || a.as_ref() == b.as_ref()
 }
@@ -137,10 +230,35 @@ pub(crate) fn update_shared(
         ModelRc::new(TimelineModel {
             rows: RefCell::new(rows),
             notify: ModelNotify::default(),
+            applied: std::cell::Cell::new(Applied::Spliced),
             #[cfg(test)]
             projected: std::cell::Cell::new(0),
         })
     }
+}
+
+/// The rows of a timeline model as the Rust side stores them, without
+/// formatting any of them; empty for any other model (a blank or a preview).
+pub(crate) fn rows(model: &ModelRc<MessageItem>) -> Vec<Arc<MessageInfo>> {
+    model
+        .as_any()
+        .downcast_ref::<TimelineModel>()
+        .map(|model| model.rows.borrow().clone())
+        .unwrap_or_default()
+}
+
+/// How the latest snapshot changed this timeline model's rows.
+pub(crate) fn last_applied(model: &ModelRc<MessageItem>) -> Applied {
+    model
+        .as_any()
+        .downcast_ref::<TimelineModel>()
+        .map_or(Applied::Spliced, |model| model.applied.get())
+}
+
+/// One stored row of a timeline model, without formatting it.
+pub(crate) fn row(model: &ModelRc<MessageItem>, index: usize) -> Option<Arc<MessageInfo>> {
+    let model = model.as_any().downcast_ref::<TimelineModel>()?;
+    model.rows.borrow().get(index).cloned()
 }
 
 // Owned fixtures also exercise the value-equality fallback: a rebuilt row can
@@ -459,6 +577,38 @@ pub(crate) mod tests {
         assert_eq!(
             observer.as_ref().get().changes.borrow().last(),
             Some(&Change::Removed(0, 6, 0))
+        );
+    }
+
+    #[test]
+    fn kept_rows_stay_in_place_when_older_rows_arrive_or_rows_above_change() {
+        let mut rows: Vec<_> = (0..4).map(fixture).collect();
+        let model = update(ModelRc::default(), rows.clone());
+        let observer = Box::pin(ModelChangeListenerContainer::new(Observer {
+            model: model.clone(),
+            changes: RefCell::new(Vec::new()),
+        }));
+        model
+            .model_tracker()
+            .attach_peer(observer.as_ref().model_peer());
+        // A change above the reader together with a new message: never one
+        // removal and re-insertion over the rows on screen.
+        rows[0].reaction_summary = "heart 1".into();
+        rows.push(fixture(4));
+        update(model.clone(), rows.clone());
+        // Older history together with a new message.
+        rows.splice(0..0, [fixture(5), fixture(6)]);
+        rows.push(fixture(7));
+        update(model.clone(), rows.clone());
+        assert_rows(&model, &rows);
+        assert_eq!(
+            *observer.as_ref().get().changes.borrow(),
+            [
+                Change::Changed(0, 4),
+                Change::Added(4, 1, 5),
+                Change::Added(0, 2, 7),
+                Change::Added(7, 1, 8),
+            ]
         );
     }
 

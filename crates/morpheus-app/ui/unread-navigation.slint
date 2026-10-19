@@ -1,0 +1,47 @@
+// Scroll-aware unread state of the conversation on screen, set by
+// crates/morpheus-app/src/unread_navigation/ui.rs. Nothing here decides what
+// was read: rows only report their real geometry when Rust probes them, and
+// Rust sends private receipts for rows that stayed visible in the active
+// window.
+export struct UnreadView {
+    // The latest message is not on screen: offer Jump to latest.
+    show-jump: bool,
+    // Unread messages below what is on screen.
+    new-count: int,
+    jump-text: string,
+    jump-label: string,
+}
+
+// A band across the top of the first unread row. It takes its own height so
+// the row's content and actions move down instead of being covered, and its
+// own background so hover and search highlights never run through it.
+export component UnreadDivider inherits Rectangle {
+    in property <string> text;
+    in property <color> accent;
+    in property <color> surface;
+    in property <float> text-scale: 1;
+    background: root.surface;
+    accessible-role: text;
+    accessible-label: root.text;
+    HorizontalLayout {
+        spacing: 8px;
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            Rectangle { height: 1px; background: root.accent; }
+        }
+        Text {
+            text: root.text;
+            color: root.accent;
+            font-size: 10px * root.text-scale;
+            font-weight: 750;
+            vertical-alignment: center;
+            horizontal-stretch: 0;
+        }
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            Rectangle { height: 1px; background: root.accent; }
+        }
+    }
+}

@@ -75,18 +75,46 @@ their results. Errors use fixed wording.
 
 ## Read state and withdrawal
 
-While a room is on screen (the window is shown and not minimized, the
-conversation page is open and the room is selected), Morpheus marks its live
-timeline, and an open thread's, read with a private read receipt after each sync
-batch and when it comes into view. Unread and mention counts therefore clear in
-Morpheus and on the account's other devices, while other members see no read
-marker. The scroll position is not considered.
+Morpheus marks a message read only after its row was actually on screen: the
+row must stay readable (all of a short message, or at least 40 pixels of a tall
+one) for about a second while the window is the active window, not minimized,
+on the conversation page, with no dialog or composer popup covering the
+timeline. Visibility comes from the timeline's own rows, measured where they
+were last drawn, not from estimates. Selecting a room, refreshing it or new
+messages arriving never mark anything read by themselves, and nothing is read
+while the window is in the background.
+
+The read position moves only forwards, with a private read receipt
+(`m.read.private`), so other members see no read marker; Morpheus sends no
+public receipt and no fully-read marker. Because a receipt also covers
+everything before its message, it never moves past a message from someone else
+that was not on screen, unless the reader explicitly caught up with Jump to
+latest or by sending a message. When the newest message was seen, events the
+timeline shows no row for (undecryptable messages, polls, calls, redactions)
+after it count as read too, so the unread count can reach zero. Receipts leave
+one at a time, at most every 1.5 seconds; a transient failure is retried a few
+times, a refusal is not, and nothing is sent for an account that is no longer
+the one shown or after Morpheus quits. An open thread is read the same way from
+its replies on screen; Matrix thread receipts do not clear the room's badge.
+
+A room opens on its first unread message, below a "New messages" divider, or on
+the latest message when everything was read. When the unread messages begin
+before the loaded history, the room opens at the top of what is loaded with an
+"Unread messages start before the loaded history" divider, and no receipt is
+sent until Load earlier messages reaches the read position or the reader
+catches up explicitly. While the reader is scrolled up, new messages never move
+what is on screen; a button over the composer shows how many unread messages
+are below and jumps to the latest one. Loading earlier messages keeps the rows
+on screen in place. At the latest message, new messages are followed, but only
+while the window is being read; messages that arrive in the background wait
+below a divider.
 
 A shown banner is remembered only as an opaque token with its account, room,
 event and thread IDs, at most 32 of them and for at most 24 hours; no message
 text is kept and nothing is written to disk. A newer message in the same room
-replaces that room's banner, and banners of a room that was read here or
-elsewhere are withdrawn, where the platform allows: the Linux desktop
+replaces that room's banner, and banners of a room whose unread count reached
+zero, read here or elsewhere, are withdrawn after the next sync, where the
+platform allows: the Linux desktop
 notification service supports both through `CloseNotification`; the pinned
 macOS and Windows backends have no withdrawal API, so their banners stay until
 the user or the OS dismisses them. Quitting withdraws what it can. Removing or
