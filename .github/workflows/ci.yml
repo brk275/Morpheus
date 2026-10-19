@@ -1,27 +1,27 @@
 # TEMPORARY focused native offline app checks. NEVER MERGE this workflow.
-name: Reviewed SDKUI lock metadata
-run-name: SDKUI reviewed macro lock resolution - c0906f2
+name: Reviewed sticker timeout diagnostics
+run-name: Sticker required-state verification - 60747bc
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: sdkui-reviewed-macro-lock-c0906f2
+  group: sticker-required-state-60747bc
   cancel-in-progress: false
 jobs:
   contracts:
-    name: Resolve reviewed SDKUI dependency edges only
+    name: Verify required room state then encrypted sticker fixture
     if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: c0906f2240ac9c983dbdd3c37f8fecd57b31fa76
+          ref: 60747bc4839a3876fd466ff167cfe9cc8986d21d
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact reviewed source
-        run: test "$(git rev-parse HEAD)" = c0906f2240ac9c983dbdd3c37f8fecd57b31fa76
+        run: test "$(git rev-parse HEAD)" = 60747bc4839a3876fd466ff167cfe9cc8986d21d
       - name: Scan source before executing reviewed native tests
         shell: bash
         run: |
@@ -34,6 +34,15 @@ jobs:
           printf '[extend]\nuseDefault = true\n' > "$RUNNER_TEMP/default.toml"
           : > "$RUNNER_TEMP/empty.ignore"
           "$RUNNER_TEMP/gitleaks/gitleaks" git --redact=100 --ignore-gitleaks-allow --no-banner --config "$RUNNER_TEMP/default.toml" --gitleaks-ignore-path "$RUNNER_TEMP/empty.ignore" --log-opts=--all .
+      - name: Install native Linux build and isolated desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libclang-dev libdbus-1-dev libdrm-dev libegl-dev \
+            libfontconfig1-dev libgbm-dev libglib2.0-dev libinih-dev libpipewire-0.3-dev libssl-dev \
+            libsystemd-dev libudev-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxi6 libxrandr-dev meson ninja-build pkg-config wayland-protocols xvfb xauth \
+            dbus-x11 gnome-keyring libsecret-tools libgl1-mesa-dri fonts-noto-color-emoji
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action
         with:
           toolchain: 1.99.0
@@ -41,7 +50,7 @@ jobs:
         with:
           key: verified-sdk-archives-v1
           save-if: false
-      - name: Resolve dependency edges without compiling or executing project code
+      - name: Verify seven privacy and scanner-order diagnostic contracts
         timeout-minutes: 5
         env:
           CARGO_BUILD_JOBS: "2"
@@ -54,7 +63,7 @@ jobs:
           set -euo pipefail
           umask 077
           python3 -I -B - <<'PY'
-          import hashlib, json, os, pathlib, re, select, signal, subprocess, tempfile, time, tomllib
+          import json, os, pathlib, re, select, signal, subprocess, tempfile, time
           assert os.environ.get('GITHUB_ACTIONS') == 'true'
           assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
           assert os.environ.get('ImageOS') == 'ubuntu24'
@@ -69,12 +78,11 @@ jobs:
           log = logs/'cargo.log'
           reason = None
           code = None
-          before=pathlib.Path('Cargo.lock').read_bytes()
           with log.open('xb') as output:
-              child = subprocess.Popen(['cargo','update','--workspace'],
+              child = subprocess.Popen(['python3','-I','-B','-c',"import sys,unittest; sys.path.insert(0,'scripts/tests'); suite=unittest.defaultTestLoader.loadTestsFromNames(['test_sticker_diagnostics.StickerDiagnosticTests','test_matrix_acceptance.StickerFailureForwardingTests']); result=unittest.TextTestRunner(verbosity=2).run(suite); raise SystemExit(not result.wasSuccessful() or result.testsRun != 7 or bool(result.skipped))"],
                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                   env=environment, start_new_session=True)
-              deadline = time.monotonic()+180
+              deadline = time.monotonic()+90
               size = 0
               try:
                   while True:
@@ -87,7 +95,7 @@ jobs:
                       block=os.read(child.stdout.fileno(),65536)
                       if not block: break
                       size+=len(block)
-                      if size>8*1024*1024:
+                      if size>1024*1024:
                           reason='output_limit'; break
                       output.write(block)
                   if reason is None:
@@ -111,75 +119,108 @@ jobs:
           if scan.returncode!=0:
               print('OFFLINE_NATIVE_LOG_WITHHELD',flush=True); raise SystemExit(1)
           output=log.read_text(errors='replace')
-          report={'check':'sdkui_lock_metadata','source':'c0906f2240ac9c983dbdd3c37f8fecd57b31fa76',
-              'status':'failed','failure':reason or 'metadata_command_failed',
-              'project_code_executed':False,'raw_logs_public':False,'artifacts_uploaded':False}
-          families={
-              'lock_update': ('lock file' in output or 'lockfile' in output) and '--locked' in output,
-              'workspace_inheritance': 'inherit' in output and 'workspace' in output,
-              'manifest': 'manifest' in output and ('parse' in output or 'failed to load' in output),
-              'offline_cache': '--offline' in output or 'offline mode' in output,
-              'dependency_resolution': 'failed to select a version' in output or 'no matching package' in output,
-              'git_fetch': 'failed to fetch' in output or 'failed to clone' in output,
-              'network': 'network failure' in output or 'Could not resolve host' in output or 'failed to get successful HTTP response' in output,
-          }
-          report['error_families']=sorted(name for name,value in families.items() if value)
-          if reason is None and code==0:
-              stage='size'
-              try:
-                  after=pathlib.Path('Cargo.lock').read_bytes()
-                  assert len(before)<=4*1024*1024 and len(after)<=4*1024*1024
-                  old=tomllib.loads(before.decode()); new=tomllib.loads(after.decode())
-                  stage='top_level'
-                  report['changed_top_level_keys']=sorted(key for key in ('version','metadata','patch') if old.get(key)!=new.get(key))
-                  assert {k:v for k,v in old.items() if k!='package'}=={k:v for k,v in new.items() if k!='package'}
-                  def identity(package):
-                      return tuple(package.get(key,'') for key in ('name','version','source','checksum'))
-                  previous={identity(package):package for package in old['package']}
-                  current={identity(package):package for package in new['package']}
-                  assert len(previous)==len(old['package']) and len(current)==len(new['package'])
-                  stage='identities'
-                  added=sorted(set(current)-set(previous)); removed=sorted(set(previous)-set(current))
-                  report.update(previous_packages=len(previous),current_packages=len(current))
-                  assert len(added)<=64 and len(removed)<=64
-                  known_sources={key[2] for key in previous}
-                  def public_identity(key):
-                      name,version,source,checksum=key
-                      assert type(name) is str and re.fullmatch(r'[A-Za-z0-9_-]{1,100}',name)
-                      assert type(version) is str and re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.+_-]{1,80})?',version)
-                      assert checksum=='' or re.fullmatch(r'[a-f0-9]{64}',checksum)
-                      return {'name':name,'version':version,'source':source if source in known_sources else None,
-                          'source_known':source in known_sources,'checksum':checksum}
-                  report['identity_changes']={'added':[public_identity(key) for key in added],
-                      'removed':[public_identity(key) for key in removed]}
-                  assert set(previous)==set(current)
-                  allowed={edge for package in old['package'] for edge in package.get('dependencies',[])}
-                  for package in old['package']:
-                      allowed.add(package['name'])
-                      allowed.add(package['name']+' '+package['version'])
-                      if 'source' in package:
-                          allowed.add(package['name']+' '+package['version']+' ('+package['source']+')')
-                  changes=[]
-                  for key in sorted(previous):
-                      first,last=previous[key],current[key]
-                      stage='package_fields'
-                      assert {k:v for k,v in first.items() if k!='dependencies'}=={k:v for k,v in last.items() if k!='dependencies'}
-                      stage='edge_references'
-                      left,right=first.get('dependencies',[]),last.get('dependencies',[])
-                      assert type(left) is list and type(right) is list and len(right)<=256
-                      assert all(type(edge) is str and edge in allowed for edge in right)
-                      if left!=right:
-                          changes.append({'package':key[0]+'@'+key[1],'before':left,'after':right})
-                  stage='change_bound'
-                  assert len(changes)<=64
-                  report.update(status='passed',failure=None,error_families=[],
-                      package_identities_unchanged=True,changes=changes,
-                      base_lock_sha256=hashlib.sha256(before).hexdigest(),
-                      generated_lock_sha256=hashlib.sha256(after).hexdigest())
-              except (AssertionError,ValueError,KeyError,TypeError,UnicodeError):
-                  report['failure']='unexpected_dependency_graph'
-                  report['graph_stage']=stage
-          print(json.dumps(report,sort_keys=True),flush=True)
-          if report['status']!='passed': raise SystemExit(1)
+          passed=reason is None and code==0 and re.search(r'^Ran 7 tests in ',output,re.MULTILINE) is not None and re.search(r'^OK$',output,re.MULTILINE) is not None
+          print(json.dumps({'check':'sticker_diagnostic_contracts','status':'passed' if passed else 'failed',
+              'source':'60747bc4839a3876fd466ff167cfe9cc8986d21d','failure':reason,
+              'tests_passed':7 if passed else None,'raw_logs_public':False,
+              'accounts_generated':False,'app_executed':False},sort_keys=True),flush=True)
+          if not passed: raise SystemExit(1)
           PY
-      # Metadata only; generated lock is represented by validated existing-package edges and SHA256.
+      - name: Verify preserved SDK defaults and exact custom room state
+        timeout-minutes: 40
+        env:
+          CARGO_BUILD_JOBS: "2"
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          CARGO_TERM_COLOR: never
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -I -B - <<'PY'
+          import json, os, pathlib, re, select, signal, subprocess, tempfile, time
+          assert os.environ.get('GITHUB_ACTIONS') == 'true'
+          assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+          assert os.environ.get('ImageOS') == 'ubuntu24'
+          names = ('PATH','HOME','LANG','LC_ALL','TMPDIR','CARGO_HOME','RUSTUP_HOME','RUSTUP_TOOLCHAIN',
+              'PKG_CONFIG_PATH','LD_LIBRARY_PATH','SSL_CERT_FILE','SSL_CERT_DIR','CARGO_BUILD_JOBS',
+              'CARGO_INCREMENTAL','CARGO_PROFILE_DEV_DEBUG','CARGO_PROFILE_TEST_DEBUG','CARGO_TERM_COLOR',
+              'GITHUB_ACTIONS','RUNNER_ENVIRONMENT','RUNNER_OS','ImageOS','RUNNER_TEMP','RUNNER_TRACKING_ID')
+          environment = {name:os.environ[name] for name in names if name in os.environ}
+          root = pathlib.Path(tempfile.mkdtemp(prefix='morpheus-offline-app-',dir=os.environ['RUNNER_TEMP']))
+          root.chmod(0o700)
+          logs = root/'logs'; logs.mkdir(mode=0o700)
+          log = logs/'cargo.log'
+          reason = None
+          code = None
+          with log.open('xb') as output:
+              child = subprocess.Popen(['cargo','test','--locked','-p','matrix-sdk-ui','--features','unstable-msc4354','--lib','room_list_service::tests::morpheus_custom_state_preserves_defaults_for_lists_and_subscriptions','--','--exact','--test-threads=1'],
+                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                  env=environment, start_new_session=True)
+              deadline = time.monotonic()+35*60
+              size = 0
+              try:
+                  while True:
+                      remaining = deadline-time.monotonic()
+                      if remaining<=0:
+                          reason='deadline'; break
+                      ready,_,_=select.select([child.stdout],[],[],remaining)
+                      if not ready:
+                          reason='deadline'; break
+                      block=os.read(child.stdout.fileno(),65536)
+                      if not block: break
+                      size+=len(block)
+                      if size>50*1024*1024:
+                          reason='output_limit'; break
+                      output.write(block)
+                  if reason is None:
+                      code=child.wait(timeout=10)
+              except (OSError,subprocess.SubprocessError):
+                  reason='process_error'
+              finally:
+                  # Never signal an already-reaped PID/group. Timeout and
+                  # overflow keep our child anchored until after group kill.
+                  if child.returncode is None:
+                      try: os.killpg(child.pid,signal.SIGKILL)
+                      except ProcessLookupError: pass
+                      child.wait(timeout=10)
+                  child.stdout.close()
+          with (root/'scan.log').open('wb') as output:
+              scan=subprocess.run([os.environ['RUNNER_TEMP']+'/gitleaks/gitleaks','dir',str(logs),
+                  '--redact=100','--ignore-gitleaks-allow','--no-banner','--max-target-megabytes','0',
+                  '--config',os.environ['RUNNER_TEMP']+'/default.toml',
+                  '--gitleaks-ignore-path',os.environ['RUNNER_TEMP']+'/empty.ignore'],
+                  stdout=output,stderr=subprocess.STDOUT,timeout=60)
+          if scan.returncode!=0:
+              print('OFFLINE_NATIVE_LOG_WITHHELD',flush=True); raise SystemExit(1)
+          output=log.read_text(errors='replace')
+          needed={'room_list_service::tests::morpheus_custom_state_preserves_defaults_for_lists_and_subscriptions'}
+          ok=set(re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. ok$',output,re.MULTILINE))
+          summaries=re.findall(r'^test result: ok\. 1 passed; 0 failed; 0 ignored;',output,re.MULTILINE)
+          passed=reason is None and code==0 and needed==ok and len(summaries)==1
+          print(json.dumps({'check':'sdkui_custom_required_state','lock_update_required':('lock file' in output and 'needs to be updated' in output and '--locked' in output),'dependency_resolution_failed':('failed to select a version' in output),'error_codes':sorted(set(re.findall(r'error\[(E[0-9]{4})\]',output))),'status':'passed' if passed else 'failed',
+              'source':'60747bc4839a3876fd466ff167cfe9cc8986d21d','failure':reason,
+              'tests_passed':1 if passed else None,'raw_logs_public':False,
+              'accounts_generated':False,'app_executed':False},sort_keys=True),flush=True)
+          if not passed: raise SystemExit(1)
+          PY
+      - name: Compile the reviewed media fixture before generated accounts exist
+        timeout-minutes: 25
+        env:
+          CARGO_BUILD_JOBS: "2"
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: cargo test --locked -p morpheus-matrix --test media_local --no-run
+      - name: Verify encrypted sticker catalog send and receive with disposable accounts
+        timeout-minutes: 55
+        env:
+          CARGO_BUILD_JOBS: "2"
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+        run: >-
+          dbus-run-session -- python3 scripts/run_matrix_acceptance.py
+          --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks" --suite media-only
+      # Fresh hosted synthetic vault only; no owner data, signing material or artifacts.
