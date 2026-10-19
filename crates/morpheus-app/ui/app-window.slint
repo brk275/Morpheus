@@ -6270,6 +6270,17 @@ export component AppWindow inherits Window {
                                             font-size: 10px * root.text-scale; vertical-alignment: top; horizontal-stretch: 0; accessible-label: thread-reply.time-label;
                                         }
                                         Rectangle { horizontal-stretch: 1; min-width: 0px; }
+                                        // The main timeline hides thread replies, so an own reply is
+                                        // edited from here, in the main composer's edit mode.
+                                        if reply.event-id != "" && reply.is-own && reply.attachment == "" : IconAction {
+                                            width: 24px; height: 22px; icon: "✎"; label: "Edit your reply";
+                                            ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                            enabled: root.live-session && !root.composer-busy;
+                                            activated => {
+                                                if !root.composer-busy { root.begin-compose(2, reply.event-id, reply.sender, reply.edit-source, reply.edit-markdown); }
+                                                root.focus-composer(false);
+                                            }
+                                        }
                                     }
                                     StyledText {
                                         text: reply.rich-body;
