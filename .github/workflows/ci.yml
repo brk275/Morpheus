@@ -1,9 +1,16 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
 name: Reviewed beta four-platform native checks
-run-name: Reviewed native candidate - 7c2d9b4
+run-name: Reviewed native candidate - 7c2d9b4 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Select only affected native platforms
+        type: choice
+        required: true
+        default: all
+        options: [all, macos-arm64, macos-intel, windows, linux]
 permissions:
   contents: read
 concurrency:
@@ -12,27 +19,10 @@ concurrency:
 jobs:
   native:
     name: Native ${{ matrix.name }}
-    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
+    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false && contains(fromJSON('["all","macos-arm64","macos-intel","windows","linux"]'), inputs.platform)
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - name: macOS ARM64
-            runner: macos-15
-            os: macOS
-            arch: ARM64
-          - name: macOS Intel
-            runner: macos-15-intel
-            os: macOS
-            arch: X64
-          - name: Windows x64
-            runner: windows-2025
-            os: Windows
-            arch: X64
-          - name: Linux x64
-            runner: ubuntu-24.04
-            os: Linux
-            arch: X64
+      matrix: ${{ fromJSON(inputs.platform == 'macos-arm64' && '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"}]}' || inputs.platform == 'macos-intel' && '{"include":[{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"}]}' || inputs.platform == 'windows' && '{"include":[{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"}]}' || inputs.platform == 'linux' && '{"include":[{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}' || '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"},{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"},{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"},{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:
@@ -184,8 +174,8 @@ jobs:
               scanner.chmod(0o700)
           except Exception:
               print(json.dumps({'check':'verified_scanner_bootstrap','status':'failed'})); raise SystemExit(1)
-          config=private/'default.toml'; config.write_text('[extend]\nuseDefault = true\n')
-          ignore=private/'empty.ignore'; ignore.write_text('')
+          config=private/'default.toml'; config.write_bytes(b'[extend]\nuseDefault = true\n')
+          ignore=private/'empty.ignore'; ignore.write_bytes(b'')
           report=private/'source-scan.json'
           scan=bounded([str(scanner),'git','--redact=100','--ignore-gitleaks-allow','--no-banner',
               '--max-target-megabytes','0','--config',str(config),'--gitleaks-ignore-path',str(ignore),
