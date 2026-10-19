@@ -3884,7 +3884,11 @@ async fn assert_media_viewer_keyboard(ui: &AppWindow) {
         "Save synthetic.png to a location you choose"
     ));
     tab_to_control(ui, "Zoom in");
-    // Zoom out and Fit are unavailable at fit, so the cycle wraps to Close.
+    key(ui, Key::Tab);
+    assert!(focused_control_has_label(ui, "Rotate image clockwise"));
+    // Turning the view starts again from fit, so Zoom out and Fit stay
+    // unavailable and the cycle wraps to Close.
+    key(ui, Key::Space);
     key(ui, Key::Tab);
     assert!(focused_control_has_label(ui, "Close image preview"));
     ui.set_image_preview_open(false);

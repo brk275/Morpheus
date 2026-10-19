@@ -78,7 +78,8 @@ component ViewerAction inherits Rectangle {
 // The modal viewer. Escape closes; Tab moves through every available action
 // in layout order; Left/Right open the previous/next loaded image, or pan
 // while zoomed; Up/Down pan; +, - and 0 zoom in, out and back to fit; K plays
-// or pauses an animation and R replays it.
+// or pauses an animation and R replays it; ] and [ turn the view clockwise
+// and counterclockwise.
 export component MediaViewer inherits Rectangle {
     // Changes when another item opens; zoom and pan reset then.
     in property <string> item-key;
@@ -112,17 +113,27 @@ export component MediaViewer inherits Rectangle {
     property <length> pan-x: 0px;
     property <length> pan-y: 0px;
     property <length> pan-step: 48px;
+    // Clockwise quarter turns of the view only; Save keeps the original file.
+    property <int> turns: 0;
+    property <bool> sideways: mod(root.turns, 2) == 1;
     property <length> natural-width: root.image.width * 1px;
     property <length> natural-height: root.image.height * 1px;
+    // The picture's on-screen extent before scaling, after the turns.
+    property <length> turned-width: root.sideways ? root.natural-height : root.natural-width;
+    property <length> turned-height: root.sideways ? root.natural-width : root.natural-height;
     // Fit never enlarges a small picture past its own pixels.
     property <float> fit-scale: root.natural-width <= 0px || root.natural-height <= 0px ? 1
-        : min(1, stage.width / root.natural-width, stage.height / root.natural-height);
+        : min(1, stage.width / root.turned-width, stage.height / root.turned-height);
+    // The unturned element size; the turn happens around its centre.
     property <length> shown-width: root.natural-width * root.fit-scale * root.zoom;
     property <length> shown-height: root.natural-height * root.fit-scale * root.zoom;
-    property <length> pan-limit-x: max(0px, (root.shown-width - stage.width) / 2);
-    property <length> pan-limit-y: max(0px, (root.shown-height - stage.height) / 2);
+    property <length> pan-limit-x: max(0px, (root.turned-width * root.fit-scale * root.zoom - stage.width) / 2);
+    property <length> pan-limit-y: max(0px, (root.turned-height * root.fit-scale * root.zoom - stage.height) / 2);
 
-    changed item-key => { root.reset-view(); }
+    changed item-key => {
+        root.turns = 0;
+        root.reset-view();
+    }
     // An action that becomes unavailable while focused hands focus on, so the
     // keyboard never lands outside the dialog.
     changed has-previous => { root.keep-focus(); }
@@ -161,6 +172,14 @@ export component MediaViewer inherits Rectangle {
         }
     }
 
+    // A new turn starts again from fit, so the turned picture is whole.
+    function rotate(clockwise: bool) {
+        if root.loaded {
+            root.turns = mod(root.turns + (clockwise ? 1 : 3), 4);
+            root.reset-view();
+        }
+    }
+
     function pan-to(x: length, y: length) {
         root.pan-x = clamp(x, -root.pan-limit-x, root.pan-limit-x);
         root.pan-y = clamp(y, -root.pan-limit-y, root.pan-limit-y);
@@ -168,7 +187,7 @@ export component MediaViewer inherits Rectangle {
 
     // Tab order follows the layout: Close (0), Save (1), Previous (2),
     // Next (3), Play/Pause (4), Replay (5), loading action (6), Zoom out (7),
-    // Fit (8), Zoom in (9). Disabled actions are skipped.
+    // Fit (8), Zoom in (9), Rotate (10). Disabled actions are skipped.
     pure function action-enabled(index: int) -> bool {
         index == 1 ? root.can-save
             : index == 2 ? root.has-previous
@@ -178,6 +197,7 @@ export component MediaViewer inherits Rectangle {
             : index == 7 ? root.loaded && root.zoom > 1
             : index == 8 ? root.loaded && root.zoom != 1
             : index == 9 ? root.loaded && root.zoom < 8
+            : index == 10 ? root.loaded
             : true
     }
 
@@ -200,6 +220,8 @@ export component MediaViewer inherits Rectangle {
             fit-action.focus();
         } else if index == 9 {
             zoom-in-action.focus();
+        } else if index == 10 {
+            rotate-action.focus();
         } else {
             close-action.focus();
         }
@@ -215,12 +237,13 @@ export component MediaViewer inherits Rectangle {
             : zoom-out-action.has-focus ? 7
             : fit-action.has-focus ? 8
             : zoom-in-action.has-focus ? 9
+            : rotate-action.has-focus ? 10
             : 0
     }
 
     // The index `offset` places after (or before) `current`, cyclically.
     pure function step(current: int, offset: int, forward: bool) -> int {
-        mod(current + (forward ? offset : 10 - offset), 10)
+        mod(current + (forward ? offset : 11 - offset), 11)
     }
 
     // The nearest enabled action after (or before) `current`; Close (0) is
@@ -235,6 +258,7 @@ export component MediaViewer inherits Rectangle {
             : root.action-enabled(root.step(current, 7, forward)) ? root.step(current, 7, forward)
             : root.action-enabled(root.step(current, 8, forward)) ? root.step(current, 8, forward)
             : root.action-enabled(root.step(current, 9, forward)) ? root.step(current, 9, forward)
+            : root.action-enabled(root.step(current, 10, forward)) ? root.step(current, 10, forward)
             : 0
     }
 
@@ -289,6 +313,12 @@ export component MediaViewer inherits Rectangle {
             } else if (event.text == "r" || event.text == "R") && root.animated {
                 root.replay();
                 accept
+            } else if event.text == "]" {
+                root.rotate(true);
+                accept
+            } else if event.text == "[" {
+                root.rotate(false);
+                accept
             } else {
                 reject
             }
@@ -308,7 +338,7 @@ export component MediaViewer inherits Rectangle {
             background: root.palette.surface;
             accessible-role: region;
             accessible-label: "Image preview " + root.title;
-            accessible-description: "Left and Right show the previous or next image. Plus, minus and 0 zoom in, zoom out and fit; arrow keys pan a zoomed image."
+            accessible-description: "Left and Right show the previous or next image. Plus, minus and 0 zoom in, zoom out and fit; arrow keys pan a zoomed image. The right and left square brackets rotate the view clockwise and counterclockwise."
                 + (root.animated ? " K plays or pauses the animation and R replays it." : "")
                 + " Escape closes the preview.";
             VerticalLayout {
@@ -359,12 +389,14 @@ export component MediaViewer inherits Rectangle {
                         y: (parent.height - self.height) / 2 + root.pan-y;
                         width: root.shown-width;
                         height: root.shown-height;
+                        transform-rotation: root.turns * 90deg;
                         source: root.image;
                         image-fit: fill;
                         accessible-role: image;
                         accessible-label: "Attachment " + root.title
                             + (root.position != "" ? ", image " + root.position : "")
-                            + ", " + round(root.zoom * root.fit-scale * 100) + "% zoom";
+                            + ", " + round(root.zoom * root.fit-scale * 100) + "% zoom"
+                            + (root.turns == 0 ? "" : ", turned " + (root.turns * 90) + " degrees clockwise");
                     }
                     if !root.loaded : Text {
                         text: root.loading ? "Loading…" : "▧";
@@ -497,6 +529,14 @@ export component MediaViewer inherits Rectangle {
                         palette: root.palette;
                         text-scale: root.text-scale;
                         activated => { root.zoom-by(1.25); }
+                    }
+                    rotate-action := ViewerAction {
+                        text: "Rotate";
+                        label: "Rotate image clockwise";
+                        enabled: root.loaded;
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        activated => { root.rotate(true); }
                     }
                 }
             }
