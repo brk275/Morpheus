@@ -29,6 +29,7 @@ mod navigation;
 mod notifications;
 #[cfg(feature = "native-calls")]
 mod outgoing_ring;
+mod polls;
 #[cfg(debug_assertions)]
 mod preview_capture;
 mod room_settings;
@@ -175,6 +176,7 @@ fn message(
         attachment: attachment.into(),
         attachment_is_image: false,
         reaction: reaction.into(),
+        poll: PollCardData::default(),
         accent,
     }
 }
@@ -3324,6 +3326,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         composer_mentions::ui::ComposerUi::install(&ui, live.clone(), runtime.handle().clone());
     // Callbacks own the controller; picker state ends with its selection.
     let _stickers = stickers::register(&ui, live.clone(), runtime.handle().clone());
+    polls::register(&ui, live.clone(), runtime.handle().clone());
 
     let weak = ui.as_weak();
     let attach_live = live.clone();

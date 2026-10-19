@@ -1,0 +1,315 @@
+// Native Matrix poll card and the shared poll interaction state. Rust owns
+// every transition: the card shows the projected SDK state and reports the
+// person's explicit choices. Choosing an option only edits a local draft;
+// a vote or an end is sent only from its button. This file cannot import the
+// window's globals, so the window passes resolved colors.
+
+import { Button } from "std-widgets.slint";
+
+export struct PollPalette {
+    ink: color,
+    muted: color,
+    panel: color,
+    elevated: color,
+    hover: color,
+    accent: color,
+    divider: color,
+    focus: color,
+    error: color,
+    success: color,
+}
+
+export struct PollOptionItem {
+    // Opaque answer ID; only handed back to Rust.
+    id: string,
+    text: string,
+    // "3 votes" while results are visible, otherwise empty.
+    votes: string,
+    // Share of the counted votes (0 to 1); zero while results are withheld.
+    share: float,
+    // This account's counted vote includes this option.
+    voted: bool,
+    leading: bool,
+}
+
+export struct PollCardData {
+    present: bool,
+    question: string,
+    options: [PollOptionItem],
+    multiple: bool,
+    hint: string,
+    status: string,
+    ended: bool,
+    has-vote: bool,
+    can-vote: bool,
+    can-end: bool,
+}
+
+// One poll interaction at a time, keyed by the poll's event ID, plus the
+// create dialog's draft. Rust resets all of it on every account, room or
+// thread change.
+export global PollUiState {
+    in-out property <string> draft-event-id;
+    in-out property <int> draft-revision;
+    in-out property <bool> draft-ready;
+    in-out property <string> busy-event-id;
+    in-out property <string> notice-event-id;
+    in-out property <string> notice;
+    in-out property <bool> notice-error;
+    in-out property <string> confirm-end-event-id;
+    in-out property <string> dialog-room;
+    in-out property <string> dialog-question;
+    in-out property <[string]> dialog-answers;
+    in-out property <int> dialog-max: 1;
+    in-out property <bool> dialog-disclosed: true;
+    in-out property <bool> dialog-busy;
+    in-out property <string> dialog-error;
+    in-out property <bool> dialog-ready;
+    // Reads the draft; `revision` makes bindings follow draft changes.
+    pure callback option-chosen(event-id: string, option-id: string, revision: int) -> bool;
+    callback choose-option(event-id: string, option-id: string, thread-root: string);
+    callback vote(event-id: string, thread-root: string);
+    callback request-end(event-id: string);
+    callback confirm-end(event-id: string, thread-root: string);
+    callback cancel-end();
+    callback question-edited(text: string);
+    callback answer-edited(index: int, text: string);
+    callback add-answer();
+    callback remove-answer(index: int);
+    callback change-max(delta: int);
+    callback set-disclosed(disclosed: bool);
+    callback submit-poll();
+    callback cancel-poll();
+}
+
+// A keyboard and pointer choice row. Multiple-choice polls use this
+// checkbox; single-choice polls use PollRadio below.
+component PollChoice inherits Rectangle {
+    in property <string> text;
+    in property <string> votes;
+    in property <float> share;
+    in property <bool> checked;
+    in property <bool> leading;
+    in property <bool> enabled: true;
+    in property <bool> round;
+    in property <PollPalette> palette;
+    in property <float> text-scale: 1;
+    callback activated();
+
+    // An explicit height keeps the parent-sized result bar out of layout.
+    height: max(32px * root.text-scale, row.preferred-height);
+    border-radius: 6px;
+    background: touch.has-hover && root.enabled ? root.palette.hover : root.palette.elevated;
+    border-width: root.checked ? 2px : 1px;
+    border-color: root.checked ? root.palette.accent : root.palette.divider;
+    forward-focus: scope;
+    accessible-role: checkbox;
+    accessible-label: root.votes == "" ? root.text : root.text + ", " + root.votes;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        if root.enabled {
+            root.activated();
+        }
+    }
+
+    // The result bar sits behind the option text once results are visible.
+    if root.votes != "" : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width * clamp(root.share, 0, 1);
+        height: parent.height;
+        border-radius: parent.border-radius;
+        background: root.palette.accent.with-alpha(root.leading ? 0.3 : 0.15);
+    }
+    row := HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        padding-top: 6px;
+        padding-bottom: 6px;
+        spacing: 8px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 14px;
+                height: 14px;
+                border-radius: root.round ? 7px : 3px;
+                border-width: 2px;
+                border-color: root.checked ? root.palette.accent : root.palette.muted;
+                background: root.checked ? root.palette.accent : transparent;
+            }
+        }
+        Text {
+            text: root.text;
+            color: root.palette.ink;
+            font-size: 12px * root.text-scale;
+            wrap: word-wrap;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            accessible-role: none;
+        }
+        if root.votes != "" : Text {
+            text: root.votes;
+            color: root.leading ? root.palette.ink : root.palette.muted;
+            font-size: 11px * root.text-scale;
+            font-weight: root.leading ? 700 : 400;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+    }
+    scope := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == Key.Space || event.text == Key.Return {
+                if root.enabled {
+                    root.activated();
+                }
+                accept
+            } else {
+                reject
+            }
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => {
+            scope.focus();
+            root.activated();
+        }
+    }
+    if scope.has-focus : Rectangle {
+        border-radius: parent.border-radius;
+        border-width: 2px;
+        border-color: root.palette.focus;
+        background: transparent;
+    }
+}
+
+component PollRadio inherits PollChoice {
+    accessible-role: radio-button;
+    round: true;
+}
+
+export component PollCard inherits Rectangle {
+    in property <PollCardData> data;
+    // Empty for a poll still being sent; it cannot be voted on yet.
+    in property <string> event-id;
+    // The thread this card is shown in, or empty for the room timeline.
+    in property <string> thread-root;
+    in property <bool> enabled: true;
+    in property <PollPalette> palette;
+    in property <float> text-scale: 1;
+    in property <length> corner: 10px;
+
+    property <bool> drafting: root.event-id != "" && PollUiState.draft-event-id == root.event-id;
+    property <bool> busy: PollUiState.busy-event-id != "";
+    property <bool> confirming: root.event-id != "" && PollUiState.confirm-end-event-id == root.event-id;
+    property <bool> noticed: root.event-id != "" && PollUiState.notice-event-id == root.event-id;
+    property <bool> choosable: root.enabled && root.data.can-vote && !root.busy;
+
+    height: content.preferred-height;
+    border-radius: root.corner;
+    border-width: 1px;
+    border-color: root.palette.divider;
+    background: root.palette.panel;
+    accessible-role: groupbox;
+    accessible-label: "Poll options: " + root.data.question;
+
+    content := VerticalLayout {
+        padding: 10px;
+        spacing: 6px;
+        Text {
+            text: root.data.hint;
+            color: root.palette.muted;
+            font-size: 10px * root.text-scale;
+            wrap: word-wrap;
+        }
+        if root.data.multiple : VerticalLayout {
+            spacing: 4px;
+            for option in root.data.options : PollChoice {
+                text: option.text;
+                votes: option.votes;
+                share: option.share;
+                leading: option.leading;
+                checked: root.drafting ? PollUiState.option-chosen(root.event-id, option.id, PollUiState.draft-revision) : option.voted;
+                enabled: root.choosable;
+                palette: root.palette;
+                text-scale: root.text-scale;
+                activated => { PollUiState.choose-option(root.event-id, option.id, root.thread-root); }
+            }
+        }
+        if !root.data.multiple : VerticalLayout {
+            spacing: 4px;
+            for option in root.data.options : PollRadio {
+                text: option.text;
+                votes: option.votes;
+                share: option.share;
+                leading: option.leading;
+                checked: root.drafting ? PollUiState.option-chosen(root.event-id, option.id, PollUiState.draft-revision) : option.voted;
+                enabled: root.choosable;
+                palette: root.palette;
+                text-scale: root.text-scale;
+                activated => { PollUiState.choose-option(root.event-id, option.id, root.thread-root); }
+            }
+        }
+        Text {
+            text: root.data.status;
+            color: root.palette.muted;
+            font-size: 10px * root.text-scale;
+            wrap: word-wrap;
+        }
+        if root.noticed && PollUiState.notice != "" : Text {
+            text: PollUiState.notice;
+            color: PollUiState.notice-error ? root.palette.error : root.palette.success;
+            font-size: 11px * root.text-scale;
+            wrap: word-wrap;
+            accessible-live-region: polite;
+        }
+        if !root.confirming && (root.data.can-vote || root.data.can-end) : HorizontalLayout {
+            spacing: 8px;
+            alignment: end;
+            if root.data.can-end : Button {
+                text: "End poll";
+                enabled: root.enabled && !root.busy;
+                accessible-label: "End the poll " + root.data.question;
+                clicked => { PollUiState.request-end(root.event-id); }
+            }
+            if root.data.can-vote : Button {
+                text: root.data.has-vote ? "Change vote" : "Vote";
+                primary: true;
+                enabled: root.enabled && root.drafting && PollUiState.draft-ready && !root.busy;
+                accessible-label: (root.data.has-vote ? "Change your vote in the poll " : "Vote in the poll ") + root.data.question;
+                clicked => { PollUiState.vote(root.event-id, root.thread-root); }
+            }
+        }
+        if root.confirming && root.data.can-end : VerticalLayout {
+            spacing: 6px;
+            Text {
+                text: "End this poll? Voting closes for everyone and the results become final.";
+                color: root.palette.ink;
+                font-size: 11px * root.text-scale;
+                wrap: word-wrap;
+                accessible-live-region: polite;
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                alignment: end;
+                Button {
+                    text: "Keep open";
+                    enabled: !root.busy;
+                    accessible-label: "Keep the poll " + root.data.question + " open";
+                    clicked => { PollUiState.cancel-end(); }
+                }
+                Button {
+                    text: "End poll";
+                    primary: true;
+                    enabled: root.enabled && !root.busy;
+                    accessible-label: "Confirm ending the poll " + root.data.question;
+                    clicked => { PollUiState.confirm-end(root.event-id, root.thread-root); }
+                }
+            }
+        }
+    }
+}

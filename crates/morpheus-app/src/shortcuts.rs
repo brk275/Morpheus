@@ -145,6 +145,7 @@ fn blocked(ui: &AppWindow) -> bool {
         || !ui.get_security_recovery_key().is_empty()
         || ui.get_quick_switcher_open()
         || ui.get_image_preview_open()
+        || ui.get_poll_dialog_open()
 }
 
 fn visible_rooms(ui: &AppWindow) -> Vec<RoomItem> {

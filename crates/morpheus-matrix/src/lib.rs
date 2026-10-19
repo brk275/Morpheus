@@ -19,6 +19,11 @@ pub use image_packs::{
     MAX_STICKER_PREVIEW_BYTES, PendingSticker, PublicMediaConsent, StickerCatalog, StickerEntry,
     StickerPack, StickerPackSource, StickerPreview,
 };
+mod polls;
+pub use polls::{
+    MAX_POLL_ANSWER_CHARS, MAX_POLL_ANSWER_COUNT, MAX_POLL_QUESTION_CHARS, MIN_POLL_ANSWER_COUNT,
+    PollAnswerInfo, PollDraft, PollDraftError, PollError, PollInfo, ValidPoll,
+};
 mod discovery;
 pub use discovery::{
     MatrixLinkTarget, PublicRoomInfo, PublicRoomsPage, PublicRoomsQuery, ResolvedRoomAlias,
@@ -317,6 +322,10 @@ pub struct MessageInfo {
     /// Display hint only; preview download revalidates the actual event kind.
     #[serde(default)]
     pub attachment_is_image: bool,
+    /// Bounded poll state from the SDK's aggregation; `body` then holds a
+    /// plain "Poll: question" line for search, replies and fallbacks.
+    #[serde(default)]
+    pub poll: Option<PollInfo>,
     pub reply_preview: Option<String>,
     pub reaction_summary: String,
     pub timestamp_ms: u64,
@@ -3225,16 +3234,18 @@ async fn message_feed_from_timeline(
     timeline: Arc<Timeline>,
 ) -> MessageFeed {
     let (items, mut stream) = timeline.subscribe().await;
+    // A poll row shows this account's own counted vote.
+    let own = timeline.room().own_user_id().to_owned();
     let mut mapped: Vector<Option<Arc<MessageInfo>>> = items
         .iter()
-        .map(|item| message_info(item).map(Arc::new))
+        .map(|item| message_info_for(item, Some(&*own)).map(Arc::new))
         .collect();
     let initial: MessageSnapshot = Arc::new(mapped.iter().filter_map(Clone::clone).collect());
     let (updates, receiver) = watch::channel(initial);
     let task = tokio::spawn(async move {
         while let Some(diffs) = stream.next().await {
             for diff in diffs {
-                diff.map(|item| message_info(&item).map(Arc::new))
+                diff.map(|item| message_info_for(&item, Some(&*own)).map(Arc::new))
                     .apply(&mut mapped);
             }
             // Unchanged rows retain their allocations. Publication copies only
@@ -3909,16 +3920,27 @@ async fn room_info(room: &Room) -> RoomInfo {
 }
 
 fn message_info(item: &TimelineItem) -> Option<MessageInfo> {
+    message_info_for(item, None)
+}
+
+fn message_info_for(item: &TimelineItem, own_user_id: Option<&UserId>) -> Option<MessageInfo> {
     let event = item.as_event()?;
     let content = event.content();
     let message = content.as_message();
+    let poll = content
+        .as_poll()
+        .map(|poll| polls::poll_info(poll, own_user_id));
+    let poll_body = poll.as_ref().map(|poll| format!("Poll: {}", poll.question));
     // Stickers are their own Matrix event type. The SDK deliberately does not
     // expose them through as_message(), but they still belong in the timeline.
-    let body = message.map(|message| message.body()).or_else(|| {
-        content
-            .as_sticker()
-            .map(|sticker| sticker.content().body.as_str())
-    })?;
+    let body = message
+        .map(|message| message.body())
+        .or_else(|| {
+            content
+                .as_sticker()
+                .map(|sticker| sticker.content().body.as_str())
+        })
+        .or(poll_body.as_deref())?;
     let reply_preview =
         event
             .content()
@@ -3933,6 +3955,10 @@ fn message_info(item: &TimelineItem) -> Option<MessageInfo> {
                         .split(':')
                         .next()
                         .unwrap_or("someone");
+                    let poll_line = replied_to
+                        .content
+                        .as_poll()
+                        .map(|poll| format!("Poll: {}", poll.results().question));
                     let body = replied_to
                         .content
                         .as_message()
@@ -3943,6 +3969,7 @@ fn message_info(item: &TimelineItem) -> Option<MessageInfo> {
                                 .as_sticker()
                                 .map(|sticker| sticker.content().body.as_str())
                         })
+                        .or(poll_line.as_deref())
                         .map(|body| body.lines().next().unwrap_or("message"))
                         .unwrap_or("message");
                     format!("{sender}: {}", body.chars().take(72).collect::<String>())
@@ -3979,6 +4006,7 @@ fn message_info(item: &TimelineItem) -> Option<MessageInfo> {
         attachment_is_image: message
             .is_some_and(|message| matches!(message.msgtype(), MessageType::Image(_)))
             || content.is_sticker(),
+        poll,
         reply_preview,
         reaction_summary: event
             .reactions()

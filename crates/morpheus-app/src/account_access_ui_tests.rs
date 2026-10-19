@@ -2693,6 +2693,12 @@ async fn exercise_account_ui(runtime: Handle) {
     // render that private surface as well before testing the real detach.
     ui.set_security_recovery_input("synthetic recovery input".into());
     ui.set_security_recovery_key("synthetic recovery output".into());
+    // A poll draft, notice and dialog draft are private presentation too.
+    let polls = slint::ComponentHandle::global::<crate::PollUiState>(&ui);
+    polls.set_draft_event_id("$private-poll".into());
+    polls.set_notice_event_id("$private-poll".into());
+    polls.set_notice("private poll notice".into());
+    polls.set_dialog_question("private poll question".into());
     settle(&ui).await;
     assert_eq!(control_bounds(&ui, "One-time Matrix recovery key").len(), 1);
     live.account_detached(ui.as_weak()).await;
@@ -2744,6 +2750,10 @@ async fn exercise_account_ui(runtime: Handle) {
     assert!(ui.get_attachment_status().is_empty());
     assert!(ui.get_security_recovery_input().is_empty());
     assert!(ui.get_security_recovery_key().is_empty());
+    assert!(polls.get_draft_event_id().is_empty());
+    assert!(polls.get_notice().is_empty() && polls.get_notice_event_id().is_empty());
+    assert!(polls.get_dialog_question().is_empty());
+    assert!(!ui.get_poll_dialog_open());
     // The call stage clears synchronously with the account, not after an
     // asynchronous video update: no tile, pinned row, picture or roster row.
     assert_eq!(ui.get_native_call_tiles().row_count(), 0);

@@ -1,5 +1,9 @@
 import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView, Slider, SpinBox } from "std-widgets.slint";
 import { CallParticipantItem, CallStage, CallTileItem } from "call-stage.slint";
+import { PollCard, PollCardData, PollPalette } from "poll-card.slint";
+import { PollCreateDialog } from "poll-dialog.slint";
+// Rust drives poll drafts, pending actions and the create dialog through this global.
+export { PollOptionItem, PollUiState } from "poll-card.slint";
 
 // Optional overrides retain each control's existing color when absent.
 export struct ColorRole {
@@ -224,6 +228,8 @@ export struct MessageItem {
     attachment: string,
     attachment-is-image: bool,
     reaction: string,
+    // Native poll card state; `present` is false for every other message.
+    poll: PollCardData,
     accent: color,
 }
 
@@ -2389,6 +2395,10 @@ export component AppWindow inherits Window {
     callback sticker-send-cancel();
     callback sticker-send-retry();
     callback sticker-send-dismiss();
+    // Native polls; see src/polls.rs. Votes and ends go through PollUiState.
+    in-out property <bool> poll-dialog-open: false;
+    callback open-create-poll();
+    callback poll-context-changed();
     callback focus-composer(bool);
     focus-composer(threaded) => {
         root.composer-focus-thread = threaded;
@@ -2527,6 +2537,10 @@ export component AppWindow inherits Window {
     // or hides them before a stale choice can act.
     property <string> sticker-scope: root.active-account-local-id + "\n" + root.active-room-id + "\n" + root.thread-root-id + "\n" + root.composer-mode + "\n" + root.side-panel-tab;
     changed sticker-scope => { root.sticker-context-changed(); }
+    // Poll drafts, pending votes and the create dialog belong to one account,
+    // room and thread view; any change drops them before a stale action can run.
+    property <string> poll-scope: (root.live-session ? "live" : "") + "\n" + root.active-account-local-id + "\n" + root.active-room-id + "\n" + root.thread-root-id;
+    changed poll-scope => { root.poll-context-changed(); }
     property <bool> composer-focus-thread: false;
     property <int> composer-focus-request: 0;
 
@@ -2729,6 +2743,18 @@ export component AppWindow inherits Window {
     // their colors, whatever alpha a token or the window setting has.
     property <color> dialog-surface: root.canvas.with-alpha(1);
     property <color> sign-in-surface: root.rail.with-alpha(1);
+    property <PollPalette> poll-palette: {
+        ink: root.ink,
+        muted: root.muted,
+        panel: root.panel,
+        elevated: root.elevated,
+        hover: root.hover,
+        accent: root.accent,
+        divider: root.divider,
+        focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent,
+        error: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483,
+        success: StyleTokens.roles.success.present ? StyleTokens.roles.success.color : #78c8b1
+    };
     default-font-family: root.ui-font-family;
     background: root.window-translucent ? transparent : canvas;
 
@@ -3634,6 +3660,16 @@ export component AppWindow inherits Window {
                                         accessible-label: message.rich-accessible-body;
                                         link-clicked(url) => { root.open-message-link(url); }
                                     }
+                                    if message.poll.present : PollCard {
+                                        width: min(440px, max(0px, message-content.width - (message-row.columns ? message-row.action-width + 8px : 0px)));
+                                        data: message.poll;
+                                        event-id: message.event-id;
+                                        thread-root: "";
+                                        enabled: root.live-session;
+                                        palette: root.poll-palette;
+                                        text-scale: root.text-scale;
+                                        corner: StyleTokens.radius * 0.9;
+                                    }
                                     if message.attachment-is-image && message.event-id != "" : ActionRect {
                                         height: 67px; border-radius: StyleTokens.radius * 1;
                                         background: self.has-hover ? root.hover : root.elevated;
@@ -3704,7 +3740,7 @@ export component AppWindow inherits Window {
                                         message-input.focus();
                                     }
                                 }
-                                if message.event-id != "" && message.is-own && message.attachment == "" : IconAction {
+                                if message.event-id != "" && message.is-own && message.attachment == "" && !message.poll.present : IconAction {
                                     quiet: true; context-hover: message-hover.has-hover;
                                     width: 28px; height: 26px; icon: "✎"; label: "Edit your message";
                                     ink: root.muted; surface: transparent; hover-surface: root.hover;
@@ -3854,6 +3890,18 @@ export component AppWindow inherits Window {
                                     activated => {
                                         if root.emoji-open { root.emoji-dismiss(); }
                                         root.open-stickers(false);
+                                    }
+                                }
+                                IconAction {
+                                    width: 32px; icon: "▤"; label: "Create a poll in this room";
+                                    ink: root.poll-dialog-open ? root.accent : root.muted;
+                                    selected: root.poll-dialog-open;
+                                    surface: transparent; hover-surface: root.hover;
+                                    enabled: root.mention-ui-allowed && !root.composer-busy && root.composer-mode == 0 && root.active-room-id != "" && !root.poll-dialog-open;
+                                    activated => {
+                                        if root.emoji-open { root.emoji-dismiss(); }
+                                        if root.sticker-open { root.sticker-dismiss(); }
+                                        root.open-create-poll();
                                     }
                                 }
                                 IconAction {
@@ -6096,6 +6144,15 @@ export component AppWindow inherits Window {
                                         accessible-label: reply.rich-accessible-body;
                                         link-clicked(url) => { root.open-message-link(url); }
                                     }
+                                    if reply.poll.present : PollCard {
+                                        data: reply.poll;
+                                        event-id: reply.event-id;
+                                        thread-root: root.thread-root-id;
+                                        enabled: root.live-session;
+                                        palette: root.poll-palette;
+                                        text-scale: root.text-scale;
+                                        corner: StyleTokens.radius * 0.8;
+                                    }
                                     if reply.attachment-is-image && reply.event-id != "" : Button {
                                         text: "Preview image"; accessible-label: "Preview image " + reply.attachment;
                                         enabled: root.live-session;
@@ -7222,6 +7279,18 @@ export component AppWindow inherits Window {
             }
         }
         }
+    }
+
+    if root.poll-dialog-open && root.live-session : PollCreateDialog {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        palette: root.poll-palette;
+        text-scale: root.text-scale;
+        corner: StyleTokens.radius;
+        surface: root.dialog-surface;
+        scrim: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
     }
 
     if root.show-sign-in : FocusScope {
