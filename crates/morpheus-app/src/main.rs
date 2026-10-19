@@ -781,6 +781,9 @@ fn finish_composer_submission(
 
 fn reset_attachment_view(ui: &AppWindow) {
     ui.invoke_close_image_preview();
+    // An unfinished save of this room's attachment stops downloading; its
+    // late result cannot appear in the next room.
+    ui.invoke_cancel_attachment_save();
     // Uploads continue in their room after navigation and staged files stay
     // with it. The workbench shows the next room's queue once the active
     // account or room changes; nothing of this one remains meanwhile.
@@ -3398,86 +3401,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Its callbacks hold the attachment workbench for the window's lifetime.
     let _attachments =
         attachment_workbench::Workbench::register(&ui, live.clone(), runtime.handle().clone());
-
-    let weak = ui.as_weak();
-    let save_live = live.clone();
-    let save_handle = runtime.handle().clone();
-    ui.on_save_attachment(move |event_id, filename| {
-        let Some(ui) = weak.upgrade() else { return };
-        if !save_live.is_live.load(Ordering::Acquire)
-            || event_id.is_empty()
-            || !ui.get_downloading_event_id().is_empty()
-        {
-            return;
-        }
-        let account_id = ui.get_active_account_local_id().to_string();
-        let room_id = ui.get_active_room_id().to_string();
-        let event_id = event_id.to_string();
-        // The sender chose this name: suggest only a sanitized final
-        // component, and let the user pick the folder explicitly.
-        let mut dialog = rfd::FileDialog::new()
-            .set_title("Save attachment")
-            .set_file_name(attachments::safe_file_name(&filename));
-        if let Some(downloads) = directories::UserDirs::new()
-            .and_then(|dirs| dirs.download_dir().map(|dir| dir.to_path_buf()))
-        {
-            dialog = dialog.set_directory(downloads);
-        }
-        let Some(path) = dialog.save_file() else {
-            return;
-        };
-        if ui.get_active_account_local_id().as_str() != account_id
-            || ui.get_active_room_id().as_str() != room_id
-            || path.file_name().is_none()
-        {
-            return;
-        }
-        let operation = ui.get_download_operation().wrapping_add(1);
-        ui.set_download_operation(operation);
-        ui.set_downloading_event_id(event_id.clone().into());
-        ui.set_transfer_notice("Downloading and decrypting attachment…".into());
-        let live = save_live.clone();
-        let weak = weak.clone();
-        save_handle.spawn(async move {
-            let result = async {
-                let downloaded = live
-                    .download_attachment(&account_id, &room_id, &event_id)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                // The final account and room guard is held through the local
-                // write, so navigation cannot race the plaintext save.
-                live.save_download_to(&account_id, &room_id, path, downloaded.bytes)
-                    .await
-                    .map_err(|error| error.to_string())
-            }
-            .await;
-            let _ = weak.upgrade_in_event_loop(move |ui| {
-                if ui.get_active_account_local_id().as_str() != account_id
-                    || ui.get_active_room_id().as_str() != room_id
-                    || ui.get_download_operation() != operation
-                    || ui.get_downloading_event_id().as_str() != event_id
-                {
-                    return;
-                }
-                ui.set_downloading_event_id("".into());
-                match result {
-                    Ok(path) => {
-                        let name = path.file_name().unwrap_or_default().to_string_lossy();
-                        let folder = path
-                            .parent()
-                            .map(|folder| folder.display().to_string())
-                            .unwrap_or_default();
-                        let notice = format!("Saved {name} to {folder}");
-                        ui.set_transfer_notice(directory_plain_text(&notice, 300).into());
-                    }
-                    Err(error) => {
-                        ui.set_transfer_notice("".into());
-                        ui.set_session_error(format!("Could not save attachment: {error}").into());
-                    }
-                }
-            });
-        });
-    });
 
     let weak = ui.as_weak();
     let send_state = state.clone();

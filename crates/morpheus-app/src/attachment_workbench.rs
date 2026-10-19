@@ -9,6 +9,11 @@
 //! queued can be retried once by the user. A paused upload is retried in place
 //! with the SDK's unwedge, never re-enqueued. An upload whose outcome is
 //! unknown can only be dismissed.
+//!
+//! Saving a received attachment asks for the location every time and can be
+//! cancelled while it downloads. The bounded local write, guarded by the core
+//! against navigation, is never interrupted halfway, so the reported outcome
+//! is always what happened on disk.
 
 use std::{
     path::PathBuf,
@@ -23,9 +28,16 @@ use morpheus_matrix::{
     AttachmentSendUpdate, MAX_ATTACHMENT_BYTES, MatrixCoreError, QueuedAttachment,
 };
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
-use tokio::{runtime::Handle, sync::mpsc};
+use tokio::{
+    runtime::Handle,
+    sync::{mpsc, watch},
+};
 
-use crate::{AppWindow, AttachmentItem, attachments::mime_type_for, live::LiveUi};
+use crate::{
+    AppWindow, AttachmentItem,
+    attachments::{mime_type_for, safe_file_name},
+    live::LiveUi,
+};
 
 /// Attachments that can wait in one room at once.
 const MAX_ROOM_ITEMS: usize = 10;
@@ -138,6 +150,19 @@ struct State {
     items: Vec<Item>,
 }
 
+/// The save in progress. Replacing or dropping it cancels its download.
+struct SaveJob {
+    operation: i32,
+    cancel: watch::Sender<bool>,
+}
+
+enum SaveOutcome {
+    Saved(PathBuf),
+    /// Stopped before anything was written.
+    Cancelled,
+    Failed(String),
+}
+
 pub struct Workbench {
     live: Arc<LiveUi>,
     runtime: Handle,
@@ -145,6 +170,7 @@ pub struct Workbench {
     state: Mutex<State>,
     /// A projection is already waiting on the event loop.
     queued: AtomicBool,
+    save: Mutex<Option<SaveJob>>,
 }
 
 impl Workbench {
@@ -157,6 +183,7 @@ impl Workbench {
             window: ui.as_weak(),
             state: Mutex::new(State::default()),
             queued: AtomicBool::new(false),
+            save: Mutex::new(None),
         });
         {
             let owner = owner.clone();
@@ -186,6 +213,14 @@ impl Workbench {
         }
         {
             let owner = owner.clone();
+            ui.on_save_attachment(move |event_id, filename| owner.save(&event_id, &filename));
+        }
+        {
+            let owner = owner.clone();
+            ui.on_cancel_attachment_save(move || owner.cancel_save());
+        }
+        {
+            let owner = owner.clone();
             ui.on_attachment_context_changed(move || {
                 if let Some(ui) = owner.window.upgrade() {
                     owner.project(&ui);
@@ -198,6 +233,141 @@ impl Workbench {
 
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn lock_save(&self) -> MutexGuard<'_, Option<SaveJob>> {
+        self.save.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn save(self: &Arc<Self>, event_id: &str, filename: &str) {
+        let Some(ui) = self.window.upgrade() else {
+            return;
+        };
+        if !self.live.is_live.load(Ordering::Acquire)
+            || event_id.is_empty()
+            || !ui.get_downloading_event_id().is_empty()
+        {
+            return;
+        }
+        let account_id = ui.get_active_account_local_id().to_string();
+        let room_id = ui.get_active_room_id().to_string();
+        // The sender chose this name: suggest only a sanitized final
+        // component, and let the user pick the folder explicitly.
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Save attachment")
+            .set_file_name(safe_file_name(filename));
+        if let Some(downloads) = directories::UserDirs::new()
+            .and_then(|dirs| dirs.download_dir().map(|dir| dir.to_path_buf()))
+        {
+            dialog = dialog.set_directory(downloads);
+        }
+        let Some(path) = dialog.save_file() else {
+            return;
+        };
+        if ui.get_active_account_local_id().as_str() != account_id
+            || ui.get_active_room_id().as_str() != room_id
+            || path.file_name().is_none()
+        {
+            return;
+        }
+        let operation = ui.get_download_operation().wrapping_add(1);
+        ui.set_download_operation(operation);
+        ui.set_downloading_event_id(event_id.into());
+        ui.set_transfer_notice("Downloading and decrypting attachment…".into());
+        let (cancel, cancelled) = watch::channel(false);
+        // Dropping an older job's sender cancels that save's download.
+        *self.lock_save() = Some(SaveJob { operation, cancel });
+        let owner = self.clone();
+        let event_id = event_id.to_owned();
+        self.runtime.spawn(async move {
+            let mut cancelled = cancelled;
+            let outcome = owner
+                .download_and_save(&account_id, &room_id, &event_id, path, &mut cancelled)
+                .await;
+            {
+                let mut save = owner.lock_save();
+                if save.as_ref().is_some_and(|job| job.operation == operation) {
+                    *save = None;
+                }
+            }
+            let _ = owner.window.upgrade_in_event_loop(move |ui| {
+                if ui.get_active_account_local_id().as_str() != account_id
+                    || ui.get_active_room_id().as_str() != room_id
+                    || ui.get_download_operation() != operation
+                    || ui.get_downloading_event_id().as_str() != event_id
+                {
+                    return;
+                }
+                ui.set_downloading_event_id("".into());
+                match outcome {
+                    SaveOutcome::Saved(path) => {
+                        let name = path.file_name().unwrap_or_default().to_string_lossy();
+                        let folder = path
+                            .parent()
+                            .map(|folder| folder.display().to_string())
+                            .unwrap_or_default();
+                        let notice = format!("Saved {name} to {folder}");
+                        ui.set_transfer_notice(crate::directory_plain_text(&notice, 300).into());
+                    }
+                    SaveOutcome::Cancelled => {
+                        ui.set_transfer_notice("Save cancelled; nothing was written.".into());
+                    }
+                    SaveOutcome::Failed(error) => {
+                        ui.set_transfer_notice("".into());
+                        ui.set_session_error(format!("Could not save attachment: {error}").into());
+                    }
+                }
+            });
+        });
+    }
+
+    async fn download_and_save(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        event_id: &str,
+        path: PathBuf,
+        cancelled: &mut watch::Receiver<bool>,
+    ) -> SaveOutcome {
+        let downloaded = tokio::select! {
+            biased;
+            // A cancel, or a newer save replacing this one, drops the download.
+            () = async {
+                let _ = cancelled.wait_for(|cancelled| *cancelled).await;
+            } => return SaveOutcome::Cancelled,
+            downloaded = self.live.download_attachment(account_id, room_id, event_id) => match downloaded {
+                Ok(downloaded) => downloaded,
+                Err(error) => return SaveOutcome::Failed(error.to_string()),
+            },
+        };
+        if *cancelled.borrow() || cancelled.has_changed().is_err() {
+            return SaveOutcome::Cancelled;
+        }
+        // The final account and room guard is held through the local write,
+        // so navigation cannot race the plaintext save. Once it starts, the
+        // bounded write finishes and its real outcome is reported.
+        match self
+            .live
+            .save_download_to(account_id, room_id, path, downloaded.bytes)
+            .await
+        {
+            Ok(path) => SaveOutcome::Saved(path),
+            Err(error) => SaveOutcome::Failed(error.to_string()),
+        }
+    }
+
+    fn cancel_save(&self) {
+        let Some(ui) = self.window.upgrade() else {
+            return;
+        };
+        let operation = ui.get_download_operation();
+        let sent = self
+            .lock_save()
+            .as_ref()
+            .is_some_and(|job| job.operation == operation && job.cancel.send(true).is_ok());
+        if sent && !ui.get_downloading_event_id().is_empty() {
+            ui.set_transfer_notice("Cancelling save…".into());
+        }
     }
 
     fn choose_files(self: &Arc<Self>) {

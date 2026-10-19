@@ -2274,6 +2274,7 @@ export component AppWindow inherits Window {
     callback attachment-action(int, int);
     callback attachment-context-changed();
     callback save-attachment(string, string);
+    callback cancel-attachment-save();
     callback preview-image-attachment(string, string);
     callback close-image-preview();
     callback dismiss-image-preview();
@@ -3430,16 +3431,26 @@ export component AppWindow inherits Window {
                     }
                 }
                 if root.transfer-notice != "" : Rectangle {
+                    property <color> notice-ink: StyleTokens.roles.success-ink.present ? StyleTokens.roles.success-ink.color : #ffffff;
                     height: 30px;
                     background: StyleTokens.roles.success-surface.present ? StyleTokens.roles.success-surface.color : #214a46;
                     Text {
-                        x: 16px; width: parent.width - 32px;
+                        x: 16px; width: parent.width - 32px - (root.downloading-event-id != "" ? save-cancel.width + 8px : 0px);
                         text: root.transfer-notice;
                         accessible-live-region: polite;
-                        color: StyleTokens.roles.success-ink.present ? StyleTokens.roles.success-ink.color : #ffffff;
+                        color: parent.notice-ink;
                         font-size: 11px * root.text-scale;
                         vertical-alignment: center;
                         overflow: elide;
+                    }
+                    save-cancel := TextAction {
+                        visible: root.downloading-event-id != "";
+                        enabled: root.downloading-event-id != "";
+                        x: parent.width - self.width - 12px; y: 3px; width: self.preferred-width; height: 24px;
+                        text: "Cancel"; label: "Cancel saving the attachment";
+                        ink: parent.notice-ink; muted: parent.notice-ink; surface: transparent;
+                        hover-surface: root.hover; outline: parent.notice-ink; text-scale: root.text-scale;
+                        activated => { root.cancel-attachment-save(); }
                     }
                 }
 
