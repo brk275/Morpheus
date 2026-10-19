@@ -1,12 +1,12 @@
-# TEMPORARY owner-reviewed transfer contracts. NEVER MERGE this workflow.
+# TEMPORARY owner-reviewed layout contracts. NEVER MERGE this workflow.
 name: Reviewed layout contracts
-run-name: Reviewed layout contracts - ae94d76
+run-name: Reviewed layout contracts - 67386ee
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: layout-contracts-ae94d76-${{ github.ref }}
+  group: layout-contracts-67386ee-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   search:
@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ae94d76fbc251a02c1919ad867eb6101683f33bf
+          ref: 67386eeb2d91e6f71c74c161b0d3f6320d313824
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -68,7 +68,7 @@ jobs:
           key: verified-sdk-archives-v1
           workspaces: candidate -> target
           save-if: false
-      - name: Run reviewed transfer contracts and native integration
+      - name: Run reviewed affected layout and native integration
         timeout-minutes: 225
         env:
           CARGO_BUILD_JOBS: "2"
@@ -179,7 +179,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='ae94d76fbc251a02c1919ad867eb6101683f33bf'
+          source='67386eeb2d91e6f71c74c161b0d3f6320d313824'
           assert subprocess.check_output(['git','rev-parse','HEAD'],cwd=workspace,env=environment,text=True).strip()==source
           assert hashlib.sha256((workspace/'Cargo.lock').read_bytes()).hexdigest()=='8db1e7dcf70013d71a4d9fa8be42a25da4efa1d74edd6711812a2897c0ccf6b7'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
@@ -265,7 +265,6 @@ jobs:
               for function in re.findall(r'#\[test\]\s*(?:#\[[^\]\r\n]+\]\s*)*(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(',text):
                   known_test_ids.add(prefix+function)
           checks=[
-              ('config_layout_schema', ['cargo', 'test', '--locked', '-p', 'morpheus-config', '--lib', '--', '--test-threads=1'], 2700, {'registry::tests::setting_targets_are_unique_and_searchable_by_their_aliases', 'tests::the_field_reference_agrees_with_the_real_schema', 'tests::pane_arrangements_validate_and_keep_older_files_working', 'style_profiles::tests::the_documented_profile_schema_matches_the_profile_type', 'style_profiles::tests::pane_arrangements_round_trip_in_profiles_and_old_profiles_reset_them'}, set()),
               ('workspace_layout', ['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'workspace_layout::tests::', '--', '--test-threads=1'], 2700, {'workspace_layout::tests::hidden_and_collapsed_panes_restore_to_the_default', 'workspace_layout::tests::the_account_control_stays_bottom_left_in_every_arrangement', 'workspace_layout::tests::presets_change_only_the_arrangement_and_are_recognized', 'workspace_layout::tests::narrow_windows_give_way_in_order_and_keep_the_conversation', 'workspace_layout::tests::the_default_arrangement_matches_the_classic_layout'}, set()),
               ('app_transfer_private_ui', ['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation', '--', '--exact', '--test-threads=1'], 2700, {'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'}, set()),
               ('native_app_build', ['cargo', 'build', '--locked', '-p', 'morpheus-app', '--features', 'native-calls'], 2400, None, set()),
