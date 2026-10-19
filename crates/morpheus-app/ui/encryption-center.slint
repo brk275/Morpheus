@@ -177,7 +177,13 @@ export component SasVerificationPanel inherits Rectangle {
             }
         }
         if root.stage != 0 : Text {
-            text: root.stage == 1 ? (root.request-initiator
+            text: root.peer != ""
+                ? (root.stage == 1 ? "Waiting for " + root.peer + " to accept. Morpheus shows their response as soon as it arrives."
+                    : root.stage == 2 ? root.peer + " accepted. Start the comparison."
+                    : root.stage == 3 ? "Waiting for " + root.peer + " to accept the comparison."
+                    : root.stage == 4 ? "Compare every shown emoji or all three numbers with " + root.peer + ". Confirm only if they match exactly."
+                    : "Your confirmation was sent. Waiting for " + root.peer + " to finish.")
+                : root.stage == 1 ? (root.request-initiator
                 ? "Approve the verification request on your other device. Morpheus shows its response as soon as it arrives."
                 : "Request accepted. Waiting for the requesting device to start the comparison.")
                 : root.stage == 2 ? "The other device accepted. Start the short authentication string comparison."
@@ -210,7 +216,9 @@ export component SasVerificationPanel inherits Rectangle {
             border-color: root.compared ? root.palette.accent : root.palette.divider;
             border-width: 1px;
             focus-color: root.palette.focus;
-            label: "I compared these values on both devices and they match exactly";
+            label: root.peer == ""
+                ? "I compared these values on both devices and they match exactly"
+                : "I compared these values with " + root.peer + " and they match exactly";
             checked: root.compared;
             enabled: !root.busy;
             toggled => { root.compared = !root.compared; }
@@ -218,7 +226,7 @@ export component SasVerificationPanel inherits Rectangle {
                 x: 10px;
                 width: parent.width - 20px;
                 height: parent.height;
-                text: (root.compared ? "✓ " : "○ ") + "I compared both devices; the values match";
+                text: (root.compared ? "✓ " : "○ ") + (root.peer == "" ? "I compared both devices; the values match" : "I compared the values with " + root.peer + "; they match");
                 color: root.palette.ink;
                 font-size: 11px * root.text-scale;
                 vertical-alignment: center;

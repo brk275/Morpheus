@@ -499,8 +499,12 @@ fn refresh_flow(window: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, finishe
                 }
                 Ok(info) if stage == WAITING_FOR_REQUEST && info.we_started && info.is_ready => {
                     window.set_sas_stage(READY_TO_START);
-                    window
-                        .set_sas_notice("The other device accepted. Start comparison.".into());
+                    let accepted = if person {
+                        "They accepted. Start comparison."
+                    } else {
+                        "The other device accepted. Start comparison."
+                    };
+                    window.set_sas_notice(accepted.into());
                     window.set_sas_error("".into());
                 }
                 Ok(info) if stage == WAITING_FOR_REQUEST && !info.we_started => {
