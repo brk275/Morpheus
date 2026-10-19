@@ -2656,6 +2656,7 @@ async fn exercise_account_ui(runtime: Handle) {
     ui.set_attachment_status("private upload name".into());
     assert_recovery_strip_projection(&ui).await;
     assert_sticker_picker_projection(&ui).await;
+    assert_media_viewer_keyboard(&ui).await;
     // The real picker controller over a recording fake core: admission,
     // persistence, single-flight commands, held sends and exact reconciliation.
     crate::stickers::controller_tests::run(&ui, runtime.clone()).await;
@@ -3859,5 +3860,37 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
     );
     draft_recovery::publish_thread(ui, &PendingSummary::default(), &[]);
     draft_recovery::publish_room(ui, &PendingSummary::default(), &[]);
+    settle(ui).await;
+}
+
+/// The image viewer's Tab cycle reaches every available action in layout
+/// order, skips unavailable ones and stays inside the dialog.
+async fn assert_media_viewer_keyboard(ui: &AppWindow) {
+    ui.set_image_preview_account_id(ui.get_active_account_local_id());
+    ui.set_image_preview_room_id(ui.get_active_room_id());
+    ui.set_image_preview_event_id("$image:example.org".into());
+    ui.set_image_preview_title("synthetic.png".into());
+    ui.set_image_preview_loaded(true);
+    ui.set_image_preview_has_previous(false);
+    ui.set_image_preview_has_next(true);
+    ui.set_image_preview_open(true);
+    settle(ui).await;
+    assert!(focused_control_has_label(ui, "Close image preview"));
+    tab_to_control(ui, "Next image");
+    // Previous is unavailable, so Shift+Tab goes back to Save.
+    key(ui, Key::Backtab);
+    assert!(focused_control_has_label(
+        ui,
+        "Save synthetic.png to a location you choose"
+    ));
+    tab_to_control(ui, "Zoom in");
+    // Zoom out and Fit are unavailable at fit, so the cycle wraps to Close.
+    key(ui, Key::Tab);
+    assert!(focused_control_has_label(ui, "Close image preview"));
+    ui.set_image_preview_open(false);
+    ui.set_image_preview_loaded(false);
+    ui.set_image_preview_has_next(false);
+    ui.set_image_preview_event_id("".into());
+    ui.set_image_preview_title("".into());
     settle(ui).await;
 }
