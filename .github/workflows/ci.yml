@@ -209,6 +209,56 @@ jobs:
         with:
           key: verified-sdk-archives-v1
           save-if: false
+      - name: Select the installed Microsoft x64 compiler environment
+        if: runner.os == 'Windows'
+        timeout-minutes: 2
+        shell: python
+        run: |
+          import json, os, pathlib, shutil, subprocess
+          assert os.environ['RUNNER_OS']=='Windows' and os.environ['RUNNER_ARCH']=='X64'
+          # Use the runner's installed vendor tools, without a new setup action.
+          # Keep tokens out of the compiler environment and print no raw output.
+          allowed=('PATH','SystemRoot','SYSTEMROOT','SystemDrive','PROCESSOR_ARCHITECTURE','OS','WINDIR','COMSPEC','PATHEXT',
+              'ProgramFiles','ProgramFiles(x86)','ProgramW6432','TEMP','TMP',
+              'USERPROFILE','HOMEDRIVE','HOMEPATH','LOCALAPPDATA','APPDATA',
+              'CARGO_HOME','RUSTUP_HOME')
+          environment={key:os.environ[key] for key in allowed if key in os.environ}
+          installer=pathlib.Path(os.environ['ProgramFiles(x86)'])/'Microsoft Visual Studio'/'Installer'/'vswhere.exe'
+          def command(args):
+              result=subprocess.run(args,env=environment,stdin=subprocess.DEVNULL,
+                  stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60,check=False)
+              assert result.returncode==0 and len(result.stdout)<=256*1024 and len(result.stderr)<=64*1024
+              return result.stdout
+          selected=command([str(installer),'-latest','-products','*','-requires',
+              'Microsoft.VisualStudio.Component.VC.Tools.x86.x64','-property','installationPath']).decode('utf-8').strip()
+          assert selected and not any(char in selected for char in '\r\n"%')
+          installation=pathlib.Path(selected).resolve(strict=True)
+          assert installation.is_relative_to(pathlib.Path(os.environ['ProgramFiles']).resolve())
+          setup=installation/'Common7'/'Tools'/'VsDevCmd.bat'
+          assert setup.is_file()
+          cmd=pathlib.Path(os.environ['SystemRoot'])/'System32'/'cmd.exe'
+          raw=command([str(cmd),'/d','/s','/c',f'""{setup}" -no_logo -arch=x64 -host_arch=x64 >nul && set"'])
+          wanted={'PATH','INCLUDE','LIB','LIBPATH','VCTOOLSINSTALLDIR','VCINSTALLDIR',
+              'VSINSTALLDIR','WINDOWSSDKDIR','WINDOWSSDKVERSION'}
+          values={}
+          # cmd writes OEM text to pipes; preserve all characters in tool paths.
+          import ctypes
+          encoding='cp'+str(ctypes.windll.kernel32.GetOEMCP())
+          for line in raw.decode(encoding,errors='strict').splitlines():
+              name,separator,value=line.partition('=')
+              if separator and name.upper() in wanted:
+                  assert name.upper() not in values and value and not any(c in value for c in '\r\n\x00')
+                  values[name.upper()]=value
+          assert wanted<=values.keys()
+          compiler_root=pathlib.Path(values['VCTOOLSINSTALLDIR']).resolve(strict=True)
+          assert compiler_root.is_relative_to(installation/'VC'/'Tools'/'MSVC')
+          linker=shutil.which('link.exe',path=values['PATH'])
+          assert linker and pathlib.Path(linker).resolve().is_relative_to(compiler_root/'bin'/'Hostx64'/'x64')
+          # Fixed names, single-line values; no credentials or compiler stdout.
+          with pathlib.Path(os.environ['GITHUB_ENV']).open('a',encoding='utf-8',newline='\n') as output:
+              for name,value in values.items():
+                  output.write(name+'='+value+'\n')
+          print(json.dumps({'check':'msvc_environment','status':'passed','target':'x64','linker':'msvc'}))
       - name: Build native desktop and run existing unit and controller suites
         timeout-minutes: 160
         env:
