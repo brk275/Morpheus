@@ -1685,7 +1685,8 @@ component SettingsSearchBar inherits VerticalLayout {
                 + (result.key != "" ? key-text.preferred-height + 2px : 0px));
             label: result.label + ", " + result.breadcrumb + ". " + result.description
                 + (result.key != "" ? " Key " + result.key + " in config.toml." : "");
-            background: i == root.index || self.has-hover ? root.hover-surface : transparent;
+            background: i == root.index ? root.hover-surface
+                : self.has-hover ? (StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover-surface) : transparent;
             border-radius: StyleTokens.radius * 0.6;
             border-width: i == root.index ? StyleTokens.line-width : 0px;
             border-color: root.accent;
@@ -1769,7 +1770,7 @@ component ColorTokenList inherits VerticalLayout {
             height: max(32px, 26px * root.text-scale);
             label: group.label + (index == root.group-index ? ", selected" : "");
             background: index == root.group-index ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover-surface)
-                : self.has-hover ? root.hover-surface : transparent;
+                : self.has-hover ? (StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover-surface) : transparent;
             border-radius: StyleTokens.radius * 0.6; focus-color: root.accent;
             activated => { root.group-chosen(index); }
             HorizontalLayout {
@@ -1793,7 +1794,7 @@ component ColorTokenList inherits VerticalLayout {
         height: max(36px, 30px * root.text-scale);
         label: token.label + (token.overridden ? ", customized" : "") + (token.id == root.selected-id ? ", selected" : "");
         background: token.id == root.selected-id ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover-surface)
-            : self.has-hover ? root.hover-surface : transparent;
+            : self.has-hover ? (StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover-surface) : transparent;
         border-radius: StyleTokens.radius * 0.6; focus-color: root.accent;
         activated => { root.token-chosen(token.id); }
         HorizontalLayout {
@@ -1969,7 +1970,7 @@ component MetricList inherits VerticalLayout {
                     height: max(32px, 26px * root.text-scale);
                     label: group.label + (index == root.group-index ? ", selected" : "");
                     background: index == root.group-index ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover-surface)
-                        : self.has-hover ? root.hover-surface : transparent;
+                        : self.has-hover ? (StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover-surface) : transparent;
                     border-radius: StyleTokens.radius * 0.6; focus-color: root.accent;
                     activated => { root.group-chosen(index); }
                     HorizontalLayout {
@@ -1993,7 +1994,7 @@ component MetricList inherits VerticalLayout {
                 height: max(36px, 30px * root.text-scale);
                 label: item.label + ", " + item.value-text + (item.overridden ? ", customized" : "") + (item.key == root.selected-key ? ", selected" : "");
                 background: item.key == root.selected-key ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover-surface)
-                    : self.has-hover ? root.hover-surface : transparent;
+                    : self.has-hover ? (StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover-surface) : transparent;
                 border-radius: StyleTokens.radius * 0.6; focus-color: root.accent;
                 activated => { root.metric-chosen(item.key); }
                 HorizontalLayout {
@@ -2433,7 +2434,7 @@ component StyleProfilesEditor inherits VerticalLayout {
                 label: item.name + ", " + item.detail + (item.current ? ", matches your current look" : "")
                     + (item.key == root.selected-key ? ", selected" : "");
                 background: item.key == root.selected-key ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover-surface)
-                    : self.has-hover ? root.hover-surface : transparent;
+                    : self.has-hover ? (StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover-surface) : transparent;
                 border-radius: StyleTokens.radius * 0.6; focus-color: root.accent;
                 activated => { root.chosen(item.key); }
                 VerticalLayout {
