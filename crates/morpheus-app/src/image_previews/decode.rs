@@ -14,6 +14,8 @@ pub(super) const MAX_PIXELS: usize = 4 * 1024 * 1024;
 const MAX_DECODER_ALLOC: u64 = 32 * 1024 * 1024;
 /// Frames one animation pass may contain or decode.
 pub(super) const MAX_ANIMATION_FRAMES: usize = 1000;
+/// Chunks an animated PNG may contain (a still PNG may have 4096).
+const MAX_ANIMATION_CHUNKS: usize = 16 * 1024;
 /// Scans one progressive JPEG may contain; its decoder gets the same cap.
 const MAX_JPEG_SCANS: usize = 64;
 
@@ -92,9 +94,12 @@ fn png_input_with(bytes: &[u8], animation: bool) -> Result<Zeroizing<Vec<u8>>, P
         return Err(PreviewError::Unsupported);
     }
     output.extend_from_slice(&bytes[..8]);
+    // An animation may split each of its up to 1000 frames over several fdAT
+    // chunks. The walk stays linear and the input is at most 8 MiB.
+    let max_chunks = if animation { MAX_ANIMATION_CHUNKS } else { 4096 };
     while position < bytes.len() {
         chunks += 1;
-        if chunks > 4096 || ended {
+        if chunks > max_chunks || ended {
             return Err(PreviewError::Invalid);
         }
         let header = bytes
@@ -654,6 +659,17 @@ mod tests {
         let mut twice = animated.clone();
         twice.splice(33..33, control(2));
         assert!(png_animation_input(&twice).is_err());
+        // Many small ancillary chunks: over the still ceiling, under the
+        // animation one.
+        let filler: Vec<u8> = (0..5000)
+            .flat_map(|_| [0, 0, 0, 0, b't', b'E', b'X', b't', 0, 0, 0, 0])
+            .collect();
+        let mut crowded = animated.clone();
+        crowded.splice(33..33, filler.iter().copied());
+        assert!(png_animation_input(&crowded).is_ok());
+        let mut crowded_still = original.clone();
+        crowded_still.splice(33..33, filler);
+        assert!(png_input(&crowded_still).is_err());
     }
     #[test]
     fn dimensions_reject_before_decoder_or_output_allocation() {
