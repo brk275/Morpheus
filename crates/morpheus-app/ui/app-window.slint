@@ -5560,7 +5560,10 @@ export component AppWindow inherits Window {
                     background: transparent;
                     // The compact pinned preview: the same sample rules as the full
                     // preview, kept in view while any setting below is edited.
-                    if root.appearance-preview-pinned : Rectangle {
+                    if root.appearance-preview-pinned : pinned-strip := Rectangle {
+                        // Narrow or large-text strips keep the navigation and message
+                        // samples and leave out the buttons and chips rather than cut them.
+                        property <bool> compact: self.width < 620px * max(1, min(2, root.text-scale));
                         x: 26px; y: settings-search.preferred-height + 14px;
                         width: parent.width - 52px; height: root.pinned-preview-height;
                         background: root.panel;
@@ -5590,7 +5593,9 @@ export component AppWindow inherits Window {
                                         accessible-role: none;
                                     }
                                     Rectangle {
-                                        width: 230px * min(1.3, root.text-scale);
+                                        horizontal-stretch: 1;
+                                        min-width: 0px;
+                                        max-width: 230px * min(1.3, root.text-scale);
                                         background: root.row-surface(false, false, false, root.canvas);
                                         border-radius: StyleTokens.radius * 0.6;
                                         clip: true;
@@ -5622,31 +5627,34 @@ export component AppWindow inherits Window {
                                             }
                                         }
                                     }
-                                    for sample[index] in ["Button", "Primary"] : VerticalLayout {
-                                        alignment: center;
-                                        TokenButton {
-                                            text: sample;
-                                            colors: root.button-colors;
-                                            text-scale: root.text-scale;
-                                            primary: index == 1;
-                                            interactive: false;
-                                            accessible-role: none;
+                                    if !pinned-strip.compact : HorizontalLayout {
+                                        spacing: 10px;
+                                        for sample[index] in ["Button", "Primary"] : VerticalLayout {
+                                            alignment: center;
+                                            TokenButton {
+                                                text: sample;
+                                                colors: root.button-colors;
+                                                text-scale: root.text-scale;
+                                                primary: index == 1;
+                                                interactive: false;
+                                                accessible-role: none;
+                                            }
                                         }
-                                    }
-                                    for chip in [
-                                        { text: "Selected", surface: root.token-color("selection"), ink: root.token-color("selection_ink") },
-                                        { text: "3", surface: root.token-color("unread"), ink: root.token-color("unread_ink") },
-                                        { text: "@2", surface: root.mention-badge, ink: root.mention-badge-ink },
-                                    ] : VerticalLayout {
-                                        alignment: center;
-                                        Rectangle {
-                                            height: max(22px, 16px * root.text-scale + 6px);
-                                            width: max(self.height, pinned-chip-text.preferred-width + 16px);
-                                            border-radius: self.height / 2;
-                                            background: chip.surface;
-                                            pinned-chip-text := Text {
-                                                text: chip.text; color: chip.ink; font-size: 11px * root.text-scale; font-weight: 700;
-                                                horizontal-alignment: center; vertical-alignment: center;
+                                        for chip in [
+                                            { text: "Selected", surface: root.token-color("selection"), ink: root.token-color("selection_ink") },
+                                            { text: "3", surface: root.token-color("unread"), ink: root.token-color("unread_ink") },
+                                            { text: "@2", surface: root.mention-badge, ink: root.mention-badge-ink },
+                                        ] : VerticalLayout {
+                                            alignment: center;
+                                            Rectangle {
+                                                height: max(22px, 16px * root.text-scale + 6px);
+                                                width: max(self.height, pinned-chip-text.preferred-width + 16px);
+                                                border-radius: self.height / 2;
+                                                background: chip.surface;
+                                                pinned-chip-text := Text {
+                                                    text: chip.text; color: chip.ink; font-size: 11px * root.text-scale; font-weight: 700;
+                                                    horizontal-alignment: center; vertical-alignment: center;
+                                                }
                                             }
                                         }
                                     }
