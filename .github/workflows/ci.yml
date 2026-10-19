@@ -1,13 +1,13 @@
 # TEMPORARY reviewed messaging verification. NEVER MERGE.
 # No installers, physical-device, real-account, installed-app or artifact jobs.
 name: Reviewed native messaging
-run-name: Native messaging diagnosis - 0098b78
+run-name: Native messaging completion - 725e8e0
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: native-messaging-diagnosis-0098b78
+  group: native-messaging-completion-725e8e0
   cancel-in-progress: false
 jobs:
   native:
@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 0098b784c3a13fda4365984740c06e3176db7bad
+          ref: 725e8e0c1ff687b91a1c119e0293c8106b1f835f
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -125,7 +125,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='0098b784c3a13fda4365984740c06e3176db7bad'
+          source='725e8e0c1ff687b91a1c119e0293c8106b1f835f'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -307,7 +307,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='0098b784c3a13fda4365984740c06e3176db7bad'
+          source='725e8e0c1ff687b91a1c119e0293c8106b1f835f'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -398,7 +398,6 @@ jobs:
               'kept_replies::tests::a_queued_restore_cannot_outlive_a_clear_or_a_room_change',
               'message_search::tests::search_result_display_sanitizes_untrusted_text_without_changing_ids',
               'message_search::tests::context_keeps_the_hit_near_the_top_and_stays_bounded',
-              'timeline_model::tests::sparse_edits_across_ten_thousand_shared_rows_notify_only_changed_rows',
           }
           needed_matrix={
               'history::tests::search_rejects_an_aba_selection_and_keeps_the_current_one',
@@ -406,8 +405,9 @@ jobs:
               'tests::homeserver_must_not_send_password_over_plain_http',
           }
           allowed_app_ignore={'outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction'}
+          # Slint inputs unchanged from0098's passed UIcompile; app/Matrix Rust
+          # changed. Sparse10K guard exists on owner62, not this older fork.
           checks=(
-              ('native_ui_compile',['cargo','check','--locked','-p','morpheus-ui-check'],10*60,None,set()),
               ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
                   '--bin','morpheus-app','--','--test-threads=1'],40*60,needed_app,allowed_app_ignore),
               ('matrix_unit',['cargo','test','--locked','-p','morpheus-matrix','--lib','--','--test-threads=1'],20*60,needed_matrix,set()),
@@ -484,6 +484,7 @@ jobs:
                       'crates/morpheus-app/src/account_access_ui_tests.rs',
                       'crates/morpheus-app/src/live.rs',
                       'crates/morpheus-app/src/message_search.rs',
+                      'crates/morpheus-matrix/src/lib.rs',
                       'crates/morpheus-matrix/src/history.rs',
                       'crates/morpheus-matrix/src/search.rs')
                   ui_locations=[]
