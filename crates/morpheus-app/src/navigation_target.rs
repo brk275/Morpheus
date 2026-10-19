@@ -1,11 +1,9 @@
-//! The one place a conversation can be addressed from outside the room list:
-//! a saved account, a joined room and optionally one event and one thread.
+//! The identifiers a shown banner opens: a saved account, a room and
+//! optionally one event and one thread.
 //!
-//! Notification activation builds these from its own bounded record of shown
-//! banners; message search can build them from a listed hit. Both hand the
-//! target to `notification_center::activation::Activator::open`, which goes
-//! through the protected account switch when the target is in another
-//! account and fences every later step by that account's selection. A target
+//! `DesktopNotifications` keeps one per shown banner in its bounded record
+//! and hands a clicked one to `notification_center::activation`, which opens
+//! it through the window's `open-conversation` navigation seam. A target
 //! holds identifiers only, never message text, and is never persisted.
 
 /// Matrix room and event IDs are at most 255 bytes.

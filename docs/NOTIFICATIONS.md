@@ -94,28 +94,27 @@ signing out an account withdraws and forgets its banners.
 
 ## Opening a banner
 
-Clicking a banner opens its exact account, room and, for a thread reply, the
-thread panel. An invitation banner opens its account, where the invitation
-waits in the room list. A banner in the visible account opens directly. For another saved
-account, or while no account is open, the click goes through the same switch as
-the account menu or Manage accounts: an unfinished security operation still
+Clicking a banner opens its exact account, room, event and, for a thread reply,
+thread panel, through the same navigation as a message-search result. A banner
+in the visible account opens directly. For another saved account the click goes
+through the account menu's switch: an unfinished security operation still
 blocks it, an active call still asks to be left first, and a protected account
-still asks for the local app password. The target then waits as one request and
-opens only if that exact account becomes active within two minutes; a newer
-click, a switch to any other account, choosing a room or Space, or a removed
-account ends it, so an A → B → A sequence never navigates for the earlier
-request. A banner resolves once; a dismissed, replaced, expired or unknown banner
-opens nothing, and an old banner never brings back a removed account or a reused
-local ID for a different Matrix user. While a reply or edit is being written in
-another room, the click is refused with a notice instead of discarding it, and
-a click for another account never replaces an app-password or leave-call dialog
-that is already open. Up to
-eight banners listen for clicks at a time; beyond that a banner is shown without
-click handling. On macOS the click also brings Morpheus forward; on Linux and
-Windows a minimized window is restored, but raising it is up to the desktop.
-Opening an older event at its exact position is left to the message-search
-focused view; a banner's event is normally the newest message, shown at the
-bottom of the opened room.
+still asks for the local app password. The target then waits for at most two
+minutes and opens only when that exact account becomes visible; a newer click
+or search result, or a different account becoming visible, drops it, so an
+A → B → A sequence never navigates for the earlier request. While no account is
+open, a click only restores the window. An invitation banner in the visible
+account points to the invitation in the room list.
+
+A banner resolves once; a dismissed, replaced, expired or unknown banner opens
+nothing, and an old banner never brings back a removed account or a reused
+local ID for a different Matrix user. A reply or edit being written in another
+room is never discarded; the click is refused with a notice. A click for another
+account never replaces an app-password or leave-call dialog that is already
+open. Up to eight banners listen for clicks at a time; beyond that a banner is
+shown without click handling. On macOS the click also brings Morpheus forward;
+on Linux and Windows a minimized window is restored, but raising it is up to the
+desktop.
 
 These behaviors were written against the pinned SDK and `notify-rust` sources
 and have not been run. Click activation, withdrawal, private receipts against a

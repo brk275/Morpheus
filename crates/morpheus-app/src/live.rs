@@ -1679,70 +1679,6 @@ impl LiveUi {
         Ok(true)
     }
 
-    /// `select_room_for` for an addressed target (a notification banner or a
-    /// `NavigationTarget`): the room must be joined, and when the selected
-    /// Space does not list it, Home or the lowest-ID Space that lists it is
-    /// selected so the room is shown instead of the first visible one.
-    /// Before the background Space scan has listed it, the room opens from
-    /// Home. Returns `Ok(false)` when superseded.
-    pub(crate) async fn open_room_target_for(
-        self: &Arc<Self>,
-        account_id: &str,
-        room_id: String,
-        navigation_epoch: u64,
-        ui: Weak<AppWindow>,
-    ) -> Result<bool, MatrixCoreError> {
-        let _transition = self.account_transition.lock().await;
-        if !self.navigation_is_current(navigation_epoch)
-            || self.require_active_account(account_id).await.is_err()
-        {
-            return Ok(false);
-        }
-        let rooms = self.manager.rooms_snapshot().await?;
-        let room = rooms
-            .iter()
-            .find(|room| {
-                room.room_id == room_id
-                    && room.membership == RoomMembership::Joined
-                    && !room.is_space
-            })
-            .ok_or_else(|| MatrixCoreError::RoomNotFound(room_id.clone()))?;
-        let children = self.space_children.lock().await.clone();
-        let current = self.selected_space.lock().await.clone();
-        let listed_by = |space: &String| {
-            children
-                .get(space)
-                .is_some_and(|rooms| rooms.contains(&room_id))
-        };
-        let space = if current.as_ref().is_some_and(listed_by) {
-            current
-        } else if room.is_direct || !children.values().any(|rooms| rooms.contains(&room_id)) {
-            None
-        } else {
-            children.keys().filter(|&space| listed_by(space)).min().cloned()
-        };
-        if !self.navigation_is_current(navigation_epoch) {
-            return Ok(false);
-        }
-        self.clear_feed().await;
-        *self.selected_space.lock().await = space;
-        {
-            let mut selected = self.selected_room.lock().await;
-            if !self.navigation_is_current(navigation_epoch) {
-                return Ok(false);
-            }
-            *selected = Some(room_id);
-        }
-        self.refresh(ui.clone()).await?;
-        if let Some(selection) = self.manager.account_selection(account_id) {
-            let room_id = self.selected_room.lock().await.clone();
-            if let Some(room_id) = room_id {
-                self.complete_room_recovery(selection, room_id, ui).await;
-            }
-        }
-        Ok(true)
-    }
-
     pub async fn select_space_for(
         self: &Arc<Self>,
         account_id: &str,
@@ -3551,54 +3487,6 @@ mod account_presentation_tests {
         ));
         assert_feed_cancelled(feed_cancelled).await;
         assert_feed_cancelled(thread_cancelled).await;
-        close_profile(directory, live).await;
-    }
-
-    #[tokio::test]
-    async fn an_addressed_room_never_opens_for_a_stale_navigation_or_another_account() {
-        let (directory, live) = empty_profile();
-        live.is_live.store(true, Ordering::Release);
-        *live.selected_room.lock().await = Some("!kept:example.org".into());
-        *live.selected_space.lock().await = Some("!space:example.org".into());
-        live.space_children.lock().await.insert(
-            "!space:example.org".into(),
-            HashSet::from(["!target:example.org".into()]),
-        );
-        // A banner activation superseded by newer navigation changes nothing.
-        let stale = live.invalidate_navigation();
-        live.invalidate_navigation();
-        assert!(
-            !live
-                .open_room_target_for(
-                    "account",
-                    "!target:example.org".into(),
-                    stale,
-                    Weak::default()
-                )
-                .await
-                .unwrap()
-        );
-        // Neither does a current one for an account that is not active.
-        let current = live.invalidate_navigation();
-        assert!(
-            !live
-                .open_room_target_for(
-                    "account",
-                    "!target:example.org".into(),
-                    current,
-                    Weak::default()
-                )
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            live.selected_room.lock().await.as_deref(),
-            Some("!kept:example.org")
-        );
-        assert_eq!(
-            live.selected_space.lock().await.as_deref(),
-            Some("!space:example.org")
-        );
         close_profile(directory, live).await;
     }
 
