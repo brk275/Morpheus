@@ -2559,6 +2559,7 @@ export component AppWindow inherits Window {
     in-out property <[AttachmentItem]> attachment-items;
     in-out property <int> attachment-ready-count: 0;
     in-out property <bool> attachment-can-add: true;
+    out property <bool> composer-sends-attachments: root.composer-text == "" && root.composer-mode == 0 && root.attachment-ready-count > 0;
     in-out property <string> attachment-status;
     in-out property <string> downloading-event-id;
     in-out property <int> download-operation: 0;
@@ -3929,16 +3930,17 @@ export component AppWindow inherits Window {
                                             root.mention-cursor(false, self.caret-bytes, self.anchor-bytes, self.composing);
                                         }
                                         accepted => {
-                                            root.send-message(root.composer-text);
+                                            // An empty composer sends the room's ready attachments.
+                                            if root.composer-sends-attachments { root.send-attachments(); } else { root.send-message(root.composer-text); }
                                         }
                                     }
                                 }
                                 IconAction {
-                                    icon: "➤"; label: root.composer-mode == 2 ? "Save edit" : root.composer-mode == 1 ? "Send reply" : "Send message"; ink: root.accent;
+                                    icon: "➤"; label: root.composer-sends-attachments ? "Send ready attachments" : root.composer-mode == 2 ? "Save edit" : root.composer-mode == 1 ? "Send reply" : "Send message"; ink: root.accent;
                                     surface: transparent; hover-surface: root.hover;
                                     activated => {
                                         root.composer-caret = message-input.caret-bytes; root.composer-anchor = message-input.anchor-bytes; root.composer-preedit = message-input.composing;
-                                        root.send-message(root.composer-text);
+                                        if root.composer-sends-attachments { root.send-attachments(); } else { root.send-message(root.composer-text); }
                                     }
                                 }
                             }
