@@ -52,6 +52,13 @@ pub use room_settings::{
     RoomSettingsCancellation, RoomSettingsError, RoomSettingsPermissions, RoomSettingsSession,
     RoomSettingsSnapshot,
 };
+mod pinned_messages;
+pub use pinned_messages::{
+    MAX_PINNED_DISPLAY, MAX_PINNED_EVENTS, MAX_PINNED_SENDER_CHARS, MAX_PINNED_TEXT_CHARS,
+    PINNED_FETCH_CONCURRENCY, PinnedChange, PinnedMessage, PinnedMessageKind, PinnedMessages,
+    PinnedMessagesCancellation, PinnedMessagesError, PinnedRoomChange, PinnedState,
+    room_updates_affect_pinned,
+};
 mod rich_text;
 pub use account_selection::AccountSelection;
 pub use admin::RoomMemberInfo;

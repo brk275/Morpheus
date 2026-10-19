@@ -29,6 +29,7 @@ mod navigation;
 mod notifications;
 #[cfg(feature = "native-calls")]
 mod outgoing_ring;
+mod pinned_messages;
 #[cfg(debug_assertions)]
 mod preview_capture;
 mod room_settings;
@@ -176,6 +177,7 @@ fn message(
         attachment_is_image: false,
         reaction: reaction.into(),
         accent,
+        pinned: false,
     }
 }
 
@@ -1570,6 +1572,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         image_previews::ImagePreviews::register(&ui, live.clone(), store.clone(), runtime.handle());
     let room_settings =
         room_settings::RoomSettingsUi::register(&ui, live.clone(), runtime.handle());
+    let pinned_messages =
+        pinned_messages::PinnedMessagesUi::register(&ui, live.clone(), runtime.handle());
     ui.set_native_call_enabled(cfg!(feature = "native-calls"));
     ui.set_native_call_status("Select a room to check call availability".into());
     let update_activity = updater::UpdateActivity::default();
@@ -2255,6 +2259,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ui) = weak.upgrade() {
             ui.invoke_cancel_room_settings();
             ui.invoke_close_image_preview();
+            ui.invoke_reset_pinned_messages();
         }
         if switch_live.is_live.load(Ordering::Acquire) {
             if let Some(window) = weak.upgrade()
@@ -2296,6 +2301,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ui) = weak.upgrade() {
             ui.invoke_cancel_room_settings();
             ui.invoke_close_image_preview();
+            ui.invoke_reset_pinned_messages();
         }
         if room_live.is_live.load(Ordering::Acquire) {
             let Some(window) = weak.upgrade() else {
@@ -4453,6 +4459,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         window.invoke_cancel_room_settings();
         window.invoke_close_image_preview();
+        window.invoke_reset_pinned_messages();
         if !logout_live.is_live.load(Ordering::Acquire) {
             if window.get_call_connected() {
                 window.set_pending_account_index(-3);
@@ -4777,6 +4784,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(morpheus_timeline_acceptance)]
     let acceptance = acceptance.start(&ui, live.clone(), runtime.handle().clone())?;
     let ui_result = ui.run();
+    pinned_messages.shutdown(&ui);
     room_settings.shutdown(&ui);
     image_previews.shutdown(&ui);
     #[cfg(feature = "native-calls")]

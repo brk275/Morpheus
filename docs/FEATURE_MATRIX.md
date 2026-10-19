@@ -28,6 +28,7 @@ See [account access](ACCOUNT_ACCESS.md) for password and removal behavior.
 | Timeline | Bounded native rich text, threads and virtualized message rows. | Rendered encrypted-message UI and a real 10,000-message room with variable-height content. |
 | Emoji and images | Offline Unicode emoji search; explicit, bounded PNG/baseline-JPEG attachment viewer; encrypted image previews off by default. | Full picker interaction, platform font coverage and viewer accessibility. |
 | Search | Account-scoped encrypted local index, room/cross-room queries and event context. | All-room UI, large histories and cross-platform interaction. |
+| Pinned messages | Source only, not yet built or tested: a permission-aware Pin/Unpin timeline action and a searchable Pins side-panel tab. They use authoritative list reads and changes that keep every other field. Redacted, undecryptable and unavailable pins are shown as such. See [pinned messages](PINNED_MESSAGES.md). | Build and tests, live fixture coverage, exact-event opening through the shared navigation seam, and installed interaction. |
 | Administration | Room details, avatars, supported join rules, member roles, invite/kick/ban/unban and redaction controls. | Permission-error UI, roster refresh and full administration QA. |
 | Notifications | Active-account native alerts with room visibility, privacy, sound, age and duplicate policies. | Visible/audible notification acceptance on each platform. |
 

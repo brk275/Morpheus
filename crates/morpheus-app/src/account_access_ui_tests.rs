@@ -2322,6 +2322,7 @@ async fn exercise_account_ui(runtime: Handle) {
     // A denied account-change guard also prevents any mistaken key sequence
     // from starting policy writes, account activation, or local deletion.
     let access = AccountAccessUi::register(&ui, live.clone(), runtime.clone(), || false);
+    let _pinned = crate::pinned_messages::PinnedMessagesUi::register(&ui, live.clone(), &runtime);
     assert_switch_readiness(&ui, &live, &access).await;
     ui.set_composer_text("untouched conversation draft".into());
     settle(&ui).await;
@@ -2695,9 +2696,25 @@ async fn exercise_account_ui(runtime: Handle) {
     ui.set_security_recovery_key("synthetic recovery output".into());
     settle(&ui).await;
     assert_eq!(control_bounds(&ui, "One-time Matrix recovery key").len(), 1);
+    // Seeded after the last settle, so only the detach path can clear it.
+    ui.set_pinned_items(ModelRc::new(VecModel::from(vec![crate::PinnedMessageItem {
+        text: "private pinned text".into(),
+        ..Default::default()
+    }])));
+    ui.set_pinned_filter("private pinned search".into());
+    ui.set_pinned_summary("3 pinned messages".into());
+    ui.set_pinned_notice("Message pinned.".into());
+    ui.set_pinned_can_edit(true);
+    ui.set_pinned_state_loaded(true);
+    crate::pinned_messages::seed_row_pins_for_test(&["$pinned:example.org"]);
     live.account_detached(ui.as_weak()).await;
     settle(&ui).await;
     assert!(!ui.get_live_session());
+    assert_eq!(ui.get_pinned_items().row_count(), 0);
+    assert!(ui.get_pinned_filter().is_empty() && ui.get_pinned_summary().is_empty());
+    assert!(ui.get_pinned_notice().is_empty());
+    assert!(!ui.get_pinned_can_edit() && !ui.get_pinned_state_loaded());
+    assert!(!crate::pinned_messages::row_pinned(Some("$pinned:example.org")));
     // Both saved-send strips are cleared by the real detach path; no departed
     // scope's records, flags or notices survive.
     assert_eq!(ui.get_composer_pending_items().row_count(), 0);
