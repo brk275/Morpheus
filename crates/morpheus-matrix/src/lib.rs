@@ -71,6 +71,7 @@ pub use identity_warnings::{
     IdentityAckError, IdentityWarning, IdentityWarningFeed, IdentityWarningKind, IdentityWarnings,
     MAX_IDENTITY_WARNINGS,
 };
+mod message_trust;
 mod undecryptable;
 
 use std::{
@@ -345,6 +346,13 @@ pub struct MessageInfo {
     /// and there is no text of its own to edit.
     #[serde(default)]
     pub undecryptable: bool,
+    /// A fixed authenticity warning from the SDK's message shield, if any.
+    #[serde(default)]
+    pub authenticity_warning: Option<String>,
+    /// The warning means the message may not be what it claims (a red
+    /// shield) rather than an informational note.
+    #[serde(default)]
+    pub authenticity_severe: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3993,6 +4001,7 @@ fn message_info(item: &TimelineItem) -> Option<MessageInfo> {
     let rich_accessible = rich_markdown
         .as_deref()
         .map(rich_text::markdown_to_accessible_text);
+    let authenticity = message_trust::warning(event);
     Some(MessageInfo {
         key: item.unique_id().0.clone(),
         event_id: event.event_id().map(ToString::to_string),
@@ -4019,6 +4028,8 @@ fn message_info(item: &TimelineItem) -> Option<MessageInfo> {
         is_local_echo: event.is_local_echo(),
         send_state,
         undecryptable: content.is_unable_to_decrypt(),
+        authenticity_warning: authenticity.map(|(text, _)| text.to_owned()),
+        authenticity_severe: authenticity.is_some_and(|(_, severe)| severe),
     })
 }
 

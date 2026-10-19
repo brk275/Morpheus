@@ -3215,6 +3215,8 @@ pub(super) fn message_item(info: &MessageInfo) -> MessageItem {
         attachment_is_image: info.attachment_is_image,
         reaction: info.reaction_summary.as_str().into(),
         accent: accent(&info.sender),
+        authenticity: info.authenticity_warning.as_deref().unwrap_or("").into(),
+        authenticity_severe: info.authenticity_severe,
     }
 }
 
@@ -3346,6 +3348,8 @@ mod member_tests {
             is_local_echo: false,
             send_state: MessageSendState::Sent,
             undecryptable: false,
+            authenticity_warning: None,
+            authenticity_severe: false,
         };
         let item = message_item(&info);
         assert!(item.edit_markdown);
@@ -3376,6 +3380,18 @@ mod member_tests {
         });
         assert_eq!(locked.body.as_str(), "Waiting for keys");
         assert!(locked.edit_source.is_empty());
+
+        // The core's authenticity warning and its severity reach the row
+        // beside the unchanged body.
+        assert!(item.authenticity.is_empty() && !item.authenticity_severe);
+        let warned = message_item(&MessageInfo {
+            authenticity_warning: Some("Unknown device.".into()),
+            authenticity_severe: true,
+            ..info.clone()
+        });
+        assert_eq!(warned.authenticity.as_str(), "Unknown device.");
+        assert!(warned.authenticity_severe);
+        assert_eq!(warned.body, item.body);
 
         let plain = message_item(&MessageInfo {
             rich_markdown: None,

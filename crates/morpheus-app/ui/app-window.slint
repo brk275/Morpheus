@@ -225,6 +225,9 @@ export struct MessageItem {
     attachment-is-image: bool,
     reaction: string,
     accent: color,
+    // Fixed authenticity warning from the core, and whether it is serious.
+    authenticity: string,
+    authenticity-severe: bool,
 }
 
 // Type comes from the originating list, independently of a room's display name.
@@ -3758,6 +3761,17 @@ export component AppWindow inherits Window {
                                         accessible-label: message.rich-accessible-body;
                                         link-clicked(url) => { root.open-message-link(url); }
                                     }
+                                    // Drawn outside the body, so message text cannot imitate it.
+                                    if message.authenticity != "" : Text {
+                                        width: max(0px, message-content.width - (message-row.columns ? message-row.action-width + 8px : 0px));
+                                        text: (message.authenticity-severe ? "⚠ " : "ⓘ ") + message.authenticity;
+                                        color: message.authenticity-severe
+                                            ? (StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #ff8d9d)
+                                            : (message-row.selected-message && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.muted);
+                                        font-size: 11px * root.text-scale;
+                                        wrap: word-wrap;
+                                        accessible-label: (message.authenticity-severe ? "Warning: " : "Note: ") + message.authenticity;
+                                    }
                                     if message.attachment-is-image && message.event-id != "" : ActionRect {
                                         height: 67px; border-radius: StyleTokens.radius * 1;
                                         background: self.has-hover ? root.hover : root.elevated;
@@ -6312,6 +6326,13 @@ export component AppWindow inherits Window {
                                         accessible-role: text;
                                         accessible-label: reply.rich-accessible-body;
                                         link-clicked(url) => { root.open-message-link(url); }
+                                    }
+                                    if reply.authenticity != "" : Text {
+                                        text: (reply.authenticity-severe ? "⚠ " : "ⓘ ") + reply.authenticity;
+                                        color: reply.authenticity-severe ? (StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #ff8d9d) : root.muted;
+                                        font-size: 11px * root.text-scale;
+                                        wrap: word-wrap;
+                                        accessible-label: (reply.authenticity-severe ? "Warning: " : "Note: ") + reply.authenticity;
                                     }
                                     if reply.attachment-is-image && reply.event-id != "" : Button {
                                         text: "Preview image"; accessible-label: "Preview image " + reply.attachment;

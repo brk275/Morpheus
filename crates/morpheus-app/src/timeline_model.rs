@@ -193,6 +193,8 @@ pub(crate) mod tests {
             is_local_echo: false,
             send_state: MessageSendState::Sent,
             undecryptable: false,
+            authenticity_warning: None,
+            authenticity_severe: false,
         }
     }
 
@@ -516,6 +518,8 @@ pub(crate) mod tests {
         changed!(is_local_echo, true);
         changed!(send_state, MessageSendState::Pending);
         changed!(undecryptable, true);
+        changed!(authenticity_warning, Some("changed warning".into()));
+        changed!(authenticity_severe, true);
         for row in variants {
             let model = update(ModelRc::default(), vec![base.clone()]);
             let observer = Box::pin(ModelChangeListenerContainer::new(Observer {

@@ -179,6 +179,8 @@ fn message(
         attachment_is_image: false,
         reaction: reaction.into(),
         accent,
+        authenticity: SharedString::default(),
+        authenticity_severe: false,
     }
 }
 
