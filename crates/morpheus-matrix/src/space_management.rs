@@ -761,6 +761,56 @@ impl SpaceSession {
         .await
     }
 
+    /// Make this Space the main (canonical) parent of a direct child room the
+    /// account has joined, in that room's own `m.space.parent` state. Only
+    /// this Space's parent event changes; its other fields are kept. The
+    /// account's level in the child room decides, read fresh.
+    pub async fn claim_parent(&self, link: &SpaceChildLink) -> Result<SpaceWriteOutcome> {
+        let child = self.direct_child(link)?;
+        if child.as_str() == self.space_id() {
+            return Err(RoomAdminError::NotApplicable);
+        }
+        self.run(WRITE_TIMEOUT, async {
+            let client = self.space.client();
+            let room = client.get_room(&child);
+            let room = room.filter(|room| room.state() == RoomState::Joined);
+            let room = room.ok_or(RoomAdminError::NotApplicable)?;
+            let create = room_settings::state(&room, StateEventType::RoomCreate, "").await?;
+            let create = create.ok_or(RoomAdminError::InvalidState)?;
+            let power = room_settings::state(&room, StateEventType::RoomPowerLevels, "").await?;
+            let levels = room_settings::effective_power_levels(&create, power.as_ref())?
+                .ok_or(RoomAdminError::InvalidState)?;
+            if !levels.user_can_send_state(&self.own_user, StateEventType::SpaceParent) {
+                return Err(RoomAdminError::InsufficientPower);
+            }
+            let space = self.space_id();
+            let current = room_settings::state(&room, StateEventType::SpaceParent, space).await?;
+            let current = current.as_ref().map(|event| &event.content);
+            let server = self.own_user.server_name().to_string();
+            let content = parent_content(current, &server)?;
+            let text = serde_json::to_string(&content).map_err(|_| RoomAdminError::InvalidState)?;
+            if text.len() > MAX_CHILD_CONTENT_BYTES {
+                return Err(RoomAdminError::UnsupportedContent);
+            }
+            let raw = Raw::from_json_string(text).map_err(|_| RoomAdminError::InvalidState)?;
+            let kind = StateEventType::SpaceParent;
+            let request =
+                send_state_event::v3::Request::new_raw(child, kind, space.to_owned(), raw);
+            self.check()?;
+            client
+                .send(request)
+                .with_request_config(room_admin::write_config())
+                .await
+                .map_err(room_admin::write_failure)?;
+            self.check()?;
+            let kind = StateEventType::SpaceParent;
+            let after = room_settings::state(&room, kind, space).await;
+            let after = after.ok().flatten();
+            Ok(single(after.is_some_and(|after| after.content == content)))
+        })
+        .await
+    }
+
     /// The room that replaced `old`, from a fresh read of its tombstone, and
     /// route servers for it: the routing algorithm over its members when
     /// this account joined it, else the server of whoever upgraded the room,
@@ -877,6 +927,36 @@ fn child_room_request(
         request.initial_state.push(rules.to_raw_any());
     }
     request
+}
+
+/// A child's `m.space.parent` content naming this Space as its main
+/// parent: canonical, with the account's homeserver as the route when none
+/// is listed; every other field is kept. Content Morpheus cannot keep intact
+/// is refused, and a parent that is already canonical is left alone.
+fn parent_content(current: Option<&Value>, server: &str) -> Result<Value> {
+    let mut object = match current {
+        None => Map::new(),
+        Some(Value::Object(object)) => object.clone(),
+        Some(_) => return Err(RoomAdminError::UnsupportedContent),
+    };
+    let via = object.get("via");
+    let routes = via.and_then(Value::as_array);
+    let listed = routes.is_some_and(|routes| !routes.is_empty());
+    if via.is_some() && routes.is_none() {
+        return Err(RoomAdminError::UnsupportedContent);
+    }
+    let canonical = object.get("canonical");
+    if canonical.is_some_and(|canonical| !canonical.is_boolean()) {
+        return Err(RoomAdminError::UnsupportedContent);
+    }
+    if listed && canonical.and_then(Value::as_bool) == Some(true) {
+        return Err(RoomAdminError::NotApplicable);
+    }
+    if !listed {
+        object.insert("via".to_owned(), Value::from(vec![server.to_owned()]));
+    }
+    object.insert("canonical".to_owned(), Value::Bool(true));
+    Ok(Value::Object(object))
 }
 
 fn single(confirmed: bool) -> SpaceWriteOutcome {
@@ -1363,6 +1443,25 @@ mod tests {
     }
 
     #[test]
+    fn main_space_claims_keep_other_fields_and_refuse_unknown_content() {
+        let fresh = parent_content(None, "example.org").unwrap();
+        assert_eq!(fresh, json!({"via": ["example.org"], "canonical": true}));
+        let listed = json!({"via": ["other.org"], "custom": 1});
+        let claimed = parent_content(Some(&listed), "example.org").unwrap();
+        let expected = json!({"via": ["other.org"], "custom": 1, "canonical": true});
+        assert_eq!(claimed, expected);
+        let again = parent_content(Some(&claimed), "example.org");
+        assert_eq!(again, Err(RoomAdminError::NotApplicable));
+        // A removed parent link is restored with a route.
+        let removed = parent_content(Some(&json!({})), "example.org").unwrap();
+        assert_eq!(removed["via"], json!(["example.org"]));
+        for odd in [json!({"via": "x"}), json!({"canonical": "yes"}), json!([])] {
+            let refused = parent_content(Some(&odd), "example.org");
+            assert_eq!(refused, Err(RoomAdminError::UnsupportedContent));
+        }
+    }
+
+    #[test]
     fn child_events_parse_bounded_links_in_matrix_order() {
         let event = |room: &str, content: Value, ts: u64| {
             let mut event = json!({"type": "m.space.child", "state_key": room});
@@ -1470,6 +1569,7 @@ mod tests {
             send(session.joined_rooms());
             send(session.link_many(std::slice::from_ref(target), false));
             send(session.unlink_many(std::slice::from_ref(link)));
+            send(session.claim_parent(link));
         }
     }
 }

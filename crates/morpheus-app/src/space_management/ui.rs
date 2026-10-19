@@ -51,6 +51,7 @@ pub(crate) const INVITE: i32 = 20;
 pub(crate) const EDIT_ABOUT: i32 = 21;
 pub(crate) const SAVE_ABOUT: i32 = 22;
 pub(crate) const CLOSE_ABOUT: i32 = 23;
+pub(crate) const CLAIM_PARENT: i32 = 24;
 /// Spaces remembered for Back, newest last.
 const MAX_TRAIL: usize = 8;
 
@@ -502,6 +503,7 @@ impl SpaceManagerUi {
             EDIT_ABOUT => self.open_about(ui, panel),
             SAVE_ABOUT => self.review_about(ui, panel),
             CLOSE_ABOUT => self.close_about(ui, &panel),
+            CLAIM_PARENT => self.review_claim(ui, panel),
             _ => {}
         }
     }
@@ -980,6 +982,19 @@ impl SpaceManagerUi {
         }
     }
 
+    /// Make this Space the main Space of the selected joined room.
+    fn review_claim(self: &Arc<Self>, ui: &AppWindow, panel: Arc<Panel>) {
+        if !self.idle(&panel) {
+            return;
+        }
+        let Some((row, name)) = self.selected(&panel) else {
+            return;
+        };
+        if claimable(&panel.lock(), &row) {
+            self.review(ui, panel, Change::ClaimParent { link: row.link }, name);
+        }
+    }
+
     fn review_replace(self: &Arc<Self>, ui: &AppWindow, panel: Arc<Panel>) {
         if !self.idle(&panel) {
             return;
@@ -1152,6 +1167,7 @@ impl SpaceManagerUi {
                         Change::Update { link, suggested, order } => session.update(&link, suggested, order.as_deref()).await?,
                         Change::Unlink { link } => session.unlink(&link).await?,
                         Change::Replace { link, .. } => session.replace(&link).await?,
+                        Change::ClaimParent { link } => session.claim_parent(&link).await?,
                         Change::Reorder { plan, .. } => session.reorder(&plan).await?,
                         Change::Create { name: room_name, is_space, members_only, suggested } => {
                             let kind = if is_space { ChildKind::Space } else { ChildKind::Room };
@@ -1439,6 +1455,13 @@ fn refreshed(model: ModelRc<SpacePick>, picks: Vec<SpacePick>) -> Option<ModelRc
     None
 }
 
+/// A direct entry whose room the account has joined, so this Space can be
+/// named its main Space there.
+fn claimable(state: &PanelState, row: &Row) -> bool {
+    let node = row.node.map(|index| &state.nodes[index]);
+    row.direct() && node.is_some_and(|node| node.membership == Some(RoomMembership::Joined))
+}
+
 /// The account may change the topic here, and it fits a one-line field.
 fn editable_topic(about: &RoomSettingsSnapshot) -> bool {
     about.permissions.topic && !about.topic.contains('\n')
@@ -1538,6 +1561,7 @@ fn render(
         can_open: openable,
         can_edit: editable,
         can_replace: editable && selected.is_some_and(|row| row.link.replaced_by.is_some()),
+        can_claim: editable && selected.is_some_and(|row| claimable(state, row)),
         can_move_up: editable && position.is_some_and(|index| index > 0),
         can_move_down: editable && position.is_some_and(|index| index + 1 < direct.len()),
         target: state

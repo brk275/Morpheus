@@ -32,6 +32,8 @@ const MOVE_BODY: &str = "Everyone in the Space sees the new order.";
 const CREATE_BODY: &str = "Nobody else is invited, and nothing already in the Space changes.";
 pub(crate) const NOTHING_PICKED: &str = "Choose at least one room to add.";
 pub(crate) const BAD_USER_ID: &str = "Enter a full Matrix user ID, like @name:example.org.";
+const CLAIM_BODY: &str = "names this Space as its main Space in its own settings, so apps show \
+     it there. If it named another main Space, apps may show either. Nobody joins or leaves.";
 const INVITE_BODY_START: &str = "They can join";
 const INVITE_BODY_END: &str =
     "and see the rooms it lists. Each room keeps its own rules for who can join it.";
@@ -401,6 +403,8 @@ pub(crate) enum Change {
     },
     /// Invite one person to the Space itself.
     Invite { user_id: String },
+    /// Make this Space the main Space of a joined direct child room.
+    ClaimParent { link: SpaceChildLink },
     /// Rename the Space or change its topic; `None` keeps that one.
     About {
         name: Option<String>,
@@ -430,6 +434,7 @@ impl Intent {
             Change::Link { target, .. } => target.room_id.as_str(),
             Change::Update { link, .. }
             | Change::Unlink { link }
+            | Change::ClaimParent { link }
             | Change::Replace { link, .. } => link.room_id.as_str(),
             Change::Reorder { plan, .. } => {
                 plan.first().map_or("", |(link, _)| link.room_id.as_str())
@@ -446,6 +451,7 @@ impl Intent {
         match &self.change {
             Change::Update { link, .. }
             | Change::Unlink { link }
+            | Change::ClaimParent { link }
             | Change::Replace { link, .. } => listed(link),
             Change::Reorder { plan, .. } => plan.iter().all(|(link, _)| listed(link)),
             Change::UnlinkMany { links } => links.iter().all(listed),
@@ -634,6 +640,12 @@ pub(crate) fn confirmation(intent: &Intent) -> Confirmation {
                 destructive: false,
             }
         }
+        Change::ClaimParent { .. } => Confirmation {
+            title: format!("Make {space} the main Space of {name}?"),
+            body: format!("{name} {CLAIM_BODY}"),
+            action: "Make main Space",
+            destructive: false,
+        },
         Change::Invite { .. } => Confirmation {
             title: format!("Invite {name} to {space}?"),
             body: format!("{INVITE_BODY_START} {space} {INVITE_BODY_END}"),
@@ -691,6 +703,7 @@ pub(crate) fn pending_text(intent: &Intent) -> String {
         Change::Reorder { .. } => "Moving",
         Change::Join { .. } => "Joining",
         Change::Invite { .. } => "Inviting",
+        Change::ClaimParent { .. } => "Updating",
         Change::About { .. } => "Saving the name and topic of",
         Change::Create { .. } => "Creating",
     };
@@ -736,6 +749,10 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: SpaceWriteOutcome) -> Strin
             format!("Invited {name} to {space}. The homeserver confirmed it.")
         }
         Change::About { .. } => about_text(outcome),
+        Change::ClaimParent { .. } => {
+            let space = &intent.space;
+            format!("{name} now shows {space} as its main Space. The homeserver confirmed it.")
+        }
         Change::Create { .. } => format!("Created {name}."),
     }
 }
@@ -1226,6 +1243,25 @@ mod tests {
         assert!(text.starts_with("Invited @kim:example.org to Crew."));
         let already = error_text(RoomAdminError::AlreadyJoined);
         assert_eq!(already, "They are already a member of this Space.");
+    }
+
+    #[test]
+    fn claiming_the_main_space_is_reviewed_for_one_listed_entry() {
+        let a = "!a:example.org";
+        let entry = link(SPACE, a, 1);
+        let intent = Intent {
+            change: Change::ClaimParent {
+                link: entry.clone(),
+            },
+            name: "Lounge".to_owned(),
+            space: "Crew".to_owned(),
+        };
+        assert_eq!(intent.room_id(), a);
+        assert!(intent.still_matches(std::slice::from_ref(&entry)));
+        assert!(!intent.still_matches(&[]));
+        let review = confirmation(&intent);
+        assert!(!review.destructive && review.title == "Make Crew the main Space of Lounge?");
+        assert!(review.body.contains("Nobody joins or leaves"));
     }
 
     #[test]
