@@ -41,6 +41,7 @@ mod pinned_messages;
 mod polls;
 #[cfg(debug_assertions)]
 mod preview_capture;
+mod room_activity;
 mod room_organization;
 mod room_settings;
 mod security;
@@ -907,6 +908,7 @@ fn apply_behavior(ui: &AppWindow, config: &Config) {
     shortcuts::apply_config(ui, config);
     audio_devices::apply_config(ui, config);
     image_previews::apply_config(ui, config);
+    room_activity::apply_config(ui, config);
     apply_notification_settings(ui, config);
 }
 
@@ -1041,6 +1043,7 @@ fn save_config_edit(
             shortcuts::apply_config(ui, &config);
             audio_devices::apply_config(ui, &config);
             image_previews::apply_config(ui, &config);
+            room_activity::apply_config(ui, &config);
             match store.load_theme(&config) {
                 Ok(theme) => apply_loaded_config(
                     ui,
@@ -1557,6 +1560,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         room_settings::RoomSettingsUi::register(&ui, live.clone(), runtime.handle());
     let pinned_messages =
         pinned_messages::PinnedMessagesUi::register(&ui, live.clone(), runtime.handle());
+    let room_activity =
+        room_activity::RoomActivityUi::register(&ui, live.clone(), store.clone(), runtime.handle());
     let device_sessions =
         device_sessions::DeviceSessionsUi::register(&ui, live.clone(), runtime.handle());
     ui.set_native_call_enabled(cfg!(feature = "native-calls"));
@@ -1823,6 +1828,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         shortcuts::apply_config(&ui, &config);
                         audio_devices::apply_config(&ui, &config);
                         image_previews::apply_config(&ui, &config);
+                        room_activity::apply_config(&ui, &config);
                         current_live.voice_spaces.apply_config(&config);
                         match current_store.load_theme(&config) {
                             Ok(theme) => apply_loaded_config(
@@ -4420,6 +4426,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ui_result = ui.run();
     device_sessions.shutdown(&ui);
     pinned_messages.shutdown(&ui);
+    room_activity.shutdown(&ui);
     room_settings.shutdown(&ui);
     image_previews.shutdown(&ui);
     #[cfg(feature = "native-calls")]

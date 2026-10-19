@@ -178,6 +178,9 @@ pub struct Config {
     pub layout: Layout,
     pub notifications: Notifications,
     pub media: Media,
+    /// What this client tells others about the user's activity. Every switch
+    /// is off unless chosen; a missing section keeps them off.
+    pub activity: Activity,
     pub shortcuts: BTreeMap<String, String>,
     pub experimental: Experimental,
     pub account_overrides: BTreeMap<String, AccountOverrides>,
@@ -223,6 +226,7 @@ impl Default for Config {
             layout: Layout::default(),
             notifications: Notifications::default(),
             media: Media::default(),
+            activity: Activity::default(),
             shortcuts: default_shortcuts(),
             experimental: Experimental::default(),
             account_overrides: BTreeMap::new(),
@@ -1401,6 +1405,21 @@ impl Default for Notifications {
             highlight_words: Vec::new(),
         }
     }
+}
+
+/// Typing notices and read receipts this client sends. All off by default:
+/// nothing is published until the user turns it on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Activity {
+    /// Tell a room while this account is typing (m.typing).
+    pub send_typing: bool,
+    /// Send public read receipts (m.read), which others can see. Otherwise
+    /// receipts are private (m.read.private).
+    pub public_read_receipts: bool,
+    /// Move this account's read receipt automatically to the newest message
+    /// actually shown at the bottom of a live timeline in a focused window.
+    pub read_tracking: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

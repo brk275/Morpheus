@@ -21,6 +21,10 @@ import { VoicePresencePill, VoiceRosters } from "voice-rosters.slint";
 export { VoiceParticipant, VoicePresence, VoiceRosters } from "voice-rosters.slint";
 import { SpaceExplorer, SpaceExplorerPanel } from "space-explorer.slint";
 export { SpaceExplorer, SpaceExplorerCrumb, SpaceExplorerRow } from "space-explorer.slint";
+import { RoomActivity, SeenByDialog, SeenByRow, TypingFooter } from "room-activity.slint";
+// Rust drives typing names, Seen by, Mark as read and the activity settings
+// through this global.
+export { RoomActivity, SeenByRow } from "room-activity.slint";
 import { DeviceSessionRow, DeviceSessionsPanel, DeviceSessionsView } from "device-sessions.slint";
 import { NotificationRules, RoomNotificationPanel, RoomNotificationState } from "notification-settings.slint";
 // Rust drives the notification rules and the room panel through these globals.
@@ -803,6 +807,14 @@ component OrganizableRoomRow inherits Rectangle {
             // keeps the items it was shown with: if sync changes the row's
             // tags meanwhile, an outdated item still sends its action, which
             // changes nothing when the room already has that result.
+            // Room activity: the private read marker plus a read receipt,
+            // public only when chosen in Settings. Rust checks the account.
+            MenuItem {
+                title: "Mark as read";
+                enabled: !RoomActivity.marking;
+                activated => { RoomActivity.mark-read(root.room.id); }
+            }
+            MenuSeparator { }
             if !root.room.favourite: MenuItem {
                 title: "Add to Favorites";
                 activated => { RoomOrganizationState.organize(root.room.id, 0); }
@@ -4251,6 +4263,10 @@ export component AppWindow inherits Window {
     // room and thread view; any change drops them before a stale action can run.
     property <string> poll-scope: (root.live-session ? "live" : "") + "\n" + root.active-account-local-id + "\n" + root.active-room-id + "\n" + root.thread-root-id + "\n" + root.timeline-jump-event-id + "\n" + (root.conversation-focused ? "focused" : "live");
     changed poll-scope => { root.poll-context-changed(); }
+    // Typing names, Seen by and automatic read receipts belong to one live
+    // account, room, page and shown thread; any change re-scopes them.
+    property <string> activity-scope: (root.live-session ? "live" : "") + "\n" + root.active-account-local-id + "\n" + root.active-room-id + "\n" + root.page + "\n" + (root.show-side-panel && root.side-panel-tab == 1 ? root.thread-root-id : "");
+    changed activity-scope => { RoomActivity.context-changed(); }
     property <bool> composer-focus-thread: false;
     property <int> composer-focus-request: 0;
 
@@ -5502,6 +5518,12 @@ export component AppWindow inherits Window {
                     timeline-list := ListView {
                         vertical-stretch: 1;
                         horizontal-scrollbar-policy: always-off;
+                        // Automatic read receipts (room activity): the last row's event while
+                        // the live list is scrolled to its bottom; Rust checks everything else.
+                        property <bool> at-bottom: self.content-height <= self.visible-height + 1px || -self.content-y >= self.content-height - self.visible-height - 24px;
+                        property <string> read-key: root.live-session && root.page == 0 && !root.conversation-focused && self.at-bottom && root.messages.length > 0 ? root.messages[root.messages.length - 1].event-id : "";
+                        changed read-key => { RoomActivity.read-view(false, self.read-key); }
+                        init => { RoomActivity.read-view(false, self.read-key); }
                         // A search jump first approaches the row from the average
                         // row height, refines it as nearby rows load, and the row
                         // itself finishes the reveal once it exists.
@@ -5531,7 +5553,8 @@ export component AppWindow inherits Window {
                             // A pin action shows once the pinned list is known, for anyone who
                             // may change it, and as a disabled marker on pinned messages.
                             property <bool> pin-action: message.event-id != "" && root.pinned-state-loaded && (root.pinned-can-edit || message.pinned);
-                            property <length> action-width: message.event-id == "" ? 0px : (message.is-own && message.attachment == "" ? 172px : 136px) + (self.pin-action ? 36px : 0px);
+                            // The last 36 px hold Seen by (room activity).
+                            property <length> action-width: message.event-id == "" ? 0px : (message.is-own && message.attachment == "" ? 172px : 136px) + (self.pin-action ? 36px : 0px) + 36px;
                             property <length> column-width: self.columns ? min(root.nickname-width-px * 1px, self.width * 0.2) : 0px;
                             property <bool> tight-header: !self.columns && self.body-width < self.action-width + 180px * root.text-scale;
                             // The tallest header text: name, message size and, when shown, the
@@ -5767,6 +5790,14 @@ export component AppWindow inherits Window {
                                         root.open-thread(message.event-id, message.sender, message.body);
                                     }
                                 }
+                                // Public read receipts at or after this message (room activity).
+                                if message.event-id != "" : IconAction {
+                                    quiet: true; context-hover: message-hover.has-hover;
+                                    width: 28px; height: 26px; icon: "✓✓"; label: "Seen by: who has read up to this message from " + message.sender;
+                                    ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                                    enabled: root.live-session;
+                                    activated => { RoomActivity.show-seen-by(message.event-id, false); }
+                                }
                                 if message-row.pin-action : IconAction {
                                     quiet: !message.pinned; context-hover: message-hover.has-hover;
                                     width: 28px; height: 26px; icon: "Pin";
@@ -5805,6 +5836,11 @@ export component AppWindow inherits Window {
                             root.timeline-jump-passes -= 1;
                             timeline-list.approach-jump();
                         }
+                    }
+                    // Who is typing in this room, or a Mark as read result.
+                    TypingFooter {
+                        muted: root.muted;
+                        text-scale: root.text-scale;
                     }
                     Rectangle {
                         property <length> status-height: root.composer-status-visible ? composer-status.height + 10px : 0px;
@@ -5973,15 +6009,19 @@ export component AppWindow inherits Window {
                                             }
                                         }
                                         init => { root.mention-cursor(false, self.caret-bytes, self.anchor-bytes, self.composing); }
+                                        // Focus ends when the window stops being active (room activity).
+                                        changed has-focus => { RoomActivity.composer-focus(false, self.has-focus); }
                                         key-pressed(event) => {
                                             root.composer-caret = self.caret-bytes; root.composer-anchor = self.anchor-bytes; root.composer-preedit = self.composing;
                                             if !event.modifiers.control && !event.modifiers.meta && !event.modifiers.alt && !event.modifiers.shift && root.mention-key(false, event.text) { accept } else { reject }
                                         }
                                         edited => {
                                             root.composer-edited(root.composer-text);
+                                            RoomActivity.composer-changed(false, root.composer-text != "");
                                             root.mention-cursor(false, self.caret-bytes, self.anchor-bytes, self.composing);
                                         }
                                         accepted => {
+                                            RoomActivity.composer-sent(false);
                                             // An empty composer sends the room's ready attachments.
                                             if root.composer-sends-attachments { root.send-attachments(); } else { root.send-message(root.composer-text); }
                                         }
@@ -5992,6 +6032,7 @@ export component AppWindow inherits Window {
                                     surface: transparent; hover-surface: root.hover;
                                     activated => {
                                         root.composer-caret = message-input.caret-bytes; root.composer-anchor = message-input.anchor-bytes; root.composer-preedit = message-input.composing;
+                                        RoomActivity.composer-sent(false);
                                         if root.composer-sends-attachments { root.send-attachments(); } else { root.send-message(root.composer-text); }
                                     }
                                 }
@@ -8096,6 +8137,77 @@ export component AppWindow inherits Window {
                             revealed(id) => { root.settings-revealed-id = id; }
                         }
                         Rectangle { height: StyleTokens.line-width; background: root.divider; }
+                        Text { text: "Typing and read receipts"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
+                        Text { text: "Nothing here is shared until you turn it on. Typing indicators and public read receipts are seen by everyone in the room. Read tracking and Mark as read (in a room's menu) move your own read position on your server, privately unless public read receipts are on, so unread counts match on your other devices."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                        ActionRect {
+                            height: 68px; border-radius: StyleTokens.radius * 1; background: root.elevated; focus-color: root.accent;
+                            property <int> reveal-request: root.reveal-request("privacy.activity");
+                            changed reveal-request => {
+                                if self.reveal-request > 0 {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    self.focus();
+                                    if self.has-focus { root.settings-revealed-id = "privacy.activity"; }
+                                }
+                            }
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
+                            label: "Send typing indicators";
+                            accessible-checkable: true; accessible-checked: RoomActivity.send-typing;
+                            activated => { RoomActivity.set-preference(0, !RoomActivity.send-typing); }
+                            HorizontalLayout {
+                                padding-left: 16px; padding-right: 16px; spacing: 12px;
+                                VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 3px;
+                                    Text { text: "Send typing indicators"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+                                    Text { text: RoomActivity.send-typing ? "On · people in the room see when you are typing" : "Off"; color: root.muted; font-size: 11px * root.text-scale; overflow: elide; }
+                                }
+                                Text { text: RoomActivity.send-typing ? "✓" : "○"; color: root.accent; font-size: 20px * root.text-scale; vertical-alignment: center; }
+                            }
+                        }
+                        ActionRect {
+                            height: 68px; border-radius: StyleTokens.radius * 1; background: root.elevated; focus-color: root.accent;
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
+                            label: "Send public read receipts";
+                            accessible-checkable: true; accessible-checked: RoomActivity.public-receipts;
+                            activated => { RoomActivity.set-preference(1, !RoomActivity.public-receipts); }
+                            HorizontalLayout {
+                                padding-left: 16px; padding-right: 16px; spacing: 12px;
+                                VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 3px;
+                                    Text { text: "Send public read receipts"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+                                    Text { text: RoomActivity.public-receipts ? "On · people in the room see how far you have read" : "Off · read receipts stay private to your server"; color: root.muted; font-size: 11px * root.text-scale; overflow: elide; }
+                                }
+                                Text { text: RoomActivity.public-receipts ? "✓" : "○"; color: root.accent; font-size: 20px * root.text-scale; vertical-alignment: center; }
+                            }
+                        }
+                        ActionRect {
+                            height: 68px; border-radius: StyleTokens.radius * 1; background: root.elevated; focus-color: root.accent;
+                            // Keyboard focus and search share the same bounded reveal.
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
+                            label: "Mark messages read as I view them";
+                            accessible-checkable: true; accessible-checked: RoomActivity.read-tracking;
+                            activated => { RoomActivity.set-preference(2, !RoomActivity.read-tracking); }
+                            HorizontalLayout {
+                                padding-left: 16px; padding-right: 16px; spacing: 12px;
+                                VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 3px;
+                                    Text { text: "Mark messages read as I view them"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+                                    Text { text: RoomActivity.read-tracking ? "On · the newest message you view in an active window" : "Off · only Mark as read moves your read position"; color: root.muted; font-size: 11px * root.text-scale; overflow: elide; }
+                                }
+                                Text { text: RoomActivity.read-tracking ? "✓" : "○"; color: root.accent; font-size: 20px * root.text-scale; vertical-alignment: center; }
+                            }
+                        }
+                        Rectangle { height: StyleTokens.line-width; background: root.divider; }
                         Text { text: "Accounts"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Select your account in the bottom-left corner to switch instantly."; color: root.muted; font-size: 13px * root.text-scale; wrap: word-wrap; }
                         Rectangle { height: StyleTokens.line-width; background: root.divider; }
@@ -9203,6 +9315,11 @@ export component AppWindow inherits Window {
                     if root.thread-root-id != "" : thread-scroll := ScrollView {
                         vertical-stretch: 1;
                         horizontal-scrollbar-policy: always-off;
+                        // Automatic read receipts (room activity) for this thread.
+                        property <bool> at-bottom: self.content-height <= self.visible-height + 1px || -self.content-y >= self.content-height - self.visible-height - 24px;
+                        property <string> read-key: root.live-session && root.page == 0 && root.show-side-panel && root.side-panel-tab == 1 && self.at-bottom && root.thread-messages.length > 0 ? root.thread-messages[root.thread-messages.length - 1].event-id : "";
+                        changed read-key => { RoomActivity.read-view(true, self.read-key); }
+                        init => { RoomActivity.read-view(true, self.read-key); }
                         VerticalLayout {
                             width: parent.width;
                             padding: 12px;
@@ -9283,6 +9400,14 @@ export component AppWindow inherits Window {
                                             font-size: root.timestamp-font-px; vertical-alignment: top; horizontal-stretch: 0; accessible-label: thread-reply.time-label;
                                         }
                                         Rectangle { horizontal-stretch: 1; min-width: 0px; }
+                                        // This thread's read receipts at or after the reply (room activity).
+                                        if reply.event-id != "" : IconAction {
+                                            quiet: true;
+                                            width: 24px; height: 20px; icon: "✓✓"; label: "Seen in this thread: who has read up to this reply from " + reply.sender;
+                                            ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                                            enabled: root.live-session;
+                                            activated => { RoomActivity.show-seen-by(reply.event-id, true); }
+                                        }
                                     }
                                     StyledText {
                                         text: reply.rich-body;
@@ -9368,7 +9493,9 @@ export component AppWindow inherits Window {
                                     property <string> thread-context: root.thread-root-id;
                                     init => { self.focus(); root.mention-cursor(true, self.caret-bytes, self.anchor-bytes, self.composing); }
                                     changed thread-context => { if self.thread-context != "" { self.focus(); } }
-                                    accepted => { if !root.thread-send-pending { root.send-thread-message(root.thread-composer-text); } }
+                                    // Focus ends when the window stops being active (room activity).
+                                    changed has-focus => { RoomActivity.composer-focus(true, self.has-focus); }
+                                    accepted => { if !root.thread-send-pending { RoomActivity.composer-sent(true); root.send-thread-message(root.thread-composer-text); } }
                                     caret-changed => { root.mention-cursor(true, self.caret-bytes, self.anchor-bytes, self.composing); }
                                     property <int> composer-focus-request: root.composer-focus-request;
                                     changed composer-focus-request => { if root.composer-focus-thread { self.focus(); } }
@@ -9384,7 +9511,7 @@ export component AppWindow inherits Window {
                                             root.thread-caret = self.caret-bytes; root.thread-anchor = self.anchor-bytes; root.thread-preedit = self.composing;
                                             if !event.modifiers.control && !event.modifiers.meta && !event.modifiers.alt && !event.modifiers.shift && root.mention-key(true, event.text) { accept } else { reject }
                                     }
-                                    edited => { root.thread-composer-edited(self.text); root.mention-cursor(true, self.caret-bytes, self.anchor-bytes, self.composing); }
+                                    edited => { root.thread-composer-edited(self.text); RoomActivity.composer-changed(true, self.text != ""); root.mention-cursor(true, self.caret-bytes, self.anchor-bytes, self.composing); }
                                 }
                             }
                             IconAction {
@@ -9420,6 +9547,7 @@ export component AppWindow inherits Window {
                                 surface: transparent; hover-surface: root.hover;
                                 activated => {
                                     root.thread-caret = thread-input.caret-bytes; root.thread-anchor = thread-input.anchor-bytes; root.thread-preedit = thread-input.composing;
+                                    RoomActivity.composer-sent(true);
                                     root.send-thread-message(root.thread-composer-text);
                                 }
                             }
@@ -10182,6 +10310,13 @@ export component AppWindow inherits Window {
         }
     }
 
+    // Who has read an event (room activity). Modal; Rust fills the rows.
+    if RoomActivity.seen-open : SeenByDialog {
+        x: 0px; y: 0px; width: root.width; height: root.height;
+        ink: root.ink; muted: root.muted; accent: root.accent; surface: root.dialog-surface;
+        scrim: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
+        text-scale: root.text-scale;
+    }
     if root.room-actions-open : FocusScope {
         focus-on-tab-navigation: false;
         init => { room-action-input.focus(); }

@@ -14,6 +14,10 @@ pub use media::{
     AttachmentKind, AttachmentMetadata, AttachmentSendUpdate, DownloadedAttachment,
     ImagePreviewDownload, MAX_ATTACHMENT_BYTES, MAX_IMAGE_PREVIEW_BYTES, QueuedAttachment,
 };
+mod room_activity;
+pub use room_activity::{
+    ActivityMember, MAX_RECEIPT_EVENTS, Reader, ReceiptScope, SeenBy, Typing, TypingWatch,
+};
 mod image_packs;
 pub use image_packs::{
     MAX_STICKER_PREVIEW_BYTES, PendingSticker, PublicMediaConsent, StickerCatalog, StickerEntry,

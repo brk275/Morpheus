@@ -3577,6 +3577,8 @@ fn apply_snapshot(
         ui.set_member_confirm_open(false);
         // Pinned rows, flags and filter text belong to the previous room.
         ui.invoke_reset_pinned_messages();
+        // So do typing names, Seen-by rows and read receipt state.
+        crate::room_activity::clear(ui);
         crate::reset_attachment_view(ui);
         // All-room results stay with their account across rooms, which is
         // how opening a hit in another room keeps the list it came from.
@@ -3786,6 +3788,8 @@ fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::Securi
     // So is who is in this account's voice rooms.
     #[cfg(feature = "native-calls")]
     crate::voice_rosters::clear(ui);
+    // Typing names and read receipts are account-private too.
+    crate::room_activity::clear(ui);
     ui.set_room_actions_open(false);
     ui.set_room_action_busy(false);
     ui.set_room_action_error("".into());

@@ -635,6 +635,24 @@ no_highlights = true  # local highlight words do not mark it
 
 A room appears only while one of its switches is on, at most 256 rooms per
 account; unknown keys and invalid room IDs are rejected like any other field.
+## Typing and read receipts
+
+**Settings › Typing and read receipts** (search for "typing" or "read
+receipts") decides what other people learn about your activity. Morpheus shares
+none of it until you turn it on:
+
+```toml
+[activity]
+send_typing = false           # tell a room while you are typing
+public_read_receipts = false  # others see how far you have read (m.read)
+read_tracking = false         # move your read position as you view messages
+```
+
+With public read receipts off, read tracking and **Mark as read** (in a room's
+menu) still move your own read position, privately (`m.read.private` and the
+fully-read marker), so unread counts match on your other devices. These are
+global settings; there are no per-room or per-account overrides. See
+[ROOM_ACTIVITY.md](ROOM_ACTIVITY.md).
 
 ## Theme files
 

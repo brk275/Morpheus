@@ -1514,6 +1514,24 @@ pub const FIELDS: &[FieldSpec] = &[
         "Panes shown as a narrow strip with a restore control.",
     ),
     field(
+        "activity.send_typing",
+        Bool,
+        "false",
+        "Tell rooms while you are typing.",
+    ),
+    field(
+        "activity.public_read_receipts",
+        Bool,
+        "false",
+        "Public read receipts others can see; otherwise private.",
+    ),
+    field(
+        "activity.read_tracking",
+        Bool,
+        "false",
+        "Mark the newest message shown in a focused, live timeline as read.",
+    ),
+    field(
         "notifications.enabled",
         Bool,
         "true",
@@ -2134,6 +2152,24 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
             "silence room",
         ],
     )),
+    target(
+        "privacy.activity",
+        "Privacy",
+        "Settings › Typing and read receipts",
+        "Typing and read receipts",
+        "Send typing indicators, public read receipts, and private automatic read tracking.",
+        &[
+            "send typing indicators",
+            "typing indicator",
+            "public read receipts",
+            "private read receipts",
+            "read receipt",
+            "seen",
+            "mark as read",
+            "read marker",
+            "read tracking",
+        ],
+    ),
     accounts(
         target(
             "accounts.manage",
