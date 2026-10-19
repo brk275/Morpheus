@@ -533,7 +533,9 @@ fn tab_to_control(ui: &AppWindow, label: &str) {
     // Walk the real current tab order without activating intervening controls.
     // A missing FocusScope must fail instead of silently invoking the callback.
     let window = WindowInner::from_pub(ui.window());
-    for _ in 0..160 {
+    // One full cycle of the Settings page (about 180 stops with the metric,
+    // sender color and shortcut editors) plus margin; every step is checked.
+    for _ in 0..400 {
         if focused_control_has_label(ui, label) {
             return;
         }
@@ -2547,6 +2549,33 @@ async fn assert_interaction_states_and_sender_palette(ui: &AppWindow, directory:
     settle(ui).await;
     assert_eq!(senders().unwrap(), vec!["#FFFF00".to_owned()]);
     assert!(!rows().row_data(0).unwrap().readable);
+    // Alpha is blended over the background before measuring, and kept.
+    ui.invoke_sender_color_edited(0, "#00000020".into());
+    settle(ui).await;
+    assert_eq!(senders().unwrap(), vec!["#00000020".to_owned()]);
+    assert!(!rows().row_data(0).unwrap().readable);
+    ui.invoke_sender_color_edited(0, "#000000".into());
+    settle(ui).await;
+    assert!(rows().row_data(0).unwrap().readable);
+    // In the narrowest window at 200% text the hex field keeps a usable width
+    // on its own line, and the row's actions stay inside the window.
+    ui.set_page(1);
+    ui.set_font_scale_percent(200);
+    ui.window().set_size(slint::PhysicalSize::new(940, 900));
+    settle(ui).await;
+    let hex = control_bounds(ui, "Sender color 1 hex, #RRGGBB or #RRGGBBAA");
+    let remove = control_bounds(ui, "Remove sender color 1");
+    assert_eq!((hex.len(), remove.len()), (1, 1));
+    assert!(hex[0].right - hex[0].left >= 140.0, "{:?}", hex[0]);
+    assert!(remove[0].top >= hex[0].bottom, "{:?} {:?}", hex[0], remove[0]);
+    assert!(remove[0].right <= window_size(ui).0, "{:?}", remove[0]);
+    ui.set_font_scale_percent(100);
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    settle(ui).await;
+    // At the default size one line holds the field and its actions.
+    let hex = control_bounds(ui, "Sender color 1 hex, #RRGGBB or #RRGGBBAA");
+    let remove = control_bounds(ui, "Remove sender color 1");
+    assert!(remove[0].top < hex[0].bottom, "{:?} {:?}", hex[0], remove[0]);
     ui.invoke_sender_colors_reset();
     settle(ui).await;
     assert_eq!(senders(), None);
@@ -2636,6 +2665,24 @@ async fn assert_pane_composition_and_motion(ui: &AppWindow) {
         "spacious room rows: {:?}",
         row[0]
     );
+
+    // With combined lists, Direct messages first is disabled; the search
+    // destination is still a live control, the selected details-panel side.
+    config.layout.group_direct_messages = false;
+    apply_config(ui, &config, None);
+    ui.set_settings_revealed_id("".into());
+    settle(ui).await;
+    assert!(crate::settings_search::reveal(ui, "layout.composition"));
+    settle(ui).await;
+    assert_eq!(ui.get_settings_revealed_id(), "layout.composition");
+    assert!(focused_control_has_label(
+        ui,
+        "Details panel on the Left of the conversation, selected"
+    ));
+    config.layout.group_direct_messages = true;
+    apply_config(ui, &config, None);
+    ui.set_page(0);
+    settle(ui).await;
 
     // Fades are opt-in, and Reduce motion makes them immediate.
     let tokens = ui.global::<crate::StyleTokens>();
@@ -2800,7 +2847,7 @@ async fn assert_shortcut_customization(ui: &AppWindow, directory: &std::path::Pa
     // A modifier on its own keeps waiting for the key.
     assert!(ui.invoke_shortcut_recorded(
         "toggle_details_panel".into(),
-        SharedString::from(Key::Shift),
+        slint::SharedString::from(Key::Shift),
         false,
         false,
         true,
@@ -2889,7 +2936,7 @@ async fn assert_shortcut_customization(ui: &AppWindow, directory: &std::path::Pa
     crate::navigation::apply_room_order(ui);
     ui.set_active_room_id("!a".into());
     assert!(ui.invoke_dispatch_shortcut(
-        SharedString::from(Key::DownArrow),
+        slint::SharedString::from(Key::DownArrow),
         false,
         true,
         true,

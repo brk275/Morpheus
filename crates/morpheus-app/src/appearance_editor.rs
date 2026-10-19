@@ -677,6 +677,12 @@ fn reproject(ui: &AppWindow, refill: bool) {
     let moved = SESSION.with(|session| {
         let mut session = session.borrow_mut();
         let moved = session.view.as_ref() != Some(&view);
+        // Undo steps and a Reset all snapshot never cross active accounts,
+        // in either scope.
+        if session.view.as_ref().is_some_and(|(active, _)| *active != view.0) {
+            session.previous.clear();
+            session.reset_all = ResetAll::Idle;
+        }
         session.view = Some(view);
         moved
     });

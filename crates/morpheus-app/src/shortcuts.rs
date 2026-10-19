@@ -12,6 +12,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 use morpheus_config::{
     Config, ConfigStore, Shortcut, ShortcutAction, ShortcutKey, ShortcutModifiers,
@@ -40,6 +41,10 @@ thread_local! {
     // Slint callbacks and projections run on the UI thread only.
     static ACTIVE: RefCell<Vec<(ShortcutAction, Shortcut)>> = const { RefCell::new(Vec::new()) };
     static EDITOR: RefCell<Editor> = RefCell::new(Editor::default());
+    // Rows update in place while the shown actions are unchanged, so a
+    // focused field or button in the list keeps its focus after a save or a
+    // reload; a different set of actions replaces them.
+    static ROWS: Rc<VecModel<ShortcutItem>> = Rc::new(VecModel::default());
 }
 
 pub fn apply_config(ui: &AppWindow, config: &Config) {
@@ -117,7 +122,20 @@ fn project(ui: &AppWindow) {
                     }
                 })
                 .collect();
-        ui.set_shortcut_items(ModelRc::new(VecModel::from(items)));
+        ROWS.with(|model| {
+            let same_actions = model.row_count() == items.len()
+                && model.iter().zip(&items).all(|(shown, item)| shown.action == item.action);
+            if same_actions {
+                for (index, item) in items.into_iter().enumerate() {
+                    if model.row_data(index).as_ref() != Some(&item) {
+                        model.set_row_data(index, item);
+                    }
+                }
+            } else {
+                model.set_vec(items);
+            }
+            ui.set_shortcut_items(ModelRc::from(model.clone()));
+        });
         ui.set_shortcut_message(editor.message.as_str().into());
         ui.set_shortcut_message_error(editor.error);
         ui.set_shortcut_can_undo(editor.undo.is_some());
@@ -450,8 +468,15 @@ fn run(ui: &AppWindow, action: ShortcutAction) -> bool {
             ui.invoke_open_room(room);
         }
         ShortcutAction::GoHome => ui.invoke_go_home(),
-        ShortcutAction::OpenSettings => ui.set_page(1),
-        ShortcutAction::SearchSettings => ui.invoke_focus_settings_search(),
+        // Like the Settings entries, which also refresh the security status.
+        ShortcutAction::OpenSettings => {
+            ui.set_page(1);
+            ui.invoke_open_security();
+        }
+        ShortcutAction::SearchSettings => {
+            ui.invoke_focus_settings_search();
+            ui.invoke_open_security();
+        }
         ShortcutAction::FocusComposer if in_room && ui.get_page() == 0 => {
             ui.invoke_focus_composer(false)
         }

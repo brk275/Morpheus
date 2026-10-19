@@ -692,11 +692,14 @@ a hint. Colors can be moved earlier or later, removed (one always remains) or
 added up to 16. Undo restores the previous palette only while the file still
 holds the palette you saved, and **Use theme colors** removes your palette.
 Colors with less than 4.5:1 contrast against the conversation background are
-marked *Low contrast*; they are never changed for you, including in the high
-contrast palette. Each sender keeps the slot derived from their Matrix user ID,
-so a name has the same color in every room and account; nothing about senders is
-stored. With no palette at all, names use each sender's identity color, and the
-first edit starts from those colors.
+marked *Low contrast*. Contrast is measured as the color is drawn: its alpha is
+blended over the background first, so a mostly transparent color is reported
+even when its opaque form would be readable. Colors are never changed for you,
+including their alpha and in the high contrast palette. Each sender keeps the
+slot derived from their Matrix user ID, so a name has the same color in every
+room and account; nothing about senders is stored. With no palette at all,
+names use each sender's identity color, and the first edit starts from those
+colors.
 
 Old eleven-token themes keep their previous per-control fallbacks. Omitting a
 role restores that control's existing color; it does not borrow the value from

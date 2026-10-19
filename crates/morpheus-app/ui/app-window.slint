@@ -1618,8 +1618,11 @@ component ShortcutEditor inherits VerticalLayout {
                     } else { reject }
                 }
                 // Clicking elsewhere ends recording, which pauses every shortcut.
-                focus-lost => {
-                    if root.recording == item.action { root.cancel-recording(); }
+                // Switching windows keeps it, and focus comes back here.
+                focus-lost(reason) => {
+                    if reason != FocusReason.window-activation && root.recording == item.action {
+                        root.cancel-recording();
+                    }
                 }
                 Rectangle {
                     background: root.surface;
@@ -1662,13 +1665,14 @@ component ShortcutEditor inherits VerticalLayout {
                 text: "Default"; label: "Use the default shortcut for " + item.label + (item.default-binding == "" ? "" : ", " + item.default-binding);
                 ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
                 outline: root.outline; text-scale: root.text-scale;
-                activated => { root.use-default(item.action); }
+                // This button disappears once used; keep focus in the row.
+                activated => { typed-field.focus(); root.use-default(item.action); }
             }
             if item.binding != "" : TextAction {
                 text: "Disable"; label: "Disable the shortcut for " + item.label;
                 ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
                 outline: root.outline; text-scale: root.text-scale;
-                activated => { root.disable(item.action); }
+                activated => { typed-field.focus(); root.disable(item.action); }
             }
         }
     }
@@ -1685,7 +1689,8 @@ component ShortcutEditor inherits VerticalLayout {
             text: "Undo"; label: "Undo the last shortcut change";
             ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
             outline: root.outline; text-scale: root.text-scale;
-            activated => { root.undo(); }
+            // Undo disappears once used; focus returns to the filter.
+            activated => { filter-input.focus(); root.undo(); }
         }
         TextAction {
             text: "Restore all defaults"; label: "Restore every shortcut to its default";
@@ -2287,12 +2292,69 @@ component MetricValueEditor inherits VerticalLayout {
     }
 }
 
+// The sample name of one sender color, drawn on the conversation background.
+component SenderColorSample inherits Rectangle {
+    in property <SenderColorRow> row;
+    in property <color> canvas;
+    in property <color> outline;
+    in property <string> sample-font-family;
+    in property <float> text-scale: 1;
+    height: max(34px, 26px * root.text-scale);
+    background: root.canvas; border-radius: StyleTokens.radius * 0.6;
+    border-width: StyleTokens.line-width; border-color: root.outline;
+    Text {
+        x: 8px; width: parent.width - 16px; height: parent.height;
+        text: "Sample name " + (root.row.index + 1); color: root.row.swatch;
+        font-family: root.sample-font-family; font-size: 12px * root.text-scale; font-weight: 650;
+        vertical-alignment: center; overflow: elide;
+        accessible-label: "Sample of sender color " + (root.row.index + 1) + (root.row.readable ? "" : ", low contrast on the conversation background");
+    }
+}
+
+// The contrast note and the order and remove actions of one sender color.
+component SenderColorActions inherits HorizontalLayout {
+    in property <SenderColorRow> row;
+    in property <int> count;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> surface;
+    in property <color> hover-surface;
+    in property <float> text-scale: 1;
+    callback moved(int, int);
+    callback removed(int);
+    spacing: 8px;
+    if !root.row.readable : Text {
+        text: "Low contrast"; color: root.muted; font-size: 10px * root.text-scale; vertical-alignment: center;
+    }
+    IconAction {
+        icon: "▲"; label: "Move sender color " + (root.row.index + 1) + " earlier";
+        ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
+        enabled: root.row.index > 0;
+        activated => { root.moved(root.row.index, -1); }
+    }
+    IconAction {
+        icon: "▼"; label: "Move sender color " + (root.row.index + 1) + " later";
+        ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
+        enabled: root.row.index < root.count - 1;
+        activated => { root.moved(root.row.index, 1); }
+    }
+    IconAction {
+        icon: "×"; label: "Remove sender color " + (root.row.index + 1);
+        ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
+        enabled: root.count > 1;
+        activated => { root.removed(root.row.index); }
+    }
+}
+
 // The sender-name palette: one row per slot with a sample name drawn on the
 // conversation background, its hex value, reordering and removal. A valid
 // value saves at once; partial input only hints. Low contrast is reported
 // beside the sample and never corrected.
 component SenderPaletteEditor inherits VerticalLayout {
     in property <[SenderColorRow]> rows;
+    // Narrow Settings or large text: each row puts its hex field on a line
+    // of its own so it stays wide enough to edit.
+    in property <bool> stacked: false;
     in property <string> source;
     in property <bool> custom;
     in property <bool> can-undo;
@@ -2318,63 +2380,62 @@ component SenderPaletteEditor inherits VerticalLayout {
     spacing: 6px;
     alignment: start;
     Text { text: root.source; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
-    for row in root.rows : HorizontalLayout {
-        spacing: 8px;
+    for row in root.rows : VerticalLayout {
+        spacing: 6px;
         // Typing replaces the field's binding to the row, so an in-place
         // change (move, undo, reload) is copied in unless the field is being
         // edited, and a value left half typed returns to the saved one.
         property <string> saved-hex: row.hex;
         changed saved-hex => { if !hex-field.has-focus { hex-field.text = self.saved-hex; } }
-        Rectangle {
-            width: 128px * root.text-scale; height: max(34px, 26px * root.text-scale);
-            background: root.canvas; border-radius: StyleTokens.radius * 0.6;
-            border-width: StyleTokens.line-width; border-color: root.outline;
-            Text {
-                x: 8px; width: parent.width - 16px; height: parent.height;
-                text: "Sample name " + (row.index + 1); color: row.swatch;
-                font-family: root.sample-font-family; font-size: 12px * root.text-scale; font-weight: 650;
-                vertical-alignment: center; overflow: elide;
-                accessible-label: "Sample of sender color " + (row.index + 1) + (row.readable ? "" : ", low contrast on the conversation background");
+        HorizontalLayout {
+            spacing: 8px;
+            if !root.stacked : SenderColorSample {
+                width: 128px * root.text-scale;
+                row: row; canvas: root.canvas; outline: root.outline;
+                sample-font-family: root.sample-font-family; text-scale: root.text-scale;
+            }
+            Rectangle {
+                horizontal-stretch: 1; height: max(34px, 28px * root.text-scale);
+                background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.surface;
+                border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.7;
+                border-width: hex-field.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
+                border-color: hex-field.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent)
+                    : StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.outline;
+                hex-field := ThemedTextInput {
+                    x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
+                    text: row.hex; single-line: true;
+                    color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center;
+                    accessible-label: "Sender color " + (row.index + 1) + " hex, #RRGGBB or #RRGGBBAA";
+                    changed has-focus => { if !self.has-focus { self.text = row.hex; } }
+                    accessible-description: row.readable ? "" : "Low contrast on the conversation background";
+                    edited => { root.edited(row.index, self.text); }
+                    accepted => { root.edited(row.index, self.text); }
+                }
+            }
+            if !root.stacked : SenderColorActions {
+                row: row; count: root.rows.length;
+                ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+                text-scale: root.text-scale;
+                moved(index, direction) => { root.moved(index, direction); }
+                removed(index) => { root.removed(index); }
             }
         }
-        Rectangle {
-            horizontal-stretch: 1; height: max(34px, 28px * root.text-scale);
-            background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.surface;
-            border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.7;
-            border-width: hex-field.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
-            border-color: hex-field.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent)
-                : StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.outline;
-            hex-field := ThemedTextInput {
-                x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
-                text: row.hex; single-line: true;
-                color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center;
-                accessible-label: "Sender color " + (row.index + 1) + " hex, #RRGGBB or #RRGGBBAA";
-                changed has-focus => { if !self.has-focus { self.text = row.hex; } }
-                accessible-description: row.readable ? "" : "Low contrast on the conversation background";
-                edited => { root.edited(row.index, self.text); }
-                accepted => { root.edited(row.index, self.text); }
+        // Narrow Settings or large text: the hex field keeps the whole first
+        // line, and the sample and actions share the second.
+        if root.stacked : HorizontalLayout {
+            spacing: 8px;
+            SenderColorSample {
+                horizontal-stretch: 1; min-width: 48px; preferred-width: 128px * root.text-scale;
+                row: row; canvas: root.canvas; outline: root.outline;
+                sample-font-family: root.sample-font-family; text-scale: root.text-scale;
             }
-        }
-        if !row.readable : Text {
-            text: "Low contrast"; color: root.muted; font-size: 10px * root.text-scale; vertical-alignment: center;
-        }
-        IconAction {
-            icon: "▲"; label: "Move sender color " + (row.index + 1) + " earlier";
-            ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
-            enabled: row.index > 0;
-            activated => { root.moved(row.index, -1); }
-        }
-        IconAction {
-            icon: "▼"; label: "Move sender color " + (row.index + 1) + " later";
-            ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
-            enabled: row.index < root.rows.length - 1;
-            activated => { root.moved(row.index, 1); }
-        }
-        IconAction {
-            icon: "×"; label: "Remove sender color " + (row.index + 1);
-            ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
-            enabled: root.rows.length > 1;
-            activated => { root.removed(row.index); }
+            SenderColorActions {
+                row: row; count: root.rows.length;
+                ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+                text-scale: root.text-scale;
+                moved(index, direction) => { root.moved(index, direction); }
+                removed(index) => { root.removed(index); }
+            }
         }
     }
     if root.hint != "" : Text {
@@ -2385,6 +2446,7 @@ component SenderPaletteEditor inherits VerticalLayout {
         spacing: 8px; alignment: start;
         add-color := TextAction {
             text: "Add color"; label: "Add a sender color";
+            wrap-caption: root.stacked;
             enabled: root.rows.length < 16;
             ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
             outline: root.outline; text-scale: root.text-scale;
@@ -2392,12 +2454,14 @@ component SenderPaletteEditor inherits VerticalLayout {
         }
         if root.can-undo : TextAction {
             text: "Undo"; label: "Undo the last change to sender colors";
+            wrap-caption: root.stacked;
             ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
             outline: root.outline; text-scale: root.text-scale;
             activated => { root.undo(); }
         }
         if root.custom : TextAction {
             text: "Use theme colors"; label: "Remove your sender colors and use the theme's";
+            wrap-caption: root.stacked;
             ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
             outline: root.outline; text-scale: root.text-scale;
             activated => { root.reset(); }
@@ -3222,6 +3286,8 @@ export component AppWindow inherits Window {
         root.cancel-room-settings();
         root.close-image-preview();
         if root.page != 1 {
+            // Leaving Settings ends a recording, so shortcuts never stay paused.
+            if root.shortcut-recording != "" { root.shortcut-cancel-recording(); }
             root.security-recovery-input = "";
             root.sas-compared = false;
             root.notification-highlight-error = "";
@@ -5254,6 +5320,12 @@ export component AppWindow inherits Window {
                                     }
                                 }
                                 x: 12px; y: 12px; width: parent.width - 24px;
+                                // One line needs the sample, a usable hex field, the contrast
+                                // note and three actions. Measured from the scroll view (minus
+                                // page padding and this card's inset), which this editor's own
+                                // size never changes, so there is no layout loop.
+                                stacked: settings-scroll.visible-width - 76px
+                                    < (128px + 160px + 70px) * root.text-scale + 3 * StyleTokens.icon-button-size + 40px;
                                 rows: root.sender-color-rows;
                                 source: root.sender-palette-source;
                                 custom: root.sender-palette-custom;
@@ -5825,18 +5897,11 @@ export component AppWindow inherits Window {
                             activated => { root.set-group-direct-messages(!root.group-direct-messages); }
                         }
                         TextAction {
-                            property <int> reveal-request: root.reveal-request("layout.composition");
-                            // Keyboard focus and search share the same bounded reveal.
+                            // Keyboard focus reveals it; search lands on the details-panel
+                            // side below, which is enabled for combined lists too.
                             changed has-focus => {
                                 if self.has-focus {
                                     settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
-                                }
-                            }
-                            changed reveal-request => {
-                                if self.reveal-request > 0 {
-                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
-                                    self.focus();
-                                    if self.has-focus { root.settings-revealed-id = "layout.composition"; }
                                 }
                             }
                             height: 36px * root.text-scale; vertical-stretch: 0;
@@ -5850,6 +5915,21 @@ export component AppWindow inherits Window {
                         HorizontalLayout {
                             spacing: 10px; alignment: start;
                             for side[index] in ["Right", "Left"] : TextAction {
+                                // The search destination for pane order and density: the
+                                // selected side, which is always enabled.
+                                property <int> reveal-request: root.reveal-request("layout.composition");
+                                changed has-focus => {
+                                    if self.has-focus {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    }
+                                }
+                                changed reveal-request => {
+                                    if self.reveal-request > 0 && index == root.details-side {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                        self.focus();
+                                        if self.has-focus { root.settings-revealed-id = "layout.composition"; }
+                                    }
+                                }
                                 height: 36px * root.text-scale; vertical-stretch: 0;
                                 text: side; label: "Details panel on the " + side + " of the conversation" + (root.details-side == index ? ", selected" : "");
                                 ink: root.ink; muted: root.muted; surface: root.details-side == index ? root.hover : root.elevated;

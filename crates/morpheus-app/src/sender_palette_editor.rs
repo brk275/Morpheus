@@ -301,9 +301,26 @@ fn relative_luminance([red, green, blue, _]: [u8; 4]) -> f64 {
     0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue)
 }
 
-/// The WCAG contrast ratio of two opaque colors.
+/// `foreground` drawn over the opaque `background`, as a sample name shows
+/// it: each channel is mixed by the foreground's alpha.
+fn composite([red, green, blue, alpha]: [u8; 4], background: [u8; 4]) -> [u8; 4] {
+    let alpha = f64::from(alpha) / 255.0;
+    let mix =
+        |front: u8, back: u8| (f64::from(front) * alpha + f64::from(back) * (1.0 - alpha)).round();
+    [
+        mix(red, background[0]) as u8,
+        mix(green, background[1]) as u8,
+        mix(blue, background[2]) as u8,
+        u8::MAX,
+    ]
+}
+
+/// The WCAG contrast ratio of `foreground`, composited over the opaque
+/// `background`, against that background. A transparent color is as
+/// readable as the background itself; the stored alpha is never changed.
 fn contrast(foreground: [u8; 4], background: [u8; 4]) -> f64 {
-    let (first, second) = (relative_luminance(foreground), relative_luminance(background));
+    let shown = composite(foreground, background);
+    let (first, second) = (relative_luminance(shown), relative_luminance(background));
     (first.max(second) + 0.05) / (first.min(second) + 0.05)
 }
 
@@ -390,5 +407,27 @@ mod tests {
         assert!((contrast(white, black) - 21.0).abs() < 0.01);
         assert!((contrast(black, white) - 21.0).abs() < 0.01);
         assert!((contrast(white, white) - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn contrast_composites_the_sender_color_over_the_conversation_background() {
+        let black = [0, 0, 0, 255];
+        // Transparent white is invisible on black; opaque white is the maximum.
+        assert!((contrast([255, 255, 255, 0], black) - 1.0).abs() < 0.001);
+        assert!(contrast([255, 255, 255, 0], black) < READABLE_CONTRAST);
+        assert!((contrast([255, 255, 255, 255], black) - 21.0).abs() < 0.01);
+        // Half-transparent white draws as #808080: about 5.3:1, still readable.
+        assert_eq!(composite([255, 255, 255, 128], black), [128, 128, 128, 255]);
+        let half = contrast([255, 255, 255, 128], black);
+        assert!((5.2..5.4).contains(&half), "{half}");
+        assert!(half >= READABLE_CONTRAST);
+        // A quarter-opaque white draws as #404040: about 2:1, reported as low.
+        let quarter = contrast([255, 255, 255, 64], black);
+        assert!((1.9..2.2).contains(&quarter), "{quarter}");
+        assert!(quarter < READABLE_CONTRAST);
+        // Only the composited color counts: the same color at full alpha differs.
+        let white = [255, 255, 255, 255];
+        assert!((contrast([0, 0, 0, 0], white) - 1.0).abs() < 0.001);
+        assert!((contrast([0, 0, 0, 255], white) - 21.0).abs() < 0.01);
     }
 }
