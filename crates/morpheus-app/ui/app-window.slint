@@ -2138,6 +2138,8 @@ export component AppWindow inherits Window {
     in-out property <string> security-recovery-status: "Unknown";
     in-out property <string> security-backup-status: "Unknown";
     in-out property <bool> security-can-enable: false;
+    // Recovery is fully set up and this device is verified.
+    in-out property <bool> security-can-change-key: false;
     in-out property <bool> security-loading: false;
     in-out property <bool> security-busy: false;
     in-out property <string> security-error;
@@ -2469,6 +2471,7 @@ export component AppWindow inherits Window {
     callback open-security();
     callback refresh-security();
     callback enable-recovery();
+    callback change-recovery-key();
     callback recover-account(string);
     callback copy-recovery-key();
     callback dismiss-recovery-key();
@@ -5263,6 +5266,46 @@ export component AppWindow inherits Window {
                                         primary: true; enabled: root.security-can-enable && !root.security-busy && !root.security-loading && root.security-recovery-key == "" && root.sas-stage == 0 && !root.sas-busy;
                                         accessible-label: "Create and reveal a one-time Matrix recovery key";
                                         clicked => { root.enable-recovery(); }
+                                    }
+                                }
+                            }
+                            // Replacing the key is offered only with recovery fully set up on a
+                            // verified device, and always asks first: the old key stops working.
+                            if root.security-can-change-key : change-key-card := Rectangle {
+                                property <bool> confirming: false;
+                                height: change-key-layout.preferred-height; border-radius: 10px; background: root.elevated;
+                                change-key-layout := VerticalLayout {
+                                    padding: 14px; spacing: 8px;
+                                    Text { text: "Change recovery key"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+                                    Text {
+                                        text: change-key-card.confirming
+                                            ? "Your current recovery key will stop working. Morpheus shows the new key once; save it before you close Settings."
+                                            : "Replace a lost or exposed recovery key. This device keeps its access to encrypted history.";
+                                        color: change-key-card.confirming ? root.ink : root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                                        accessible-live-region: polite;
+                                    }
+                                    HorizontalLayout {
+                                        spacing: 8px; alignment: start;
+                                        if !change-key-card.confirming : Button {
+                                            text: root.security-busy ? "Working…" : "Change recovery key";
+                                            enabled: !root.security-busy && !root.security-loading && root.security-recovery-key == "" && root.sas-stage == 0 && !root.sas-busy;
+                                            accessible-label: "Replace the Matrix recovery key";
+                                            clicked => { change-key-card.confirming = true; }
+                                        }
+                                        if change-key-card.confirming : Button {
+                                            text: "Replace key"; primary: true;
+                                            enabled: !root.security-busy && !root.security-loading && root.security-recovery-key == "" && root.sas-stage == 0 && !root.sas-busy;
+                                            accessible-label: "Confirm replacing the Matrix recovery key";
+                                            clicked => {
+                                                change-key-card.confirming = false;
+                                                root.change-recovery-key();
+                                            }
+                                        }
+                                        if change-key-card.confirming : Button {
+                                            text: "Keep current key";
+                                            accessible-label: "Keep the current Matrix recovery key";
+                                            clicked => { change-key-card.confirming = false; }
+                                        }
                                     }
                                 }
                             }

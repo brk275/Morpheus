@@ -9,17 +9,21 @@ use std::time::Duration;
 use futures_util::{StreamExt, stream::BoxStream};
 use matrix_sdk::{
     Client,
-    encryption::verification::{SasVerification, VerificationRequest},
+    encryption::{
+        recovery::RecoveryState,
+        verification::{SasVerification, VerificationRequest},
+    },
     ruma::{
         OwnedDeviceId,
         events::key::verification::{VerificationMethod, cancel::CancelCode},
     },
 };
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::{
-    AccountManager, MatrixCoreError, Result, VerificationInfo, find_sas, find_verification_request,
-    parse_user_id, selected_loaded_for, verification_info,
+    AccountManager, MatrixCoreError, RecoveryKey, Result, VerificationInfo, find_sas,
+    find_verification_request, parse_user_id, selected_loaded_for, verification_info,
 };
 
 /// Bound for one device-list snapshot shown in Settings.
@@ -110,6 +114,33 @@ impl VerificationSnapshot {
 }
 
 impl AccountManager {
+    /// Replace the recovery key of the account the UI showed. Offered only
+    /// while recovery is fully set up on this device (all cross-signing keys
+    /// and the backup key are here), so every secret moves to the new key.
+    /// The new key is returned only here and the previous key stops working;
+    /// callers keep the account fixed until the person saved it.
+    pub async fn change_recovery_key_for(&self, expected_account_id: &str) -> Result<RecoveryKey> {
+        let client = {
+            let state = self.state.lock().await;
+            selected_loaded_for(&state, expected_account_id)?
+                .client
+                .clone()
+        };
+        let recovery = client.encryption().recovery();
+        if recovery.state() != RecoveryState::Enabled {
+            return Err(MatrixCoreError::Sdk(
+                "Recovery is not fully set up on this device.".into(),
+            ));
+        }
+        let key = recovery
+            .reset_key()
+            .await
+            .map_err(|_| MatrixCoreError::Sdk("The recovery key could not be changed.".into()))?;
+        Ok(RecoveryKey {
+            secret: Zeroizing::new(key),
+        })
+    }
+
     /// This account's signed-in devices and their trust. The server's device
     /// list decides which devices exist; the crypto store decides trust. When
     /// the server list is unavailable, known non-deleted crypto devices are

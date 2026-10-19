@@ -183,6 +183,13 @@ async fn active_account_is(live: &LiveUi, account_id: &str) -> bool {
         .is_some_and(|account| account.id == account_id)
 }
 
+/// Only a fully set-up recovery on a verified device holds every secret the
+/// new key must protect.
+fn can_change_key(info: SecurityInfo) -> bool {
+    info.recovery == RecoveryStatus::Enabled
+        && info.device_verification == DeviceVerificationStatus::Verified
+}
+
 fn status_labels(info: SecurityInfo) -> (&'static str, &'static str, &'static str, bool) {
     let device = match info.device_verification {
         DeviceVerificationStatus::Unknown => "Checking",
@@ -239,6 +246,7 @@ fn recovery_result(status: Option<SecurityInfo>) -> (bool, &'static str) {
 }
 
 fn apply_status(ui: &AppWindow, info: SecurityInfo) {
+    ui.set_security_can_change_key(can_change_key(info));
     let (device, recovery, backup, can_enable) = status_labels(info);
     ui.set_security_device_status(device.into());
     ui.set_security_recovery_status(recovery.into());
@@ -261,6 +269,7 @@ pub(crate) fn clear_ui(ui: &AppWindow, gate: &SecurityGate) {
     ui.set_security_recovery_status("Unknown".into());
     ui.set_security_backup_status("Unknown".into());
     ui.set_security_can_enable(false);
+    ui.set_security_can_change_key(false);
     ui.set_security_loading(false);
     ui.set_security_busy(false);
     ui.set_security_error("".into());
@@ -483,6 +492,92 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
     });
 
     let weak = ui.as_weak();
+    let change_live = live.clone();
+    let change_handle = handle.clone();
+    let change_gate = live.security_gate.clone();
+    ui.on_change_recovery_key(move || {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        if window.get_security_busy()
+            || !window.get_live_session()
+            || window.get_sas_stage() != 0
+            || window.get_sas_busy()
+            || !window.get_security_can_change_key()
+            || !window.get_security_recovery_key().is_empty()
+        {
+            return;
+        }
+        let account_id = window.get_active_account_local_id().to_string();
+        if account_id.is_empty() {
+            return;
+        }
+        // The same reservation as recovery setup: the account cannot change
+        // and the window cannot close until the new key is saved.
+        if !change_gate.begin() {
+            return;
+        }
+        let operation = next_operation(&window);
+        window.set_security_busy(true);
+        window.set_security_error("".into());
+        window.set_security_notice("Keep Morpheus open while the key is replaced.".into());
+        let live = change_live.clone();
+        let gate = change_gate.clone();
+        let weak = weak.clone();
+        change_handle.spawn(async move {
+            let _transition = live.account_transition.lock().await;
+            if !active_account_is(&live, &account_id).await {
+                gate.reset();
+                let _ = weak.upgrade_in_event_loop(move |window| {
+                    if same_view(&window, &account_id, operation) {
+                        window.set_security_busy(false);
+                        window.set_security_notice("".into());
+                        window.set_security_error(
+                            "Account changed before the key was replaced. Nothing changed.".into(),
+                        );
+                    }
+                });
+                return;
+            }
+            // The new key exists only in this result; never cancel this
+            // future after the server may have accepted the new store.
+            let result = live.manager.change_recovery_key_for(&account_id).await;
+            let status = live.manager.security_info().await.ok();
+            if result.is_ok() {
+                gate.key_pending();
+            }
+            let gate_for_ui = gate.clone();
+            let _ = weak.upgrade_in_event_loop(move |window| {
+                if !same_view(&window, &account_id, operation) {
+                    return;
+                }
+                window.set_security_busy(false);
+                if let Some(info) = status {
+                    apply_status(&window, info);
+                }
+                match result {
+                    Ok(key) => {
+                        window.set_security_key_revealed(false);
+                        window.set_security_recovery_key(key.reveal().into());
+                        window.set_security_notice(
+                            "Reveal and save this new key now. The previous key no longer works."
+                                .into(),
+                        );
+                    }
+                    Err(_) => {
+                        gate_for_ui.reset();
+                        window.set_security_notice("".into());
+                        window.set_security_error(
+                            "Could not replace the recovery key. Refresh status, then try again."
+                                .into(),
+                        );
+                    }
+                }
+            });
+        });
+    });
+
+    let weak = ui.as_weak();
     let recover_live = live.clone();
     let recover_handle = handle.clone();
     let recover_gate = live.security_gate.clone();
@@ -666,6 +761,25 @@ mod tests {
             backup: BackupStatus::Enabling,
         });
         assert_eq!(incomplete, ("Verified", "Incomplete", "Enabling", false));
+    }
+
+    #[test]
+    fn only_complete_recovery_on_a_verified_device_can_change_the_key() {
+        use DeviceVerificationStatus::{Unverified, Verified};
+        use RecoveryStatus::{Disabled, Enabled, Incomplete};
+        let info = |recovery, device_verification| SecurityInfo {
+            device_verification,
+            recovery,
+            backup: BackupStatus::Enabled,
+        };
+        assert!(can_change_key(info(Enabled, Verified)));
+        for (recovery, device) in [
+            (Enabled, Unverified),
+            (Incomplete, Verified),
+            (Disabled, Verified),
+        ] {
+            assert!(!can_change_key(info(recovery, device)));
+        }
     }
 
     #[test]
