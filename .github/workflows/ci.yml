@@ -1,27 +1,27 @@
 # TEMPORARY focused native offline app checks. NEVER MERGE this workflow.
 name: Reviewed sticker timeout diagnostics
-run-name: Sticker catalog await diagnosis - ecccac2
+run-name: Sticker required-state verification - 9100616
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: sticker-catalog-awaits-ecccac2
+  group: sticker-required-state-9100616
   cancel-in-progress: false
 jobs:
   contracts:
-    name: Verify private timeout diagnostics then encrypted sticker fixture
+    name: Verify required room state then encrypted sticker fixture
     if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ecccac280d43ee7a4ce0da4f6a016012b9afb4f0
+          ref: 91006162290903debe8e2675b06cda407f7c7604
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact reviewed source
-        run: test "$(git rev-parse HEAD)" = ecccac280d43ee7a4ce0da4f6a016012b9afb4f0
+        run: test "$(git rev-parse HEAD)" = 91006162290903debe8e2675b06cda407f7c7604
       - name: Scan source before executing reviewed native tests
         shell: bash
         run: |
@@ -121,8 +121,87 @@ jobs:
           output=log.read_text(errors='replace')
           passed=reason is None and code==0 and re.search(r'^Ran 7 tests in ',output,re.MULTILINE) is not None and re.search(r'^OK$',output,re.MULTILINE) is not None
           print(json.dumps({'check':'sticker_diagnostic_contracts','status':'passed' if passed else 'failed',
-              'source':'ecccac280d43ee7a4ce0da4f6a016012b9afb4f0','failure':reason,
+              'source':'91006162290903debe8e2675b06cda407f7c7604','failure':reason,
               'tests_passed':7 if passed else None,'raw_logs_public':False,
+              'accounts_generated':False,'app_executed':False},sort_keys=True),flush=True)
+          if not passed: raise SystemExit(1)
+          PY
+      - name: Verify preserved SDK defaults and exact custom room state
+        timeout-minutes: 40
+        env:
+          CARGO_BUILD_JOBS: "2"
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          CARGO_TERM_COLOR: never
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 -I -B - <<'PY'
+          import json, os, pathlib, re, select, signal, subprocess, tempfile, time
+          assert os.environ.get('GITHUB_ACTIONS') == 'true'
+          assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+          assert os.environ.get('ImageOS') == 'ubuntu24'
+          names = ('PATH','HOME','LANG','LC_ALL','TMPDIR','CARGO_HOME','RUSTUP_HOME','RUSTUP_TOOLCHAIN',
+              'PKG_CONFIG_PATH','LD_LIBRARY_PATH','SSL_CERT_FILE','SSL_CERT_DIR','CARGO_BUILD_JOBS',
+              'CARGO_INCREMENTAL','CARGO_PROFILE_DEV_DEBUG','CARGO_PROFILE_TEST_DEBUG','CARGO_TERM_COLOR',
+              'GITHUB_ACTIONS','RUNNER_ENVIRONMENT','RUNNER_OS','ImageOS','RUNNER_TEMP','RUNNER_TRACKING_ID')
+          environment = {name:os.environ[name] for name in names if name in os.environ}
+          root = pathlib.Path(tempfile.mkdtemp(prefix='morpheus-offline-app-',dir=os.environ['RUNNER_TEMP']))
+          root.chmod(0o700)
+          logs = root/'logs'; logs.mkdir(mode=0o700)
+          log = logs/'cargo.log'
+          reason = None
+          code = None
+          with log.open('xb') as output:
+              child = subprocess.Popen(['cargo','test','--locked','-p','matrix-sdk-ui','--features','unstable-msc4354','--lib','room_list_service::tests::morpheus_custom_state_preserves_defaults_for_lists_and_subscriptions','--','--exact','--test-threads=1'],
+                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                  env=environment, start_new_session=True)
+              deadline = time.monotonic()+35*60
+              size = 0
+              try:
+                  while True:
+                      remaining = deadline-time.monotonic()
+                      if remaining<=0:
+                          reason='deadline'; break
+                      ready,_,_=select.select([child.stdout],[],[],remaining)
+                      if not ready:
+                          reason='deadline'; break
+                      block=os.read(child.stdout.fileno(),65536)
+                      if not block: break
+                      size+=len(block)
+                      if size>50*1024*1024:
+                          reason='output_limit'; break
+                      output.write(block)
+                  if reason is None:
+                      code=child.wait(timeout=10)
+              except (OSError,subprocess.SubprocessError):
+                  reason='process_error'
+              finally:
+                  # Never signal an already-reaped PID/group. Timeout and
+                  # overflow keep our child anchored until after group kill.
+                  if child.returncode is None:
+                      try: os.killpg(child.pid,signal.SIGKILL)
+                      except ProcessLookupError: pass
+                      child.wait(timeout=10)
+                  child.stdout.close()
+          with (root/'scan.log').open('wb') as output:
+              scan=subprocess.run([os.environ['RUNNER_TEMP']+'/gitleaks/gitleaks','dir',str(logs),
+                  '--redact=100','--ignore-gitleaks-allow','--no-banner','--max-target-megabytes','0',
+                  '--config',os.environ['RUNNER_TEMP']+'/default.toml',
+                  '--gitleaks-ignore-path',os.environ['RUNNER_TEMP']+'/empty.ignore'],
+                  stdout=output,stderr=subprocess.STDOUT,timeout=60)
+          if scan.returncode!=0:
+              print('OFFLINE_NATIVE_LOG_WITHHELD',flush=True); raise SystemExit(1)
+          output=log.read_text(errors='replace')
+          needed={'room_list_service::tests::morpheus_custom_state_preserves_defaults_for_lists_and_subscriptions'}
+          ok=set(re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. ok$',output,re.MULTILINE))
+          summaries=re.findall(r'^test result: ok\. 1 passed; 0 failed; 0 ignored;',output,re.MULTILINE)
+          passed=reason is None and code==0 and needed==ok and len(summaries)==1
+          print(json.dumps({'check':'sdkui_custom_required_state','lock_update_required':('lock file' in output and 'needs to be updated' in output and '--locked' in output),'dependency_resolution_failed':('failed to select a version' in output),'error_codes':sorted(set(re.findall(r'error\[(E[0-9]{4})\]',output))),'status':'passed' if passed else 'failed',
+              'source':'91006162290903debe8e2675b06cda407f7c7604','failure':reason,
+              'tests_passed':1 if passed else None,'raw_logs_public':False,
               'accounts_generated':False,'app_executed':False},sort_keys=True),flush=True)
           if not passed: raise SystemExit(1)
           PY
