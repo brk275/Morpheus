@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
-name: Reviewed beta four-platform native checks
-run-name: Reviewed native candidate - f7d2e7f - ${{ inputs.platform }}
+name: Reviewed style profile native checks
+run-name: Reviewed native candidate - 518e3fd - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: beta-native-f7d2e7f-${{ github.ref }}
+  group: beta-native-518e3fd-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: f7d2e7fe9ad0383811ef7fd090f8d6c3a446525c
+          ref: 518e3fd1a04a17a72915f76e361605e250d03c16
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -135,7 +135,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='f7d2e7fe9ad0383811ef7fd090f8d6c3a446525c'
+          source='518e3fd1a04a17a72915f76e361605e250d03c16'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -379,7 +379,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='f7d2e7fe9ad0383811ef7fd090f8d6c3a446525c'
+          source='518e3fd1a04a17a72915f76e361605e250d03c16'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -454,58 +454,45 @@ jobs:
               'sdk_cache_publish':'Cannot publish verified native SDK cache',
           }
           needed_app={
-              'kept_replies::tests::a_queued_restore_cannot_outlive_a_clear_or_a_room_change',
-              'live::account_presentation_tests::a_focused_view_loaded_out_of_order_never_replaces_the_shown_one',
-              'live::account_presentation_tests::a_withdrawn_search_navigation_held_at_its_commit_changes_nothing',
-              'live::account_presentation_tests::no_refresh_samples_a_reveal_until_it_is_decided_or_given_back',
-              'message_search::tests::context_keeps_the_hit_near_the_top_and_stays_bounded',
-              'message_search::tests::search_result_display_sanitizes_untrusted_text_without_changing_ids',
               'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
-              'discovery_tests::timeline_link_handler_accepts_only_browser_urls',
-              'discovery_tests::call_stage_uses_joined_room_even_after_chat_navigation',
+              'config_cli::tests::the_schema_lists_every_field_token_and_code_from_the_registry',
+              'style_profiles::tests::summaries_describe_the_look_without_files_or_paths',
+              'style_profiles::tests::the_dialog_permit_admits_one_operation_at_a_time',
               'timeline_model::tests::sparse_edits_across_ten_thousand_shared_rows_notify_only_changed_rows',
-              'video_render::tests::screen_share_is_featured_while_cameras_stay_in_a_bounded_filmstrip',
-              'video_render::tests::hidden_stage_pauses_every_remote_stream_and_drops_pictures',
-              'video_render::tests::released_slot_discards_a_late_conversion',
-              'local_video::tests::signaling_gate_withholds_frames_without_an_owner_or_stop',
-              'local_video::tests::transmission_pause_serializes_with_pushes_and_stale_resumes',
-              'call_recovery::tests::only_running_sticky_sync_may_transmit',
-              'calls::tests::recovering_calls_keep_blocking_account_switches',
-              'calls::tests::late_recovery_status_cannot_overwrite_a_leave',
           }
-          needed_matrix={
-              'history::tests::a_focused_view_is_owned_only_by_the_selection_that_loaded_it',
-              'history::tests::search_rejects_an_aba_selection_and_keeps_the_current_one',
-              'tests::homeserver_must_not_send_password_over_plain_http',
-              'tests::registry_rejects_path_like_account_ids',
-              'tests::sso_redirect_must_be_private_loopback_listener',
-          }
-          needed_rtc={
-              'tests::build_capability_matches_feature','tests::device_capability_matches_features',
-              'audio_device::tests::signaling_gate_withholds_audio_without_an_owner_or_revocation',
-              'audio_device::tests::paused_transmission_withholds_audio_and_keeps_the_requested_mute_state',
-              'reconnect::tests::no_attempt_starts_at_or_after_the_budget',
-              'reconnect::tests::deliberate_removals_are_not_treated_as_connection_loss',
-              'video_device::tests::cancelled_camera_open_returns_before_native_enumeration',
-              'video_device::tests::camera_permission::stop_while_permission_is_pending_drops_late_grant',
-          }
-          allowed_app_ignore={'outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction'}
+          allowed_app_ignore={"outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction"}
           needed_config={
-              'tests::pane_composition_and_fades_default_off_round_trip_and_survive_presets',
-              'tests::interaction_states_are_optional_validated_and_absent_from_shipped_presets',
-              'tests::config_sender_palette_is_bounded_round_trips_and_survives_presets',
-              'tests::metric_edits_reject_invalid_files_without_repeating_values_and_recover',
-              'tests::validation_errors_never_repeat_the_rejected_value',
+              'style_profiles::tests::a_profile_holds_the_look_only_and_round_trips_sparse_toml',
+              'style_profiles::tests::applying_replaces_the_look_and_keeps_everything_else',
+              'style_profiles::tests::the_documented_profile_schema_matches_the_profile_type',
+              'style_profiles::tests::unknown_keys_versions_and_values_are_rejected_without_repeating_them',
+              'style_profiles::tests::looks_compare_appearance_and_account_colors_only',
+              'style_profiles::tests::names_and_file_stems_are_bounded_and_safe',
+              'style_profiles::tests::the_store_creates_lists_renames_duplicates_and_deletes_safely',
+              'style_profiles::tests::invalid_files_are_listed_as_invalid_and_other_entries_are_skipped',
+              'style_profiles::tests::export_and_import_round_trip_and_replace_only_regular_files',
           }
+          if os.environ['RUNNER_OS']=='Windows':
+              needed_config.add('style_profiles::tests::the_windows_folder_anchor_prevents_replacement_until_released')
+          else:
+              needed_config.update({
+                  'style_profiles::tests::a_fifo_open_is_nonblocking_and_never_read_as_a_profile',
+                  'style_profiles::tests::special_files_in_place_of_a_profile_are_refused',
+                  'style_profiles::tests::a_profiles_folder_replaced_by_a_link_is_never_followed',
+                  'style_profiles::tests::operations_stay_in_the_anchored_folder_when_its_path_is_swapped',
+                  'style_profiles::tests::links_are_never_followed_for_profiles_imports_or_exports',
+              })
+          # First acceptance of the feature, not final integrated all4 app proof.
+          # Config exercises actual filesystem/FFI paths on every supported target.
           checks=[
-              ('native_app_build',['cargo','build','--locked','-p','morpheus-app','--features','native-calls'],70*60,None,set()),
-              ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
-                  '--bin','morpheus-app','--','--test-threads=1'],40*60,needed_app,allowed_app_ignore),
-              ('matrix_unit',['cargo','test','--locked','-p','morpheus-matrix','--lib','--','--test-threads=1'],20*60,needed_matrix,set()),
+              ('config_unit',['cargo','test','--locked','-p','morpheus-config','--lib','--','--test-threads=1'],10*60,needed_config,set()),
+              ('style_profile_examples',['cargo','test','--locked','-p','morpheus-config','--test','style_profile_examples','--','--test-threads=1'],5*60,{'style_profile_examples_are_valid_importable_profiles'},set()),
           ]
-          # Config/RTC source, manifests, lock, toolchain, build and vendor inputs
-          # are identical to accepted all4 source62b90fc/run39200849224.
-          # Run only changed app/controller and Matrix inputs on all4.
+          if os.environ['RUNNER_OS']=='Linux':
+              checks.extend([
+                  ('native_ui_compile',['cargo','check','--locked','-p','morpheus-ui-check'],10*60,None,set()),
+                  ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls','--bin','morpheus-app','--','--test-threads=1'],70*60,needed_app,allowed_app_ignore),
+              ])
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
               result=bounded(args,name,seconds)
@@ -587,5 +574,5 @@ jobs:
               all_passed=all_passed and passed
               # Failed compilation cannot yield meaningful unit checks. Independent test
               # suites still run after a test failure, using the same compiled graph.
-              if name=='native_app_build' and not passed: break
+              if name in ('native_ui_compile','native_app_build') and not passed: break
           if not all_passed: raise SystemExit(1)
