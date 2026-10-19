@@ -105,7 +105,10 @@ same results back. Each color and metric editor has its own Reset and Undo.
 Pinned messages, message search, polls and the call stage follow the same
 corner, outline, focus ring and control state settings as the rest of the
 window, and the control padding, field padding and icon size where they have
-those controls.
+those controls. Dropdowns (sticker packs, call audio devices, the room join
+rule) and the window transparency slider are drawn the same way, with the
+usual keys: Up and Down choose, Return or Space opens a list, Escape closes
+it; Left, Right, Home and End move the slider.
 
 ## Navigation
 

@@ -2,7 +2,7 @@
 // the Settings preview. They read only StyleTokens and caller colors, never
 // a setting store, and report activation through callbacks.
 
-import { Palette } from "std-widgets.slint";
+import { Palette, ScrollView } from "std-widgets.slint";
 import { StyleTokens } from "style-tokens.slint";
 
 // Animate only the decorative hover layer. Selection colors, content, focus
@@ -342,5 +342,426 @@ export component TokenCheck inherits Rectangle {
         border-width: StyleTokens.focus-width;
         border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.colors.accent;
         background: transparent;
+    }
+}
+
+// A compact dropdown drawn from StyleTokens with ComboBox's contract:
+// `current-index` stays clamped to the model, Up and Down choose the
+// previous or next entry directly (each choice reports `selected`), Return
+// or Space (or a click) opens the list, and the wheel moves the choice while
+// the control has focus. In the open list Up, Down, Home, End, Page Up and
+// Page Down choose live; Return, Space, Escape and Tab close it; a click
+// chooses and closes; a click outside, disabling the control or losing it
+// closes the list without choosing.
+export component TokenSelect inherits Rectangle {
+    in property <[string]> model;
+    in property <bool> enabled: true;
+    in-out property <int> current-index: 0;
+    out property <string> current-value: root.current-index >= 0 && root.current-index < root.model.length
+        ? root.model[root.current-index] : "";
+    in property <ControlColors> colors;
+    in property <float> text-scale: 1;
+    out property <bool> has-focus: (scope.has-focus || root.popup-has-focus) && root.enabled;
+    callback selected(string);
+
+    property <bool> popup-has-focus: false;
+    property <length> item-height: max(30px, 16px * root.text-scale + 14px);
+    property <int> visible-items: min(6, root.model.length);
+    property <length> popup-padding: 4px;
+    // Selection and hover colors of the list, from the theme's roles and
+    // states, else the control's own surfaces.
+    property <color> chosen-surface: StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.colors.hover;
+    property <color> chosen-ink: StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.colors.ink;
+    property <color> row-hover: StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.colors.hover;
+    property <color> disabled-ink: StyleTokens.states.control-disabled.present ? StyleTokens.states.control-disabled.color : root.colors.muted;
+
+    function choose(index: int) {
+        if root.enabled && index >= 0 && index < root.model.length {
+            root.current-index = index;
+            root.selected(root.model[index]);
+        }
+    }
+    function step(delta: int) {
+        if root.model.length > 0 {
+            root.choose(clamp(root.current-index + delta, 0, root.model.length - 1));
+        }
+    }
+    function open() {
+        if root.enabled && root.model.length > 0 {
+            popup.show();
+        }
+    }
+
+    changed model => {
+        root.current-index = root.model.length == 0 ? 0 : clamp(root.current-index, 0, root.model.length - 1);
+    }
+    changed enabled => {
+        if !root.enabled { popup.close(); }
+    }
+
+    min-width: max(160px, caption.preferred-width + 2 * StyleTokens.input-padding + 24px);
+    min-height: max(32px, 16px * root.text-scale + 14px);
+    preferred-height: self.min-height;
+    horizontal-stretch: 1;
+    vertical-stretch: 0;
+    forward-focus: scope;
+    border-radius: StyleTokens.input-corner;
+    border-width: StyleTokens.line-width;
+    border-color: StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.colors.outline;
+    background: !root.enabled ? root.colors.surface
+        : touch.pressed && StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color
+        : touch.has-hover ? root.row-hover
+        : StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.colors.surface;
+    accessible-role: combobox;
+    accessible-enabled: root.enabled;
+    accessible-expandable: true;
+    accessible-expanded: root.popup-has-focus;
+    accessible-value: root.current-value;
+    accessible-action-expand => { root.open(); }
+
+    caption := Text {
+        x: StyleTokens.input-padding;
+        width: max(0px, parent.width - 2 * StyleTokens.input-padding - 18px * root.text-scale);
+        height: parent.height;
+        text: root.current-value;
+        color: root.enabled ? root.colors.ink : root.disabled-ink;
+        font-size: 12px * root.text-scale;
+        vertical-alignment: center;
+        overflow: elide;
+        accessible-role: none;
+    }
+    Path {
+        x: parent.width - StyleTokens.input-padding - self.width;
+        y: (parent.height - self.height) / 2;
+        width: 10px * root.text-scale;
+        height: 6px * root.text-scale;
+        viewbox-width: 10;
+        viewbox-height: 6;
+        commands: "M 1 1 L 5 5 L 9 1";
+        stroke: root.enabled ? root.colors.muted : root.disabled-ink;
+        stroke-width: 1.5px;
+        fill: transparent;
+        accessible-role: none;
+    }
+    scope := FocusScope {
+        enabled: root.enabled;
+        changed has-focus => {
+            // Focus comes back here when the list closes.
+            if self.has-focus { root.popup-has-focus = false; }
+        }
+        key-pressed(event) => {
+            if !root.enabled {
+                return reject;
+            }
+            if event.text == Key.UpArrow {
+                root.step(-1);
+                return accept;
+            } else if event.text == Key.DownArrow {
+                root.step(1);
+                return accept;
+            } else if event.text == Key.Return || event.text == Key.Space {
+                root.open();
+                return accept;
+            }
+            reject
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => {
+            scope.focus();
+            root.open();
+        }
+        scroll-event(event) => {
+            if !root.has-focus {
+                return reject;
+            }
+            if event.delta-y < -2px {
+                root.step(1);
+                return accept;
+            }
+            if event.delta-y > 2px {
+                root.step(-1);
+                return accept;
+            }
+            reject
+        }
+    }
+    if scope.has-focus : Rectangle {
+        border-radius: parent.border-radius;
+        border-width: StyleTokens.focus-width;
+        border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.colors.accent;
+        background: transparent;
+    }
+
+    popup := PopupWindow {
+        x: 0px;
+        y: root.height + 2px;
+        width: root.width;
+        height: root.visible-items * root.item-height + 2 * root.popup-padding;
+        close-policy: close-on-click-outside;
+        forward-focus: list-scope;
+        Rectangle {
+            background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.colors.surface;
+            border-radius: StyleTokens.input-corner;
+            border-width: max(1px, StyleTokens.line-width);
+            border-color: StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.colors.outline;
+            clip: true;
+            list-scope := FocusScope {
+                focus-changed-event => { root.popup-has-focus = self.has-focus; }
+                key-pressed(event) => {
+                    if event.text == Key.UpArrow {
+                        root.step(-1);
+                    } else if event.text == Key.DownArrow {
+                        root.step(1);
+                    } else if event.text == Key.Home {
+                        root.choose(0);
+                    } else if event.text == Key.End {
+                        root.choose(root.model.length - 1);
+                    } else if event.text == Key.PageUp {
+                        root.step(-max(1, root.visible-items - 1));
+                    } else if event.text == Key.PageDown {
+                        root.step(max(1, root.visible-items - 1));
+                    } else if event.text == Key.Return || event.text == Key.Space
+                        || event.text == Key.Escape || event.text == Key.Tab || event.text == Key.Backtab {
+                        popup.close();
+                    } else {
+                        return reject;
+                    }
+                    accept
+                }
+                ScrollView {
+                    width: parent.width;
+                    height: parent.height;
+                    horizontal-scrollbar-policy: always-off;
+                    content-width: self.visible-width;
+                    // Keep the chosen entry in view.
+                    content-y: -max(0, root.current-index - root.visible-items + 1) * root.item-height;
+                    VerticalLayout {
+                        width: parent.width;
+                        alignment: start;
+                        padding: root.popup-padding;
+                        for value[index] in root.model : Rectangle {
+                            height: root.item-height;
+                            border-radius: StyleTokens.control-corner;
+                            background: index == root.current-index ? root.chosen-surface
+                                : row.pressed && StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color
+                                : row.has-hover ? root.row-hover : transparent;
+                            accessible-role: list-item;
+                            accessible-label: value;
+                            accessible-item-selectable: true;
+                            accessible-item-selected: index == root.current-index;
+                            accessible-item-index: index;
+                            accessible-item-count: root.model.length;
+                            Text {
+                                x: StyleTokens.input-padding;
+                                width: max(0px, parent.width - 2 * StyleTokens.input-padding);
+                                height: parent.height;
+                                text: value;
+                                color: index == root.current-index ? root.chosen-ink : root.colors.ink;
+                                font-size: 12px * root.text-scale;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                accessible-role: none;
+                            }
+                            row := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    root.choose(index);
+                                    popup.close();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// A horizontal slider drawn from StyleTokens with Slider's exact contract.
+// `changed` reports every actual value change: a press away from the thumb,
+// a drag, Left, Right, Home and End, and accessibility set, increment and
+// decrement. `released` reports the end of a pointer press that began on
+// the control, and the release of Left, Right, Home or End, even when the
+// value did not change. Values are clamped to the range; setting the
+// current value reports nothing.
+export component TokenSlider inherits Rectangle {
+    in property <float> minimum: 0;
+    in property <float> maximum: 100;
+    in property <float> step: 1;
+    in property <bool> enabled: true;
+    in-out property <float> value: root.minimum;
+    in property <ControlColors> colors;
+    in property <float> text-scale: 1;
+    out property <bool> has-focus: scope.has-focus;
+    callback changed(float);
+    callback released(float);
+
+    property <bool> thumb-pressed: false;
+    property <float> pressed-value: 0;
+    property <length> thumb-size: max(20px, 12px * root.text-scale + 8px);
+    property <length> travel: max(0px, root.width - root.thumb-size);
+    property <float> span: root.maximum - root.minimum;
+    property <length> thumb-x: root.span <= 0 ? 0px
+        : root.travel * (clamp(root.value, root.minimum, root.maximum) - root.minimum) / root.span;
+    property <bool> thumb-hover: touch.has-hover && touch.mouse-x >= root.thumb-x
+        && touch.mouse-x <= root.thumb-x + root.thumb-size;
+    property <color> track-color: !root.enabled
+        ? (StyleTokens.states.control-disabled.present ? StyleTokens.states.control-disabled.color : root.colors.muted)
+        : root.colors.accent;
+
+    public function set-value(new-value: float) {
+        let clamped = max(root.minimum, min(root.maximum, new-value));
+        if root.value == clamped {
+            return;
+        }
+        root.value = clamped;
+        root.changed(root.value);
+    }
+    // The value at a pointer position along the track, centered on the thumb.
+    pure function value-at(x: length) -> float {
+        root.travel <= 0px ? root.minimum : root.minimum + (x - root.thumb-size / 2) / root.travel * root.span
+    }
+
+    min-width: 2 * root.thumb-size;
+    min-height: root.thumb-size + 8px;
+    preferred-height: self.min-height;
+    horizontal-stretch: 1;
+    vertical-stretch: 0;
+    forward-focus: scope;
+    accessible-role: slider;
+    accessible-enabled: root.enabled;
+    accessible-value: root.value;
+    accessible-value-minimum: root.minimum;
+    accessible-value-maximum: root.maximum;
+    accessible-value-step: min(root.step, (root.maximum - root.minimum) / 100);
+    accessible-action-set-value(text) => {
+        if root.enabled && text.is-float() {
+            root.set-value(text.to-float());
+        }
+    }
+    accessible-action-increment => {
+        if root.enabled { root.set-value(root.value + root.step); }
+    }
+    accessible-action-decrement => {
+        if root.enabled { root.set-value(root.value - root.step); }
+    }
+
+    rail := Rectangle {
+        x: root.thumb-size / 2;
+        y: (root.height - self.height) / 2;
+        width: max(0px, root.width - root.thumb-size);
+        height: 4px;
+        border-radius: self.height / 2;
+        background: StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.colors.outline;
+    }
+    Rectangle {
+        x: rail.x;
+        y: rail.y;
+        width: root.thumb-x;
+        height: rail.height;
+        border-radius: rail.border-radius;
+        background: root.track-color;
+    }
+    thumb := Rectangle {
+        x: root.thumb-x;
+        y: (root.height - self.height) / 2;
+        width: root.thumb-size;
+        height: self.width;
+        border-radius: StyleTokens.control-radius >= 0px ? min(StyleTokens.control-radius, self.width / 2) : self.width / 2;
+        background: root.enabled && root.thumb-pressed && StyleTokens.states.control-pressed.present
+            ? StyleTokens.states.control-pressed.color
+            : root.enabled && root.thumb-hover && StyleTokens.states.control-hover.present
+            ? StyleTokens.states.control-hover.color : root.colors.surface;
+        border-width: max(1px, StyleTokens.line-width);
+        border-color: root.enabled ? root.colors.outline : root.track-color;
+        Rectangle {
+            width: parent.width * (root.thumb-pressed ? 0.4 : root.thumb-hover ? 0.6 : 0.5);
+            height: self.width;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            border-radius: StyleTokens.control-radius >= 0px ? min(StyleTokens.control-radius, self.width / 2) : self.width / 2;
+            background: root.track-color;
+        }
+    }
+    if scope.has-focus : Rectangle {
+        x: thumb.x - 3px;
+        y: thumb.y - 3px;
+        width: thumb.width + 6px;
+        height: thumb.height + 6px;
+        border-radius: thumb.border-radius + 3px;
+        border-width: StyleTokens.focus-width;
+        border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.colors.accent;
+        background: transparent;
+    }
+    scope := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if !root.enabled || root.step <= 0 {
+                return reject;
+            }
+            if event.text == Key.RightArrow {
+                root.set-value(root.value + root.step);
+                return accept;
+            } else if event.text == Key.LeftArrow {
+                root.set-value(root.value - root.step);
+                return accept;
+            } else if event.text == Key.Home {
+                root.set-value(root.minimum);
+                return accept;
+            } else if event.text == Key.End {
+                root.set-value(root.maximum);
+                return accept;
+            }
+            reject
+        }
+        key-released(event) => {
+            if !root.enabled {
+                return reject;
+            }
+            if event.text == Key.RightArrow || event.text == Key.LeftArrow
+                || event.text == Key.Home || event.text == Key.End {
+                root.released(root.value);
+            }
+            accept
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        pointer-event(event) => {
+            if event.button != PointerEventButton.left {
+                return;
+            }
+            if event.kind == PointerEventKind.up {
+                if root.thumb-pressed {
+                    root.released(root.value);
+                }
+                root.thumb-pressed = false;
+                return;
+            }
+            if event.kind == PointerEventKind.cancel {
+                root.thumb-pressed = false;
+                return;
+            }
+            if event.kind != PointerEventKind.down {
+                return;
+            }
+            // A press away from the thumb moves it there first.
+            if !root.thumb-hover {
+                root.set-value(root.value-at(self.mouse-x));
+            }
+            root.pressed-value = root.value;
+            scope.focus();
+            root.thumb-pressed = true;
+        }
+        moved => {
+            if !self.enabled || !root.thumb-pressed || root.travel <= 0px {
+                return;
+            }
+            root.set-value(root.pressed-value + (self.mouse-x - self.pressed-x) / root.travel * root.span);
+        }
     }
 }
