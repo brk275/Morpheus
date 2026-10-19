@@ -120,6 +120,8 @@ pub enum RoomAdminError {
     UnsupportedContent,
     #[error("This change would touch too many entries at once")]
     TooManyChanges,
+    #[error("Enter a room name of at most 255 bytes")]
+    InvalidName,
 }
 type Result<T> = std::result::Result<T, RoomAdminError>;
 

@@ -987,6 +987,7 @@ pub(crate) fn error_text(
         RoomAdminError::NoRoute => NO_ROUTE,
         RoomAdminError::UnsupportedContent => UNSUPPORTED_CONTENT,
         RoomAdminError::TooManyChanges => "This change would rewrite too many entries at once.",
+        RoomAdminError::InvalidName => "Enter a room name of up to 255 bytes, on one line.",
         RoomAdminError::InsufficientPower => {
             return snapshot.map_or_else(
                 || "Your current power level does not allow this change.".to_owned(),

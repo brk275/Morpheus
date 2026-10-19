@@ -10,8 +10,8 @@ pub(crate) use ui::clear_presentation;
 use std::collections::{HashMap, HashSet};
 
 use morpheus_matrix::{
-    HIERARCHY_MAX_DEPTH, NodeAccess, RoomAdminError, RoomMembership, RouteSource, SpaceChildLink,
-    SpaceNode, SpaceTarget, SpaceWriteOutcome, reorder_plan, valid_order,
+    CreatedChild, HIERARCHY_MAX_DEPTH, NodeAccess, RoomAdminError, RoomMembership, RouteSource,
+    SpaceChildLink, SpaceNode, SpaceTarget, SpaceWriteOutcome, reorder_plan, valid_order,
 };
 
 /// Rows the hierarchy view lists at once; search narrows the rest.
@@ -28,6 +28,7 @@ const UNLINK_BODY: &str =
     "Only this link is removed. Nobody leaves, the room is not deleted, and other Spaces keep it.";
 const JOIN_BODY: &str = "You join only this one, not the rest of the Space. Members can see it.";
 const MOVE_BODY: &str = "Everyone in the Space sees the new order.";
+const CREATE_BODY: &str = "Nobody else is invited, and nothing already in the Space changes.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Filter {
@@ -352,6 +353,12 @@ pub(crate) enum Change {
         via: Vec<String>,
         is_space: bool,
     },
+    /// Create a new room inside the Space and list it there.
+    Create {
+        name: String,
+        members_only: bool,
+        suggested: bool,
+    },
 }
 
 /// A change the operator reviewed, with the names it was reviewed under.
@@ -380,7 +387,7 @@ impl Intent {
         match &self.change {
             Change::Update { link, .. } | Change::Unlink { link } => listed(link),
             Change::Reorder { plan, .. } => plan.iter().all(|(link, _)| listed(link)),
-            Change::Link { .. } | Change::Join { .. } => true,
+            Change::Link { .. } | Change::Join { .. } | Change::Create { .. } => true,
         }
     }
 }
@@ -485,6 +492,30 @@ pub(crate) fn confirmation(intent: &Intent) -> Confirmation {
                 destructive: false,
             }
         }
+        Change::Create {
+            members_only,
+            suggested,
+            ..
+        } => {
+            let who = if *members_only {
+                format!("Members of {space} can join it")
+            } else {
+                "People need an invitation to join it".to_owned()
+            };
+            let mut body = format!(
+                "Morpheus creates a new encrypted room and lists it in {space}. {who}, and you \
+                 are its administrator. {CREATE_BODY}"
+            );
+            if *suggested {
+                body.push_str(" It is suggested to members.");
+            }
+            Confirmation {
+                title: format!("Create {name} in {space}?"),
+                body,
+                action: "Create room",
+                destructive: false,
+            }
+        }
     }
 }
 
@@ -495,6 +526,7 @@ pub(crate) fn pending_text(intent: &Intent) -> String {
         Change::Unlink { .. } => "Removing",
         Change::Reorder { .. } => "Moving",
         Change::Join { .. } => "Joining",
+        Change::Create { .. } => "Creating",
     };
     format!("{verb} {}… Waiting for the homeserver.", intent.name)
 }
@@ -518,6 +550,30 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: SpaceWriteOutcome) -> Strin
         Change::Unlink { .. } => format!("Removed the link to {name}; the room is unchanged."),
         Change::Reorder { .. } => format!("Moved {name}. The homeserver confirmed the order."),
         Change::Join { .. } => format!("Joined {name}."),
+        Change::Create { .. } => format!("Created {name}."),
+    }
+}
+
+/// The notice and error after a room was created inside the Space: listing
+/// it can fail after the room itself exists, and then says so.
+pub(crate) fn created_text(intent: &Intent, created: &CreatedChild) -> (String, String) {
+    let (name, space) = (&intent.name, &intent.space);
+    if created.linked {
+        return (format!("Created {name} and listed it in {space}."), String::new());
+    }
+    let id = crate::directory_plain_text(&created.room_id, 260);
+    match created.link_error {
+        Some(error) => (
+            format!("Created {name} ({id})."),
+            format!(
+                "Listing it in {space} failed: {} Add it with Find using its ID.",
+                error_text(error)
+            ),
+        ),
+        None => (
+            format!("Created {name}; its listing was accepted, but reading it back differed."),
+            String::new(),
+        ),
     }
 }
 
@@ -564,6 +620,7 @@ pub(crate) fn error_text(error: RoomAdminError) -> String {
         RoomAdminError::TooManyChanges => {
             "Moving it needs too many order keys at once. Give nearby entries order keys first."
         }
+        RoomAdminError::InvalidName => "Enter a room name of up to 255 bytes, on one line.",
         RoomAdminError::CreatorProtected
         | RoomAdminError::SelfTarget
         | RoomAdminError::AlreadyJoined
@@ -586,6 +643,7 @@ pub(crate) fn reread_after(error: RoomAdminError) -> bool {
             | RoomAdminError::InvalidRoom
             | RoomAdminError::RoomNotFound
             | RoomAdminError::NoRoute
+            | RoomAdminError::InvalidName
     )
 }
 
@@ -661,6 +719,40 @@ mod tests {
         assert_eq!(others[0].link.room_id, b);
         let (found, _) = visible(&rows, &nodes, "!C:EXAMPLE", Filter::All);
         assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn creating_a_room_is_reviewed_and_a_failed_listing_is_reported() {
+        let change = Change::Create {
+            name: "Planning".to_owned(),
+            members_only: true,
+            suggested: false,
+        };
+        let intent = Intent {
+            change,
+            name: "Planning".to_owned(),
+            space: "Crew".to_owned(),
+        };
+        let review = confirmation(&intent);
+        assert!(!review.destructive && review.body.contains("Members of Crew can join it"));
+        assert!(intent.still_matches(&[]));
+        let listed = CreatedChild {
+            room_id: "!new:example.org".to_owned(),
+            linked: true,
+            link_error: None,
+        };
+        let (notice, error) = created_text(&intent, &listed);
+        assert_eq!(notice, "Created Planning and listed it in Crew.");
+        assert!(error.is_empty());
+        let unlisted = CreatedChild {
+            linked: false,
+            link_error: Some(RoomAdminError::Forbidden),
+            ..listed
+        };
+        let (notice, error) = created_text(&intent, &unlisted);
+        assert!(notice.contains("!new:example.org"));
+        assert!(error.starts_with("Listing it in Crew failed:"));
+        assert!(!reread_after(RoomAdminError::InvalidName));
     }
 
     #[test]

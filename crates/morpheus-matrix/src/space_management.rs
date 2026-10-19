@@ -13,10 +13,18 @@ use matrix_sdk::{
         OwnedRoomId, OwnedServerName, OwnedUserId, RoomAliasId, RoomId, ServerName, UInt,
         api::client::{
             alias::get_alias,
+            room::create_room,
             space::{SpaceHierarchyRoomsChunk, get_hierarchy},
             state::send_state_event,
         },
-        events::StateEventType,
+        events::{
+            InitialStateEvent, StateEventType,
+            room::{
+                encryption::RoomEncryptionEventContent,
+                join_rules::{AllowRule, RoomJoinRulesEventContent},
+            },
+            space::parent::SpaceParentEventContent,
+        },
         room::{JoinRuleSummary, RoomType},
         serde::Raw,
     },
@@ -43,6 +51,8 @@ pub const MAX_VIA_SERVERS: usize = 3;
 pub const MAX_ORDER_BYTES: usize = 50;
 /// Links one reorder may rewrite.
 pub const MAX_REORDER_WRITES: usize = 8;
+/// Longest name of a room created inside a Space.
+pub const MAX_CHILD_NAME_BYTES: usize = 255;
 const MAX_TOKEN_BYTES: usize = 2048;
 const MAX_NAME_BYTES: usize = 256;
 const MAX_TOPIC_BYTES: usize = 512;
@@ -160,6 +170,16 @@ pub struct SpaceWriteOutcome {
     pub confirmed: bool,
     /// Why a change of several links stopped after some were accepted.
     pub stopped: Option<RoomAdminError>,
+}
+
+/// A room `create_child` made inside the Space.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreatedChild {
+    pub room_id: String,
+    /// The Space lists the new room: its link was accepted and read back.
+    pub linked: bool,
+    /// Why listing it failed after the room itself was created.
+    pub link_error: Option<RoomAdminError>,
 }
 
 pub struct SpaceSession {
@@ -479,6 +499,56 @@ impl SpaceSession {
         .await
     }
 
+    /// Create an encrypted room whose canonical parent is this Space, then
+    /// list it here. With `members_only`, members of this Space may join it;
+    /// otherwise people need an invitation. The account becomes the new
+    /// room's administrator. The link's only route server is this account's
+    /// homeserver, the only server that knows the room yet. Nobody else
+    /// joins, and nothing else changes.
+    pub async fn create_child(
+        &self,
+        name: &str,
+        members_only: bool,
+        suggested: bool,
+    ) -> Result<CreatedChild> {
+        let name = checked_name(name)?;
+        let server = self.own_user.server_name().to_owned();
+        let request = child_room_request(name, self.space.room_id(), &server, members_only);
+        self.run(WRITE_TIMEOUT, async {
+            self.require_manage().await?;
+            self.check()?;
+            let response = self
+                .space
+                .client()
+                .send(request)
+                .with_request_config(room_admin::write_config())
+                .await
+                .map_err(room_admin::write_failure)?;
+            let child = response.room_id;
+            // The room exists from here on: a failure to list it is reported
+            // with the room, never hidden.
+            let via = [server.to_string()];
+            let linked = async {
+                self.check()?;
+                let current = self.child_state(&child).await?;
+                let content = link_content(current.as_ref(), &via, suggested, None)?;
+                self.send_child(&child, &content).await?;
+                let after = self.child_state(&child).await.ok().flatten();
+                Ok::<_, RoomAdminError>(after.as_ref() == Some(&content))
+            };
+            let (linked, link_error) = match linked.await {
+                Ok(linked) => (linked, None),
+                Err(error) => (false, Some(error)),
+            };
+            Ok(CreatedChild {
+                room_id: child.to_string(),
+                linked,
+                link_error,
+            })
+        })
+        .await
+    }
+
     fn direct_child(&self, link: &SpaceChildLink) -> Result<OwnedRoomId> {
         if link.parent_id != self.space_id() {
             return Err(RoomAdminError::NotApplicable);
@@ -511,6 +581,44 @@ impl SpaceSession {
             .map_err(room_admin::write_failure)?;
         self.check()
     }
+}
+
+/// A room name: trimmed, not empty, at most `MAX_CHILD_NAME_BYTES`, and free
+/// of control characters.
+fn checked_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    let valid = !name.is_empty()
+        && name.len() <= MAX_CHILD_NAME_BYTES
+        && !name.chars().any(char::is_control);
+    valid.then_some(name).ok_or(RoomAdminError::InvalidName)
+}
+
+/// The creation request of a room inside `space`: encrypted from its first
+/// event, naming `space` as its canonical parent, and joinable by the
+/// Space's members when `members_only`, else by invitation.
+fn child_room_request(
+    name: &str,
+    space: &RoomId,
+    server: &ServerName,
+    members_only: bool,
+) -> create_room::v3::Request {
+    let mut request = create_room::v3::Request::new();
+    request.name = Some(name.to_owned());
+    request.preset = Some(create_room::v3::RoomPreset::PrivateChat);
+    let encryption = RoomEncryptionEventContent::with_recommended_defaults();
+    let encryption = InitialStateEvent::with_empty_state_key(encryption);
+    request.initial_state.push(encryption.to_raw_any());
+    let mut parent = SpaceParentEventContent::new(vec![server.to_owned()]);
+    parent.canonical = true;
+    let parent = InitialStateEvent::new(space.to_owned(), parent);
+    request.initial_state.push(parent.to_raw_any());
+    if members_only {
+        let rule = AllowRule::room_membership(space.to_owned());
+        let rules = RoomJoinRulesEventContent::restricted(vec![rule]);
+        let rules = InitialStateEvent::with_empty_state_key(rules);
+        request.initial_state.push(rules.to_raw_any());
+    }
+    request
 }
 
 fn single(confirmed: bool) -> SpaceWriteOutcome {
@@ -1021,6 +1129,35 @@ mod tests {
     }
 
     #[test]
+    fn rooms_made_inside_a_space_are_encrypted_parented_and_optionally_restricted() {
+        let space = RoomId::parse("!space:example.org").unwrap();
+        let server = ServerName::parse("example.org").unwrap();
+        let state = |request: &create_room::v3::Request| {
+            request
+                .initial_state
+                .iter()
+                .map(|event| event.json().get().to_owned())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let open = child_room_request("Planning", &space, &server, false);
+        let text = state(&open);
+        assert_eq!(open.name.as_deref(), Some("Planning"));
+        assert!(text.contains("m.room.encryption") && text.contains("m.megolm.v1.aes-sha2"));
+        assert!(text.contains("m.space.parent") && text.contains("\"canonical\":true"));
+        assert!(text.contains("!space:example.org") && !text.contains("restricted"));
+        let members = state(&child_room_request("Planning", &space, &server, true));
+        assert!(members.contains("restricted") && members.contains("m.room_membership"));
+
+        assert_eq!(checked_name("  Planning  "), Ok("Planning"));
+        for name in ["", "   ", "Plan\nning"] {
+            assert_eq!(checked_name(name), Err(RoomAdminError::InvalidName));
+        }
+        let long = "x".repeat(MAX_CHILD_NAME_BYTES + 1);
+        assert_eq!(checked_name(&long), Err(RoomAdminError::InvalidName));
+    }
+
+    #[test]
     fn session_and_its_network_futures_keep_the_ui_worker_send_contract() {
         fn send_sync<T: Send + Sync>() {}
         send_sync::<SpaceSession>();
@@ -1047,6 +1184,7 @@ mod tests {
             send(session.update(link, true, Some("a")));
             send(session.unlink(link));
             send(session.reorder(&[]));
+            send(session.create_child("Planning", true, false));
         }
     }
 }

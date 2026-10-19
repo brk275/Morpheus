@@ -120,9 +120,14 @@ export component SpaceManagerPage inherits VerticalLayout {
     in-out property <string> target-order;
     in-out property <bool> suggested;
     in-out property <string> order;
+    // A new room made inside this Space.
+    in-out property <string> create-name;
+    in-out property <bool> create-members-only: true;
+    in-out property <bool> create-suggested;
     callback scope-changed();
     // 0 refresh, 1 load more, 2 find, 3 clear found, 4 add, 5 save,
-    // 6 move up, 7 move down, 8 remove, 9 join, 10 open sub-Space, 11 stop read
+    // 6 move up, 7 move down, 8 remove, 9 join, 10 open sub-Space, 11 stop read,
+    // 12 create a room here
     callback action(int);
     callback select(string);
     callback search-edited(string);
@@ -476,6 +481,51 @@ export component SpaceManagerPage inherits VerticalLayout {
                             label: "Forget the found room";
                             enabled: !root.view.busy;
                             activated => { root.action(3); }
+                        }
+                    }
+                }
+            }
+            if root.ready && root.view.can-manage : Rectangle {
+                background: root.palette.elevated;
+                border-color: root.palette.divider; border-width: 1px; border-radius: 10px;
+                accessible-role: groupbox;
+                accessible-label: "Create a room in this Space";
+                VerticalLayout {
+                    padding: 12px; spacing: 6px;
+                    Text { text: "CREATE A ROOM HERE"; color: root.palette.muted; font-size: 9px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
+                    Text {
+                        text: "A new encrypted room, listed in this Space. You become its administrator; nobody else is invited.";
+                        color: root.palette.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
+                    }
+                    RosterField {
+                        palette: root.palette; text-scale: root.text-scale;
+                        placeholder: "Room name";
+                        label: "Name of the new room";
+                        enabled: !root.view.busy;
+                        text <=> root.create-name;
+                        accepted => { if !root.view.busy && root.create-name != "" { root.action(12); } }
+                    }
+                    SpaceToggle {
+                        palette: root.palette; text-scale: root.text-scale;
+                        text: "Members of this Space can join";
+                        enabled: !root.view.busy;
+                        checked <=> root.create-members-only;
+                    }
+                    SpaceToggle {
+                        palette: root.palette; text-scale: root.text-scale;
+                        text: "Suggest it to members";
+                        enabled: !root.view.busy;
+                        checked <=> root.create-suggested;
+                    }
+                    HorizontalLayout {
+                        alignment: start;
+                        RosterButton {
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: "Create…";
+                            label: "Review creating this room in the Space";
+                            primary: true;
+                            enabled: !root.view.busy && root.create-name != "";
+                            activated => { root.action(12); }
                         }
                     }
                 }

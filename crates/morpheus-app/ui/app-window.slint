@@ -1931,6 +1931,9 @@ export component AppWindow inherits Window {
     in-out property <string> space-manager-target-order;
     in-out property <bool> space-manager-suggested: false;
     in-out property <string> space-manager-order;
+    in-out property <string> space-manager-create-name;
+    in-out property <bool> space-manager-create-members-only: true;
+    in-out property <bool> space-manager-create-suggested: false;
     in-out property <int> active-account-index: 0;
     in-out property <string> active-account-local-id;
     in-out property <string> active-account-name;
@@ -4229,6 +4232,9 @@ export component AppWindow inherits Window {
                     target-order <=> root.space-manager-target-order;
                     suggested <=> root.space-manager-suggested;
                     order <=> root.space-manager-order;
+                    create-name <=> root.space-manager-create-name;
+                    create-members-only <=> root.space-manager-create-members-only;
+                    create-suggested <=> root.space-manager-create-suggested;
                     scope-changed => { root.space-manager-scope-changed(); }
                     action(code) => { root.space-manager-action(code); }
                     select(key) => { root.space-manager-select(key); }

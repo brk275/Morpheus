@@ -10,9 +10,9 @@ use std::sync::{
 };
 
 use morpheus_matrix::{
-    AccountSelection, HierarchyPage, MAX_HIERARCHY_PAGES, MatrixLinkTarget, RoomAdminError,
-    RoomMembership, RoomSettingsCancellation, SpaceChildLink, SpaceNode, SpacePermissions,
-    SpaceSession, SpaceTarget, SpaceWriteOutcome,
+    AccountSelection, CreatedChild, HierarchyPage, MAX_CHILD_NAME_BYTES, MAX_HIERARCHY_PAGES,
+    MatrixLinkTarget, RoomAdminError, RoomMembership, RoomSettingsCancellation, SpaceChildLink,
+    SpaceNode, SpacePermissions, SpaceSession, SpaceTarget, SpaceWriteOutcome,
 };
 use slint::{ComponentHandle, ModelRc, VecModel};
 use tokio::{runtime::Handle, sync::Notify};
@@ -36,6 +36,7 @@ pub(crate) const REMOVE: i32 = 8;
 pub(crate) const JOIN: i32 = 9;
 pub(crate) const OPEN_SPACE: i32 = 10;
 pub(crate) const STOP: i32 = 11;
+pub(crate) const CREATE: i32 = 12;
 
 struct Panel {
     id: u64,
@@ -161,6 +162,7 @@ enum Done {
     },
     Resolved(SpaceTarget),
     Written(SpaceWriteOutcome),
+    Created(CreatedChild),
     Joined,
 }
 
@@ -406,6 +408,7 @@ impl SpaceManagerUi {
             JOIN => self.review_join(ui, panel),
             OPEN_SPACE => self.open_selected_space(ui, &panel),
             STOP => self.stop_read(&panel),
+            CREATE => self.review_create(ui, panel),
             _ => {}
         }
     }
@@ -548,6 +551,27 @@ impl SpaceManagerUi {
             order,
         };
         self.review(ui, panel, change, name);
+    }
+
+    fn review_create(self: &Arc<Self>, ui: &AppWindow, panel: Arc<Panel>) {
+        if !self.idle(&panel) || !panel.lock().can_manage() {
+            return;
+        }
+        let name = ui.get_space_manager_create_name().trim().to_owned();
+        let valid = !name.is_empty()
+            && name.len() <= MAX_CHILD_NAME_BYTES
+            && !name.chars().any(char::is_control);
+        if !valid {
+            let message = super::error_text(RoomAdminError::InvalidName);
+            return self.reject(ui, &panel, message);
+        }
+        let shown = crate::directory_plain_text(&name, 100);
+        let change = Change::Create {
+            name,
+            members_only: ui.get_space_manager_create_members_only(),
+            suggested: ui.get_space_manager_create_suggested(),
+        };
+        self.review(ui, panel, change, shown);
     }
 
     fn review_save(self: &Arc<Self>, ui: &AppWindow, panel: Arc<Panel>) {
@@ -720,6 +744,10 @@ impl SpaceManagerUi {
                         Change::Update { link, suggested, order } => session.update(&link, suggested, order.as_deref()).await?,
                         Change::Unlink { link } => session.unlink(&link).await?,
                         Change::Reorder { plan, .. } => session.reorder(&plan).await?,
+                        Change::Create { name: room_name, members_only, suggested } => {
+                            let created = session.create_child(&room_name, members_only, suggested).await?;
+                            return Ok(Done::Created(created));
+                        }
                         Change::Join { room_id, via, is_space } => {
                             // The normal explicit join flow for one room only.
                             let target = MatrixLinkTarget::Room { room_or_alias_id: room_id, event_id: None, via_servers: via };
@@ -746,6 +774,7 @@ impl SpaceManagerUi {
         // Release the generation even for a retired panel; paint only an active one.
         let active = self.active(&panel);
         let mut joined = false;
+        let succeeded = result.is_ok();
         {
             let mut state = panel.lock();
             if !state.progress.finish(generation) {
@@ -770,6 +799,15 @@ impl SpaceManagerUi {
                         settle(&mut state, intent, outcome);
                     }
                     // Show the authoritative hierarchy after every write.
+                    state.stale = true;
+                }
+                Ok(Done::Created(created)) => {
+                    if let Some(intent) = &intent {
+                        let (notice, error) = super::created_text(intent, &created);
+                        state.notice = notice;
+                        state.error = error;
+                    }
+                    // Show the authoritative hierarchy with the new room.
                     state.stale = true;
                 }
                 Ok(Done::Joined) => {
@@ -798,7 +836,9 @@ impl SpaceManagerUi {
             if !this.matches_ui(&panel, &ui) {
                 return;
             }
-            if let Some(intent) = &intent {
+            if let Some(intent) = &intent
+                && succeeded
+            {
                 reset_inputs(&ui, intent);
             }
             this.repaint_panel(&ui, &panel);
@@ -905,11 +945,19 @@ fn settle(state: &mut PanelState, intent: &Intent, outcome: SpaceWriteOutcome) {
     }
 }
 
+/// Clear the inputs a successful change used; a failed one keeps them.
 fn reset_inputs(ui: &AppWindow, intent: &Intent) {
-    if let Change::Link { .. } = intent.change {
-        ui.set_space_manager_target_input("".into());
-        ui.set_space_manager_target_order("".into());
-        ui.set_space_manager_target_suggested(false);
+    match intent.change {
+        Change::Link { .. } => {
+            ui.set_space_manager_target_input("".into());
+            ui.set_space_manager_target_order("".into());
+            ui.set_space_manager_target_suggested(false);
+        }
+        Change::Create { .. } => {
+            ui.set_space_manager_create_name("".into());
+            ui.set_space_manager_create_suggested(false);
+        }
+        _ => {}
     }
 }
 
@@ -1026,6 +1074,9 @@ pub(crate) fn clear_presentation(ui: &AppWindow) {
     ui.set_space_manager_target_suggested(false);
     ui.set_space_manager_order("".into());
     ui.set_space_manager_suggested(false);
+    ui.set_space_manager_create_name("".into());
+    ui.set_space_manager_create_members_only(true);
+    ui.set_space_manager_create_suggested(false);
 }
 
 fn scope_active(
