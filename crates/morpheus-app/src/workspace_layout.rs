@@ -22,6 +22,11 @@
 //! (`save_config_change`); no other writer exists here. An invalid file never
 //! reaches `apply_config`, so the last valid arrangement stays.
 
+use std::{
+    cell::{Cell, RefCell},
+    sync::{Arc, Weak},
+};
+
 use morpheus_config::{Config, ConfigStore, DetailsSide, Layout, PaneId};
 use slint::{ComponentHandle, ModelRc, VecModel};
 
@@ -34,6 +39,42 @@ pub(crate) const STRIP: f32 = 28.0;
 pub(crate) const CONVERSATION_MIN: f32 = 360.0;
 /// The account control's own column, when the room list does not lead.
 pub(crate) const ACCOUNT_COLUMN: f32 = 64.0;
+
+/// Saved width ranges, as `config.toml` validates them.
+pub(crate) const ROOMS_WIDTH: (u16, u16) = (180, 480);
+pub(crate) const DETAILS_WIDTH: (u16, u16) = (200, 520);
+const CONFLICT: &str =
+    "The layout changed elsewhere while you were dragging; your change was not applied.";
+const REFUSED: &str = "That change can't be made right now; the layout is unchanged.";
+
+/// One pointer resize or drag arrangement in progress. Its preview lives in
+/// the window only; nothing is written until it is committed once, and only
+/// if the fields it changes still hold the values it started from.
+struct Gesture {
+    token: i32,
+    account_id: String,
+    room_id: String,
+    page: i32,
+    context_current: Box<dyn Fn() -> bool>,
+    /// The arrangement as last applied when the gesture began.
+    base: Layout,
+}
+
+thread_local! {
+    // Slint callbacks and config projections run on the UI thread only.
+    static APPLIED: RefCell<Option<Layout>> = const { RefCell::new(None) };
+    static GESTURE: RefCell<Option<Gesture>> = const { RefCell::new(None) };
+    static NEXT_TOKEN: Cell<i32> = const { Cell::new(0) };
+}
+
+/// Why a committed gesture did not change the file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Refusal {
+    /// The field changed in the file since the gesture began.
+    Conflict,
+    /// The value is unchanged, or the pane cannot take it.
+    Nothing,
+}
 
 /// The four built-in presets, in the order Settings shows them.
 const PRESET_STANDARD: i32 = 0;
@@ -174,6 +215,273 @@ pub(crate) fn register(ui: &AppWindow, store: &ConfigStore) {
         changed
     });
     ui.on_reset_pane_visibility(move || reset_visibility("", 0));
+
+    let weak = ui.as_weak();
+    ui.on_begin_pane_gesture(move || {
+        weak.upgrade().map_or(0, |ui| {
+            // A live gesture requires an exact backend selection, installed
+            // by register_live. Presentation strings alone cannot authorize it.
+            if ui.get_live_session() {
+                return 0;
+            }
+            begin_gesture(&ui, Box::new(|| true))
+        })
+    });
+    let weak = ui.as_weak();
+    ui.on_cancel_pane_gesture(move |token| {
+        if let Some(ui) = weak.upgrade() {
+            end_gesture(&ui, token);
+        }
+    });
+    let weak = ui.as_weak();
+    let width_store = store.clone();
+    ui.on_commit_pane_width(move |token, pane, width| {
+        if let Some(ui) = weak.upgrade() {
+            commit(&ui, &width_store, token, |current, base| {
+                merge_width(current, base, pane.as_str(), width)
+            });
+        }
+    });
+    let weak = ui.as_weak();
+    let order_store = store.clone();
+    ui.on_commit_pane_order(move |token, pane, index| {
+        if let Some(ui) = weak.upgrade() {
+            commit(&ui, &order_store, token, |current, base| {
+                merge_order(current, base, pane.as_str(), index)
+            });
+        }
+    });
+}
+
+/// Bind production gestures to the exact account selection and navigation
+/// epoch. Returning to the same account/room strings never revives a drag.
+pub(crate) fn register_live(ui: &AppWindow, store: &ConfigStore, live: &Arc<crate::live::LiveUi>) {
+    register(ui, store);
+    let weak = ui.as_weak();
+    let live = Arc::downgrade(live);
+    ui.on_begin_pane_gesture(move || {
+        let Some(ui) = weak.upgrade() else {
+            return 0;
+        };
+        let Some(context) = capture_context(&ui, &live) else {
+            return 0;
+        };
+        begin_gesture(&ui, context)
+    });
+}
+
+fn capture_context(
+    ui: &AppWindow,
+    weak: &Weak<crate::live::LiveUi>,
+) -> Option<Box<dyn Fn() -> bool>> {
+    let live = weak.upgrade()?;
+    let navigation = live.current_navigation_epoch();
+    let was_live = ui.get_live_session();
+    let selection = if was_live {
+        Some(live.account_selection(ui.get_active_account_local_id().as_str())?)
+    } else {
+        None
+    };
+    let weak = weak.clone();
+    let current = move || {
+        weak.upgrade().is_some_and(|live| {
+            live.current_navigation_epoch() == navigation
+                && live.is_live.load(std::sync::atomic::Ordering::Acquire) == was_live
+                && selection
+                    .as_ref()
+                    .is_none_or(|selection| selection.is_current())
+        })
+    };
+    if !current() {
+        return None;
+    }
+    Some(Box::new(current))
+}
+
+/// A modal, lock, sign-in, recovery or account switch owns the window: no
+/// pointer gesture may start or commit, and none may move focus.
+fn gesture_blocked(ui: &AppWindow) -> bool {
+    (!ui.get_live_session() && !ui.get_preview_session() && ui.get_page() != 1)
+        || ui.get_show_sign_in()
+        || ui.get_account_switch_pending()
+        || ui.get_account_menu_open()
+        || ui.get_manage_accounts_open()
+        || ui.get_access_open()
+        || ui.get_room_actions_open()
+        || ui.get_room_admin_open()
+        || ui.get_member_confirm_open()
+        || ui.get_native_capture_picker_open()
+        || ui.get_leave_call_dialog()
+        || !ui.get_security_recovery_key().is_empty()
+        || ui.get_quick_switcher_open()
+        || ui.get_image_preview_open()
+        || ui.get_poll_dialog_open()
+}
+
+/// Start a gesture: capture the applied arrangement and the account. Returns
+/// its token, or 0 when no gesture may start (the window then shows no
+/// preview). A new gesture replaces any unfinished one.
+fn begin_gesture(ui: &AppWindow, context_current: Box<dyn Fn() -> bool>) -> i32 {
+    let Some(base) = APPLIED.with(|applied| applied.borrow().clone()) else {
+        return 0;
+    };
+    if gesture_blocked(ui) || !context_current() {
+        return 0;
+    }
+    let token = NEXT_TOKEN.with(|next| {
+        let token = next.get().checked_add(1)?;
+        next.set(token);
+        Some(token)
+    });
+    let Some(token) = token else {
+        return 0;
+    };
+    GESTURE.with(|gesture| {
+        *gesture.borrow_mut() = Some(Gesture {
+            token,
+            account_id: ui.get_active_account_local_id().to_string(),
+            room_id: ui.get_active_room_id().to_string(),
+            page: ui.get_page(),
+            context_current,
+            base,
+        });
+    });
+    ui.set_layout_notice("".into());
+    token
+}
+
+/// Forget the gesture `token` (cancelled, interrupted or committed).
+fn end_gesture(ui: &AppWindow, token: i32) -> Option<Gesture> {
+    let ended = GESTURE.with(|gesture| {
+        let mut gesture = gesture.borrow_mut();
+        if gesture
+            .as_ref()
+            .is_some_and(|current| current.token == token)
+        {
+            gesture.take()
+        } else {
+            None
+        }
+    });
+    if ended.is_some() {
+        ui.set_pane_gesture(0);
+    }
+    ended
+}
+
+/// Commit the gesture `token` once: only while its account is still the one
+/// shown and nothing modal owns the window, and only the field it changed,
+/// merged onto the configuration as re-read by the existing writer. A field
+/// that changed since the gesture began is a conflict, never overwritten.
+fn commit(
+    ui: &AppWindow,
+    store: &ConfigStore,
+    token: i32,
+    merge: impl FnOnce(&mut Layout, &Layout) -> Result<(), Refusal>,
+) {
+    let Some(gesture) = end_gesture(ui, token) else {
+        return;
+    };
+    if gesture.account_id != ui.get_active_account_local_id().as_str()
+        || gesture.room_id != ui.get_active_room_id().as_str()
+        || gesture.page != ui.get_page()
+        || !(gesture.context_current)()
+        || gesture_blocked(ui)
+    {
+        ui.set_layout_notice(REFUSED.into());
+        return;
+    }
+    let mut refusal = None;
+    let saved = crate::save_config_edit(ui, store, |config| {
+        match merge(&mut config.layout, &gesture.base) {
+            Ok(()) => true,
+            Err(why) => {
+                refusal = Some(why);
+                false
+            }
+        }
+    });
+    match (saved, refusal) {
+        (Some(_), _) => ui.set_layout_notice("".into()),
+        (None, Some(Refusal::Conflict)) => ui.set_layout_notice(CONFLICT.into()),
+        (None, Some(Refusal::Nothing)) => {}
+        // The writer refused (an invalid file, or a style preview it would
+        // not save over); its own error is shown, and nothing changed.
+        (None, None) => ui.set_layout_notice(REFUSED.into()),
+    }
+}
+
+fn width_of(layout: &Layout, pane: PaneId) -> Option<u16> {
+    match pane {
+        PaneId::Rooms => Some(layout.room_list_width),
+        PaneId::Details => Some(layout.details_width),
+        PaneId::Spaces | PaneId::Conversation => None,
+    }
+}
+
+/// Set one pane's saved width (clamped to its range) on `current`, if it
+/// still holds the width the gesture started from.
+pub(crate) fn merge_width(
+    current: &mut Layout,
+    base: &Layout,
+    pane: &str,
+    width: i32,
+) -> Result<(), Refusal> {
+    let pane = pane_from_id(pane).ok_or(Refusal::Nothing)?;
+    let (start, now) = (width_of(base, pane), width_of(current, pane));
+    let (Some(start), Some(now)) = (start, now) else {
+        return Err(Refusal::Nothing);
+    };
+    if now != start {
+        return Err(Refusal::Conflict);
+    }
+    let (minimum, maximum) = match pane {
+        PaneId::Rooms => ROOMS_WIDTH,
+        _ => DETAILS_WIDTH,
+    };
+    let width = u16::try_from(width.clamp(i32::from(minimum), i32::from(maximum)))
+        .map_err(|_| Refusal::Nothing)?;
+    if width == now {
+        return Err(Refusal::Nothing);
+    }
+    match pane {
+        PaneId::Rooms => current.room_list_width = width,
+        _ => current.details_width = width,
+    }
+    Ok(())
+}
+
+/// Move one pane to `index` (0 to 3) of the arrangement on `current`, if its
+/// order still is the one the gesture started from. Every pane stays exactly
+/// once, and hidden or collapsed panes keep their state and widths.
+pub(crate) fn merge_order(
+    current: &mut Layout,
+    base: &Layout,
+    pane: &str,
+    index: i32,
+) -> Result<(), Refusal> {
+    let pane = pane_from_id(pane).ok_or(Refusal::Nothing)?;
+    if current.effective_pane_order() != base.effective_pane_order()
+        || current.pane_order != base.pane_order
+    {
+        return Err(Refusal::Conflict);
+    }
+    let order = reordered(base.effective_pane_order(), pane, index).ok_or(Refusal::Nothing)?;
+    if order == current.effective_pane_order() {
+        return Err(Refusal::Nothing);
+    }
+    current.pane_order = order.to_vec();
+    Ok(())
+}
+
+/// `order` with `pane` moved to `index`, counted in the final order.
+pub(crate) fn reordered(order: [PaneId; 4], pane: PaneId, index: i32) -> Option<[PaneId; 4]> {
+    let index = usize::try_from(index)
+        .ok()
+        .filter(|index| *index < order.len())?;
+    let mut rest: Vec<PaneId> = order.into_iter().filter(|other| *other != pane).collect();
+    rest.insert(index, pane);
+    <[PaneId; 4]>::try_from(rest).ok()
 }
 
 /// Project an accepted configuration's arrangement into the window.
@@ -182,6 +490,9 @@ pub(crate) fn apply_config(ui: &AppWindow, config: &Config) {
     // A new accepted config ends temporary explicit-open presentation. The
     // saved hide/collapse choices remain authoritative after an edit/reload.
     ui.set_details_reveal_open(false);
+    // Gestures compare against this; a gesture begun before an external
+    // change still holds its own base and is refused as a conflict.
+    APPLIED.with(|applied| *applied.borrow_mut() = Some(layout.clone()));
     let order = layout.effective_pane_order();
     let slot_of = |pane| i32::try_from(slot(&order, pane)).unwrap_or(0);
     ui.set_pane_slot_spaces(slot_of(PaneId::Spaces));
@@ -528,5 +839,140 @@ mod tests {
             rows.iter()
                 .any(|row| row.id == "conversation" && !row.can_hide)
         );
+    }
+
+    #[test]
+    fn a_dragged_width_commits_once_clamped_and_never_over_an_external_change() {
+        let base = Layout::default();
+        let mut current = base.clone();
+        // Clamped to the saved range, only the dragged pane's width changes.
+        assert_eq!(merge_width(&mut current, &base, "rooms", 9_000), Ok(()));
+        assert_eq!(current.room_list_width, ROOMS_WIDTH.1);
+        assert_eq!(current.details_width, base.details_width);
+        let mut current = base.clone();
+        assert_eq!(merge_width(&mut current, &base, "details", 10), Ok(()));
+        assert_eq!(current.details_width, DETAILS_WIDTH.0);
+        // The file changed during the drag: a conflict, nothing overwritten.
+        let mut edited = Layout {
+            room_list_width: 333,
+            ..base.clone()
+        };
+        assert_eq!(
+            merge_width(&mut edited, &base, "rooms", 250),
+            Err(Refusal::Conflict)
+        );
+        assert_eq!(edited.room_list_width, 333);
+        // Unchanged widths and panes without a width change nothing.
+        let mut same = base.clone();
+        assert_eq!(
+            merge_width(&mut same, &base, "rooms", i32::from(base.room_list_width)),
+            Err(Refusal::Nothing)
+        );
+        assert_eq!(
+            merge_width(&mut same, &base, "conversation", 300),
+            Err(Refusal::Nothing)
+        );
+        assert_eq!(
+            merge_width(&mut same, &base, "members", 300),
+            Err(Refusal::Nothing)
+        );
+        // Another layout field changing meanwhile is kept, not reverted.
+        let mut other = Layout {
+            sort_unread_first: true,
+            ..base.clone()
+        };
+        assert_eq!(merge_width(&mut other, &base, "rooms", 300), Ok(()));
+        assert!(other.sort_unread_first);
+    }
+
+    #[test]
+    fn a_dragged_pane_lands_exactly_once_at_its_insertion_position() {
+        for pane in PaneId::ALL {
+            for index in 0..4 {
+                let order = reordered(STANDARD, pane, index).unwrap();
+                assert_eq!(order[usize::try_from(index).unwrap()], pane);
+                for other in PaneId::ALL {
+                    assert_eq!(
+                        order
+                            .iter()
+                            .filter(|candidate| **candidate == other)
+                            .count(),
+                        1
+                    );
+                }
+            }
+            assert_eq!(reordered(STANDARD, pane, 4), None);
+            assert_eq!(reordered(STANDARD, pane, -1), None);
+        }
+        // Dragging the conversation to the front keeps the others in order.
+        assert_eq!(
+            reordered(STANDARD, PaneId::Conversation, 0),
+            Some([
+                PaneId::Conversation,
+                PaneId::Spaces,
+                PaneId::Rooms,
+                PaneId::Details
+            ])
+        );
+    }
+
+    #[test]
+    fn reordering_keeps_hidden_collapsed_and_widths_and_refuses_stale_orders() {
+        let base = Layout {
+            hidden_panes: vec![PaneId::Spaces],
+            collapsed_panes: vec![PaneId::Details],
+            room_list_width: 300,
+            ..Layout::default()
+        };
+        let mut current = base.clone();
+        // A hidden pane can be moved too; it stays hidden, nothing duplicates.
+        assert_eq!(merge_order(&mut current, &base, "spaces", 3), Ok(()));
+        assert_eq!(
+            current.pane_order,
+            vec![
+                PaneId::Rooms,
+                PaneId::Conversation,
+                PaneId::Details,
+                PaneId::Spaces
+            ]
+        );
+        assert_eq!(current.hidden_panes, base.hidden_panes);
+        assert_eq!(current.collapsed_panes, base.collapsed_panes);
+        assert_eq!(current.room_list_width, 300);
+        Config {
+            layout: current.clone(),
+            ..Config::default()
+        }
+        .validate()
+        .unwrap();
+        // The order changed elsewhere during the drag (also via the side).
+        let mut reordered_elsewhere = Layout {
+            pane_order: vec![
+                PaneId::Details,
+                PaneId::Spaces,
+                PaneId::Rooms,
+                PaneId::Conversation,
+            ],
+            ..base.clone()
+        };
+        assert_eq!(
+            merge_order(&mut reordered_elsewhere, &base, "rooms", 0),
+            Err(Refusal::Conflict)
+        );
+        let mut side_changed = Layout {
+            details_side: DetailsSide::Left,
+            ..base.clone()
+        };
+        assert_eq!(
+            merge_order(&mut side_changed, &base, "rooms", 0),
+            Err(Refusal::Conflict)
+        );
+        // Dropping a pane where it already is saves nothing.
+        let mut unchanged = base.clone();
+        assert_eq!(
+            merge_order(&mut unchanged, &base, "rooms", 1),
+            Err(Refusal::Nothing)
+        );
+        assert!(unchanged.pane_order.is_empty());
     }
 }

@@ -3795,6 +3795,7 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
         directory.path().join("config.toml"),
     )));
     let live = LiveUi::new(manager.clone(), runtime.clone(), ui.as_weak(), voices);
+    assert_pane_navigation_epoch(&ui, &live, directory.path()).await;
     // This suite tests the actual dialog/controller boundary, not credentials.
     // A denied account-change guard also prevents any mistaken key sequence
     // from starting policy writes, account activation, or local deletion.
@@ -5732,6 +5733,138 @@ async fn assert_layout_navigation_recovery(ui: &AppWindow, directory: &std::path
     }
     ui.window().set_size(size);
     apply_config(ui, &Config::default(), None);
+    assert_pane_pointer_cancellation(ui, &store).await;
     ui.set_page(page);
+    settle(ui).await;
+}
+
+/// Exercise real generated TouchAreas: Slint sends Cancel with button Other.
+/// Neither a cancelled grab nor its late release may persist a layout edit.
+async fn assert_pane_pointer_cancellation(ui: &AppWindow, store: &morpheus_config::ConfigStore) {
+    use slint::platform::PointerEventButton;
+    let was_live = ui.get_live_session();
+    let was_preview = ui.get_preview_session();
+    ui.set_live_session(false);
+    ui.set_preview_session(true);
+    ui.set_show_sign_in(false);
+    ui.set_page(0);
+    let config = Config::default();
+    store.save(&config).unwrap();
+    apply_config(ui, &config, None);
+    settle(ui).await;
+    let saved = std::fs::read(store.path()).unwrap();
+    for component in ["PaneResizeEdge", "PaneDragGrip"] {
+        let handle = ElementHandle::find_by_element_type_name(ui, component)
+            .find(|item| item.size().width > 0.0 && item.size().height > 0.0)
+            .expect("the generated pane pointer control must be present");
+        let origin = handle.absolute_position();
+        let size = handle.size();
+        let start = slint::LogicalPosition::new(
+            origin.x + size.width / 2.0,
+            origin.y + 6.0_f32.min(size.height / 2.0),
+        );
+        ui.window()
+            .dispatch_event(WindowEvent::PointerMoved { position: start });
+        ui.window().dispatch_event(WindowEvent::PointerPressed {
+            position: start,
+            button: PointerEventButton::Left,
+        });
+        settle(ui).await;
+        let token = ui.get_pane_gesture();
+        assert!(
+            token > 0,
+            "the actual pointer press must begin a gesture: {component}"
+        );
+        let moved = slint::LogicalPosition::new(start.x + 40.0, start.y);
+        ui.window()
+            .dispatch_event(WindowEvent::PointerMoved { position: moved });
+        settle(ui).await;
+        assert_eq!(
+            std::fs::read(store.path()).unwrap(),
+            saved,
+            "pointer preview must not save"
+        );
+        ui.window().dispatch_event(WindowEvent::PointerExited);
+        settle(ui).await;
+        assert_eq!(
+            ui.get_pane_gesture(),
+            0,
+            "Cancel/Other must clear the gesture: {component}"
+        );
+        ui.window().dispatch_event(WindowEvent::PointerReleased {
+            position: moved,
+            button: PointerEventButton::Left,
+        });
+        settle(ui).await;
+        assert_eq!(
+            std::fs::read(store.path()).unwrap(),
+            saved,
+            "cancelled pointer release must not save"
+        );
+        // A late commit token cannot be reused, including after a new gesture.
+        let newer = ui.invoke_begin_pane_gesture();
+        assert!(newer > token);
+        ui.set_pane_gesture(newer);
+        ui.invoke_commit_pane_width(token, "rooms".into(), 350);
+        assert_eq!(ui.get_pane_gesture(), newer);
+        ui.invoke_cancel_pane_preview();
+        assert_eq!(std::fs::read(store.path()).unwrap(), saved);
+    }
+    ui.set_live_session(was_live);
+    ui.set_preview_session(was_preview);
+    settle(ui).await;
+}
+
+/// Use the production LiveUi epoch even when a rapid A-B-A has coalesced to
+/// the original UI strings. A preview session uses no real account or vault.
+async fn assert_pane_navigation_epoch(
+    ui: &AppWindow,
+    live: &Arc<LiveUi>,
+    directory: &std::path::Path,
+) {
+    let store = morpheus_config::ConfigStore::at(directory.join("pane-epoch.toml"));
+    let config = Config::default();
+    store.save(&config).unwrap();
+    let saved = std::fs::read(store.path()).unwrap();
+    let was_live = ui.get_live_session();
+    let was_preview = ui.get_preview_session();
+    ui.set_live_session(false);
+    ui.set_preview_session(true);
+    ui.set_show_sign_in(false);
+    ui.set_page(0);
+    crate::workspace_layout::register_live(ui, &store, live);
+    apply_config(ui, &config, None);
+    settle(ui).await;
+    let account = ui.get_active_account_local_id();
+    let room = ui.get_active_room_id();
+    let token = ui.invoke_begin_pane_gesture();
+    assert!(token > 0);
+    ui.set_pane_gesture(token);
+    live.invalidate_navigation();
+    ui.set_active_account_local_id("synthetic-other-account".into());
+    ui.set_active_room_id("!synthetic-other-room:example.invalid".into());
+    live.invalidate_navigation();
+    ui.set_active_account_local_id(account);
+    ui.set_active_room_id(room);
+    // Deliberately do not settle: identical final strings are not an epoch.
+    ui.invoke_commit_pane_width(token, "rooms".into(), 350);
+    assert_eq!(std::fs::read(store.path()).unwrap(), saved);
+    assert!(!ui.get_layout_notice().is_empty());
+    assert_eq!(ui.get_pane_gesture(), 0);
+    let token = ui.invoke_begin_pane_gesture();
+    assert!(token > 0);
+    ui.set_pane_gesture(token);
+    ui.invoke_commit_pane_width(token, "rooms".into(), 350);
+    assert_eq!(store.load().unwrap().layout.room_list_width, 350);
+    ui.invoke_commit_pane_width(token, "rooms".into(), 400);
+    assert_eq!(
+        store.load().unwrap().layout.room_list_width,
+        350,
+        "commit is single-use"
+    );
+    ui.invoke_cancel_pane_preview();
+    apply_config(ui, &config, None);
+    ui.set_live_session(was_live);
+    ui.set_preview_session(was_preview);
     settle(ui).await;
 }

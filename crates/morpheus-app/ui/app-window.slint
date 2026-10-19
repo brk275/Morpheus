@@ -376,6 +376,160 @@ component InterfaceGlyph inherits Path {
         : "M 3 4 L 17 4 L 17 13 L 10 13 L 6 17 L 6 13 L 3 13 Z M 6 7 L 14 7 M 6 10 L 12 10";
 }
 
+// A pane's resize edge: a subtle line that shows on hover and while
+// dragging. Only the window previews the new width while the pointer moves;
+// `finished` reports the final width once, on release. A cancelled pointer
+// (lost grab) reports `cancelled`. Keyboard users have Settings' width
+// fields, so the edge itself takes no focus.
+component PaneResizeEdge inherits Rectangle {
+    in property <bool> grows-right: true;
+    in property <length> start-width;
+    in property <length> minimum;
+    in property <length> maximum;
+    in property <color> accent;
+    in property <bool> enabled: true;
+    callback began() -> bool;
+    callback previewed(length);
+    callback finished(length);
+    callback cancelled();
+    property <bool> active: false;
+    in property <int> gesture-token;
+    property <int> owned-token: 0;
+    changed gesture-token => {
+        if root.owned-token != root.gesture-token { root.active = false; }
+    }
+    property <length> press-x;
+    property <length> base;
+    pure function value-now() -> length {
+        clamp(root.base + (root.grows-right ? 1 : -1) * (self.absolute-position.x + touch.mouse-x - root.press-x), root.minimum, root.maximum)
+    }
+    width: 8px;
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        width: touch.has-hover || root.active ? 3px : 1px;
+        height: parent.height;
+        background: touch.has-hover || root.active ? root.accent : transparent;
+    }
+    touch := TouchArea {
+        enabled: root.enabled || root.active;
+        mouse-cursor: ew-resize;
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.cancel {
+                if root.active && root.owned-token == root.gesture-token {
+                    root.active = false;
+                    root.cancelled();
+                }
+                return;
+            }
+            if event.button != PointerEventButton.left {
+                return;
+            }
+            if event.kind == PointerEventKind.down {
+                if root.began() {
+                    root.owned-token = root.gesture-token;
+                    root.active = true;
+                    root.press-x = root.absolute-position.x + self.mouse-x;
+                    root.base = root.start-width;
+                }
+            } else if event.kind == PointerEventKind.up {
+                if root.active && root.owned-token == root.gesture-token {
+                    root.active = false;
+                    root.finished(root.value-now());
+                }
+            }
+        }
+        moved => {
+            if root.active && root.owned-token == root.gesture-token {
+                root.previewed(root.value-now());
+            }
+        }
+    }
+}
+
+// A pane's drag grip for arranging panes by pointer. While dragging it
+// reports the pointer's window x; the window shows where the pane would go
+// and commits once on release. Move left/right in Settings does the same by
+// keyboard.
+component PaneDragGrip inherits Rectangle {
+    in property <color> ink;
+    in property <color> accent;
+    in property <color> hover;
+    in property <bool> enabled: true;
+    callback began() -> bool;
+    callback dragged(length);
+    callback dropped(length);
+    callback cancelled();
+    property <bool> active: false;
+    in property <int> gesture-token;
+    property <int> owned-token: 0;
+    changed gesture-token => {
+        if root.owned-token != root.gesture-token { root.active = false; }
+    }
+    width: 36px;
+    height: 12px;
+    border-radius: 6px;
+    background: root.active ? root.accent : touch.has-hover ? root.hover : transparent;
+    Text {
+        text: "⋯";
+        color: root.active ? root.hover : root.ink;
+        font-size: 12px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+    touch := TouchArea {
+        enabled: root.enabled || root.active;
+        mouse-cursor: root.active ? grabbing : grab;
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.cancel {
+                if root.active && root.owned-token == root.gesture-token {
+                    root.active = false;
+                    root.cancelled();
+                }
+                return;
+            }
+            if event.button != PointerEventButton.left {
+                return;
+            }
+            if event.kind == PointerEventKind.down {
+                if root.began() {
+                    root.owned-token = root.gesture-token;
+                    root.active = true;
+                }
+            } else if event.kind == PointerEventKind.up {
+                if root.active && root.owned-token == root.gesture-token {
+                    root.active = false;
+                    root.dropped(root.absolute-position.x + self.mouse-x);
+                }
+            }
+        }
+        moved => {
+            if root.active && root.owned-token == root.gesture-token {
+                root.dragged(root.absolute-position.x + self.mouse-x);
+            }
+        }
+    }
+}
+
+// An exact width entry that follows the saved width after every save.
+component WidthSpin inherits Rectangle {
+    in property <int> saved;
+    in property <int> minimum;
+    in property <int> maximum;
+    in property <string> label;
+    callback edited(int);
+    changed saved => { spin.value = root.saved; }
+    width: 120px;
+    spin := SpinBox {
+        width: parent.width;
+        minimum: root.minimum;
+        maximum: root.maximum;
+        value: root.saved;
+        accessible-label: root.label;
+        edited(value) => { root.edited(value); }
+    }
+}
+
 component IconAction inherits Rectangle {
     in property <string> icon;
     in property <string> label;
@@ -2992,6 +3146,32 @@ export component AppWindow inherits Window {
     // The advanced editor's rows, in the current order.
     in-out property <[LayoutPaneItem]> layout-panes;
     in-out property <int> layout-preset: 0;
+    // Pointer gesture in progress (token from Rust; 0 none). Its preview is
+    // the window's only: nothing is saved until the gesture is committed.
+    in-out property <int> pane-gesture: 0;
+    in-out property <string> layout-notice;
+    property <length> rooms-preview: -1px;
+    property <length> details-preview: -1px;
+    property <string> pane-dragging: "";
+    property <int> pane-drag-slot: -1;
+    property <int> pane-drop-index: -1;
+    // Settings editor drag: the row being moved and its target position.
+    property <int> layout-editor-drop: -1;
+    property <int> layout-editor-from: -1;
+    property <length> layout-row-height: max(48px, 30px * root.text-scale + 18px);
+    // A modal, lock, recovery or account switch owns the window: no gesture
+    // starts, and one in progress is discarded.
+    property <bool> pane-gesture-allowed: !(root.show-sign-in || root.access-open || root.account-switch-pending
+        || root.security-recovery-key != "" || root.leave-call-dialog || root.manage-accounts-open
+        || root.account-menu-open || root.native-capture-picker-open || root.member-confirm-open
+        || root.room-admin-open || root.room-actions-open || root.quick-switcher-open
+        || root.image-preview-open || root.poll-dialog-open);
+    changed pane-gesture-allowed => {
+        if !root.pane-gesture-allowed { root.cancel-pane-preview(); }
+    }
+    // A preview never carries over to another account or room.
+    property <string> pane-gesture-context: root.active-account-local-id + "\n" + root.active-room-id + "\n" + root.page;
+    changed pane-gesture-context => { root.cancel-pane-preview(); }
     // Geometry. Mirrors workspace_layout::arrange in Rust (tested there).
     property <length> pane-strip: 28px;
     property <length> pane-conversation-min: 360px;
@@ -3007,9 +3187,9 @@ export component AppWindow inherits Window {
     in-out property <bool> details-reveal-open: false;
     property <bool> details-reveal-active: root.details-reveal-open && root.show-side-panel && root.page == 0;
     property <length> pane-rail-saved: root.navigation-mode == 0 && !root.pane-spaces-hidden ? root.rail-width-px * 1px : 0px;
-    property <length> pane-rooms-full: root.room-list-width * 1px;
+    property <length> pane-rooms-full: root.rooms-preview >= 0px ? root.rooms-preview : root.room-list-width * 1px;
     property <length> pane-rooms-saved: root.pane-rooms-hidden ? 0px : root.pane-rooms-collapsed ? root.pane-strip : root.pane-rooms-full;
-    property <length> details-reveal-width: min(root.details-width * 1px, max(0px, root.width - root.account-column-width - root.pane-conversation-min));
+    property <length> details-reveal-width: min((root.details-preview >= 0px ? root.details-preview : root.details-width * 1px), max(0px, root.width - root.account-column-width - root.pane-conversation-min));
     property <length> details-reveal-room-budget: max(0px, root.width - root.account-column-width - root.pane-conversation-min - root.details-reveal-width);
     property <length> pane-rooms-w0: !root.details-reveal-active ? root.pane-rooms-saved
         : root.details-reveal-room-budget >= root.pane-rooms-saved ? root.pane-rooms-saved
@@ -3017,7 +3197,7 @@ export component AppWindow inherits Window {
     property <length> pane-rail-w0: !root.details-reveal-active || root.details-reveal-room-budget - root.pane-rooms-w0 >= root.pane-rail-saved ? root.pane-rail-saved : 0px;
     property <bool> pane-details-open: root.show-side-panel && root.page == 0 && (!root.pane-details-hidden || root.details-reveal-active);
     property <length> pane-details-w0: !root.pane-details-open ? 0px : root.details-reveal-active ? root.details-reveal-width
-        : root.pane-details-collapsed ? root.pane-strip : root.details-width * 1px;
+        : root.pane-details-collapsed ? root.pane-strip : root.details-preview >= 0px ? root.details-preview : root.details-width * 1px;
     changed show-side-panel => {
         if !root.show-side-panel { root.details-reveal-open = false; }
     }
@@ -3037,6 +3217,76 @@ export component AppWindow inherits Window {
     out property <length> pane-conversation-w: max(0px, root.pane-avail - root.pane-rail-w - root.pane-rooms-w - root.pane-details-w);
     out property <length> account-corner-x: root.account-column ? 0px : root.pane-x(root.pane-slot-rooms);
     out property <length> account-corner-width: root.account-column ? root.account-column-width : root.pane-rooms-w;
+    // Start a pointer gesture; false when one is running or none may start
+    // (a modal, lock, recovery or account switch owns the window).
+    function start-pane-gesture() -> bool {
+        if root.pane-gesture != 0 {
+            return false;
+        }
+        root.pane-gesture = root.begin-pane-gesture();
+        root.pane-gesture != 0
+    }
+    function end-pane-preview() {
+        root.rooms-preview = -1px;
+        root.details-preview = -1px;
+        root.pane-dragging = "";
+        root.pane-drag-slot = -1;
+        root.pane-drop-index = -1;
+        root.layout-editor-drop = -1;
+        root.layout-editor-from = -1;
+    }
+    // Escape, a lost pointer or a context change: discard the preview.
+    public function cancel-pane-preview() {
+        let token = root.pane-gesture;
+        root.end-pane-preview();
+        root.pane-gesture = 0;
+        if token != 0 {
+            root.cancel-pane-gesture(token);
+        }
+    }
+    function finish-pane-width(pane: string, width: length) {
+        let token = root.pane-gesture;
+        if token != 0 {
+            // Saved (and re-applied) before the preview is dropped, so the
+            // pane never jumps back for a frame.
+            root.commit-pane-width(token, pane, round(width / 1px));
+        }
+        root.end-pane-preview();
+        root.pane-gesture = 0;
+    }
+    function finish-pane-order(pane: string, index: int) {
+        let token = root.pane-gesture;
+        if token != 0 && index >= 0 {
+            root.commit-pane-order(token, pane, index);
+        } else if token != 0 {
+            root.cancel-pane-gesture(token);
+        }
+        root.end-pane-preview();
+        root.pane-gesture = 0;
+    }
+    // Panes other than `dragged` that come before `slot`.
+    pure function pane-rank(slot: int, dragged: int) -> int {
+        (root.pane-slot-spaces < slot && root.pane-slot-spaces != dragged ? 1 : 0)
+            + (root.pane-slot-rooms < slot && root.pane-slot-rooms != dragged ? 1 : 0)
+            + (root.pane-slot-conversation < slot && root.pane-slot-conversation != dragged ? 1 : 0)
+            + (root.pane-slot-details < slot && root.pane-slot-details != dragged ? 1 : 0)
+    }
+    // Where the dragged pane would go: how many other panes' centers lie
+    // left of the pointer (0 to 3, counted in the final order).
+    pure function pane-drop-at(px: length, dragged: int) -> int {
+        (root.pane-slot-spaces != dragged && root.pane-x(root.pane-slot-spaces) + root.pane-rail-w / 2 < px ? 1 : 0)
+            + (root.pane-slot-rooms != dragged && root.pane-x(root.pane-slot-rooms) + root.pane-rooms-w / 2 < px ? 1 : 0)
+            + (root.pane-slot-conversation != dragged && root.pane-x(root.pane-slot-conversation) + root.pane-conversation-w / 2 < px ? 1 : 0)
+            + (root.pane-slot-details != dragged && root.pane-x(root.pane-slot-details) + root.pane-details-w / 2 < px ? 1 : 0)
+    }
+    // The x of the insertion line for drop position `index`.
+    pure function pane-insert-x(index: int, dragged: int) -> length {
+        index >= 3 ? root.width - 2px
+            : root.pane-slot-spaces != dragged && root.pane-rank(root.pane-slot-spaces, dragged) == index ? root.pane-x(root.pane-slot-spaces)
+            : root.pane-slot-rooms != dragged && root.pane-rank(root.pane-slot-rooms, dragged) == index ? root.pane-x(root.pane-slot-rooms)
+            : root.pane-slot-conversation != dragged && root.pane-rank(root.pane-slot-conversation, dragged) == index ? root.pane-x(root.pane-slot-conversation)
+            : root.pane-x(root.pane-slot-details)
+    }
     // A pane's left edge: the account column, then every pane before it.
     pure function pane-x(slot: int) -> length {
         (root.account-column ? root.account-column-width : 0px)
@@ -3768,6 +4018,11 @@ export component AppWindow inherits Window {
     callback restore-default-layout();
     callback reset-pane-order();
     callback reset-pane-visibility();
+    // Pointer gestures: a token, then exactly one commit or cancel.
+    callback begin-pane-gesture() -> int;
+    callback commit-pane-width(int, string, int);
+    callback commit-pane-order(int, string, int);
+    callback cancel-pane-gesture(int);
     callback toggle-native-microphone();
     callback toggle-native-deafen();
     callback refresh-native-capture-sources(int);
@@ -4209,6 +4464,15 @@ export component AppWindow inherits Window {
     // editing take precedence over application commands. Never capture Tab/Escape.
     key-pressed(event) => {
         if root.dispatch-shortcut(event.text, event.modifiers.control, event.modifiers.alt, event.modifiers.shift, event.modifiers.meta) { accept } else { reject }
+    }
+    // Only while a pane gesture runs: Escape discards its preview. Nothing
+    // else is observed or consumed here, and focus is never moved.
+    capture-key-pressed(event) => {
+        if root.pane-gesture != 0 && event.text == Key.Escape {
+            root.cancel-pane-preview();
+            return accept;
+        }
+        reject
     }
 
     // Workspace panes. Each pane is one element placed by the arrangement
@@ -7297,6 +7561,11 @@ export component AppWindow inherits Window {
                                     Text { text: "Room list width"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
                                     Text { text: root.room-list-width + " px"; color: root.muted; font-size: 11px * root.text-scale; }
                                 }
+                                WidthSpin {
+                                    saved: root.room-list-width; minimum: 180; maximum: 480;
+                                    label: "Room list width in pixels, 180 to 480";
+                                    edited(width) => { root.change-room-list-width(width); }
+                                }
                                 IconAction { icon: "−"; label: "Narrow room list"; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-room-list-width(root.room-list-width - 20); } }
                                 IconAction { icon: "+"; label: "Widen room list"; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-room-list-width(root.room-list-width + 20); } }
                             }
@@ -7308,6 +7577,11 @@ export component AppWindow inherits Window {
                                 VerticalLayout { alignment: center; horizontal-stretch: 1; spacing: 3px;
                                     Text { text: "Details panel width"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
                                     Text { text: root.details-width + " px"; color: root.muted; font-size: 11px * root.text-scale; }
+                                }
+                                WidthSpin {
+                                    saved: root.details-width; minimum: 200; maximum: 520;
+                                    label: "Details panel width in pixels, 200 to 520";
+                                    edited(width) => { root.change-details-width(width); }
                                 }
                                 IconAction { icon: "−"; label: "Narrow details panel"; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-details-width(root.details-width - 20); } }
                                 IconAction { icon: "+"; label: "Widen details panel"; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-details-width(root.details-width + 20); } }
@@ -7344,10 +7618,68 @@ export component AppWindow inherits Window {
                             text: "Standard is the classic order. Focused hides the Space rail and collapses the room list. Conversation first puts the room list on the right. Minimal shows only the conversation and details. The account control stays at the bottom left in every arrangement.";
                             color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
                         }
-                        for pane in root.layout-panes : Rectangle {
-                            height: max(48px, 30px * root.text-scale + 18px); border-radius: StyleTokens.radius * 1; background: root.elevated;
+                        for pane[index] in root.layout-panes : Rectangle {
+                            height: root.layout-row-height; border-radius: StyleTokens.radius * 1; background: root.elevated;
+                            border-color: root.layout-editor-from == index ? root.accent : transparent;
+                            border-width: root.layout-editor-from == index ? 2px : 0px;
+                            // Where a dragged row would land: below this row when moving down, above it when moving up.
+                            if root.layout-editor-from >= 0 && root.layout-editor-drop == index && root.layout-editor-from != index : Rectangle {
+                                y: root.layout-editor-from < index ? parent.height - 3px : 0px;
+                                height: 3px;
+                                background: root.accent;
+                            }
                             HorizontalLayout {
-                                padding-left: 16px; padding-right: 10px; spacing: 6px;
+                                padding-left: 8px; padding-right: 10px; spacing: 6px;
+                                // Drag to reorder; Move left/right do the same by keyboard.
+                                Rectangle {
+                                    width: 22px;
+                                    property <bool> active: false;
+                                    property <int> owned-token: 0;
+                                    property <int> gesture-token: root.pane-gesture;
+                                    changed gesture-token => {
+                                        if self.owned-token != self.gesture-token { self.active = false; }
+                                    }
+                                    property <length> press-y;
+                                    border-radius: 4px;
+                                    background: grip-touch.has-hover || self.active ? root.hover : transparent;
+                                    Text { text: "⋮⋮"; color: root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; accessible-role: none; }
+                                    grip-touch := TouchArea {
+                                        enabled: (root.pane-gesture == 0 && root.pane-gesture-allowed) || parent.active;
+                                        mouse-cursor: parent.active ? grabbing : grab;
+                                        pointer-event(event) => {
+                                            if event.kind == PointerEventKind.cancel {
+                                                if parent.active && parent.owned-token == root.pane-gesture {
+                                                    parent.active = false;
+                                                    root.cancel-pane-preview();
+                                                }
+                                                return;
+                                            }
+                                            if event.button != PointerEventButton.left {
+                                                return;
+                                            }
+                                            if event.kind == PointerEventKind.down {
+                                                if root.start-pane-gesture() {
+                                                    parent.owned-token = root.pane-gesture;
+                                                    parent.active = true;
+                                                    parent.press-y = self.absolute-position.y + self.mouse-y;
+                                                    root.pane-dragging = pane.id;
+                                                    root.layout-editor-from = index;
+                                                    root.layout-editor-drop = index;
+                                                }
+                                            } else if event.kind == PointerEventKind.up {
+                                                if parent.active && parent.owned-token == root.pane-gesture {
+                                                    parent.active = false;
+                                                    root.finish-pane-order(pane.id, root.pane-gesture != 0 ? root.layout-editor-drop : -1);
+                                                }
+                                            }
+                                        }
+                                        moved => {
+                                            if parent.active && parent.owned-token == root.pane-gesture && root.pane-gesture != 0 {
+                                                root.layout-editor-drop = clamp(index + round((self.absolute-position.y + self.mouse-y - parent.press-y) / (root.layout-row-height + 18px)), 0, 3);
+                                            }
+                                        }
+                                    }
+                                }
                                 Text {
                                     text: pane.label + (pane.hidden ? " · hidden" : pane.collapsed ? " · collapsed" : "");
                                     color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
@@ -7403,7 +7735,8 @@ export component AppWindow inherits Window {
                             }
                         }
                         Text {
-                            text: "Stored in config.toml [layout] as pane_order, hidden_panes and collapsed_panes. A narrow window gives way details first, then the room list, then the Space rail; the conversation always stays.";
+                            text: (root.layout-editor-from >= 0 ? "Release to move it to position " + (root.layout-editor-drop + 1) + "; Escape cancels. " : "")
+                                + "Drag a row's grip, a pane's top grip or a pane edge, or use Move left/right. Stored in config.toml [layout] as pane_order, hidden_panes and collapsed_panes. A narrow window gives way details first, then the room list, then the Space rail; the conversation always stays.";
                             color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
                         }
                         Rectangle {
@@ -9075,6 +9408,119 @@ export component AppWindow inherits Window {
                     activated => { root.set-pane-collapsed("details", false); }
                 }
             }
+        }
+
+        // Direct pane interaction: resize edges and drag grips over the
+        // panes. Elements are always present (only shown or hidden), so a
+        // pane that a preview squeezes never drops the pointer mid-drag.
+        rooms-edge := PaneResizeEdge {
+            gesture-token: root.pane-gesture;
+            x: root.pane-x(root.pane-slot-rooms) + (self.grows-right ? root.pane-rooms-w : 0px) - self.width / 2;
+            y: 0px;
+            height: parent.height - (root.account-column ? 0px : root.account-trigger-height + root.account-toolbar-height + StyleTokens.line-width);
+            visible: root.pane-rooms-w > root.pane-strip || root.rooms-preview >= 0px;
+            enabled: root.pane-gesture == 0 && root.pane-gesture-allowed && root.pane-rooms-w > root.pane-strip;
+            grows-right: root.pane-slot-rooms < root.pane-slot-conversation;
+            start-width: root.room-list-width * 1px;
+            minimum: 180px;
+            maximum: 480px;
+            accent: root.accent;
+            began => { return root.start-pane-gesture(); }
+            previewed(width) => { if root.pane-gesture != 0 { root.rooms-preview = width; } }
+            finished(width) => { root.finish-pane-width("rooms", width); }
+            cancelled => { root.cancel-pane-preview(); }
+        }
+        details-edge := PaneResizeEdge {
+            gesture-token: root.pane-gesture;
+            x: root.pane-x(root.pane-slot-details) + (self.grows-right ? root.pane-details-w : 0px) - self.width / 2;
+            y: 0px;
+            height: parent.height;
+            visible: root.pane-details-w > root.pane-strip || root.details-preview >= 0px;
+            enabled: root.pane-gesture == 0 && root.pane-gesture-allowed && root.pane-details-w > root.pane-strip;
+            grows-right: root.pane-slot-details < root.pane-slot-conversation;
+            start-width: root.details-width * 1px;
+            minimum: 200px;
+            maximum: 520px;
+            accent: root.accent;
+            began => { return root.start-pane-gesture(); }
+            previewed(width) => { if root.pane-gesture != 0 { root.details-preview = width; } }
+            finished(width) => { root.finish-pane-width("details", width); }
+            cancelled => { root.cancel-pane-preview(); }
+        }
+        // One grip per pane, centered at its top; hidden or squeezed panes
+        // are arranged from Settings instead.
+        for grip in [
+            { id: "spaces", slot: root.pane-slot-spaces, w: root.pane-rail-w },
+            { id: "rooms", slot: root.pane-slot-rooms, w: root.pane-rooms-w },
+            { id: "conversation", slot: root.pane-slot-conversation, w: root.pane-conversation-w },
+            { id: "details", slot: root.pane-slot-details, w: root.pane-details-w }
+        ] : PaneDragGrip {
+            gesture-token: root.pane-gesture;
+            x: root.pane-x(grip.slot) + (grip.w - self.width) / 2;
+            y: 3px;
+            visible: grip.w > root.pane-strip + self.width || root.pane-dragging == grip.id;
+            enabled: root.pane-gesture == 0 && root.pane-gesture-allowed;
+            ink: root.muted;
+            accent: root.accent;
+            hover: root.hover;
+            began => {
+                if !root.start-pane-gesture() {
+                    return false;
+                }
+                root.pane-dragging = grip.id;
+                root.pane-drag-slot = grip.slot;
+                root.pane-drop-index = root.pane-rank(grip.slot, -1);
+                return true;
+            }
+            dragged(px) => {
+                if root.pane-gesture != 0 {
+                    root.pane-drop-index = root.pane-drop-at(px, root.pane-drag-slot);
+                }
+            }
+            dropped(px) => {
+                root.finish-pane-order(grip.id, root.pane-gesture != 0 ? root.pane-drop-at(px, root.pane-drag-slot) : -1);
+            }
+            cancelled => { root.cancel-pane-preview(); }
+        }
+        // While a pane is dragged: its outline, and the line where it would go.
+        if root.pane-dragging != "" && root.pane-drag-slot >= 0 : Rectangle {
+            x: root.pane-x(root.pane-drag-slot);
+            y: 0px;
+            width: root.pane-dragging == "spaces" ? root.pane-rail-w : root.pane-dragging == "rooms" ? root.pane-rooms-w
+                : root.pane-dragging == "details" ? root.pane-details-w : root.pane-conversation-w;
+            height: parent.height;
+            background: transparent;
+            border-color: root.accent;
+            border-width: 2px;
+        }
+        if root.pane-dragging != "" && root.pane-drag-slot >= 0 && root.pane-drop-index >= 0 : Rectangle {
+            x: max(0px, root.pane-insert-x(root.pane-drop-index, root.pane-drag-slot) - 2px);
+            y: 0px;
+            width: 4px;
+            height: parent.height;
+            background: root.accent;
+            accessible-role: none;
+        }
+        if root.layout-notice != "" : Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: 20px;
+            width: min(parent.width - 40px, notice-text.preferred-width + 28px);
+            height: max(32px, notice-text.preferred-height + 14px);
+            border-radius: StyleTokens.radius;
+            background: root.elevated;
+            border-color: root.divider;
+            border-width: StyleTokens.line-width;
+            notice-text := Text {
+                x: 14px;
+                width: parent.width - 28px;
+                text: root.layout-notice;
+                color: root.ink;
+                font-size: 12px * root.text-scale;
+                wrap: word-wrap;
+                vertical-alignment: center;
+                accessible-live-region: polite;
+            }
+            TouchArea { clicked => { root.layout-notice = ""; } }
         }
 
         // The active account's control, always at the window's bottom left:

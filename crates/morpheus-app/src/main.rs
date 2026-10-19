@@ -4169,7 +4169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     let setting_store = store.clone();
     appearance::install_callbacks(&ui, &store);
-    workspace_layout::register(&ui, &store);
+    workspace_layout::register_live(&ui, &store, &live);
     appearance_editor::register(&ui, &store);
     metric_editor::register(&ui, &store);
     sender_palette_editor::register(&ui, &store);
