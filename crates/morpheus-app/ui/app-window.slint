@@ -2219,6 +2219,7 @@ export component AppWindow inherits Window {
     // The conversation shows the messages around an opened search hit
     // instead of the latest ones, until Return to live or a room change.
     in-out property <bool> conversation-focused: false;
+    in-out property <bool> focus-newer-loading: false;
     // Older replies of the open thread; reset whenever the thread changes.
     in-out property <bool> thread-history-loading: false;
     in-out property <bool> thread-history-at-start: false;
@@ -2434,6 +2435,7 @@ export component AppWindow inherits Window {
     callback open-search-result(string, string);
     callback load-older-thread-replies();
     callback return-to-live();
+    callback load-newer-focused();
     callback join-discovery-target(string, string, string, string, bool);
     callback toggle-native-microphone();
     callback toggle-native-deafen();
@@ -3536,6 +3538,14 @@ export component AppWindow inherits Window {
                                 color: root.muted; font-size: 11px * root.text-scale;
                                 vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
                                 accessible-live-region: polite;
+                            }
+                            TextAction {
+                                ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover;
+                                outline: root.divider; text-scale: root.text-scale;
+                                text: root.focus-newer-loading ? "Loading newer…" : "Load newer";
+                                enabled: !root.focus-newer-loading;
+                                accessible-label: "Load newer messages after these";
+                                activated => { root.load-newer-focused(); }
                             }
                             TextAction {
                                 ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover;

@@ -53,6 +53,8 @@ const FOCUS_TIMEOUT: Duration = Duration::from_secs(30);
 const JUMP_RETRY: Duration = Duration::from_millis(120);
 const JUMP_ATTEMPTS: u8 = 10;
 const ARRIVAL_ATTEMPTS: u8 = 5;
+/// Events per Load newer page of a focused conversation view.
+const NEWER_PAGE: u16 = 50;
 
 // Fixed wording only: SDK error text is never shown, since it could echo
 // the query or an identifier.
@@ -74,6 +76,7 @@ const REVEAL_FAILED: &str = "Earlier replies could not be loaded to reach this o
 const FOCUSING: &str = "Opening the conversation around this message…";
 const FOCUS_FAILED: &str =
     "The conversation around this message could not be opened, so it is shown here.";
+const NEWER_FAILED: &str = "Could not load newer messages. Check sync and retry.";
 const KEEP_COMPOSER: &str =
     "Send or cancel the reply or edit in this room before opening a result in another room.";
 // Keep in step with MAX_RESULTS.
@@ -316,6 +319,15 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, runtime: Handle) {
     ui.on_return_to_live(move || {
         if let Some(window) = weak.upgrade() {
             return_to_live(&window, &return_live, &return_runtime);
+        }
+    });
+
+    let weak = ui.as_weak();
+    let newer_live = live.clone();
+    let newer_runtime = runtime.clone();
+    ui.on_load_newer_focused(move || {
+        if let Some(window) = weak.upgrade() {
+            load_newer(&window, &newer_live, &newer_runtime);
         }
     });
 
@@ -888,6 +900,41 @@ fn return_to_live(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
     runtime.spawn(async move { live.return_to_live_for(&account, room, weak).await });
 }
 
+/// Page a focused conversation view towards the latest messages. Once it
+/// reaches them, the live conversation takes over, so new messages arrive.
+fn load_newer(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
+    if !window.get_conversation_focused() || window.get_focus_newer_loading() {
+        return;
+    }
+    let account = window.get_active_account_local_id().to_string();
+    let room = window.get_active_room_id().to_string();
+    let Some(selection) = live.manager.account_selection(&account) else {
+        return;
+    };
+    window.set_focus_newer_loading(true);
+    window.set_history_error("".into());
+    let manager = live.manager.clone();
+    let weak = window.as_weak();
+    runtime.spawn(async move {
+        let newer = manager.paginate_focused_selected(&selection, &room, false, NEWER_PAGE);
+        let result = newer.await;
+        let _ = weak.upgrade_in_event_loop(move |window| {
+            if !selection.is_current()
+                || window.get_active_account_local_id().as_str() != account
+                || window.get_active_room_id().as_str() != room
+            {
+                return;
+            }
+            window.set_focus_newer_loading(false);
+            match result {
+                Ok(true) => window.invoke_return_to_live(),
+                Ok(false) => {}
+                Err(_) => window.set_history_error(NEWER_FAILED.into()),
+            }
+        });
+    });
+}
+
 /// Load earlier messages pages whichever view is shown, live or focused; a
 /// result for the other view no longer applies.
 fn reset_history(window: &AppWindow) {
@@ -895,6 +942,7 @@ fn reset_history(window: &AppWindow) {
     window.set_history_loading(false);
     window.set_history_at_start(false);
     window.set_history_error("".into());
+    window.set_focus_newer_loading(false);
 }
 
 fn unsent_reply_or_edit(window: &AppWindow) -> bool {
