@@ -1,4 +1,5 @@
 import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView, Slider, SpinBox } from "std-widgets.slint";
+import { AttachmentItem, AttachmentQueue } from "attachment-workbench.slint";
 
 // Optional overrides retain each control's existing color when absent.
 export struct ColorRole {
@@ -2265,9 +2266,12 @@ export component AppWindow inherits Window {
     callback respond-invite(string, bool);
     callback send-message(string);
     callback open-message-link(string);
+    // Composer attachment queue; see attachment-workbench.slint and
+    // src/attachment_workbench.rs.
     callback attach-file();
-    callback cancel-attachment();
-    callback retry-attachment();
+    callback send-attachments();
+    callback attachment-action(int, int);
+    callback attachment-context-changed();
     callback save-attachment(string, string);
     callback preview-image-attachment(string, string);
     callback close-image-preview();
@@ -2540,10 +2544,10 @@ export component AppWindow inherits Window {
     in-out property <bool> composer-markdown: false;
     in-out property <bool> composer-saved-markdown: false;
     in-out property <bool> composer-busy: false;
-    in-out property <bool> attachment-busy: false;
-    in-out property <bool> attachment-needs-retry: false;
+    in-out property <[AttachmentItem]> attachment-items;
+    in-out property <int> attachment-ready-count: 0;
+    in-out property <bool> attachment-can-add: true;
     in-out property <string> attachment-status;
-    in-out property <int> attachment-operation: 0;
     in-out property <string> downloading-event-id;
     in-out property <int> download-operation: 0;
     in-out property <int> composer-operation: 0;
@@ -2596,10 +2600,10 @@ export component AppWindow inherits Window {
         if root.room-admin-mode != 0 { root.cancel-room-settings(); }
     }
     changed active-account-local-id => {
-        root.cancel-room-settings(); root.close-image-preview(); root.quick-switcher-open = false; root.incoming-call-notice = ""; root.mention-context-changed(); }
+        root.cancel-room-settings(); root.close-image-preview(); root.quick-switcher-open = false; root.incoming-call-notice = ""; root.mention-context-changed(); root.attachment-context-changed(); }
     changed active-account-index => { root.quick-switcher-open = false; root.mention-context-changed(); }
     changed active-room-id => {
-        root.cancel-room-settings(); root.close-image-preview(); root.mention-context-changed(); }
+        root.cancel-room-settings(); root.close-image-preview(); root.mention-context-changed(); root.attachment-context-changed(); }
     changed thread-root-id => { root.close-image-preview(); root.mention-context-changed(); }
     changed active-space-id => { root.quick-switcher-open = false; }
     // Conditional dialog subtrees do not retain a usable keyboard focus target
@@ -3753,10 +3757,10 @@ export component AppWindow inherits Window {
                     }
                     Rectangle {
                         property <length> status-height: root.composer-status-visible ? composer-status.height + 10px : 0px;
-                        height: (root.composer-mode == 0 ? max(78px, 1.5 * root.message-font-px + 48px) : max(109px, 1.5 * root.message-font-px + 79px)) + (root.attachment-busy ? 29px : 0px) + self.status-height;
+                        height: (root.composer-mode == 0 ? max(78px, 1.5 * root.message-font-px + 48px) : max(109px, 1.5 * root.message-font-px + 79px)) + attachment-queue.needed-height + self.status-height;
                         background: transparent;
                         composer-status := PendingSendStrip {
-                            x: 22px; y: (root.composer-mode == 0 ? 2px : 33px) + (root.attachment-busy ? 29px : 0px);
+                            x: 22px; y: (root.composer-mode == 0 ? 2px : 33px) + attachment-queue.needed-height;
                             width: parent.width - 44px;
                             items: root.composer-pending-items; blocked-notice: root.composer-blocked-notice;
                             composer-empty: root.composer-text == "";
@@ -3770,28 +3774,27 @@ export component AppWindow inherits Window {
                             discard(key) => { root.discard-record-text(false, key); }
                             discard-unreadable => { root.discard-unreadable-status(false); }
                         }
-                        if root.attachment-busy : HorizontalLayout {
-                            x: 22px; y: (root.composer-mode == 0 ? 2px : 33px) + parent.status-height;
-                            width: parent.width - 44px; height: 28px; spacing: 8px;
-                            Text {
-                                text: root.attachment-status;
-                                color: root.muted;
-                                font-size: 11px * root.text-scale;
-                                vertical-alignment: center;
-                                horizontal-stretch: 1;
-                                overflow: elide;
-                                accessible-live-region: polite;
-                            }
-                            if root.attachment-needs-retry : IconAction {
-                                width: 27px; height: 26px; icon: "↻"; label: "Retry queued attachment";
-                                ink: root.accent; surface: transparent; hover-surface: root.hover;
-                                activated => { root.retry-attachment(); }
-                            }
-                            IconAction {
-                                width: 27px; height: 26px; icon: "×"; label: "Cancel attachment upload";
-                                ink: root.muted; surface: transparent; hover-surface: root.hover;
-                                activated => { root.cancel-attachment(); }
-                            }
+                        // The queue sits first; the saved-send strip follows it.
+                        attachment-queue := AttachmentQueue {
+                            x: 22px; y: root.composer-mode == 0 ? 2px : 33px;
+                            width: parent.width - 44px;
+                            items: root.attachment-items;
+                            ready-count: root.attachment-ready-count;
+                            status: root.attachment-status;
+                            text-scale: root.text-scale;
+                            palette: {
+                                ink: root.ink,
+                                muted: root.muted,
+                                accent: root.accent,
+                                accent-ink: root.accent-ink,
+                                surface: root.panel,
+                                hover: root.hover,
+                                divider: root.divider,
+                                focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent,
+                                error: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b
+                            };
+                            send => { root.send-attachments(); }
+                            action(id, kind) => { root.attachment-action(id, kind); }
                         }
                         if root.composer-mode != 0 : HorizontalLayout {
                             x: 20px; y: 4px; width: parent.width - 40px; height: 27px; spacing: 8px;
@@ -3809,7 +3812,7 @@ export component AppWindow inherits Window {
                         }
                         Rectangle {
                             x: root.content-inset;
-                            y: (root.composer-mode == 0 ? 7px : 38px) + (root.attachment-busy ? 29px : 0px) + parent.status-height;
+                            y: (root.composer-mode == 0 ? 7px : 38px) + attachment-queue.needed-height + parent.status-height;
                             width: max(0px, parent.width - 2 * root.content-inset);
                             height: max(58px, 1.5 * root.message-font-px + 28px);
                             border-radius: StyleTokens.radius * 1.1;
@@ -3823,8 +3826,8 @@ export component AppWindow inherits Window {
                                 padding-bottom: 11px;
                                 spacing: 6px;
                                 IconAction {
-                                    icon: "+"; label: "Attach file"; ink: root.muted; surface: transparent; hover-surface: root.hover;
-                                    enabled: root.live-session && root.active-room-id != "" && root.composer-mode == 0 && !root.attachment-busy;
+                                    icon: "+"; label: "Attach files"; ink: root.muted; surface: transparent; hover-surface: root.hover;
+                                    enabled: root.live-session && root.active-room-id != "" && root.composer-mode == 0 && root.attachment-can-add;
                                     activated => { root.attach-file(); }
                                 }
                                 IconAction {

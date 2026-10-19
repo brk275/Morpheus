@@ -5,6 +5,7 @@
 mod account_access;
 mod appearance;
 mod appearance_editor;
+mod attachment_workbench;
 mod attachments;
 mod audio_devices;
 #[cfg(feature = "native-calls")]
@@ -64,13 +65,12 @@ use morpheus_config::{
     Config, ConfigStore, Density, LoadedConfig, RoomCallMode, ThemeMode, ThemePack,
 };
 use morpheus_matrix::{
-    AccountManager, AttachmentSendUpdate, Generation, MatrixLinkTarget, MessageInfo,
-    MessageSearchResult, PublicRoomInfo, PublicRoomsQuery, TextFormat, parse_matrix_link_target,
+    AccountManager, Generation, MatrixLinkTarget, MessageInfo, MessageSearchResult,
+    PublicRoomInfo, PublicRoomsQuery, TextFormat, parse_matrix_link_target,
 };
 use slint::{Color, Model, ModelRc, SharedString, StyledText, VecModel};
 use url::Url;
 
-use crate::attachments::{UploadCommand, UploadController, mime_type_for};
 #[cfg(feature = "native-calls")]
 use crate::calls::{
     AudioUpdate, CallController, CallControllerError, CallJoinMode, CallStartIntent, CallStatus,
@@ -781,57 +781,15 @@ fn finish_composer_submission(
 
 fn reset_attachment_view(ui: &AppWindow) {
     ui.invoke_close_image_preview();
-    // A queued upload may continue in its room after navigation. Its event
-    // loop update must not repaint the newly selected account or room.
-    ui.set_attachment_operation(ui.get_attachment_operation().wrapping_add(1));
-    ui.set_attachment_busy(false);
-    ui.set_attachment_needs_retry(false);
+    // Uploads continue in their room after navigation and staged files stay
+    // with it. The workbench shows the next room's queue once the active
+    // account or room changes; nothing of this one remains meanwhile.
+    ui.set_attachment_items(ModelRc::new(VecModel::<AttachmentItem>::default()));
+    ui.set_attachment_ready_count(0);
     ui.set_attachment_status("".into());
     ui.set_download_operation(ui.get_download_operation().wrapping_add(1));
     ui.set_downloading_event_id("".into());
     ui.set_transfer_notice("".into());
-}
-
-fn post_upload_progress(
-    weak: &slint::Weak<AppWindow>,
-    account_id: String,
-    room_id: String,
-    operation: i32,
-    status: String,
-    needs_retry: bool,
-) {
-    let _ = weak.upgrade_in_event_loop(move |ui| {
-        if ui.get_active_account_local_id().as_str() == account_id
-            && ui.get_active_room_id().as_str() == room_id
-            && ui.get_attachment_operation() == operation
-        {
-            ui.set_attachment_status(status.into());
-            ui.set_attachment_needs_retry(needs_retry);
-        }
-    });
-}
-
-fn post_upload_completion(
-    weak: &slint::Weak<AppWindow>,
-    account_id: String,
-    room_id: String,
-    operation: i32,
-    outcome: Result<String, String>,
-) {
-    let _ = weak.upgrade_in_event_loop(move |ui| {
-        if ui.get_active_account_local_id().as_str() == account_id
-            && ui.get_active_room_id().as_str() == room_id
-            && ui.get_attachment_operation() == operation
-        {
-            ui.set_attachment_busy(false);
-            ui.set_attachment_needs_retry(false);
-            ui.set_attachment_status("".into());
-            match outcome {
-                Ok(notice) => ui.set_transfer_notice(notice.into()),
-                Err(error) => ui.set_session_error(error.into()),
-            }
-        }
-    });
 }
 
 fn switch_account(state: &mut PreviewState, index: usize) {
@@ -1604,7 +1562,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         voice_spaces.clone(),
     );
     security::register(&ui, live.clone(), runtime.handle().clone());
-    let uploads = Arc::new(UploadController::default());
     let image_previews =
         image_previews::ImagePreviews::register(&ui, live.clone(), store.clone(), runtime.handle());
     let room_settings =
@@ -3438,186 +3395,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Callbacks own the controller; picker state ends with its selection.
     let _stickers = stickers::register(&ui, live.clone(), runtime.handle().clone());
 
-    let weak = ui.as_weak();
-    let attach_live = live.clone();
-    let attach_uploads = uploads.clone();
-    let attach_handle = runtime.handle().clone();
-    ui.on_attach_file(move || {
-        let Some(ui) = weak.upgrade() else { return };
-        if !attach_live.is_live.load(Ordering::Acquire)
-            || ui.get_active_room_id().is_empty()
-            || ui.get_composer_mode() != 0
-            || ui.get_attachment_busy()
-        {
-            return;
-        }
-        let account_id = ui.get_active_account_local_id().to_string();
-        let room_id = ui.get_active_room_id().to_string();
-        // The system picker runs modally on the Slint UI thread, which is
-        // required by macOS AppKit. Network and file reads stay on Tokio.
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("Choose an attachment")
-            .pick_file()
-        else {
-            return;
-        };
-        if ui.get_active_account_local_id().as_str() != account_id
-            || ui.get_active_room_id().as_str() != room_id
-        {
-            return;
-        }
-        let filename = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "attachment".into());
-        let mime_type = mime_type_for(&path);
-        let operation = ui.get_attachment_operation().wrapping_add(1);
-        ui.set_attachment_operation(operation);
-        ui.set_attachment_busy(true);
-        ui.set_attachment_status(format!("Preparing {filename}…").into());
-        ui.set_transfer_notice("".into());
-        let mut commands = attach_uploads.begin(operation);
-        let live = attach_live.clone();
-        let weak = weak.clone();
-        let uploads = attach_uploads.clone();
-        attach_handle.spawn(async move {
-            let result = live
-                .send_attachment(&account_id, &room_id, path, &mime_type)
-                .await;
-            let mut queued = match result {
-                Ok(queued) => queued,
-                Err(error) => {
-                    uploads.finish(operation);
-                    post_upload_completion(
-                        &weak,
-                        account_id,
-                        room_id,
-                        operation,
-                        Err(format!("Could not attach {filename}: {error}")),
-                    );
-                    return;
-                }
-            };
-            loop {
-                tokio::select! {
-                    biased;
-                    command = commands.recv() => match command {
-                        Some(UploadCommand::Cancel) => match queued.abort().await {
-                            Ok(true) => {
-                                uploads.finish(operation);
-                                post_upload_completion(
-                                    &weak, account_id, room_id, operation,
-                                    Ok(format!("Cancelled {filename}")),
-                                );
-                                return;
-                            }
-                            Ok(false) => {
-                                uploads.finish(operation);
-                                post_upload_completion(
-                                    &weak, account_id, room_id, operation,
-                                    Ok(format!("{filename} was already sent")),
-                                );
-                                return;
-                            }
-                            Err(error) => post_upload_progress(
-                                &weak, account_id.clone(), room_id.clone(), operation,
-                                format!("Could not cancel {filename}: {error}"), true,
-                            ),
-                        },
-                        Some(UploadCommand::Retry) => match queued.retry_wedged().await {
-                            Ok(()) => post_upload_progress(
-                                &weak, account_id.clone(), room_id.clone(), operation,
-                                format!("Retrying {filename}…"), false,
-                            ),
-                            Err(error) => post_upload_progress(
-                                &weak, account_id.clone(), room_id.clone(), operation,
-                                format!("Could not retry {filename}: {error}"), true,
-                            ),
-                        },
-                        None => return,
-                    },
-                    update = queued.next_update() => match update {
-                        AttachmentSendUpdate::Progress { current, total } => {
-                            let percent = if total == 0 { 0 } else { current.min(total) * 100 / total };
-                            post_upload_progress(
-                                &weak,
-                                account_id.clone(),
-                                room_id.clone(),
-                                operation,
-                                format!("Uploading {filename} · {percent}%"),
-                                false,
-                            );
-                        }
-                        AttachmentSendUpdate::Sent { .. } => {
-                            uploads.finish(operation);
-                            post_upload_completion(
-                                &weak,
-                                account_id,
-                                room_id,
-                                operation,
-                                Ok(format!("Sent {filename}")),
-                            );
-                            return;
-                        }
-                        AttachmentSendUpdate::Retained { recoverable } => {
-                            let status = if recoverable {
-                                format!("{filename} is queued; waiting to retry…")
-                            } else {
-                                format!("{filename} send paused; retry or cancel this upload")
-                            };
-                            post_upload_progress(
-                                &weak, account_id.clone(), room_id.clone(), operation,
-                                status, !recoverable,
-                            );
-                        }
-                        AttachmentSendUpdate::Cancelled => {
-                            uploads.finish(operation);
-                            post_upload_completion(
-                                &weak, account_id, room_id, operation,
-                                Ok(format!("Cancelled {filename}")),
-                            );
-                            return;
-                        }
-                        AttachmentSendUpdate::Unknown => {
-                            uploads.finish(operation);
-                            post_upload_completion(
-                                &weak,
-                                account_id,
-                                room_id,
-                                operation,
-                                Err(format!("Could not confirm {filename}; the queued upload may still send. Check the room before another upload")),
-                            );
-                            return;
-                        }
-                    }
-                }
-            }
-        });
-    });
-
-    let weak = ui.as_weak();
-    let cancel_uploads = uploads.clone();
-    ui.on_cancel_attachment(move || {
-        if let Some(ui) = weak.upgrade() {
-            if ui.get_attachment_busy() && cancel_uploads.cancel(ui.get_attachment_operation()) {
-                ui.set_attachment_status("Cancelling attachment…".into());
-            }
-        }
-    });
-
-    let weak = ui.as_weak();
-    let retry_uploads = uploads.clone();
-    ui.on_retry_attachment(move || {
-        if let Some(ui) = weak.upgrade() {
-            if ui.get_attachment_busy()
-                && ui.get_attachment_needs_retry()
-                && retry_uploads.retry(ui.get_attachment_operation())
-            {
-                ui.set_attachment_status("Retrying queued attachment…".into());
-                ui.set_attachment_needs_retry(false);
-            }
-        }
-    });
+    // Its callbacks hold the attachment workbench for the window's lifetime.
+    let _attachments =
+        attachment_workbench::Workbench::register(&ui, live.clone(), runtime.handle().clone());
 
     let weak = ui.as_weak();
     let save_live = live.clone();
