@@ -9,6 +9,19 @@ use std::{future::Future, pin::Pin};
 
 use super::*;
 
+/// Most history pages one reveal may read, and the events per page.
+const MAX_REVEAL_PAGES: u8 = 8;
+const REVEAL_PAGE_EVENTS: u16 = 50;
+
+/// How far a bounded backward reveal through history got.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HistoryReveal {
+    /// The event is among the timeline's loaded items.
+    pub found: bool,
+    /// The start of the room or thread was reached.
+    pub start_reached: bool,
+}
+
 impl AccountManager {
     /// Load older items for the account selected when this future is polled.
     /// Returns true when the start of the room was reached.
@@ -55,6 +68,67 @@ impl AccountManager {
                 .paginate_backwards(count)
                 .await
                 .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
+        })
+        .await
+    }
+
+    /// Load older replies of one thread under the exact selection captured
+    /// by the caller. Returns true when the start of the thread was reached.
+    pub async fn paginate_thread_backwards_selected(
+        &self,
+        selection: &AccountSelection,
+        room_id: &str,
+        root_event_id: &str,
+        count: u16,
+    ) -> Result<bool> {
+        self.read_selected_timeline(selection, |loaded| async move {
+            let timeline = loaded.thread_timeline(room_id, root_event_id).await?;
+            timeline
+                .paginate_backwards(count)
+                .await
+                .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
+        })
+        .await
+    }
+
+    /// Page back through a room's conversation, or one of its threads, until
+    /// `event_id` is loaded, the start is reached or `max_pages` pages were
+    /// read. The feeds of that same timeline show what was loaded.
+    pub async fn reveal_event_selected(
+        &self,
+        selection: &AccountSelection,
+        room_id: &str,
+        thread_root: Option<&str>,
+        event_id: &str,
+        max_pages: u8,
+    ) -> Result<HistoryReveal> {
+        let target = parse_event_id(event_id)?;
+        self.read_selected_timeline(selection, |loaded| async move {
+            let timeline = match thread_root {
+                Some(root) => loaded.thread_timeline(room_id, root).await?,
+                None => loaded.timeline(room_id).await?,
+            };
+            let mut start_reached = false;
+            for _ in 0..max_pages.min(MAX_REVEAL_PAGES) {
+                if timeline.item_by_event_id(&target).await.is_some() {
+                    return Ok(HistoryReveal {
+                        found: true,
+                        start_reached,
+                    });
+                }
+                if start_reached {
+                    break;
+                }
+                start_reached = timeline
+                    .paginate_backwards(REVEAL_PAGE_EVENTS)
+                    .await
+                    .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
+            }
+            let found = timeline.item_by_event_id(&target).await.is_some();
+            Ok(HistoryReveal {
+                found,
+                start_reached,
+            })
         })
         .await
     }

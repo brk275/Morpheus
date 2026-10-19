@@ -37,6 +37,7 @@ mod sso;
 #[cfg(not(morpheus_timeline_acceptance))]
 mod startup_error;
 mod stickers;
+mod thread_history;
 // Instrumented release builds only (see build.rs); unit tests cover its pure checks.
 #[cfg(any(test, morpheus_timeline_acceptance))]
 mod timeline_acceptance;
@@ -2924,6 +2925,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     message_search::register(&ui, live.clone(), runtime.handle().clone());
+    thread_history::register(&ui, live.clone(), runtime.handle().clone());
 
     let weak = ui.as_weak();
     let directory_live = live.clone();

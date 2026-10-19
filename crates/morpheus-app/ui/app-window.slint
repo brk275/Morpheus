@@ -2216,6 +2216,11 @@ export component AppWindow inherits Window {
     in-out property <int> timeline-jump-index: -1;
     in-out property <int> timeline-jump-request: 0;
     property <int> timeline-jump-passes: 0;
+    // Older replies of the open thread; reset whenever the thread changes.
+    in-out property <bool> thread-history-loading: false;
+    in-out property <bool> thread-history-at-start: false;
+    in-out property <string> thread-history-error;
+    in-out property <int> thread-history-operation: 0;
     in-out property <string> directory-search;
     in-out property <string> directory-server;
     in-out property <string> directory-next-batch;
@@ -2424,6 +2429,7 @@ export component AppWindow inherits Window {
     callback load-more-room-search();
     // Room ID and event ID of one listed hit.
     callback open-search-result(string, string);
+    callback load-older-thread-replies();
     callback join-discovery-target(string, string, string, string, bool);
     callback toggle-native-microphone();
     callback toggle-native-deafen();
@@ -2609,7 +2615,12 @@ export component AppWindow inherits Window {
     changed active-account-index => { root.quick-switcher-open = false; root.mention-context-changed(); }
     changed active-room-id => {
         root.cancel-room-settings(); root.close-image-preview(); root.mention-context-changed(); }
-    changed thread-root-id => { root.close-image-preview(); root.mention-context-changed(); }
+    changed thread-root-id => {
+        root.close-image-preview(); root.mention-context-changed();
+        // A page request for the previous thread can no longer publish here.
+        root.thread-history-operation += 1; root.thread-history-loading = false;
+        root.thread-history-at-start = false; root.thread-history-error = "";
+    }
     changed active-space-id => { root.quick-switcher-open = false; }
     // Conditional dialog subtrees do not retain a usable keyboard focus target
     // after dismissal. Return to an account control on the visible surface.
@@ -6157,6 +6168,22 @@ export component AppWindow inherits Window {
                                 }
                             }
                             Rectangle { height: 1px; background: root.divider; }
+                            // A thread feed starts with its latest replies; earlier
+                            // replies load on request, a page at a time.
+                            if root.live-session : TextAction {
+                                ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                                outline: root.divider; text-scale: root.text-scale; wrap-caption: true;
+                                text: root.thread-history-loading ? "Loading earlier replies…" : root.thread-history-at-start ? "Start of thread" : "Load earlier replies";
+                                enabled: !root.thread-history-loading && !root.thread-history-at-start;
+                                accessible-label: root.thread-history-at-start ? "Start of thread reached" : "Load earlier replies in this thread";
+                                activated => { root.load-older-thread-replies(); }
+                            }
+                            if root.thread-history-error != "" : Text {
+                                text: root.thread-history-error;
+                                color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483;
+                                font-size: 11px * root.text-scale; wrap: word-wrap; vertical-stretch: 0;
+                                accessible-live-region: polite;
+                            }
                             Text { text: "REPLIES · " + root.thread-messages.length; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; vertical-stretch: 0; }
                             for reply in root.thread-messages : thread-reply := Rectangle {
                                 property <string> time-label: root.message-time-label(reply);

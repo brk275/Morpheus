@@ -18,10 +18,10 @@ use std::time::Duration;
 
 use chrono::{Local, TimeZone};
 use morpheus_matrix::{
-    AccountManager, AccountSelection, MatrixCoreError, MessageInfo, MessageSearchPage,
-    MessageSearchResult,
+    AccountManager, AccountSelection, HistoryReveal, MatrixCoreError, MessageInfo,
+    MessageSearchPage, MessageSearchResult,
 };
-use slint::{ComponentHandle, Model, ModelRc, VecModel, Weak};
+use slint::{ComponentHandle, Model, ModelRc, Timer, VecModel, Weak};
 use tokio::{runtime::Handle, task::JoinHandle};
 
 use crate::{AppWindow, MessageItem, MessageSearchItem, live::LiveUi};
@@ -40,6 +40,13 @@ const CONTEXT_EVENTS: u16 = 6;
 const CONTEXT_BEFORE: usize = 2;
 const CONTEXT_AFTER: usize = 5;
 const MAX_QUERY_BYTES: usize = 256;
+/// History pages (of 50 events) loaded at most to reach an older hit.
+const REVEAL_PAGES: u8 = 4;
+const REVEAL_TIMEOUT: Duration = Duration::from_secs(30);
+/// The conversation feed applies loaded history asynchronously; a revealed
+/// row is looked for this often, this many times.
+const JUMP_RETRY: Duration = Duration::from_millis(120);
+const JUMP_ATTEMPTS: u8 = 10;
 
 // Fixed wording only: SDK error text is never shown, since it could echo
 // the query or an identifier.
@@ -55,6 +62,12 @@ const CONTEXT_SLOW: &str = "Nearby messages took too long to load.";
 const CONTEXT_MISSING: &str = "The matched message is no longer available in this conversation.";
 const CONTEXT_OLDER: &str =
     "Older than the loaded conversation, so it is shown here. Load earlier messages to reach it.";
+const THREAD_OLDER: &str =
+    "This reply is older than the loaded thread. Use Load earlier replies to reach it.";
+const FINDING: &str = "Loading earlier messages to reach this one…";
+const REVEAL_FAILED: &str = "Earlier messages could not be loaded to reach this one.";
+const KEEP_COMPOSER: &str =
+    "Send or cancel the reply or edit in this room before opening a result in another room.";
 // Keep in step with MAX_RESULTS.
 const RESULT_LIMIT: &str = "showing the first 200; refine the search to narrow them";
 
@@ -135,6 +148,11 @@ impl Opening {
             && window.get_room_search_context_operation() == self.operation
             && self.hit.selected(window)
     }
+
+    /// The hit's room is the open one.
+    fn here(&self, window: &AppWindow) -> bool {
+        window.get_active_room_id().as_str() == self.hit.room_id
+    }
 }
 
 /// Search state lives on the UI thread; Tokio tasks only return owned
@@ -144,6 +162,15 @@ struct Controller {
     request: Option<Request>,
     query_task: Option<JoinHandle<()>>,
     context_task: Option<JoinHandle<()>>,
+    reveal_task: Option<JoinHandle<()>>,
+}
+
+impl Controller {
+    /// End the work of the opened hit: its nearby context and history reveal.
+    fn abort_opening(&mut self) {
+        abort(self.context_task.take());
+        abort(self.reveal_task.take());
+    }
 }
 
 thread_local! {
@@ -182,7 +209,7 @@ fn owns(ticket: &Ticket) -> bool {
 pub(crate) fn reset(ui: &AppWindow) {
     with(|controller| {
         abort(controller.query_task.take());
-        abort(controller.context_task.take());
+        controller.abort_opening();
         controller.request = None;
     });
     ui.set_room_search_operation(ui.get_room_search_operation().wrapping_add(1));
@@ -303,7 +330,7 @@ fn submit(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
 fn start(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, delay: Option<Duration>) {
     with(|controller| {
         abort(controller.query_task.take());
-        abort(controller.context_task.take());
+        controller.abort_opening();
         controller.request = None;
     });
     let operation = window.get_room_search_operation().wrapping_add(1);
@@ -561,6 +588,13 @@ fn open(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, room_id: &str,
     let Some(item) = listed(window, room_id, event_id) else {
         return;
     };
+    // A reply or edit has no saved draft; leaving its room would drop the
+    // typed text. Keep it and say why the hit did not open.
+    let elsewhere = window.get_active_room_id().as_str() != room_id;
+    if elsewhere && unsent_reply_or_edit(window) {
+        window.set_room_search_notice(KEEP_COMPOSER.into());
+        return;
+    }
     let hit = Hit {
         room_id: room_id.to_owned(),
         event_id: event_id.to_owned(),
@@ -578,13 +612,13 @@ fn open(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, room_id: &str,
     window.set_room_search_context_error("".into());
     window.set_room_search_context_notice("".into());
     window.set_room_search_context(ModelRc::new(VecModel::<MessageSearchItem>::default()));
-    with(|controller| abort(controller.context_task.take()));
+    with(Controller::abort_opening);
     let opening = Opening {
         ticket,
         hit,
         operation,
     };
-    if window.get_active_room_id().as_str() == room_id {
+    if !elsewhere {
         arrived(window, live, runtime, &opening);
         return;
     }
@@ -619,7 +653,7 @@ fn navigated(
     if !opening.current(window) {
         return;
     }
-    let here = window.get_active_room_id().as_str() == opening.hit.room_id;
+    let here = opening.here(window);
     match outcome {
         Ok(true) if here && live.navigation_is_current(epoch) => {
             arrived(window, live, runtime, opening);
@@ -633,15 +667,19 @@ fn navigated(
     }
 }
 
-/// The hit's room is open: show the event, then load its nearby messages.
+/// The hit's room is open: show the event (loading a bounded amount of
+/// earlier history when it is older than what is loaded), then load its
+/// nearby messages.
 fn arrived(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, opening: &Opening) {
     let hit = &opening.hit;
-    let jumped = if hit.thread_root.is_empty() {
-        jump_timeline(window, &hit.event_id)
+    if hit.thread_root.is_empty() {
+        if !jump_timeline(window, &hit.event_id) {
+            reveal(window, live, runtime, opening);
+        }
     } else {
         open_thread(window, &hit.room_id, &hit.thread_root);
-        true
-    };
+        reveal(window, live, runtime, opening);
+    }
     let manager = live.manager.clone();
     let opening = opening.clone();
     let weak = window.as_weak();
@@ -650,13 +688,94 @@ fn arrived(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, opening: &O
             return;
         };
         let _ = weak.upgrade_in_event_loop(move |window| {
-            publish_context(&window, &opening, jumped, outcome);
+            publish_context(&window, &opening, outcome);
         });
     });
     with(|controller| {
         abort(controller.context_task.take());
         controller.context_task = Some(task);
     });
+}
+
+/// Page back through the hit's conversation or thread, a bounded number of
+/// pages, until the hit is loaded. The visible feed shows what was loaded.
+fn reveal(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, opening: &Opening) {
+    window.set_room_search_context_notice(FINDING.into());
+    let manager = live.manager.clone();
+    let opening = opening.clone();
+    let weak = window.as_weak();
+    let task = runtime.spawn(async move {
+        let outcome = reveal_hit(&manager, &opening).await;
+        let _ = weak.upgrade_in_event_loop(move |window| revealed(&window, &opening, outcome));
+    });
+    with(|controller| {
+        abort(controller.reveal_task.take());
+        controller.reveal_task = Some(task);
+    });
+}
+
+/// How far the reveal got, or `None` when it failed, timed out or its
+/// account selection ended.
+async fn reveal_hit(manager: &AccountManager, opening: &Opening) -> Option<HistoryReveal> {
+    let selection = &opening.ticket.selection;
+    let hit = &opening.hit;
+    let thread = (!hit.thread_root.is_empty()).then_some(hit.thread_root.as_str());
+    let (room, event) = (hit.room_id.as_str(), hit.event_id.as_str());
+    let reveal = manager.reveal_event_selected(selection, room, thread, event, REVEAL_PAGES);
+    let outcome = tokio::time::timeout(REVEAL_TIMEOUT, reveal).await;
+    outcome.ok().and_then(Result::ok)
+}
+
+fn revealed(window: &AppWindow, opening: &Opening, outcome: Option<HistoryReveal>) {
+    if !opening.current(window) || !opening.here(window) {
+        return;
+    }
+    let hit = &opening.hit;
+    let threaded = !hit.thread_root.is_empty();
+    let thread_open = window.get_thread_root_id().as_str() == hit.thread_root;
+    // The reveal read the same history the load-earlier controls page.
+    let start_reached = outcome.is_some_and(|reveal| reveal.start_reached);
+    if start_reached && !threaded {
+        window.set_history_at_start(true);
+    } else if start_reached && thread_open {
+        window.set_thread_history_at_start(true);
+    }
+    let notice = match outcome {
+        Some(reveal) if reveal.found => {
+            if !threaded {
+                jump_when_loaded(window.as_weak(), opening.clone(), JUMP_ATTEMPTS);
+            }
+            ""
+        }
+        Some(_) if threaded => THREAD_OLDER,
+        Some(_) => CONTEXT_OLDER,
+        None => REVEAL_FAILED,
+    };
+    window.set_room_search_context_notice(notice.into());
+}
+
+/// Jump once the revealed row reaches the conversation model.
+fn jump_when_loaded(weak: Weak<AppWindow>, opening: Opening, attempts: u8) {
+    Timer::single_shot(JUMP_RETRY, move || {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        if !opening.current(&window) || !opening.here(&window) {
+            return;
+        }
+        if jump_timeline(&window, &opening.hit.event_id) {
+            return;
+        }
+        if attempts > 1 {
+            jump_when_loaded(weak, opening, attempts - 1);
+        } else {
+            window.set_room_search_context_notice(CONTEXT_OLDER.into());
+        }
+    });
+}
+
+fn unsent_reply_or_edit(window: &AppWindow) -> bool {
+    window.get_composer_mode() != 0 && !window.get_composer_text().trim().is_empty()
 }
 
 /// The nearby messages of a hit, or `None` once its account selection ended.
@@ -674,12 +793,7 @@ async fn load_context(
     })
 }
 
-fn publish_context(
-    window: &AppWindow,
-    opening: &Opening,
-    jumped: bool,
-    outcome: Shown<Vec<MessageInfo>>,
-) {
+fn publish_context(window: &AppWindow, opening: &Opening, outcome: Shown<Vec<MessageInfo>>) {
     if !opening.current(window) {
         return;
     }
@@ -698,15 +812,11 @@ fn publish_context(
         .map(|message| context_item(message, &hit.room_id))
         .collect::<Vec<_>>();
     window.set_room_search_context(ModelRc::new(VecModel::from(rows)));
-    let here = window.get_active_room_id().as_str() == hit.room_id;
-    let notice = if !found {
-        CONTEXT_MISSING
-    } else if here && !jumped && !jump_timeline(window, &hit.event_id) {
-        CONTEXT_OLDER
-    } else {
-        ""
-    };
-    window.set_room_search_context_notice(notice.into());
+    if !found {
+        // A message gone from its room cannot be revealed in it either.
+        with(|controller| abort(controller.reveal_task.take()));
+        window.set_room_search_context_notice(CONTEXT_MISSING.into());
+    }
 }
 
 fn position_of(messages: &[MessageInfo], event_id: &str) -> Option<usize> {
