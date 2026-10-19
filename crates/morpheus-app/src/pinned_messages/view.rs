@@ -40,7 +40,7 @@ pub(super) fn item(message: &PinnedMessage, can_unpin: bool) -> PinnedMessageIte
         time: if message.timestamp_ms == 0 {
             "".into()
         } else {
-            crate::search_time(message.timestamp_ms).into()
+            crate::message_search::search_time(message.timestamp_ms).into()
         },
         text: crate::directory_plain_text(&message.text, ROW_TEXT_CHARS).into(),
         status: status_text(message.kind).into(),
@@ -193,6 +193,15 @@ mod tests {
         assert_eq!(row.text.as_str(), "Hello  world");
         assert_eq!(row.thread_id.as_str(), "$root:example.org");
         assert_eq!(row.time.as_str(), "");
+        // Pins use the formatter shared with search, including safe handling
+        // of a remote timestamp outside the platform's representable range.
+        let mut dated = message(PinnedMessageKind::Message);
+        dated.timestamp_ms = 1_700_000_000_000;
+        let dated_row = item(&dated, false);
+        assert!(!dated_row.time.is_empty());
+        assert_ne!(dated_row.time.as_str(), "Unknown time");
+        dated.timestamp_ms = u64::MAX;
+        assert_eq!(item(&dated, false).time.as_str(), "Unknown time");
         assert!(row.status.is_empty() && row.can_unpin && row.can_open);
         for kind in [
             PinnedMessageKind::Redacted,
