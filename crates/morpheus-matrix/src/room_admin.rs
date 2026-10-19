@@ -19,9 +19,10 @@ use matrix_sdk::{
     deserialized_responses::MemberEvent,
     room::RoomMember,
     ruma::{
-        Int, OwnedEventId, OwnedUserId, RoomId, UserId,
+        Int, OwnedEventId, OwnedUserId, RoomId, RoomVersionId, UserId,
         api::{
             client::{
+                discovery::get_capabilities,
                 membership::{
                     ban_user,
                     invite_user::{
@@ -30,6 +31,7 @@ use matrix_sdk::{
                     },
                     kick_user, unban_user,
                 },
+                room::upgrade_room,
                 state::send_state_event,
             },
             error::ErrorKind,
@@ -51,7 +53,7 @@ use matrix_sdk::{
 };
 use serde_json::Value;
 use tokio::{
-    sync::{Mutex, broadcast},
+    sync::{Mutex, OnceCell, broadcast},
     time,
 };
 
@@ -288,6 +290,23 @@ pub enum AccessChange {
     Guests { allow: bool },
     /// Turn on end-to-end encryption; it cannot be turned off again.
     Encrypt,
+    /// Replace the room by one on the homeserver's recommended version.
+    Upgrade,
+}
+
+/// The room's version against the homeserver's recommended one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpgradeSettings {
+    /// The version the homeserver uses for new rooms.
+    pub recommended: String,
+    /// The recommended version is a newer numbered version than the room's.
+    pub newer: bool,
+    /// The room was already replaced: it has a tombstone.
+    pub replaced: bool,
+    /// The level needed to replace the room (sending `m.room.tombstone`).
+    pub level: i64,
+    /// The account may upgrade the room now.
+    pub allowed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -313,6 +332,8 @@ pub struct RoomAdminSnapshot {
     /// `None` when the room's rules are unknown.
     pub access: Option<AccessSettings>,
     pub room_version: String,
+    /// `None` when the room's rules or the homeserver's recommendation are unknown.
+    pub upgrade: Option<UpgradeSettings>,
 }
 
 impl RoomAdminSnapshot {
@@ -396,6 +417,8 @@ pub struct AdminOutcome {
     /// The read-back shows exactly the requested result.
     pub confirmed: bool,
     pub snapshot: Arc<RoomAdminSnapshot>,
+    /// The new room that replaced this one, after an upgrade.
+    pub replacement: Option<String>,
 }
 
 #[derive(Clone)]
@@ -424,6 +447,8 @@ pub struct RoomAdminSession {
     loaded: RwLock<Arc<RoomAdminSnapshot>>,
     overrides: std::sync::Mutex<HashMap<OwnedUserId, Override>>,
     operation: Mutex<()>,
+    /// The homeserver's recommended room version, read once per session.
+    recommended: OnceCell<Option<String>>,
 }
 
 impl AccountManager {
@@ -479,9 +504,11 @@ impl AccountManager {
                 permissions: Vec::new(),
                 access: None,
                 room_version: String::new(),
+                upgrade: None,
             })),
             overrides: std::sync::Mutex::new(HashMap::new()),
             operation: Mutex::new(()),
+            recommended: OnceCell::new(),
         };
         session.refresh().await?;
         Ok(session)
@@ -562,8 +589,78 @@ impl RoomAdminSession {
             let encrypted = encryption.is_some();
             let access = access_settings(levels, &self.own_user, history, guests, encrypted);
             snapshot.access = Some(access);
+            let tombstone = self.optional_state(StateEventType::RoomTombstone).await?;
+            let recommended = self.recommended_version().await;
+            self.check()?;
+            let replaced = tombstone.is_some();
+            snapshot.upgrade = recommended.map(|recommended| {
+                upgrade_settings(levels, &self.own_user, &self.room_version, recommended, replaced)
+            });
         }
         Ok(snapshot)
+    }
+    /// The homeserver's recommended room version, asked once per session
+    /// with one bounded request; `None` when it did not say.
+    async fn recommended_version(&self) -> Option<String> {
+        let read = async {
+            let request = get_capabilities::v3::Request::new();
+            let client = self.room.client();
+            let response = client.send(request).with_request_config(write_config()).await;
+            let capabilities = response.ok()?.capabilities;
+            Some(capabilities.room_versions.default.as_str().to_owned())
+        };
+        self.recommended.get_or_init(|| read).await.clone()
+    }
+    /// Replace the room by one on the homeserver's recommended version. The
+    /// homeserver copies the room's state, closes this room with a tombstone
+    /// pointing at the replacement and returns the replacement's ID.
+    async fn upgrade_room(&self) -> Result<AdminOutcome> {
+        self.run(WRITE_TIMEOUT, async {
+            let recommended = self.recommended_version().await;
+            let recommended = recommended.ok_or(RoomAdminError::NotApplicable)?;
+            if !newer_version(&self.room_version, &recommended) {
+                return Err(RoomAdminError::NotApplicable);
+            }
+            let power = self.power_state().await?;
+            let levels = room_settings::effective_power_levels(&self.create, power.as_ref())?
+                .ok_or(RoomAdminError::InvalidState)?;
+            if self.optional_state(StateEventType::RoomTombstone).await?.is_some() {
+                return Err(RoomAdminError::TargetChanged);
+            }
+            if !levels.user_can_send_state(&self.own_user, StateEventType::RoomTombstone) {
+                return Err(RoomAdminError::InsufficientPower);
+            }
+            let version = RoomVersionId::try_from(recommended.as_str())
+                .map_err(|_| RoomAdminError::InvalidState)?;
+            let request = upgrade_room::v3::Request::new(self.room.room_id().to_owned(), version);
+            self.check()?;
+            let response = self
+                .room
+                .client()
+                .send(request)
+                .with_request_config(write_config())
+                .await
+                .map_err(write_failure)?;
+            self.check()?;
+            let replacement = response.replacement_room.to_string();
+            // Accepted by the server; a failed read-back is unconfirmed, not failed.
+            let tombstone = self.optional_state(StateEventType::RoomTombstone).await;
+            let confirmed = tombstone.ok().flatten().is_some_and(|event| {
+                let points = event.content.get("replacement_room").and_then(Value::as_str);
+                points == Some(replacement.as_str())
+            });
+            let built = match self.build(power.as_ref()).await {
+                Ok(built) => Some(self.publish(built)?),
+                Err(_) => None,
+            };
+            Ok(AdminOutcome {
+                confirmed,
+                observed: None,
+                snapshot: built.unwrap_or_else(|| self.snapshot()),
+                replacement: Some(replacement),
+            })
+        })
+        .await
     }
     async fn optional_state(&self, kind: StateEventType) -> Result<Option<StateEnvelope>> {
         let state = room_settings::state(&self.room, kind, "").await?;
@@ -630,6 +727,7 @@ impl RoomAdminSession {
                 confirmed: observed.is_some_and(|seen| confirms(request.action, seen)),
                 observed,
                 snapshot,
+                replacement: None,
             })
         })
         .await
@@ -690,6 +788,7 @@ impl RoomAdminSession {
                 confirmed: observed.is_some_and(|seen| confirms(action, seen)),
                 observed,
                 snapshot,
+                replacement: None,
             })
         })
         .await
@@ -699,6 +798,9 @@ impl RoomAdminSession {
     async fn set_access(&self, change: AccessChange) -> Result<AdminOutcome> {
         if matches!(change, AccessChange::History { from, to } if from == to) {
             return Err(RoomAdminError::NotApplicable);
+        }
+        if change == AccessChange::Upgrade {
+            return self.upgrade_room().await;
         }
         self.run(WRITE_TIMEOUT, async {
             let power = self.power_state().await?;
@@ -738,6 +840,7 @@ impl RoomAdminSession {
                 confirmed,
                 observed,
                 snapshot: built.unwrap_or_else(|| self.snapshot()),
+                replacement: None,
             })
         })
         .await
@@ -1167,6 +1270,7 @@ fn access_kind(change: AccessChange) -> StateEventType {
         AccessChange::History { .. } => StateEventType::RoomHistoryVisibility,
         AccessChange::Guests { .. } => StateEventType::RoomGuestAccess,
         AccessChange::Encrypt => StateEventType::RoomEncryption,
+        AccessChange::Upgrade => StateEventType::RoomTombstone,
     }
 }
 
@@ -1176,7 +1280,7 @@ fn access_matches(change: AccessChange, current: Option<&StateEnvelope>) -> bool
         AccessChange::Guests { allow } => guests_can_join(current) == Some(!allow),
         // Any encryption event, even one this client cannot read, means it
         // is on already; it is never replaced.
-        AccessChange::Encrypt => current.is_none(),
+        AccessChange::Encrypt | AccessChange::Upgrade => current.is_none(),
     }
 }
 
@@ -1185,6 +1289,8 @@ fn access_applied(change: AccessChange, access: AccessSettings) -> bool {
         AccessChange::History { to, .. } => access.history == Some(to),
         AccessChange::Guests { allow } => access.guests_can_join == Some(allow),
         AccessChange::Encrypt => access.encrypted,
+        // Confirmed from the tombstone, not from these settings.
+        AccessChange::Upgrade => false,
     }
 }
 
@@ -1208,8 +1314,39 @@ fn access_request(room: &RoomId, change: AccessChange) -> Result<send_state_even
             let content = RoomEncryptionEventContent::with_recommended_defaults();
             send_state_event::v3::Request::new(room, &EmptyStateKey, &content)
         }
+        // An upgrade is its own request, never a state event.
+        AccessChange::Upgrade => return Err(RoomAdminError::NotApplicable),
     };
     request.map_err(|_| RoomAdminError::InvalidState)
+}
+
+/// A recommended version that is a newer numbered version than the room's.
+/// Unnumbered (experimental) versions are never offered as an upgrade.
+fn newer_version(current: &str, recommended: &str) -> bool {
+    match (current.parse::<u32>(), recommended.parse::<u32>()) {
+        (Ok(current), Ok(recommended)) => recommended > current,
+        _ => false,
+    }
+}
+
+fn upgrade_settings(
+    levels: &RoomPowerLevels,
+    own: &UserId,
+    current: &str,
+    recommended: String,
+    replaced: bool,
+) -> UpgradeSettings {
+    let tombstone = StateEventType::RoomTombstone;
+    let newer = newer_version(current, &recommended);
+    let level = levels.for_state(tombstone.clone()).into();
+    let allowed = newer && !replaced && levels.user_can_send_state(own, tombstone);
+    UpgradeSettings {
+        recommended,
+        newer,
+        replaced,
+        level,
+        allowed,
+    }
 }
 
 fn permission_level(levels: &RoomPowerLevels, key: PermissionKey) -> Int {
@@ -1524,6 +1661,7 @@ fn assemble(
         permissions,
         access: None,
         room_version: room_version.to_owned(),
+        upgrade: None,
     }
 }
 
@@ -1986,6 +2124,17 @@ mod tests {
         let room = room_id!("!admin:example.org");
         let request = access_request(room, AccessChange::Encrypt).unwrap();
         assert!(request.body.json().get().contains("m.megolm.v1.aes-sha2"));
+
+        // Upgrades go only to a newer numbered version, once, with the power
+        // to close the room.
+        assert!(newer_version("10", "11") && !newer_version("11", "11"));
+        assert!(!newer_version("11", "10") && !newer_version("10", "org.example.2"));
+        let upgrade = upgrade_settings(&levels, own, "10", "11".to_owned(), false);
+        assert!(upgrade.newer && upgrade.allowed && upgrade.level == 50);
+        assert!(!upgrade_settings(&levels, own, "10", "11".to_owned(), true).allowed);
+        assert!(!upgrade_settings(&levels, member, "10", "11".to_owned(), false).allowed);
+        assert!(!upgrade_settings(&levels, own, "11", "11".to_owned(), false).allowed);
+        assert!(access_request(room, AccessChange::Upgrade).is_err());
     }
 
     #[test]

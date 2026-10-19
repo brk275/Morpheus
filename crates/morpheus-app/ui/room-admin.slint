@@ -31,7 +31,7 @@ export struct RosterMember {
 export struct RosterPermission {
     // A threshold's index, or -1 for an access row.
     key: int,
-    // 0 threshold, 1 history visibility, 2 guest access, 3 encryption.
+    // 0 threshold, 1 history visibility, 2 guest access, 3 encryption, 4 room version.
     kind: int,
     // Access rows: the current option index (guests: 1 allowed; encryption:
     // 1 on), or -1.
@@ -744,6 +744,19 @@ export component RoomMembersPanel inherits VerticalLayout {
                             enabled: !root.busy && root.access-choice >= 0 && root.access-choice != root.chosen.choice;
                             activated => { root.request-access(1, root.access-choice); }
                         }
+                    }
+                }
+                // An upgrade replaces the room with a new one on a newer version.
+                if root.chosen.kind == 4 && root.chosen.editable : HorizontalLayout {
+                    alignment: start;
+                    RosterButton {
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        text: "Upgrade room…";
+                        label: "Review replacing this room with one on the recommended version";
+                        destructive: true;
+                        enabled: !root.busy && root.chosen.choice == 0;
+                        activated => { root.request-access(4, 1); }
                     }
                 }
                 // Encryption only turns on: Matrix rooms cannot turn it off again.

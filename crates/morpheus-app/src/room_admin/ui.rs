@@ -860,6 +860,7 @@ fn access_row(row: super::AccessRow, pending: Option<AccessChange>) -> RosterPer
         Some(AccessChange::History { .. }) => row.kind == super::ACCESS_HISTORY,
         Some(AccessChange::Guests { .. }) => row.kind == super::ACCESS_GUESTS,
         Some(AccessChange::Encrypt) => row.kind == super::ACCESS_ENCRYPTION,
+        Some(AccessChange::Upgrade) => row.kind == super::ACCESS_UPGRADE,
         None => false,
     };
     RosterPermission {

@@ -11,7 +11,7 @@ use morpheus_matrix::{
     AccessChange, AccessSettings, AdminAction, AdminMember, AdminMembership, AdminOutcome,
     AdminRequest, HistoryChoice, MAX_ADMIN_REASON_BYTES, MemberExpectation, MemberPower,
     MembershipCounts, ObservedMembership, ObservedTarget, PERMISSION_KEYS, PermissionKey,
-    PermissionSetting, PowerThresholds, RoomAdminError, RoomAdminSnapshot,
+    PermissionSetting, PowerThresholds, RoomAdminError, RoomAdminSnapshot, UpgradeSettings,
 };
 
 /// Rows shown at once. Search narrows a larger roster; the count says so.
@@ -58,6 +58,10 @@ const ENCRYPT_BODY: &str = "From now on only members' devices can read new messa
      turned off again, and bots or bridges without encryption support stop reading new messages. \
      Messages already sent stay as they are.";
 const ENCRYPTION_ON: &str = "Encryption is on. Matrix rooms cannot turn it off again.";
+const UPGRADE_BODY: &str = "Members must join the new room themselves; this room keeps its \
+     history but no longer takes messages. Spaces that list this room keep pointing at it.";
+const UPGRADE_REPLACED: &str = "This room was already replaced by a newer one.";
+const UPGRADE_CURRENT: &str = "This room already uses the version your homeserver recommends.";
 const SETTING_CHANGED: &str = "This setting changed on the server. Review it again.";
 
 pub(crate) const KICK: i32 = 1;
@@ -72,6 +76,7 @@ pub(crate) const DENY: i32 = 6;
 pub(crate) const ACCESS_HISTORY: i32 = 1;
 pub(crate) const ACCESS_GUESTS: i32 = 2;
 pub(crate) const ACCESS_ENCRYPTION: i32 = 3;
+pub(crate) const ACCESS_UPGRADE: i32 = 4;
 /// History options in the panel's order, narrowest first. The Slint option
 /// labels follow the same order.
 pub(crate) const HISTORY_CHOICES: [HistoryChoice; 4] = [
@@ -350,11 +355,12 @@ fn history_rank(choice: HistoryChoice) -> i32 {
 pub(crate) struct AccessRow {
     pub(crate) kind: i32,
     /// History: index in `HISTORY_CHOICES`. Guests: 1 allowed, 0 not.
-    /// Encryption: 1 on, 0 off. -1 custom.
+    /// Encryption: 1 on, 0 off. Version: 0 upgradable, 1 current, 2
+    /// replaced. -1 custom.
     pub(crate) choice: i32,
     pub(crate) label: &'static str,
     pub(crate) description: &'static str,
-    pub(crate) summary: &'static str,
+    pub(crate) summary: String,
     pub(crate) editable: bool,
     pub(crate) restriction: String,
 }
@@ -391,13 +397,14 @@ pub(crate) fn access_rows(snapshot: &RoomAdminSnapshot) -> Vec<AccessRow> {
         Some(false) => "Guests cannot join",
         None => "Custom guest setting",
     };
-    vec![
+    let encryption = if access.encrypted { "On" } else { "Off" };
+    let mut rows = vec![
         AccessRow {
             kind: ACCESS_HISTORY,
             choice: access.history.map_or(-1, history_rank),
             label: "History visibility",
             description: "Who can read new messages in this room.",
-            summary: access.history.map_or(CUSTOM_HISTORY, history_text),
+            summary: access.history.map_or(CUSTOM_HISTORY, history_text).to_owned(),
             editable: access.history_editable,
             restriction: access_lock(ACCESS_HISTORY, access, snapshot),
         },
@@ -406,7 +413,7 @@ pub(crate) fn access_rows(snapshot: &RoomAdminSnapshot) -> Vec<AccessRow> {
             choice: access.guests_can_join.map_or(-1, i32::from),
             label: "Guest access",
             description: "Whether guest accounts can join when the join rules let them.",
-            summary: guests,
+            summary: guests.to_owned(),
             editable: access.guests_editable,
             restriction: access_lock(ACCESS_GUESTS, access, snapshot),
         },
@@ -416,11 +423,55 @@ pub(crate) fn access_rows(snapshot: &RoomAdminSnapshot) -> Vec<AccessRow> {
             label: "End-to-end encryption",
             description: "Whether only members' devices can read new messages. Once on, it \
                 stays on.",
-            summary: if access.encrypted { "On" } else { "Off" },
+            summary: encryption.to_owned(),
             editable: access.encryption_editable,
             restriction: access_lock(ACCESS_ENCRYPTION, access, snapshot),
         },
-    ]
+    ];
+    if let Some(upgrade) = &snapshot.upgrade {
+        rows.push(upgrade_row(upgrade, snapshot));
+    }
+    rows
+}
+
+/// A room or homeserver version, shown as plain bounded text.
+fn version_text(version: &str) -> String {
+    crate::directory_plain_text(version, 32)
+}
+
+fn upgrade_row(upgrade: &UpgradeSettings, snapshot: &RoomAdminSnapshot) -> AccessRow {
+    let current = version_text(&snapshot.room_version);
+    let recommended = version_text(&upgrade.recommended);
+    let (choice, summary) = if upgrade.replaced {
+        (2, format!("Version {current}, replaced by a newer room"))
+    } else if upgrade.newer {
+        (0, format!("Version {current}; version {recommended} is recommended"))
+    } else {
+        (1, format!("Version {current}, the recommended version"))
+    };
+    AccessRow {
+        kind: ACCESS_UPGRADE,
+        choice,
+        label: "Room version",
+        description: "The version of the rules this room follows. Upgrading replaces the room \
+            with a new one on a newer version.",
+        summary,
+        editable: upgrade.allowed,
+        restriction: upgrade_lock(upgrade, snapshot),
+    }
+}
+
+/// Why the room cannot be upgraded now, or empty when it can.
+fn upgrade_lock(upgrade: &UpgradeSettings, snapshot: &RoomAdminSnapshot) -> String {
+    if upgrade.allowed {
+        String::new()
+    } else if upgrade.replaced {
+        UPGRADE_REPLACED.to_owned()
+    } else if !upgrade.newer {
+        UPGRADE_CURRENT.to_owned()
+    } else {
+        access_restriction(upgrade.level, snapshot)
+    }
 }
 
 fn access_restriction(level: i64, snapshot: &RoomAdminSnapshot) -> String {
@@ -434,6 +485,8 @@ fn access_current(change: AccessChange, access: AccessSettings) -> bool {
         AccessChange::History { from, .. } => access.history == Some(from),
         AccessChange::Guests { allow } => access.guests_can_join == Some(!allow),
         AccessChange::Encrypt => !access.encrypted,
+        // Checked against the snapshot's version settings instead.
+        AccessChange::Upgrade => true,
     }
 }
 
@@ -486,6 +539,14 @@ pub(crate) fn access_intent(
                 return Err("Encryption is already off.".to_owned());
             }
             (AccessChange::Encrypt, "End-to-end encryption")
+        }
+        ACCESS_UPGRADE => {
+            let upgrade = snapshot.upgrade.as_ref();
+            let upgrade = upgrade.ok_or_else(|| UNKNOWN_RULES.to_owned())?;
+            if !upgrade.allowed {
+                return Err(upgrade_lock(upgrade, snapshot));
+            }
+            (AccessChange::Upgrade, "Room version")
         }
         _ => return Err(UNKNOWN_RULES.to_owned()),
     };
@@ -567,6 +628,10 @@ impl Intent {
         if let AdminAction::SetPermission(key, _) = self.action {
             let current = snapshot.permission(key).map(|row| row.level);
             return current.map(MemberPower::Level) == self.expected.power;
+        }
+        if let AdminAction::SetAccess(AccessChange::Upgrade) = self.action {
+            let upgrade = snapshot.upgrade.as_ref();
+            return upgrade.is_some_and(|upgrade| upgrade.allowed);
         }
         if let AdminAction::SetAccess(change) = self.action {
             let access = snapshot.access;
@@ -816,6 +881,22 @@ pub(crate) fn confirmation(intent: &Intent, snapshot: &RoomAdminSnapshot) -> Opt
             action: "Turn on encryption",
             destructive: true,
         },
+        AdminAction::SetAccess(AccessChange::Upgrade) => {
+            let upgrade = snapshot.upgrade.as_ref();
+            let version = upgrade.map_or_else(String::new, |upgrade| {
+                version_text(&upgrade.recommended)
+            });
+            Confirmation {
+                title: "Upgrade this room?".to_owned(),
+                body: format!(
+                    "Your homeserver creates a replacement room on version {version}, copies \
+                     this room's name, topic, permissions and addresses, and closes this room \
+                     with a pointer to the new one. {UPGRADE_BODY}"
+                ),
+                action: "Upgrade room",
+                destructive: true,
+            }
+        }
     };
     if let Some(reason) = &intent.reason {
         confirmation.body.push_str("\n\nReason, visible to the room: ");
@@ -855,6 +936,17 @@ fn observed_text(seen: ObservedTarget) -> String {
 /// Report only what the homeserver accepted and what reading it back showed.
 pub(crate) fn outcome_text(intent: &Intent, outcome: &AdminOutcome) -> String {
     let name = &intent.name;
+    if let Some(replacement) = &outcome.replacement {
+        let id = crate::directory_plain_text(replacement, 260);
+        return if outcome.confirmed {
+            format!("Upgraded. The replacement room {id} is ready; members need to join it.")
+        } else {
+            format!(
+                "The homeserver created the replacement room {id}, but this room does not \
+                 point to it yet. Refresh before trying again."
+            )
+        };
+    }
     let Some(seen) = outcome.observed else {
         return format!("The homeserver accepted the change for {name}. {UNREAD}");
     };
@@ -907,6 +999,7 @@ fn access_outcome_text(change: AccessChange, confirmed: bool) -> String {
         AccessChange::Encrypt => {
             "End-to-end encryption is on. The homeserver confirmed it.".to_owned()
         }
+        AccessChange::Upgrade => "The room was upgraded.".to_owned(),
     }
 }
 
@@ -922,6 +1015,7 @@ pub(crate) fn permission_text(action: AdminAction, snapshot: &RoomAdminSnapshot)
             AccessChange::History { .. } => access.history_level,
             AccessChange::Guests { .. } => access.guests_level,
             AccessChange::Encrypt => access.encryption_level,
+            AccessChange::Upgrade => snapshot.upgrade.as_ref().map_or(100, |up| up.level),
         };
         return access_restriction(level, snapshot);
     }
@@ -1103,6 +1197,7 @@ mod tests {
             permissions: Vec::new(),
             access: None,
             room_version: "11".to_owned(),
+            upgrade: None,
         }
     }
     fn intent(action: AdminAction, level: i64, knock: bool) -> Intent {
@@ -1365,6 +1460,48 @@ mod tests {
     }
 
     #[test]
+    fn upgrades_are_offered_only_for_a_newer_version_and_reported_with_the_new_room() {
+        let mut snapshot = with_access(true);
+        snapshot.room_version = "10".to_owned();
+        snapshot.upgrade = Some(UpgradeSettings {
+            recommended: "11".to_owned(),
+            newer: true,
+            replaced: false,
+            level: 100,
+            allowed: true,
+        });
+        let row = access_rows(&snapshot).pop().unwrap();
+        assert_eq!((row.kind, row.choice, row.editable), (ACCESS_UPGRADE, 0, true));
+        assert_eq!(row.summary, "Version 10; version 11 is recommended");
+        let upgrade = access_intent(ACCESS_UPGRADE, 1, &snapshot).unwrap();
+        assert_eq!(upgrade.action, AdminAction::SetAccess(AccessChange::Upgrade));
+        let review = confirmation(&upgrade, &snapshot).unwrap();
+        assert!(review.destructive && review.body.contains("version 11"));
+        assert!(upgrade.still_matches(&snapshot));
+
+        let outcome = AdminOutcome {
+            observed: None,
+            confirmed: true,
+            snapshot: std::sync::Arc::new(snapshot.clone()),
+            replacement: Some("!new:example.org".to_owned()),
+        };
+        let text = outcome_text(&upgrade, &outcome);
+        assert!(text.starts_with("Upgraded.") && text.contains("!new:example.org"));
+
+        // Already replaced, or already current: nothing to do, and a stale
+        // review is withdrawn.
+        if let Some(settings) = snapshot.upgrade.as_mut() {
+            settings.replaced = true;
+            settings.allowed = false;
+        }
+        assert!(!upgrade.still_matches(&snapshot));
+        let replaced = access_intent(ACCESS_UPGRADE, 1, &snapshot);
+        assert_eq!(replaced, Err(UPGRADE_REPLACED.to_owned()));
+        let row = access_rows(&snapshot).pop().unwrap();
+        assert_eq!((row.choice, row.editable), (2, false));
+    }
+
+    #[test]
     fn encryption_only_turns_on_after_a_destructive_review() {
         let snapshot = with_access(true);
         let encrypt = access_intent(ACCESS_ENCRYPTION, 1, &snapshot).unwrap();
@@ -1385,7 +1522,7 @@ mod tests {
         assert!(!encrypt.still_matches(&on));
         assert_eq!(access_intent(ACCESS_ENCRYPTION, 1, &on), Err(ENCRYPTION_ON.to_owned()));
         let row = &access_rows(&on)[2];
-        assert_eq!((row.choice, row.summary, row.editable), (1, "On", false));
+        assert_eq!((row.choice, row.summary.as_str(), row.editable), (1, "On", false));
         assert_eq!(row.restriction, ENCRYPTION_ON);
     }
 
