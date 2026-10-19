@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
 name: Reviewed beta four-platform native checks
-run-name: Reviewed pinned integration - 21ab453 - ${{ inputs.platform }}
+run-name: Pinned native compile diagnosis - 21ab453 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,12 +14,12 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: beta-native-21ab453-${{ github.ref }}
+  group: pinned-native-diagnosis-21ab453-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
     name: Native ${{ matrix.name }}
-    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false && contains(fromJSON('["all","non-intel","macos-arm64","macos-intel","windows","linux"]'), inputs.platform)
+    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false && inputs.platform == 'linux'
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(inputs.platform == 'non-intel' && '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"},{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"},{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}' || inputs.platform == 'macos-arm64' && '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"}]}' || inputs.platform == 'macos-intel' && '{"include":[{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"}]}' || inputs.platform == 'windows' && '{"include":[{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"}]}' || inputs.platform == 'linux' && '{"include":[{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}' || '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"},{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"},{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"},{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}') }}
@@ -504,9 +504,6 @@ jobs:
           }
           checks=[
               ('native_app_build',['cargo','build','--locked','-p','morpheus-app','--features','native-calls'],70*60,None,set()),
-              ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
-                  '--bin','morpheus-app','--','--test-threads=1'],40*60,needed_app,allowed_app_ignore),
-              ('matrix_unit',['cargo','test','--locked','-p','morpheus-matrix','--lib','--','--test-threads=1'],20*60,needed_matrix,set()),
           ]
           # Config/RTC and SDK source, locks, compiler and dependencies are unchanged.
           # SDK18 evidence is tracked separately in the prior matrix and Windows-only lane.
@@ -576,7 +573,33 @@ jobs:
                   resolved_link=shutil.which('link.exe',path=environment.get('PATH','')) if os.name=='nt' else None
                   locked_names={package for package,version in locked}
                   failed_packages=set(re.findall(r'could not compile `([A-Za-z0-9_-]+)`',normalized))
+                  # Only reviewed public filenames and numeric compiler spans.
+                  # Missing identifiers are admitted only if already in those public sources.
+                  source_files=('crates/morpheus-app/src/main.rs',
+                      'crates/morpheus-app/src/live.rs',
+                      'crates/morpheus-app/src/timeline_model.rs',
+                      'crates/morpheus-app/src/pinned_messages/mod.rs',
+                      'crates/morpheus-app/src/pinned_messages/view.rs',
+                      'crates/morpheus-app/src/message_search.rs',
+                      'crates/morpheus-app/src/polls/mod.rs',
+                      'crates/morpheus-app/ui/app-window.slint',
+                      'crates/morpheus-app/ui/pinned-messages.slint',
+                      'crates/morpheus-matrix/src/lib.rs',
+                      'crates/morpheus-matrix/src/pinned_messages.rs')
+                  locations=[]; public_identifiers=set()
+                  for path in source_files:
+                      file=workspace/path
+                      if not file.is_file(): continue
+                      text=file.read_text()
+                      public_identifiers.update(re.findall(r'\b[A-Za-z_][A-Za-z0-9_]{0,127}\b',text))
+                      line_limit=len(text.splitlines())+1
+                      spans={(int(line),int(column)) for line,column in re.findall(re.escape(path)+r':([0-9]{1,7}):([0-9]{1,5})',normalized)
+                          if 0<int(line)<=line_limit and 0<int(column)<=4096}
+                      locations.extend({'file':path,'line':line,'column':column} for line,column in sorted(spans)[:32])
+                  missing=set(re.findall(r'cannot find (?:value|function|type|struct) `([A-Za-z_][A-Za-z0-9_]{0,127})`',normalized))
                   record['failure_diagnostics']={
+                      'source_locations':locations,
+                      'missing_public_identifiers':sorted(missing & public_identifiers)[:32],
                       'linker_failures':[{'tool':tool_family(tool),'exit_code':int(code)} for tool,code in linker_failures[:8]],
                       'path_link_family':tool_family(resolved_link) if resolved_link else 'not_resolved',
                       'locked_failed_packages':sorted(failed_packages & locked_names),
