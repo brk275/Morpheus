@@ -86,7 +86,9 @@ fn png_input_with(bytes: &[u8], animation: bool) -> Result<Zeroizing<Vec<u8>>, P
     let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
     let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
     size(width, height)?;
-    if bytes[24] > 8 {
+    // Still images may use 16-bit samples, which are narrowed after decoding;
+    // animation frames stay 8-bit.
+    if bytes[24] > 16 || (animation && bytes[24] > 8) {
         return Err(PreviewError::Unsupported);
     }
     output.extend_from_slice(&bytes[..8]);
@@ -339,29 +341,39 @@ pub(super) fn decode(bytes: Zeroizing<Vec<u8>>) -> Result<Pixels, PreviewError> 
         let (width, height) = decoder.dimensions();
         let length = size(width, height)?;
         let color = decoder.color_type();
-        let channels = match color {
-            ColorType::L8 => 1,
-            ColorType::La8 => 2,
-            ColorType::Rgb8 => 3,
-            ColorType::Rgba8 => 4,
+        let (channels, wide) = match color {
+            ColorType::L8 => (1, false),
+            ColorType::La8 => (2, false),
+            ColorType::Rgb8 => (3, false),
+            ColorType::Rgba8 => (4, false),
+            ColorType::L16 => (1, true),
+            ColorType::La16 => (2, true),
+            ColorType::Rgb16 => (3, true),
+            ColorType::Rgba16 => (4, true),
             _ => return Err(PreviewError::Unsupported),
         };
-        let mut raw = Zeroizing::new(vec![0; length / 4 * channels]);
+        let sample_bytes = if wide { 2 } else { 1 };
+        let mut raw = Zeroizing::new(vec![0; length / 4 * channels * sample_bytes]);
         if decoder.total_bytes() != raw.len() as u64 {
             return Err(PreviewError::Invalid);
         }
         decoder
             .read_image(&mut raw)
             .map_err(|_| PreviewError::Invalid)?;
-        let mut rgba = Zeroizing::new(Vec::with_capacity(length));
-        for pixel in raw.chunks_exact(channels) {
-            match channels {
-                1 => rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], 255]),
-                2 => rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]),
-                3 => rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]),
-                _ => rgba.extend_from_slice(pixel),
+        let rgba = if wide {
+            narrow_to_rgba(raw, channels)
+        } else {
+            let mut rgba = Zeroizing::new(Vec::with_capacity(length));
+            for pixel in raw.chunks_exact(channels) {
+                match channels {
+                    1 => rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], 255]),
+                    2 => rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]),
+                    3 => rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]),
+                    _ => rgba.extend_from_slice(pixel),
+                }
             }
-        }
+            rgba
+        };
         Ok(Pixels {
             width,
             height,
@@ -400,6 +412,50 @@ pub(super) fn decode(bytes: Zeroizing<Vec<u8>>) -> Result<Pixels, PreviewError> 
     } else {
         Err(PreviewError::Unsupported)
     }
+}
+
+/// One 16-bit sample, rounded to 8 bits. The PNG decoder writes 16-bit
+/// samples in native byte order.
+fn narrow(sample: [u8; 2]) -> u8 {
+    ((u32::from(u16::from_ne_bytes(sample)) * 255 + 32_767) / 65_535) as u8
+}
+
+/// 16-bit gray, gray-alpha, RGB or RGBA samples to 8-bit RGBA. Formats of at
+/// least four bytes per pixel are compacted in place (each pixel is read
+/// before its smaller output overwrites anything still unread), so the peak
+/// stays at the decoded buffer; gray expands into a new buffer.
+fn narrow_to_rgba(mut raw: Zeroizing<Vec<u8>>, channels: usize) -> Zeroizing<Vec<u8>> {
+    let stride = channels * 2;
+    let pixels = raw.len() / stride;
+    let sample = |raw: &[u8], index: usize| narrow([raw[index], raw[index + 1]]);
+    if channels == 1 {
+        let mut rgba = Zeroizing::new(Vec::with_capacity(pixels * 4));
+        for pixel in raw.chunks_exact(2) {
+            let gray = narrow([pixel[0], pixel[1]]);
+            rgba.extend_from_slice(&[gray, gray, gray, 255]);
+        }
+        return rgba;
+    }
+    for index in 0..pixels {
+        let at = index * stride;
+        let out = match channels {
+            2 => {
+                let gray = sample(&raw, at);
+                [gray, gray, gray, sample(&raw, at + 2)]
+            }
+            3 => [sample(&raw, at), sample(&raw, at + 2), sample(&raw, at + 4), 255],
+            _ => [
+                sample(&raw, at),
+                sample(&raw, at + 2),
+                sample(&raw, at + 4),
+                sample(&raw, at + 6),
+            ],
+        };
+        raw[index * 4..index * 4 + 4].copy_from_slice(&out);
+    }
+    // Truncation keeps the capacity, which Zeroizing still clears on drop.
+    raw.truncate(pixels * 4);
+    raw
 }
 
 /// Turn decoded RGBA rows upright for an Exif orientation. The copy goes to a
@@ -465,6 +521,38 @@ mod tests {
         bytes.splice(33..33, metadata);
         let pixels = decode(Zeroizing::new(bytes)).unwrap();
         assert_eq!(&*pixels.rgba, &[12, 34, 56, 78]);
+    }
+    #[test]
+    fn sixteen_bit_png_is_narrowed_with_rounding() {
+        let encode = |samples: &[u16], color| {
+            // The encoder takes native-endian samples and writes big-endian.
+            let bytes: Vec<u8> = samples.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let mut png = Vec::new();
+            image::codecs::png::PngEncoder::new(&mut png)
+                .write_image(&bytes, 1, 1, color)
+                .unwrap();
+            decode(Zeroizing::new(png)).unwrap()
+        };
+        let rgba = encode(&[65_535, 0, 32_896, 257], image::ExtendedColorType::Rgba16);
+        assert_eq!(&*rgba.rgba, &[255, 0, 128, 1]);
+        let rgb = encode(&[0, 65_535, 128], image::ExtendedColorType::Rgb16);
+        assert_eq!(&*rgb.rgba, &[0, 255, 0, 255]);
+        let gray = encode(&[32_896], image::ExtendedColorType::L16);
+        assert_eq!(&*gray.rgba, &[128, 128, 128, 255]);
+        let gray_alpha = encode(&[65_535, 0], image::ExtendedColorType::La16);
+        assert_eq!(&*gray_alpha.rgba, &[255, 255, 255, 0]);
+    }
+    #[test]
+    fn in_place_narrowing_keeps_every_pixel() {
+        // Two RGBA16 pixels: the second must survive the first's write.
+        let samples: [u16; 8] = [1, 2, 3, 4, 65_535, 65_535, 0, 65_535];
+        let raw: Vec<u8> = samples.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let rgba = narrow_to_rgba(Zeroizing::new(raw), 4);
+        assert_eq!(&*rgba, &[0, 0, 0, 0, 255, 255, 0, 255]);
+        let samples: [u16; 6] = [0, 65_535, 0, 65_535, 0, 65_535];
+        let raw: Vec<u8> = samples.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let rgba = narrow_to_rgba(Zeroizing::new(raw), 3);
+        assert_eq!(&*rgba, &[0, 255, 0, 255, 255, 0, 255, 255]);
     }
     #[test]
     fn baseline_jpeg_decodes_color_and_grayscale_with_bounded_rgba_output() {

@@ -14,7 +14,7 @@ An explicit image viewer is implemented in the room timeline and thread replies.
 
 ## Supported inputs and limits
 
-Static PNG up to 8 bits per channel (including indexed/grayscale expansion), and 8-bit baseline or progressive (Huffman) JPEG with one or three components are supported. Images must be at most **8 MiB**, **4096 pixels per side**, and **4,194,304 pixels**. The body limit is enforced while streaming even if the event and HTTP response omit a size.
+Static PNG up to 16 bits per channel (including indexed/grayscale expansion; 16-bit samples are rounded to 8 bits after decoding, compacting in place for formats of four or more bytes per pixel, so the peak buffer is unchanged; source only, not yet built or tested), and 8-bit baseline or progressive (Huffman) JPEG with one or three components are supported. Images must be at most **8 MiB**, **4096 pixels per side**, and **4,194,304 pixels**. The body limit is enforced while streaming even if the event and HTTP response omit a size.
 
 PNG framing checks dimensions before constructing the decoder. It strips ancillary metadata without decompressing it, rejects animation, bounds palette/transparency chunks, and configures the pinned PNG decoder's 32 MiB allocation budget before header parsing. The budget applies to allocations tracked by that decoder; it is not a whole-process/RSS guarantee.
 
