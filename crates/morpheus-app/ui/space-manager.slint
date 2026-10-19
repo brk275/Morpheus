@@ -73,6 +73,9 @@ export struct SpaceManagerView {
     // The list of joined rooms to add from is open, and how many are picked.
     rooms-open: bool,
     picked: int,
+    // The list of this Space's entries to remove several of is open; it
+    // shares the picked count.
+    removing-open: bool,
     confirm-open: bool,
     confirm-title: string,
     confirm-body: string,
@@ -180,6 +183,8 @@ export component SpaceManagerPage inherits VerticalLayout {
     in property <SpaceManagerView> view;
     in property <[SpaceRow]> rows;
     in property <[SpacePick]> picks;
+    // This Space's direct entries offered for removing several at once.
+    in property <[SpacePick]> removals;
     // Narrows the list of joined rooms offered for adding.
     in-out property <string> pick-query;
     in-out property <string> query;
@@ -198,7 +203,8 @@ export component SpaceManagerPage inherits VerticalLayout {
     // 6 move up, 7 move down, 8 remove, 9 join, 10 open sub-Space, 11 stop read,
     // 12 create a room here, 13 back to the previous Space, 14 list an upgraded
     // room's replacement in its place, 15 list your joined rooms, 16 add the
-    // picked rooms, 17 close that list
+    // picked rooms, 17 close either pick list, 18 list entries to remove,
+    // 19 remove the picked entries
     callback action(int);
     callback select(string);
     // Pick or unpick one listed joined room by its room ID.
@@ -681,6 +687,61 @@ export component SpaceManagerPage inherits VerticalLayout {
                             primary: true;
                             enabled: !root.view.busy && root.create-name != "";
                             activated => { root.action(12); }
+                        }
+                    }
+                }
+            }
+            if root.ready && root.view.can-manage : Rectangle {
+                background: root.palette.elevated;
+                border-color: root.palette.divider; border-width: 1px; border-radius: 10px;
+                accessible-role: groupbox;
+                accessible-label: "Remove several entries from this Space";
+                VerticalLayout {
+                    padding: 12px; spacing: 6px;
+                    Text { text: "REMOVE SEVERAL ENTRIES"; color: root.palette.muted; font-size: 9px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
+                    if !root.view.removing-open : HorizontalLayout {
+                        alignment: start;
+                        RosterButton {
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: "Choose entries…";
+                            label: "List this Space's entries to remove several links at once; no room is left or deleted";
+                            enabled: !root.view.busy;
+                            activated => { root.action(18); }
+                        }
+                    }
+                    if root.view.removing-open && root.removals.length == 0 : Text {
+                        text: "This Space has no entries Morpheus can remove.";
+                        color: root.palette.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
+                    }
+                    if root.view.removing-open && root.removals.length > 0 : removals-list := ListView {
+                        height: min(220px, root.removals.length * max(30px, 20px * root.text-scale + 10px));
+                        horizontal-scrollbar-policy: always-off;
+                        for entry in root.removals : SpacePickRow {
+                            width: removals-list.visible-width;
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: entry.name;
+                            detail: entry.detail;
+                            checked: entry.picked;
+                            enabled: !root.view.busy;
+                            activated => { root.pick(entry.key); }
+                        }
+                    }
+                    if root.view.removing-open : HorizontalLayout {
+                        spacing: 5px; alignment: start;
+                        RosterButton {
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: root.view.picked == 1 ? "Remove 1 entry…" : "Remove " + root.view.picked + " entries…";
+                            label: "Review removing the picked entries from the Space";
+                            destructive: true;
+                            enabled: !root.view.busy && root.view.picked > 0;
+                            activated => { root.action(19); }
+                        }
+                        RosterButton {
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: "Close list";
+                            label: "Close the list of entries without removing any";
+                            enabled: !root.view.busy;
+                            activated => { root.action(17); }
                         }
                     }
                 }

@@ -459,6 +459,57 @@ impl SpaceSession {
         .await
     }
 
+    /// Remove several direct child links, one at a time and in order. Each
+    /// reviewed link must still be current; the first failure stops the
+    /// rest. No room is left or deleted, and other Spaces keep their links.
+    pub async fn unlink_many(&self, links: &[SpaceChildLink]) -> Result<SpaceWriteOutcome> {
+        if links.is_empty() {
+            return Err(RoomAdminError::NotApplicable);
+        }
+        if links.len() > MAX_LINKS_AT_ONCE {
+            return Err(RoomAdminError::TooManyChanges);
+        }
+        let children = links
+            .iter()
+            .map(|link| self.direct_child(link))
+            .collect::<Result<Vec<_>>>()?;
+        self.run(WRITE_TIMEOUT, async {
+            self.require_manage().await?;
+            let mut accepted = 0;
+            let mut confirmed = true;
+            let mut stopped = None;
+            for (link, child) in links.iter().zip(&children) {
+                let step = async {
+                    let current = self.child_state(child).await?;
+                    if current.as_ref() != Some(&link.content) {
+                        return Err(RoomAdminError::TargetChanged);
+                    }
+                    self.send_child(child, &Value::Object(Map::new())).await
+                };
+                match step.await {
+                    Ok(()) => {
+                        accepted += 1;
+                        let after = self.child_state(child).await;
+                        let removed = after.is_ok_and(|after| after.is_none_or(|v| !is_linked(&v)));
+                        confirmed &= removed;
+                    }
+                    Err(error) if accepted == 0 => return Err(error),
+                    Err(error) => {
+                        stopped = Some(error);
+                        break;
+                    }
+                }
+            }
+            Ok(SpaceWriteOutcome {
+                accepted,
+                requested: links.len(),
+                confirmed: confirmed && stopped.is_none(),
+                stopped,
+            })
+        })
+        .await
+    }
+
     /// Write a reorder plan's keys one link at a time. Each reviewed link must
     /// still be current; the first refusal stops the remaining writes.
     pub async fn reorder(&self, plan: &[(SpaceChildLink, String)]) -> Result<SpaceWriteOutcome> {
@@ -1415,6 +1466,7 @@ mod tests {
             send(session.replace(link));
             send(session.joined_rooms());
             send(session.link_many(std::slice::from_ref(target), false));
+            send(session.unlink_many(std::slice::from_ref(link)));
         }
     }
 }

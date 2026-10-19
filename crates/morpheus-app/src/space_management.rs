@@ -31,6 +31,10 @@ const JOIN_BODY: &str = "You join only this one, not the rest of the Space. Memb
 const MOVE_BODY: &str = "Everyone in the Space sees the new order.";
 const CREATE_BODY: &str = "Nobody else is invited, and nothing already in the Space changes.";
 pub(crate) const NOTHING_PICKED: &str = "Choose at least one room to add.";
+pub(crate) const NOTHING_TO_REMOVE: &str = "Choose at least one entry to remove.";
+const UNLINK_MANY_BODY: &str = "Only these links are removed. Nobody leaves, no room is deleted, \
+     and other Spaces keep them. They are removed one at a time, and the first failure stops \
+     the rest.";
 const LINK_MANY_BODY: &str = "Nobody joins them, and they stay in any other Spaces that list them. \
      They are added one at a time, and the first failure stops the rest.";
 /// Rooms named in a confirmation for adding several; the rest are counted.
@@ -372,6 +376,8 @@ pub(crate) enum Change {
         order: Option<String>,
     },
     Unlink { link: SpaceChildLink },
+    /// Remove several direct entries, in the listed order.
+    UnlinkMany { links: Vec<SpaceChildLink> },
     /// List the room that replaced an upgraded child in its place.
     Replace {
         link: SpaceChildLink,
@@ -415,8 +421,8 @@ impl Intent {
                 plan.first().map_or("", |(link, _)| link.room_id.as_str())
             }
             Change::Join { room_id, .. } => room_id.as_str(),
-            // New entries are not rows yet, so no row is marked.
-            Change::Create { .. } | Change::LinkMany { .. } => "",
+            // New entries are not rows yet, and several entries mark none.
+            Change::Create { .. } | Change::LinkMany { .. } | Change::UnlinkMany { .. } => "",
         }
     }
     /// Every reviewed link is still listed unchanged by a fresher load.
@@ -427,6 +433,7 @@ impl Intent {
             | Change::Unlink { link }
             | Change::Replace { link, .. } => listed(link),
             Change::Reorder { plan, .. } => plan.iter().all(|(link, _)| listed(link)),
+            Change::UnlinkMany { links } => links.iter().all(listed),
             Change::Link { .. }
             | Change::LinkMany { .. }
             | Change::Join { .. }
@@ -535,6 +542,23 @@ pub(crate) fn confirmation(intent: &Intent) -> Confirmation {
             action: "Remove link",
             destructive: true,
         },
+        Change::UnlinkMany { links } => {
+            let named = links.iter().take(MAX_NAMED_ROOMS);
+            let named = named.map(|link| title(&link.room_id, None));
+            let named = named.collect::<Vec<_>>().join(", ");
+            let mut body = format!("Members of {space} will no longer see {named}");
+            let more = links.len().saturating_sub(MAX_NAMED_ROOMS);
+            if more > 0 {
+                body.push_str(&format!(" and {more} more"));
+            }
+            body.push_str(&format!(" listed. {UNLINK_MANY_BODY}"));
+            Confirmation {
+                title: format!("Remove {name} from {space}?"),
+                body,
+                action: "Remove links",
+                destructive: true,
+            }
+        }
         Change::Replace { link, replacement } => {
             let id = crate::directory_plain_text(replacement, 260);
             let suggested = if link.suggested {
@@ -612,7 +636,7 @@ pub(crate) fn pending_text(intent: &Intent) -> String {
     let verb = match intent.change {
         Change::Link { .. } | Change::LinkMany { .. } => "Adding",
         Change::Update { .. } => "Updating",
-        Change::Unlink { .. } => "Removing",
+        Change::Unlink { .. } | Change::UnlinkMany { .. } => "Removing",
         Change::Replace { .. } => "Replacing",
         Change::Reorder { .. } => "Moving",
         Change::Join { .. } => "Joining",
@@ -630,6 +654,9 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: SpaceWriteOutcome) -> Strin
     if let Change::LinkMany { .. } = intent.change {
         return linked_text(name, &intent.space, outcome);
     }
+    if let Change::UnlinkMany { .. } = intent.change {
+        return unlinked_text(name, &intent.space, outcome);
+    }
     if let Some(error) = outcome.stopped {
         let (accepted, requested) = (outcome.accepted, outcome.requested);
         let reason = error_text(error);
@@ -645,6 +672,7 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: SpaceWriteOutcome) -> Strin
         Change::LinkMany { .. } => linked_text(name, &intent.space, outcome),
         Change::Update { .. } => format!("Updated {name}. The homeserver confirmed it."),
         Change::Unlink { .. } => format!("Removed the link to {name}; the room is unchanged."),
+        Change::UnlinkMany { .. } => unlinked_text(name, &intent.space, outcome),
         Change::Replace { .. } => replaced_text(name, &intent.space, outcome),
         Change::Reorder { .. } => format!("Moved {name}. The homeserver confirmed the order."),
         Change::Join { .. } => format!("Joined {name}."),
@@ -670,6 +698,54 @@ fn linked_text(name: &str, space: &str, outcome: SpaceWriteOutcome) -> String {
 
 pub(crate) fn too_many_picked() -> String {
     format!("Add at most {MAX_LINKS_AT_ONCE} rooms at a time.")
+}
+
+/// What removing several entries did: each was removed in order until the
+/// first failure, which is named.
+fn unlinked_text(name: &str, space: &str, outcome: SpaceWriteOutcome) -> String {
+    let (accepted, requested) = (outcome.accepted, outcome.requested);
+    if let Some(error) = outcome.stopped {
+        let reason = error_text(error);
+        return format!(
+            "{accepted} of {requested} entries were removed from {space}, then: {reason}"
+        );
+    }
+    if !outcome.confirmed {
+        return format!(
+            "The homeserver accepted removing {name}, but reading the links back differed."
+        );
+    }
+    format!("Removed {name} from {space}; the rooms themselves are unchanged.")
+}
+
+/// "1 entry" or "N entries", for a removal of several.
+pub(crate) fn entries_text(count: usize) -> String {
+    if count == 1 {
+        "1 entry".to_owned()
+    } else {
+        format!("{count} entries")
+    }
+}
+
+/// The secondary line of a direct entry offered for removal.
+pub(crate) fn entry_detail(link: &SpaceChildLink, node: Option<&SpaceNode>) -> String {
+    let mut parts = Vec::new();
+    match node {
+        Some(node) => {
+            parts.push(if node.is_space { "Space" } else { "Room" });
+            parts.push(membership_text(node.membership));
+        }
+        None => parts.push("Not returned by your homeserver yet"),
+    }
+    if link.suggested {
+        parts.push("Suggested");
+    }
+    parts.join(" · ")
+}
+
+/// Direct entries Morpheus can remove: their content is one it edits.
+pub(crate) fn removable(direct: &[SpaceChildLink]) -> Vec<&SpaceChildLink> {
+    direct.iter().filter(|link| link.editable).collect()
 }
 
 /// "1 room" or "N rooms", for a change of several.
@@ -978,6 +1054,40 @@ mod tests {
         let confirmation = confirmation(&intent);
         assert!(confirmation.destructive);
         assert!(confirmation.body.contains("Nobody leaves"));
+    }
+
+    #[test]
+    fn removing_several_entries_is_destructive_and_fenced_by_each_link() {
+        let (a, b) = ("!a:example.org", "!b:example.org");
+        let links = vec![link(SPACE, a, 1), link(SPACE, b, 2)];
+        let intent = Intent {
+            change: Change::UnlinkMany {
+                links: links.clone(),
+            },
+            name: entries_text(2),
+            space: "Crew".to_owned(),
+        };
+        assert_eq!(entries_text(1), "1 entry");
+        assert_eq!(intent.room_id(), "");
+        assert!(intent.still_matches(&links));
+        // Any reviewed link that changed withdraws the whole review.
+        assert!(!intent.still_matches(&links[..1]));
+        let review = confirmation(&intent);
+        assert!(review.destructive && review.title == "Remove 2 entries from Crew?");
+        assert!(review.body.contains("Nobody leaves"));
+        let pending = pending_text(&intent);
+        assert_eq!(pending, "Removing 2 entries… Waiting for the homeserver.");
+        let partial = SpaceWriteOutcome {
+            accepted: 1,
+            requested: 2,
+            confirmed: false,
+            stopped: Some(RoomAdminError::TargetChanged),
+        };
+        let text = outcome_text(&intent, partial);
+        assert!(text.starts_with("1 of 2 entries were removed from Crew, then:"));
+        let nodes = [node(a, true, Vec::new())];
+        assert_eq!(entry_detail(&links[0], Some(&nodes[0])), "Room · Joined");
+        assert_eq!(removable(&links).len(), 2);
     }
 
     #[test]

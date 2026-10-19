@@ -44,6 +44,8 @@ pub(crate) const REPLACE: i32 = 14;
 pub(crate) const LIST_ROOMS: i32 = 15;
 pub(crate) const ADD_PICKED: i32 = 16;
 pub(crate) const CLOSE_ROOMS: i32 = 17;
+pub(crate) const CHOOSE_REMOVALS: i32 = 18;
+pub(crate) const REMOVE_PICKED: i32 = 19;
 /// Spaces remembered for Back, newest last.
 const MAX_TRAIL: usize = 8;
 
@@ -78,7 +80,9 @@ struct PanelState {
     target: Option<SpaceTarget>,
     /// The account's joined rooms offered for adding, while that list is open.
     rooms: Option<Vec<SpaceTarget>>,
-    /// Room IDs picked from `rooms`, at most `MAX_LINKS_AT_ONCE`.
+    /// The list of direct entries to remove several of is open.
+    removing: bool,
+    /// Room IDs picked from the open list, at most `MAX_LINKS_AT_ONCE`.
     picked: HashSet<String>,
     /// The change waiting for the homeserver.
     pending: Option<Intent>,
@@ -464,6 +468,8 @@ impl SpaceManagerUi {
             LIST_ROOMS => self.list_rooms(ui, panel),
             ADD_PICKED => self.review_picked(ui, panel),
             CLOSE_ROOMS => self.close_rooms(ui, &panel),
+            CHOOSE_REMOVALS => self.choose_removals(ui, &panel),
+            REMOVE_PICKED => self.review_removals(ui, panel),
             _ => {}
         }
     }
@@ -664,13 +670,50 @@ impl SpaceManagerUi {
         {
             let mut state = panel.lock();
             state.rooms = None;
+            state.removing = false;
             state.picked.clear();
         }
         ui.set_space_manager_pick_query("".into());
         self.repaint_panel(ui, panel);
     }
 
-    /// Pick or unpick one listed room, up to `MAX_LINKS_AT_ONCE`.
+    /// Open the list of direct entries to remove several of; the list of
+    /// joined rooms closes.
+    fn choose_removals(&self, ui: &AppWindow, panel: &Panel) {
+        if !self.idle(panel) || !panel.lock().can_manage() {
+            return;
+        }
+        {
+            let mut state = panel.lock();
+            state.rooms = None;
+            state.removing = true;
+            state.picked.clear();
+            state.error.clear();
+        }
+        ui.set_space_manager_pick_query("".into());
+        self.repaint_panel(ui, panel);
+    }
+
+    fn review_removals(self: &Arc<Self>, ui: &AppWindow, panel: Arc<Panel>) {
+        if !self.idle(&panel) || !panel.lock().can_manage() {
+            return;
+        }
+        let links = {
+            let state = panel.lock();
+            let direct = state.direct(&panel.space);
+            let removable = super::removable(&direct);
+            let chosen = |link: &&SpaceChildLink| state.picked.contains(&link.room_id);
+            let picked = removable.into_iter().filter(chosen);
+            picked.cloned().collect::<Vec<_>>()
+        };
+        if links.is_empty() {
+            return self.reject(ui, &panel, super::NOTHING_TO_REMOVE.to_owned());
+        }
+        let name = super::entries_text(links.len());
+        self.review(ui, panel, Change::UnlinkMany { links }, name);
+    }
+
+    /// Pick or unpick one entry of the open list, up to `MAX_LINKS_AT_ONCE`.
     fn pick(&self, ui: &AppWindow, room_id: &str) {
         let Some(panel) = self.current_for(ui) else {
             return;
@@ -678,7 +721,10 @@ impl SpaceManagerUi {
         {
             let mut state = panel.lock();
             let rooms = state.rooms.as_deref().unwrap_or_default();
-            let listed = rooms.iter().any(|room| room.room_id == room_id);
+            let direct = state.direct(&panel.space);
+            let removable = super::removable(&direct);
+            let removable = state.removing && removable.iter().any(|link| link.room_id == room_id);
+            let listed = removable || rooms.iter().any(|room| room.room_id == room_id);
             if !listed || state.progress.busy {
                 return;
             }
@@ -945,6 +991,7 @@ impl SpaceManagerUi {
                     let outcome = match change {
                         Change::Link { target, suggested, order } => session.link(&target, suggested, order.as_deref()).await?,
                         Change::LinkMany { targets, suggested } => session.link_many(&targets, suggested).await?,
+                        Change::UnlinkMany { links } => session.unlink_many(&links).await?,
                         Change::Update { link, suggested, order } => session.update(&link, suggested, order.as_deref()).await?,
                         Change::Unlink { link } => session.unlink(&link).await?,
                         Change::Replace { link, .. } => session.replace(&link).await?,
@@ -1001,6 +1048,7 @@ impl SpaceManagerUi {
                 Ok(Done::Resolved(target)) => state.target = Some(target),
                 Ok(Done::Rooms(rooms)) => {
                     state.rooms = Some(rooms);
+                    state.removing = false;
                     state.picked.clear();
                 }
                 Ok(Done::Written(outcome)) => {
@@ -1103,8 +1151,17 @@ impl SpaceManagerUi {
         view.back_name = self.back_name(panel.selection.account_id()).into();
         ui.set_space_manager_rows(ModelRc::new(VecModel::from(rows)));
         let pick_query = ui.get_space_manager_pick_query();
-        let picks = picker_rows(&panel.lock(), &panel.space, pick_query.as_str());
-        update_picks(ui, picks);
+        let (picks, removals) = {
+            let state = panel.lock();
+            let picks = picker_rows(&state, &panel.space, pick_query.as_str());
+            (picks, removal_rows(&state, &panel.space))
+        };
+        if let Some(model) = refreshed(ui.get_space_manager_picks(), picks) {
+            ui.set_space_manager_picks(model);
+        }
+        if let Some(model) = refreshed(ui.get_space_manager_removals(), removals) {
+            ui.set_space_manager_removals(model);
+        }
         ui.set_space_manager_view(view);
     }
 }
@@ -1159,6 +1216,12 @@ fn settle(state: &mut PanelState, intent: &Intent, outcome: SpaceWriteOutcome) {
             state.rooms = None;
             state.picked.clear();
         }
+        // The refreshed hierarchy no longer lists what was removed.
+        Change::UnlinkMany { .. } if outcome.accepted > 0 => {
+            state.removing = false;
+            state.picked.clear();
+            state.selected = None;
+        }
         Change::Unlink { .. } | Change::Replace { .. } if outcome.confirmed => {
             state.selected = None;
         }
@@ -1174,7 +1237,9 @@ fn reset_inputs(ui: &AppWindow, intent: &Intent) {
             ui.set_space_manager_target_order("".into());
             ui.set_space_manager_target_suggested(false);
         }
-        Change::LinkMany { .. } => ui.set_space_manager_pick_query("".into()),
+        Change::LinkMany { .. } | Change::UnlinkMany { .. } => {
+            ui.set_space_manager_pick_query("".into());
+        }
         Change::Create { .. } => {
             ui.set_space_manager_create_name("".into());
             ui.set_space_manager_create_is_space(false);
@@ -1184,23 +1249,40 @@ fn reset_inputs(ui: &AppWindow, intent: &Intent) {
     }
 }
 
-/// Show the picker rows, updating them in place while the same rooms are
-/// listed so the list keeps its scroll position as rooms are picked.
-fn update_picks(ui: &AppWindow, picks: Vec<SpacePick>) {
-    let model = ui.get_space_manager_picks();
+/// Update a pick list in place while it lists the same entries, so it keeps
+/// its scroll position as entries are picked; otherwise a new model to show.
+fn refreshed(model: ModelRc<SpacePick>, picks: Vec<SpacePick>) -> Option<ModelRc<SpacePick>> {
     let mut same_rooms = model.row_count() == picks.len();
     for (index, pick) in picks.iter().enumerate() {
         same_rooms &= model.row_data(index).is_some_and(|row| row.key == pick.key);
     }
     if !same_rooms {
-        ui.set_space_manager_picks(ModelRc::new(VecModel::from(picks)));
-        return;
+        return Some(ModelRc::new(VecModel::from(picks)));
     }
     for (index, pick) in picks.into_iter().enumerate() {
         if model.row_data(index).as_ref() != Some(&pick) {
             model.set_row_data(index, pick);
         }
     }
+    None
+}
+
+/// The open list of this Space's direct entries that can be removed.
+fn removal_rows(state: &PanelState, space: &str) -> Vec<SpacePick> {
+    if !state.removing {
+        return Vec::new();
+    }
+    let direct = state.direct(space);
+    let node = |room_id: &str| state.nodes.iter().find(|node| node.room_id == room_id);
+    super::removable(&direct)
+        .into_iter()
+        .map(|link| SpacePick {
+            key: link.room_id.as_str().into(),
+            name: super::title(&link.room_id, node(&link.room_id)).into(),
+            detail: super::entry_detail(link, node(&link.room_id)).into(),
+            picked: state.picked.contains(&link.room_id),
+        })
+        .collect()
 }
 
 /// The open list of joined rooms the Space does not list yet, narrowed by
@@ -1291,6 +1373,7 @@ fn render(
         ..SpaceManagerView::default()
     };
     view.rooms_open = state.rooms.is_some();
+    view.removing_open = state.removing;
     view.picked = i32::try_from(state.picked.len()).unwrap_or(i32::MAX);
     if let Some(row) = selected {
         view.selected = space_row(row, &state.nodes, pending_room);
@@ -1334,6 +1417,7 @@ pub(crate) fn clear_presentation(ui: &AppWindow) {
     ui.set_space_manager_view(SpaceManagerView::default());
     ui.set_space_manager_rows(ModelRc::new(VecModel::<SpaceRow>::default()));
     ui.set_space_manager_picks(ModelRc::new(VecModel::<SpacePick>::default()));
+    ui.set_space_manager_removals(ModelRc::new(VecModel::<SpacePick>::default()));
     ui.set_space_manager_query("".into());
     ui.set_space_manager_pick_query("".into());
     ui.set_space_manager_target_input("".into());
