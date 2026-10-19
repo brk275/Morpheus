@@ -3760,6 +3760,8 @@ export component AppWindow inherits Window {
         return StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : idle;
     }
     property <color> field-focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent;
+    // A disabled control's label: the theme's disabled state, else muted.
+    property <color> control-disabled-ink: StyleTokens.states.control-disabled.present ? StyleTokens.states.control-disabled.color : root.muted;
     pure function control-fill(hovered: bool, pressed: bool, idle: color) -> color {
         return pressed && StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color
             : hovered ? (StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover)
@@ -5830,6 +5832,20 @@ export component AppWindow inherits Window {
                                             horizontal-alignment: center; vertical-alignment: center;
                                         }
                                     }
+                                    // A text field with its input surface, border and corner.
+                                    Rectangle {
+                                        width: 112px * min(1.3, root.text-scale);
+                                        height: max(26px, 18px * root.text-scale + 8px);
+                                        background: root.input-fill(root.elevated);
+                                        border-radius: StyleTokens.input-corner;
+                                        border-width: StyleTokens.line-width;
+                                        border-color: root.input-border-color;
+                                        Text {
+                                            x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
+                                            text: "Search…"; color: root.muted; font-size: 11px * root.text-scale;
+                                            vertical-alignment: center; overflow: elide;
+                                        }
+                                    }
                                     Text {
                                         text: "Link"; color: root.token-color("link"); font-size: 12px * root.text-scale;
                                         vertical-alignment: center;
@@ -7615,35 +7631,38 @@ export component AppWindow inherits Window {
                             if !root.live-session : IconAction { width: 43px; height: 43px; icon: "V"; label: root.camera-off ? "Turn camera preview on" : "Turn camera preview off"; ink: root.ink; surface: root.elevated; hover-surface: root.hover; activated => { root.camera-off = !root.camera-off; } }
                             if root.live-session : ActionRect {
                                 width: 88px; height: 43px; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.9;
-                                background: root.native-microphone-muted && root.native-audio-ready ? root.hover : root.elevated;
+                                background: root.native-microphone-muted && root.native-audio-ready ? root.hover
+                                    : root.control-fill(self.enabled && self.has-hover, self.enabled && self.has-pressed, root.elevated);
                                 focus-color: root.accent;
                                 label: root.native-microphone-muted ? "Unmute microphone" : "Mute microphone";
                                 enabled: root.native-call-enabled && root.native-audio-ready;
                                 activated => { root.toggle-native-microphone(); }
                                 Text {
                                     text: root.native-microphone-muted ? "Unmute mic" : "Mute mic";
-                                    color: root.native-audio-ready ? root.ink : root.muted;
+                                    color: root.native-audio-ready ? root.ink : root.control-disabled-ink;
                                     font-size: 12px * root.text-scale; font-weight: 700;
                                     horizontal-alignment: center; vertical-alignment: center;
                                 }
                             }
                             if root.live-session : ActionRect {
                                 width: 88px; height: 43px; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.9;
-                                background: root.native-deafened && root.native-audio-ready ? root.hover : root.elevated;
+                                background: root.native-deafened && root.native-audio-ready ? root.hover
+                                    : root.control-fill(self.enabled && self.has-hover, self.enabled && self.has-pressed, root.elevated);
                                 focus-color: root.accent;
                                 label: root.native-deafened ? "Undeafen speaker" : "Deafen speaker";
                                 enabled: root.native-call-enabled && root.native-audio-ready;
                                 activated => { root.toggle-native-deafen(); }
                                 Text {
                                     text: root.native-deafened ? "Undeafen" : "Deafen";
-                                    color: root.native-audio-ready ? root.ink : root.muted;
+                                    color: root.native-audio-ready ? root.ink : root.control-disabled-ink;
                                     font-size: 12px * root.text-scale; font-weight: 700;
                                     horizontal-alignment: center; vertical-alignment: center;
                                 }
                             }
                             if root.live-session : ActionRect {
                                 width: 96px; height: 43px; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.9;
-                                background: root.native-camera-active ? root.hover : root.elevated;
+                                background: root.native-camera-active ? root.hover
+                                    : root.control-fill(self.enabled && self.has-hover, self.enabled && self.has-pressed, root.elevated);
                                 focus-color: root.accent;
                                 label: root.native-camera-active ? "Stop camera" : "Choose camera and start video";
                                 accessible-checkable: true;
@@ -7659,14 +7678,15 @@ export component AppWindow inherits Window {
                                 }
                                 Text {
                                     text: root.native-camera-stopping ? "Stopping…" : root.native-camera-busy ? "Camera…" : root.native-camera-active ? "Stop camera" : "Camera";
-                                    color: root.native-call-joined ? root.ink : root.muted;
+                                    color: root.native-call-joined ? root.ink : root.control-disabled-ink;
                                     font-size: 11px * root.text-scale; font-weight: 700;
                                     horizontal-alignment: center; vertical-alignment: center;
                                 }
                             }
                             if root.live-session : ActionRect {
                                 width: 106px; height: 43px; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.9;
-                                background: root.native-screen-active ? root.hover : root.elevated;
+                                background: root.native-screen-active ? root.hover
+                                    : root.control-fill(self.enabled && self.has-hover, self.enabled && self.has-pressed, root.elevated);
                                 focus-color: root.accent;
                                 label: root.native-screen-selecting ? "Cancel system screen selection" : root.native-screen-active ? "Stop screen sharing" : "Choose a display or window to share";
                                 accessible-checkable: true;
@@ -7682,7 +7702,7 @@ export component AppWindow inherits Window {
                                 }
                                 Text {
                                     text: root.native-screen-stopping ? "Stopping…" : root.native-screen-selecting ? "Cancel selection" : root.native-screen-busy ? "Starting…" : root.native-screen-active ? "Stop share" : "Share screen";
-                                    color: root.native-call-joined ? root.ink : root.muted;
+                                    color: root.native-call-joined ? root.ink : root.control-disabled-ink;
                                     font-size: 11px * root.text-scale; font-weight: 700;
                                     horizontal-alignment: center; vertical-alignment: center;
                                 }
