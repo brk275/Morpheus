@@ -90,17 +90,51 @@ pub enum DeviceSetupNeed {
 }
 
 /// This device's setup need, plus whether the account has no recovery at
-/// all: logging out the last device holding its keys then loses encrypted
-/// history.
+/// all (logging out the last device holding its keys then loses encrypted
+/// history) and how many other devices of the account are unverified.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceSetup {
     pub need: DeviceSetupNeed,
     pub recovery_off: bool,
+    /// Counted only once this device is verified; before that every other
+    /// device looks unverified from here.
+    pub unverified_devices: usize,
 }
 
 enum DeviceStateChange {
     Verification(VerificationState),
     Recovery(RecoveryState),
+    Devices,
+}
+
+struct SetupWatch {
+    client: Client,
+    changes: BoxStream<'static, DeviceStateChange>,
+    verification: VerificationState,
+    recovery: RecoveryState,
+}
+
+/// Other devices of this account that are not verified, from the local
+/// crypto store (no request); deleted, dehydrated and blocked devices are
+/// not counted.
+async fn unverified_other_devices(client: &Client) -> usize {
+    let (Some(user_id), Some(current)) = (client.user_id(), client.device_id()) else {
+        return 0;
+    };
+    let Ok(devices) = client.encryption().get_user_devices(user_id).await else {
+        return 0;
+    };
+    devices
+        .devices()
+        .filter(|device| {
+            device.device_id() != current
+                && !device.is_deleted()
+                && !device.is_dehydrated()
+                && !device.is_blacklisted()
+                && !device.is_verified_with_cross_signing()
+                && !device.is_locally_trusted()
+        })
+        .count()
 }
 
 fn device_setup_need(verification: VerificationState, recovery: RecoveryState) -> DeviceSetupNeed {
@@ -544,19 +578,39 @@ impl AccountManager {
             .recovery()
             .state_stream()
             .map(DeviceStateChange::Recovery);
+        // Device and identity changes, including another device of this
+        // account being verified, arrive through the crypto store's stream.
+        let devices = encryption
+            .devices_stream()
+            .await
+            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?
+            .map(|_| DeviceStateChange::Devices);
         let changes = futures_util::stream::select(verification, recovery);
-        let start = (VerificationState::Unknown, RecoveryState::Unknown);
-        let needs = changes.scan(start, |latest, change| {
-            match change {
-                DeviceStateChange::Verification(state) => latest.0 = state,
-                DeviceStateChange::Recovery(state) => latest.1 = state,
+        let watch = SetupWatch {
+            changes: futures_util::stream::select(changes, devices).boxed(),
+            client,
+            verification: VerificationState::Unknown,
+            recovery: RecoveryState::Unknown,
+        };
+        let states = futures_util::stream::unfold(watch, |mut watch| async move {
+            match watch.changes.next().await? {
+                DeviceStateChange::Verification(state) => watch.verification = state,
+                DeviceStateChange::Recovery(state) => watch.recovery = state,
+                DeviceStateChange::Devices => {}
             }
-            std::future::ready(Some(DeviceSetup {
-                need: device_setup_need(latest.0, latest.1),
-                recovery_off: latest.1 == RecoveryState::Disabled,
-            }))
+            let unverified_devices = if watch.verification == VerificationState::Verified {
+                unverified_other_devices(&watch.client).await
+            } else {
+                0
+            };
+            let setup = DeviceSetup {
+                need: device_setup_need(watch.verification, watch.recovery),
+                recovery_off: watch.recovery == RecoveryState::Disabled,
+                unverified_devices,
+            };
+            Some((setup, watch))
         });
-        Ok(needs.boxed())
+        Ok(states.boxed())
     }
 
     /// Request progress plus the reason a cancelled flow stopped, so the UI

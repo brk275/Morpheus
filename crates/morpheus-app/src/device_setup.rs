@@ -1,5 +1,6 @@
 //! App-wide prompt to finish securing this device: verify it, or enter the
-//! recovery key where recovery is incomplete. One task follows the live
+//! recovery key where recovery is incomplete, and then to review other
+//! devices of the account that are not verified. One task follows the live
 //! account's SDK state under the selection captured for it. The prompt only
 //! opens Security settings; it never verifies, recovers or resets anything.
 //! The same state tells logout to warn first when recovery is off.
@@ -10,7 +11,7 @@ use std::sync::{
 };
 
 use futures_util::StreamExt;
-use morpheus_matrix::DeviceSetupNeed;
+use morpheus_matrix::{DeviceSetup, DeviceSetupNeed};
 use slint::ComponentHandle;
 use tokio::{runtime::Handle, task::AbortHandle};
 
@@ -34,12 +35,15 @@ fn stop_watcher() {
     }
 }
 
-/// The window's value for each need: 0 nothing, 1 verify, 2 recovery key.
-fn need_code(need: DeviceSetupNeed) -> i32 {
-    match need {
-        DeviceSetupNeed::None => 0,
+/// The window's value for what to ask: 0 nothing, 1 verify this device,
+/// 2 the recovery key, 3 review other unverified devices. This device comes
+/// first; other devices are only counted once it is verified.
+fn need_code(setup: DeviceSetup) -> i32 {
+    match setup.need {
         DeviceSetupNeed::Verify => 1,
         DeviceSetupNeed::EnterRecoveryKey => 2,
+        DeviceSetupNeed::None if setup.unverified_devices > 0 => 3,
+        DeviceSetupNeed::None => 0,
     }
 }
 
@@ -50,7 +54,8 @@ pub(crate) fn clear_ui(ui: &AppWindow) {
     stop_watcher();
     GENERATION.fetch_add(1, Ordering::AcqRel);
     ui.set_device_setup_need(0);
-    ui.set_device_setup_dismissed(false);
+    ui.set_unverified_device_count(0);
+    ui.set_device_setup_dismissed("".into());
     ui.set_account_recovery_off(false);
     ui.set_logout_key_warning(false);
 }
@@ -76,7 +81,9 @@ fn follow(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle) {
                 if GENERATION.load(Ordering::Acquire) == generation
                     && scope(&ui).as_deref() == Some(shown.as_str())
                 {
-                    ui.set_device_setup_need(need_code(setup.need));
+                    let count = i32::try_from(setup.unverified_devices).unwrap_or(i32::MAX);
+                    ui.set_device_setup_need(need_code(setup));
+                    ui.set_unverified_device_count(count);
                     ui.set_account_recovery_off(setup.recovery_off);
                 }
             });
@@ -98,10 +105,19 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
 mod tests {
     use super::*;
 
+    fn setup(need: DeviceSetupNeed, unverified_devices: usize) -> DeviceSetup {
+        DeviceSetup {
+            need,
+            recovery_off: false,
+            unverified_devices,
+        }
+    }
+
     #[test]
-    fn each_setup_need_has_its_own_window_value() {
-        assert_eq!(need_code(DeviceSetupNeed::None), 0);
-        assert_eq!(need_code(DeviceSetupNeed::Verify), 1);
-        assert_eq!(need_code(DeviceSetupNeed::EnterRecoveryKey), 2);
+    fn this_device_comes_before_other_unverified_devices() {
+        assert_eq!(need_code(setup(DeviceSetupNeed::None, 0)), 0);
+        assert_eq!(need_code(setup(DeviceSetupNeed::Verify, 2)), 1);
+        assert_eq!(need_code(setup(DeviceSetupNeed::EnterRecoveryKey, 2)), 2);
+        assert_eq!(need_code(setup(DeviceSetupNeed::None, 2)), 3);
     }
 }

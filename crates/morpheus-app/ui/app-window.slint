@@ -2210,10 +2210,13 @@ export component AppWindow inherits Window {
     in-out property <string> person-request-dismissed;
     in-out property <bool> person-request-busy;
     in-out property <string> person-request-error;
-    // What this device still needs (src/device_setup.rs): 0 nothing,
-    // 1 verification, 2 the recovery key; hidden for this account view.
+    // What to ask (src/device_setup.rs): 0 nothing, 1 verify this device,
+    // 2 the recovery key, 3 review other unverified devices. Not now hides
+    // only the state it was shown for (need and count) in this account view.
     in-out property <int> device-setup-need;
-    in-out property <bool> device-setup-dismissed;
+    in-out property <int> unverified-device-count;
+    in-out property <string> device-setup-dismissed;
+    property <string> device-setup-key: "" + root.device-setup-need + ":" + root.unverified-device-count;
     // The live account has no recovery; logout asks first (src/main.rs).
     in-out property <bool> account-recovery-off;
     in-out property <bool> logout-key-warning: false;
@@ -3539,15 +3542,16 @@ export component AppWindow inherits Window {
                         root.settings-search-choose("security.recovery");
                     }
                 }
-                if root.live-session && root.page == 0 && root.sas-stage == 0 && root.device-setup-need != 0 && !root.device-setup-dismissed : DeviceSetupBanner {
+                if root.live-session && root.page == 0 && root.sas-stage == 0 && root.device-setup-need != 0 && root.device-setup-dismissed != root.device-setup-key : DeviceSetupBanner {
                     palette: root.encryption-palette;
                     text-scale: root.text-scale;
                     need: root.device-setup-need;
+                    count: root.unverified-device-count;
                     set-up => {
                         root.open-security();
-                        root.settings-search-choose("security.recovery");
+                        root.settings-search-choose(root.device-setup-need == 3 ? "security.devices" : "security.recovery");
                     }
-                    dismiss => { root.device-setup-dismissed = true; }
+                    dismiss => { root.device-setup-dismissed = root.device-setup-key; }
                 }
                 if root.config-error != "" : Rectangle {
                     height: 39px;

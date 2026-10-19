@@ -399,13 +399,16 @@ export component PersonVerificationBanner inherits Rectangle {
     }
 }
 
-// Asks to finish securing this device. Set up only opens Security settings;
-// nothing is verified, recovered or reset from here.
+// Asks to finish securing this device, then to review other devices of the
+// account that are not verified. The button only opens Security settings;
+// nothing is verified, recovered, signed out or reset from here.
 export component DeviceSetupBanner inherits Rectangle {
     in property <EncryptionPalette> palette;
     in property <float> text-scale: 1;
-    // 1: this device is not verified; 2: recovery is incomplete here.
+    // 1: this device is not verified; 2: recovery is incomplete here;
+    // 3: `count` other devices of the account are not verified.
     in property <int> need;
+    in property <int> count;
     callback set-up();
     callback dismiss();
 
@@ -421,7 +424,11 @@ export component DeviceSetupBanner inherits Rectangle {
         Text {
             text: root.need == 1
                 ? "This device isn't verified yet. Verify it from another device or enter your recovery key to read encrypted messages."
-                : "Enter your recovery key to finish setting up encrypted history on this device.";
+                : root.need == 2
+                ? "Enter your recovery key to finish setting up encrypted history on this device."
+                : root.count == 1
+                ? "Another signed-in device of this account isn't verified. If you don't recognize it, sign it out in Security."
+                : "" + root.count + " signed-in devices of this account aren't verified. If you don't recognize one, sign it out in Security.";
             color: root.palette.ink;
             font-size: 11px * root.text-scale;
             vertical-alignment: center;
@@ -430,8 +437,8 @@ export component DeviceSetupBanner inherits Rectangle {
             accessible-live-region: polite;
         }
         Button {
-            text: "Set up";
-            accessible-label: root.need == 1 ? "Verify this device in Security settings" : "Enter your recovery key in Security settings";
+            text: root.need == 3 ? "Review" : "Set up";
+            accessible-label: root.need == 1 ? "Verify this device in Security settings" : root.need == 2 ? "Enter your recovery key in Security settings" : "Review this account's devices in Security settings";
             clicked => { root.set-up(); }
         }
         Button {
