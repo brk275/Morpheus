@@ -1,53 +1,35 @@
-name: CI
-
+# TEMPORARY owner-reviewed device contracts. NEVER MERGE this workflow.
+name: Reviewed device contracts
+run-name: Reviewed device contracts - 50923fc
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  # Manual dispatch always checks the complete supported native matrix.
   workflow_dispatch:
-
 permissions:
   contents: read
-
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
-env:
-  CARGO_BUILD_JOBS: "2"
-  CARGO_INCREMENTAL: "0"
-  CARGO_PROFILE_DEV_DEBUG: "0"
-  CARGO_PROFILE_TEST_DEBUG: "0"
-
+  group: device-contracts-50923fc-${{ github.ref }}
+  cancel-in-progress: false
 jobs:
-  scope:
-    name: Security and change scope
-    # Hosted validation is disabled while private to prevent unauthorized paid builds.
-    if: github.event.repository.private == false
+  search:
+    name: Device contracts Linux x64
+    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    outputs:
-      native: ${{ steps.scope.outputs.native }}
-      native_matrix: ${{ steps.scope.outputs.native_matrix }}
-      config: ${{ steps.scope.outputs.config }}
-      wayland: ${{ steps.scope.outputs.wayland }}
+    timeout-minutes: 240
+    env:
+      MORPHEUS_EXPECTED_OS: Linux
+      MORPHEUS_EXPECTED_ARCH: X64
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: 50923fc6bb1384b2ff05ccc7620e6bc9d3106549
           path: candidate
           fetch-depth: 0
           persist-credentials: false
-      - name: Check out reviewed validation inputs
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          # PR input is read as data; classification code comes from its base.
-          # Push uses reviewed main; dispatch uses its owner-selected revision.
-          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
+          ref: 5b6aad377c86b9e98567fbc9181791fec900a065
           path: trusted
           persist-credentials: false
-      - name: Scan committed history for credentials
+      - name: Install reviewed scanner and scan isolated candidate history
         working-directory: candidate
         shell: bash
         run: |
@@ -59,350 +41,363 @@ jobs:
           echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
           mkdir "$RUNNER_TEMP/gitleaks"
           tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
-          # Scanner code and exact fixture manifest come from the reviewed base.
-          # The candidate's ignore files, attributes and config are not trusted.
           python3 -I ../trusted/scripts/scan_history.py \
             --candidate "$PWD" --scanner "$RUNNER_TEMP/gitleaks/gitleaks" \
             --manifest ../trusted/scripts/public-fixtures.json \
             --evidence "$RUNNER_TEMP/morpheus-history-scan"
-      - name: Select checks from changed inputs using reviewed classifier
-        id: scope
-        working-directory: candidate
-        # Isolated mode excludes the candidate working directory and Python
-        # environment hooks from import lookup. The classifier uses stdlib only.
-        run: python3 -I ../trusted/scripts/ci_scope.py --github-event
-
-  helpers:
-    name: Validation helper tests
-    needs: scope
-    if: github.event.repository.private == false
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - name: Check scope and packaging helpers
-        run: |
-          python3 -m unittest discover -s scripts/tests -v
-          python3 -m unittest discover -s scripts -p 'test_*.py' -v
-          python3 -m compileall -q scripts
-          node --check scripts/element_call_peer.mjs
-          node --check scripts/element_call_stock_peer.mjs
-          python3 scripts/package.py --check
-
-  config:
-    name: Theme configuration tests
-    needs: [scope, helpers]
-    if: github.event.repository.private == false && needs.scope.outputs.config == 'true'
-    runs-on: ubuntu-24.04
-    concurrency:
-      group: native-${{ github.sha }}-ubuntu-24.04
-      cancel-in-progress: false
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action, pinned compiler below
-        with:
-          toolchain: 1.99.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
-      - run: cargo test --locked -p morpheus-config
-
-  compile:
-    name: Check and test (${{ matrix.os }})
-    needs: [scope, helpers]
-    if: github.event.repository.private == false && needs.scope.outputs.native == 'true'
-    runs-on: ${{ matrix.os }}
-    concurrency:
-      group: native-${{ github.sha }}-${{ matrix.os }}
-      cancel-in-progress: false
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.scope.outputs.native_matrix) }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-      - name: Linux native dependencies
+          mkdir "$RUNNER_TEMP/morpheus-native-private"
+          cp "$archive" "$RUNNER_TEMP/morpheus-native-private/verified-scanner-archive"
+          cp "$RUNNER_TEMP/gitleaks/gitleaks" "$RUNNER_TEMP/morpheus-native-private/gitleaks"
+          printf '[extend]\nuseDefault = true\n' > "$RUNNER_TEMP/morpheus-native-private/default.toml"
+          : > "$RUNNER_TEMP/morpheus-native-private/empty.ignore"
+      - name: Install reviewed Linux native compilation dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            libasound2-dev libclang-dev libdbus-1-dev libdrm-dev libegl-dev \
-            libfontconfig1-dev libgbm-dev libglib2.0-dev libinih-dev libpipewire-0.3-dev libssl-dev libsystemd-dev libudev-dev \
-            libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev \
-            libxkbcommon-dev libxkbcommon-x11-dev libxi6 libxrandr-dev meson ninja-build pkg-config wayland-protocols xvfb xdotool \
-            dbus-x11 gnome-keyring libsecret-tools libglib2.0-bin \
-            sway swaybg pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-wlr
-          # Ubuntu 24.04 Chromium dependencies from pinned Playwright 1.62.1.
-          # Install before the peer drops privileges inside its PID namespace.
-          sudo apt-get install -y \
-            libasound2t64 libatk-bridge2.0-0t64 libatk1.0-0t64 libatspi2.0-0t64 \
-            libcairo2 libcups2t64 libdbus-1-3 libdrm2 libgbm1 libglib2.0-0t64 \
-            libnspr4 libnss3 libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 \
-            libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 \
-            fonts-noto-color-emoji fonts-unifont libfontconfig1 libfreetype6 \
-            xfonts-cyrillic xfonts-scalable fonts-liberation fonts-ipafont-gothic \
-            fonts-wqy-zenhei fonts-tlwg-loma-otf fonts-freefont-ttf
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable action
+          sudo apt-get install -y libasound2-dev libclang-dev libdbus-1-dev libdrm-dev libegl-dev \
+            libfontconfig1-dev libgbm-dev libglib2.0-dev libinih-dev libpipewire-0.3-dev libssl-dev \
+            libsystemd-dev libudev-dev libwayland-dev libx11-dev libx11-xcb-dev libxcb1-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxcursor-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libxi6 libxrandr-dev meson ninja-build pkg-config wayland-protocols xvfb xauth \
+            dbus-x11 gnome-keyring libsecret-tools libgl1-mesa-dri fonts-noto-color-emoji
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # reviewed action pin
         with:
           toolchain: 1.99.0
-          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          # Preserve compiled dependencies when a later acceptance check fails.
-          # The save guard still makes untrusted/PR executions restore-only.
-          cache-on-failure: true
-          save-if: ${{ github.repository == 'brk275/Morpheus' && github.ref == 'refs/heads/main' && github.event_name != 'pull_request' }}
-      - name: Check formatting
-        if: runner.os == 'Linux'
-        run: cargo fmt --all -- --check
-      - name: Test configuration, Matrix, and RTC protocol models
-        id: model-tests
-        # Still fail the job below, but collect independent desktop/device
-        # results on this candidate instead of paying the compilation cost
-        # again merely because an authentication fixture failed first.
-        continue-on-error: true
-        run: cargo test --locked --no-fail-fast -p morpheus-config -p morpheus-matrix -p morpheus-rtc
-      - name: Check desktop and Matrix crates
-        run: cargo check --locked -p morpheus-app -p morpheus-matrix
-      - name: Build desktop with native call and device adapters
-        run: cargo build --locked -p morpheus-app --features native-calls
-      - name: Capture actual native preview screens
-        id: preview-capture
-        if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && (github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push'))
-        continue-on-error: true
-        timeout-minutes: 2
+          key: verified-sdk-archives-v1
+          workspaces: candidate -> target
+          save-if: false
+      - name: Run reviewed device contracts and native integration
+        timeout-minutes: 225
         env:
-          SLINT_SCALE_FACTOR: "1"
-          SLINT_BACKEND: winit-software
-        shell: bash
+          CARGO_BUILD_JOBS: "2"
+          CARGO_INCREMENTAL: "0"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          CARGO_TERM_COLOR: never
+          SLINT_EMIT_DEBUG_INFO: "1"
+        shell: python
         run: |
-          set -euo pipefail
-          umask 077
-          preview_root="$RUNNER_TEMP/morpheus-preview-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          mkdir "$preview_root"
-          # This debug-only early CLI renders fictional fixtures before any
-          # account/config store or network service initialization. Native
-          # logs and raw frames stay private and are never uploaded.
-          # Reviewed PRs capture their tested merge tree before integration;
-          # their PNGs remain untrusted until visual/privacy review.
-          if ! timeout --kill-after=5s 30s xvfb-run -a -s '-screen 0 1440x900x24' \
-            sh -c 'xdotool mousemove 1 1 && exec "$@"' sh \
-            target/debug/morpheus-app --morpheus-capture-preview "$preview_root/raw" \
-            >"$preview_root/native.log" 2>&1; then
-            echo "Native preview capture failed; private output was not published."
-            exit 1
-          fi
-          python3 scripts/encode_preview_pngs.py \
-            --input-dir "$preview_root/raw" --output-dir "$preview_root/png" \
-            --source-commit "$GITHUB_SHA" --binary target/debug/morpheus-app \
-            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
-      - name: Upload native preview PNGs and provenance only
-        id: preview-upload
-        if: runner.os == 'Linux' && github.repository == 'brk275/Morpheus' && (github.event_name == 'pull_request' || (github.ref == 'refs/heads/main' && github.event_name == 'push')) && steps.preview-capture.outcome == 'success'
-        continue-on-error: true
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: native-preview-${{ github.sha }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/desktop-preview.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/account-switcher.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/sign-in.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/incoming-call.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/room-settings.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/paper-preview.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/manage-accounts.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/account-password.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/account-password-large.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/sign-in-large.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/terminal-sidebar.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/terminal-space-labels.png
-            ${{ runner.temp }}/morpheus-preview-${{ github.run_id }}-${{ github.run_attempt }}/png/provenance.json
-          if-no-files-found: error
-          retention-days: 1
-          compression-level: 0
-          include-hidden-files: false
-      - name: Smoke test Linux desktop startup under Xvfb
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set +e
-          timeout 12s xvfb-run -a -s '-screen 0 1280x800x24' target/debug/morpheus-app
-          result=$?
-          if [ "$result" -ne 124 ]; then
-            echo "Morpheus exited before the Linux desktop smoke window (status $result)"
-            exit 1
-          fi
-      - name: Test desktop controller and call guards
-        id: desktop-tests
-        # The independently built app can still exercise disposable fixtures
-        # after a unit assertion fails. Keep that evidence and reject the
-        # candidate at the final gate instead of rebuilding just to reach it.
-        continue-on-error: true
-        run: cargo test --locked -p morpheus-app --features native-calls --bin morpheus-app
-      - name: Test native device and call guards
-        run: cargo test --locked -p morpheus-rtc --features native-devices --lib
-      - name: Test Windows capture of an owned synthetic window and display
-        id: windows-capture-tests
-        if: runner.os == 'Windows'
-        continue-on-error: true
-        timeout-minutes: 15
-        env:
-          MORPHEUS_WINDOWS_CAPTURE_ACCEPTANCE: "1"
-        run: python scripts/run_windows_capture_acceptance.py
-      - name: Test real Wayland portal streaming, source loss, and cancellation
-        id: wayland-tests
-        # Missing/malformed selection is fail-closed; the result gate below
-        # rejects it even if the fixture happens to pass.
-        if: runner.os == 'Linux' && needs.scope.outputs.wayland != 'false'
-        # Collect independent Matrix/OAuth/RTC evidence even if this desktop
-        # fixture fails. The final outcome gate still rejects the candidate.
-        continue-on-error: true
-        timeout-minutes: 15
-        run: python3 scripts/run_wayland_acceptance.py
-      - name: Test vendored security fixes
-        id: vendor-tests
-        # Keep independent SDK and live checks on the already-built app.
-        # The final gate still rejects any failed vendor regression command.
-        continue-on-error: true
-        shell: bash
-        run: |
-          cargo test --locked -p lru --lib test_pop_panicking_key_drop_keeps_list_consistent
-          cargo test --locked -p livekit-api --lib --features signal-client-tokio,rustls-tls-native-roots
-          cargo test --locked -p matrix-rtc-livekit --lib
-          cargo test --locked -p matrix-rtc-core --features testing --lib --test key_rotation
-          cargo test --locked -p cargo-packager-updater --lib
-      - name: Test pinned SDK sticky receipt and redaction regressions
-        id: sdk-receipt-tests
-        # Keep collecting the independently built app's live acceptance. The
-        # final outcome gate still rejects failed SDK unit regressions.
-        continue-on-error: true
-        shell: bash
-        run: cargo test --locked -p matrix-sdk-base --no-default-features --features e2e-encryption,unstable-msc4354 --lib sticky
-      - name: Test real Matrix accounts, recovery, moderation, and encrypted RTC
-        if: runner.os == 'Linux'
-        # Four fresh invitation cases each have a bounded 300-second command.
-        # Preserve room for the existing checks and their service cleanup.
-        timeout-minutes: 55
-        shell: bash
-        run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
-          curl --fail --silent --show-error --location \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
-            --output "$archive"
-          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $archive" | sha256sum --check --status
-          mkdir -p "$RUNNER_TEMP/gitleaks"
-          tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks" gitleaks
-          dbus-run-session -- python3 scripts/run_matrix_acceptance.py \
-            --gitleaks "$RUNNER_TEMP/gitleaks/gitleaks"
-      - name: Require the selected Wayland result
-        if: ${{ !cancelled() && runner.os == 'Linux' }}
-        env:
-          WAYLAND_SELECTED: ${{ needs.scope.outputs.wayland }}
-          WAYLAND_OUTCOME: ${{ steps.wayland-tests.outcome }}
-        shell: bash
-        run: |
-          python3 - <<'PY_WAYLAND_ACCEPTANCE'
-          import os
-          import sys
+          import hashlib, json, os, pathlib, queue, re, signal, subprocess, tempfile, threading, time
+          assert os.environ.get('GITHUB_ACTIONS') == 'true'
+          assert os.environ.get('RUNNER_ENVIRONMENT') == 'github-hosted'
+          assert (os.environ.get('RUNNER_OS'),os.environ.get('RUNNER_ARCH')) == (
+              os.environ['MORPHEUS_EXPECTED_OS'],os.environ['MORPHEUS_EXPECTED_ARCH'])
+          os.umask(0o077)
+          workspace=pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve()/'candidate'
+          private=pathlib.Path(os.environ['RUNNER_TEMP'])/'morpheus-native-private'
+          private.mkdir(mode=0o700,exist_ok=True)
+          logs=private/'logs'; logs.mkdir(mode=0o700,exist_ok=True)
+          # Only compilation/runtime essentials. No GITHUB_TOKEN, ACTIONS tokens, inherited
+          # credentials, personal accounts, signing identities, or release environment.
+          names=('PATH','HOME','USERPROFILE','HOMEDRIVE','HOMEPATH','SYSTEMROOT','SystemRoot',
+              'WINDIR','COMSPEC','PATHEXT','TEMP','TMP','TMPDIR','LANG','LC_ALL',
+              'ProgramFiles','ProgramFiles(x86)','ProgramW6432','ALLUSERSPROFILE',
+              'LOCALAPPDATA','APPDATA','VCToolsInstallDir','VCINSTALLDIR','VSINSTALLDIR',
+              'WindowsSdkDir','WindowsSDKVersion','INCLUDE','LIB','LIBPATH','LIBCLANG_PATH',
+              'CARGO_HOME','RUSTUP_HOME','RUSTUP_TOOLCHAIN','PKG_CONFIG_PATH',
+              'LD_LIBRARY_PATH','DYLD_LIBRARY_PATH','SSL_CERT_FILE','SSL_CERT_DIR',
+              'SDKROOT','DEVELOPER_DIR','MACOSX_DEPLOYMENT_TARGET',
+              'CARGO_BUILD_JOBS','CARGO_INCREMENTAL','CARGO_PROFILE_DEV_DEBUG',
+              'CARGO_PROFILE_TEST_DEBUG','CARGO_TERM_COLOR','SLINT_EMIT_DEBUG_INFO',
+              'GITHUB_ACTIONS','RUNNER_ENVIRONMENT','RUNNER_OS','RUNNER_ARCH','ImageOS',
+              'RUNNER_TEMP','RUNNER_TRACKING_ID')
+          environment={name:os.environ[name] for name in names if name in os.environ}
+          environment['GIT_CONFIG_GLOBAL']=os.devnull
+          environment['GIT_CONFIG_NOSYSTEM']='1'
+          environment['GIT_TERMINAL_PROMPT']='0'
+          # The SDK test ctor defaults to verbose mock credential traces on failure.
+          # Keep every test/assertion and scanner; suppress only tracing output.
+          environment['RUST_LOG']='off'
+          def bounded(args, name, seconds, limit=64*1024*1024):
+              directory=logs/name; directory.mkdir(mode=0o700)
+              log=directory/'output.log'
+              # A bounded queue works with anonymous pipes on Windows as well as POSIX;
+              # never use unbounded communicate() or a terminal-only size check.
+              blocks=queue.Queue(maxsize=8)
+              stop=threading.Event()
+              error=[]
+              kwargs={'start_new_session':True} if os.name!='nt' else {
+                  'creationflags':subprocess.CREATE_NEW_PROCESS_GROUP}
+              child=subprocess.Popen(args,cwd=workspace,stdin=subprocess.DEVNULL,
+                  stdout=subprocess.PIPE,stderr=subprocess.STDOUT,env=environment,**kwargs)
+              def reader():
+                  try:
+                      while not stop.is_set():
+                          block=os.read(child.stdout.fileno(),65536)
+                          while not stop.is_set():
+                              try: blocks.put(block,timeout=0.2); break
+                              except queue.Full: pass
+                          if not block: return
+                  except OSError:
+                      error.append(True)
+              thread=threading.Thread(target=reader,daemon=True); thread.start()
+              deadline=time.monotonic()+seconds
+              reason=None; size=0; code=None
+              with log.open('xb') as output:
+                  try:
+                      while True:
+                          remaining=deadline-time.monotonic()
+                          if remaining<=0: reason='deadline'; break
+                          try: block=blocks.get(timeout=min(0.2,remaining))
+                          except queue.Empty:
+                              if not thread.is_alive(): reason='process_error'; break
+                              continue
+                          if not block: break
+                          size+=len(block)
+                          if size>limit: reason='output_limit'; break
+                          output.write(block)
+                      if reason is None:
+                          code=child.wait(timeout=min(10,max(0.01,deadline-time.monotonic())))
+                  except (OSError,subprocess.SubprocessError):
+                      reason='process_error'
+                  finally:
+                      stop.set()
+                      # Keep the direct child unreaped until process-tree termination.
+                      # Even EOF can precede exit; do not signal a recycled PID/group.
+                      if child.returncode is None:
+                          if os.name=='nt':
+                              try:
+                                  subprocess.run(['taskkill','/PID',str(child.pid),'/T','/F'],
+                                      stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,
+                                      stderr=subprocess.DEVNULL,env=environment,timeout=10,check=False)
+                              except (OSError,subprocess.SubprocessError):
+                                  reason=reason or 'process_error'
+                              if child.poll() is None: child.kill()
+                          else:
+                              try: os.killpg(child.pid,signal.SIGKILL)
+                              except ProcessLookupError: pass
+                          try: child.wait(timeout=10)
+                          except subprocess.SubprocessError: reason=reason or 'process_error'
+                      thread.join(timeout=2)
+                      if thread.is_alive(): reason=reason or 'process_error'
+                      child.stdout.close()
+              # Validate the persisted limit even when a very fast child has exited.
+              if error: reason=reason or 'process_error'
+              if log.stat().st_size>limit: reason='output_limit'
+              return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
-          def wayland_error(selected, outcome):
-              if selected not in ("true", "false"):
-                  return "Wayland selection is missing or malformed."
-              expected = "success" if selected == "true" else "skipped"
-              if outcome != expected:
-                  return "The selected Wayland check failed, was cancelled, or did not run."
-              return None
-
-          error = wayland_error(os.environ.get("WAYLAND_SELECTED"), os.environ.get("WAYLAND_OUTCOME"))
-          if error:
-              print(error, file=sys.stderr)
-              raise SystemExit(1)
-          if os.environ["WAYLAND_SELECTED"] == "false":
-              print("System Wayland was outside this change's inputs; its existing release gate remains open.")
-          PY_WAYLAND_ACCEPTANCE
-      - name: Enforce collected acceptance results
-        if: ${{ !cancelled() && (steps.model-tests.outcome == 'failure' || steps.preview-capture.outcome == 'failure' || steps.preview-upload.outcome == 'failure' || steps.desktop-tests.outcome == 'failure' || steps.wayland-tests.outcome == 'failure' || steps.windows-capture-tests.outcome == 'failure' || steps.sdk-receipt-tests.outcome == 'failure' || steps.vendor-tests.outcome == 'failure') }}
-        shell: bash
-        run: |
-          echo "Protocol model, native preview, desktop controller, native capture, SDK receipt, or vendor regression tests failed; this candidate is not verified."
-          exit 1
-
-  acceptance:
-    name: CI acceptance
-    needs: [scope, helpers, config, compile]
-    # Run after failed/skipped dependencies too. A selected check may never
-    # disappear behind a skipped aggregate that branch protection accepts.
-    if: always() && github.event.repository.private == false
-    runs-on: ubuntu-24.04
-    permissions: {}
-    timeout-minutes: 2
-    steps:
-      # No checkout, dependency/cache restore, artifacts, or submitted code.
-      # This combines job conclusions; source/workflow review remains required.
-      - name: Require every selected check to succeed
-        env:
-          CHECK_RESULTS: ${{ toJSON(needs) }}
-        shell: bash
-        run: |
-          python3 - <<'PY_ACCEPTANCE'
-          import json
-          import os
-          import sys
-
-          def acceptance_error(needs):
-              if not isinstance(needs, dict) or set(needs) != {"scope", "helpers", "config", "compile"}:
-                  return "Missing dependency conclusions."
-              if any(not isinstance(value, dict) for value in needs.values()):
-                  return "Malformed dependency conclusions."
-              if needs["scope"].get("result") != "success":
-                  return "Security and change scope did not succeed."
-              if needs["helpers"].get("result") != "success":
-                  return "Validation helper tests did not succeed."
-              outputs = needs["scope"].get("outputs")
-              if not isinstance(outputs, dict):
-                  return "Scope outputs are missing."
-              native, config, wayland = outputs.get("native"), outputs.get("config"), outputs.get("wayland")
-              if any(flag not in ("true", "false") for flag in (native, config, wayland)):
-                  return "Scope flags are missing or malformed."
-              if native == config == "true":
-                  return "Native checks already include configuration tests."
+          import io, tarfile, zipfile
+          source='50923fc6bb1384b2ff05ccc7620e6bc9d3106549'
+          assert subprocess.check_output(['git','rev-parse','HEAD'],cwd=workspace,env=environment,text=True).strip()==source
+          assert hashlib.sha256((workspace/'Cargo.lock').read_bytes()).hexdigest()=='8db1e7dcf70013d71a4d9fa8be42a25da4efa1d74edd6711812a2897c0ccf6b7'
+          scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
+          archive_digests={
+              ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
+              ('macOS','ARM64'):'b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5',
+              ('macOS','X64'):'dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709',
+              ('Windows','X64'):'d29144deff3a68aa93ced33dddf84b7fdc26070add4aa0f4513094c8332afc4e',
+          }
+          # Revalidate the independently pinned scanner and its rules after every
+          # candidate process. Candidate output cannot authorize a new scanner.
+          def scanner_intact():
               try:
-                  matrix = json.loads(outputs.get("native_matrix", ""))
-              except (TypeError, ValueError):
-                  return "Native matrix is missing or malformed."
-              if not isinstance(matrix, dict) or set(matrix) != {"os"}:
-                  return "Native matrix must contain only standard operating systems."
-              platforms = matrix["os"]
-              allowed = {"macos-15", "macos-15-intel", "ubuntu-24.04", "windows-2025"}
-              if (not isinstance(platforms, list)
-                      or any(not isinstance(item, str) or item not in allowed for item in platforms)
-                      or len(platforms) != len(set(platforms))
-                      or bool(platforms) != (native == "true")):
-                  return "Native matrix disagrees with the selected standard checks."
-              if wayland == "true" and "ubuntu-24.04" not in platforms:
-                  return "Selected Wayland acceptance requires the Linux native job."
-              for job, selected in (("config", config), ("compile", native)):
-                  expected = "success" if selected == "true" else "skipped"
-                  if needs[job].get("result") != expected:
-                      return "A selected check failed, was cancelled, or did not run."
-              return None
-
-          try:
-              error = acceptance_error(json.loads(os.environ["CHECK_RESULTS"]))
-          except (KeyError, ValueError):
-              error = "Dependency conclusions are missing or malformed."
-          if error:
-              print(error, file=sys.stderr)
-              raise SystemExit(1)
-          print("Security checks and every selected validation job succeeded.")
-          PY_ACCEPTANCE
+                  with (private/'verified-scanner-archive').open('rb') as saved:
+                      data=saved.read(32*1024*1024+1)
+                  if len(data)>32*1024*1024 or hashlib.sha256(data).hexdigest()!=archive_digests[(os.environ['RUNNER_OS'],os.environ['RUNNER_ARCH'])]: return False
+                  if os.name=='nt':
+                      with zipfile.ZipFile(io.BytesIO(data)) as packaged:
+                          member=packaged.getinfo('gitleaks.exe')
+                          if member.file_size>64*1024*1024: return False
+                          expected=packaged.read(member)
+                  else:
+                      with tarfile.open(fileobj=io.BytesIO(data),mode='r:gz') as packaged:
+                          member=packaged.getmember('gitleaks')
+                          if not member.isfile() or member.size>64*1024*1024: return False
+                          expected=packaged.extractfile(member).read(64*1024*1024+1)
+                  with scanner.open('rb') as binary: actual=binary.read(64*1024*1024+1)
+                  with config.open('rb') as rules: fixed=rules.read(1024)
+                  with ignore.open('rb') as exclusions: empty=exclusions.read(1)
+                  return (len(expected)<=64*1024*1024 and hashlib.sha256(actual).digest()==hashlib.sha256(expected).digest()
+                      and fixed==b'[extend]\nuseDefault = true\n' and empty==b'')
+              except Exception: return False
+          config=private/'default.toml'; ignore=private/'empty.ignore'
+          # Failure-only closed diagnostics: emit known marker IDs and exact locked
+          # package identities, never a server/build response, path or raw log line.
+          import tomllib
+          locked={(package['name'],package['version']) for package in
+              tomllib.loads((workspace/'Cargo.lock').read_text(encoding='utf-8'))['package']}
+          failure_markers={
+              'custom_build_command':'failed to run custom build command',
+              'cxx_bridge':'cxxbridge',
+              'cc_tool_missing':'ToolNotFound',
+              'cc_command_failed':'error occurred in cc-rs',
+              'cmake_error':'CMake Error',
+              'linker_error':'linking with',
+              'gnu_link_extra_operand':'extra operand',
+              'gnu_link_help':"link --help",
+              'linker_not_found':'linker `link.exe` not found',
+              'linker_unrecognized_option':'unrecognized command-line option',
+              'linker_invalid_argument':'invalid argument',
+              'linker_no_such_file':'No such file or directory',
+              'linker_machine_conflict':'conflicts with target machine',
+              'linker_corrupt':'invalid or corrupt file',
+              'linker_undefined':'undefined reference',
+              'linker_unresolved':'unresolved external symbol',
+              'proc_macro_target':'does not support these crate types',
+              'locked_resolution':'lock file needs to be updated',
+              'tls_certificate':'certificate verify failed',
+              'permission_denied':'Access is denied',
+              'file_missing':'The system cannot find the file specified',
+              'path_too_long':'The filename or extension is too long',
+              'disk_full':'There is not enough space on the disk',
+              'sdk_download_request':'Native SDK download request failed',
+              'sdk_download_response':'Native SDK download response does not match the reviewed release',
+              'sdk_identity':'Native SDK archive identity does not match the reviewed release',
+              'sdk_missing_receipt':'Native SDK cache has no verified-download receipt',
+              'sdk_invalid_receipt':'Invalid native SDK cache receipt',
+              'sdk_receipt_mismatch':'Native SDK cache receipt does not match the reviewed release',
+              'sdk_unsafe_cache':'Unsafe native SDK cache directory',
+              'sdk_unsupported_path':'Unsupported native SDK archive path',
+              'sdk_unsafe_path':'Unsafe native SDK archive path',
+              'sdk_unsupported_type':'Native SDK archive contains an unsupported entry type',
+              'sdk_extraction':'Cannot unpack native SDK archive entry',
+              'sdk_cache_publish':'Cannot publish verified native SDK cache',
+          }
+          checks=[
+              ('sdk_http_limits', ['cargo', 'test', '--locked', '-p', 'matrix-sdk', '--features', 'experimental-search,testing', '--lib', 'http_client::tests::test_', '--', '--test-threads=1'], 2700, {'http_client::tests::test_bounded_body_length_is_checked_without_extra_allocation', 'http_client::tests::test_response_limit_request_stops_when_dropped', 'http_client::tests::test_ensure_no_max_concurrent_request_does_not_limit', 'http_client::tests::test_ensure_concurrent_request_limit_is_observed', 'http_client::tests::test_bounded_body_refuses_more_than_the_limit', 'http_client::tests::test_response_limit_counts_chunked_transport_before_appending', 'http_client::tests::test_response_limit_applies_per_request_and_is_terminal', 'http_client::tests::test_bounded_body_accepts_up_to_the_limit', 'http_client::tests::test_oversized_responses_are_never_retried'}, set()),
+              ('sdk_request_config', ['cargo', 'test', '--locked', '-p', 'matrix-sdk', '--features', 'experimental-search,testing', '--lib', 'config::request::tests::', '--', '--test-threads=1'], 2700, {'config::request::tests::response_limit_is_opt_in', 'config::request::tests::smoketest', 'config::request::tests::testing_retry_settings'}, set()),
+              ('core_device_sessions', ['cargo', 'test', '--locked', '-p', 'morpheus-matrix', '--lib', 'device_sessions::tests::', '--', '--test-threads=1'], 2700, {'device_sessions::tests::trust_follows_cross_signing_then_local_trust_and_blocking_wins', 'device_sessions::tests::account_switch_removal_or_shutdown_stops_work_before_and_after_it_runs', 'device_sessions::tests::device_names_are_trimmed_bounded_and_stripped_of_spoofing_characters', 'device_sessions::tests::fallback_pages_stay_on_the_trusted_homeserver_origin', 'device_sessions::tests::this_device_and_stale_rows_are_refused_before_any_sign_out_is_sent', 'device_sessions::tests::errors_never_carry_server_text_or_secrets', 'device_sessions::tests::invalid_or_partial_server_rosters_cannot_be_used_as_sign_out_confirmation', 'device_sessions::tests::challenges_offer_one_stage_hide_their_session_and_end_with_their_account', 'device_sessions::tests::sessions_put_this_device_first_drop_addresses_and_stay_bounded'}, set()),
+              ('app_device_sessions', ['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'device_sessions::tests::', '--', '--test-threads=1'], 2700, {'device_sessions::tests::this_device_and_stale_rows_are_never_reviewed_for_sign_out', 'device_sessions::tests::verification_only_starts_the_existing_comparison', 'device_sessions::tests::errors_are_fixed_actionable_text', 'device_sessions::tests::finishing_or_superseding_an_operation_cannot_revive_its_pending_write', 'device_sessions::tests::results_apply_only_to_the_same_panel_account_and_selection', 'device_sessions::tests::rows_are_searchable_bounded_and_never_show_an_address', 'device_sessions::tests::cancelled_queued_session_write_never_sends_when_transition_unlocks', 'device_sessions::tests::sign_out_steps_name_the_session_and_account_and_carry_no_secret'}, set()),
+              ('app_private_ui_clearing', ['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation', '--', '--exact', '--test-threads=1'], 2700, {'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'}, set()),
+              ('native_app_build', ['cargo', 'build', '--locked', '-p', 'morpheus-app', '--features', 'native-calls'], 2400, None, set()),
+          ]
+          # Stop at the first concrete failure; diagnose it before further native work.
+          all_passed=True
+          for name,args,seconds,required,allowed_ignored in checks:
+              result=bounded(args,name,seconds)
+              report=private/(name+'-scan.json')
+              if not scanner_intact():
+                  print(json.dumps({'check':name,'status':'failed','reason':'scanner_integrity_failed',
+                      'source':source,'raw_logs_public':False},sort_keys=True),flush=True)
+                  raise SystemExit(1)
+              scanned=bounded([str(scanner),'dir',str(result['log'].parent),
+                  '--redact=100','--ignore-gitleaks-allow','--no-banner','--max-target-megabytes','0',
+                  '--config',str(config),'--gitleaks-ignore-path',str(ignore),
+                  '--report-format','json','--report-path',str(report)],name+'-scan',60,8*1024*1024)
+              try:
+                  clean=(scanned['reason'] is None and scanned['code']==0
+                      and report.stat().st_size<=8*1024*1024 and json.loads(report.read_text(encoding='utf-8'))==[])
+              except (OSError,ValueError): clean=False
+              if not clean:
+                  print(json.dumps({'check':name,'status':'failed','reason':'private_log_scan_failed',
+                      'source':source,'raw_logs_public':False},sort_keys=True),flush=True)
+                  raise SystemExit(1)
+              output=result['log'].read_text(encoding='utf-8',errors='replace')
+              passed=result['reason'] is None and result['code']==0
+              record={'check':name,'status':'passed' if passed else 'failed','reason':result['reason'],
+                  'source':source,'exit_code':result['code'],'log_bytes':result['bytes'],
+                  'raw_logs_public':False,'real_accounts':False,'physical_devices':False,
+                  'installed_app':False,'packages_uploaded':False}
+              # Interleaved CLI stdout does not guarantee each name and ok share a line.
+              # Account for every unique prefix and exact failure/ignore sets instead.
+              if required is not None:
+                  names=re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\.',output,re.MULTILINE)
+                  seen=set(names)
+                  failures=set(re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. FAILED$',output,re.MULTILINE))
+                  ignored=set(re.findall(r'^test ([A-Za-z0-9_:]+) \.\.\. ignored',output,re.MULTILINE))
+                  summaries=re.findall(r'^test result: (ok|FAILED)\. ([0-9]+) passed; ([0-9]+) failed; ([0-9]+) ignored;',output,re.MULTILINE)
+                  complete=len(summaries)==1 and len(names)==len(seen)
+                  a=b=c=None
+                  if complete:
+                      status,a,b,c=summaries[0]; a,b,c=map(int,(a,b,c))
+                      complete=(len(seen)==a+b+c and len(failures)==b and len(ignored)==c
+                          and failures<=seen and ignored<=seen and not failures&ignored)
+                  okay=seen-failures-ignored if complete else set()
+                  passed=(passed and complete and summaries[0][0]=='ok' and a>0 and b==0
+                      and ignored==allowed_ignored and required<=okay)
+                  record.update({'complete_test_accounting':complete,'tests_passed':a,'tests_failed':b,
+                      'tests_ignored':c,'required_tests':{fixed:fixed in okay for fixed in sorted(required)}})
+              record['error_codes']=sorted(set(re.findall(r'error\[(E[0-9]{4})\]',output)))
+              if not passed:
+                  crates=set(re.findall(r"failed to run custom build command for `([A-Za-z0-9_-]+) v([0-9][A-Za-z0-9.+_-]*)`",output))
+                  # Only fixed tool families and package names from the reviewed lock
+                  # may leave the private log. Normalize NULs for native UTF-16 output.
+                  normalized=output.replace('\x00','')
+                  folded_output=normalized.lower()
+                  linker_failures=re.findall(r'linking with `([^`\r\n]{1,1024})` failed: exit code: ([0-9]{1,10})',normalized)
+                  def tool_family(path):
+                      value=path.replace('\\','/').lower()
+                      name=value.rsplit('/',1)[-1]
+                      if name not in ('link.exe','lld-link.exe','clang-cl.exe','cc','clang','gcc'): return 'other'
+                      if '/git/usr/bin/' in value: return 'git_coreutils_link' if name=='link.exe' else 'other'
+                      if '/vc/tools/msvc/' in value: return 'msvc_link' if name=='link.exe' else 'other'
+                      return {'link.exe':'link','lld-link.exe':'lld_link','clang-cl.exe':'clang_cl',
+                          'cc':'cc','clang':'clang','gcc':'gcc'}[name]
+                  import shutil
+                  resolved_link=shutil.which('link.exe',path=environment.get('PATH','')) if os.name=='nt' else None
+                  locked_names={package for package,version in locked}
+                  failed_packages=set(re.findall(r'could not compile `([A-Za-z0-9_-]+)`',normalized))
+                  # Only reviewed public filenames and numeric compiler spans.
+                  # Missing identifiers are admitted only if already in those public sources.
+                  source_files=('crates/morpheus-matrix/src/device_sessions.rs',
+                      'crates/morpheus-app/src/device_sessions.rs',
+                      'crates/morpheus-app/ui/device-sessions.slint',
+                      'vendor/matrix-sdk/src/config/request.rs',
+                      'vendor/matrix-sdk/src/error.rs',
+                      'vendor/matrix-sdk/src/http_client/mod.rs',
+                      'vendor/matrix-sdk/src/http_client/native.rs',
+                      'vendor/matrix-sdk/src/search_index/mod.rs',
+                      'vendor/matrix-sdk/src/message_search.rs',
+                      'vendor/matrix-sdk-search/src/index/mod.rs',
+                      'vendor/matrix-sdk-search/src/schema.rs',
+                      'crates/morpheus-matrix/src/search.rs',
+                      'crates/morpheus-app/src/main.rs',
+                      'crates/morpheus-app/src/settings_search.rs',
+                      'crates/morpheus-app/src/room_organization/mod.rs',
+                      'crates/morpheus-app/src/navigation.rs',
+                      'crates/morpheus-app/ui/room-organization.slint',
+                      'crates/morpheus-matrix/src/room_tags.rs',
+                      'crates/morpheus-app/src/appearance.rs',
+                      'crates/morpheus-app/src/style_profiles.rs',
+                      'crates/morpheus-app/ui/controls.slint',
+                      'crates/morpheus-app/ui/style-tokens.slint',
+                      'crates/morpheus-app/ui/call-stage.slint',
+                      'crates/morpheus-app/ui/message-search.slint',
+                      'crates/morpheus-app/ui/poll-card.slint',
+                      'crates/morpheus-app/ui/poll-dialog.slint',
+                      'crates/morpheus-app/ui/attachment-workbench.slint',
+                      'crates/morpheus-app/ui/media-viewer.slint',
+                      'crates/morpheus-app/src/account_access_ui_tests.rs',
+                      'crates/morpheus-app/src/live.rs',
+                      'crates/morpheus-app/src/timeline_model.rs',
+                      'crates/morpheus-app/src/pinned_messages/mod.rs',
+                      'crates/morpheus-app/src/pinned_messages/view.rs',
+                      'crates/morpheus-app/src/message_search.rs',
+                      'crates/morpheus-app/src/polls/mod.rs',
+                      'crates/morpheus-app/ui/app-window.slint',
+                      'crates/morpheus-app/ui/pinned-messages.slint',
+                      'crates/morpheus-matrix/src/lib.rs',
+                      'crates/morpheus-matrix/src/pinned_messages.rs')
+                  locations=[]; public_identifiers=set()
+                  for path in source_files:
+                      file=workspace/path
+                      if not file.is_file(): continue
+                      text=file.read_text(encoding='utf-8')
+                      public_identifiers.update(re.findall(r'\b[A-Za-z_][A-Za-z0-9_]{0,127}\b',text))
+                      line_limit=len(text.splitlines())+1
+                      spans={(int(line),int(column)) for line,column in re.findall(re.escape(path)+r':([0-9]{1,7}):([0-9]{1,5})',normalized)
+                          if 0<int(line)<=line_limit and 0<int(column)<=4096}
+                      locations.extend({'file':path,'line':line,'column':column} for line,column in sorted(spans)[:32])
+                  missing=set(re.findall(r'cannot find (?:value|function|type|struct) `([A-Za-z_][A-Za-z0-9_]{0,127})`',normalized))
+                  record['failure_diagnostics']={
+                      'source_locations':locations,
+                      'missing_public_identifiers':sorted(missing & public_identifiers)[:32],
+                      'linker_failures':[{'tool':tool_family(tool),'exit_code':int(code)} for tool,code in linker_failures[:8]],
+                      'path_link_family':tool_family(resolved_link) if resolved_link else 'not_resolved',
+                      'locked_failed_packages':sorted(failed_packages & locked_names),
+                      'markers':sorted(key for key,value in failure_markers.items() if value.lower() in folded_output),
+                      'locked_build_script_crates':sorted(name+'@'+version for name,version in crates if (name,version) in locked),
+                      'native_error_codes':sorted(set(re.findall(r'\b(?:LNK[0-9]{4}|C[0-9]{4})\b',normalized))),
+                      'os_error_codes':sorted(set(int(code) for code in re.findall(r'os error ([0-9]{1,5})\b',output))),
+                  }
+              loops=len(re.findall(r'part of a binding loop',output))
+              passed=passed and loops==0
+              record.update({'status':'passed' if passed else 'failed','ui_binding_loop_warnings':loops})
+              print(json.dumps(record,sort_keys=True),flush=True)
+              all_passed=all_passed and passed
+              # Failed compilation cannot yield meaningful unit checks. Independent test
+              # suites still run after a test failure, using the same compiled graph.
+              if not passed: break
+          if not all_passed: raise SystemExit(1)
