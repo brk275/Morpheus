@@ -1,13 +1,13 @@
 # TEMPORARY narrowly scoped customization expansion verification. NEVER MERGE.
 # No installers, physical-device, real-account, installed-app or artifact jobs.
 name: Reviewed customization expansion
-run-name: Customization expansion - 907cf70
+run-name: Customization expansion - 8126716
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: customization-expansion-907cf70
+  group: customization-expansion-8126716
   cancel-in-progress: false
 jobs:
   native:
@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 907cf70b64d4794e828a51f0da2728f6f3d579c4
+          ref: 8126716e91cbad2914290112db15381037605c34
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -125,7 +125,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='907cf70b64d4794e828a51f0da2728f6f3d579c4'
+          source='8126716e91cbad2914290112db15381037605c34'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -307,7 +307,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='907cf70b64d4794e828a51f0da2728f6f3d579c4'
+          source='8126716e91cbad2914290112db15381037605c34'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
