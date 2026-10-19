@@ -1,12 +1,12 @@
 # TEMPORARY focused native offline app checks. NEVER MERGE this workflow.
 name: Reviewed settings workspace regression
-run-name: Settings target availability diagnosis - d68aa5b
+run-name: Account search initial focus regression - 9a99185
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: settings-target-availability-d68aa5b
+  group: account-search-init-9a99185
   cancel-in-progress: false
 jobs:
   contracts:
@@ -17,11 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: d68aa5bc63fe4e711e542469a4da7a7d66e551ef
+          ref: 9a991851e50dd62c7f93aee7c3ffa1ee5089585c
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact reviewed source
-        run: test "$(git rev-parse HEAD)" = d68aa5bc63fe4e711e542469a4da7a7d66e551ef
+        run: test "$(git rev-parse HEAD)" = 9a991851e50dd62c7f93aee7c3ffa1ee5089585c
       - name: Scan source before executing reviewed native tests
         shell: bash
         run: |
@@ -177,14 +177,14 @@ jobs:
           target_probes=[]
           for line in output.splitlines():
               if not line.startswith('MORPHEUS_SETTINGS_TARGET_FAILURE '): continue
-              match=re.fullmatch(r'MORPHEUS_SETTINGS_TARGET_FAILURE index=([0-9]{1,3}) live=(true|false)',line)
-              if match is None or len(target_probes)>=1 or int(match[1])>=34:
+              match=re.fullmatch(r'MORPHEUS_SETTINGS_TARGET_FAILURE stage=([01]) index=([0-9]{1,3}) live=(true|false)',line)
+              if match is None or len(target_probes)>=1 or int(match[2])>=34:
                   probe_invalid=True
               else:
-                  target_probes.append({'index':int(match[1]),'live':match[2]=='true'})
+                  target_probes.append({'stage':int(match[1]),'index':int(match[2]),'live':match[3]=='true'})
           passed=passed and not probe_invalid and not probes and not target_probes
           print(json.dumps({'check':'native_settings_workspace_regression','motion_probe':probes,'target_availability_probe':target_probes,'probe_invalid':probe_invalid,'complete_test_accounting':complete,'status':'passed' if passed else 'failed',
-              'source':'d68aa5bc63fe4e711e542469a4da7a7d66e551ef','failure':reason,
+              'source':'9a991851e50dd62c7f93aee7c3ffa1ee5089585c','failure':reason,
               'ignored_tests':sorted(ignored),'ui_binding_loop_warnings':binding_loops[:8],
               'tests_passed':passed_count,
               'tests_failed':failed_count,
