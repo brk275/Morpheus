@@ -5768,6 +5768,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "matrix-sdk-ffi-macros"
+version = "0.7.0"
+source = "git+https://github.com/matrix-org/matrix-rust-sdk?rev=c6ad52ecc09eaa36601f55effb0a48a533eb87dd#c6ad52ecc09eaa36601f55effb0a48a533eb87dd"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
+]
+
+[[package]]
 name = "matrix-sdk-indexeddb"
 version = "0.19.1"
 source = "git+https://github.com/matrix-org/matrix-rust-sdk?rev=c6ad52ecc09eaa36601f55effb0a48a533eb87dd#c6ad52ecc09eaa36601f55effb0a48a533eb87dd"
