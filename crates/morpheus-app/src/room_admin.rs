@@ -9,10 +9,10 @@ pub(crate) use ui::clear_presentation;
 
 use morpheus_matrix::{
     AccessChange, AccessSettings, AdminAction, AdminMember, AdminMembership, AdminOutcome,
-    AdminRequest, HistoryChoice, MAX_ADMIN_REASON_BYTES, MAX_REMOVED_MESSAGES, MemberExpectation,
-    MemberPower, MembershipCounts, MessageRemoval, ObservedMembership, ObservedTarget,
-    PERMISSION_KEYS, PermissionKey, PermissionSetting, PowerThresholds, RoomAdminError,
-    RoomAdminSnapshot, UpgradeSettings,
+    AdminRequest, HistoryChoice, MAX_ADMIN_REASON_BYTES, MAX_BLOCKED_SERVERS, MAX_REMOVED_MESSAGES,
+    MAX_SERVER_BYTES, MemberExpectation, MemberPower, MembershipCounts, MessageRemoval,
+    ObservedMembership, ObservedTarget, PERMISSION_KEYS, PermissionKey, PermissionSetting,
+    PowerThresholds, RoomAdminError, RoomAdminSnapshot, ServerAclSettings, UpgradeSettings,
 };
 
 /// Rows shown at once. Search narrows a larger roster; the count says so.
@@ -73,6 +73,18 @@ const UPGRADE_BODY: &str = "Members must join the new room themselves; this room
 const UPGRADE_REPLACED: &str = "This room was already replaced by a newer one.";
 const UPGRADE_CURRENT: &str = "This room already uses the version your homeserver recommends.";
 const SETTING_CHANGED: &str = "This setting changed on the server. Review it again.";
+const BAD_SERVER: &str =
+    "Enter a server name such as spam.example, or a pattern like *.spam.example.";
+const SERVERS_UNCONFIRMED: &str =
+    "The homeserver accepted the change, but the block list reads differently.";
+const OWN_SERVER: &str =
+    "That would block your own homeserver, and this room would stop accepting your messages.";
+const CUSTOM_SERVERS: &str =
+    "This room limits servers with an allow list or settings Morpheus does not edit.";
+const BLOCK_BODY: &str = "can no longer join, send messages or receive new ones in this room. \
+     Members already here stay listed but are cut off. Other rooms are unaffected.";
+/// Blocked servers named in the row summary; the rest are counted.
+const MAX_LISTED_SERVERS: usize = 20;
 
 pub(crate) const KICK: i32 = 1;
 pub(crate) const BAN: i32 = 2;
@@ -90,6 +102,7 @@ pub(crate) const ACCESS_HISTORY: i32 = 1;
 pub(crate) const ACCESS_GUESTS: i32 = 2;
 pub(crate) const ACCESS_ENCRYPTION: i32 = 3;
 pub(crate) const ACCESS_UPGRADE: i32 = 4;
+pub(crate) const ACCESS_SERVERS: i32 = 5;
 /// History options in the panel's order, narrowest first. The Slint option
 /// labels follow the same order.
 pub(crate) const HISTORY_CHOICES: [HistoryChoice; 4] = [
@@ -444,7 +457,107 @@ pub(crate) fn access_rows(snapshot: &RoomAdminSnapshot) -> Vec<AccessRow> {
     if let Some(upgrade) = &snapshot.upgrade {
         rows.push(upgrade_row(upgrade, snapshot));
     }
+    if let Some(servers) = &snapshot.servers {
+        rows.push(servers_row(servers, snapshot));
+    }
     rows
+}
+
+fn servers_row(servers: &ServerAclSettings, snapshot: &RoomAdminSnapshot) -> AccessRow {
+    let count = servers.denied.len();
+    let mut summary = match count {
+        0 => "No servers blocked".to_owned(),
+        1 => "1 server blocked: ".to_owned(),
+        _ => format!("{count} servers blocked: "),
+    };
+    let names = servers.denied.iter().take(MAX_LISTED_SERVERS);
+    let names = names.map(|server| crate::directory_plain_text(server, 64));
+    summary.push_str(&names.collect::<Vec<_>>().join(", "));
+    if count > MAX_LISTED_SERVERS {
+        summary.push_str(&format!(" and {} more", count - MAX_LISTED_SERVERS));
+    }
+    let restriction = if servers.editable {
+        String::new()
+    } else if !servers.known {
+        CUSTOM_SERVERS.to_owned()
+    } else {
+        access_restriction(servers.level, snapshot)
+    };
+    AccessRow {
+        kind: ACCESS_SERVERS,
+        choice: i32::try_from(count).unwrap_or(i32::MAX),
+        label: "Blocked servers",
+        description: "Homeservers whose people cannot join, send or receive new messages here.",
+        summary,
+        editable: servers.editable,
+        restriction,
+    }
+}
+
+/// The block list names this server or pattern; matching ignores case.
+fn blocks(denied: &[String], server: &str) -> bool {
+    denied.iter().any(|entry| entry.eq_ignore_ascii_case(server))
+}
+
+/// A server name or pattern as the session accepts it: host characters
+/// with `*` and `?` wildcards and no port, lowercased.
+fn parse_server(input: &str) -> Result<String, String> {
+    let server = input.trim().to_ascii_lowercase();
+    let host = |byte: u8| byte.is_ascii_alphanumeric() || b".-*?".contains(&byte);
+    let valid = !server.is_empty() && server.len() <= MAX_SERVER_BYTES && server.bytes().all(host);
+    if valid {
+        Ok(server)
+    } else {
+        Err(BAD_SERVER.to_owned())
+    }
+}
+
+/// Block or unblock one server. The session re-reads the list, keeps the
+/// rest of it, and refuses a block that would also match the account's own
+/// homeserver.
+pub(crate) fn server_intent(
+    input: &str,
+    block: bool,
+    snapshot: &RoomAdminSnapshot,
+) -> Result<Intent, String> {
+    let servers = snapshot.servers.as_ref();
+    let servers = servers.ok_or_else(|| UNKNOWN_RULES.to_owned())?;
+    if !servers.known {
+        return Err(CUSTOM_SERVERS.to_owned());
+    }
+    if !servers.editable {
+        return Err(access_restriction(servers.level, snapshot));
+    }
+    let server = parse_server(input)?;
+    let shown = crate::directory_plain_text(&server, 260);
+    let listed = blocks(&servers.denied, &server);
+    if block && listed {
+        return Err(format!("{shown} is already blocked."));
+    }
+    if !block && !listed {
+        return Err(format!("{shown} is not blocked."));
+    }
+    if block && servers.denied.len() >= MAX_BLOCKED_SERVERS {
+        return Err(format!(
+            "This room already blocks {MAX_BLOCKED_SERVERS} servers, the most Morpheus edits."
+        ));
+    }
+    let own = snapshot.members.iter().find(|member| member.is_self);
+    let own_server = own.and_then(|member| member.user_id.split_once(':'));
+    if block && own_server.is_some_and(|(_, own)| own.eq_ignore_ascii_case(&server)) {
+        return Err(OWN_SERVER.to_owned());
+    }
+    Ok(Intent {
+        action: AdminAction::SetAccess(AccessChange::Servers { block }),
+        user_id: server,
+        name: "Blocked servers".to_owned(),
+        expected: MemberExpectation {
+            membership: None,
+            power: None,
+        },
+        reason: None,
+        knock: false,
+    })
 }
 
 /// A room or homeserver version, shown as plain bounded text.
@@ -498,8 +611,8 @@ fn access_current(change: AccessChange, access: AccessSettings) -> bool {
         AccessChange::History { from, .. } => access.history == Some(from),
         AccessChange::Guests { allow } => access.guests_can_join == Some(!allow),
         AccessChange::Encrypt => !access.encrypted,
-        // Checked against the snapshot's version settings instead.
-        AccessChange::Upgrade => true,
+        // Checked against the snapshot's version settings or block list instead.
+        AccessChange::Upgrade | AccessChange::Servers { .. } => true,
     }
 }
 
@@ -641,6 +754,12 @@ impl Intent {
         if let AdminAction::SetPermission(key, _) = self.action {
             let current = snapshot.permission(key).map(|row| row.level);
             return current.map(MemberPower::Level) == self.expected.power;
+        }
+        if let AdminAction::SetAccess(AccessChange::Servers { block }) = self.action {
+            let Some(servers) = &snapshot.servers else {
+                return false;
+            };
+            return servers.editable && blocks(&servers.denied, &self.user_id) != block;
         }
         if let AdminAction::SetAccess(AccessChange::Upgrade) = self.action {
             let upgrade = snapshot.upgrade.as_ref();
@@ -956,6 +1075,24 @@ pub(crate) fn confirmation(intent: &Intent, snapshot: &RoomAdminSnapshot) -> Opt
             action: "Turn on encryption",
             destructive: true,
         },
+        AdminAction::SetAccess(AccessChange::Servers { block: true }) => {
+            let server = crate::directory_plain_text(&intent.user_id, 260);
+            Confirmation {
+                title: format!("Block {server}?"),
+                body: format!("People on {server} {BLOCK_BODY} You can unblock it later."),
+                action: "Block server",
+                destructive: true,
+            }
+        }
+        AdminAction::SetAccess(AccessChange::Servers { block: false }) => {
+            let server = crate::directory_plain_text(&intent.user_id, 260);
+            Confirmation {
+                title: format!("Unblock {server}?"),
+                body: format!("People on {server} can take part in this room again."),
+                action: "Unblock server",
+                destructive: false,
+            }
+        }
         AdminAction::SetAccess(AccessChange::Upgrade) => {
             let upgrade = snapshot.upgrade.as_ref();
             let version = upgrade.map_or_else(String::new, |upgrade| {
@@ -1036,6 +1173,14 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: &AdminOutcome) -> String {
     let Some(seen) = outcome.observed else {
         return format!("The homeserver accepted the change for {name}. {UNREAD}");
     };
+    if let AdminAction::SetAccess(AccessChange::Servers { block }) = intent.action {
+        let server = crate::directory_plain_text(&intent.user_id, 260);
+        return match (block, outcome.confirmed) {
+            (true, true) => format!("Blocked {server}. The homeserver confirmed it."),
+            (false, true) => format!("Unblocked {server}. The homeserver confirmed it."),
+            _ => SERVERS_UNCONFIRMED.to_owned(),
+        };
+    }
     if let AdminAction::SetAccess(change) = intent.action {
         return access_outcome_text(change, outcome.confirmed);
     }
@@ -1144,6 +1289,7 @@ fn access_outcome_text(change: AccessChange, confirmed: bool) -> String {
             "End-to-end encryption is on. The homeserver confirmed it.".to_owned()
         }
         AccessChange::Upgrade => "The room was upgraded.".to_owned(),
+        AccessChange::Servers { .. } => "The blocked servers changed.".to_owned(),
     }
 }
 
@@ -1160,6 +1306,7 @@ pub(crate) fn permission_text(action: AdminAction, snapshot: &RoomAdminSnapshot)
             AccessChange::Guests { .. } => access.guests_level,
             AccessChange::Encrypt => access.encryption_level,
             AccessChange::Upgrade => snapshot.upgrade.as_ref().map_or(100, |up| up.level),
+            AccessChange::Servers { .. } => snapshot.servers.as_ref().map_or(100, |acl| acl.level),
         };
         return access_restriction(level, snapshot);
     }
@@ -1247,6 +1394,8 @@ pub(crate) fn error_text(
             (RoomAdminError::Forbidden, _) => {
                 return format!("The homeserver refused this change. {REFUSED_PERMISSION}");
             }
+            (RoomAdminError::SelfTarget, _) => return OWN_SERVER.to_owned(),
+            (RoomAdminError::InvalidUserId, _) => return BAD_SERVER.to_owned(),
             _ => {}
         }
     }
@@ -1348,6 +1497,7 @@ mod tests {
             access: None,
             room_version: "11".to_owned(),
             upgrade: None,
+            servers: None,
         }
     }
     fn intent(action: AdminAction, level: i64, knock: bool) -> Intent {
@@ -1687,6 +1837,75 @@ mod tests {
     }
 
     #[test]
+    fn blocking_servers_is_reviewed_bounded_and_spares_the_own_homeserver() {
+        let mut snapshot = with_access(true);
+        let mut own = member("@me:example.org", None, AdminMembership::Join);
+        own.is_self = true;
+        snapshot.members.push(own);
+        let unknown = server_intent("spam.example", true, &snapshot);
+        assert_eq!(unknown, Err(UNKNOWN_RULES.to_owned()));
+        snapshot.servers = Some(ServerAclSettings {
+            denied: vec!["Old.Example".to_owned()],
+            known: true,
+            level: 50,
+            editable: true,
+        });
+        let row = access_rows(&snapshot).pop().unwrap();
+        assert_eq!(
+            (row.kind, row.choice, row.editable),
+            (ACCESS_SERVERS, 1, true)
+        );
+        assert_eq!(row.summary, "1 server blocked: Old.Example");
+
+        let block = server_intent(" Spam.Example ", true, &snapshot).unwrap();
+        let blocking = AccessChange::Servers { block: true };
+        assert_eq!(block.action, AdminAction::SetAccess(blocking));
+        assert_eq!(block.user_id, "spam.example");
+        assert!(block.still_matches(&snapshot));
+        let review = confirmation(&block, &snapshot).unwrap();
+        assert!(review.destructive && review.title == "Block spam.example?");
+        let again = server_intent("old.example", true, &snapshot);
+        assert_eq!(again, Err("old.example is already blocked.".to_owned()));
+        assert!(server_intent("spam.example", false, &snapshot).is_err());
+        let unblock = server_intent("old.example", false, &snapshot).unwrap();
+        assert!(!confirmation(&unblock, &snapshot).unwrap().destructive);
+        // The own homeserver, ports and spaces are refused before review.
+        for refused in ["Example.org", "spam.example:8448", "spam example", ""] {
+            assert!(server_intent(refused, true, &snapshot).is_err());
+        }
+        // A pattern matching the own homeserver is refused by the session.
+        let own_pattern = error_text(RoomAdminError::SelfTarget, &block, Some(&snapshot));
+        assert_eq!(own_pattern, OWN_SERVER);
+
+        let outcome = AdminOutcome {
+            observed: Some(ObservedTarget {
+                membership: ObservedMembership::None,
+                power: MemberPower::Level(0),
+            }),
+            confirmed: true,
+            snapshot: std::sync::Arc::new(snapshot.clone()),
+            replacement: None,
+            removal: None,
+        };
+        let text = outcome_text(&block, &outcome);
+        assert_eq!(text, "Blocked spam.example. The homeserver confirmed it.");
+        // A review is withdrawn once the server is blocked anyway.
+        if let Some(servers) = snapshot.servers.as_mut() {
+            servers.denied.push("spam.example".to_owned());
+        }
+        assert!(!block.still_matches(&snapshot));
+        // Allow lists and other settings stay read-only, with the reason.
+        if let Some(servers) = snapshot.servers.as_mut() {
+            servers.known = false;
+            servers.editable = false;
+        }
+        let custom = server_intent("other.example", true, &snapshot);
+        assert_eq!(custom, Err(CUSTOM_SERVERS.to_owned()));
+        let row = access_rows(&snapshot).pop().unwrap();
+        assert_eq!(row.restriction, CUSTOM_SERVERS);
+    }
+
+    #[test]
     fn access_changes_are_reviewed_confirmed_and_withdrawn_when_stale() {
         let snapshot = with_access(true);
         let open = access_intent(ACCESS_HISTORY, 3, &snapshot).unwrap();
@@ -1734,10 +1953,16 @@ mod tests {
             allowed: true,
         });
         let row = access_rows(&snapshot).pop().unwrap();
-        assert_eq!((row.kind, row.choice, row.editable), (ACCESS_UPGRADE, 0, true));
+        assert_eq!(
+            (row.kind, row.choice, row.editable),
+            (ACCESS_UPGRADE, 0, true)
+        );
         assert_eq!(row.summary, "Version 10; version 11 is recommended");
         let upgrade = access_intent(ACCESS_UPGRADE, 1, &snapshot).unwrap();
-        assert_eq!(upgrade.action, AdminAction::SetAccess(AccessChange::Upgrade));
+        assert_eq!(
+            upgrade.action,
+            AdminAction::SetAccess(AccessChange::Upgrade)
+        );
         let review = confirmation(&upgrade, &snapshot).unwrap();
         assert!(review.destructive && review.body.contains("version 11"));
         assert!(upgrade.still_matches(&snapshot));
@@ -1769,7 +1994,10 @@ mod tests {
     fn encryption_only_turns_on_after_a_destructive_review() {
         let snapshot = with_access(true);
         let encrypt = access_intent(ACCESS_ENCRYPTION, 1, &snapshot).unwrap();
-        assert_eq!(encrypt.action, AdminAction::SetAccess(AccessChange::Encrypt));
+        assert_eq!(
+            encrypt.action,
+            AdminAction::SetAccess(AccessChange::Encrypt)
+        );
         let review = confirmation(&encrypt, &snapshot).unwrap();
         assert!(review.destructive && review.body.contains("cannot be turned off"));
         assert!(encrypt.still_matches(&snapshot));
@@ -1784,9 +2012,15 @@ mod tests {
             access.encryption_editable = false;
         }
         assert!(!encrypt.still_matches(&on));
-        assert_eq!(access_intent(ACCESS_ENCRYPTION, 1, &on), Err(ENCRYPTION_ON.to_owned()));
+        assert_eq!(
+            access_intent(ACCESS_ENCRYPTION, 1, &on),
+            Err(ENCRYPTION_ON.to_owned())
+        );
         let row = &access_rows(&on)[2];
-        assert_eq!((row.choice, row.summary.as_str(), row.editable), (1, "On", false));
+        assert_eq!(
+            (row.choice, row.summary.as_str(), row.editable),
+            (1, "On", false)
+        );
         assert_eq!(row.restriction, ENCRYPTION_ON);
     }
 

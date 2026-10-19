@@ -33,10 +33,11 @@ export struct RosterMember {
 export struct RosterPermission {
     // A threshold's index, or -1 for an access row.
     key: int,
-    // 0 threshold, 1 history visibility, 2 guest access, 3 encryption, 4 room version.
+    // 0 threshold, 1 history visibility, 2 guest access, 3 encryption, 4 room version,
+    // 5 blocked servers.
     kind: int,
     // Access rows: the current option index (guests: 1 allowed; encryption:
-    // 1 on), or -1.
+    // 1 on; blocked servers: how many), or -1.
     choice: int,
     label: string,
     description: string,
@@ -237,6 +238,8 @@ export component RoomMembersPanel inherits VerticalLayout {
     // 0 all, 1 joined, 2 invited, 3 join requests, 4 banned
     in property <int> filter;
     in-out property <string> invite-input;
+    // The server typed in the blocked-servers editor.
+    in-out property <string> server-input;
     in property <string> selected-key;
     in property <RosterMember> selected;
     in property <string> selected-status;
@@ -257,6 +260,8 @@ export component RoomMembersPanel inherits VerticalLayout {
     callback request-permission(int, string);
     // An access row's kind and the chosen option.
     callback request-access(int, int);
+    // Block (true) or unblock a server name or pattern.
+    callback request-server(bool, string);
     callback open-settings();
 
     property <length> row-height: max(50px, 32px * root.text-scale + 18px);
@@ -798,6 +803,36 @@ export component RoomMembersPanel inherits VerticalLayout {
                         destructive: true;
                         enabled: !root.busy && root.chosen.choice == 0;
                         activated => { root.request-access(3, 1); }
+                    }
+                }
+                if root.chosen.kind == 5 && root.chosen.editable : HorizontalLayout {
+                    spacing: 5px;
+                    RosterField {
+                        horizontal-stretch: 1;
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        placeholder: "spam.example or *.spam.example";
+                        label: "Server name or pattern to block or unblock";
+                        enabled: !root.busy;
+                        text <=> root.server-input;
+                        accepted => { if !root.busy && root.server-input != "" { root.request-server(true, root.server-input); } }
+                    }
+                    RosterButton {
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        text: "Block…";
+                        destructive: true;
+                        label: "Review blocking this server from the room";
+                        enabled: !root.busy && root.server-input != "";
+                        activated => { root.request-server(true, root.server-input); }
+                    }
+                    RosterButton {
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        text: "Unblock…";
+                        label: "Review unblocking this server";
+                        enabled: !root.busy && root.server-input != "" && root.chosen.choice > 0;
+                        activated => { root.request-server(false, root.server-input); }
                     }
                 }
                 if root.chosen.kind == 2 && root.chosen.editable : HorizontalLayout {

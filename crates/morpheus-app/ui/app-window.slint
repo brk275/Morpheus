@@ -1908,6 +1908,7 @@ export component AppWindow inherits Window {
     in-out property <string> roster-query;
     in-out property <int> roster-filter: 0;
     in-out property <string> roster-invite-input;
+    in-out property <string> roster-server-input;
     in-out property <string> roster-selected-key;
     in-out property <RosterMember> roster-selected;
     in-out property <string> roster-selected-status;
@@ -2269,6 +2270,7 @@ export component AppWindow inherits Window {
     callback roster-invite();
     // 1 kick, 2 ban, 3 unban, 4 set level, 5 approve request, 6 deny request
     callback roster-request(int);
+    callback roster-request-server(bool, string);
     // A permission key from roster-permissions and the requested level text.
     callback roster-request-permission(int, string);
     // An access row kind (1 history, 2 guests) and the chosen option.
@@ -5929,6 +5931,7 @@ export component AppWindow inherits Window {
                     query <=> root.roster-query;
                     filter: root.roster-filter;
                     invite-input <=> root.roster-invite-input;
+                    server-input <=> root.roster-server-input;
                     selected-key: root.roster-selected-key;
                     selected: root.roster-selected;
                     selected-status: root.roster-selected-status;
@@ -5943,6 +5946,7 @@ export component AppWindow inherits Window {
                     select(key) => { root.roster-select(key); }
                     invite => { root.roster-invite(); }
                     request(kind) => { root.roster-request(kind); }
+                    request-server(block, server) => { root.roster-request-server(block, server); }
                     request-permission(key, level) => { root.roster-request-permission(key, level); }
                     request-access(kind, choice) => { root.roster-request-access(kind, choice); }
                     open-settings => { root.open-room-settings(); }

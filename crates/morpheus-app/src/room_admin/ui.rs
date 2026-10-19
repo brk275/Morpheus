@@ -197,6 +197,13 @@ impl RoomAdminUi {
         });
         let this = owner.clone();
         let weak = ui.as_weak();
+        ui.on_roster_request_server(move |block, server| {
+            if let Some(ui) = weak.upgrade() {
+                this.request_server(&ui, block, server.as_str());
+            }
+        });
+        let this = owner.clone();
+        let weak = ui.as_weak();
         ui.on_roster_confirm(move || {
             if let Some(ui) = weak.upgrade() {
                 this.confirm(&ui);
@@ -550,6 +557,16 @@ impl RoomAdminUi {
         }
     }
 
+    fn request_server(self: &Arc<Self>, ui: &AppWindow, block: bool, server: &str) {
+        let Some((panel, snapshot)) = self.idle_snapshot(ui) else {
+            return;
+        };
+        match super::server_intent(server, block, &snapshot) {
+            Ok(intent) => self.review(ui, panel, intent, &snapshot),
+            Err(message) => self.reject(ui, &panel, message),
+        }
+    }
+
     fn request_access(self: &Arc<Self>, ui: &AppWindow, kind: i32, choice: i32) {
         let Some((panel, snapshot)) = self.idle_snapshot(ui) else {
             return;
@@ -712,6 +729,12 @@ fn reconcile_confirmation(state: &mut PanelState, snapshot: &RoomAdminSnapshot) 
 }
 
 fn reset_inputs(ui: &AppWindow, intent: &Intent, confirmed: bool) {
+    let typed = ui.get_roster_server_input();
+    if let AdminAction::SetAccess(AccessChange::Servers { .. }) = intent.action
+        && typed.trim().eq_ignore_ascii_case(&intent.user_id)
+    {
+        ui.set_roster_server_input("".into());
+    }
     if matches!(
         intent.action,
         AdminAction::SetPermission(..) | AdminAction::SetAccess(_)
@@ -870,6 +893,7 @@ fn access_row(row: super::AccessRow, pending: Option<AccessChange>) -> RosterPer
         Some(AccessChange::Guests { .. }) => row.kind == super::ACCESS_GUESTS,
         Some(AccessChange::Encrypt) => row.kind == super::ACCESS_ENCRYPTION,
         Some(AccessChange::Upgrade) => row.kind == super::ACCESS_UPGRADE,
+        Some(AccessChange::Servers { .. }) => row.kind == super::ACCESS_SERVERS,
         None => false,
     };
     RosterPermission {
@@ -924,6 +948,7 @@ fn clear_selection(ui: &AppWindow) {
     ui.set_roster_selected_restriction("".into());
     ui.set_roster_level_input("".into());
     ui.set_roster_reason_input("".into());
+    ui.set_roster_server_input("".into());
 }
 
 /// Remove every roster value from the window, including private member

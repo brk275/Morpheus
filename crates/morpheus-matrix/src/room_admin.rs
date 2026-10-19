@@ -19,7 +19,8 @@ use matrix_sdk::{
     deserialized_responses::MemberEvent,
     room::RoomMember,
     ruma::{
-        Int, OwnedEventId, OwnedUserId, RoomId, RoomVersionId, TransactionId, UInt, UserId,
+        Int, OwnedEventId, OwnedUserId, RoomId, RoomVersionId, ServerName, TransactionId, UInt,
+        UserId,
         api::{
             client::{
                 discovery::get_capabilities,
@@ -47,6 +48,7 @@ use matrix_sdk::{
                 history_visibility::{HistoryVisibility, RoomHistoryVisibilityEventContent},
                 member::{MembershipState, RoomMemberEventContent},
                 power_levels::{RoomPowerLevels, RoomPowerLevelsEventContent, UserPowerLevel},
+                server_acl::RoomServerAclEventContent,
             },
         },
         serde::Raw,
@@ -54,7 +56,7 @@ use matrix_sdk::{
     sync::{RoomUpdate, State as SyncState},
 };
 use serde::{Deserialize, de::IgnoredAny};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tokio::{
     sync::{Mutex, OnceCell, broadcast},
     time,
@@ -86,6 +88,9 @@ const REMOVAL_PAGE: u32 = 100;
 // the write timeout. Running it again continues.
 const REMOVAL_SPACING: Duration = Duration::from_millis(250);
 const REMOVAL_BUDGET: Duration = Duration::from_secs(45);
+/// Blocked servers a room may list for Morpheus to edit the list.
+pub const MAX_BLOCKED_SERVERS: usize = 200;
+pub const MAX_SERVER_BYTES: usize = 255;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RoomAdminError {
@@ -308,6 +313,25 @@ pub enum AccessChange {
     Encrypt,
     /// Replace the room by one on the homeserver's recommended version.
     Upgrade,
+    /// Block or unblock, in `m.room.server_acl`, the server name or pattern
+    /// given as the request's user ID.
+    Servers { block: bool },
+}
+
+/// Homeservers the room blocks with `m.room.server_acl`. People on a blocked
+/// server can no longer send, join or receive new events here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ServerAclSettings {
+    /// Blocked server names or patterns, as the event lists them; at most
+    /// `MAX_BLOCKED_SERVERS` are shown.
+    pub denied: Vec<String>,
+    /// Every server that is not blocked may take part, and the lists are
+    /// plain strings, so Morpheus can edit the block list without changing
+    /// anything else.
+    pub known: bool,
+    pub level: i64,
+    /// The list is known and the account may send the event.
+    pub editable: bool,
 }
 
 /// The room's version against the homeserver's recommended one.
@@ -350,6 +374,8 @@ pub struct RoomAdminSnapshot {
     pub room_version: String,
     /// `None` when the room's rules or the homeserver's recommendation are unknown.
     pub upgrade: Option<UpgradeSettings>,
+    /// `None` when the room's rules are unknown.
+    pub servers: Option<ServerAclSettings>,
 }
 
 impl RoomAdminSnapshot {
@@ -601,6 +627,7 @@ impl AccountManager {
                 access: None,
                 room_version: String::new(),
                 upgrade: None,
+                servers: None,
             })),
             overrides: std::sync::Mutex::new(HashMap::new()),
             operation: Mutex::new(()),
@@ -689,9 +716,13 @@ impl RoomAdminSession {
             let recommended = self.recommended_version().await;
             self.check()?;
             let replaced = tombstone.is_some();
+            let own = &self.own_user;
             snapshot.upgrade = recommended.map(|recommended| {
-                upgrade_settings(levels, &self.own_user, &self.room_version, recommended, replaced)
+                upgrade_settings(levels, own, &self.room_version, recommended, replaced)
             });
+            let acl = self.optional_state(StateEventType::RoomServerAcl).await?;
+            self.check()?;
+            snapshot.servers = Some(server_acl_settings(levels, &self.own_user, acl.as_ref()));
         }
         Ok(snapshot)
     }
@@ -778,6 +809,9 @@ impl RoomAdminSession {
     pub async fn apply(&self, request: AdminRequest) -> Result<AdminOutcome> {
         if let AdminAction::SetPermission(key, level) = request.action {
             return self.set_permission(key, level, request.expected.power).await;
+        }
+        if let AdminAction::SetAccess(AccessChange::Servers { block }) = request.action {
+            return self.set_server_block(&request.user_id, block).await;
         }
         if let AdminAction::SetAccess(change) = request.action {
             return self.set_access(change).await;
@@ -1047,6 +1081,59 @@ impl RoomAdminSession {
             Ok(AdminOutcome {
                 confirmed,
                 observed,
+                snapshot: built.unwrap_or_else(|| self.snapshot()),
+                replacement: None,
+                removal: None,
+            })
+        })
+        .await
+    }
+    /// Block or unblock one server in `m.room.server_acl` and keep every
+    /// other field. A change that would also block this account's own
+    /// homeserver is refused: the room would stop accepting its events.
+    async fn set_server_block(&self, server: &str, block: bool) -> Result<AdminOutcome> {
+        let server = checked_server(server)?;
+        self.run(WRITE_TIMEOUT, async {
+            let power = self.power_state().await?;
+            let levels = room_settings::effective_power_levels(&self.create, power.as_ref())?
+                .ok_or(RoomAdminError::InvalidState)?;
+            let kind = StateEventType::RoomServerAcl;
+            if !levels.user_can_send_state(&self.own_user, kind.clone()) {
+                return Err(RoomAdminError::InsufficientPower);
+            }
+            let current = self.optional_state(kind.clone()).await?;
+            let current = current.as_ref().map(|event| &event.content);
+            let content = blocked_content(current, &server, block)?;
+            if !server_allowed(&content, self.own_user.server_name()) {
+                return Err(RoomAdminError::SelfTarget);
+            }
+            let content = finish_content(&content)?;
+            let room_id = self.room.room_id().to_owned();
+            let request =
+                send_state_event::v3::Request::new_raw(room_id, kind, String::new(), content);
+            self.check()?;
+            self.room
+                .client()
+                .send(request)
+                .with_request_config(write_config())
+                .await
+                .map_err(write_failure)?;
+            self.check()?;
+            // Accepted by the server; a failed read-back is unconfirmed, not failed.
+            let built = match self.build(power.as_ref()).await {
+                Ok(built) => Some(self.publish(built)?),
+                Err(_) => None,
+            };
+            let servers = built.as_ref().and_then(|snapshot| snapshot.servers.as_ref());
+            let listed = servers.map(|servers| blocks(&servers.denied, &server));
+            let confirmed = listed == Some(block);
+            let read_back = ObservedTarget {
+                membership: ObservedMembership::None,
+                power: MemberPower::Level(0),
+            };
+            Ok(AdminOutcome {
+                confirmed,
+                observed: built.is_some().then_some(read_back),
                 snapshot: built.unwrap_or_else(|| self.snapshot()),
                 replacement: None,
                 removal: None,
@@ -1491,6 +1578,7 @@ fn access_kind(change: AccessChange) -> StateEventType {
         AccessChange::Guests { .. } => StateEventType::RoomGuestAccess,
         AccessChange::Encrypt => StateEventType::RoomEncryption,
         AccessChange::Upgrade => StateEventType::RoomTombstone,
+        AccessChange::Servers { .. } => StateEventType::RoomServerAcl,
     }
 }
 
@@ -1501,6 +1589,8 @@ fn access_matches(change: AccessChange, current: Option<&StateEnvelope>) -> bool
         // Any encryption event, even one this client cannot read, means it
         // is on already; it is never replaced.
         AccessChange::Encrypt | AccessChange::Upgrade => current.is_none(),
+        // Checked against the block list by its own path.
+        AccessChange::Servers { .. } => false,
     }
 }
 
@@ -1509,8 +1599,8 @@ fn access_applied(change: AccessChange, access: AccessSettings) -> bool {
         AccessChange::History { to, .. } => access.history == Some(to),
         AccessChange::Guests { allow } => access.guests_can_join == Some(allow),
         AccessChange::Encrypt => access.encrypted,
-        // Confirmed from the tombstone, not from these settings.
-        AccessChange::Upgrade => false,
+        // Confirmed from the tombstone or the block list, not from these settings.
+        AccessChange::Upgrade | AccessChange::Servers { .. } => false,
     }
 }
 
@@ -1534,10 +1624,129 @@ fn access_request(room: &RoomId, change: AccessChange) -> Result<send_state_even
             let content = RoomEncryptionEventContent::with_recommended_defaults();
             send_state_event::v3::Request::new(room, &EmptyStateKey, &content)
         }
-        // An upgrade is its own request, never a state event.
-        AccessChange::Upgrade => return Err(RoomAdminError::NotApplicable),
+        // An upgrade is its own request, and the block list keeps fields
+        // this client does not edit, so neither is a typed state event.
+        AccessChange::Upgrade | AccessChange::Servers { .. } => {
+            return Err(RoomAdminError::NotApplicable);
+        }
     };
     request.map_err(|_| RoomAdminError::InvalidState)
+}
+
+/// The blocked servers of `m.room.server_acl`. The list is known only when
+/// every other server is allowed (`allow` is exactly `["*"]`, or there is no
+/// ACL yet) and every list is plain strings, so a block list edit keeps the
+/// rest of the content as it is.
+fn server_acl_settings(
+    levels: &RoomPowerLevels,
+    own: &UserId,
+    acl: Option<&StateEnvelope>,
+) -> ServerAclSettings {
+    let kind = StateEventType::RoomServerAcl;
+    let level = levels.for_state(kind.clone()).into();
+    let allowed = levels.user_can_send_state(own, kind);
+    let Some(content) = acl.map(|event| &event.content) else {
+        return ServerAclSettings {
+            denied: Vec::new(),
+            known: true,
+            level,
+            editable: allowed,
+        };
+    };
+    let deny = string_list(content.get("deny"));
+    let known = content.is_object()
+        && open_acl(content)
+        && deny.as_ref().is_some_and(|deny| deny.len() <= MAX_BLOCKED_SERVERS);
+    let denied = deny
+        .unwrap_or_default()
+        .iter()
+        .take(MAX_BLOCKED_SERVERS)
+        .map(|server| bounded(server, MAX_SERVER_BYTES))
+        .collect();
+    ServerAclSettings {
+        denied,
+        known,
+        level,
+        editable: known && allowed,
+    }
+}
+
+/// Every server is allowed unless blocked, and the IP-literal flag, when
+/// present, is a plain boolean.
+fn open_acl(content: &Value) -> bool {
+    let allow = string_list(content.get("allow"));
+    let flag = content.get("allow_ip_literals");
+    allow.is_some_and(|allow| allow == ["*"]) && flag.is_none_or(Value::is_boolean)
+}
+
+/// A list of strings: empty when the field is absent, `None` when it holds
+/// anything else.
+fn string_list(value: Option<&Value>) -> Option<Vec<String>> {
+    let Some(value) = value else {
+        return Some(Vec::new());
+    };
+    value
+        .as_array()?
+        .iter()
+        .map(|item| item.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The block list names this server or pattern; matching ignores case.
+fn blocks(denied: &[String], server: &str) -> bool {
+    denied.iter().any(|entry| entry.eq_ignore_ascii_case(server))
+}
+
+/// A server name or pattern for the block list: host characters with `*`
+/// and `?` wildcards, no port, at most `MAX_SERVER_BYTES`. Lowercased, since
+/// the list matches without case.
+fn checked_server(input: &str) -> Result<String> {
+    let server = input.trim().to_ascii_lowercase();
+    let host = |byte: u8| byte.is_ascii_alphanumeric() || b".-*?".contains(&byte);
+    let valid = !server.is_empty() && server.len() <= MAX_SERVER_BYTES && server.bytes().all(host);
+    if valid {
+        Ok(server)
+    } else {
+        Err(RoomAdminError::InvalidUserId)
+    }
+}
+
+/// The ACL content with `server` added to or removed from `deny`. An ACL
+/// whose lists Morpheus cannot keep intact is refused, never rewritten.
+fn blocked_content(current: Option<&Value>, server: &str, block: bool) -> Result<Value> {
+    let mut object = match current {
+        // No ACL yet: every server is allowed, including IP literals.
+        None => Map::from_iter([
+            ("allow".to_owned(), Value::from(vec!["*"])),
+            ("allow_ip_literals".to_owned(), Value::Bool(true)),
+        ]),
+        Some(Value::Object(object)) => object.clone(),
+        Some(_) => return Err(RoomAdminError::InvalidState),
+    };
+    let content = Value::Object(object.clone());
+    let mut deny = string_list(object.get("deny")).ok_or(RoomAdminError::InvalidState)?;
+    if !open_acl(&content) || deny.len() > MAX_BLOCKED_SERVERS {
+        return Err(RoomAdminError::InvalidState);
+    }
+    if blocks(&deny, server) == block {
+        return Err(RoomAdminError::NotApplicable);
+    }
+    if block {
+        if deny.len() == MAX_BLOCKED_SERVERS {
+            return Err(RoomAdminError::InvalidState);
+        }
+        deny.push(server.to_owned());
+    } else {
+        deny.retain(|entry| !entry.eq_ignore_ascii_case(server));
+    }
+    object.insert("deny".to_owned(), Value::from(deny));
+    Ok(Value::Object(object))
+}
+
+/// The ACL would still let this server take part.
+fn server_allowed(content: &Value, server: &ServerName) -> bool {
+    let acl = serde_json::from_value::<RoomServerAclEventContent>(content.clone());
+    acl.is_ok_and(|acl| acl.is_allowed(server))
 }
 
 /// A recommended version that is a newer numbered version than the room's.
@@ -1882,6 +2091,7 @@ fn assemble(
         access: None,
         room_version: room_version.to_owned(),
         upgrade: None,
+        servers: None,
     }
 }
 
@@ -2134,6 +2344,63 @@ mod tests {
         assert_eq!(full.removable.len(), MAX_REMOVED_MESSAGES);
         assert!(full.more);
         assert_eq!(full.removable[0].as_str(), "$spam0");
+    }
+
+    #[test]
+    fn server_blocks_keep_other_fields_and_never_block_the_own_homeserver() {
+        let own = matrix_sdk::ruma::server_name!("example.org");
+        // No ACL yet: every server stays allowed apart from the blocked one.
+        let first = blocked_content(None, "spam.example", true).unwrap();
+        assert_eq!(
+            first,
+            json!({"allow": ["*"], "allow_ip_literals": true, "deny": ["spam.example"]})
+        );
+        assert!(server_allowed(&first, own));
+        let current = json!({"allow": ["*"], "deny": ["Spam.Example"], "custom": {"x": 1}});
+        assert_eq!(
+            blocked_content(Some(&current), "spam.example", true),
+            Err(RoomAdminError::NotApplicable)
+        );
+        let lifted = blocked_content(Some(&current), "spam.example", false).unwrap();
+        let expected = json!({"allow": ["*"], "deny": [], "custom": {"x": 1}});
+        assert_eq!(lifted, expected);
+        // A pattern that also matches the own homeserver is caught.
+        let everyone = blocked_content(Some(&current), "*.org", true).unwrap();
+        assert!(!server_allowed(&everyone, own));
+        // Allow lists and odd content are left for other clients to edit.
+        for content in [
+            json!({"allow": ["good.example"], "deny": []}),
+            json!({"deny": ["spam.example"]}),
+            json!({"allow": ["*"], "deny": "spam.example"}),
+            json!({"allow": ["*"], "allow_ip_literals": "yes"}),
+            json!(["*"]),
+        ] {
+            assert_eq!(
+                blocked_content(Some(&content), "other.example", true),
+                Err(RoomAdminError::InvalidState)
+            );
+        }
+        assert_eq!(checked_server(" Spam.Example ").unwrap(), "spam.example");
+        assert_eq!(checked_server("*.spam.example").unwrap(), "*.spam.example");
+        for invalid in ["", "spam.example:8448", "spam example", "@spam:example.org"] {
+            assert_eq!(checked_server(invalid), Err(RoomAdminError::InvalidUserId));
+        }
+
+        let levels = levels("11", json!({"@mod:example.org": 50}));
+        let moderator = user_id!("@mod:example.org");
+        let member = user_id!("@member:example.org");
+        let none = server_acl_settings(&levels, moderator, None);
+        assert!(none.known && none.editable && none.denied.is_empty());
+        assert_eq!(none.level, 50);
+        let acl = envelope("m.room.server_acl", "@mod:example.org", current);
+        let listed = server_acl_settings(&levels, moderator, Some(&acl));
+        assert_eq!(listed.denied, ["Spam.Example"]);
+        assert!(listed.editable && blocks(&listed.denied, "spam.example"));
+        assert!(!server_acl_settings(&levels, member, Some(&acl)).editable);
+        let allow_list = json!({"allow": ["good.example"]});
+        let allow_list = envelope("m.room.server_acl", "@mod:example.org", allow_list);
+        let custom = server_acl_settings(&levels, moderator, Some(&allow_list));
+        assert!(!custom.known && !custom.editable);
     }
 
     fn levels_v12() -> RoomPowerLevels {
