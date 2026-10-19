@@ -3623,15 +3623,19 @@ export component AppWindow inherits Window {
                             background: root.row-surface(message-row.selected-message, message-hover.has-hover, message.is-own, transparent);
                             message-hover := TouchArea { mouse-cursor: default; }
                             // Finish a search jump once this row exists: place it a
-                            // third of the way down the visible conversation.
-                            if root.timeline-jump-passes > 0 && message.event-id != "" && message.event-id == root.timeline-jump-event-id : Timer {
-                                interval: 1ms;
-                                running: true;
-                                triggered => {
-                                    self.running = false;
-                                    timeline-list.content-y = -max(0px, min(timeline-list.content-height - timeline-list.visible-height,
-                                        message-row.y - timeline-list.visible-height / 3));
-                                    root.timeline-jump-passes = 0;
+                            // third of the way down the visible conversation. A Timer
+                            // cannot itself be conditional, so a zero-size holder is.
+                            if root.timeline-jump-passes > 0 && message.event-id != "" && message.event-id == root.timeline-jump-event-id : Rectangle {
+                                width: 0px; height: 0px;
+                                Timer {
+                                    interval: 1ms;
+                                    running: true;
+                                    triggered => {
+                                        self.running = false;
+                                        timeline-list.content-y = -max(0px, min(timeline-list.content-height - timeline-list.visible-height,
+                                            message-row.y - timeline-list.visible-height / 3));
+                                        root.timeline-jump-passes = 0;
+                                    }
                                 }
                             }
                             message-flow := HorizontalLayout {
@@ -6241,13 +6245,17 @@ export component AppWindow inherits Window {
                                 vertical-stretch: 0;
                                 background: root.row-surface(thread-reply.search-hit, false, reply.is-own, root.elevated);
                                 border-radius: StyleTokens.radius * 0.8;
-                                // Reveal that reply once it is laid out.
-                                if reply.event-id != "" && reply.event-id == root.timeline-jump-event-id : Timer {
-                                    interval: 1ms;
-                                    running: true;
-                                    triggered => {
-                                        self.running = false;
-                                        thread-scroll.content-y = -max(0px, min(thread-scroll.content-height - thread-scroll.visible-height, thread-reply.y - 12px));
+                                // Reveal that reply once it is laid out (a zero-size
+                                // holder carries the condition; a Timer cannot).
+                                if reply.event-id != "" && reply.event-id == root.timeline-jump-event-id : Rectangle {
+                                    width: 0px; height: 0px;
+                                    Timer {
+                                        interval: 1ms;
+                                        running: true;
+                                        triggered => {
+                                            self.running = false;
+                                            thread-scroll.content-y = -max(0px, min(thread-scroll.content-height - thread-scroll.visible-height, thread-reply.y - 12px));
+                                        }
                                     }
                                 }
                                 VerticalLayout {

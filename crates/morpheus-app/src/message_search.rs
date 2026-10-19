@@ -272,6 +272,8 @@ struct PendingTarget {
 struct Controller {
     request: Option<Request>,
     query_task: Option<JoinHandle<()>>,
+    /// Clears the search when the shown request's account selection ends.
+    revoke_task: Option<JoinHandle<()>>,
     context_task: Option<JoinHandle<()>>,
     reveal_task: Option<JoinHandle<()>>,
     /// The navigation of the latest open, and whether search owns it. It is
@@ -284,15 +286,23 @@ struct Controller {
 }
 
 impl Controller {
-    /// End the work of the opened hit: its nearby context, history reveal
-    /// and, when search owns it, its room or focus navigation.
+    /// End the work of the opened hit: its nearby context and, when search
+    /// owns the open, its thread reveal and room or focus navigation. An
+    /// activation's open is left to finish.
     fn abort_opening(&mut self) {
         abort(self.context_task.take());
-        abort(self.reveal_task.take());
         if let Some((navigation, true)) = &self.navigation {
             navigation.withdraw();
+            abort(self.reveal_task.take());
             self.navigation = None;
         }
+    }
+
+    /// End the shown request's work: its page and revocation watcher.
+    fn abort_request(&mut self) {
+        abort(self.query_task.take());
+        abort(self.revoke_task.take());
+        self.request = None;
     }
 
     /// A newer open supersedes the previous navigation, whoever owns it.
@@ -342,9 +352,8 @@ fn owns(ticket: &Ticket) -> bool {
 /// changes and removal, sign-out, and room changes in the open-room scope.
 pub(crate) fn reset(ui: &AppWindow) {
     with(|controller| {
-        abort(controller.query_task.take());
+        controller.abort_request();
         controller.abort_opening();
-        controller.request = None;
     });
     ui.set_room_search_operation(ui.get_room_search_operation().wrapping_add(1));
     ui.set_room_search_context_operation(ui.get_room_search_context_operation().wrapping_add(1));
@@ -499,9 +508,8 @@ fn submit(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
 /// Begin a new query, cancelling the previous query and context requests.
 fn start(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, delay: Option<Duration>) {
     with(|controller| {
-        abort(controller.query_task.take());
+        controller.abort_request();
         controller.abort_opening();
-        controller.request = None;
     });
     let operation = window.get_room_search_operation().wrapping_add(1);
     window.set_room_search_operation(operation);
@@ -559,6 +567,7 @@ fn start(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, delay: Option
     let weak = window.as_weak();
     let manager = live.manager.clone();
     let task = spawn_page(weak, manager, runtime, ticket.clone(), 0, delay);
+    let watcher = watch_revocation(window.as_weak(), runtime, ticket.clone());
     with(|controller| {
         controller.request = Some(Request {
             ticket,
@@ -567,7 +576,22 @@ fn start(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, delay: Option
             seen: HashSet::new(),
         });
         controller.query_task = Some(task);
+        controller.revoke_task = Some(watcher);
     });
+}
+
+/// Clear the search once its request's account selection ends: a switch,
+/// a removal or A -> B -> A, even when the window shows the same account
+/// again and no account change resets the search.
+fn watch_revocation(weak: Weak<AppWindow>, runtime: &Handle, ticket: Ticket) -> JoinHandle<()> {
+    runtime.spawn(async move {
+        ticket.selection.revoked().await;
+        let _ = weak.upgrade_in_event_loop(move |window| {
+            if owns(&ticket) {
+                reset(&window);
+            }
+        });
+    })
 }
 
 fn load_more(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
@@ -662,16 +686,20 @@ fn publish_page(
     }
     window.set_room_search_loading(false);
     window.set_room_search_loading_more(false);
-    window.set_room_search_searched(true);
     let page = match outcome {
         Ok(page) => page,
-        Err(message) => {
+        // The account changed under this request: claim no result. Its
+        // revocation watcher clears the search.
+        Err(None) => return,
+        Err(Some(message)) => {
             // A failed first page shows the error; a failed later page keeps
             // the listed results and their cursor, so Load more can retry.
-            window.set_room_search_error(message.unwrap_or("").into());
+            window.set_room_search_searched(true);
+            window.set_room_search_error(message.into());
             return;
         }
     };
+    window.set_room_search_searched(true);
     let Some((items, more, unavailable)) = with(|controller| accept_page(controller, page)) else {
         return;
     };
@@ -1176,25 +1204,30 @@ fn load_newer(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
     let Some(selection) = live.manager.account_selection(&account) else {
         return;
     };
+    // Focusing again or returning to live bumps the history operation, so
+    // a late result never lands on another view.
+    let operation = window.get_history_operation();
     window.set_focus_newer_loading(true);
     window.set_history_error("".into());
     let manager = live.manager.clone();
     let weak = window.as_weak();
     runtime.spawn(async move {
         let newer = manager.paginate_focused_selected(&selection, &room, false, NEWER_PAGE);
-        let result = newer.await;
+        let result = tokio::time::timeout(FOCUS_TIMEOUT, newer).await;
         let _ = weak.upgrade_in_event_loop(move |window| {
-            if !selection.is_current()
-                || window.get_active_account_local_id().as_str() != account
+            if window.get_active_account_local_id().as_str() != account
                 || window.get_active_room_id().as_str() != room
             {
                 return;
             }
             window.set_focus_newer_loading(false);
+            if !selection.is_current() || window.get_history_operation() != operation {
+                return;
+            }
             match result {
-                Ok(true) => window.invoke_return_to_live(),
-                Ok(false) => {}
-                Err(_) => window.set_history_error(NEWER_FAILED.into()),
+                Ok(Ok(true)) => window.invoke_return_to_live(),
+                Ok(Ok(false)) => {}
+                Ok(Err(_)) | Err(_) => window.set_history_error(NEWER_FAILED.into()),
             }
         });
     });

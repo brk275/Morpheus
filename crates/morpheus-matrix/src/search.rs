@@ -271,10 +271,9 @@ async fn room_page(
         .map_err(index_error)?
         .events;
     let more = hits.len() > allowance;
+    let examined = hits.len().min(allowance);
     let mut page = PageBuilder::default();
-    let mut examined = 0;
     for (relevance_score, event_id) in hits.into_iter().take(allowance) {
-        examined += 1;
         page.add(room, &event_id, relevance_score).await;
     }
     let next = offset + examined;
