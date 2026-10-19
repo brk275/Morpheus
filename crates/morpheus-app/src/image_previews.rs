@@ -47,7 +47,7 @@ impl PreviewError {
                 "Preview limit: 8 MiB, 4096 pixels per side, 4 megapixels and 1000 animation frames. You can still save the attachment."
             }
             Self::Unsupported => {
-                "Preview supports 8-bit PNG, baseline JPEG, GIF and WebP; animated GIF and WebP can play. Animated PNG, progressive JPEG, SVG, audio and video previews are not supported yet."
+                "Preview supports 8-bit PNG, baseline JPEG, GIF and WebP, and plays animated PNG, GIF and WebP. Progressive JPEG, 16-bit PNG, SVG, audio and video previews are not supported yet."
             }
             Self::Invalid => {
                 "This image could not be decoded safely. You can still save the attachment."

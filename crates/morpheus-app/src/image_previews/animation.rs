@@ -1,5 +1,5 @@
-//! Bounded, sequential playback of animated GIF and WebP previews with the
-//! pinned `image` codecs. It runs on the preview's single dedicated worker,
+//! Bounded, sequential playback of animated GIF, WebP and PNG previews with
+//! the pinned `image` codecs. It runs on the preview's single dedicated worker,
 //! which already owns the only decode permit. Frames are decoded strictly in
 //! order, one at a time, and only the newest picture is handed to the window.
 //! Nothing is collected ahead of playback; looping and Replay decode the same
@@ -19,7 +19,7 @@ use std::{
 
 use image::{
     AnimationDecoder, ColorType, Frames, ImageDecoder, ImageError, Limits,
-    codecs::{gif::GifDecoder, webp::WebPDecoder},
+    codecs::{gif::GifDecoder, png::PngDecoder, webp::WebPDecoder},
     metadata::LoopCount,
 };
 use zeroize::Zeroizing;
@@ -31,7 +31,7 @@ pub(super) const MAX_ANIMATED_PIXELS: usize = 2 * 1024 * 1024;
 /// The codec's own buffers for one pass, including the frame it returns.
 const MAX_CODEC_ALLOC: u64 = 64 * 1024 * 1024;
 /// Frames decoded in one pass; any further frames are not shown.
-const MAX_FRAMES: usize = 1000;
+const MAX_FRAMES: usize = decode::MAX_ANIMATION_FRAMES;
 /// Delays shorter than this play at the customary 100 ms instead.
 const MIN_DELAY: Duration = Duration::from_millis(20);
 const SHORT_DELAY: Duration = Duration::from_millis(100);
@@ -42,11 +42,15 @@ const MAX_PLAY: Duration = Duration::from_secs(10 * 60);
 pub(super) enum Format {
     Gif,
     WebP,
+    /// Only a PNG that declares an animation; still PNGs keep their path.
+    Apng,
 }
 
 impl Format {
     pub(super) fn sniff(bytes: &[u8]) -> Option<Self> {
-        if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        if decode::png_animated(bytes) {
+            Some(Self::Apng)
+        } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
             Some(Self::Gif)
         } else if bytes.get(..4) == Some(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
             Some(Self::WebP)
@@ -59,6 +63,7 @@ impl Format {
         match self {
             Self::Gif => "GIF",
             Self::WebP => "WebP",
+            Self::Apng => "PNG",
         }
     }
 }
@@ -148,7 +153,7 @@ fn header_dimensions(format: Format, bytes: &[u8]) -> Option<(u32, u32)> {
         // An extended WebP's VP8X chunk; simple files are checked after
         // their header is parsed instead.
         Format::WebP if bytes.get(12..16) == Some(b"VP8X") => Some((le24(24)? + 1, le24(27)? + 1)),
-        Format::WebP => None,
+        Format::WebP | Format::Apng => None,
     }
 }
 
@@ -166,6 +171,21 @@ impl<'a> Pass<'a> {
                 let (width, height) = decoder.dimensions();
                 decode::size(width, height)?;
                 decoder.set_limits(limits()).map_err(codec_error)?;
+                let loops = decoder.loop_count();
+                (decoder.into_frames(), loops, width, height)
+            }
+            Format::Apng => {
+                // The decoder owns a sanitized, zeroizing copy: the same chunk
+                // framing as still PNGs plus the bounded animation chunks.
+                let input = decode::png_animation_input(bytes)?;
+                let decoder =
+                    PngDecoder::with_limits(Cursor::new(input), limits()).map_err(codec_error)?;
+                let (width, height) = decoder.dimensions();
+                decode::size(width, height)?;
+                if !decoder.is_apng().map_err(codec_error)? {
+                    return Err(PreviewError::Invalid);
+                }
+                let decoder = decoder.apng().map_err(codec_error)?;
                 let loops = decoder.loop_count();
                 (decoder.into_frames(), loops, width, height)
             }

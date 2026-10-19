@@ -1,6 +1,7 @@
 //! Memory-only PNG/baseline-JPEG decoding. Framing/dimension guards run before
-//! decoder construction; metadata is discarded without decompression. This
-//! deliberately excludes animation, progressive JPEG, ICC/EXIF and WebP.
+//! decoder construction; metadata is discarded without decompression. Still
+//! decoding deliberately excludes animation, progressive JPEG, ICC/EXIF and
+//! WebP; `animation` plays GIF, WebP and APNG through `png_animation_input`.
 use super::{Pixels, PreviewError};
 use image::{ColorType, ImageDecoder, Limits};
 use std::io::Cursor;
@@ -9,6 +10,8 @@ use zeroize::Zeroizing;
 pub(super) const MAX_SIDE: u32 = 4096;
 pub(super) const MAX_PIXELS: usize = 4 * 1024 * 1024;
 const MAX_DECODER_ALLOC: u64 = 32 * 1024 * 1024;
+/// Frames one animation pass may contain or decode.
+pub(super) const MAX_ANIMATION_FRAMES: usize = 1000;
 
 pub(super) fn size(width: u32, height: u32) -> Result<usize, PreviewError> {
     let pixels = (width as usize)
@@ -21,12 +24,57 @@ pub(super) fn size(width: u32, height: u32) -> Result<usize, PreviewError> {
 }
 
 fn png_input(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, PreviewError> {
+    png_input_with(bytes, false)
+}
+
+/// Sanitized APNG input for the animation player: the still framing plus the
+/// animation control and frame chunks, with one acTL before any image data
+/// and at most `MAX_ANIMATION_FRAMES` frames.
+pub(super) fn png_animation_input(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, PreviewError> {
+    if bytes.len() > morpheus_matrix::MAX_IMAGE_PREVIEW_BYTES {
+        return Err(PreviewError::TooLarge);
+    }
+    png_input_with(bytes, true)
+}
+
+/// Whether a PNG declares an animation (acTL before its first IDAT). Only
+/// chunk headers are read, at most 4096 of them.
+pub(super) fn png_animated(bytes: &[u8]) -> bool {
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return false;
+    }
+    let mut position = 8usize;
+    for _ in 0..4096 {
+        let Some(header) = bytes.get(position..position + 8) else {
+            return false;
+        };
+        let length = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+        match &header[4..8] {
+            b"acTL" => return true,
+            b"IDAT" | b"IEND" => return false,
+            _ => {}
+        }
+        let Some(next) = position
+            .checked_add(12)
+            .and_then(|position| position.checked_add(length))
+        else {
+            return false;
+        };
+        position = next;
+    }
+    false
+}
+
+fn png_input_with(bytes: &[u8], animation: bool) -> Result<Zeroizing<Vec<u8>>, PreviewError> {
     let mut position = 8usize;
     let mut output = Zeroizing::new(Vec::new());
     let mut chunks = 0;
     let mut ended = false;
     let mut palette = false;
     let mut transparency = false;
+    let mut control = false;
+    let mut frames = 0usize;
+    let mut image_data = false;
     // Validate IHDR before even allocating the bounded sanitized input.
     if bytes.get(8..16) != Some(&b"\0\0\0\rIHDR"[..]) || bytes.len() < 33 {
         return Err(PreviewError::Invalid);
@@ -53,9 +101,29 @@ fn png_input(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, PreviewError> {
             .ok_or(PreviewError::Invalid)?;
         let chunk = bytes.get(position..end).ok_or(PreviewError::Invalid)?;
         let kind = &header[4..8];
-        if matches!(kind, b"acTL" | b"fcTL" | b"fdAT") {
+        if matches!(kind, b"acTL" | b"fcTL" | b"fdAT") && !animation {
             return Err(PreviewError::Unsupported);
         }
+        if kind == b"acTL" {
+            if control || image_data || length != 8 {
+                return Err(PreviewError::Invalid);
+            }
+            let declared = u32::from_be_bytes(chunk[8..12].try_into().unwrap()) as usize;
+            if declared == 0 || declared > MAX_ANIMATION_FRAMES {
+                return Err(PreviewError::TooLarge);
+            }
+            control = true;
+        }
+        if kind == b"fcTL" {
+            frames += 1;
+            if !control || length != 26 || frames > MAX_ANIMATION_FRAMES {
+                return Err(PreviewError::Invalid);
+            }
+        }
+        if kind == b"fdAT" && !control {
+            return Err(PreviewError::Invalid);
+        }
+        image_data |= kind == b"IDAT";
         if kind == b"IHDR" && chunks != 1 {
             return Err(PreviewError::Invalid);
         }
@@ -73,6 +141,7 @@ fn png_input(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, PreviewError> {
         }
         match kind {
             b"IHDR" | b"PLTE" | b"IDAT" | b"IEND" | b"tRNS" => output.extend_from_slice(chunk),
+            b"acTL" | b"fcTL" | b"fdAT" if animation => output.extend_from_slice(chunk),
             _ if kind[0].is_ascii_lowercase() => {} // Ancillary metadata is never decompressed.
             _ => return Err(PreviewError::Unsupported),
         }
@@ -311,6 +380,36 @@ mod tests {
             bytes.splice(33..33, chunk);
             assert!(png_input(&bytes).is_err());
         }
+    }
+    #[test]
+    fn animation_chunks_pass_only_the_bounded_animation_sanitizer() {
+        let mut original = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut original)
+            .write_image(&[1, 2, 3, 255], 1, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        let control = |frames: u32| {
+            let mut chunk = 8u32.to_be_bytes().to_vec();
+            chunk.extend_from_slice(b"acTL");
+            chunk.extend_from_slice(&frames.to_be_bytes());
+            chunk.extend_from_slice(&0u32.to_be_bytes());
+            chunk.extend_from_slice(&[0; 4]);
+            chunk
+        };
+        let mut animated = original.clone();
+        animated.splice(33..33, control(2));
+        assert!(png_animated(&animated) && !png_animated(&original));
+        assert!(png_input(&animated).is_err());
+        let kept = png_animation_input(&animated).unwrap();
+        assert!(kept.windows(4).any(|window| window == b"acTL"));
+        let mut too_many = original.clone();
+        too_many.splice(33..33, control(MAX_ANIMATION_FRAMES as u32 + 1));
+        assert!(matches!(
+            png_animation_input(&too_many),
+            Err(PreviewError::TooLarge)
+        ));
+        let mut twice = animated.clone();
+        twice.splice(33..33, control(2));
+        assert!(png_animation_input(&twice).is_err());
     }
     #[test]
     fn dimensions_reject_before_decoder_or_output_allocation() {
