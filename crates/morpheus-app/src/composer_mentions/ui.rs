@@ -906,10 +906,16 @@ impl ComposerUi {
         let owner = self.clone();
         let live = live.clone();
         let weak = window.as_weak();
+        // An edit opened from a focused conversation view loads through the
+        // view shown at this click: its row may not be in the live timeline.
+        let focused = window
+            .get_conversation_focused()
+            .then(|| live.focused_view(&room))
+            .flatten();
         runtime.spawn(async move {
             let result=tokio::select! {
                 _=selection.revoked()=>None,
-                result=tokio::time::timeout(Duration::from_secs(15),live.manager.edit_composition_for(&selection,&room,&event))=>result.ok().and_then(Result::ok),
+                result=tokio::time::timeout(Duration::from_secs(15),live.manager.edit_composition_with_view_for(&selection,&room,&event,focused.as_ref()))=>result.ok().and_then(Result::ok),
             };
             let _=weak.upgrade_in_event_loop(move |window| {
                 if !selection.is_current() || window.get_composer_operation()!=operation || window.get_active_account_local_id().as_str()!=account || window.get_active_room_id().as_str()!=room || window.get_composer_mode()!=2 || window.get_composer_target_id().as_str()!=event { return; }

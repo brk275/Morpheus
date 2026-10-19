@@ -5466,6 +5466,9 @@ mod composed_adapter {
         event: String,
         revision: EditRevision,
         inherited_reply_sender: Option<matrix_sdk::ruma::OwnedUserId>,
+        /// The focused conversation view the message was opened from, whose
+        /// timeline may be the only one holding its row.
+        view: Option<FocusedView>,
     }
     impl EditBaseline {
         fn matches(&self, selection: &AccountSelection, room: &str, event: &str) -> bool {
@@ -5474,6 +5477,10 @@ mod composed_adapter {
                 && self.selection.account_id() == selection.account_id()
                 && self.room == room
                 && self.event == event
+                && self
+                    .view
+                    .as_ref()
+                    .is_none_or(|view| view.owned_by(selection) && view.room_id() == room)
         }
     }
     impl fmt::Debug for EditBaseline {
@@ -5672,20 +5679,41 @@ mod composed_adapter {
             room_id: &str,
             event_id: &str,
         ) -> Result<EditComposition> {
+            self.edit_composition_with_view_for(selection, room_id, event_id, None)
+                .await
+        }
+
+        /// As edit_composition_for, for a message opened from the focused
+        /// conversation view `view` when one is given: its row may be only in
+        /// that view's timeline. The view must show `room_id` and belong to
+        /// `selection` itself, not merely to the same account ID; the
+        /// baseline keeps it, so the send checks the same timelines.
+        pub async fn edit_composition_with_view_for(
+            &self,
+            selection: &AccountSelection,
+            room_id: &str,
+            event_id: &str,
+            view: Option<&FocusedView>,
+        ) -> Result<EditComposition> {
+            if let Some(view) = view {
+                if view.room_id() != room_id || !view.owned_by(selection) {
+                    return Err(unavailable());
+                }
+            }
             tokio::time::timeout(Duration::from_secs(15), async {
                 let state = self.state.lock().await;
                 let loaded = selected_loaded_for(&state, selection.account_id())?;
                 let room = account_room(&state, selection.account_id(), room_id)?;
                 context(selection, &room)?;
                 let event_id = parse_event_id(event_id)?;
-                let revision = current_revision(loaded, &room, &event_id).await?;
+                let revision = current_revision(loaded, &room, &event_id, view).await?;
                 context(selection, &room)?;
                 pending_ready(loaded, &room, &event_id, &revision).await?;
                 context(selection, &room)?;
                 let inherited = inherited_reply_sender(selection, &room, &revision).await?;
                 context(selection, &room)?;
                 let text = restore_edit(&revision, room.own_user_id(), inherited.as_deref())?;
-                if current_revision(loaded, &room, &event_id).await? != revision {
+                if current_revision(loaded, &room, &event_id, view).await? != revision {
                     return Err(unavailable());
                 }
                 context(selection, &room)?;
@@ -5697,6 +5725,7 @@ mod composed_adapter {
                         event: event_id.to_string(),
                         revision,
                         inherited_reply_sender: inherited,
+                        view: view.cloned(),
                     },
                 })
             })
@@ -5777,7 +5806,8 @@ mod composed_adapter {
                             return Err(unavailable());
                         }
                         let event_id = parse_event_id(event_id)?;
-                        let revision = current_revision(loaded, &room, &event_id).await?;
+                        let view = baseline.view.as_ref();
+                        let revision = current_revision(loaded, &room, &event_id, view).await?;
                         if revision != baseline.revision {
                             return Err(unavailable());
                         }
@@ -5807,7 +5837,7 @@ mod composed_adapter {
                         bounded_event(&content)?;
                         // Re-read after the SDK's asynchronous author/type/relation
                         // work; never silently diff against a changed effective edit.
-                        if current_revision(loaded, &room, &event_id).await? != revision {
+                        if current_revision(loaded, &room, &event_id, view).await? != revision {
                             return Err(unavailable());
                         }
                         validate_mentions(selection, &room, &text).await?;
@@ -5815,7 +5845,7 @@ mod composed_adapter {
                             queue.subscribe().await.map_err(|_| pending())?;
                         reject_pending_echoes(&echoes, &event_id)?;
                         reconcile_pending_capacity(loaded, selection).await?;
-                        if current_revision(loaded, &room, &event_id).await? != revision {
+                        if current_revision(loaded, &room, &event_id, view).await? != revision {
                             return Err(unavailable());
                         }
                         context(selection, &room)?;
@@ -6063,7 +6093,7 @@ mod composed_adapter {
                 let Ok(event) = parse_event_id(&key.1) else {
                     continue;
                 };
-                let revision = current_revision(loaded, &room, &event).await;
+                let revision = current_revision(loaded, &room, &event, None).await;
                 if !selection.is_current() {
                     return Err(MatrixCoreError::SelectedAccountChanged);
                 }
@@ -6135,11 +6165,12 @@ mod composed_adapter {
         loaded: &LoadedAccount,
         room: &Room,
         event: &EventId,
+        view: Option<&FocusedView>,
     ) -> Result<EditRevision> {
         // The ordinary room view hides thread messages. Also inspect already
         // open thread timelines, but never fetch a target into a new view merely
         // to invent an effective replacement baseline.
-        let timelines: Vec<_> = loaded
+        let mut timelines: Vec<_> = loaded
             .timelines
             .lock()
             .await
@@ -6147,6 +6178,11 @@ mod composed_adapter {
             .filter(|timeline| timeline.room().room_id() == room.room_id())
             .cloned()
             .collect();
+        // A message opened from a focused conversation view may be only in
+        // that view's timeline, which the caller checked is its own.
+        if let Some(view) = view.filter(|view| view.room_id() == room.room_id().as_str()) {
+            timelines.push(view.timeline().clone());
+        }
         if timelines.len() > 64 {
             return Err(unavailable());
         }
@@ -7048,6 +7084,7 @@ mod composed_adapter {
                     json!({"msgtype":"m.text","body":"private source","m.mentions":{}}),
                 ),
                 inherited_reply_sender: None,
+                view: None,
             };
             assert!(baseline.matches(&first, "!private:example.org", "$private:example.org"));
             assert_eq!(format!("{baseline:?}"), "EditBaseline([redacted])");
