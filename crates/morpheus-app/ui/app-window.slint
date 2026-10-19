@@ -1,5 +1,5 @@
 import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView, Slider, SpinBox } from "std-widgets.slint";
-import { EncryptionDevices, TrustedDeviceItem } from "encryption-center.slint";
+import { EncryptionDevices, EncryptionPalette, SasVerificationPanel, TrustedDeviceItem } from "encryption-center.slint";
 
 // Optional overrides retain each control's existing color when absent.
 export struct ColorRole {
@@ -2166,6 +2166,18 @@ export component AppWindow inherits Window {
     in-out property <bool> encryption-devices-loading: false;
     in-out property <string> encryption-devices-error;
     in-out property <int> encryption-devices-operation: 0;
+    property <EncryptionPalette> encryption-palette: {
+        ink: root.ink,
+        muted: root.muted,
+        panel: root.panel,
+        elevated: root.elevated,
+        hover: root.hover,
+        accent: root.accent,
+        divider: root.divider,
+        focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent,
+        error: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483,
+        success: StyleTokens.roles.success.present ? StyleTokens.roles.success.color : root.accent
+    };
     in-out property <bool> native-call-enabled: false;
     in-out property <int> room-call-mode: 0;
     in-out property <bool> native-call-request-pending: false;
@@ -5118,128 +5130,34 @@ export component AppWindow inherits Window {
                             }
                             if root.security-error != "" : Text { text: root.security-error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
                             if root.security-notice != "" : Text { text: root.security-notice; color: StyleTokens.roles.success.present ? StyleTokens.roles.success.color : root.accent; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
-                            Timer {
-                                interval: 3s;
-                                running: root.page == 1 && !root.sas-busy && (root.sas-stage == 1 || root.sas-stage == 3 || root.sas-stage == 5);
-                                triggered => { root.refresh-sas-verification(); }
-                            }
-                            Timer {
-                                interval: 3s;
-                                running: root.page == 1 && root.sas-stage == 0 && !root.sas-incoming-loading && !root.security-busy;
-                                triggered => { root.refresh-incoming-verification(); }
-                            }
-                            Rectangle {
-                                height: (root.sas-stage == 4 ? 380px : root.sas-stage == 0 ? (root.sas-incoming-flow-id == "" ? 160px : 222px) : 250px) * root.text-scale;
-                                border-radius: 10px; background: root.elevated;
-                                VerticalLayout {
-                                    padding: 14px; spacing: 7px;
-                                    Text { text: "Verify this device"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
-                                    if root.sas-stage == 0 : Text {
-                                        text: "Start here, then approve on another signed-in, verified device of this account. Compare the values on both devices before confirming.";
-                                        color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
-                                    }
-                                    if root.sas-stage == 0 && root.sas-incoming-flow-id != "" : HorizontalLayout {
-                                        spacing: 8px;
-                                        Text {
-                                            text: "Another device on this account requested verification.";
-                                            color: root.accent; font-size: 11px * root.text-scale;
-                                            wrap: word-wrap; horizontal-stretch: 1;
-                                            accessible-live-region: polite;
-                                        }
-                                        Button {
-                                            text: root.sas-busy ? "Accepting…" : "Review request";
-                                            enabled: !root.sas-busy && !root.security-busy;
-                                            accessible-label: "Accept incoming verification request from another device on this account";
-                                            clicked => { root.accept-incoming-verification(); }
-                                        }
-                                    }
-                                    if root.sas-stage == 0 : Button {
-                                        width: 178px; text: root.sas-busy ? "Starting…" : "Verify with another device";
-                                        enabled: !root.sas-busy && !root.security-busy && root.security-recovery-key == "" && root.security-device-status == "Unverified";
-                                        accessible-label: "Request SAS verification from another device on this Matrix account";
-                                        clicked => { root.request-own-verification(); }
-                                    }
-                                    if root.sas-stage != 0 : Text {
-                                        text: root.sas-stage == 1 ? (root.sas-request-initiator
-                                            ? "Approve the verification request on your other device. Morpheus checks for its response while Settings is open."
-                                            : "Request accepted. Waiting for the requesting device to start the comparison.")
-                                            : root.sas-stage == 2 ? "The other device accepted. Start the short authentication string comparison."
-                                            : root.sas-stage == 3 ? "Waiting for the other device to accept the comparison. Keep both devices open."
-                                            : root.sas-stage == 4 ? "Compare every shown emoji or all three numbers with the other device. Confirm only if they match exactly."
-                                            : "Your confirmation was sent. Waiting for the other device to finish.";
-                                        color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite;
-                                    }
-                                    if root.sas-stage == 4 && root.sas-emoji != "" : Text {
-                                        text: root.sas-emoji; color: root.ink; font-size: 14px * root.text-scale;
-                                        wrap: word-wrap; accessible-label: "SAS emoji comparison: " + root.sas-emoji;
-                                    }
-                                    if root.sas-stage == 4 && root.sas-decimals != "" : Text {
-                                        text: "Numbers: " + root.sas-decimals; color: root.ink;
-                                        font-family: root.monospace-font-family; font-size: 14px * root.text-scale;
-                                        accessible-label: "SAS number comparison: " + root.sas-decimals;
-                                    }
-                                    if root.sas-stage == 4 : ActionRect {
-                                        height: 38px; border-radius: 7px;
-                                        background: root.sas-compared ? root.hover : root.panel;
-                                        border-color: root.sas-compared ? root.accent : root.divider;
-                                        border-width: 1px; focus-color: root.accent;
-                                        label: "I compared these values on both devices and they match exactly";
-                                        accessible-checkable: true; accessible-checked: root.sas-compared;
-                                        enabled: !root.sas-busy;
-                                        activated => { root.sas-compared = !root.sas-compared; }
-                                        Text {
-                                            x: 10px; width: parent.width - 20px; height: parent.height;
-                                            text: (root.sas-compared ? "✓ " : "○ ") + "I compared both devices; the values match";
-                                            color: root.ink; font-size: 11px * root.text-scale; vertical-alignment: center;
-                                        }
-                                    }
-                                    if root.sas-error != "" : Text { text: root.sas-error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483; font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
-                                    if root.sas-notice != "" : Text { text: root.sas-notice; color: StyleTokens.roles.success.present ? StyleTokens.roles.success.color : root.accent; font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
-                                    if root.sas-stage != 0 : HorizontalLayout {
-                                        spacing: 8px;
-                                        if root.sas-stage == 1 || root.sas-stage == 3 || root.sas-stage == 5 : Button {
-                                            text: root.sas-busy ? "Checking…" : "Check status";
-                                            enabled: !root.sas-busy;
-                                            accessible-label: "Check device verification progress";
-                                            clicked => { root.refresh-sas-verification(); }
-                                        }
-                                        if root.sas-stage == 2 : Button {
-                                            text: root.sas-busy ? "Starting…" : "Start comparison";
-                                            enabled: !root.sas-busy;
-                                            accessible-label: "Start or accept SAS comparison on this device";
-                                            clicked => { root.start-sas-verification(); }
-                                        }
-                                        if root.sas-stage == 4 : Button {
-                                            text: root.sas-busy ? "Confirming…" : "Confirm match";
-                                            primary: true; enabled: root.sas-compared && !root.sas-busy;
-                                            accessible-label: "Confirm that SAS values match on both devices";
-                                            clicked => { root.confirm-sas-verification(); }
-                                        }
-                                        if root.sas-stage == 4 : Button {
-                                            text: root.sas-busy ? "Reporting…" : "They don't match";
-                                            enabled: !root.sas-busy;
-                                            accessible-label: "The values differ: stop verification on both devices without trusting either";
-                                            clicked => { root.mismatch-sas-verification(); }
-                                        }
-                                        Button {
-                                            text: "Cancel verification";
-                                            enabled: !root.sas-busy;
-                                            accessible-label: "Cancel this verification request";
-                                            clicked => { root.cancel-sas-verification(); }
-                                        }
-                                    }
-                                }
+                            SasVerificationPanel {
+                                palette: root.encryption-palette;
+                                text-scale: root.text-scale;
+                                number-font: root.monospace-font-family;
+                                active: root.page == 1;
+                                stage: root.sas-stage;
+                                busy: root.sas-busy;
+                                request-initiator: root.sas-request-initiator;
+                                compared <=> root.sas-compared;
+                                emoji: root.sas-emoji;
+                                decimals: root.sas-decimals;
+                                error: root.sas-error;
+                                notice: root.sas-notice;
+                                incoming-pending: root.sas-incoming-flow-id != "";
+                                incoming-loading: root.sas-incoming-loading;
+                                blocked: root.security-busy;
+                                can-request: !root.security-busy && root.security-recovery-key == "" && root.security-device-status == "Unverified";
+                                poll-incoming => { root.refresh-incoming-verification(); }
+                                accept-incoming => { root.accept-incoming-verification(); }
+                                request-own => { root.request-own-verification(); }
+                                refresh => { root.refresh-sas-verification(); }
+                                start => { root.start-sas-verification(); }
+                                confirm => { root.confirm-sas-verification(); }
+                                mismatch => { root.mismatch-sas-verification(); }
+                                cancel => { root.cancel-sas-verification(); }
                             }
                             EncryptionDevices {
-                                palette: {
-                                    ink: root.ink,
-                                    muted: root.muted,
-                                    panel: root.panel,
-                                    elevated: root.elevated,
-                                    divider: root.divider,
-                                    error: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483,
-                                    success: StyleTokens.roles.success.present ? StyleTokens.roles.success.color : root.accent
-                                };
+                                palette: root.encryption-palette;
                                 text-scale: root.text-scale;
                                 devices: root.encryption-devices;
                                 loading: root.encryption-devices-loading;

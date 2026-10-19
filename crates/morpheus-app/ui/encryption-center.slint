@@ -1,7 +1,8 @@
-// Encryption center: this account's signed-in devices and their trust. Rust
-// supplies every row and decides which devices may be verified; this file
-// only lays them out and reports Refresh, Verify and settings-search reveals.
-// It cannot import the window's globals, so the window passes resolved colors.
+// Encryption center: SAS verification of this device and this account's
+// signed-in devices with their trust. Rust owns every state transition and
+// decides which actions are allowed; this file only lays them out and reports
+// the person's explicit choices. It cannot import the window's globals, so
+// the window passes resolved colors.
 
 import { Button } from "std-widgets.slint";
 
@@ -10,9 +11,242 @@ export struct EncryptionPalette {
     muted: color,
     panel: color,
     elevated: color,
+    hover: color,
+    accent: color,
     divider: color,
+    focus: color,
     error: color,
     success: color,
+}
+
+// A keyboard and pointer toggle with caller-supplied visuals.
+component CompareToggle inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <bool> checked;
+    in property <color> focus-color;
+    callback toggled();
+    forward-focus: keyboard-focus;
+    accessible-role: checkbox;
+    accessible-label: root.label;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if root.enabled { root.toggled(); } }
+    @children
+    keyboard-focus := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == Key.Space || event.text == Key.Return {
+                if root.enabled { root.toggled(); }
+                accept
+            } else {
+                reject
+            }
+        }
+    }
+    TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => {
+            keyboard-focus.focus();
+            root.toggled();
+        }
+    }
+    if keyboard-focus.has-focus : Rectangle {
+        border-radius: parent.border-radius;
+        border-width: 2px;
+        border-color: root.focus-color;
+        background: transparent;
+    }
+}
+
+// Stages: 0 idle, 1 waiting for the request, 2 ready to start, 3 waiting for
+// values, 4 comparing, 5 waiting for the other device to finish.
+export component SasVerificationPanel inherits Rectangle {
+    in property <EncryptionPalette> palette;
+    in property <float> text-scale: 1;
+    in property <string> number-font;
+    // Settings is showing; progress checks run only then.
+    in property <bool> active;
+    in property <int> stage;
+    in property <bool> busy;
+    in property <bool> request-initiator;
+    // Set only by the person, after comparing both devices.
+    in-out property <bool> compared;
+    in property <string> emoji;
+    in property <string> decimals;
+    in property <string> error;
+    in property <string> notice;
+    in property <bool> incoming-pending;
+    in property <bool> incoming-loading;
+    // Another security operation owns this account.
+    in property <bool> blocked;
+    // This device is unverified and no new recovery key is waiting.
+    in property <bool> can-request;
+    callback poll-incoming();
+    callback accept-incoming();
+    callback request-own();
+    callback refresh();
+    callback start();
+    callback confirm();
+    callback mismatch();
+    callback cancel();
+
+    border-radius: 10px;
+    background: root.palette.elevated;
+    height: content.preferred-height;
+
+    Timer {
+        interval: 3s;
+        running: root.active && !root.busy && (root.stage == 1 || root.stage == 3 || root.stage == 5);
+        triggered => { root.refresh(); }
+    }
+    Timer {
+        interval: 3s;
+        running: root.active && root.stage == 0 && !root.incoming-loading && !root.blocked;
+        triggered => { root.poll-incoming(); }
+    }
+
+    content := VerticalLayout {
+        padding: 14px;
+        spacing: 7px;
+        Text {
+            text: "Verify this device";
+            color: root.palette.ink;
+            font-size: 13px * root.text-scale;
+            font-weight: 700;
+        }
+        if root.stage == 0 : Text {
+            text: "Start here, then approve on another signed-in, verified device of this account. Compare the values on both devices before confirming.";
+            color: root.palette.muted;
+            font-size: 11px * root.text-scale;
+            wrap: word-wrap;
+        }
+        if root.stage == 0 && root.incoming-pending : HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "Another device on this account requested verification.";
+                color: root.palette.accent;
+                font-size: 11px * root.text-scale;
+                wrap: word-wrap;
+                horizontal-stretch: 1;
+                accessible-live-region: polite;
+            }
+            Button {
+                text: root.busy ? "Accepting…" : "Review request";
+                enabled: !root.busy && !root.blocked;
+                accessible-label: "Accept incoming verification request from another device on this account";
+                clicked => { root.accept-incoming(); }
+            }
+        }
+        if root.stage == 0 : HorizontalLayout {
+            alignment: start;
+            Button {
+                text: root.busy ? "Starting…" : "Verify with another device";
+                enabled: !root.busy && root.can-request;
+                accessible-label: "Request SAS verification from another device on this Matrix account";
+                clicked => { root.request-own(); }
+            }
+        }
+        if root.stage != 0 : Text {
+            text: root.stage == 1 ? (root.request-initiator
+                ? "Approve the verification request on your other device. Morpheus checks for its response while Settings is open."
+                : "Request accepted. Waiting for the requesting device to start the comparison.")
+                : root.stage == 2 ? "The other device accepted. Start the short authentication string comparison."
+                : root.stage == 3 ? "Waiting for the other device to accept the comparison. Keep both devices open."
+                : root.stage == 4 ? "Compare every shown emoji or all three numbers with the other device. Confirm only if they match exactly."
+                : "Your confirmation was sent. Waiting for the other device to finish.";
+            color: root.palette.muted;
+            font-size: 11px * root.text-scale;
+            wrap: word-wrap;
+            accessible-live-region: polite;
+        }
+        if root.stage == 4 && root.emoji != "" : Text {
+            text: root.emoji;
+            color: root.palette.ink;
+            font-size: 14px * root.text-scale;
+            wrap: word-wrap;
+            accessible-label: "SAS emoji comparison: " + root.emoji;
+        }
+        if root.stage == 4 && root.decimals != "" : Text {
+            text: "Numbers: " + root.decimals;
+            color: root.palette.ink;
+            font-family: root.number-font;
+            font-size: 14px * root.text-scale;
+            accessible-label: "SAS number comparison: " + root.decimals;
+        }
+        if root.stage == 4 : CompareToggle {
+            height: 38px;
+            border-radius: 7px;
+            background: root.compared ? root.palette.hover : root.palette.panel;
+            border-color: root.compared ? root.palette.accent : root.palette.divider;
+            border-width: 1px;
+            focus-color: root.palette.focus;
+            label: "I compared these values on both devices and they match exactly";
+            checked: root.compared;
+            enabled: !root.busy;
+            toggled => { root.compared = !root.compared; }
+            Text {
+                x: 10px;
+                width: parent.width - 20px;
+                height: parent.height;
+                text: (root.compared ? "✓ " : "○ ") + "I compared both devices; the values match";
+                color: root.palette.ink;
+                font-size: 11px * root.text-scale;
+                vertical-alignment: center;
+            }
+        }
+        if root.error != "" : Text {
+            text: root.error;
+            color: root.palette.error;
+            font-size: 11px * root.text-scale;
+            wrap: word-wrap;
+            accessible-live-region: polite;
+        }
+        if root.notice != "" : Text {
+            text: root.notice;
+            color: root.palette.success;
+            font-size: 11px * root.text-scale;
+            wrap: word-wrap;
+            accessible-live-region: polite;
+        }
+        if root.stage != 0 : HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            if root.stage == 1 || root.stage == 3 || root.stage == 5 : Button {
+                text: root.busy ? "Checking…" : "Check status";
+                enabled: !root.busy;
+                accessible-label: "Check device verification progress";
+                clicked => { root.refresh(); }
+            }
+            if root.stage == 2 : Button {
+                text: root.busy ? "Starting…" : "Start comparison";
+                enabled: !root.busy;
+                accessible-label: "Start or accept SAS comparison on this device";
+                clicked => { root.start(); }
+            }
+            if root.stage == 4 : Button {
+                text: root.busy ? "Confirming…" : "Confirm match";
+                primary: true;
+                enabled: root.compared && !root.busy;
+                accessible-label: "Confirm that SAS values match on both devices";
+                clicked => { root.confirm(); }
+            }
+            if root.stage == 4 : Button {
+                text: root.busy ? "Reporting…" : "They don't match";
+                enabled: !root.busy;
+                accessible-label: "The values differ: stop verification on both devices without trusting either";
+                clicked => { root.mismatch(); }
+            }
+            Button {
+                text: "Cancel verification";
+                enabled: !root.busy;
+                accessible-label: "Cancel this verification request";
+                clicked => { root.cancel(); }
+            }
+        }
+    }
 }
 
 export struct TrustedDeviceItem {

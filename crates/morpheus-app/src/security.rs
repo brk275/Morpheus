@@ -335,6 +335,12 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
                 );
             }
         }
+        if response == CloseRequestResponse::HideWindow
+            && let Some(window) = close_weak.upgrade()
+        {
+            // A hidden window keeps running; it must not keep a typed secret.
+            window.set_security_recovery_input("".into());
+        }
         response
     });
 
