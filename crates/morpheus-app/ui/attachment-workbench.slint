@@ -32,6 +32,11 @@ export struct AttachmentPalette {
     hover: color,
     // The control pressed state, else the hover color.
     pressed: color,
+    // Whether a theme or config.toml set the hover or pressed state. A set
+    // state shows on the primary Send action too; otherwise it keeps the
+    // accent.
+    hover-set: bool,
+    pressed-set: bool,
     divider: color,
     focus: color,
     error: color,
@@ -59,17 +64,22 @@ component QueueAction inherits Rectangle {
     in property <float> text-scale: 1;
     callback activated();
     width: action-text.preferred-width + 2 * root.style.action-padding;
+    // Never shorter than its own caption line plus 4 px above and below.
+    min-height: action-text.preferred-height + 8px;
     border-radius: root.style.control-radius;
-    background: root.primary ? root.palette.accent
-        : hit.pressed ? root.palette.pressed
-        : hit.has-hover ? root.palette.hover : transparent;
+    // A configured state shows over the primary accent too, with plain ink.
+    property <bool> state-shown: (hit.pressed && root.palette.pressed-set)
+        || (hit.has-hover && root.palette.hover-set);
+    background: hit.pressed && (root.palette.pressed-set || !root.primary) ? root.palette.pressed
+        : hit.has-hover && (root.palette.hover-set || !root.primary) ? root.palette.hover
+        : root.primary ? root.palette.accent : transparent;
     forward-focus: keyboard-focus;
     accessible-role: button;
     accessible-label: root.label;
     accessible-action-default => { root.activated(); }
     action-text := Text {
         text: root.text;
-        color: root.primary ? root.palette.accent-ink : root.palette.ink;
+        color: root.primary && !root.state-shown ? root.palette.accent-ink : root.palette.ink;
         font-size: 11px * root.text-scale;
         font-weight: 700;
         horizontal-alignment: center;
@@ -112,9 +122,16 @@ export component AttachmentQueue inherits Rectangle {
     // (item id, 0 remove, 1 cancel, 2 retry)
     callback action(int, int);
 
-    // The header grows with large text so Send never clips; 30 px by default.
-    property <length> header-height: max(30px, 18px * root.text-scale + 8px);
-    property <length> row-height: max(32px, 20px * root.text-scale + 12px);
+    // Heights follow the natural line heights of the queue's own captions in
+    // the configured font and text size (measured by the hidden probes
+    // below), never below the built-in 30 px header and 32 px row. Send is
+    // its caption plus 4 px above and below, 2 px inside the header.
+    property <length> header-height: max(30px, action-probe.preferred-height + 12px);
+    // Name and status lines, 2 px apart, 3 px row padding above and below;
+    // and room for an action's caption plus its own padding.
+    property <length> row-height: max(32px,
+        name-probe.preferred-height + status-probe.preferred-height + 2px + 6px,
+        action-probe.preferred-height + 8px + 6px);
     // Rows beyond three scroll inside the list.
     out property <length> needed-height: root.items.length == 0 ? 0px : root.header-height + min(3, root.items.length) * root.row-height;
 
@@ -246,5 +263,32 @@ export component AttachmentQueue inherits Rectangle {
                 }
             }
         }
+    }
+
+    // Zero-size, hidden probes with the captions' exact fonts. Their
+    // preferred heights are intrinsic, so measuring them never feeds back
+    // into this queue's own size.
+    action-probe := Text {
+        x: 0px; y: 0px; width: 0px; height: 0px;
+        visible: false;
+        text: "Send";
+        font-size: 11px * root.text-scale;
+        font-weight: 700;
+        accessible-role: none;
+    }
+    name-probe := Text {
+        x: 0px; y: 0px; width: 0px; height: 0px;
+        visible: false;
+        text: "Name";
+        font-size: 11px * root.text-scale;
+        font-weight: 700;
+        accessible-role: none;
+    }
+    status-probe := Text {
+        x: 0px; y: 0px; width: 0px; height: 0px;
+        visible: false;
+        text: "Status";
+        font-size: 10px * root.text-scale;
+        accessible-role: none;
     }
 }

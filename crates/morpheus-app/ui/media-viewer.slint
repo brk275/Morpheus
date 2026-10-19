@@ -17,6 +17,11 @@ export struct ViewerPalette {
     hover: color,
     // The control pressed state, else the hover color.
     pressed: color,
+    // Whether a theme or config.toml set the hover or pressed state. A set
+    // state shows on the primary Close action too; otherwise it keeps the
+    // accent.
+    hover-set: bool,
+    pressed-set: bool,
     // The control disabled state; used only when `disabled-set`, otherwise an
     // unavailable action keeps its built-in dimming.
     disabled: color,
@@ -53,12 +58,16 @@ component ViewerAction inherits Rectangle {
     out property <bool> has-focus: keyboard-focus.has-focus;
     callback activated();
     width: max(32px, action-text.preferred-width + 2 * root.style.action-padding);
-    // 30 px by default; large text or icons grow it rather than clip.
-    height: max(30px, 14px * root.text-scale + 8px, 18px * root.style.glyph-scale + 12px);
+    // The caption's own line height (any font, text scale and, for glyphs, icon
+    // scale together) plus 6 px above and below; never below the built-in 30 px.
+    height: max(30px, action-text.preferred-height + 12px);
     border-radius: root.style.control-radius;
-    background: root.primary && root.enabled ? root.palette.accent
-        : hit.pressed && root.enabled ? root.palette.pressed
-        : hit.has-hover && root.enabled ? root.palette.hover : transparent;
+    // A configured state shows over the primary accent too, with plain ink.
+    property <bool> state-shown: root.enabled && ((hit.pressed && root.palette.pressed-set)
+        || (hit.has-hover && root.palette.hover-set));
+    background: root.enabled && hit.pressed && (root.palette.pressed-set || !root.primary) ? root.palette.pressed
+        : root.enabled && hit.has-hover && (root.palette.hover-set || !root.primary) ? root.palette.hover
+        : root.primary && root.enabled ? root.palette.accent : transparent;
     opacity: root.enabled || root.palette.disabled-set ? 1 : 0.45;
     forward-focus: keyboard-focus;
     accessible-role: button;
@@ -70,7 +79,7 @@ component ViewerAction inherits Rectangle {
     action-text := Text {
         text: root.text;
         color: !root.enabled && root.palette.disabled-set ? root.palette.disabled
-            : root.primary && root.enabled ? root.palette.accent-ink : root.palette.ink;
+            : root.primary && root.enabled && !root.state-shown ? root.palette.accent-ink : root.palette.ink;
         font-size: 12px * root.text-scale * (root.glyph ? root.style.glyph-scale : 1);
         font-weight: 700;
         horizontal-alignment: center;
