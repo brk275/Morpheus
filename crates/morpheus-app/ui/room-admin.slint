@@ -232,6 +232,8 @@ export component RoomMembersPanel inherits VerticalLayout {
     in property <bool> can-invite;
     // Ban by Matrix user ID, including people who are not in the room.
     in property <bool> can-ban-id;
+    // Remove recent messages by Matrix user ID, including people who left.
+    in property <bool> can-remove-id;
     in property <int> own-level;
     in property <int> member-level;
     in-out property <string> query;
@@ -254,7 +256,8 @@ export component RoomMembersPanel inherits VerticalLayout {
     callback select(string);
     callback invite();
     // 1 kick, 2 ban, 3 unban, 4 set level, 5 approve request, 6 deny request,
-    // 7 remove recent messages, 8 ban the user ID in the invite field
+    // 7 remove recent messages, 8 ban the user ID in the invite field,
+    // 9 remove the recent messages of the user ID in the invite field
     callback request(int);
     // A permission's key and the requested level text.
     callback request-permission(int, string);
@@ -399,38 +402,54 @@ export component RoomMembersPanel inherits VerticalLayout {
                     }
                 }
             }
-            if root.ready && (root.can-invite || root.can-ban-id) : HorizontalLayout {
-                spacing: 6px;
-                RosterField {
-                    horizontal-stretch: 1;
-                    palette: root.palette;
-                    text-scale: root.text-scale;
-                    placeholder: root.can-invite ? "Invite @name:example.org" : "Ban @name:example.org";
-                    label: root.can-invite ? "Matrix user ID to invite to this room" : "Matrix user ID to ban from this room";
-                    enabled: !root.busy;
-                    text <=> root.invite-input;
-                    accepted => {
-                        if !root.busy && root.invite-input != "" {
-                            if root.can-invite { root.invite(); } else { root.request(8); }
+            if root.ready && (root.can-invite || root.can-ban-id || root.can-remove-id) : VerticalLayout {
+                spacing: 4px;
+                HorizontalLayout {
+                    spacing: 6px;
+                    RosterField {
+                        horizontal-stretch: 1;
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        placeholder: root.can-invite ? "Invite @name:example.org" : "@name:example.org";
+                        label: root.can-invite ? "Matrix user ID to invite to this room" : "Matrix user ID to moderate in this room";
+                        enabled: !root.busy;
+                        text <=> root.invite-input;
+                        accepted => {
+                            if !root.busy && root.invite-input != "" {
+                                if root.can-invite { root.invite(); } else if root.can-ban-id { root.request(8); }
+                            }
                         }
                     }
+                    if root.can-invite : RosterButton {
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        text: "Invite";
+                        label: "Invite this Matrix user to the room";
+                        enabled: !root.busy && root.invite-input != "";
+                        activated => { root.invite(); }
+                    }
                 }
-                if root.can-invite : RosterButton {
-                    palette: root.palette;
-                    text-scale: root.text-scale;
-                    text: "Invite";
-                    label: "Invite this Matrix user to the room";
-                    enabled: !root.busy && root.invite-input != "";
-                    activated => { root.invite(); }
-                }
-                if root.can-ban-id : RosterButton {
-                    palette: root.palette;
-                    text-scale: root.text-scale;
-                    text: "Ban…";
-                    destructive: true;
-                    label: "Review banning this Matrix user, even if they are not in the room";
-                    enabled: !root.busy && root.invite-input != "";
-                    activated => { root.request(8); }
+                // Moderation by ID reaches people who already left.
+                if root.can-ban-id || root.can-remove-id : HorizontalLayout {
+                    spacing: 5px; alignment: start;
+                    if root.can-ban-id : RosterButton {
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        text: "Ban…";
+                        destructive: true;
+                        label: "Review banning this Matrix user, even if they are not in the room";
+                        enabled: !root.busy && root.invite-input != "";
+                        activated => { root.request(8); }
+                    }
+                    if root.can-remove-id : RosterButton {
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        text: "Remove messages…";
+                        destructive: true;
+                        label: "Review removing the recent messages of this Matrix user, even if they left";
+                        enabled: !root.busy && root.invite-input != "";
+                        activated => { root.request(9); }
+                    }
                 }
             }
         }

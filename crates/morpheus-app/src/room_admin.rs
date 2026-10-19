@@ -45,6 +45,7 @@ const REMOVE_BODY: &str = "including files and reactions, are removed for everyo
 const REMOVE_UNFINISHED: &str =
     "Removing messages did not finish. Some may already be gone; check the conversation.";
 const LEAVE_INSTEAD: &str = "Use Leave room to remove yourself.";
+const OWN_MESSAGES: &str = "Remove your own messages from the conversation itself.";
 const SELF_DEMOTION: &str =
     "You cannot raise it again yourself; someone with a higher level would have to.";
 const DEMOTION: &str = "They lose permissions that need a higher level.";
@@ -95,6 +96,8 @@ pub(crate) const DENY: i32 = 6;
 pub(crate) const REMOVE_MESSAGES: i32 = 7;
 /// Ban the Matrix user ID typed in the invite field.
 pub(crate) const BAN_ID: i32 = 8;
+/// Remove the recent messages of the Matrix user ID typed in the invite field.
+pub(crate) const REMOVE_ID: i32 = 9;
 
 /// Access rows in the permissions view: history visibility, guest access and
 /// end-to-end encryption.
@@ -882,23 +885,63 @@ pub(crate) fn invite_intent(input: &str, snapshot: &RoomAdminSnapshot) -> Result
 }
 
 /// Ban by Matrix user ID, including someone who already left or never
-/// joined. A listed member is reviewed as their row shows them; the session
-/// still checks the server's current membership and levels before sending.
+/// joined.
 pub(crate) fn ban_intent(input: &str, snapshot: &RoomAdminSnapshot) -> Result<Intent, String> {
+    by_id_intent(AdminAction::Ban, input, snapshot)
+}
+
+/// Remove the recent messages of a Matrix user ID, including someone who
+/// already left.
+pub(crate) fn remove_intent(input: &str, snapshot: &RoomAdminSnapshot) -> Result<Intent, String> {
+    by_id_intent(AdminAction::RemoveMessages, input, snapshot)
+}
+
+/// The account may remove other members' messages under the snapshot's
+/// rules; the session checks the exact rule before sending.
+pub(crate) fn can_remove_by_id(snapshot: &RoomAdminSnapshot) -> bool {
+    let Some(levels) = snapshot.thresholds else {
+        return false;
+    };
+    snapshot.own_power >= MemberPower::Level(levels.redact)
+}
+
+/// A ban or message removal by typed Matrix user ID. A listed member is
+/// reviewed as their row shows them, with the member card's refusals; anyone
+/// else is reviewed as not in the room. The session still checks the
+/// server's current membership and levels before sending.
+fn by_id_intent(
+    action: AdminAction,
+    input: &str,
+    snapshot: &RoomAdminSnapshot,
+) -> Result<Intent, String> {
     let user_id = shaped_user_id(input)?;
-    if !snapshot.own.ban {
-        return Err(permission_text(AdminAction::Ban, snapshot));
+    let banning = action == AdminAction::Ban;
+    let allowed = if banning {
+        snapshot.own.ban
+    } else {
+        can_remove_by_id(snapshot)
+    };
+    if !allowed {
+        return Err(permission_text(action, snapshot));
     }
+    let permits = |member: &AdminMember| {
+        if banning {
+            member.actions.ban
+        } else {
+            member.actions.remove_messages
+        }
+    };
     let existing = snapshot.member(user_id);
     let name = existing.map_or_else(|| crate::directory_plain_text(user_id, 260), display_name);
     let expected = match existing {
-        Some(member) if member.is_self => return Err(LEAVE_INSTEAD.to_owned()),
-        Some(member) if member.membership == AdminMembership::Ban => {
+        Some(member) if member.is_self && banning => return Err(LEAVE_INSTEAD.to_owned()),
+        Some(member) if member.is_self => return Err(OWN_MESSAGES.to_owned()),
+        Some(member) if banning && member.membership == AdminMembership::Ban => {
             return Err(format!("{name} is already banned."));
         }
         Some(member) if member.power == MemberPower::Creator => return Err(CREATOR.to_owned()),
-        Some(member) if !member.actions.ban => {
-            return Err(permission_text(AdminAction::Ban, snapshot));
+        Some(member) if !permits(member) => {
+            return Err(permission_text(action, snapshot));
         }
         Some(member) => MemberExpectation {
             membership: Some(member.membership),
@@ -910,7 +953,7 @@ pub(crate) fn ban_intent(input: &str, snapshot: &RoomAdminSnapshot) -> Result<In
         },
     };
     Ok(Intent {
-        action: AdminAction::Ban,
+        action,
         user_id: user_id.to_owned(),
         name,
         expected,
@@ -1751,6 +1794,28 @@ mod tests {
         assert_eq!(confirmation(&listed, &snapshot).unwrap().body, BAN_BODY);
         snapshot.own.ban = false;
         assert!(ban_intent("@spam:example.org", &snapshot).is_err());
+    }
+
+    #[test]
+    fn removing_messages_by_id_reaches_people_who_left_at_the_redaction_level() {
+        let mut own = member("@me:example.org", None, AdminMembership::Join);
+        own.is_self = true;
+        let peer = member("@peer:example.org", None, AdminMembership::Join);
+        let mut snapshot = roster(vec![own, peer], 50);
+        assert!(can_remove_by_id(&snapshot));
+        let yours = remove_intent("@me:example.org", &snapshot);
+        assert_eq!(yours, Err(OWN_MESSAGES.to_owned()));
+        // A listed member needs the member card's permission.
+        assert!(remove_intent("@peer:example.org", &snapshot).is_err());
+        let gone = remove_intent(" @spam:example.org ", &snapshot).unwrap();
+        assert_eq!(gone.action, AdminAction::RemoveMessages);
+        assert_eq!(gone.user_id, "@spam:example.org");
+        assert_eq!(gone.expected.membership, None);
+        assert!(confirmation(&gone, &snapshot).unwrap().destructive);
+        snapshot.own_power = MemberPower::Level(0);
+        assert!(!can_remove_by_id(&snapshot));
+        let low = remove_intent("@spam:example.org", &snapshot).unwrap_err();
+        assert!(low.starts_with("Removing others' messages needs level 50"));
     }
 
     #[test]

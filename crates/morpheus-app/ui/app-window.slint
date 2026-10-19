@@ -1903,6 +1903,7 @@ export component AppWindow inherits Window {
     in-out property <string> roster-notice;
     in-out property <bool> roster-can-invite: false;
     in-out property <bool> roster-can-ban-id: false;
+    in-out property <bool> roster-can-remove-id: false;
     in-out property <int> roster-own-level: 0;
     in-out property <int> roster-member-level: 0;
     in-out property <string> roster-query;
@@ -5926,6 +5927,7 @@ export component AppWindow inherits Window {
                     notice: root.roster-notice;
                     can-invite: root.roster-can-invite;
                     can-ban-id: root.roster-can-ban-id;
+                    can-remove-id: root.roster-can-remove-id;
                     own-level: root.roster-own-level;
                     member-level: root.roster-member-level;
                     query <=> root.roster-query;
