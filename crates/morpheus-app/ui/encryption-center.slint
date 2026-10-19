@@ -308,6 +308,63 @@ export component VerificationRequestBanner inherits Rectangle {
     }
 }
 
+// Warns that a member of the open room has a changed identity. Accepting a
+// changed identity or withdrawing a lost verification is the person's
+// explicit choice; there is no dismiss, because the warning stays until the
+// identity is resolved.
+export component IdentityWarningBanner inherits Rectangle {
+    in property <EncryptionPalette> palette;
+    in property <float> text-scale: 1;
+    // Display name, or the user ID when the member has none.
+    in property <string> name;
+    // 1: the identity changed; 2: a verified identity changed.
+    in property <int> kind;
+    // Further members with a warning in this room.
+    in property <int> others;
+    in property <bool> busy;
+    in property <string> error;
+    callback acknowledge();
+
+    background: root.palette.panel;
+    height: row.preferred-height;
+
+    row := HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 8px;
+        padding-top: 4px;
+        padding-bottom: 4px;
+        spacing: 8px;
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: (root.kind == 2
+                    ? root.name + "'s verified identity has changed. Messages stay encrypted, but confirm the change with them before trusting it."
+                    : root.name + "'s identity has changed. Messages stay encrypted, but confirm the change with them another way before sharing anything sensitive.")
+                    + (root.others == 1 ? " One more member's identity also changed." : root.others > 1 ? " " + root.others + " more members' identities also changed." : "");
+                color: root.kind == 2 ? root.palette.error : root.palette.ink;
+                font-size: 11px * root.text-scale;
+                wrap: word-wrap;
+                accessible-live-region: polite;
+            }
+            if root.error != "" : Text {
+                text: root.error;
+                color: root.palette.error;
+                font-size: 11px * root.text-scale;
+                wrap: word-wrap;
+                accessible-live-region: polite;
+            }
+        }
+        Button {
+            text: root.busy ? "Saving…" : root.kind == 2 ? "Withdraw verification" : "Accept change";
+            enabled: !root.busy;
+            accessible-label: (root.kind == 2 ? "Withdraw the lost verification of " : "Accept the changed identity of ") + root.name;
+            clicked => { root.acknowledge(); }
+        }
+    }
+}
+
 export struct TrustedDeviceItem {
     // Opaque Matrix device ID; it only names the Verify target.
     device-id: string,

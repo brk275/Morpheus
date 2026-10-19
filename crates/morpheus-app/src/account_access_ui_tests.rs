@@ -2671,6 +2671,11 @@ async fn exercise_account_ui(runtime: Handle) {
     ui.set_device_rename_id("PRIVATEID".into());
     ui.set_device_rename_input("private draft name".into());
     ui.set_device_session_notice("private device notice".into());
+    // A room member's identity warning names a private member.
+    ui.set_identity_warning_user("@member:example.org".into());
+    ui.set_identity_warning_name("private member name".into());
+    ui.set_identity_warning_kind(2);
+    ui.set_identity_warning_error("private warning error".into());
     settle(&ui).await;
     assert_eq!(control_bounds(&ui, "One-time Matrix recovery key").len(), 1);
     live.account_detached(ui.as_weak()).await;
@@ -2729,6 +2734,10 @@ async fn exercise_account_ui(runtime: Handle) {
     assert!(ui.get_device_rename_id().is_empty());
     assert!(ui.get_device_rename_input().is_empty());
     assert!(ui.get_device_session_notice().is_empty());
+    assert!(ui.get_identity_warning_user().is_empty());
+    assert!(ui.get_identity_warning_name().is_empty());
+    assert_eq!(ui.get_identity_warning_kind(), 0);
+    assert!(ui.get_identity_warning_error().is_empty());
     assert!(manager.active_account().await.is_none());
 
     assert_removed_account_menu_projection(&ui);

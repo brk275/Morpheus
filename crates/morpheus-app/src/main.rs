@@ -17,6 +17,7 @@ mod device_sessions;
 mod draft_recovery;
 mod drafts;
 mod encryption_center;
+mod identity_warnings;
 mod image_previews;
 #[cfg(feature = "native-calls")]
 mod incoming_ring;

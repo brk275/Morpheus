@@ -1,5 +1,5 @@
 import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView, Slider, SpinBox } from "std-widgets.slint";
-import { EncryptionDevices, EncryptionPalette, SasVerificationPanel, TrustedDeviceItem, VerificationRequestBanner } from "encryption-center.slint";
+import { EncryptionDevices, EncryptionPalette, IdentityWarningBanner, SasVerificationPanel, TrustedDeviceItem, VerificationRequestBanner } from "encryption-center.slint";
 
 // Optional overrides retain each control's existing color when absent.
 export struct ColorRole {
@@ -2183,6 +2183,14 @@ export component AppWindow inherits Window {
     // one the person chose to hide; opaque flow IDs, never shown.
     in-out property <string> encryption-incoming-flow-id;
     in-out property <string> encryption-incoming-dismissed;
+    // First identity-change warning of the open room (src/identity_warnings.rs);
+    // the user ID is opaque and only returned with the explicit choice.
+    in-out property <string> identity-warning-user;
+    in-out property <string> identity-warning-name;
+    in-out property <int> identity-warning-kind: 0;
+    in-out property <int> identity-warning-others: 0;
+    in-out property <bool> identity-warning-busy: false;
+    in-out property <string> identity-warning-error;
     property <EncryptionPalette> encryption-palette: {
         ink: root.ink,
         muted: root.muted,
@@ -2483,6 +2491,8 @@ export component AppWindow inherits Window {
     callback open-device-signout-page();
     callback continue-device-signout();
     callback cancel-device-signout();
+    callback identity-scope-changed();
+    callback acknowledge-identity-warning();
 
     in-out property <bool> account-menu-open: false;
     in-out property <bool> manage-accounts-open: false;
@@ -2568,6 +2578,9 @@ export component AppWindow inherits Window {
     // or hides them before a stale choice can act.
     property <string> sticker-scope: root.active-account-local-id + "\n" + root.active-room-id + "\n" + root.thread-root-id + "\n" + root.composer-mode + "\n" + root.side-panel-tab;
     changed sticker-scope => { root.sticker-context-changed(); }
+    // Identity warnings follow exactly one live account and room view.
+    property <string> identity-scope: (root.live-session ? "live" : "") + "\n" + root.active-account-local-id + "\n" + root.active-room-id;
+    changed identity-scope => { root.identity-scope-changed(); }
     property <bool> composer-focus-thread: false;
     property <int> composer-focus-request: 0;
 
@@ -3444,6 +3457,16 @@ export component AppWindow inherits Window {
                         root.settings-search-choose("security.recovery");
                     }
                     dismiss => { root.encryption-incoming-dismissed = root.encryption-incoming-flow-id; }
+                }
+                if root.live-session && root.page == 0 && root.identity-warning-user != "" : IdentityWarningBanner {
+                    palette: root.encryption-palette;
+                    text-scale: root.text-scale;
+                    name: root.identity-warning-name;
+                    kind: root.identity-warning-kind;
+                    others: root.identity-warning-others;
+                    busy: root.identity-warning-busy;
+                    error: root.identity-warning-error;
+                    acknowledge => { root.acknowledge-identity-warning(); }
                 }
                 if root.config-error != "" : Rectangle {
                     height: 39px;

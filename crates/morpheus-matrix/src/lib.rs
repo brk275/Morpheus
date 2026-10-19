@@ -65,6 +65,11 @@ pub use device_sessions::{
     DeviceSignOutBlocker, DeviceSignOutChallenge, DeviceSignOutStep, MAX_DEVICE_NAME_CHARS,
     bounded_device_name,
 };
+mod identity_warnings;
+pub use identity_warnings::{
+    IdentityAckError, IdentityWarning, IdentityWarningFeed, IdentityWarningKind, IdentityWarnings,
+    MAX_IDENTITY_WARNINGS,
+};
 
 use std::{
     collections::{HashMap, HashSet},
