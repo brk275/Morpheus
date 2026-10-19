@@ -132,6 +132,7 @@ fn call_error(value: CallControllerError) {
         CallControllerError::TimedOut(_) => "timed_out",
         CallControllerError::Cleanup(_) => "cleanup",
         CallControllerError::Update(_) => "update",
+        CallControllerError::ConnectionLost(_) => "connection_lost",
     });
 }
 // Fixed enum categories preserve the failing boundary without SDK text or IDs.
