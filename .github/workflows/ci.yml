@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
-name: Reviewed pinned-message focused checks
-run-name: Pinned-message focused checks - 3682101 - ${{ inputs.platform }}
+name: Reviewed pinned-message UI teardown check
+run-name: Pinned-message UI teardown check - da94b10 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: pinned-focused-3682101-${{ github.ref }}
+  group: pinned-ui-teardown-da94b10-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 3682101c7b5ea95dbade286f1dadf25bf6a14ebe
+          ref: da94b10dba805f071c6c5473c14c504eaa0a2e6e
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -135,7 +135,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='3682101c7b5ea95dbade286f1dadf25bf6a14ebe'
+          source='da94b10dba805f071c6c5473c14c504eaa0a2e6e'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -379,7 +379,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='3682101c7b5ea95dbade286f1dadf25bf6a14ebe'
+          source='da94b10dba805f071c6c5473c14c504eaa0a2e6e'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -459,11 +459,13 @@ jobs:
               'sdk_extraction':'Cannot unpack native SDK archive entry',
               'sdk_cache_publish':'Cannot publish verified native SDK cache',
           }
-          # First focused execution of fully reviewed pin source. No unrelated
-          # MatrixRTC/config/package/device cases. All selected cases required.
+          # Core14 and other343app cases already passed. Recheck only the
+          # fixture that must release its explicit pinned controller owner.
           checks=[
-              ('core_pinned',['cargo','test','--locked','-p','morpheus-matrix','--lib','pinned_messages::tests::','--','--test-threads=1'],4200,{'pinned_messages::tests::rows_report_redacted_undecryptable_and_unsupported_events_honestly', 'pinned_messages::tests::duplicate_content_fields_are_refused_instead_of_lost_on_write', 'pinned_messages::tests::pin_preserves_unknown_fields_and_entries_byte_for_byte', 'pinned_messages::tests::permission_follows_authoritative_power_levels', 'pinned_messages::tests::attachments_threads_replies_and_edits_are_described_without_media', 'pinned_messages::tests::a_list_that_is_not_an_array_is_never_replaced', 'pinned_messages::tests::display_text_is_bounded_and_single_line', 'pinned_messages::tests::adding_is_bounded_but_removing_is_not', 'pinned_messages::tests::unpin_removes_every_occurrence_and_keeps_the_rest', 'pinned_messages::tests::state_envelope_must_match_the_exact_request', 'pinned_messages::tests::absent_or_redacted_list_gains_only_the_pinned_field', 'pinned_messages::tests::requested_state_already_present_sends_nothing', 'pinned_messages::tests::plaintext_in_an_encrypted_room_and_device_problems_are_flagged', 'pinned_messages::tests::sync_batches_select_only_relevant_room_changes'},set()),
-              ('app_pinned',['cargo','test','--locked','-p','morpheus-app','--features','native-calls','--bin','morpheus-app','--','--test-threads=1'],4200,{'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation', 'pinned_messages::view::tests::summaries_count_shown_hidden_and_unsupported_entries', 'pinned_messages::tests::row_flags_follow_the_last_published_set', 'pinned_messages::view::tests::filter_matches_sender_text_and_status_case_insensitively', 'pinned_messages::view::tests::rows_are_sanitized_and_say_why_text_is_missing', 'pinned_messages::view::tests::errors_are_fixed_text_and_account_changes_are_silent', 'pinned_messages::tests::rows_update_in_place_and_end_in_the_requested_order'},{'outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction'}),
+              ('app_pinned_ui',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
+                  '--bin','morpheus-app','account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
+                  '--','--exact','--test-threads=1'],4200,
+                  {'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'},set()),
           ]
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
