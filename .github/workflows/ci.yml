@@ -349,6 +349,38 @@ jobs:
                       and fixed==b'[extend]\nuseDefault = true\n' and empty==b'')
               except Exception: return False
           config=private/'default.toml'; ignore=private/'empty.ignore'
+          # Failure-only closed diagnostics: emit known marker IDs and exact locked
+          # package identities, never a server/build response, path or raw log line.
+          import tomllib
+          locked={(package['name'],package['version']) for package in
+              tomllib.loads((workspace/'Cargo.lock').read_text())['package']}
+          failure_markers={
+              'custom_build_command':'failed to run custom build command',
+              'cxx_bridge':'cxxbridge',
+              'cc_tool_missing':'ToolNotFound',
+              'cc_command_failed':'error occurred in cc-rs',
+              'cmake_error':'CMake Error',
+              'linker_error':'linking with',
+              'proc_macro_target':'does not support these crate types',
+              'locked_resolution':'lock file needs to be updated',
+              'tls_certificate':'certificate verify failed',
+              'permission_denied':'Access is denied',
+              'file_missing':'The system cannot find the file specified',
+              'path_too_long':'The filename or extension is too long',
+              'disk_full':'There is not enough space on the disk',
+              'sdk_download_request':'Native SDK download request failed',
+              'sdk_download_response':'Native SDK download response does not match the reviewed release',
+              'sdk_identity':'Native SDK archive identity does not match the reviewed release',
+              'sdk_missing_receipt':'Native SDK cache has no verified-download receipt',
+              'sdk_invalid_receipt':'Invalid native SDK cache receipt',
+              'sdk_receipt_mismatch':'Native SDK cache receipt does not match the reviewed release',
+              'sdk_unsafe_cache':'Unsafe native SDK cache directory',
+              'sdk_unsupported_path':'Unsupported native SDK archive path',
+              'sdk_unsafe_path':'Unsafe native SDK archive path',
+              'sdk_unsupported_type':'Native SDK archive contains an unsupported entry type',
+              'sdk_extraction':'Cannot unpack native SDK archive entry',
+              'sdk_cache_publish':'Cannot publish verified native SDK cache',
+          }
           needed_app={
               'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
               'discovery_tests::timeline_link_handler_accepts_only_browser_urls',
@@ -420,6 +452,15 @@ jobs:
                   record.update({'complete_test_accounting':complete,'tests_passed':a,'tests_failed':b,
                       'tests_ignored':c,'required_tests':{fixed:fixed in okay for fixed in sorted(required)}})
               record['error_codes']=sorted(set(re.findall(r'error\[(E[0-9]{4})\]',output)))
+              if not passed:
+                  folded_output=output.lower()
+                  crates=set(re.findall(r"failed to run custom build command for `([A-Za-z0-9_-]+) v([0-9][A-Za-z0-9.+_-]*)`",output))
+                  record['failure_diagnostics']={
+                      'markers':sorted(key for key,value in failure_markers.items() if value.lower() in folded_output),
+                      'locked_build_script_crates':sorted(name+'@'+version for name,version in crates if (name,version) in locked),
+                      'native_error_codes':sorted(set(re.findall(r'\b(?:LNK[0-9]{4}|C[0-9]{4})\b',output))),
+                      'os_error_codes':sorted(set(int(code) for code in re.findall(r'os error ([0-9]{1,5})\b',output))),
+                  }
               loops=len(re.findall(r'part of a binding loop',output))
               passed=passed and loops==0
               record.update({'status':'passed' if passed else 'failed','ui_binding_loop_warnings':loops})
