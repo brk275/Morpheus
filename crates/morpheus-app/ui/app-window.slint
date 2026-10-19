@@ -13,6 +13,8 @@ import { ActionRect, ControlColors, HoverSurface, TextAction, TokenButton, Token
 // Rust projects every accepted configuration into StyleTokens; the screen
 // files import the same global, so one projection reaches every control.
 export { BaseColorSet, ColorRole, StyleTokens, ThemeRoleSet, ThemeStateSet } from "style-tokens.slint";
+import { RoomOrganizationButton, RoomOrganizationState, RoomSectionHeader } from "room-organization.slint";
+export { RoomOrganizationState } from "room-organization.slint";
 
 // One Settings search result. `id` is a registry target ID, never a path or URL.
 export struct SettingsResult {
@@ -239,6 +241,9 @@ export struct RoomItem {
     voice-space: bool,
     voice-local: bool,
     voice-shared: bool,
+    // Standard Matrix m.favourite / m.lowpriority tags (room organization).
+    favourite: bool,
+    low-priority: bool,
 }
 
 export struct MessageItem {
@@ -528,6 +533,106 @@ component NavigationRoomRow inherits ActionRect {
             border-radius: self.height / 2;
             background: StyleTokens.roles.unread.present ? StyleTokens.roles.unread.color : root.accent;
             unread-count := Text { text: root.room.unread; color: StyleTokens.roles.unread-ink.present ? StyleTokens.roles.unread-ink.color : root.accent-ink; font-size: 10px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+        }
+    }
+}
+
+// A room-list row with its organization menu. The menu area lies above the
+// row: a right click opens it, every other input reaches the row. The row's
+// own control passes on keys it does not use, so the Menu key or Shift+F10
+// on a focused row opens the same menu; the room header has it too
+// (RoomOrganizationButton).
+component OrganizableRoomRow inherits Rectangle {
+    in property <RoomItem> room;
+    in property <bool> direct;
+    in property <bool> selected;
+    in property <int> density-mode;
+    in property <float> text-scale;
+    in property <color> ink;
+    in property <color> muted;
+    in property <color> elevated;
+    in property <color> hover;
+    in property <color> accent;
+    in property <color> accent-ink;
+    in property <color> mention-surface;
+    in property <color> mention-ink;
+    // A live account is shown; the preview has no Matrix tags.
+    in property <bool> organizable;
+    in property <bool> can-move-up;
+    in property <bool> can-move-down;
+    callback open(string, bool);
+    height: row.height;
+    // Never focused itself; it only sees keys the row's control passes on.
+    FocusScope {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        focus-on-click: false;
+        focus-on-tab-navigation: false;
+        key-pressed(event) => {
+            if root.organizable && RoomOrganizationState.pending-room == "" && (event.text == Key.Menu || (event.modifiers.shift && event.text == Key.F10)) {
+                row-menu.show({ x: 0px, y: root.height });
+                accept
+            } else {
+                reject
+            }
+        }
+        row := NavigationRoomRow {
+            x: 0px;
+            y: 0px;
+            width: root.width;
+            room: root.room;
+            direct: root.direct;
+            selected: root.selected;
+            density-mode: root.density-mode;
+            text-scale: root.text-scale;
+            ink: root.ink;
+            muted: root.muted;
+            elevated: root.elevated;
+            hover: root.hover;
+            accent: root.accent;
+            accent-ink: root.accent-ink;
+            mention-surface: root.mention-surface;
+            mention-ink: root.mention-ink;
+            open(id, voice) => { root.open(id, voice); }
+        }
+    }
+    row-menu := ContextMenuArea {
+        // One change at a time per account; every menu waits for it.
+        enabled: root.organizable && RoomOrganizationState.pending-room == "";
+        Menu {
+            // Each item sends only the action its title states. The menu
+            // keeps the items it was shown with: if sync changes the row's
+            // tags meanwhile, an outdated item still sends its action, which
+            // changes nothing when the room already has that result.
+            if !root.room.favourite: MenuItem {
+                title: "Add to Favorites";
+                activated => { RoomOrganizationState.organize(root.room.id, 0); }
+            }
+            if root.room.favourite: MenuItem {
+                title: "Remove from Favorites";
+                activated => { RoomOrganizationState.organize(root.room.id, 1); }
+            }
+            if !root.room.low-priority: MenuItem {
+                title: "Mark as low priority";
+                activated => { RoomOrganizationState.organize(root.room.id, 2); }
+            }
+            if root.room.low-priority: MenuItem {
+                title: "Normal priority";
+                activated => { RoomOrganizationState.organize(root.room.id, 3); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: "Move up in Favorites";
+                enabled: root.room.favourite && root.can-move-up;
+                activated => { RoomOrganizationState.organize(root.room.id, 4); }
+            }
+            MenuItem {
+                title: "Move down in Favorites";
+                enabled: root.room.favourite && root.can-move-down;
+                activated => { RoomOrganizationState.organize(root.room.id, 5); }
+            }
         }
     }
 }
@@ -2734,6 +2839,10 @@ export component AppWindow inherits Window {
     in-out property <[RoomItem]> channels;
     in-out property <[RoomItem]> direct-messages;
     in-out property <[NavigationRoomItem]> combined-rooms;
+    // Rooms tagged m.favourite / m.lowpriority, out of the lists above, in
+    // tag order (see navigation.rs).
+    in-out property <[NavigationRoomItem]> favourite-rooms;
+    in-out property <[NavigationRoomItem]> low-priority-rooms;
     out property <int> navigation-mode: 0; // rail or text-first sidebar
     in-out property <bool> show-space-labels: false;
     in-out property <bool> group-direct-messages: true;
@@ -3730,7 +3839,7 @@ export component AppWindow inherits Window {
         root.cancel-room-settings(); root.close-image-preview(); root.quick-switcher-open = false; root.incoming-call-notice = ""; root.mention-context-changed(); root.attachment-context-changed(); }
     changed active-account-index => { root.quick-switcher-open = false; root.mention-context-changed(); }
     changed active-room-id => {
-        root.cancel-room-settings(); root.close-image-preview(); root.mention-context-changed(); root.attachment-context-changed(); }
+        root.cancel-room-settings(); root.close-image-preview(); root.mention-context-changed(); root.attachment-context-changed(); RoomOrganizationState.active-room-changed(); }
     changed thread-root-id => {
         root.close-image-preview(); root.mention-context-changed();
         // A page request for the previous thread can no longer publish here.
@@ -4240,6 +4349,29 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
+                        if root.favourite-rooms.length > 0 : RoomSectionHeader {
+                            title: "FAVORITES"; count: root.favourite-rooms.length;
+                            collapsed: RoomOrganizationState.favourites-collapsed;
+                            text-scale: root.text-scale; muted: root.muted; focus-color: root.accent;
+                            toggle => { RoomOrganizationState.favourites-collapsed = !RoomOrganizationState.favourites-collapsed; }
+                        }
+                        if root.favourite-rooms.length > 0 && !RoomOrganizationState.favourites-collapsed : VerticalLayout {
+                            spacing: 3px; alignment: start; vertical-stretch: 0;
+                            for entry[index] in root.favourite-rooms : OrganizableRoomRow {
+                                organizable: root.live-session;
+                                can-move-up: index > 0;
+                                can-move-down: index < root.favourite-rooms.length - 1;
+                                room: entry.room; direct: entry.direct;
+                                selected: entry.room.id == root.active-room-id && root.page == 0;
+                                density-mode: root.room-density-mode; text-scale: root.text-scale;
+                                ink: root.ink; muted: root.muted; elevated: root.elevated; hover: root.hover; accent: root.accent; accent-ink: root.accent-ink;
+                                mention-surface: root.mention-badge; mention-ink: root.mention-badge-ink;
+                                open(id, voice) => {
+                                    if voice && root.live-session { root.open-voice-space(id); }
+                                    else { root.page = 0; root.open-room(id); }
+                                }
+                            }
+                        }
                         if root.group-direct-messages : VerticalLayout {
                             spacing: 3px; alignment: start; vertical-stretch: 0;
                             // Direct messages first, when chosen; keyboard order follows.
@@ -4249,7 +4381,8 @@ export component AppWindow inherits Window {
                             }
                             if root.direct-messages-first : VerticalLayout {
                                 spacing: 3px; alignment: start;
-                                for dm in root.direct-messages : NavigationRoomRow {
+                                for dm in root.direct-messages : OrganizableRoomRow {
+                                    organizable: root.live-session;
                                     room: dm; direct: true;
                                     selected: dm.id == root.active-room-id && root.page == 0;
                                     density-mode: root.room-density-mode; text-scale: root.text-scale;
@@ -4265,7 +4398,8 @@ export component AppWindow inherits Window {
                                 text: "ROOMS"; color: root.muted; font-size: 10px * root.text-scale;
                                 font-weight: 750; letter-spacing: 1px; height: 40px; vertical-alignment: bottom;
                             }
-                            for channel in root.channels : NavigationRoomRow {
+                            for channel in root.channels : OrganizableRoomRow {
+                                organizable: root.live-session;
                                 room: channel; direct: false;
                                 selected: channel.id == root.active-room-id && root.page == 0;
                                 density-mode: root.room-density-mode; text-scale: root.text-scale;
@@ -4282,7 +4416,8 @@ export component AppWindow inherits Window {
                             }
                             if !root.direct-messages-first : VerticalLayout {
                                 spacing: 3px; alignment: start;
-                                for dm in root.direct-messages : NavigationRoomRow {
+                                for dm in root.direct-messages : OrganizableRoomRow {
+                                    organizable: root.live-session;
                                     room: dm; direct: true;
                                     selected: dm.id == root.active-room-id && root.page == 0;
                                     density-mode: root.room-density-mode; text-scale: root.text-scale;
@@ -4297,7 +4432,29 @@ export component AppWindow inherits Window {
                         }
                         if !root.group-direct-messages : VerticalLayout {
                             spacing: 3px; alignment: start; vertical-stretch: 0;
-                            for entry in root.combined-rooms : NavigationRoomRow {
+                            for entry in root.combined-rooms : OrganizableRoomRow {
+                                organizable: root.live-session;
+                                room: entry.room; direct: entry.direct;
+                                selected: entry.room.id == root.active-room-id && root.page == 0;
+                                density-mode: root.room-density-mode; text-scale: root.text-scale;
+                                ink: root.ink; muted: root.muted; elevated: root.elevated; hover: root.hover; accent: root.accent; accent-ink: root.accent-ink;
+                                mention-surface: root.mention-badge; mention-ink: root.mention-badge-ink;
+                                open(id, voice) => {
+                                    if voice && root.live-session { root.open-voice-space(id); }
+                                    else { root.page = 0; root.open-room(id); }
+                                }
+                            }
+                        }
+                        if root.low-priority-rooms.length > 0 : RoomSectionHeader {
+                            title: "LOW PRIORITY"; count: root.low-priority-rooms.length;
+                            collapsed: RoomOrganizationState.low-priority-collapsed;
+                            text-scale: root.text-scale; muted: root.muted; focus-color: root.accent;
+                            toggle => { RoomOrganizationState.low-priority-collapsed = !RoomOrganizationState.low-priority-collapsed; }
+                        }
+                        if root.low-priority-rooms.length > 0 && !RoomOrganizationState.low-priority-collapsed : VerticalLayout {
+                            spacing: 3px; alignment: start; vertical-stretch: 0;
+                            for entry in root.low-priority-rooms : OrganizableRoomRow {
+                                organizable: root.live-session;
                                 room: entry.room; direct: entry.direct;
                                 selected: entry.room.id == root.active-room-id && root.page == 0;
                                 density-mode: root.room-density-mode; text-scale: root.text-scale;
@@ -4543,6 +4700,16 @@ export component AppWindow inherits Window {
                             horizontal-stretch: 1;
                             min-width: 0px;
                             overflow: elide;
+                        }
+                        if root.page == 0 : VerticalLayout {
+                            width: StyleTokens.icon-button-size; alignment: center;
+                            RoomOrganizationButton {
+                                width: StyleTokens.icon-button-size; height: StyleTokens.icon-button-size;
+                                room-id: root.active-room-id; room-name: root.active-room-name;
+                                enabled: root.live-session && root.active-room-id != "";
+                                ink: root.muted; hover: root.hover; radius: StyleTokens.radius * 0.9;
+                                focus-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.ink;
+                            }
                         }
                         if root.page == 0 : VerticalLayout {
                             width: StyleTokens.icon-button-size; alignment: center;

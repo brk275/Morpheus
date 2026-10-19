@@ -66,8 +66,13 @@ pub use pinned_messages::{
     room_updates_affect_pinned,
 };
 mod rich_text;
+mod room_tags;
 pub use account_selection::AccountSelection;
 pub use admin::RoomMemberInfo;
+pub use room_tags::{
+    ConfirmedTags, FavouriteOrder, MAX_TAG_ORDER_WRITES, RoomTagChange, RoomTagError, TagKnowledge,
+    TagOrder,
+};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -258,6 +263,17 @@ pub struct RoomInfo {
     pub is_direct: bool,
     pub is_space: bool,
     pub avatar_mxc: Option<String>,
+    /// Standard `m.favourite` and `m.lowpriority` tags; Morpheus keeps them
+    /// exclusive when it writes them, but another client may set both.
+    #[serde(default)]
+    pub favourite: bool,
+    #[serde(default)]
+    pub low_priority: bool,
+    /// Each tag's own stored order, for a tag the room has.
+    #[serde(default)]
+    pub favourite_order: Option<TagOrder>,
+    #[serde(default)]
+    pub low_priority_order: Option<TagOrder>,
     pub unread_messages: u64,
     pub unread_notifications: u64,
     /// Unread messages that mention this account or match its highlight
@@ -4011,6 +4027,7 @@ async fn room_info(room: &Room) -> RoomInfo {
         .await
         .map(|name| name.to_string())
         .unwrap_or_else(|_| room_id.clone());
+    let tags = room_tags::tag_summary(room).await;
     RoomInfo {
         room_id,
         name,
@@ -4019,6 +4036,10 @@ async fn room_info(room: &Room) -> RoomInfo {
         is_direct: room.is_direct().await.unwrap_or(false),
         is_space: room.is_space(),
         avatar_mxc: room.avatar_url().map(|url| url.to_string()),
+        favourite: tags.favourite,
+        low_priority: tags.low_priority,
+        favourite_order: tags.favourite_order,
+        low_priority_order: tags.low_priority_order,
         unread_messages: room.num_unread_messages(),
         unread_notifications: room.num_unread_notifications(),
         unread_mentions: room.num_unread_mentions(),
