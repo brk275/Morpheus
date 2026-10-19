@@ -1,17 +1,17 @@
-# TEMPORARY narrowly scoped native call feature verification. NEVER MERGE.
+# TEMPORARY narrowly scoped customization expansion verification. NEVER MERGE.
 # No installers, physical-device, real-account, installed-app or artifact jobs.
-name: Reviewed native call feature integration
-run-name: Native call feature integration - 88167fb
+name: Reviewed customization expansion
+run-name: Customization expansion - 907cf70
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: native-call-feature-88167fb
+  group: customization-expansion-907cf70
   cancel-in-progress: false
 jobs:
   native:
-    name: Native call feature integration
+    name: Customization expansion
     if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 180
@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 88167fb3c98fff6a5ce0cc03abff14a4e91f2186
+          ref: 907cf70b64d4794e828a51f0da2728f6f3d579c4
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -125,7 +125,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='88167fb3c98fff6a5ce0cc03abff14a4e91f2186'
+          source='907cf70b64d4794e828a51f0da2728f6f3d579c4'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -307,7 +307,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='88167fb3c98fff6a5ce0cc03abff14a4e91f2186'
+          source='907cf70b64d4794e828a51f0da2728f6f3d579c4'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -391,6 +391,9 @@ jobs:
               'sdk_cache_publish':'Cannot publish verified native SDK cache',
           }
           needed_app={
+              'metric_editor::tests::groups_list_every_metric_once_and_filters_match_every_word',
+              'metric_editor::tests::typed_values_must_be_whole_numbers_inside_the_registry_range',
+              'sender_palette_editor::tests::contrast_composites_the_sender_color_over_the_conversation_background',
               'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
               'discovery_tests::timeline_link_handler_accepts_only_browser_urls',
               'discovery_tests::call_stage_uses_joined_room_even_after_chat_navigation',
@@ -414,7 +417,19 @@ jobs:
               'video_device::tests::camera_permission::stop_while_permission_is_pending_drops_late_grant',
           }
           allowed_app_ignore={'outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction'}
+          needed_config={
+              'tests::every_editor_metric_is_a_bounded_field_with_one_accessor',
+              'tests::metric_edits_reject_invalid_files_without_repeating_values_and_recover',
+              'tests::config_sender_palette_is_bounded_round_trips_and_survives_presets',
+              'tests::account_colors_layer_over_global_colors_for_that_account_only',
+              'registry::tests::metrics_are_direct_bounded_search_results_with_exact_ids',
+          }
           checks=(
+              ('native_ui_compile',['cargo','check','--locked','-p','morpheus-ui-check'],20*60,None,set()),
+              ('config_unit',['cargo','test','--locked','-p','morpheus-config','--lib',
+                  '--','--test-threads=1'],10*60,needed_config,set()),
+              ('appearance_examples',['cargo','test','--locked','-p','morpheus-config','--test','appearance_example',
+                  '--','--test-threads=1'],10*60,{'style_examples_are_valid_and_use_registry_metrics','sparse_appearance_example_uses_supported_settings'},set()),
               ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
                   '--bin','morpheus-app','--','--test-threads=1'],40*60,needed_app,allowed_app_ignore),
           )
