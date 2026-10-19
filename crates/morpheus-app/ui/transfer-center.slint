@@ -138,16 +138,13 @@ export component TransferCenterPanel inherits Rectangle {
     accessible-label: "Transfers";
     forward-focus: heading-focus;
 
-    init => {
-        if root.focus-pending {
-            root.focus-pending = false;
-            heading-focus.focus();
-        }
-    }
     changed focus-pending => {
         if root.focus-pending {
-            root.focus-pending = false;
             heading-focus.focus();
+            if heading-focus.has-focus {
+                root.focus-pending = false;
+                root.revealed();
+            }
         }
     }
 
@@ -202,8 +199,17 @@ export component TransferCenterPanel inherits Rectangle {
                     height: parent.height;
                     accessible-role: text;
                     accessible-label: "Transfers: " + summary-text.text;
+                    // The containing panel's init can precede creation of
+                    // this focus item. Consume the request only once this
+                    // actual destination exists and receives focus.
+                    init => {
+                        if root.focus-pending { self.focus(); }
+                    }
                     changed has-focus => {
-                        if self.has-focus { root.revealed(); }
+                        if self.has-focus {
+                            root.focus-pending = false;
+                            root.revealed();
+                        }
                     }
                     key-pressed(event) => { reject }
                 }

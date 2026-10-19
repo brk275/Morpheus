@@ -2150,6 +2150,16 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
         if let Some(label) = account_label {
             assert!(focused_control_has_label(ui, label), "{} focus", target.id);
         }
+        if target.id == "files.transfers" {
+            assert_eq!(ui.get_page(), 0);
+            assert!(ui.get_show_side_panel());
+            assert_eq!(ui.get_side_panel_tab(), 4);
+            assert!(
+                focused_control_has_label(ui, &format!("Transfers: {}", ui.get_transfer_summary())),
+                "transfer destination must have real keyboard focus"
+            );
+            assert!(!ui.get_transfer_focus_pending());
+        }
     }
     for (target, label) in [
         ("appearance.reduce_motion", "Reduce motion, off"),
