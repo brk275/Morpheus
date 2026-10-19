@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
 name: Reviewed attachment focused checks
-run-name: Viewer keyboard diagnosis - a825a99 - ${{ inputs.platform }}
+run-name: Attachment label regression - adccb7a - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: viewer-keyboard-a825a99-${{ github.ref }}
+  group: viewer-keyboard-adccb7a-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: a825a991a3825106f5bd09d8fc5d70033ab951c2
+          ref: adccb7ac9aa9fc4a8b6e2b15c53cf1d105387f7e
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -135,7 +135,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='a825a991a3825106f5bd09d8fc5d70033ab951c2'
+          source='adccb7ac9aa9fc4a8b6e2b15c53cf1d105387f7e'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -379,7 +379,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='a825a991a3825106f5bd09d8fc5d70033ab951c2'
+          source='adccb7ac9aa9fc4a8b6e2b15c53cf1d105387f7e'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
