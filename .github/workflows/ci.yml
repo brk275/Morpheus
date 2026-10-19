@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
-name: Reviewed style profile UI diagnosis
-run-name: Style profile UI diagnosis - e352e49 - ${{ inputs.platform }}
+name: Reviewed style profile UI fix check
+run-name: Style profile UI fix check - 36a15b9 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: style-ui-diagnosis-e352e49-${{ github.ref }}
+  group: style-ui-fix-36a15b9-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: e352e49ab39dd2fcc632cdf4b4b69c5c12739b90
+          ref: 36a15b99d917d11e2d465ef00047eba2caf7dd67
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -135,7 +135,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='e352e49ab39dd2fcc632cdf4b4b69c5c12739b90'
+          source='36a15b99d917d11e2d465ef00047eba2caf7dd67'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -379,7 +379,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='e352e49ab39dd2fcc632cdf4b4b69c5c12739b90'
+          source='36a15b99d917d11e2d465ef00047eba2caf7dd67'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -487,7 +487,7 @@ jobs:
           checks=[
               ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls','--bin','morpheus-app',
                   'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
-                  '--','--exact','--nocapture','--test-threads=1'],70*60,
+                  '--','--exact','--test-threads=1'],70*60,
                   {'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'},set()),
           ]
           all_passed=True
