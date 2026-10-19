@@ -1366,6 +1366,7 @@ fn session_end(end: RtcCallEnd) -> SessionEnd {
         // e.g. its delayed leave fired while this device was offline.
         RtcCallEnd::Left => SessionEnd::Rejoin(RejoinCause::MembershipEnded),
         RtcCallEnd::ConnectionLost => SessionEnd::Rejoin(RejoinCause::TransportClosed),
+        RtcCallEnd::Removed => SessionEnd::Ended("the call service removed this device"),
     }
 }
 
@@ -2865,6 +2866,92 @@ mod tests {
             .store(0, Ordering::SeqCst);
         controller.abandon_failed_leave().await.unwrap();
         assert!(!controller.status().blocks_account_switch());
+    }
+
+    #[test]
+    fn recovering_calls_keep_blocking_account_switches() {
+        let call = CallInfo {
+            room_id: "!room:example.org".into(),
+            slot_id: "m.call#room".into(),
+            membership_id: "member".into(),
+            local_identity: "identity".into(),
+        };
+        for interruption in [
+            CallInterruption::Media,
+            CallInterruption::Signaling,
+            CallInterruption::WaitingForNetwork,
+            CallInterruption::Rejoining {
+                attempt: 2,
+                max_attempts: 4,
+            },
+        ] {
+            let status = CallStatus::Reconnecting {
+                account_id: "account-a".into(),
+                call: call.clone(),
+                interruption,
+            };
+            assert!(status.blocks_account_switch());
+            assert!(status.controls_available());
+        }
+        let ended = CallStatus::Ended {
+            room_id: call.room_id,
+            reason: "the room call was closed".into(),
+        };
+        assert!(!ended.blocks_account_switch());
+        assert!(!ended.controls_available());
+    }
+
+    #[tokio::test]
+    async fn late_recovery_status_cannot_overwrite_a_leave() {
+        let root = tempfile::tempdir().unwrap();
+        let manager = Arc::new(AccountManager::open(root.path()).unwrap());
+        let controller = CallController::new(manager, UpdateActivity::default());
+        let shared = Arc::clone(&controller.shared);
+        let (cancel, _cancelled) = oneshot::channel();
+        let (_done, done) = watch::channel(None);
+        let (video_commands, _video_rx) = mpsc::channel(1);
+        let stop = Arc::new(CaptureStop::default());
+        *shared.slot.lock().await = CallSlot::Running(RunningCall {
+            token: 7,
+            presentation: 9,
+            account_id: "account-a".into(),
+            room_id: "!room:example.org".into(),
+            cancel: Some(cancel),
+            done,
+            audio_controls: None,
+            video_commands,
+            capture_stop: Arc::clone(&stop),
+        });
+        let next = CallStatus::Reconnecting {
+            account_id: "account-a".into(),
+            call: CallInfo {
+                room_id: "!room:example.org".into(),
+                slot_id: "m.call#room".into(),
+                membership_id: "member".into(),
+                local_identity: "identity".into(),
+            },
+            interruption: CallInterruption::WaitingForNetwork,
+        };
+        shared.publish_live_status(7, &stop, next.clone()).await;
+        assert_eq!(controller.status(), next);
+        // Another call generation cannot publish for this slot.
+        shared.publish_live_status(8, &stop, CallStatus::Idle).await;
+        assert_eq!(controller.status(), next);
+        // Leave takes the cancel sender, so a later recovery status is dropped.
+        let ending = CallStatus::Ending {
+            account_id: "account-a".into(),
+            room_id: "!room:example.org".into(),
+        };
+        {
+            let mut slot = shared.slot.lock().await;
+            let CallSlot::Running(running) = &mut *slot else {
+                unreachable!()
+            };
+            running.cancel.take();
+            shared.status.send_replace(ending.clone());
+        }
+        shared.publish_live_status(7, &stop, next).await;
+        assert_eq!(controller.status(), ending);
     }
 
     #[test]

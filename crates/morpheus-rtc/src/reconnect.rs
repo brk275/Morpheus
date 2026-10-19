@@ -187,6 +187,10 @@ pub enum RtcCallEnd {
     /// The SFU connection this device publishes on closed and the transport
     /// gave up reconnecting it. The membership may still be published.
     ConnectionLost,
+    /// The SFU deliberately removed this participant: an administrator
+    /// removed it, deleted the room, or the same identity joined elsewhere.
+    /// Rejoining automatically would undo that decision.
+    Removed,
 }
 
 /// The connection-health subset of a call's event stream.
@@ -213,6 +217,9 @@ impl RtcConnectionSignal {
                 let end = match reason {
                     EndedReason::Left => RtcCallEnd::Left,
                     EndedReason::SlotClosed => RtcCallEnd::SlotClosed,
+                    EndedReason::ConnectionClosed { message } if removed_by_server(message) => {
+                        RtcCallEnd::Removed
+                    }
                     EndedReason::ConnectionClosed { .. } => RtcCallEnd::ConnectionLost,
                 };
                 Some(Self::Ended(end))
@@ -220,6 +227,17 @@ impl RtcConnectionSignal {
             _ => None,
         }
     }
+}
+
+/// The pinned call SDK reports the transport's disconnect reason only as the
+/// `Debug` name of LiveKit's `DisconnectReason`. A server shutdown, timeout,
+/// migration or signalling failure is not a removal and may be rejoined.
+#[cfg(feature = "native-rtc")]
+fn removed_by_server(message: &str) -> bool {
+    matches!(
+        message,
+        "ParticipantRemoved" | "RoomDeleted" | "DuplicateIdentity"
+    )
 }
 
 #[cfg(test)]
@@ -271,6 +289,32 @@ mod tests {
         let mut random = ReconnectBackoff::new(policy(), start);
         let delay = random.next_attempt(start).unwrap();
         assert!(delay >= Duration::from_millis(800) && delay <= Duration::from_secs(1));
+    }
+
+    #[cfg(feature = "native-rtc")]
+    #[test]
+    fn deliberate_removals_are_not_treated_as_connection_loss() {
+        use matrix_rtc_call_sdk::{CallEvent, EndedReason};
+
+        let ended = |message: &str| {
+            RtcConnectionSignal::from_event(&CallEvent::Ended {
+                reason: EndedReason::ConnectionClosed {
+                    message: message.to_owned(),
+                },
+            })
+        };
+        for removed in ["ParticipantRemoved", "RoomDeleted", "DuplicateIdentity"] {
+            assert_eq!(
+                ended(removed),
+                Some(RtcConnectionSignal::Ended(RtcCallEnd::Removed))
+            );
+        }
+        for lost in ["ServerShutdown", "SignalClose", "failed to reconnect after 10"] {
+            assert_eq!(
+                ended(lost),
+                Some(RtcConnectionSignal::Ended(RtcCallEnd::ConnectionLost))
+            );
+        }
     }
 
     #[test]
