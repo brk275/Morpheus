@@ -319,7 +319,8 @@ export component MessageSearchPanel inherits VerticalLayout {
             }
         }
         // Filters narrow a word search. They are checked on this device
-        // against each loaded match; the index and the homeserver see none.
+        // against each loaded match; query and filter text stay local (a
+        // match missing from the store may be fetched from the homeserver by ID).
         HorizontalLayout {
             spacing: 4px;
             height: root.chip-height;
@@ -485,7 +486,7 @@ export component MessageSearchPanel inherits VerticalLayout {
             }
             // What the filters cannot do, said plainly.
             Text {
-                text: "Filters narrow a word search on this device. Attachments are found by file name or caption, not by their contents; stickers and polls are not shown.";
+                text: "Filters narrow a word search on this device; the words and filters are never sent. Attachments are found by file name or caption only, checked after each match loads; stickers and polls are not shown.";
                 color: root.palette.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
             }
         }

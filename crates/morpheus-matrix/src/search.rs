@@ -1,5 +1,8 @@
 //! Account-scoped local message search. The SDK indexes decrypted events in
-//! each room store; no message text is sent to a homeserver search endpoint.
+//! each room store; the query and filters never leave this device and no
+//! homeserver search endpoint is used. Loading a matched event the local
+//! store lacks may still fetch that event, by its ID, from the account's
+//! homeserver over the authenticated session.
 //! Nothing here logs a query, a result or an account identifier.
 
 use std::collections::HashMap;
@@ -50,8 +53,9 @@ pub enum AttachmentFilter {
 }
 
 /// Optional narrowing of a text search. Filters are checked against each
-/// loaded hit on this device: the index is unchanged and nothing is sent to
-/// a homeserver. Debug output is redacted, since a filter can name a person
+/// loaded hit on this device: the index is unchanged and the filter values
+/// never leave it (loading a hit the store lacks may fetch that event by ID
+/// from the homeserver). Debug output is redacted, since a filter can name a person
 /// or a time.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct SearchFilters {
