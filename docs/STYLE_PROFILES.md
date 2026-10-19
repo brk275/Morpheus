@@ -58,16 +58,25 @@ from the profile name when it is created (lowercase letters, digits and
 hyphens) and do not change when the profile is renamed.
 
 Only regular files are read. Symbolic links, folders, sockets, FIFOs and
-devices in the profiles folder are skipped, and a link (or Windows junction)
-in place of the folder itself is never used: the folder is checked before and
-after each file in it is opened, so one replaced meanwhile is noticed. Files
+devices in the profiles folder are skipped. The folder that holds
+`config.toml` and its ancestors are trusted, as they are for `config.toml`
+itself; the `style-profiles` folder must be a real folder, not a link or
+Windows junction. Each operation opens that folder once and works through it:
+on macOS and Linux every file is checked, read, created, renamed and removed
+relative to the opened folder, and on Windows the opened folder cannot be
+renamed or replaced until the operation ends. So a folder swapped for a link
+or another folder meanwhile is never read, written or deleted through. Files
 are opened without following a link and without waiting on a FIFO or device
-that replaced a checked file; on Windows the profiles folder refuses any
-reparse point. File names never use Windows device names such as `con` or
-`com1`. Imports and exports refuse links, junctions, folders and devices too;
-files in a cloud-synced Documents folder can still be imported and exported.
-Every write goes to a temporary file in the same folder that then replaces
-the target, so a failed write keeps the previous file.
+put in place of a checked file. File names never use Windows device names
+such as `con` or `com1`.
+
+Imports refuse links, junctions, folders and devices, also when one replaces
+the chosen file while it is opened. On Windows that means any reparse point,
+including files kept as cloud placeholders in a synced folder such as a
+OneDrive Documents folder: copy such a file to a local folder to import it.
+Exports may replace a cloud file; a link at the target is replaced, never
+followed. Every write goes to a temporary file in the same folder that then
+replaces the target, so a failed write keeps the previous file.
 
 ## File format
 
