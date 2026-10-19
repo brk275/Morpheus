@@ -2502,7 +2502,8 @@ impl LiveUi {
         index: usize,
         consent: Option<&PublicMediaConsent>,
     ) -> Result<QueuedMessage, MatrixCoreError> {
-        self.require_media_context(catalog.account_id(), catalog.room_id()).await?;
+        self.require_media_context(catalog.account_id(), catalog.room_id())
+            .await?;
         self.manager.send_sticker_for(catalog, index, consent).await
     }
 
@@ -2526,29 +2527,44 @@ impl LiveUi {
     /// write, preventing cross-account saves after an asynchronous download.
     pub async fn save_download_to(
         &self,
-        account_id: &str,
+        selection: &AccountSelection,
         room_id: &str,
         path: PathBuf,
         bytes: Vec<u8>,
-    ) -> Result<PathBuf, MatrixCoreError> {
+        cancelled: &tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Option<PathBuf>, MatrixCoreError> {
         let _transition = self.account_transition.lock().await;
         let selected = self.selected_room.lock().await;
         if !self.is_live.load(Ordering::Acquire) || selected.as_deref() != Some(room_id) {
             return Err(MatrixCoreError::SelectedRoomChanged);
         }
-        if self
-            .manager
-            .active_account()
-            .await
-            .as_ref()
-            .map(|account| account.id.as_str())
-            != Some(account_id)
+        if !selection.is_current()
+            || self
+                .manager
+                .active_account()
+                .await
+                .as_ref()
+                .map(|account| account.id.as_str())
+                != Some(selection.account_id())
+            || !selection.is_current()
         {
             return Err(MatrixCoreError::SelectedAccountChanged);
         }
-        tokio::task::spawn_blocking(move || save_download(&path, &bytes))
+        // Cancellation remains effective while waiting for every commit guard.
+        // Hold the watch read guard through submission to the blocking pool:
+        // cancellation is then ordered before the commit or after it, without
+        // a check/submit gap. Once submitted, finish and report the real write.
+        let write = {
+            let stopped = cancelled.borrow();
+            if *stopped || cancelled.has_changed().is_err() {
+                return Ok(None);
+            }
+            tokio::task::spawn_blocking(move || save_download(&path, &bytes))
+        };
+        write
             .await
             .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?
+            .map(Some)
             .map_err(MatrixCoreError::Io)
     }
 

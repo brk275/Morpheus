@@ -25,7 +25,7 @@ use std::{
 };
 
 use morpheus_matrix::{
-    AttachmentSendUpdate, MAX_ATTACHMENT_BYTES, MatrixCoreError, QueuedAttachment,
+    AccountSelection, AttachmentSendUpdate, MAX_ATTACHMENT_BYTES, MatrixCoreError, QueuedAttachment,
 };
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use tokio::{
@@ -251,6 +251,9 @@ impl Workbench {
         }
         let account_id = ui.get_active_account_local_id().to_string();
         let room_id = ui.get_active_room_id().to_string();
+        let Some(selection) = self.live.manager.account_selection(&account_id) else {
+            return;
+        };
         // The sender chose this name: suggest only a sanitized final
         // component, and let the user pick the folder explicitly.
         let mut dialog = rfd::FileDialog::new()
@@ -266,6 +269,7 @@ impl Workbench {
         };
         if ui.get_active_account_local_id().as_str() != account_id
             || ui.get_active_room_id().as_str() != room_id
+            || !selection.is_current()
             || path.file_name().is_none()
         {
             return;
@@ -282,7 +286,7 @@ impl Workbench {
         self.runtime.spawn(async move {
             let mut cancelled = cancelled;
             let outcome = owner
-                .download_and_save(&account_id, &room_id, &event_id, path, &mut cancelled)
+                .download_and_save(&selection, &room_id, &event_id, path, &mut cancelled)
                 .await;
             {
                 let mut save = owner.lock_save();
@@ -323,7 +327,7 @@ impl Workbench {
 
     async fn download_and_save(
         &self,
-        account_id: &str,
+        selection: &AccountSelection,
         room_id: &str,
         event_id: &str,
         path: PathBuf,
@@ -335,12 +339,13 @@ impl Workbench {
             () = async {
                 let _ = cancelled.wait_for(|cancelled| *cancelled).await;
             } => return SaveOutcome::Cancelled,
-            downloaded = self.live.download_attachment(account_id, room_id, event_id) => match downloaded {
+            _ = selection.revoked() => return SaveOutcome::Cancelled,
+            downloaded = self.live.download_attachment(selection.account_id(), room_id, event_id) => match downloaded {
                 Ok(downloaded) => downloaded,
                 Err(error) => return SaveOutcome::Failed(error.to_string()),
             },
         };
-        if *cancelled.borrow() || cancelled.has_changed().is_err() {
+        if !selection.is_current() || *cancelled.borrow() || cancelled.has_changed().is_err() {
             return SaveOutcome::Cancelled;
         }
         // The final account and room guard is held through the local write,
@@ -348,10 +353,11 @@ impl Workbench {
         // bounded write finishes and its real outcome is reported.
         match self
             .live
-            .save_download_to(account_id, room_id, path, downloaded.bytes)
+            .save_download_to(selection, room_id, path, downloaded.bytes, cancelled)
             .await
         {
-            Ok(path) => SaveOutcome::Saved(path),
+            Ok(Some(path)) => SaveOutcome::Saved(path),
+            Ok(None) => SaveOutcome::Cancelled,
             Err(error) => SaveOutcome::Failed(error.to_string()),
         }
     }
@@ -744,11 +750,9 @@ impl Workbench {
             let removed = {
                 let mut state = owner.lock();
                 let before = state.items.len();
-                state.items.retain(|item| {
-                    accounts
-                        .iter()
-                        .any(|account| account.id == item.account_id)
-                });
+                state
+                    .items
+                    .retain(|item| accounts.iter().any(|account| account.id == item.account_id));
                 before != state.items.len()
             };
             if removed {
@@ -890,7 +894,11 @@ fn summary(total: usize, ready: i32, running: i32) -> String {
     if total == 0 {
         return String::new();
     }
-    let noun = if total == 1 { "attachment" } else { "attachments" };
+    let noun = if total == 1 {
+        "attachment"
+    } else {
+        "attachments"
+    };
     let mut parts = vec![format!("{total} {noun}")];
     if ready > 0 {
         parts.push(format!("{ready} ready"));
@@ -952,7 +960,10 @@ mod tests {
         let uploading = row(&item(Phase::Uploading(42), true));
         assert_eq!(uploading.progress, 0.42);
         assert!(uploading.can_cancel && !uploading.can_remove && !uploading.can_retry);
-        assert_eq!(row(&item(Phase::Staged, false)).detail, "2.4 MB · image/png");
+        assert_eq!(
+            row(&item(Phase::Staged, false)).detail,
+            "2.4 MB · image/png"
+        );
     }
 
     #[test]
