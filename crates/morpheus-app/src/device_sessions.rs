@@ -36,8 +36,7 @@ const SAS_WAITING_FOR_REQUEST: i32 = 1;
 
 const UNAVAILABLE: &str = "Sign in to see where this account is signed in.";
 const LOADING: &str = "Loading this account's sessions…";
-const BUSY_ELSEWHERE: &str =
-    "Finish the security step in progress on this page, then try again.";
+const BUSY_ELSEWHERE: &str = "Finish the security step in progress on this page, then try again.";
 const SAS_IN_PROGRESS: &str =
     "A verification is already in progress above. Finish or cancel it first.";
 const USE_LOG_OUT: &str =
@@ -70,6 +69,7 @@ struct PanelState {
     load: u64,
     // Every action takes a new number; its result needs the same number.
     operation: u64,
+    operation_cancel: DeviceSessionCancellation,
     busy: bool,
     selected: String,
     sign_out: SignOut,
@@ -80,6 +80,8 @@ struct PanelState {
 
 impl PanelState {
     fn begin(&mut self, pending: String) -> u64 {
+        self.operation_cancel.cancel();
+        self.operation_cancel = DeviceSessionCancellation::new();
         self.operation = self.operation.wrapping_add(1);
         self.busy = true;
         self.pending = pending;
@@ -88,6 +90,7 @@ impl PanelState {
         self.operation
     }
     fn finish(&mut self) {
+        self.operation_cancel.cancel();
         self.busy = false;
         self.pending.clear();
     }
@@ -132,10 +135,22 @@ enum SignOut {
 enum Stage {
     Closed,
     Review(Target),
-    Password { target: Target, rejected: bool },
-    Browser { target: Target, opened: bool },
-    Provider { target: Target, opened: bool },
-    Blocked { target: Target, blocker: SignOutBlocker },
+    Password {
+        target: Target,
+        rejected: bool,
+    },
+    Browser {
+        target: Target,
+        opened: bool,
+    },
+    Provider {
+        target: Target,
+        opened: bool,
+    },
+    Blocked {
+        target: Target,
+        blocker: SignOutBlocker,
+    },
     Sending(Target),
 }
 
@@ -388,19 +403,22 @@ impl DeviceSessionsUi {
         };
         let shown = &target.name;
         let operation = state.begin(format!("Renaming “{shown}”… Waiting for the homeserver."));
+        let cancellation = state.operation_cancel.clone();
         drop(state);
         paint(ui, &panel);
         let live = self.live.clone();
         let weak = ui.as_weak();
         self.runtime.spawn(async move {
-            let result = {
+            let result = while_requested(&cancellation, async {
                 let _transition = live.account_transition.lock().await;
                 if live.security_gate.blocked() {
                     Err(None)
                 } else {
                     session.rename(&target.device_id, &name).await.map_err(Some)
                 }
-            };
+            })
+            .await
+            .unwrap_or(Err(Some(DeviceSessionError::Cancelled)));
             let _ = weak.upgrade_in_event_loop(move |ui| {
                 let Some(mut state) = result_state(&ui, &panel, operation) else {
                     return;
@@ -478,12 +496,13 @@ impl DeviceSessionsUi {
         }
         let name = &target.name;
         let operation = state.begin(format!("Asking “{name}” to verify… Waiting for it."));
+        let cancellation = state.operation_cancel.clone();
         drop(state);
         paint(ui, &panel);
         let live = self.live.clone();
         let weak = ui.as_weak();
         self.runtime.spawn(async move {
-            let result = {
+            let result = while_requested(&cancellation, async {
                 let _transition = live.account_transition.lock().await;
                 if live.security_gate.blocked() {
                     Err(None)
@@ -491,7 +510,9 @@ impl DeviceSessionsUi {
                     let sent = session.request_verification(&target.device_id).await;
                     sent.map_err(Some)
                 }
-            };
+            })
+            .await
+            .unwrap_or(Err(Some(DeviceSessionError::Cancelled)));
             let _ = weak.upgrade_in_event_loop(move |ui| {
                 let Some(mut state) = result_state(&ui, &panel, operation) else {
                     return;
@@ -618,17 +639,26 @@ impl DeviceSessionsUi {
         target: Target,
         request: impl Future<Output = Result<SignOutStep, DeviceSessionError>> + Send + 'static,
     ) {
+        let cancellation = {
+            let state = panel.state();
+            if !state.busy || state.operation != operation {
+                return;
+            }
+            state.operation_cancel.clone()
+        };
         let live = self.live.clone();
         let weak = ui.as_weak();
         self.runtime.spawn(async move {
-            let result = {
+            let result = while_requested(&cancellation, async {
                 let _transition = live.account_transition.lock().await;
                 if live.security_gate.blocked() {
                     Err(None)
                 } else {
                     request.await.map_err(Some)
                 }
-            };
+            })
+            .await
+            .unwrap_or(Err(Some(DeviceSessionError::Cancelled)));
             let _ = weak.upgrade_in_event_loop(move |ui| {
                 let Some(mut state) = result_state(&ui, &panel, operation) else {
                     return;
@@ -642,6 +672,21 @@ impl DeviceSessionsUi {
                 }
             });
         });
+    }
+}
+
+/// Cancellation wraps the transition lock as well as the request. A confirmed
+/// sign-out cancelled while queued must never start sending after that lock
+/// becomes available. Dropping an already-sent request cannot undo its server
+/// effect; the UI continues to say to refresh in that case.
+async fn while_requested<T>(
+    cancellation: &DeviceSessionCancellation,
+    work: impl Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => None,
+        result = work => Some(result),
     }
 }
 
@@ -913,6 +958,7 @@ fn retire() {
     if let Some(panel) = previous {
         panel.cancellation.cancel();
         let mut state = panel.state();
+        state.operation_cancel.cancel();
         state.sign_out = SignOut::Closed;
         state.session = None;
         state.snapshot = None;
@@ -1121,7 +1167,10 @@ fn detail_text(row: &DeviceSession, now: u64) -> String {
 
 /// A session this device could still verify.
 fn unverified(trust: DeviceTrust) -> bool {
-    matches!(trust, DeviceTrust::Unverified | DeviceTrust::SignedUnconfirmed)
+    matches!(
+        trust,
+        DeviceTrust::Unverified | DeviceTrust::SignedUnconfirmed
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1181,7 +1230,12 @@ fn sign_out_text(row: &DeviceSession, method: SignOutMethod) -> (&'static str, &
 
 fn summary_text(snapshot: Option<&DeviceSessionSnapshot>, loading: bool) -> String {
     let Some(snapshot) = snapshot else {
-        return if loading { LOADING } else { "Sessions could not be loaded." }.to_owned();
+        return if loading {
+            LOADING
+        } else {
+            "Sessions could not be loaded."
+        }
+        .to_owned();
     };
     let total = snapshot.sessions.len() + snapshot.omitted;
     let other_unverified = |row: &&DeviceSession| !row.current && unverified(row.trust);
@@ -1252,7 +1306,10 @@ fn stage_text(stage: &Stage, account: &str) -> (String, String) {
                 .to_owned(),
         ),
         Stage::Provider { target, .. } => (
-            format!("Sign out {} on your sign-in provider's page", session(target)),
+            format!(
+                "Sign out {} on your sign-in provider's page",
+                session(target)
+            ),
             "This account's sessions are managed by its sign-in provider. Open its page, sign \
              the session out there, then refresh the list. Morpheus cannot see the result \
              until then."
@@ -1343,6 +1400,46 @@ fn reread_after(error: DeviceSessionError) -> bool {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn cancelled_queued_session_write_never_sends_when_transition_unlocks() {
+        let transition = tokio::sync::Mutex::new(());
+        let held = transition.lock().await;
+        let cancellation = DeviceSessionCancellation::new();
+        let sent = std::sync::atomic::AtomicBool::new(false);
+        let writing = while_requested(&cancellation, async {
+            let _transition = transition.lock().await;
+            sent.store(true, Ordering::SeqCst);
+        });
+        let cancel = async {
+            tokio::task::yield_now().await;
+            cancellation.cancel();
+        };
+        let (result, ()) = tokio::join!(writing, cancel);
+        assert_eq!(result, None);
+        drop(held);
+        tokio::task::yield_now().await;
+        assert!(!sent.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn finishing_or_superseding_an_operation_cannot_revive_its_pending_write() {
+        let mut state = PanelState::default();
+        state.begin("First operation".into());
+        let first = state.operation_cancel.clone();
+        state.begin("New operation".into());
+        assert_eq!(
+            while_requested(&first, async { panic!("superseded operation sent") }).await,
+            None::<()>
+        );
+        let current = state.operation_cancel.clone();
+        assert_eq!(while_requested(&current, async { 7 }).await, Some(7));
+        state.finish();
+        assert_eq!(
+            while_requested(&current, async { panic!("cancelled operation sent") }).await,
+            None::<()>
+        );
+    }
+
     fn row(id: &str, name: Option<&str>, trust: DeviceTrust, current: bool) -> DeviceSession {
         DeviceSession {
             device_id: id.to_owned(),
@@ -1361,7 +1458,12 @@ mod tests {
                 row("THIS", Some("Desk"), DeviceTrust::Verified, true),
                 row("PHONE", Some("Phone"), DeviceTrust::Unverified, false),
                 row("OLD", None, DeviceTrust::NoKeys, false),
-                row("SIGNED", Some("Tablet"), DeviceTrust::SignedUnconfirmed, false),
+                row(
+                    "SIGNED",
+                    Some("Tablet"),
+                    DeviceTrust::SignedUnconfirmed,
+                    false,
+                ),
             ],
             omitted: 0,
             cross_signing: CrossSigningState::Ready,
@@ -1493,7 +1595,10 @@ mod tests {
             let (title, body) = stage_text(stage, "@me:example.org");
             assert!(title.contains("“Phone” (PHONE)"), "{title}");
             for text in [&title, &body] {
-                assert!(!text.contains("http") && !text.contains("session="), "{text}");
+                assert!(
+                    !text.contains("http") && !text.contains("session="),
+                    "{text}"
+                );
             }
             assert_ne!(stage_code(stage), 0);
         }
@@ -1547,7 +1652,10 @@ mod tests {
         assert_eq!(last_seen_text(Some(10), 5, false), "Active recently");
         let day = 24 * 60 * 60 * 1000;
         assert_eq!(last_seen_text(Some(0), 3 * day, false), "Active 3 days ago");
-        assert_eq!(last_seen_text(Some(0), day / 24, false), "Active 1 hour ago");
+        assert_eq!(
+            last_seen_text(Some(0), day / 24, false),
+            "Active 1 hour ago"
+        );
         assert_eq!(last_seen_text(Some(0), 3 * day, true), "Active now");
         let summary = summary_text(Some(&shown), false);
         let expected = "@me:example.org: 4 sessions signed in; 2 others are not verified.";
@@ -1562,7 +1670,10 @@ mod tests {
         };
         let gone = error_text(DeviceSessionError::NotFound, Some(&target));
         assert_eq!(gone, "“Phone” is no longer signed in to this account.");
-        assert_eq!(error_text(DeviceSessionError::CurrentDevice, None), USE_LOG_OUT);
+        assert_eq!(
+            error_text(DeviceSessionError::CurrentDevice, None),
+            USE_LOG_OUT
+        );
         assert!(!reread_after(DeviceSessionError::AccountChanged));
         assert!(reread_after(DeviceSessionError::TimedOut));
     }

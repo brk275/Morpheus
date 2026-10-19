@@ -137,7 +137,9 @@ impl DeviceSessionCancellation {
     pub fn is_cancelled(&self) -> bool {
         self.0.cancelled.load(Ordering::Acquire)
     }
-    async fn cancelled(&self) {
+    /// Wait until this operation or view is cancelled. Registration precedes
+    /// the state check, so cancellation cannot be missed while going to sleep.
+    pub async fn cancelled(&self) {
         loop {
             let notified = self.0.notify.notified();
             tokio::pin!(notified);
