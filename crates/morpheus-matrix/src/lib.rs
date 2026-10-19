@@ -4052,10 +4052,12 @@ fn message_info_for(item: &TimelineItem, own_user_id: Option<&UserId>) -> Option
                         .split(':')
                         .next()
                         .unwrap_or("someone");
-                    let poll_line = replied_to
-                        .content
-                        .as_poll()
-                        .map(|poll| format!("Poll: {}", poll.results().question));
+                    let poll_line = replied_to.content.as_poll().map(|poll| {
+                        format!(
+                            "Poll: {}",
+                            poll.results().question.chars().take(72).collect::<String>()
+                        )
+                    });
                     let body = replied_to
                         .content
                         .as_message()
