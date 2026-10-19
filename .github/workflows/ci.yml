@@ -1,12 +1,12 @@
 # TEMPORARY focused native offline app checks. NEVER MERGE this workflow.
 name: Reviewed SDKUI lock metadata
-run-name: SDKUI dependency graph diagnosis - 9100616
+run-name: SDKUI reviewed macro lock resolution - c0906f2
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: sdkui-graph-diagnosis-9100616
+  group: sdkui-reviewed-macro-lock-c0906f2
   cancel-in-progress: false
 jobs:
   contracts:
@@ -17,11 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 91006162290903debe8e2675b06cda407f7c7604
+          ref: c0906f2240ac9c983dbdd3c37f8fecd57b31fa76
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact reviewed source
-        run: test "$(git rev-parse HEAD)" = 91006162290903debe8e2675b06cda407f7c7604
+        run: test "$(git rev-parse HEAD)" = c0906f2240ac9c983dbdd3c37f8fecd57b31fa76
       - name: Scan source before executing reviewed native tests
         shell: bash
         run: |
@@ -111,7 +111,7 @@ jobs:
           if scan.returncode!=0:
               print('OFFLINE_NATIVE_LOG_WITHHELD',flush=True); raise SystemExit(1)
           output=log.read_text(errors='replace')
-          report={'check':'sdkui_lock_metadata','source':'91006162290903debe8e2675b06cda407f7c7604',
+          report={'check':'sdkui_lock_metadata','source':'c0906f2240ac9c983dbdd3c37f8fecd57b31fa76',
               'status':'failed','failure':reason or 'metadata_command_failed',
               'project_code_executed':False,'raw_logs_public':False,'artifacts_uploaded':False}
           families={
