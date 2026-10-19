@@ -74,6 +74,7 @@ component SecretField inherits Rectangle {
     in property <float> text-scale: 1;
     out property <bool> empty: input.text == "";
     callback submitted(string);
+    callback cancelled();
     callback focused();
     public function submit() {
         if root.enabled && input.text != "" {
@@ -105,6 +106,13 @@ component SecretField inherits Rectangle {
         selection-foreground-color: StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : Palette.selection-foreground;
         accessible-label: root.label;
         accepted => { root.submit(); }
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                input.text = "";
+                root.cancelled();
+                accept
+            } else { reject }
+        }
         changed has-focus => { if self.has-focus { root.focused(); } }
     }
 }
@@ -413,6 +421,7 @@ export component DeviceSessionsPanel inherits VerticalLayout {
                             label: "Account password, to sign out " + root.view.selected.name;
                             enabled: !root.view.busy;
                             submitted(secret) => { root.submit-password(secret); }
+                            cancelled => { root.cancel-sign-out(); }
                             focused => { root.reveal-at(self.absolute-position.y); }
                         }
                         TokenButton {

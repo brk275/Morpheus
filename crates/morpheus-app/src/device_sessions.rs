@@ -882,7 +882,9 @@ fn apply_step(
     match result {
         Ok(SignOutStep::Done { gone }) => {
             state.notice = if gone {
-                format!("Signed out “{name}”. It can no longer use this account.")
+                format!(
+                    "The homeserver signed out “{name}”. Messages and keys already downloaded may remain on that device."
+                )
             } else {
                 format!("The homeserver accepted signing out “{name}”. Refresh to confirm.")
             };
@@ -1150,7 +1152,7 @@ fn detail_text(row: &DeviceSession, now: u64) -> String {
     let seen = last_seen_text(row.last_seen_ms, now, row.current);
     let trust = trust_text(row.trust);
     let explanation = match row.trust {
-        DeviceTrust::Verified => "It can read this account's encrypted messages.",
+        DeviceTrust::Verified => "Its encryption identity is verified.",
         DeviceTrust::LocallyTrusted => {
             "You trusted it here earlier; your account has not signed it."
         }
@@ -1159,7 +1161,7 @@ fn detail_text(row: &DeviceSession, now: u64) -> String {
         }
         DeviceTrust::Unverified => "If you don't recognize it, sign it out.",
         DeviceTrust::Blocked => "This device does not send it encrypted messages.",
-        DeviceTrust::NoKeys => "It has not published encryption keys, so it cannot be verified.",
+        DeviceTrust::NoKeys => "No encryption keys are known here, so it cannot be verified yet.",
         DeviceTrust::Unknown => "This device could not read its encryption store.",
     };
     format!("{trust}. {explanation} {seen}.")
@@ -1288,8 +1290,8 @@ fn stage_text(stage: &Stage, account: &str) -> (String, String) {
         Stage::Review(target) => (
             format!("Sign out {}?", session(target)),
             format!(
-                "It is signed out of {account} and can no longer read this account's messages \
-                 unless someone signs in there again. This device stays signed in."
+                "The homeserver will sign it out of {account}. Messages and keys already \
+                 downloaded may remain on that device. This device stays signed in."
             ),
         ),
         Stage::Password { target, .. } => (
@@ -1604,6 +1606,7 @@ mod tests {
         }
         let (_, review) = stage_text(&stages[0], "@me:example.org");
         assert!(review.contains("@me:example.org") && review.contains("This device stays"));
+        assert!(review.contains("Messages and keys already downloaded may remain"));
         let (_, password) = stage_text(&stages[1], "@me:example.org");
         assert!(password.contains("not saved"));
         for blocker in [
@@ -1625,7 +1628,12 @@ mod tests {
         assert!(!apply_step(&mut state, target.clone(), switched));
         let done = Ok(SignOutStep::Done { gone: true });
         assert!(apply_step(&mut state, target, done));
-        assert!(state.notice.starts_with("Signed out “Phone”"));
+        assert!(state.notice.contains("homeserver signed out “Phone”"));
+        assert!(
+            state
+                .notice
+                .contains("Messages and keys already downloaded may remain")
+        );
     }
 
     #[test]
