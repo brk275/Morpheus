@@ -114,9 +114,11 @@ minutes and opens only when that exact account becomes visible; a newer click
 or search result, or a different account becoming visible, drops it, so an
 A → B → A sequence never navigates for the earlier request. While no account is
 open, a click opens the banner's saved account through its protected activation
-(app password included); the room is then in its room list. An invitation
-banner in the visible account points to the invitation in the room list; one
-for another account only switches to that account, where the invitation waits.
+(app password included), then the banner's room once that account is open; a
+newer click, another account opening first or two minutes passing drops it. An
+invitation banner in the visible account points to the invitation in the room
+list; one for another account only switches to that account, where the
+invitation waits.
 
 A banner resolves once; a dismissed, replaced, expired or unknown banner opens
 nothing, and an old banner never brings back a removed account or a reused
