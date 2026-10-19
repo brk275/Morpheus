@@ -1,7 +1,7 @@
-//! Memory-only PNG/baseline-JPEG decoding. Framing/dimension guards run before
-//! decoder construction; metadata is discarded without decompression. Still
-//! decoding deliberately excludes animation, progressive JPEG, ICC/EXIF and
-//! WebP; `animation` plays GIF, WebP and APNG through `png_animation_input`.
+//! Memory-only PNG and baseline/progressive JPEG decoding. Framing/dimension
+//! guards run before decoder construction; metadata is discarded without
+//! decompression. Still decoding deliberately excludes animation, arithmetic
+//! coding, ICC/EXIF and WebP; `animation` plays GIF, WebP and APNG through `png_animation_input`.
 //! The one EXIF value read is a JPEG's orientation, taken from the first Exif
 //! segment before that segment is discarded, so camera photos show upright.
 use super::{Pixels, PreviewError};
@@ -14,6 +14,8 @@ pub(super) const MAX_PIXELS: usize = 4 * 1024 * 1024;
 const MAX_DECODER_ALLOC: u64 = 32 * 1024 * 1024;
 /// Frames one animation pass may contain or decode.
 pub(super) const MAX_ANIMATION_FRAMES: usize = 1000;
+/// Scans one progressive JPEG may contain; its decoder gets the same cap.
+const MAX_JPEG_SCANS: usize = 64;
 
 pub(super) fn size(width: u32, height: u32) -> Result<usize, PreviewError> {
     let pixels = (width as usize)
@@ -160,12 +162,17 @@ fn png_input_with(bytes: &[u8], animation: bool) -> Result<Zeroizing<Vec<u8>>, P
 }
 
 /// The sanitized decoder input and the orientation of the first Exif segment
-/// (upright when absent or unreadable).
+/// (upright when absent or unreadable). Baseline frames have exactly one
+/// scan. Progressive (SOF2, Huffman) frames may have up to `MAX_JPEG_SCANS`,
+/// with only Huffman and restart tables between them. Nothing else may follow
+/// the first scan.
 fn jpeg_input(bytes: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Orientation), PreviewError> {
     let mut output = Zeroizing::new(vec![0xff, 0xd8]);
     let mut position = 2usize;
-    let mut components = None;
+    // Component count, and whether the frame is progressive.
+    let mut frame = None;
     let mut orientation = None;
+    let mut scans = 0usize;
     for _ in 0..1024 {
         let start = position;
         if bytes.get(position) != Some(&0xff) {
@@ -185,9 +192,12 @@ fn jpeg_input(bytes: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Orientation), Preview
         }
         let end = position.checked_add(length).ok_or(PreviewError::Invalid)?;
         let payload = bytes.get(position + 2..end).ok_or(PreviewError::Invalid)?;
+        if scans > 0 && !matches!(marker, 0xc4 | 0xdd | 0xda) {
+            return Err(PreviewError::Unsupported); // No later headers or metadata.
+        }
         match marker {
-            0xc0 => {
-                if components.is_some() || payload.len() < 6 || payload[0] != 8 {
+            0xc0 | 0xc2 => {
+                if frame.is_some() || payload.len() < 6 || payload[0] != 8 {
                     return Err(PreviewError::Unsupported);
                 }
                 let count = payload[5] as usize;
@@ -205,38 +215,31 @@ fn jpeg_input(bytes: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Orientation), Preview
                         return Err(PreviewError::Unsupported);
                     }
                 }
-                components = Some(count);
+                frame = Some((count, marker == 0xc2));
             }
             0xda => {
-                let count = components.ok_or(PreviewError::Invalid)?;
-                if payload.len() != 1 + 2 * count + 3
-                    || payload[0] as usize != count
-                    || payload[payload.len() - 3..] != [0, 63, 0]
-                {
-                    return Err(PreviewError::Unsupported);
+                let (count, progressive) = frame.ok_or(PreviewError::Invalid)?;
+                scan_header(payload, count, progressive)?;
+                scans += 1;
+                let limit = if progressive { MAX_JPEG_SCANS } else { 1 };
+                if scans > limit {
+                    return Err(PreviewError::TooLarge);
                 }
                 output.extend_from_slice(&bytes[start..end]);
-                let mut cursor = end;
-                while cursor < bytes.len() {
-                    if bytes[cursor] != 0xff {
-                        cursor += 1;
-                        continue;
-                    }
-                    cursor += 1;
-                    while bytes.get(cursor) == Some(&0xff) {
-                        cursor += 1;
-                    }
-                    match bytes.get(cursor) {
-                        Some(0x00 | 0xd0..=0xd7) => cursor += 1,
-                        Some(0xd9) if cursor + 1 == bytes.len() => {
-                            output.extend_from_slice(&bytes[end..]);
-                            let orientation = orientation.unwrap_or(Orientation::NoTransforms);
-                            return Ok((output, orientation));
-                        }
-                        _ => return Err(PreviewError::Unsupported), // No later scans/headers/metadata.
-                    }
+                let (next, following, at) = entropy_end(bytes, end)?;
+                if following == 0xd9 && at + 1 == bytes.len() {
+                    output.extend_from_slice(&bytes[end..]);
+                    let orientation = orientation.unwrap_or(Orientation::NoTransforms);
+                    return Ok((output, orientation));
                 }
-                return Err(PreviewError::Invalid);
+                // A baseline scan ends the image; a progressive one may be
+                // followed only by tables and its next scan.
+                if !progressive || !matches!(following, 0xc4 | 0xdd | 0xda) {
+                    return Err(PreviewError::Unsupported);
+                }
+                output.extend_from_slice(&bytes[end..next]);
+                position = next;
+                continue;
             }
             0xdb | 0xc4 | 0xdd => {} // Quantization, Huffman and restart tables.
             0xe0 | 0xee if payload.len() <= 32 => {} // Small JFIF/Adobe colour hints.
@@ -259,6 +262,63 @@ fn jpeg_input(bytes: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Orientation), Preview
         }
         output.extend_from_slice(&bytes[start..end]);
         position = end;
+    }
+    Err(PreviewError::Invalid)
+}
+
+/// A scan header. Baseline: one interleaved scan of every component over the
+/// full spectrum. Progressive: a DC scan (spectrum 0..0) of up to every
+/// component, or an AC scan (1..=63) of exactly one, with approximation bits
+/// within the 8-bit range.
+fn scan_header(payload: &[u8], components: usize, progressive: bool) -> Result<(), PreviewError> {
+    let count = *payload.first().ok_or(PreviewError::Invalid)? as usize;
+    if payload.len() != 1 + 2 * count + 3 {
+        return Err(PreviewError::Unsupported);
+    }
+    let tail = &payload[payload.len() - 3..];
+    let (first, last, approximation) = (tail[0], tail[1], tail[2]);
+    if !progressive {
+        return if count == components && tail == [0, 63, 0] {
+            Ok(())
+        } else {
+            Err(PreviewError::Unsupported)
+        };
+    }
+    let dc = first == 0;
+    if count == 0
+        || count > components
+        || first > last
+        || last > 63
+        || dc != (last == 0)
+        || (!dc && count != 1)
+        || approximation >> 4 > 13
+        || approximation & 15 > 13
+    {
+        return Err(PreviewError::Unsupported);
+    }
+    Ok(())
+}
+
+/// The end of entropy-coded data starting at `from`: the index of the 0xff
+/// that begins the next real marker, that marker, and the marker's index.
+/// Byte stuffing and restart markers belong to the data.
+fn entropy_end(bytes: &[u8], from: usize) -> Result<(usize, u8, usize), PreviewError> {
+    let mut cursor = from;
+    while cursor < bytes.len() {
+        if bytes[cursor] != 0xff {
+            cursor += 1;
+            continue;
+        }
+        let start = cursor;
+        cursor += 1;
+        while bytes.get(cursor) == Some(&0xff) {
+            cursor += 1;
+        }
+        match bytes.get(cursor) {
+            Some(0x00 | 0xd0..=0xd7) => cursor += 1,
+            Some(&marker) => return Ok((start, marker, cursor)),
+            None => break,
+        }
     }
     Err(PreviewError::Invalid)
 }
@@ -313,7 +373,7 @@ pub(super) fn decode(bytes: Zeroizing<Vec<u8>>) -> Result<Pixels, PreviewError> 
             .set_max_width(MAX_SIDE as usize)
             .set_max_height(MAX_SIDE as usize)
             .set_strict_mode(true)
-            .jpeg_set_max_scans(1)
+            .jpeg_set_max_scans(MAX_JPEG_SCANS)
             .jpeg_set_out_colorspace(zune_core::colorspace::ColorSpace::RGBA);
         let mut decoder = zune_jpeg::JpegDecoder::new_with_options(
             zune_core::bytestream::ZCursor::new(input.as_slice()),
@@ -563,6 +623,58 @@ mod tests {
         source.extend_from_slice(&exif(9));
         source.extend_from_slice(&frame);
         assert_eq!(jpeg_input(&source).unwrap().1, Orientation::NoTransforms);
+    }
+    // SOI, a one-component 1x1 frame (`frame` is 0xc0 or 0xc2), then each
+    // scan as (scan header tail, entropy bytes), each preceded by `between`.
+    fn jpeg(frame: u8, scans: &[([u8; 3], &[u8])], between: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0xff, 0xd8, 0xff, frame, 0, 11, 8, 0, 1, 0, 1, 1, 1, 0x11, 0];
+        for (tail, data) in scans {
+            bytes.extend_from_slice(between);
+            bytes.extend_from_slice(&[0xff, 0xda, 0, 8, 1, 1, 0]);
+            bytes.extend_from_slice(tail);
+            bytes.extend_from_slice(data);
+        }
+        bytes.extend_from_slice(&[0xff, 0xd9]);
+        bytes
+    }
+    const HUFFMAN: &[u8] = &[0xff, 0xc4, 0, 3, 0];
+    #[test]
+    fn progressive_scans_pass_with_tables_between_them() {
+        let dc = ([0, 0, 0], &[0x12, 0xff, 0x00, 0x34][..]);
+        let ac = ([1, 63, 0], &[0x56, 0xff, 0xd0, 0x78][..]);
+        let refine = ([1, 63, 0x10], &[0x9a][..]);
+        let source = jpeg(0xc2, &[dc, ac, refine], HUFFMAN);
+        let (bounded, _) = jpeg_input(&source).unwrap();
+        // Every scan, its stuffed and restart bytes and every table are kept.
+        assert_eq!(bounded.as_slice(), source.as_slice());
+        // A baseline frame still has exactly one full-spectrum scan.
+        assert!(jpeg_input(&jpeg(0xc0, &[([0, 63, 0], &[1u8][..])], &[])).is_ok());
+        assert!(jpeg_input(&jpeg(0xc0, &[([0, 63, 0], &[1u8][..]); 2], &[])).is_err());
+        assert!(jpeg_input(&jpeg(0xc0, &[([0, 0, 0], &[1u8][..])], &[])).is_err());
+    }
+    #[test]
+    fn progressive_framing_rejects_metadata_bad_scans_and_too_many_scans() {
+        let dc = ([0, 0, 0], &[1u8][..]);
+        // Metadata after the first scan never reaches the decoder.
+        let comment = [0xff, 0xfe, 0, 3, b'x'];
+        let late = jpeg(0xc2, &[dc, ([1, 63, 0], &[2u8][..])], &comment);
+        assert!(matches!(jpeg_input(&late), Err(PreviewError::Unsupported)));
+        for tail in [[1, 0, 0], [0, 5, 0], [2, 64, 0], [1, 63, 0xe0], [1, 63, 0x0e]] {
+            let bad = jpeg(0xc2, &[(tail, &[1u8][..])], &[]);
+            assert!(jpeg_input(&bad).is_err(), "{tail:?}");
+        }
+        let many = vec![dc; MAX_JPEG_SCANS + 1];
+        assert!(matches!(
+            jpeg_input(&jpeg(0xc2, &many, HUFFMAN)),
+            Err(PreviewError::TooLarge)
+        ));
+        assert!(jpeg_input(&jpeg(0xc2, &many[..MAX_JPEG_SCANS], HUFFMAN)).is_ok());
+        // An AC scan covers exactly one component.
+        let mut colour = vec![0xff, 0xd8, 0xff, 0xc2, 0, 17, 8, 0, 1, 0, 1, 3];
+        colour.extend_from_slice(&[1, 0x11, 0, 2, 0x11, 0, 3, 0x11, 0]);
+        colour.extend_from_slice(&[0xff, 0xda, 0, 10, 2, 1, 0, 2, 0, 1, 63, 0, 1]);
+        colour.extend_from_slice(&[0xff, 0xd9]);
+        assert!(jpeg_input(&colour).is_err());
     }
     #[test]
     fn jpeg_metadata_is_removed_and_later_header_injection_rejected() {

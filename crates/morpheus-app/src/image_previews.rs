@@ -47,7 +47,7 @@ impl PreviewError {
                 "Preview limit: 8 MiB, 4096 pixels per side, 4 megapixels and 1000 animation frames. You can still save the attachment."
             }
             Self::Unsupported => {
-                "Preview supports 8-bit PNG, baseline JPEG, GIF and WebP, and plays animated PNG, GIF and WebP. Progressive JPEG, 16-bit PNG, SVG, audio and video previews are not supported yet."
+                "Preview supports 8-bit PNG, baseline and progressive JPEG, GIF and WebP, and plays animated PNG, GIF and WebP. Arithmetic-coded JPEG, 16-bit PNG, SVG, audio and video previews are not supported yet."
             }
             Self::Invalid => {
                 "This image could not be decoded safely. You can still save the attachment."
@@ -62,7 +62,7 @@ impl PreviewError {
     }
 }
 
-/// The same bounded PNG/baseline-JPEG decoder for other memory-only native
+/// The same bounded PNG/JPEG decoder for other memory-only native
 /// previews: (width, height, RGBA). Call it only on a dedicated worker.
 pub(crate) fn decode_rgba(
     bytes: Zeroizing<Vec<u8>>,
