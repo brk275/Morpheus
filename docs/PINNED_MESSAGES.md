@@ -59,13 +59,33 @@ app controller is `crates/morpheus-app/src/pinned_messages/`, and the pane is
 - One scope exists per account selection and room. Results publish only when
   the scope token is current, the account selection is current (A-B-A safe),
   and the window still shows that account and room.
-- Account detach, account switch, sign-out and room change clear all pinned
-  rows, flags, filter text and notices synchronously on the UI thread, and
-  cancel the scope's requests and sync watcher.
+- When the window's visible account or room actually changes (a snapshot
+  selection change, an account context clear or an account detach), all pinned
+  rows, flags, filter text and notices are cleared synchronously on the UI
+  thread, and the scope's requests and sync watcher are cancelled. A switch
+  that is blocked or cancelled keeps or rebuilds the scope for the room still
+  shown.
 - Decrypted rows are kept only in memory while the pane is open. Closing the
-  pane drops them. Nothing is logged or written to disk.
-- Sync batches that touch the pinned list, power levels, membership or
-  redactions of the visible room cause one reread per 750 ms burst.
+  pane drops them, even mid-switch. Nothing is logged or written to disk.
+- A sync batch that touches the pinned list, the power levels or this
+  account's own membership, or that has a timeline gap, rereads the list
+  once per 750 ms burst. Sliding-sync room lists do not request the pinned
+  list, so a gap may hide a change. Any redaction rereads the list, because
+  redacting the list itself empties it. An open pane refetches rows only for
+  newly shown pins, a redaction of a shown pin, or a gap.
+- A read that began before a change that may have applied is discarded and
+  rerun, so it cannot bring back an unpinned row.
+- The pane's rows update in place, so keyboard focus stays on a row that is
+  still listed. After Unpin from the pane removes the focused row, focus moves
+  to the search field. Only an explicit open (header button, Pins tab,
+  `show-pinned-panel()`) moves focus into the pane.
+
+## Actions
+
+- The timeline row action and the thread reply button show once the list is
+  known, for anyone allowed to change it. Without that permission they appear
+  only as disabled markers on pinned messages. Both pass the account and room
+  they showed, and Rust checks them against the current scope.
 
 ## Integration dependency
 

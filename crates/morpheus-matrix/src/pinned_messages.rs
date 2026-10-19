@@ -236,24 +236,48 @@ pub struct PinnedRoomChange {
     /// The pinned list, the power levels or this account's membership may
     /// have changed: reread the state.
     pub state: bool,
-    /// A redaction arrived: an open panel should reload its rows.
+    /// A shown pin may have been redacted: an open panel should reload its
+    /// rows.
     pub content: bool,
 }
 
-/// Classify a sync batch for `room_id`. State can arrive before or after the
-/// timeline, and older servers or sliding sync can put it in the timeline.
+/// Classify a sync batch for `room_id` as seen by `own_user_id`, whose
+/// current pins are `pinned`. State can arrive before or after the timeline,
+/// and older servers or sliding sync can put it in the timeline. Sliding-sync
+/// room lists carry only the newest timeline event and do not request the
+/// pinned list, so a timeline gap counts as a possible change of both.
 pub fn room_updates_affect_pinned(
     updates: &matrix_sdk::sync::RoomUpdates,
     room_id: &str,
+    own_user_id: &str,
+    pinned: &[String],
 ) -> PinnedRoomChange {
-    fn kind<T>(event: &Raw<T>) -> Option<String> {
-        event.get_field::<String>("type").ok().flatten()
+    fn field<T>(event: &Raw<T>, name: &str) -> Option<String> {
+        event.get_field::<String>(name).ok().flatten()
     }
-    fn state_kind(kind: &str) -> bool {
-        matches!(
-            kind,
-            "m.room.pinned_events" | "m.room.power_levels" | "m.room.member" | "m.room.create"
-        )
+    fn relevant_state<T>(event: &Raw<T>, own: &str) -> bool {
+        let (Some(kind), Some(key)) = (field(event, "type"), field(event, "state_key")) else {
+            return false;
+        };
+        match kind.as_str() {
+            "m.room.pinned_events" | "m.room.power_levels" | "m.room.create" => key.is_empty(),
+            // Only this account's membership changes what it may see or do.
+            "m.room.member" => key == own,
+            _ => false,
+        }
+    }
+    // Room versions before 11 put the target at the top level, later ones in
+    // the content.
+    fn redaction_target<T>(event: &Raw<T>) -> Option<String> {
+        field(event, "redacts").or_else(|| {
+            event
+                .get_field::<serde_json::Value>("content")
+                .ok()
+                .flatten()?
+                .get("redacts")?
+                .as_str()
+                .map(str::to_owned)
+        })
     }
     let Ok(room) = RoomId::parse(room_id) else {
         return PinnedRoomChange::default();
@@ -272,33 +296,32 @@ pub fn room_updates_affect_pinned(
         return PinnedRoomChange::default();
     };
     let mut change = PinnedRoomChange::default();
+    if joined.timeline.limited {
+        change.state = true;
+        change.content = true;
+    }
     let state_events = match &joined.state {
         matrix_sdk::sync::State::Before(events) | matrix_sdk::sync::State::After(events) => {
             events
         }
     };
-    for event in state_events {
-        // A member event only matters for this account, but the state reread
-        // is bounded and coalesced by the caller, so any member change counts.
-        if kind(event).is_some_and(|k| state_kind(&k)) {
-            change.state = true;
-        }
+    if state_events
+        .iter()
+        .any(|event| relevant_state(event, own_user_id))
+    {
+        change.state = true;
     }
     for event in &joined.timeline.events {
-        match kind(event.raw()).as_deref() {
-            Some("m.room.redaction") => change.content = true,
-            Some(k) if state_kind(k) => {
-                if event
-                    .raw()
-                    .get_field::<String>("state_key")
-                    .ok()
-                    .flatten()
-                    .is_some()
-                {
-                    change.state = true;
-                }
+        let raw = event.raw();
+        if field(raw, "type").as_deref() == Some("m.room.redaction") {
+            // Redacting the pinned-events state itself empties the list.
+            change.state = true;
+            match redaction_target(raw) {
+                Some(target) => change.content |= pinned.contains(&target),
+                None => change.content = true,
             }
-            _ => {}
+        } else if relevant_state(raw, own_user_id) {
+            change.state = true;
         }
     }
     change
@@ -707,8 +730,8 @@ impl PinnedContent {
             serde_json::value::to_raw_value(&entries)
                 .map_err(|_| PinnedMessagesError::InvalidState)?,
         );
-        let body =
-            serde_json::value::to_raw_value(&fields).map_err(|_| PinnedMessagesError::InvalidState)?;
+        let body = serde_json::value::to_raw_value(&fields)
+            .map_err(|_| PinnedMessagesError::InvalidState)?;
         if body.get().len() > MAX_CONTENT_BYTES {
             return Err(PinnedMessagesError::TooLarge);
         }
@@ -1037,12 +1060,12 @@ mod tests {
         assert!(!content.editable);
         assert!(content.ids.is_empty());
         assert_eq!(
-            content.with_pin(event_id!("$a:example.org"), true),
-            Err(PinnedMessagesError::Unsupported)
+            content.with_pin(event_id!("$a:example.org"), true).err(),
+            Some(PinnedMessagesError::Unsupported)
         );
         assert_eq!(
-            content.with_pin(event_id!("$a:example.org"), false),
-            Err(PinnedMessagesError::Unsupported)
+            content.with_pin(event_id!("$a:example.org"), false).err(),
+            Some(PinnedMessagesError::Unsupported)
         );
         let invalid = RawValue::from_string("[1]".to_owned()).unwrap();
         assert!(PinnedContent::parse(Some(&invalid)).is_err());
@@ -1055,8 +1078,8 @@ mod tests {
             .collect();
         let content = parse(&json!({ "pinned": ids }).to_string());
         assert_eq!(
-            content.with_pin(event_id!("$new:example.org"), true),
-            Err(PinnedMessagesError::TooMany)
+            content.with_pin(event_id!("$new:example.org"), true).err(),
+            Some(PinnedMessagesError::TooMany)
         );
         assert!(
             content
@@ -1068,8 +1091,8 @@ mod tests {
         let big: Vec<String> = (0..300).map(|i| format!("{long}{i}")).collect();
         let content = parse(&json!({ "pinned": [], "pad": big }).to_string());
         assert_eq!(
-            content.with_pin(event_id!("$a:example.org"), true),
-            Err(PinnedMessagesError::TooLarge)
+            content.with_pin(event_id!("$a:example.org"), true).err(),
+            Some(PinnedMessagesError::TooLarge)
         );
     }
 
@@ -1152,7 +1175,10 @@ mod tests {
         let id = event_id!("$m:example.org");
         let text = classify(
             id,
-            &timeline(message("$m:example.org", json!({"msgtype": "m.text", "body": "hi\u{202e}\nthere"}))),
+            &timeline(message(
+                "$m:example.org",
+                json!({"msgtype": "m.text", "body": "hi\u{202e}\nthere"}),
+            )),
             false,
         );
         assert_eq!(text.kind, PinnedMessageKind::Message);
@@ -1204,7 +1230,14 @@ mod tests {
         );
         assert_eq!(edit.kind, PinnedMessageKind::Unsupported);
 
-        let other = classify(id, &timeline(message("$x:example.org", json!({"msgtype": "m.text", "body": "x"}))), false);
+        let other = classify(
+            id,
+            &timeline(message(
+                "$x:example.org",
+                json!({"msgtype": "m.text", "body": "x"}),
+            )),
+            false,
+        );
         assert_eq!(other.kind, PinnedMessageKind::Unavailable);
     }
 
@@ -1302,43 +1335,67 @@ mod tests {
         assert_eq!(plain_text("abcdef", 4), "abc…");
         assert_eq!(plain_text("ab cd", 3), "ab…");
         assert_eq!(plain_text("\u{202e}\u{2066}", 10), "");
-        assert!(plain_text(&"x".repeat(10_000), MAX_PINNED_TEXT_CHARS).chars().count() <= MAX_PINNED_TEXT_CHARS);
+        let bounded = plain_text(&"x".repeat(10_000), MAX_PINNED_TEXT_CHARS);
+        assert!(bounded.chars().count() <= MAX_PINNED_TEXT_CHARS);
     }
 
     #[test]
     fn sync_batches_select_only_relevant_room_changes() {
         use matrix_sdk::sync::{JoinedRoomUpdate, RoomUpdates};
         let room = room_id!("!r:example.org");
-        let mut updates = RoomUpdates::default();
-        assert_eq!(
-            room_updates_affect_pinned(&updates, room.as_str()),
-            PinnedRoomChange::default()
-        );
-        let mut joined = JoinedRoomUpdate::default();
-        joined.timeline.events.push(timeline(message(
+        let own = "@own:example.org";
+        let pinned = vec!["$pin:example.org".to_owned()];
+        let affect = |updates: &RoomUpdates, room: &str| {
+            room_updates_affect_pinned(updates, room, own, &pinned)
+        };
+        let state_event = |kind: &str, key: &str| {
+            timeline(json!({
+                "type": kind, "event_id": "$s:example.org", "sender": "@a:example.org",
+                "origin_server_ts": 1, "state_key": key, "content": {},
+            }))
+        };
+        let redaction = |target: &str| {
+            timeline(json!({
+                "type": "m.room.redaction", "event_id": "$r:example.org",
+                "sender": "@a:example.org", "origin_server_ts": 1,
+                "redacts": target, "content": {"redacts": target},
+            }))
+        };
+        let batch = |events: Vec<TimelineEvent>, limited: bool| {
+            let mut joined = JoinedRoomUpdate::default();
+            joined.timeline.events = events;
+            joined.timeline.limited = limited;
+            let mut updates = RoomUpdates::default();
+            updates.joined.insert(room.to_owned(), joined);
+            updates
+        };
+        let none = PinnedRoomChange::default();
+        assert_eq!(affect(&RoomUpdates::default(), room.as_str()), none);
+        let text = timeline(message(
             "$m:example.org",
             json!({"msgtype": "m.text", "body": "x"}),
-        )));
-        updates.joined.insert(room.to_owned(), joined);
+        ));
+        assert_eq!(affect(&batch(vec![text.clone()], false), room.as_str()), none);
+        // Another member's join or profile change says nothing about pins.
+        let other = state_event("m.room.member", "@other:example.org");
+        assert_eq!(affect(&batch(vec![other], false), room.as_str()), none);
+        let mine = state_event("m.room.member", own);
+        assert!(affect(&batch(vec![mine], false), room.as_str()).state);
+        let list = state_event("m.room.pinned_events", "");
+        let changed = affect(&batch(vec![list], false), room.as_str());
+        assert!(changed.state && !changed.content);
+        // A gap may hide a pin change or a redaction.
+        let gap = affect(&batch(vec![text], true), room.as_str());
+        assert!(gap.state && gap.content);
+        // Every redaction may have emptied the list; only a pinned target
+        // changes the shown rows.
+        let unrelated = affect(&batch(vec![redaction("$x:example.org")], false), room.as_str());
+        assert!(unrelated.state && !unrelated.content);
+        let shown = affect(&batch(vec![redaction("$pin:example.org")], false), room.as_str());
+        assert!(shown.state && shown.content);
         assert_eq!(
-            room_updates_affect_pinned(&updates, room.as_str()),
-            PinnedRoomChange::default()
-        );
-        updates
-            .joined
-            .get_mut(room)
-            .unwrap()
-            .timeline
-            .events
-            .push(timeline(json!({
-                "type": "m.room.pinned_events", "event_id": "$p:example.org",
-                "sender": "@a:example.org", "origin_server_ts": 1, "state_key": "",
-                "content": {"pinned": []},
-            })));
-        assert!(room_updates_affect_pinned(&updates, room.as_str()).state);
-        assert_eq!(
-            room_updates_affect_pinned(&updates, "!other:example.org"),
-            PinnedRoomChange::default()
+            affect(&batch(vec![redaction("$pin:example.org")], false), "!other:example.org"),
+            none
         );
     }
 }

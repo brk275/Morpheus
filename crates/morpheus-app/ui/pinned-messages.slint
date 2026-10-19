@@ -155,6 +155,7 @@ component PinnedRow inherits Rectangle {
             color: root.palette.ink;
             font-size: 12px * root.text-scale;
             wrap: word-wrap;
+            min-width: 0px;
             accessible-role: none;
         }
         if root.item.attachment != "" : Text {
@@ -171,6 +172,7 @@ component PinnedRow inherits Rectangle {
             font-size: 11px * root.text-scale;
             font-italic: true;
             wrap: word-wrap;
+            min-width: 0px;
             accessible-role: none;
         }
         if root.item.edited || root.item.warning || root.item.thread-id != "" : Text {
@@ -182,6 +184,7 @@ component PinnedRow inherits Rectangle {
             color: root.item.warning ? root.palette.warning : root.palette.muted;
             font-size: 10px * root.text-scale;
             wrap: word-wrap;
+            min-width: 0px;
             accessible-role: none;
         }
         HorizontalLayout {
@@ -272,6 +275,9 @@ export component PinnedMessagesPanel inherits Rectangle {
                         padding-left: 8px;
                         padding-right: 8px;
                         Rectangle {
+                            // The typed filter must not widen the pane.
+                            min-width: 0px;
+                            clip: true;
                             search := TextInput {
                                 width: parent.width;
                                 height: parent.height;
@@ -313,12 +319,14 @@ export component PinnedMessagesPanel inherits Rectangle {
                     color: root.palette.muted;
                     font-size: 11px * root.text-scale;
                     wrap: word-wrap;
+                    min-width: 0px;
                 }
                 if root.available && root.read-only-note != "" : Text {
                     text: root.read-only-note;
                     color: root.palette.muted;
                     font-size: 11px * root.text-scale;
                     wrap: word-wrap;
+                    min-width: 0px;
                 }
             }
         }
@@ -330,6 +338,7 @@ export component PinnedMessagesPanel inherits Rectangle {
                 color: root.palette.muted;
                 font-size: 12px * root.text-scale;
                 wrap: word-wrap;
+                min-width: 0px;
                 accessible-live-region: polite;
             }
         }
@@ -340,6 +349,7 @@ export component PinnedMessagesPanel inherits Rectangle {
                 color: root.palette.muted;
                 font-size: 12px * root.text-scale;
                 wrap: word-wrap;
+                min-width: 0px;
                 accessible-live-region: polite;
             }
         }
@@ -351,6 +361,7 @@ export component PinnedMessagesPanel inherits Rectangle {
                 color: root.palette.error;
                 font-size: 12px * root.text-scale;
                 wrap: word-wrap;
+                min-width: 0px;
                 accessible-live-region: polite;
             }
             HorizontalLayout {
@@ -371,6 +382,7 @@ export component PinnedMessagesPanel inherits Rectangle {
                 color: root.palette.muted;
                 font-size: 12px * root.text-scale;
                 wrap: word-wrap;
+                min-width: 0px;
                 accessible-live-region: polite;
             }
         }
@@ -381,6 +393,7 @@ export component PinnedMessagesPanel inherits Rectangle {
                 color: root.palette.muted;
                 font-size: 11px * root.text-scale;
                 wrap: word-wrap;
+                min-width: 0px;
                 accessible-live-region: polite;
             }
         }

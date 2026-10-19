@@ -2233,6 +2233,9 @@ export component AppWindow inherits Window {
     in-out property <bool> pinned-busy: false;
     in-out property <string> pinned-filter;
     in-out property <int> pinned-focus-request: 0;
+    // Set by an explicit open of a hidden pane; Rust consumes it once the pane
+    // exists, so merely revealing the side panel never moves focus.
+    in-out property <bool> pinned-focus-pending: false;
     property <string> pinned-scope: root.active-account-local-id + "\n" + root.active-room-id + "\n" + (root.live-session ? "1" : "0");
     changed pinned-scope => { root.pinned-context-changed(); }
     property <bool> pinned-pane-visible: root.page == 0 && root.show-side-panel && root.side-panel-tab == 3;
@@ -2386,6 +2389,7 @@ export component AppWindow inherits Window {
     }
     // Presentation only: show the pinned-messages tab of the side panel.
     public function show-pinned-panel() {
+        if root.pinned-pane-visible { root.pinned-focus-request += 1; } else { root.pinned-focus-pending = true; }
         root.page = 0;
         root.show-side-panel = true;
         root.side-panel-tab = 3;
@@ -3348,7 +3352,11 @@ export component AppWindow inherits Window {
                             icon: "Pin"; label: "Show pinned messages"; ink: root.muted; surface: transparent; hover-surface: root.hover;
                             selected: root.show-side-panel && root.side-panel-tab == 3;
                             enabled: root.live-session && root.active-room-id != "";
-                            activated => { root.show-side-panel = true; root.side-panel-tab = 3; root.pinned-focus-request += 1; }
+                            activated => {
+                                if root.pinned-pane-visible { root.pinned-focus-request += 1; } else { root.pinned-focus-pending = true; }
+                                root.show-side-panel = true;
+                                root.side-panel-tab = 3;
+                            }
                         }
                         }
                         if root.page == 0 : VerticalLayout {
@@ -5852,7 +5860,10 @@ export component AppWindow inherits Window {
                             accessible-checkable: true;
                             accessible-checked: root.side-panel-tab == 3;
                             enabled: root.live-session && root.active-room-id != "";
-                            activated => { root.side-panel-tab = 3; }
+                            activated => {
+                                if !root.pinned-pane-visible { root.pinned-focus-pending = true; }
+                                root.side-panel-tab = 3;
+                            }
                             Text { text: "Pins"; color: root.side-panel-tab == 3 ? root.ink : root.muted; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; overflow: elide; }
                         }
                     }
@@ -6176,6 +6187,20 @@ export component AppWindow inherits Window {
                                         text: "Preview image"; accessible-label: "Preview image " + reply.attachment;
                                         enabled: root.live-session;
                                         clicked => { root.preview-image-attachment(reply.event-id, reply.attachment); }
+                                    }
+                                    // The timeline pin rule: shown once the pinned list is known, for
+                                    // anyone who may change it, and as a disabled marker on pinned
+                                    // replies otherwise. Rust rechecks the account, room and scope.
+                                    if reply.event-id != "" && root.pinned-state-loaded && (root.pinned-can-edit || reply.pinned) : HorizontalLayout {
+                                        alignment: end;
+                                        Button {
+                                            text: reply.pinned ? "Unpin" : "Pin";
+                                            accessible-label: (reply.pinned ? "Unpin reply from " : "Pin reply from ") + reply.sender;
+                                            enabled: root.live-session && root.pinned-can-edit && !root.pinned-busy;
+                                            clicked => {
+                                                root.toggle-message-pin(root.active-account-local-id, root.active-room-id, reply.event-id, !reply.pinned);
+                                            }
+                                        }
                                     }
                                 }
                             }

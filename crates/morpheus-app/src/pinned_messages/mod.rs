@@ -1,5 +1,6 @@
-//! Native pinned messages for the visible room: the timeline Pin/Unpin
-//! action, the Pins side-panel tab and refresh on room state changes.
+//! Native pinned messages for the visible room: the timeline and thread
+//! Pin/Unpin actions, the Pins side-panel tab and refresh on room state
+//! changes.
 //!
 //! One scope exists per account selection and room. Every published result
 //! checks the scope token, the account selection (A-B-A safe) and the visible
@@ -21,11 +22,11 @@ use std::{
 };
 
 use morpheus_matrix::{
-    AccountSelection, MessageInfo, PinnedChange, PinnedMessage, PinnedMessages,
-    PinnedMessagesCancellation, PinnedMessagesError, PinnedRoomChange, PinnedState,
-    room_updates_affect_pinned,
+    AccountSelection, MAX_PINNED_DISPLAY, MessageInfo, PinnedChange, PinnedMessage,
+    PinnedMessages, PinnedMessagesCancellation, PinnedMessagesError, PinnedRoomChange,
+    PinnedState, room_updates_affect_pinned,
 };
-use slint::{ComponentHandle, ModelRc, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use tokio::{runtime::Handle, sync::broadcast::error::RecvError, time};
 
 use crate::{AppWindow, PinnedMessageItem, live::LiveUi};
@@ -39,7 +40,8 @@ thread_local! {
     static ROW_PINS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 }
 
-/// Whether a timeline row is pinned in the visible room. UI thread only.
+/// Whether a timeline or thread row is pinned in the visible room. UI thread
+/// only.
 pub(crate) fn row_pinned(event_id: Option<&str>) -> bool {
     event_id.is_some_and(|id| ROW_PINS.with(|pins| pins.borrow().contains(id)))
 }
@@ -63,6 +65,44 @@ fn set_row_pins(ui: &AppWindow, next: HashSet<String>) {
     crate::timeline_model::refresh_rows(&ui.get_thread_messages(), affected);
 }
 
+/// Update the pane's rows in place, so every row whose event stays keeps its
+/// delegate and with it keyboard focus. The first `items.len()` rows end up
+/// equal to `items` whatever the previous order.
+fn sync_rows(model: &VecModel<PinnedMessageItem>, items: Vec<PinnedMessageItem>) {
+    let keep: HashSet<SharedString> = items.iter().map(|item| item.event_id.clone()).collect();
+    for index in (0..model.row_count()).rev() {
+        if model
+            .row_data(index)
+            .is_some_and(|row| !keep.contains(&row.event_id))
+        {
+            model.remove(index);
+        }
+    }
+    let len = items.len();
+    for (index, item) in items.into_iter().enumerate() {
+        match model.row_data(index) {
+            Some(row) if row.event_id == item.event_id => {
+                if row != item {
+                    model.set_row_data(index, item);
+                }
+            }
+            _ => model.insert(index, item),
+        }
+    }
+    while model.row_count() > len {
+        model.remove(model.row_count() - 1);
+    }
+}
+
+/// Whether the pane lacks rows, or a row for one of the newest shown pins.
+fn rows_missing(state: &PinnedState, messages: Option<&[PinnedMessage]>) -> bool {
+    let Some(messages) = messages else {
+        return true;
+    };
+    let mut shown = state.event_ids.iter().rev().take(MAX_PINNED_DISPLAY);
+    shown.any(|id| !messages.iter().any(|message| &message.event_id == id))
+}
+
 enum Loaded {
     State(PinnedState),
     Rows(PinnedMessages),
@@ -74,10 +114,20 @@ struct Inner {
     // Only while the pane is open for this scope.
     messages: Option<Vec<PinnedMessage>>,
     reading: bool,
+    // The running read includes rows.
+    reading_rows: bool,
     read: u64,
     // A read requested while another runs; true includes rows.
     queued: Option<bool>,
+    // Bumped by every change that may have applied. A read begun before the
+    // bump saw the old list, so its result is dropped and the read rerun.
+    changes: u64,
     writing: bool,
+    // The running change is the pane's Unpin, which removes the focused row.
+    focus_after_change: bool,
+    // A notice the next successful read resolves, and whether the pane (true)
+    // or the timeline notice bar shows it.
+    refresh_notice: Option<(&'static str, bool)>,
     filter: String,
 }
 
@@ -148,11 +198,13 @@ impl PinnedMessagesUi {
                 this.refresh(&ui);
             }
         });
+        // Timeline and thread rows pass the account and room they showed.
         let this = owner.clone();
         let weak = ui.as_weak();
         ui.on_toggle_message_pin(move |account, room, event, pin| {
             if let Some(ui) = weak.upgrade() {
-                this.change(&ui, account.as_str(), room.as_str(), event.as_str(), pin);
+                let target = (account.as_str(), room.as_str(), event.as_str());
+                this.change(&ui, target, pin, false);
             }
         });
         let this = owner.clone();
@@ -161,7 +213,8 @@ impl PinnedMessagesUi {
             if let Some(ui) = weak.upgrade() {
                 let account = ui.get_active_account_local_id();
                 let room = ui.get_active_room_id();
-                this.change(&ui, account.as_str(), room.as_str(), event.as_str(), false);
+                let target = (account.as_str(), room.as_str(), event.as_str());
+                this.change(&ui, target, false, true);
             }
         });
         let this = owner.clone();
@@ -225,6 +278,7 @@ impl PinnedMessagesUi {
             let mut inner = scope.inner();
             inner.messages = None;
             inner.state = None;
+            inner.refresh_notice = None;
             inner.filter.clear();
         }
         ui.set_pinned_items(ModelRc::new(VecModel::<PinnedMessageItem>::default()));
@@ -240,8 +294,9 @@ impl PinnedMessagesUi {
         set_row_pins(ui, HashSet::new());
     }
 
-    // A reset can come before the window shows the next room or account.
-    // Recreate the scope for whatever is visible once this event finishes.
+    // A reset can come before the window shows the next room or account, or
+    // for a switch that is then blocked. Recreate the scope for whatever is
+    // visible once this event finishes.
     fn defer_context(self: &Arc<Self>, ui: &AppWindow) {
         let this = self.clone();
         let _ = ui
@@ -292,21 +347,44 @@ impl PinnedMessagesUi {
     }
 
     fn pane_shown(self: &Arc<Self>, ui: &AppWindow, shown: bool) {
-        let Some(scope) = self.current_scope(ui) else {
-            return;
-        };
-        if shown {
-            if scope.inner().messages.is_none() {
-                self.read(ui, &scope, true);
+        // Consumed on every visibility change, so a stale request never moves
+        // focus on a later reveal.
+        let wants_focus = shown && ui.get_pinned_focus_pending();
+        ui.set_pinned_focus_pending(false);
+        if !shown {
+            // Dropping private rows needs no publication fence.
+            if let Some(scope) = self
+                .current
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
+                let mut inner = scope.inner();
+                inner.messages = None;
+                inner.refresh_notice = None;
             }
-            ui.set_pinned_focus_request(ui.get_pinned_focus_request().wrapping_add(1));
-        } else {
-            // A closed pane keeps no decrypted rows.
-            scope.inner().messages = None;
             ui.set_pinned_items(ModelRc::new(VecModel::<PinnedMessageItem>::default()));
             ui.set_pinned_status(0);
             ui.set_pinned_error("".into());
             ui.set_pinned_notice("".into());
+            return;
+        }
+        // Only an explicit open moves focus into the pane's search field.
+        if wants_focus {
+            ui.set_pinned_focus_request(ui.get_pinned_focus_request().wrapping_add(1));
+        }
+        let Some(scope) = self.current_scope(ui) else {
+            return;
+        };
+        let (in_flight, missing) = {
+            let inner = scope.inner();
+            (inner.reading && inner.reading_rows, inner.messages.is_none())
+        };
+        if in_flight {
+            // The running rows read publishes now that the pane is open.
+            ui.set_pinned_status(1);
+        } else if missing {
+            self.read(ui, &scope, true);
         }
     }
 
@@ -322,21 +400,22 @@ impl PinnedMessagesUi {
         if !self.publishable(scope, ui) {
             return;
         }
-        let generation = {
+        let started = {
             let mut inner = scope.inner();
             if inner.reading {
                 inner.queued = Some(inner.queued.unwrap_or(false) || rows);
                 None
             } else {
                 inner.reading = true;
+                inner.reading_rows = rows;
                 inner.read = inner.read.wrapping_add(1);
-                Some(inner.read)
+                Some((inner.read, inner.changes))
             }
         };
         if rows {
             ui.set_pinned_status(1);
         }
-        let Some(generation) = generation else {
+        let Some((generation, since)) = started else {
             return;
         };
         let this = self.clone();
@@ -362,7 +441,7 @@ impl PinnedMessagesUi {
             };
             let weak = this.ui.clone();
             let _ = weak.upgrade_in_event_loop(move |ui| {
-                this.finish_read(&ui, &scope, generation, rows, result);
+                this.finish_read(&ui, &scope, (generation, since), rows, result);
             });
         });
     }
@@ -371,45 +450,69 @@ impl PinnedMessagesUi {
         self: &Arc<Self>,
         ui: &AppWindow,
         scope: &Arc<Scope>,
-        generation: u64,
+        (generation, since): (u64, u64),
         rows: bool,
         result: Result<Loaded, PinnedMessagesError>,
     ) {
-        let queued = {
+        let (mut queued, stale) = {
             let mut inner = scope.inner();
             if inner.read != generation {
                 return;
             }
             inner.reading = false;
-            inner.queued.take()
+            inner.reading_rows = false;
+            // A change that may have applied after this read began makes its
+            // list stale; rerun it from the new baseline instead.
+            let stale = inner.changes != since;
+            if stale {
+                inner.queued = Some(inner.queued.unwrap_or(false) || rows);
+            }
+            (inner.queued.take(), stale)
         };
         if !self.publishable(scope, ui) {
             return;
         }
         let visible = Self::pane_visible(ui);
-        match result {
-            Ok(Loaded::State(state)) => self.apply_state(ui, scope, state),
-            Ok(Loaded::Rows(PinnedMessages { state, messages })) => {
-                if visible {
-                    scope.inner().messages = Some(messages);
-                    ui.set_pinned_error("".into());
-                    ui.set_pinned_status(2);
+        if !stale {
+            match result {
+                Ok(Loaded::State(state)) => {
+                    // Removed pins disappear in project(). Only a newly shown
+                    // pin, or a pane without rows, needs the rows fetched.
+                    let need_rows = visible && {
+                        let inner = scope.inner();
+                        rows_missing(&state, inner.messages.as_deref())
+                    };
+                    self.apply_state(ui, scope, state);
+                    Self::resolve_refresh_notice(ui, scope);
+                    if need_rows {
+                        queued = Some(true);
+                    }
                 }
-                self.apply_state(ui, scope, state);
-            }
-            Err(PinnedMessagesError::Cancelled | PinnedMessagesError::AccountChanged) => return,
-            Err(error) => {
-                if error == PinnedMessagesError::NotJoined {
-                    scope.inner().state = None;
-                    ui.set_pinned_can_edit(false);
-                    ui.set_pinned_state_loaded(false);
-                    ui.set_pinned_summary("".into());
-                    ui.set_pinned_read_only_note("".into());
-                    set_row_pins(ui, HashSet::new());
+                Ok(Loaded::Rows(PinnedMessages { state, messages })) => {
+                    if visible {
+                        scope.inner().messages = Some(messages);
+                        ui.set_pinned_error("".into());
+                        ui.set_pinned_status(2);
+                    }
+                    self.apply_state(ui, scope, state);
+                    Self::resolve_refresh_notice(ui, scope);
                 }
-                if visible || rows {
-                    ui.set_pinned_error(view::load_error(error).into());
-                    ui.set_pinned_status(3);
+                Err(PinnedMessagesError::Cancelled | PinnedMessagesError::AccountChanged) => {
+                    return;
+                }
+                Err(error) => {
+                    if error == PinnedMessagesError::NotJoined {
+                        scope.inner().state = None;
+                        ui.set_pinned_can_edit(false);
+                        ui.set_pinned_state_loaded(false);
+                        ui.set_pinned_summary("".into());
+                        ui.set_pinned_read_only_note("".into());
+                        set_row_pins(ui, HashSet::new());
+                    }
+                    if visible || rows {
+                        ui.set_pinned_error(view::load_error(error).into());
+                        ui.set_pinned_status(3);
+                    }
                 }
             }
         }
@@ -451,7 +554,14 @@ impl PinnedMessagesUi {
                 .map(|message| view::item(message, can_unpin))
                 .collect()
         };
-        ui.set_pinned_items(ModelRc::new(VecModel::from(items)));
+        let current = ui.get_pinned_items();
+        match current
+            .as_any()
+            .downcast_ref::<VecModel<PinnedMessageItem>>()
+        {
+            Some(model) => sync_rows(model, items),
+            None => ui.set_pinned_items(ModelRc::new(VecModel::from(items))),
+        }
     }
 
     fn filter_edited(&self, ui: &AppWindow, text: &str) {
@@ -462,20 +572,45 @@ impl PinnedMessagesUi {
         self.project(ui, &scope);
     }
 
-    fn notify(ui: &AppWindow, text: &str) {
+    /// Show `text` on one surface: the pane when it is open, otherwise the
+    /// timeline's notice bar. Returns true for the pane.
+    fn notify(ui: &AppWindow, text: &str) -> bool {
         if text.is_empty() {
-            return;
+            return false;
         }
-        ui.set_pinned_notice(text.into());
-        // A timeline action needs feedback while the pane is closed.
-        if !Self::pane_visible(ui) {
+        if Self::pane_visible(ui) {
+            ui.set_pinned_notice(text.into());
+            true
+        } else {
             ui.set_transfer_notice(text.into());
+            false
+        }
+    }
+
+    // Clear a "refreshing" notice once a read has refreshed the list, unless
+    // a newer notice replaced it.
+    fn resolve_refresh_notice(ui: &AppWindow, scope: &Scope) {
+        let Some((text, pane)) = scope.inner().refresh_notice.take() else {
+            return;
+        };
+        if pane {
+            if ui.get_pinned_notice().as_str() == text {
+                ui.set_pinned_notice("".into());
+            }
+        } else if ui.get_transfer_notice().as_str() == text {
+            ui.set_transfer_notice("".into());
         }
     }
 
     /// One explicit change for the visible room. The core rereads the list
     /// first and keeps every other entry and content field.
-    fn change(self: &Arc<Self>, ui: &AppWindow, account: &str, room: &str, event: &str, pin: bool) {
+    fn change(
+        self: &Arc<Self>,
+        ui: &AppWindow,
+        (account, room, event): (&str, &str, &str),
+        pin: bool,
+        from_pane: bool,
+    ) {
         let Some(scope) = self.current_scope(ui) else {
             return;
         };
@@ -495,6 +630,7 @@ impl PinnedMessagesUi {
             };
             if reason.is_none() {
                 inner.writing = true;
+                inner.focus_after_change = from_pane;
             }
             reason
         };
@@ -530,7 +666,19 @@ impl PinnedMessagesUi {
         pin: bool,
         result: Result<PinnedChange, PinnedMessagesError>,
     ) {
-        scope.inner().writing = false;
+        let focus = {
+            let mut inner = scope.inner();
+            inner.writing = false;
+            // The single request may have applied even when it timed out.
+            if matches!(
+                result,
+                Ok(PinnedChange { changed: true, .. })
+                    | Err(PinnedMessagesError::TimedOut | PinnedMessagesError::Unavailable)
+            ) {
+                inner.changes = inner.changes.wrapping_add(1);
+            }
+            std::mem::take(&mut inner.focus_after_change)
+        };
         if !self.publishable(scope, ui) {
             return;
         }
@@ -538,14 +686,21 @@ impl PinnedMessagesUi {
         let visible = Self::pane_visible(ui);
         match result {
             Ok(PinnedChange { changed, state }) => {
-                Self::notify(ui, view::write_notice(pin, changed, state.is_some()));
-                let confirmed = state.is_some();
-                if let Some(state) = state {
-                    self.apply_state(ui, scope, state);
-                }
-                // A new pin needs its row; an unconfirmed change needs the list.
-                if !confirmed || (visible && pin && changed) {
-                    self.read(ui, scope, visible);
+                let notice = view::write_notice(pin, changed, state.is_some());
+                let in_pane = Self::notify(ui, notice);
+                match state {
+                    Some(state) => {
+                        self.apply_state(ui, scope, state);
+                        // A new pin needs its row.
+                        if visible && pin && changed {
+                            self.read(ui, scope, true);
+                        }
+                    }
+                    // Accepted, but the reread failed: the list is unknown.
+                    None => {
+                        scope.inner().refresh_notice = Some((notice, in_pane));
+                        self.read(ui, scope, visible);
+                    }
                 }
             }
             Err(PinnedMessagesError::Cancelled | PinnedMessagesError::AccountChanged) => {}
@@ -553,6 +708,10 @@ impl PinnedMessagesUi {
                 Self::notify(ui, view::write_error(error));
                 self.read(ui, scope, visible);
             }
+        }
+        // The pane's Unpin removed the focused row; keep focus in the pane.
+        if focus && visible {
+            ui.set_pinned_focus_request(ui.get_pinned_focus_request().wrapping_add(1));
         }
     }
 
@@ -585,8 +744,34 @@ impl PinnedMessagesUi {
         if owner != scope.selection.account_id() || !scope.alive() {
             return;
         }
+        // This account's Matrix user, so only its own membership counts.
+        let Some(own) = self
+            .live
+            .manager
+            .active_account()
+            .await
+            .filter(|account| account.id == scope.selection.account_id())
+            .map(|account| account.user_id)
+        else {
+            return;
+        };
+        if !scope.alive() {
+            return;
+        }
         let classify = |update: Result<matrix_sdk::sync::RoomUpdates, RecvError>| match update {
-            Ok(update) => Some(room_updates_affect_pinned(&update, &scope.room)),
+            Ok(update) => {
+                let inner = scope.inner();
+                let pinned = inner
+                    .state
+                    .as_ref()
+                    .map_or(&[][..], |state| state.event_ids.as_slice());
+                Some(room_updates_affect_pinned(
+                    &update,
+                    &scope.room,
+                    &own,
+                    pinned,
+                ))
+            }
             Err(RecvError::Lagged(_)) => Some(PinnedRoomChange {
                 state: true,
                 content: true,
@@ -631,9 +816,11 @@ impl PinnedMessagesUi {
                     return;
                 }
                 let visible = Self::pane_visible(&ui);
-                // A redaction only changes rows, which only an open pane shows.
-                if change.state || visible {
-                    this.read(&ui, &target, visible);
+                // A state change rereads only the list; finish_read fetches
+                // rows just for newly shown pins. Rows reload only when a
+                // shown pin may have been redacted.
+                if change.state || (visible && change.content) {
+                    this.read(&ui, &target, visible && change.content);
                 }
             });
         }
@@ -660,5 +847,65 @@ mod tests {
         assert!(!row_pinned(None));
         ROW_PINS.with(|pins| pins.borrow_mut().clear());
         assert!(!row_pinned(Some("$a:example.org")));
+    }
+
+    fn row(id: &str, text: &str) -> PinnedMessageItem {
+        PinnedMessageItem {
+            event_id: id.into(),
+            text: text.into(),
+            ..Default::default()
+        }
+    }
+    fn ids(model: &VecModel<PinnedMessageItem>) -> Vec<String> {
+        model.iter().map(|row| row.event_id.to_string()).collect()
+    }
+
+    #[test]
+    fn only_newly_shown_pins_need_a_rows_fetch() {
+        let message = |id: &str| PinnedMessage {
+            event_id: id.into(),
+            kind: morpheus_matrix::PinnedMessageKind::Message,
+            sender_id: String::new(),
+            sender_name: String::new(),
+            timestamp_ms: 0,
+            text: String::new(),
+            attachment: None,
+            thread_root: None,
+            edited: false,
+            authenticity_warning: false,
+        };
+        let state = |ids: &[&str]| PinnedState {
+            event_ids: ids.iter().map(|id| (*id).to_owned()).collect(),
+            unsupported_entries: 0,
+            permitted: true,
+            editable: true,
+        };
+        let loaded = [message("$a"), message("$b")];
+        assert!(rows_missing(&state(&["$a"]), None));
+        // A removed pin is hidden by project(); no fetch.
+        assert!(!rows_missing(&state(&["$a"]), Some(&loaded[..])));
+        assert!(!rows_missing(&state(&["$a", "$b"]), Some(&loaded[..])));
+        assert!(rows_missing(&state(&["$a", "$b", "$c"]), Some(&loaded[..])));
+        // Pins older than the shown window never trigger a fetch.
+        let mut many: Vec<String> = vec!["$old".to_owned()];
+        many.extend((0..MAX_PINNED_DISPLAY).map(|i| format!("$e{i}")));
+        let shown: Vec<PinnedMessage> = many[1..].iter().map(|id| message(id.as_str())).collect();
+        let long = PinnedState {
+            event_ids: many,
+            ..state(&[])
+        };
+        assert!(!rows_missing(&long, Some(&shown[..])));
+    }
+
+    #[test]
+    fn rows_update_in_place_and_end_in_the_requested_order() {
+        let model = VecModel::from(vec![row("$a", "a"), row("$b", "b"), row("$c", "c")]);
+        sync_rows(&model, vec![row("$c", "c"), row("$b", "b2"), row("$a", "a")]);
+        assert_eq!(ids(&model), ["$c", "$b", "$a"]);
+        assert_eq!(model.row_data(1).unwrap().text.as_str(), "b2");
+        sync_rows(&model, vec![row("$d", "d"), row("$b", "b2")]);
+        assert_eq!(ids(&model), ["$d", "$b"]);
+        sync_rows(&model, Vec::new());
+        assert_eq!(model.row_count(), 0);
     }
 }
