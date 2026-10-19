@@ -1,13 +1,13 @@
 # TEMPORARY narrowly scoped customization expansion verification. NEVER MERGE.
 # No installers, physical-device, real-account, installed-app or artifact jobs.
 name: Reviewed customization expansion
-run-name: Customization native UI diagnosis - 8cfb945
+run-name: Customization native UI diagnosis - 7492df3
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: customization-native-ui-8cfb945
+  group: customization-native-ui-7492df3
   cancel-in-progress: false
 jobs:
   native:
@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 8cfb9455d50bfc3ee484d3c0d5b9334c45e11b71
+          ref: 7492df3e533bc3095ef8ed0902552e99b122f7a9
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -125,7 +125,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='8cfb9455d50bfc3ee484d3c0d5b9334c45e11b71'
+          source='7492df3e533bc3095ef8ed0902552e99b122f7a9'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -307,7 +307,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='8cfb9455d50bfc3ee484d3c0d5b9334c45e11b71'
+          source='7492df3e533bc3095ef8ed0902552e99b122f7a9'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -474,6 +474,7 @@ jobs:
                           if 0<int(line)<=line_limit and 0<int(column)<=4096}
                       ui_locations.extend({'file':path,'line':line,'column':column} for line,column in sorted(spans)[:32])
                   record['failure_diagnostics']={
+                      'ui_timeout_phases':sorted({int(value) for value in re.findall(r'(?m)^morpheus-ui-timeout-phase=([0-9]{1,2})$', normalized) if 0<=int(value)<=17}),
                       'ui_locations':ui_locations,
                       'linker_failures':[{'tool':tool_family(tool),'exit_code':int(code)} for tool,code in linker_failures[:8]],
                       'path_link_family':tool_family(resolved_link) if resolved_link else 'not_resolved',
