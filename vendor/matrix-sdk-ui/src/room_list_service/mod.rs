@@ -654,7 +654,8 @@ mod tests {
             assert!(requested.contains(&pair));
             assert!(subscription.required_state.contains(&pair));
         }
-        assert!(requested.iter().all(|(event_type, _)| event_type.as_str() != "*"));
+        let all_types = ruma::events::StateEventType::from("*");
+        assert!(requested.iter().all(|(event_type, _)| event_type != &all_types));
         assert_eq!(
             subscription.required_state.len(),
             requested.len() + super::DEFAULT_ROOM_SUBSCRIPTION_EXTRA_REQUIRED_STATE.len()
