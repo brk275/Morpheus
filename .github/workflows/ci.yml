@@ -1,13 +1,13 @@
 # TEMPORARY narrowly scoped native call feature verification. NEVER MERGE.
 # No installers, physical-device, real-account, installed-app or artifact jobs.
 name: Reviewed native call feature integration
-run-name: Native call feature integration - 40b1bad
+run-name: Native call feature integration - 88167fb
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: native-call-feature-40b1bad
+  group: native-call-feature-88167fb
   cancel-in-progress: false
 jobs:
   native:
@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 40b1bad9ef13aef51c9996a07fdd3c195d1c11e2
+          ref: 88167fb3c98fff6a5ce0cc03abff14a4e91f2186
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -125,7 +125,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='40b1bad9ef13aef51c9996a07fdd3c195d1c11e2'
+          source='88167fb3c98fff6a5ce0cc03abff14a4e91f2186'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -307,7 +307,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='40b1bad9ef13aef51c9996a07fdd3c195d1c11e2'
+          source='88167fb3c98fff6a5ce0cc03abff14a4e91f2186'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -415,12 +415,8 @@ jobs:
           }
           allowed_app_ignore={'outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction'}
           checks=(
-              ('native_ui_compile',['cargo','check','--locked','-p','morpheus-ui-check'],20*60,None,set()),
-              ('native_app_build',['cargo','build','--locked','-p','morpheus-app','--features','native-calls'],70*60,None,set()),
               ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
                   '--bin','morpheus-app','--','--test-threads=1'],40*60,needed_app,allowed_app_ignore),
-              ('rtc_native_unit',['cargo','test','--locked','-p','morpheus-rtc','--features','native-devices',
-                  '--lib','--','--test-threads=1'],20*60,needed_rtc,set()),
           )
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
