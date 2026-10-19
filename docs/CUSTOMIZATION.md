@@ -95,8 +95,8 @@ shapes** and **Edit base palette** below it jump to the detailed editors.
 
 Settings search (`Mod+Shift+F`) finds sections, every color token and every
 size or shape metric. Color and metric results show their `config.toml` key,
-such as `colors.link` or `typography.sender_size`, and a key name such as
-`sender_size` finds its field. Choosing a result focuses that exact field;
+such as `colors.link` or `typography.sender_size`; typing a key as shown, or
+a part of it such as `sender_size`, finds its field. Choosing a result focuses that exact field;
 **Back to results**, Down in the search field or `Mod+Shift+F` brings the
 same results back. Each color and metric editor has its own Reset and Undo.
 

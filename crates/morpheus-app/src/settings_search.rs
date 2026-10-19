@@ -31,9 +31,24 @@ fn available(ui: &AppWindow, requirement: Requirement) -> bool {
     }
 }
 
+/// The registry query for what was typed. Metric keys such as
+/// `typography.sender_size` are indexed as written; a color key typed as
+/// shown in results, `colors.<token>`, searches for its token ID.
+fn search_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(|word| {
+            word.get(..7)
+                .filter(|prefix| prefix.eq_ignore_ascii_case("colors."))
+                .map_or(word, |_| &word[7..])
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn show_results(ui: &AppWindow, query: &str) {
     let results: Vec<SettingsResult> =
-        registry::search(query, |requirement| available(ui, requirement))
+        registry::search(&search_query(query), |requirement| available(ui, requirement))
             .into_iter()
             .map(result_item)
             .collect();
@@ -158,5 +173,23 @@ mod tests {
 
         let section = registry::setting_target("appearance.colors").expect("the colors section");
         assert!(result_item(SearchHit::Setting(section)).key.is_empty());
+    }
+
+    #[test]
+    fn a_typed_config_key_finds_its_field() {
+        assert_eq!(search_query("Colors.link"), "link");
+        assert_eq!(search_query("typography.sender_size"), "typography.sender_size");
+        assert_eq!(search_query("  colors.presence_online  links "), "presence_online links");
+        let finds = |query: &str, id: &str| {
+            registry::search(&search_query(query), |_| true)
+                .iter()
+                .any(|hit| hit.id() == id)
+        };
+        assert!(finds("colors.link", "color:link"));
+        assert!(finds("colors.presence_online", "color:presence_online"));
+        assert!(finds(
+            "typography.sender_size",
+            &format!("{}typography.sender_size", registry::METRIC_RESULT_PREFIX)
+        ));
     }
 }
