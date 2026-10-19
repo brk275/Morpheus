@@ -31,11 +31,21 @@ fn available(ui: &AppWindow, requirement: Requirement) -> bool {
     }
 }
 
+/// What was typed, cut to the registry's own query bound (in characters, as
+/// the registry counts them) before any normalization or key matching, so
+/// neither ever walks unbounded input.
+fn bounded_query(query: &str) -> &str {
+    match query.char_indices().nth(registry::MAX_SEARCH_QUERY_CHARS) {
+        Some((end, _)) => &query[..end],
+        None => query,
+    }
+}
+
 /// The registry query for what was typed. Metric keys such as
 /// `typography.sender_size` are indexed as written; a color key typed as
 /// shown in results, `colors.<token>`, searches for its token ID.
 fn search_query(query: &str) -> String {
-    query
+    bounded_query(query)
         .split_whitespace()
         .map(|word| {
             word.get(..7)
@@ -51,9 +61,15 @@ fn search_query(query: &str) -> String {
 /// unit test keeps every ID and key in the registry.
 const SECTION_KEYS: &[(&str, &[&str])] = &[
     ("appearance.window_opacity", &["window.opacity_percent"]),
-    ("appearance.base_palette", &["appearance.theme", "appearance.theme_pack"]),
+    (
+        "appearance.base_palette",
+        &["appearance.theme", "appearance.theme_pack"],
+    ),
     ("appearance.reduce_motion", &["appearance.reduce_motion"]),
-    ("appearance.hover_duration", &["appearance.hover_duration_ms"]),
+    (
+        "appearance.hover_duration",
+        &["appearance.hover_duration_ms"],
+    ),
     (
         "appearance.fonts",
         &[
@@ -75,16 +91,31 @@ const SECTION_KEYS: &[(&str, &[&str])] = &[
         ],
     ),
     ("appearance.geometry", &["geometry.corner_radius"]),
-    ("appearance.spacing", &["geometry.message_gap", "geometry.content_padding"]),
+    (
+        "appearance.spacing",
+        &["geometry.message_gap", "geometry.content_padding"],
+    ),
     ("appearance.rail_width", &["geometry.rail_width"]),
     ("appearance.font_scale", &["appearance.scale_percent"]),
     ("appearance.sender_colors", &["senders.colors"]),
     ("layout.unread_first", &["layout.sort_unread_first"]),
     ("notifications.desktop", &["notifications.enabled"]),
-    ("notifications.previews", &["notifications.show_message_preview"]),
-    ("notifications.highlights", &["notifications.highlight_words"]),
-    ("media.audio_devices", &["media.microphone_device", "media.speaker_device"]),
-    ("media.image_previews", &["media.previews_in_encrypted_rooms"]),
+    (
+        "notifications.previews",
+        &["notifications.show_message_preview"],
+    ),
+    (
+        "notifications.highlights",
+        &["notifications.highlight_words"],
+    ),
+    (
+        "media.audio_devices",
+        &["media.microphone_device", "media.speaker_device"],
+    ),
+    (
+        "media.image_previews",
+        &["media.previews_in_encrypted_rooms"],
+    ),
 ];
 
 fn section_keys(id: &str) -> &'static [&'static str] {
@@ -97,25 +128,39 @@ fn section_keys(id: &str) -> &'static [&'static str] {
 
 /// The section whose `config.toml` key is exactly `query`, if any.
 fn section_for_key(query: &str) -> Option<&'static SettingTarget> {
-    let query = query.trim();
+    let query = bounded_query(query).trim();
     SECTION_KEYS
         .iter()
         .find(|(_, keys)| keys.iter().any(|key| key.eq_ignore_ascii_case(query)))
         .and_then(|(id, _)| registry::setting_target(id))
 }
 
-fn show_results(ui: &AppWindow, query: &str) {
-    let mut hits =
-        registry::search(&search_query(query), |requirement| available(ui, requirement));
-    // A typed section key leads with its section.
-    if let Some(target) = section_for_key(query)
-        .filter(|target| available(ui, target.requires))
-        .filter(|target| !hits.iter().any(|hit| hit.id() == target.id))
-    {
-        hits.insert(0, SearchHit::Setting(target));
-        hits.truncate(registry::MAX_SEARCH_RESULTS);
+/// `hits` led by `target`: any later occurrence moves to the front, and the
+/// list stays within the result bound.
+fn lead_with(mut hits: Vec<SearchHit>, target: &'static SettingTarget) -> Vec<SearchHit> {
+    hits.retain(|hit| hit.id() != target.id);
+    hits.insert(0, SearchHit::Setting(target));
+    hits.truncate(registry::MAX_SEARCH_RESULTS);
+    hits
+}
+
+/// The results for what was typed: the registry's ranking, led by the
+/// section whose `config.toml` key the bounded query names exactly, when
+/// that section is available now.
+fn ranked_hits(query: &str, is_available: impl Fn(Requirement) -> bool) -> Vec<SearchHit> {
+    let query = bounded_query(query);
+    let hits = registry::search(&search_query(query), &is_available);
+    match section_for_key(query) {
+        Some(target) if is_available(target.requires) => lead_with(hits, target),
+        _ => hits,
     }
-    let results: Vec<SettingsResult> = hits.into_iter().map(result_item).collect();
+}
+
+fn show_results(ui: &AppWindow, query: &str) {
+    let results: Vec<SettingsResult> = ranked_hits(query, |requirement| available(ui, requirement))
+        .into_iter()
+        .map(result_item)
+        .collect();
     ui.set_settings_search_index(if results.is_empty() { -1 } else { 0 });
     ui.set_settings_search_results(ModelRc::new(VecModel::from(results)));
     ui.set_settings_search_dismissed(false);
@@ -223,9 +268,17 @@ fn request_settings_reveal(ui: &AppWindow) {
 mod tests {
     use super::*;
 
+    fn target(id: &str) -> &'static SettingTarget {
+        registry::setting_target(id).expect("a setting target")
+    }
+
+    fn ids(hits: &[SearchHit]) -> Vec<String> {
+        hits.iter().map(|hit| hit.id()).collect()
+    }
+
     #[test]
     fn exact_field_results_name_their_config_key_and_sections_none() {
-        let token = registry::color_result("color:link").expect("the link token");
+        let token = registry::color_result("color:link").unwrap();
         assert_eq!(result_item(SearchHit::Color(token)).key, "colors.link");
 
         for (field, editor) in registry::metric_fields() {
@@ -235,40 +288,109 @@ mod tests {
             assert!(!item.key.contains('/') && !item.key.contains('\\'));
         }
 
-        let section = registry::setting_target("appearance.colors").expect("the colors section");
-        assert!(result_item(SearchHit::Setting(section)).key.is_empty());
-        let fonts = registry::setting_target("appearance.fonts").expect("the fonts section");
-        assert_eq!(
-            result_item(SearchHit::Setting(fonts)).key,
-            "appearance.font_family, typography.message_font_family, typography.monospace_font_family"
-        );
+        let colors = SearchHit::Setting(target("appearance.colors"));
+        assert!(result_item(colors).key.is_empty());
+        let fonts = result_item(SearchHit::Setting(target("appearance.fonts")));
+        let keys: Vec<&str> = fonts.key.split(", ").collect();
+        assert_eq!(keys, section_keys("appearance.fonts"));
+        assert_eq!(keys.len(), 3);
     }
 
     #[test]
     fn listed_section_keys_are_registry_keys_and_find_their_section() {
         for (id, keys) in SECTION_KEYS {
-            assert!(registry::setting_target(id).is_some(), "{id} is not a setting target");
+            assert!(registry::setting_target(id).is_some(), "{id}");
             assert!(!keys.is_empty(), "{id} lists no key");
             for key in *keys {
-                assert!(
-                    registry::FIELDS.iter().any(|field| field.key == *key),
-                    "{key} of {id} is not a registry key"
-                );
-                assert_eq!(section_for_key(key).map(|target| target.id), Some(*id));
+                let known = registry::FIELDS.iter().any(|field| field.key == *key);
+                assert!(known, "{key} of {id} is not a registry key");
+                let found = section_for_key(key).map(|section| section.id);
+                assert_eq!(found, Some(*id));
             }
         }
-        assert_eq!(
-            section_for_key(" Typography.Message_Size ").map(|target| target.id),
-            Some("appearance.message_size")
-        );
+        let found = section_for_key(" Typography.Message_Size ").map(|s| s.id);
+        assert_eq!(found, Some("appearance.message_size"));
         assert!(section_for_key("typography").is_none());
+    }
+
+    #[test]
+    fn an_exact_section_key_always_leads_once_within_the_bound() {
+        let fonts = target("appearance.fonts");
+        let colors = SearchHit::Setting(target("appearance.colors"));
+        let size = SearchHit::Setting(target("appearance.message_size"));
+        // Already ranked lower: moved to the front, never listed twice.
+        let ranked = lead_with(vec![colors, size, SearchHit::Setting(fonts)], fonts);
+        assert_eq!(ranked.len(), 3);
+        assert_eq!(ranked[0].id(), "appearance.fonts");
+        assert_eq!(ranked[1].id(), "appearance.colors");
+        assert_eq!(ranked[2].id(), "appearance.message_size");
+
+        // Not ranked and the list full: it leads and the bound holds.
+        let full: Vec<SearchHit> = registry::SETTING_TARGETS
+            .iter()
+            .filter(|section| section.id != fonts.id)
+            .take(registry::MAX_SEARCH_RESULTS)
+            .map(SearchHit::Setting)
+            .collect();
+        assert_eq!(full.len(), registry::MAX_SEARCH_RESULTS);
+        let ranked = lead_with(full, fonts);
+        assert_eq!(ranked.len(), registry::MAX_SEARCH_RESULTS);
+        assert_eq!(ranked[0].id(), fonts.id);
+        let copies = ranked.iter().filter(|hit| hit.id() == fonts.id);
+        assert_eq!(copies.count(), 1);
+
+        // Through the whole ranking: the typed key's section leads, once.
+        for key in [
+            "Typography.Message_Size",
+            "appearance.font_family",
+            " notifications.enabled ",
+        ] {
+            let hits = ranked_hits(key, |_| true);
+            let lead = section_for_key(key).unwrap().id;
+            assert_eq!(hits[0].id(), lead, "{key}");
+            let copies = hits.iter().filter(|hit| hit.id() == lead);
+            assert_eq!(copies.count(), 1, "{key}");
+            assert!(hits.len() <= registry::MAX_SEARCH_RESULTS);
+        }
+
+        // An unavailable section is never promoted.
+        let unavailable = ranked_hits("typography.message_size", |_| false);
+        let size_id = "appearance.message_size";
+        assert!(unavailable.iter().all(|hit| hit.id() != size_id));
+    }
+
+    #[test]
+    fn typed_input_is_bounded_before_normalization_and_key_matching() {
+        let limit = registry::MAX_SEARCH_QUERY_CHARS;
+        // Multi-byte characters are counted as characters, never split.
+        let wide = "é".repeat(limit * 50);
+        assert_eq!(bounded_query(&wide).chars().count(), limit);
+        assert_eq!(search_query(&wide).chars().count(), limit);
+        assert_eq!(bounded_query("short"), "short");
+
+        // A huge input ranks exactly like its bounded prefix.
+        let huge = format!("colors.link {}", "z".repeat(100_000));
+        let prefix = bounded_query(&huge);
+        assert_eq!(prefix.chars().count(), limit);
+        let whole = ids(&ranked_hits(&huge, |_| true));
+        assert_eq!(whole, ids(&ranked_hits(prefix, |_| true)));
+
+        // A key followed by padding past the bound still matches; one pushed
+        // past the bound does not.
+        let padded = format!("typography.message_size{}", " ".repeat(limit * 4));
+        let found = section_for_key(&padded).map(|section| section.id);
+        assert_eq!(found, Some("appearance.message_size"));
+        let late = format!("{}typography.message_size", " ".repeat(limit));
+        assert!(section_for_key(&late).is_none());
     }
 
     #[test]
     fn a_typed_config_key_finds_its_field() {
         assert_eq!(search_query("Colors.link"), "link");
-        assert_eq!(search_query("typography.sender_size"), "typography.sender_size");
-        assert_eq!(search_query("  colors.presence_online  links "), "presence_online links");
+        let metric = "typography.sender_size";
+        assert_eq!(search_query(metric), metric);
+        let spaced = search_query("  colors.presence_online  links ");
+        assert_eq!(spaced, "presence_online links");
         let finds = |query: &str, id: &str| {
             registry::search(&search_query(query), |_| true)
                 .iter()
@@ -276,9 +398,7 @@ mod tests {
         };
         assert!(finds("colors.link", "color:link"));
         assert!(finds("colors.presence_online", "color:presence_online"));
-        assert!(finds(
-            "typography.sender_size",
-            &format!("{}typography.sender_size", registry::METRIC_RESULT_PREFIX)
-        ));
+        let metric_id = format!("{}{metric}", registry::METRIC_RESULT_PREFIX);
+        assert!(finds(metric, &metric_id));
     }
 }
