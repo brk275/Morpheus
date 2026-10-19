@@ -3748,6 +3748,14 @@ export component AppWindow inherits Window {
         : StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : #e47483;
     property <color> mention-badge-ink: StyleTokens.states.mention-ink.present ? StyleTokens.states.mention-ink.color
         : StyleTokens.roles.destructive-ink.present ? StyleTokens.roles.destructive-ink.color : #10131b;
+    // The fill of an ordinary action: a theme's pressed state while pressed,
+    // its control hover state (else the built-in hover color) while hovered,
+    // otherwise the action's own surface.
+    pure function control-fill(hovered: bool, pressed: bool, idle: color) -> color {
+        return pressed && StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color
+            : hovered ? (StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover)
+            : idle;
+    }
     // The color each registry token shows now, for swatches and the editor.
     // A role without a value shows the built-in color it falls back to.
     public pure function token-color(id: string) -> color {
@@ -4038,7 +4046,7 @@ export component AppWindow inherits Window {
                         x: 12px; y: 12px;
                         width: parent.width - 24px; height: parent.height - 24px;
                         border-radius: StyleTokens.radius * 0.8;
-                        background: self.has-hover ? root.hover : root.elevated;
+                        background: root.control-fill(self.has-hover, self.has-pressed, root.elevated);
                         focus-color: root.accent;
                         enabled: root.page != 1 && !root.show-sign-in;
                         label: "Switch between rooms in the current Home or Space";
@@ -4299,7 +4307,7 @@ export component AppWindow inherits Window {
                     for account[index] in root.account-options : account-choice := ActionRect {
                         height: max(42px, 30px * root.text-scale + 12px);
                         border-radius: StyleTokens.radius * 0.8;
-                        background: account.index == root.active-account-index ? root.hover : self.has-hover ? root.hover : transparent;
+                        background: account.index == root.active-account-index ? root.hover : root.control-fill(self.has-hover, self.has-pressed, transparent);
                         focus-color: root.accent;
                         cancel-on-escape: true;
                         label: "Switch to " + account.name + ", " + account.handle;
@@ -4345,7 +4353,7 @@ export component AppWindow inherits Window {
                     add-account-choice := ActionRect {
                         height: 35px;
                         border-radius: StyleTokens.radius * 0.8;
-                        background: self.has-hover ? root.hover : transparent;
+                        background: root.control-fill(self.has-hover, self.has-pressed, transparent);
                         focus-color: root.accent;
                         cancel-on-escape: true;
                         label: "Add another Matrix account";
@@ -4370,7 +4378,7 @@ export component AppWindow inherits Window {
                     ActionRect {
                         height: 35px;
                         border-radius: StyleTokens.radius * 0.8;
-                        background: self.has-hover ? root.hover : transparent;
+                        background: root.control-fill(self.has-hover, self.has-pressed, transparent);
                         focus-color: root.accent;
                         cancel-on-escape: true;
                         label: "Manage accounts";
@@ -4381,7 +4389,7 @@ export component AppWindow inherits Window {
                     ActionRect {
                         height: 35px;
                         border-radius: StyleTokens.radius * 0.8;
-                        background: self.has-hover ? root.hover : transparent;
+                        background: root.control-fill(self.has-hover, self.has-pressed, transparent);
                         focus-color: root.accent;
                         cancel-on-escape: true;
                         label: "Log out of current Matrix account";
@@ -4559,7 +4567,7 @@ export component AppWindow inherits Window {
                                         width: 110px;
                                         height: 32px * root.text-scale;
                                         border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.6;
-                                        background: self.has-hover ? root.hover : root.canvas;
+                                        background: root.control-fill(self.has-hover, self.has-pressed, root.canvas);
                                         focus-color: root.accent;
                                         label: "Dismiss call from " + offer.caller + " in " + offer.room;
                                         activated => { root.dismiss-incoming-call(offer.token); }
@@ -4969,7 +4977,7 @@ export component AppWindow inherits Window {
                                     }
                                     if message.attachment-is-image && message.event-id != "" : ActionRect {
                                         height: 67px; border-radius: StyleTokens.radius * 1;
-                                        background: self.has-hover ? root.hover : root.elevated;
+                                        background: root.control-fill(self.has-hover, self.has-pressed, root.elevated);
                                         border-width: StyleTokens.line-width; border-color: root.divider; focus-color: root.accent;
                                         label: "Preview image " + message.attachment;
                                         enabled: root.live-session;
@@ -5876,7 +5884,7 @@ export component AppWindow inherits Window {
                             }
                             height: 66px * root.text-scale;
                             label: "Apply " + name + " appearance preset";
-                            background: self.has-hover ? root.hover : root.elevated;
+                            background: root.control-fill(self.has-hover, self.has-pressed, root.elevated);
                             border-radius: StyleTokens.radius; focus-color: root.accent;
                             activated => { root.choose-style-preset(index); }
                             VerticalLayout {
@@ -5910,7 +5918,7 @@ export component AppWindow inherits Window {
                             label: "Reduce motion" + (StyleTokens.reduced-motion ? ", on" : ", off");
                             accessible-checkable: true;
                             accessible-checked: StyleTokens.reduced-motion;
-                            background: self.has-hover ? root.hover : root.elevated;
+                            background: root.control-fill(self.has-hover, self.has-pressed, root.elevated);
                             border-radius: StyleTokens.radius * 0.8; focus-color: root.accent;
                             activated => { root.set-reduce-motion(!StyleTokens.reduced-motion); }
                             HorizontalLayout { padding: 12px; spacing: 8px;
@@ -6254,7 +6262,7 @@ export component AppWindow inherits Window {
                             }
                             height: 40px * root.text-scale;
                             label: "Room header: " + name + (root.conversation-header-mode == index ? ", selected" : "");
-                            background: root.conversation-header-mode == index ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : self.has-hover ? root.hover : root.elevated;
+                            background: root.conversation-header-mode == index ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : root.control-fill(self.has-hover, self.has-pressed, root.elevated);
                             border-radius: StyleTokens.radius * 0.8;
                             border-width: root.conversation-header-mode == index ? 1px : 0px;
                             border-color: root.accent;
@@ -6291,7 +6299,7 @@ export component AppWindow inherits Window {
                             }
                             height: 40px * root.text-scale;
                             label: name + (root.message-layout == index ? ", selected" : "");
-                            background: root.message-layout == index || self.has-hover ? root.hover : root.elevated;
+                            background: root.message-layout == index ? root.hover : root.control-fill(self.has-hover, self.has-pressed, root.elevated);
                             border-radius: StyleTokens.radius * 0.8; border-width: root.message-layout == index ? 1px : 0px; border-color: root.accent;
                             focus-color: root.accent; activated => { root.choose-message-layout(index); }
                             Text { x: 12px; width: parent.width - 24px; height: parent.height;
@@ -6317,7 +6325,7 @@ export component AppWindow inherits Window {
                             property <bool> selected: index == 0 ? root.show-message-avatars : index == 1 ? root.show-message-timestamps : root.color-message-senders;
                             height: 42px * root.text-scale;
                             label: name + (self.selected ? ", on" : ", off");
-                            background: self.has-hover ? root.hover : root.elevated; border-radius: StyleTokens.radius * 0.8; focus-color: root.accent;
+                            background: root.control-fill(self.has-hover, self.has-pressed, root.elevated); border-radius: StyleTokens.radius * 0.8; focus-color: root.accent;
                             activated => { root.set-style-flag(index, !self.selected); }
                             HorizontalLayout { padding: 12px; spacing: 8px;
                                 Text { text: name; color: root.ink; font-size: 12px * root.text-scale; horizontal-stretch: 1; }
@@ -6342,7 +6350,7 @@ export component AppWindow inherits Window {
                             }
                             height: 40px * root.text-scale;
                             label: "Timestamp format: " + name + (root.timestamp-format == index ? ", selected" : "");
-                            background: root.timestamp-format == index ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : self.has-hover ? root.hover : root.elevated;
+                            background: root.timestamp-format == index ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : root.control-fill(self.has-hover, self.has-pressed, root.elevated);
                             border-radius: StyleTokens.radius * 0.8; border-width: root.timestamp-format == index ? 1px : 0px; border-color: root.accent;
                             focus-color: root.accent; activated => { root.choose-timestamp-format(index); }
                             Text { x: 12px; width: parent.width - 24px; height: parent.height;
@@ -6352,7 +6360,7 @@ export component AppWindow inherits Window {
                         ActionRect {
                             height: 42px * root.text-scale;
                             label: "Timestamp square brackets" + (root.timestamp-brackets ? ", on" : ", off");
-                            background: self.has-hover ? root.hover : root.elevated; border-radius: StyleTokens.radius * 0.8; focus-color: root.accent;
+                            background: root.control-fill(self.has-hover, self.has-pressed, root.elevated); border-radius: StyleTokens.radius * 0.8; focus-color: root.accent;
                             activated => { root.set-style-flag(3, !root.timestamp-brackets); }
                             HorizontalLayout { padding: 12px; spacing: 8px;
                                 Text { text: "Timestamp square brackets"; color: root.ink; font-size: 12px * root.text-scale; horizontal-stretch: 1; }
@@ -6362,7 +6370,7 @@ export component AppWindow inherits Window {
                         ActionRect {
                             height: 42px * root.text-scale;
                             label: "Nickname angle brackets" + (root.nickname-brackets ? ", on" : ", off");
-                            background: self.has-hover ? root.hover : root.elevated; border-radius: StyleTokens.radius * 0.8; focus-color: root.accent;
+                            background: root.control-fill(self.has-hover, self.has-pressed, root.elevated); border-radius: StyleTokens.radius * 0.8; focus-color: root.accent;
                             activated => { root.set-style-flag(4, !root.nickname-brackets); }
                             HorizontalLayout { padding: 12px; spacing: 8px;
                                 Text { text: "Nickname angle brackets"; color: root.ink; font-size: 12px * root.text-scale; horizontal-stretch: 1; }
@@ -6375,7 +6383,7 @@ export component AppWindow inherits Window {
                             for name[index] in ["Left", "Right"] : ActionRect {
                                 width: 142px; height: 40px; border-radius: StyleTokens.radius * 0.9;
                                 label: "Nickname alignment: " + name + (root.nickname-alignment == index ? ", selected" : "");
-                                background: root.nickname-alignment == index ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : self.has-hover ? root.hover : root.elevated;
+                                background: root.nickname-alignment == index ? (StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover) : root.control-fill(self.has-hover, self.has-pressed, root.elevated);
                                 border-width: root.nickname-alignment == index ? 1px : 0px; border-color: root.accent; focus-color: root.accent;
                                 activated => { root.choose-nickname-alignment(index); }
                                 Text { text: name; color: root.nickname-alignment == index && StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.ink;
@@ -7213,7 +7221,7 @@ export component AppWindow inherits Window {
                         Text { text: "Image previews"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Images load only when clicked and stay in memory. Closing the viewer or switching rooms/accounts clears them. PNG and baseline JPEG only; animation, WebP, audio and video previews are not available yet."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         ActionRect {
-                            height: 40px * root.text-scale; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.8; background: self.has-hover ? root.hover : root.elevated;
+                            height: 40px * root.text-scale; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.8; background: root.control-fill(self.has-hover, self.has-pressed, root.elevated);
                             focus-color: root.accent;
                             property <int> reveal-request: root.reveal-request("media.image_previews");
                             // Keyboard focus and search share the same bounded reveal.
@@ -7844,7 +7852,7 @@ export component AppWindow inherits Window {
                                 if root.live-session : ActionRect {
                                     width: 72px * root.text-scale; height: 30px * root.text-scale;
                                     horizontal-stretch: 0; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.7;
-                                    background: self.has-hover ? root.hover : root.elevated;
+                                    background: root.control-fill(self.has-hover, self.has-pressed, root.elevated);
                                     focus-color: root.accent;
                                     enabled: !root.member-action-busy;
                                     label: "Manage room member " + member.name + " · " + member.user-id;
@@ -8651,7 +8659,7 @@ export component AppWindow inherits Window {
                         settings-refresh := ActionRect {
                             width: 118px * root.text-scale;
                             height: 42px * root.text-scale; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.8; border-width: StyleTokens.line-width; border-color: root.divider;
-                            background: self.enabled && self.has-hover ? root.hover : root.elevated; focus-color: root.ink;
+                            background: root.control-fill(self.enabled && self.has-hover, self.enabled && self.has-pressed, root.elevated); focus-color: root.ink;
                             label: "Refresh room settings from the homeserver";
                             enabled: !root.room-admin-busy && root.room-settings-confirmation == 0;
                             activated => { root.room-settings-action(0); }
@@ -8724,7 +8732,7 @@ export component AppWindow inherits Window {
                                 spacing: 8px;
                                 ActionRect {
                                     height: 42px * root.text-scale; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.8; border-width: StyleTokens.line-width; border-color: root.divider;
-                                    background: self.enabled && self.has-hover ? root.hover : root.elevated; focus-color: root.ink;
+                                    background: root.control-fill(self.enabled && self.has-hover, self.enabled && self.has-pressed, root.elevated); focus-color: root.ink;
                                     label: "Download and preview current room avatar";
                                     enabled: root.room-settings-editable && root.room-settings-preview-available && !root.room-settings-staged;
                                     activated => { root.room-settings-action(2); }
@@ -8733,7 +8741,7 @@ export component AppWindow inherits Window {
                                 }
                                 ActionRect {
                                     height: 42px * root.text-scale; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.8; border-width: StyleTokens.line-width; border-color: root.divider;
-                                    background: self.enabled && self.has-hover ? root.hover : root.elevated; focus-color: root.ink;
+                                    background: root.control-fill(self.enabled && self.has-hover, self.enabled && self.has-pressed, root.elevated); focus-color: root.ink;
                                     label: "Choose a new room avatar image";
                                     enabled: root.room-settings-editable && root.room-settings-avatar-allowed && !root.room-settings-staged;
                                     activated => { root.room-settings-action(1); }
@@ -8754,7 +8762,7 @@ export component AppWindow inherits Window {
                                 }
                                 ActionRect {
                                     height: 42px * root.text-scale; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.8; border-width: StyleTokens.line-width; border-color: root.divider;
-                                    background: self.enabled && self.has-hover ? root.hover : root.elevated; focus-color: root.ink;
+                                    background: root.control-fill(self.enabled && self.has-hover, self.enabled && self.has-pressed, root.elevated); focus-color: root.ink;
                                     label: "Discard room avatar image from this form";
                                     enabled: !root.room-admin-busy && root.room-settings-confirmation == 0 && root.room-settings-image-visible;
                                     activated => { root.room-settings-action(4); }
@@ -8765,7 +8773,7 @@ export component AppWindow inherits Window {
                             }
                             ActionRect {
                                 height: 42px * root.text-scale; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.8; border-width: StyleTokens.line-width; border-color: root.divider;
-                                background: self.enabled && self.has-hover ? root.hover : root.elevated; focus-color: root.ink;
+                                background: root.control-fill(self.enabled && self.has-hover, self.enabled && self.has-pressed, root.elevated); focus-color: root.ink;
                                 label: "Confirm removal of current room avatar";
                                 enabled: root.room-settings-editable && root.room-settings-avatar-allowed && root.room-settings-avatar-present;
                                 activated => { root.room-settings-action(5); }
@@ -8811,7 +8819,7 @@ export component AppWindow inherits Window {
                     if root.room-admin-notice != "" : Text { text: root.room-admin-notice; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
                     settings-close := ActionRect {
                         height: 42px * root.text-scale; border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.8; border-width: StyleTokens.line-width; border-color: root.divider;
-                        background: self.enabled && self.has-hover ? root.hover : root.elevated; focus-color: root.ink;
+                        background: root.control-fill(self.enabled && self.has-hover, self.enabled && self.has-pressed, root.elevated); focus-color: root.ink;
                         label: "Close room settings and discard unsaved edits and images";
                         enabled: root.room-settings-confirmation == 0;
                         activated => { root.dismiss-room-settings(); }
@@ -9403,7 +9411,7 @@ export component AppWindow inherits Window {
                 }
                 login-preview := ActionRect {
                     height: 38px * root.text-scale; vertical-stretch: 0;
-                    border-radius: StyleTokens.radius * 0.8; background: self.has-hover ? root.hover : transparent;
+                    border-radius: StyleTokens.radius * 0.8; background: root.control-fill(self.has-hover, self.has-pressed, transparent);
                     reveal-full-control: true; focus-color: root.accent;
                     label: "Open interactive preview without signing in";
                     enabled: !root.login-loading;
