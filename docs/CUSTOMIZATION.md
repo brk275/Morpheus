@@ -90,7 +90,8 @@ an account, the network, a call or a camera. **Hide preview** folds it away
 for this session only; it is not saved. **Pin above settings** keeps a compact
 copy under the search field while you edit anything further down; **Unpin**
 removes it. Its height stays fixed, so the
-settings below do not move while you edit. **Edit colors**, **Edit sizes and
+settings below do not move while you edit; the samples scroll inside it and
+rearrange at narrow widths and large text. **Edit colors**, **Edit sizes and
 shapes** and **Edit base palette** below it jump to the detailed editors.
 
 Settings search (`Mod+Shift+F`) finds sections, every color token and every
