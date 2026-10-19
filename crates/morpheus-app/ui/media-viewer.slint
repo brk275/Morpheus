@@ -257,7 +257,7 @@ export component MediaViewer inherits Rectangle {
                         height: root.shown-height;
                         source: root.image;
                         image-fit: fill;
-                        accessible-role: image;
+                        accessible-role: AccessibleRole.image;
                         accessible-label: "Attachment " + root.title;
                     }
                     if !root.loaded : Text {
