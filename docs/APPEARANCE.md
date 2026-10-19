@@ -344,7 +344,9 @@ samples. Everything in it is synthetic and inert: sample controls take no
 focus or pointer input and nothing reaches an account, the network, a call or
 capture. Its height does not follow the edited values, so the page does not
 move while editing; the samples clip instead. Hiding it is session state and
-is never saved. Its links reveal the color, metric and base-palette editors
+is never saved, as is pinning a compact copy (navigation row, message, two
+buttons and three role chips) under the search field, opt-in and off by
+default. Its links reveal the color, metric and base-palette editors
 through the same reveal as search.
 
 Message search, polls, the poll dialog and the call stage import the same

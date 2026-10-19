@@ -3185,9 +3185,14 @@ async fn assert_live_preview(ui: &AppWindow) {
     ui.set_page(1);
     settle(ui).await;
     assert!(ui.get_appearance_preview_shown(), "the preview starts shown");
-    // Samples sit between the toggle and the links in the tree; Tab skips
-    // every one of them.
+    // Samples sit between the header actions and the links in the tree; Tab
+    // skips every one of them.
     tab_to_control(ui, "Hide the live preview");
+    key(ui, Key::Tab);
+    assert!(focused_control_has_label(
+        ui,
+        "Keep a compact preview above the settings while editing"
+    ));
     key(ui, Key::Tab);
     assert!(
         focused_control_has_label(ui, "Go to the color editor"),
@@ -3211,6 +3216,19 @@ async fn assert_live_preview(ui: &AppWindow) {
     key(ui, Key::Return);
     settle(ui).await;
     assert!(ui.get_appearance_preview_shown());
+    // Pinning keeps a compact copy above the settings until its own Unpin.
+    assert!(!ui.get_appearance_preview_pinned(), "pinning is opt-in");
+    tab_to_control(ui, "Keep a compact preview above the settings while editing");
+    key(ui, Key::Return);
+    settle(ui).await;
+    assert!(ui.get_appearance_preview_pinned());
+    assert!(focused_control_has_label(
+        ui,
+        "Stop keeping the preview above the settings"
+    ));
+    click_control_once(ui, "Unpin the compact preview");
+    settle(ui).await;
+    assert!(!ui.get_appearance_preview_pinned());
     ui.set_page(0);
     settle(ui).await;
 }

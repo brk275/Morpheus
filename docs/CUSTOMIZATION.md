@@ -87,7 +87,9 @@ controls and color rules as the real views, so a theme, font, size, density,
 state color or previewed style profile shows there as soon as it applies. The
 samples are invented and inert: they take no focus or clicks and never reach
 an account, the network, a call or a camera. **Hide preview** folds it away
-for this session only; it is not saved. Its height stays fixed, so the
+for this session only; it is not saved. **Pin above settings** keeps a compact
+copy under the search field while you edit anything further down; **Unpin**
+removes it. Its height stays fixed, so the
 settings below do not move while you edit. **Edit colors**, **Edit sizes and
 shapes** and **Edit base palette** below it jump to the detailed editors.
 
