@@ -55,7 +55,11 @@ pub fn safe_file_name(name: &str) -> String {
     } else {
         trimmed.to_owned()
     };
-    let stem = name.split('.').next().unwrap_or_default().to_ascii_uppercase();
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
     let numbered = stem.len() == 4
         && (stem.starts_with("COM") || stem.starts_with("LPT"))
         && stem.as_bytes()[3].is_ascii_digit();
@@ -97,6 +101,24 @@ pub fn save_download(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
+/// Submit a guarded plaintext save. A cancelled or abandoned operation never
+/// starts a write; an admitted write must finish and report its real result.
+/// Call only after account/room/selection guards have all been acquired.
+pub(crate) fn begin_download_save(
+    path: PathBuf,
+    bytes: Vec<u8>,
+    cancelled: &tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<io::Result<PathBuf>>> {
+    let stopped = cancelled.borrow();
+    if *stopped || cancelled.has_changed().is_err() {
+        return None;
+    }
+    // The read guard orders cancellation with submitting the real write.
+    Some(tokio::task::spawn_blocking(move || {
+        save_download(&path, &bytes)
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,6 +135,42 @@ mod tests {
             mime_type_for(Path::new("unknown.oddextension")),
             "application/octet-stream"
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_waiting_for_a_save_guard_never_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("chosen.bin");
+        std::fs::write(&target, b"original").unwrap();
+        let gate = tokio::sync::Mutex::new(());
+        let (cancel, signal) = tokio::sync::watch::channel(false);
+        {
+            let held = gate.lock().await;
+            let delayed = async {
+                let _guard = gate.lock().await;
+                begin_download_save(target.clone(), b"cancelled plaintext".to_vec(), &signal)
+            };
+            tokio::pin!(delayed);
+            assert!(futures_util::poll!(delayed.as_mut()).is_pending());
+            cancel.send(true).unwrap();
+            drop(held);
+            assert!(delayed.await.is_none());
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        let (abandoned, signal) = tokio::sync::watch::channel(false);
+        drop(abandoned);
+        assert!(
+            begin_download_save(target.clone(), b"abandoned plaintext".to_vec(), &signal).is_none()
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        // After admission cancellation cannot turn a real write into a claim
+        // that nothing was written. Its caller must await this exact result.
+        let (cancel, signal) = tokio::sync::watch::channel(false);
+        let admitted =
+            begin_download_save(target.clone(), b"admitted plaintext".to_vec(), &signal).unwrap();
+        cancel.send(true).unwrap();
+        assert_eq!(admitted.await.unwrap().unwrap(), target);
+        assert_eq!(std::fs::read(&target).unwrap(), b"admitted plaintext");
     }
 
     #[test]

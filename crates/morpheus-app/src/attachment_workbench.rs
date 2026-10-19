@@ -30,7 +30,7 @@ use morpheus_matrix::{
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use tokio::{
     runtime::Handle,
-    sync::{mpsc, watch},
+    sync::{Semaphore, mpsc, watch},
 };
 
 use crate::{
@@ -43,6 +43,8 @@ use crate::{
 const MAX_ROOM_ITEMS: usize = 10;
 /// Attachments remembered across every account and room.
 const MAX_ITEMS: usize = 64;
+/// Bound simultaneous file reads and SDK preparation across all rooms.
+const MAX_PREPARING: usize = 2;
 /// Minimum spacing of one upload's progress updates.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(150);
 /// Commands are user clicks; a full channel drops a repeated click.
@@ -116,6 +118,7 @@ struct Item {
     /// A transient explanation shown until the phase changes.
     note: String,
     commands: Option<mpsc::Sender<Command>>,
+    cancel: Option<watch::Sender<bool>>,
     progress_at: Option<Instant>,
 }
 
@@ -128,6 +131,7 @@ impl Item {
 /// What one upload task owns: never the window or the item itself.
 struct Job {
     id: u64,
+    selection: AccountSelection,
     account_id: String,
     room_id: String,
     path: PathBuf,
@@ -171,6 +175,7 @@ pub struct Workbench {
     /// A projection is already waiting on the event loop.
     queued: AtomicBool,
     save: Mutex<Option<SaveJob>>,
+    preparing: Semaphore,
 }
 
 impl Workbench {
@@ -184,6 +189,7 @@ impl Workbench {
             state: Mutex::new(State::default()),
             queued: AtomicBool::new(false),
             save: Mutex::new(None),
+            preparing: Semaphore::new(MAX_PREPARING),
         });
         {
             let owner = owner.clone();
@@ -448,6 +454,7 @@ impl Workbench {
                     phase,
                     note: String::new(),
                     commands: None,
+                    cancel: None,
                     progress_at: None,
                 });
                 in_room += 1;
@@ -486,7 +493,7 @@ impl Workbench {
 
     /// Hand one staged or not-yet-queued item to a new upload task.
     fn start(self: &Arc<Self>, id: u64) {
-        let (job, commands) = {
+        let (job, commands, cancelled) = {
             let mut state = self.lock();
             let Some(item) = state.items.iter_mut().find(|item| item.id == id) else {
                 return;
@@ -494,24 +501,32 @@ impl Workbench {
             if !matches!(item.phase, Phase::Staged | Phase::Failed(_)) || item.commands.is_some() {
                 return;
             }
+            let Some(selection) = self.live.manager.account_selection(&item.account_id) else {
+                item.phase =
+                    Phase::Failed("Select this account before sending its attachments.".into());
+                return;
+            };
             let (sender, receiver) = mpsc::channel(COMMAND_CAPACITY);
+            let (cancel, cancelled) = watch::channel(false);
             item.commands = Some(sender);
+            item.cancel = Some(cancel);
             item.phase = Phase::Preparing;
             item.note.clear();
             let job = Job {
                 id,
+                selection,
                 account_id: item.account_id.clone(),
                 room_id: item.room_id.clone(),
                 path: item.path.clone(),
                 mime_type: item.mime_type.clone(),
                 filename: item.filename.clone(),
             };
-            (job, receiver)
+            (job, receiver, cancelled)
         };
         let owner = self.clone();
         self.runtime.spawn(async move {
             let mut commands = commands;
-            let outcome = owner.upload(&job, &mut commands).await;
+            let outcome = owner.upload(&job, &mut commands, &cancelled).await;
             owner.finish(&job, outcome);
         });
     }
@@ -520,19 +535,31 @@ impl Workbench {
         self: &Arc<Self>,
         job: &Job,
         commands: &mut mpsc::Receiver<Command>,
+        cancelled: &watch::Receiver<bool>,
     ) -> Outcome {
         let mut listening = true;
         let mut cancel = false;
         let queued = {
+            // Waiting tasks own only paths and small bounded command channels.
+            let _preparation = tokio::select! {
+                biased;
+                _ = wait_for_cancel(cancelled) => return Outcome::Cancelled,
+                _ = job.selection.revoked() => return Outcome::Failed("Select this account before sending its attachments.".into()),
+                permit = self.preparing.acquire() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => return Outcome::Failed("Attachment preparation is unavailable.".into()),
+                },
+            };
             // The core holds the account-switch lock while it queues and
             // checks the account it was given, so an upload is never
             // directed to another account's room. Navigating to another room
             // of the same account does not stop a send the user started.
-            let send = self.live.manager.send_attachment_for(
-                &job.account_id,
+            let send = self.live.manager.send_attachment_selected_for(
+                &job.selection,
                 &job.room_id,
                 &job.path,
                 &job.mime_type,
+                cancelled,
             );
             tokio::pin!(send);
             loop {
@@ -551,15 +578,17 @@ impl Workbench {
             }
         };
         let mut queued = match queued {
-            Ok(queued) => queued,
+            Ok(Some(queued)) => queued,
+            Ok(None) => return Outcome::Cancelled,
+            Err(MatrixCoreError::AttachmentSendUncertain) => return Outcome::Uncertain,
             Err(MatrixCoreError::MediaTooLarge { .. }) => {
                 return Outcome::Rejected(TOO_LARGE.into());
             }
             Err(error) => return Outcome::Failed(error.to_string()),
         };
-        // Cancelled while it was read: queueing finished first, so withdraw
-        // the queued upload rather than leave it running unseen.
-        if cancel {
+        // Cancellation before SDK admission returned None above. Once SDK
+        // commit began, withdraw the returned handle and report its outcome.
+        if cancel || *cancelled.borrow() || cancelled.has_changed().is_err() {
             return abort(&queued).await.unwrap_or(Outcome::Uncertain);
         }
         self.set_phase(job.id, Phase::Uploading(0), "");
@@ -614,6 +643,7 @@ impl Workbench {
             };
             let item = &mut state.items[index];
             item.commands = None;
+            item.cancel = None;
             item.note.clear();
             match outcome {
                 Outcome::Sent => {
@@ -707,8 +737,16 @@ impl Workbench {
                 .items
                 .iter()
                 .find(|item| item.id == id && item.in_room(&account_id, &room_id))
-                .and_then(|item| item.commands.as_ref())
-                .is_some_and(|commands| commands.try_send(Command::Cancel).is_ok())
+                .is_some_and(|item| {
+                    let sent = item
+                        .cancel
+                        .as_ref()
+                        .is_some_and(|cancel| cancel.send(true).is_ok());
+                    if let Some(commands) = item.commands.as_ref() {
+                        let _ = commands.try_send(Command::Cancel);
+                    }
+                    sent
+                })
         };
         if sent {
             self.set_phase(id, Phase::Cancelling, "");
@@ -820,6 +858,11 @@ impl Workbench {
         ui.set_attachment_can_add(in_room < MAX_ROOM_ITEMS);
         ui.set_attachment_status(summary(in_room, ready, running).into());
     }
+}
+
+async fn wait_for_cancel(signal: &watch::Receiver<bool>) {
+    let mut signal = signal.clone();
+    let _ = signal.wait_for(|stopped| *stopped).await;
 }
 
 /// Withdraw a queued upload. `Ok` says what happened; `Err` leaves it queued.
@@ -942,6 +985,7 @@ mod tests {
             phase,
             note: String::new(),
             commands: commands.then(|| mpsc::channel(COMMAND_CAPACITY).0),
+            cancel: None,
             progress_at: None,
         }
     }

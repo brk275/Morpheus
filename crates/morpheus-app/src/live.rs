@@ -31,7 +31,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::attachments::save_download;
+use crate::attachments::begin_download_save;
 use crate::draft_recovery::{self, PrepareError, SendScope};
 use crate::drafts::{
     DraftStore, PendingHandle, PendingItem, PendingStatus, PendingSummary, PendingTarget,
@@ -2551,15 +2551,10 @@ impl LiveUi {
             return Err(MatrixCoreError::SelectedAccountChanged);
         }
         // Cancellation remains effective while waiting for every commit guard.
-        // Hold the watch read guard through submission to the blocking pool:
-        // cancellation is then ordered before the commit or after it, without
-        // a check/submit gap. Once submitted, finish and report the real write.
-        let write = {
-            let stopped = cancelled.borrow();
-            if *stopped || cancelled.has_changed().is_err() {
-                return Ok(None);
-            }
-            tokio::task::spawn_blocking(move || save_download(&path, &bytes))
+        // Once submitted, await the real write; never report a cancelled save
+        // after it has entered the noninterruptible commit.
+        let Some(write) = begin_download_save(path, bytes, cancelled) else {
+            return Ok(None);
         };
         write
             .await
