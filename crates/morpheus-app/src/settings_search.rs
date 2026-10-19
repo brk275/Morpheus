@@ -105,7 +105,8 @@ fn section_for_key(query: &str) -> Option<&'static SettingTarget> {
 }
 
 fn show_results(ui: &AppWindow, query: &str) {
-    let mut hits = registry::search(&search_query(query), |requirement| available(ui, requirement));
+    let mut hits =
+        registry::search(&search_query(query), |requirement| available(ui, requirement));
     // A typed section key leads with its section.
     if let Some(target) = section_for_key(query)
         .filter(|target| available(ui, target.requires))
