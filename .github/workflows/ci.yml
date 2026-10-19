@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
-name: Reviewed native poll SDK diagnosis
-run-name: Native poll SDK diagnosis - 9eb5315 - ${{ inputs.platform }}
+name: Reviewed native poll SDK fixed checks
+run-name: Native poll SDK fixed checks - daf1d11 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: native-poll-sdk-diagnosis-9eb5315-${{ github.ref }}
+  group: native-poll-sdk-fixed-daf1d11-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 9eb5315f98e826c439e9870b0bc9fb898cb6bd69
+          ref: daf1d11ef5a2ca06f0596d12f4664d85d429e0b3
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -135,7 +135,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='9eb5315f98e826c439e9870b0bc9fb898cb6bd69'
+          source='daf1d11ef5a2ca06f0596d12f4664d85d429e0b3'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -379,7 +379,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='9eb5315f98e826c439e9870b0bc9fb898cb6bd69'
+          source='daf1d11ef5a2ca06f0596d12f4664d85d429e0b3'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -464,7 +464,7 @@ jobs:
           # classifications and known SDK source spans; raw output stays private.
           checks=[
               ('sdk_poll',['cargo', 'test', '--locked', '-p', 'matrix-sdk-ui', '--lib', 'timeline::tests::polls::', '--', '--test-threads=1'],4200,
-                  {'timeline::tests::polls::morpheus_duplicate_pending_ends_do_not_stop_later_pending_votes', 'timeline::tests::polls::morpheus_earliest_valid_end_wins_even_when_received_later', 'timeline::tests::polls::morpheus_known_moderator_may_end_another_users_poll', 'timeline::tests::polls::morpheus_pending_invalid_end_does_not_drop_a_pending_vote', 'timeline::tests::polls::morpheus_pending_moderator_end_is_checked_when_start_arrives', 'timeline::tests::polls::morpheus_unauthorized_poll_end_keeps_poll_open_and_creator_can_end', 'timeline::tests::polls::test_a_somewhat_complex_voting_session_yields_the_expected_outcome', 'timeline::tests::polls::test_adding_response_doesnt_clear_latest_json_edit', 'timeline::tests::polls::test_edited_poll_is_displayed', 'timeline::tests::polls::test_ending_a_poll_sets_end_time_to_results', 'timeline::tests::polls::test_ending_poll_doesnt_clear_latest_json_edit', 'timeline::tests::polls::test_events_received_before_start_are_not_lost', 'timeline::tests::polls::test_multiple_end_events_are_discarded', 'timeline::tests::polls::test_only_the_last_vote_from_a_user_is_counted', 'timeline::tests::polls::test_poll_contains_relations', 'timeline::tests::polls::test_poll_is_displayed', 'timeline::tests::polls::test_votes_after_end_are_discarded', 'timeline::tests::polls::test_voting_adds_the_vote_to_the_results'},set()),
+                  {'timeline::tests::polls::test_morpheus_duplicate_pending_ends_do_not_stop_later_pending_votes', 'timeline::tests::polls::test_morpheus_earliest_valid_end_wins_even_when_received_later', 'timeline::tests::polls::test_morpheus_known_moderator_may_end_another_users_poll', 'timeline::tests::polls::test_morpheus_pending_invalid_end_does_not_drop_a_pending_vote', 'timeline::tests::polls::test_morpheus_pending_moderator_end_is_checked_when_start_arrives', 'timeline::tests::polls::test_morpheus_unauthorized_poll_end_keeps_poll_open_and_creator_can_end', 'timeline::tests::polls::test_a_somewhat_complex_voting_session_yields_the_expected_outcome', 'timeline::tests::polls::test_adding_response_doesnt_clear_latest_json_edit', 'timeline::tests::polls::test_edited_poll_is_displayed', 'timeline::tests::polls::test_ending_a_poll_sets_end_time_to_results', 'timeline::tests::polls::test_ending_poll_doesnt_clear_latest_json_edit', 'timeline::tests::polls::test_events_received_before_start_are_not_lost', 'timeline::tests::polls::test_multiple_end_events_are_discarded', 'timeline::tests::polls::test_only_the_last_vote_from_a_user_is_counted', 'timeline::tests::polls::test_poll_contains_relations', 'timeline::tests::polls::test_poll_is_displayed', 'timeline::tests::polls::test_votes_after_end_are_discarded', 'timeline::tests::polls::test_voting_adds_the_vote_to_the_results'},set()),
           ]
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
