@@ -301,7 +301,9 @@ impl Workbench {
                 }
             }
             let _ = owner.window.upgrade_in_event_loop(move |ui| {
-                if ui.get_active_account_local_id().as_str() != account_id
+                if !selection.is_current()
+                    || !ui.get_live_session()
+                    || ui.get_active_account_local_id().as_str() != account_id
                     || ui.get_active_room_id().as_str() != room_id
                     || ui.get_download_operation() != operation
                     || ui.get_downloading_event_id().as_str() != event_id
@@ -678,9 +680,12 @@ impl Workbench {
         };
         if let Some(notice) = notice {
             let (account_id, room_id) = (job.account_id.clone(), job.room_id.clone());
+            let selection = job.selection.clone();
             let _ = self.window.upgrade_in_event_loop(move |ui| {
                 // Only the room the file was sent to may show its name.
-                if ui.get_active_account_local_id().as_str() == account_id
+                if selection.is_current()
+                    && ui.get_live_session()
+                    && ui.get_active_account_local_id().as_str() == account_id
                     && ui.get_active_room_id().as_str() == room_id
                 {
                     ui.set_transfer_notice(crate::directory_plain_text(&notice, 200).into());
@@ -826,6 +831,20 @@ impl Workbench {
     fn project(&self, ui: &AppWindow) {
         let account_id = ui.get_active_account_local_id();
         let room_id = ui.get_active_room_id();
+        if !ui.get_live_session()
+            || !self.live.is_live.load(Ordering::Acquire)
+            || account_id.is_empty()
+            || room_id.is_empty()
+            || self.live.manager.account_selection(&account_id).is_none()
+        {
+            // A queued refresh must not restore private rows after detach or
+            // revocation while the old presentation strings still exist.
+            ui.set_attachment_items(ModelRc::new(VecModel::<AttachmentItem>::default()));
+            ui.set_attachment_ready_count(0);
+            ui.set_attachment_can_add(false);
+            ui.set_attachment_status("".into());
+            return;
+        }
         let (rows, ready, running, in_room) = {
             let state = self.lock();
             let mut rows = Vec::new();
