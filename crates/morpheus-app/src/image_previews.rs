@@ -454,10 +454,21 @@ impl ImagePreviews {
             }
         });
         let weak = ui.as_weak();
+        let encrypted_store = store.clone();
         ui.on_set_encrypted_image_previews(move |enabled| {
             if let Some(ui) = weak.upgrade() {
-                let _ = crate::save_config_change(&ui, &store, |config| {
+                let _ = crate::save_config_change(&ui, &encrypted_store, |config| {
                     config.media.previews_in_encrypted_rooms = enabled
+                });
+            }
+        });
+        // Only this explicit Settings choice writes the preference; a failed
+        // save leaves the window showing the value still on disk.
+        let weak = ui.as_weak();
+        ui.on_set_animated_image_autoplay(move |enabled| {
+            if let Some(ui) = weak.upgrade() {
+                let _ = crate::save_config_change(&ui, &store, |config| {
+                    config.media.autoplay_animated_media = enabled
                 });
             }
         });

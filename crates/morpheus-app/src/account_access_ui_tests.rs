@@ -2657,6 +2657,7 @@ async fn exercise_account_ui(runtime: Handle) {
     assert_recovery_strip_projection(&ui).await;
     assert_sticker_picker_projection(&ui).await;
     assert_media_viewer_keyboard(&ui).await;
+    assert_animation_autoplay_setting(&ui).await;
     // The real picker controller over a recording fake core: admission,
     // persistence, single-flight commands, held sends and exact reconciliation.
     crate::stickers::controller_tests::run(&ui, runtime.clone()).await;
@@ -3896,5 +3897,39 @@ async fn assert_media_viewer_keyboard(ui: &AppWindow) {
     ui.set_image_preview_has_next(false);
     ui.set_image_preview_event_id("".into());
     ui.set_image_preview_title("".into());
+    settle(ui).await;
+}
+
+/// The animation autoplay row sits after the encrypted-preview row, is
+/// keyboard reachable and reports the saved value. Activating it only asks
+/// for a save: the window's value changes when the saved configuration is
+/// applied, never on the click itself.
+async fn assert_animation_autoplay_setting(ui: &AppWindow) {
+    use std::{cell::Cell, rc::Rc};
+
+    const ROW: &str = "Play animated images automatically when opened";
+    let requested = Rc::new(Cell::new(None));
+    let seen = requested.clone();
+    ui.on_set_animated_image_autoplay(move |enabled| seen.set(Some(enabled)));
+    let mut config = Config::default();
+    crate::image_previews::apply_config(ui, &config);
+    assert!(crate::settings_search::reveal(ui, "media.image_previews"));
+    settle(ui).await;
+    assert!(focused_control_has_label(
+        ui,
+        "Allow image previews in encrypted rooms"
+    ));
+    tab_to_control(ui, ROW);
+    key(ui, Key::Space);
+    assert_eq!(requested.take(), Some(true));
+    assert!(!ui.get_image_previews_autoplay());
+    config.media.autoplay_animated_media = true;
+    crate::image_previews::apply_config(ui, &config);
+    settle(ui).await;
+    assert!(ui.get_image_previews_autoplay());
+    key(ui, Key::Space);
+    assert_eq!(requested.take(), Some(false));
+    crate::image_previews::apply_config(ui, &Config::default());
+    ui.set_page(0);
     settle(ui).await;
 }

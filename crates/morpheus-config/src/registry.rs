@@ -823,12 +823,12 @@ pub const FIELDS: &[FieldSpec] = &[
         "true",
         "Noise suppression; not used yet.",
     )),
-    inactive(field(
+    field(
         "media.autoplay_animated_media",
         Bool,
         "false",
-        "Animated media autoplay; not used yet.",
-    )),
+        "Start animated image previews playing when opened; reduced motion keeps them paused.",
+    ),
     field(
         "media.previews_in_encrypted_rooms",
         Bool,

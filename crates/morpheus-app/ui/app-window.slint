@@ -2283,6 +2283,8 @@ export component AppWindow inherits Window {
         shortcut-scope.focus();
     }
     callback set-encrypted-image-previews(bool);
+    // Saves media.autoplay_animated_media; the window shows the saved value.
+    callback set-animated-image-autoplay(bool);
     // Media viewer; see media-viewer.slint and src/image_previews.rs.
     callback preview-adjacent-image(int);
     callback retry-image-preview();
@@ -5303,7 +5305,7 @@ export component AppWindow inherits Window {
                         }
                         Rectangle { height: 1px; background: root.divider; }
                         Text { text: "Image previews"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
-                        Text { text: "Images load only when clicked and stay in memory. Closing the viewer or switching rooms/accounts clears them. PNG and baseline JPEG only; animation, WebP, audio and video previews are not available yet."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                        Text { text: "Images load only when clicked and stay in memory. Closing the viewer or switching rooms/accounts clears them. PNG, JPEG, GIF and WebP images open in the viewer, and animated ones can play there. Audio and video previews are not available yet."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         ActionRect {
                             height: 40px * root.text-scale; border-radius: 8px; background: self.has-hover ? root.hover : root.elevated;
                             focus-color: root.accent;
@@ -5326,6 +5328,22 @@ export component AppWindow inherits Window {
                             activated => { root.set-encrypted-image-previews(!root.image-previews-encrypted-enabled); }
                             Text { x: 12px; width: parent.width - 24px; text: (root.image-previews-encrypted-enabled ? "✓  " : "□  ") + "Allow previews in encrypted rooms"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; }
                         }
+                        // Same row pattern and save path as the encrypted-preview row.
+                        // Search reveals this section through that row's target.
+                        ActionRect {
+                            height: 40px * root.text-scale; border-radius: 8px; background: self.has-hover ? root.hover : root.elevated;
+                            focus-color: root.accent;
+                            changed has-focus => {
+                                if self.has-focus {
+                                    settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                }
+                            }
+                            label: "Play animated images automatically when opened";
+                            accessible-checkable: true; accessible-checked: root.image-previews-autoplay;
+                            activated => { root.set-animated-image-autoplay(!root.image-previews-autoplay); }
+                            Text { x: 12px; width: parent.width - 24px; text: (root.image-previews-autoplay ? "✓  " : "□  ") + "Play animated images automatically"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; overflow: elide; }
+                        }
+                        Text { text: "Reduced motion keeps animations paused on their first frame either way. An animation that is already open keeps playing or paused."; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
                         Rectangle { height: 1px; background: root.divider; }
                         Text { text: "Call audio devices"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Saved for your next call. Your current call keeps its selection until you leave. An unavailable selected device shows an error. System default follows your operating system's audio routing."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }

@@ -279,7 +279,6 @@ consumer. Changing them does not enable the described behavior:
 | --- | --- |
 | `media.camera_device` | Saved camera selection |
 | `media.noise_suppression` | Configurable noise suppression |
-| `media.autoplay_animated_media` | Animated-media autoplay policy |
 | `experimental.background_account_sync` | Background syncing of inactive accounts |
 
 Microphone and speaker selection, notification overrides and the appearance
