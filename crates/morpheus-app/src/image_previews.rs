@@ -215,6 +215,18 @@ fn gallery(ui: &AppWindow, event: &str) -> Option<(Vec<(SharedString, SharedStri
     None
 }
 
+/// The gallery index `step` places away from `index` among `len` images,
+/// clamped to the ends, or None when that is `index` itself.
+fn gallery_step(index: usize, len: usize, step: i32) -> Option<usize> {
+    let last = len.checked_sub(1)?;
+    let target = if step < 0 {
+        index.saturating_sub(step.unsigned_abs() as usize)
+    } else {
+        index.saturating_add(step as usize).min(last)
+    };
+    (target != index && target <= last).then_some(target)
+}
+
 fn publish_position(ui: &AppWindow, event: &str) {
     let (position, previous, next) = match gallery(ui, event) {
         Some((images, index)) if images.len() > 1 => (
@@ -473,8 +485,12 @@ impl ImagePreviews {
                 let Some((images, index)) = gallery(&ui, &current) else {
                     return;
                 };
-                let target = index.checked_add_signed(isize::try_from(step).unwrap_or_default());
-                if let Some((event, filename)) = target.and_then(|target| images.get(target)) {
+                // A step past either end stops at the first or last loaded
+                // image (Home and End send large steps).
+                let Some(target) = gallery_step(index, images.len(), step) else {
+                    return;
+                };
+                if let Some((event, filename)) = images.get(target) {
                     context.open(&ui, event, filename);
                 }
             });
@@ -795,6 +811,19 @@ async fn fetch_decode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gallery_steps_stop_at_the_first_and_last_image() {
+        assert_eq!(gallery_step(2, 5, 1), Some(3));
+        assert_eq!(gallery_step(2, 5, -1), Some(1));
+        assert_eq!(gallery_step(2, 5, i32::MAX), Some(4));
+        assert_eq!(gallery_step(2, 5, -i32::MAX), Some(0));
+        assert_eq!(gallery_step(2, 5, i32::MIN), Some(0));
+        // Already at an end, or an empty gallery: nothing opens.
+        assert_eq!(gallery_step(4, 5, 1), None);
+        assert_eq!(gallery_step(0, 5, -1), None);
+        assert_eq!(gallery_step(0, 1, i32::MAX), None);
+        assert_eq!(gallery_step(0, 0, 1), None);
+    }
     #[test]
     fn cancellation_never_releases_a_worker_which_has_not_exited() {
         let gate = Arc::new(AtomicBool::new(false));

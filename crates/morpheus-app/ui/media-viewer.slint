@@ -127,6 +127,8 @@ export component MediaViewer inherits Rectangle {
     callback close();
     callback previous();
     callback next();
+    callback first();
+    callback last();
     callback cancel-loading();
     callback retry();
     callback save();
@@ -348,6 +350,12 @@ export component MediaViewer inherits Rectangle {
             } else if (event.text == "r" || event.text == "R") && root.animated {
                 root.replay();
                 accept
+            } else if event.text == Key.Home && root.has-previous {
+                root.first();
+                accept
+            } else if event.text == Key.End && root.has-next {
+                root.last();
+                accept
             } else if event.text == "]" {
                 root.rotate(true);
                 accept
@@ -373,7 +381,7 @@ export component MediaViewer inherits Rectangle {
             background: root.palette.surface;
             accessible-role: region;
             accessible-label: "Image preview " + root.title;
-            accessible-description: "Left and Right show the previous or next image. Plus, minus and 0 zoom in, zoom out and fit; arrow keys pan a zoomed image. The right and left square brackets rotate the view clockwise and counterclockwise."
+            accessible-description: "Left and Right show the previous or next image, and Home and End the first or last. Plus, minus and 0 zoom in, zoom out and fit; arrow keys pan a zoomed image. The right and left square brackets rotate the view clockwise and counterclockwise."
                 + (root.animated ? " K plays or pauses the animation and R replays it." : "")
                 + " Escape closes the preview.";
             VerticalLayout {

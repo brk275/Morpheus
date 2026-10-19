@@ -6478,6 +6478,9 @@ export component AppWindow inherits Window {
         close => { root.dismiss-image-preview(); }
         previous => { root.preview-adjacent-image(-1); }
         next => { root.preview-adjacent-image(1); }
+        // Steps past either end stop at the first or last loaded image.
+        first => { root.preview-adjacent-image(-2147483647); }
+        last => { root.preview-adjacent-image(2147483647); }
         cancel-loading => { root.cancel-image-preview-loading(); }
         retry => { root.retry-image-preview(); }
         toggle-playback => { root.toggle-image-preview-playback(); }
