@@ -52,6 +52,12 @@ fn show(ui: &AppWindow, request: Option<&PersonVerificationRequest>) {
         ui.set_person_request_busy(false);
         ui.set_person_request_error("".into());
     }
+    // Requests normally come in a direct chat; name any other room.
+    let room = match request {
+        Some(request) if !request.direct => request.room_name.as_deref().unwrap_or("a room"),
+        _ => "",
+    };
+    ui.set_person_request_room(room.into());
     ui.set_person_request_user(user.into());
     ui.set_person_request_name(name.into());
     ui.set_person_request_flow(flow.into());

@@ -351,6 +351,8 @@ export component PersonVerificationBanner inherits Rectangle {
     in property <string> name;
     // Their Matrix ID, shown beside the name since names are not unique.
     in property <string> user-id;
+    // The room it came in, when that is not a direct chat.
+    in property <string> room;
     in property <bool> can-review: true;
     // A decline is being sent; its failure text, if any.
     in property <bool> busy;
@@ -370,7 +372,8 @@ export component PersonVerificationBanner inherits Rectangle {
         spacing: 8px;
         Text {
             text: root.name + (root.user-id != "" && root.user-id != root.name ? " (" + root.user-id + ")" : "")
-                + " wants to verify identities with you. Review only if you expected this."
+                + " wants to verify identities with you" + (root.room != "" ? " in " + root.room : "")
+                + ". Review only if you expected this."
                 + (root.error != "" ? " " + root.error : "");
             color: root.palette.ink;
             font-size: 11px * root.text-scale;

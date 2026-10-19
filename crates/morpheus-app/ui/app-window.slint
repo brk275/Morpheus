@@ -2210,6 +2210,8 @@ export component AppWindow inherits Window {
     in-out property <string> person-request-dismissed;
     in-out property <bool> person-request-busy;
     in-out property <string> person-request-error;
+    // The room it came in when that is not a direct chat.
+    in-out property <string> person-request-room;
     // What to ask (src/device_setup.rs): 0 nothing, 1 verify this device,
     // 2 the recovery key, 3 review other unverified devices. Not now hides
     // only the state it was shown for (need and count) in this account view.
@@ -3511,6 +3513,7 @@ export component AppWindow inherits Window {
                     text-scale: root.text-scale;
                     name: root.person-request-name;
                     user-id: root.person-request-user;
+                    room: root.person-request-room;
                     busy: root.person-request-busy;
                     error: root.person-request-error;
                     can-review: !root.sas-busy && !root.security-busy && root.security-recovery-key == "";

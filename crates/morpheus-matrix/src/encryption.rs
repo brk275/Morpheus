@@ -47,6 +47,10 @@ pub struct PersonVerificationRequest {
     /// Bounded, sanitized room display name, if the person has one.
     pub display_name: Option<String>,
     pub flow_id: String,
+    /// The request came in a direct chat, where people normally send them.
+    pub direct: bool,
+    /// Bounded, sanitized name of the room it came in, if known.
+    pub room_name: Option<String>,
 }
 
 /// Follows verification requests other people send this account. Nothing is
@@ -511,10 +515,15 @@ impl AccountManager {
                         Ok(Some(member)) => member.display_name().and_then(bounded_name),
                         _ => None,
                     };
+                    let room_name = room
+                        .cached_display_name()
+                        .and_then(|name| bounded_name(&name.to_string()));
                     let request = PersonVerificationRequest {
                         user_id: event.sender.to_string(),
                         display_name,
                         flow_id,
+                        direct: room.is_direct().await.unwrap_or(false),
+                        room_name,
                     };
                     sender.send_modify(|known| remember_person_request(known, request));
                 }
@@ -815,6 +824,8 @@ mod tests {
             user_id: "@member:example.org".into(),
             display_name: None,
             flow_id: format!("$flow{flow}"),
+            direct: true,
+            room_name: None,
         }
     }
 
