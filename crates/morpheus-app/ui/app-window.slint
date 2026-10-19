@@ -1,5 +1,5 @@
 import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView, Slider, SpinBox } from "std-widgets.slint";
-import { MemberActionDialog, RoomMembersPanel, RosterMember, RosterPalette } from "room-admin.slint";
+import { MemberActionDialog, RoomMembersPanel, RosterMember, RosterPalette, RosterPermission } from "room-admin.slint";
 
 // Optional overrides retain each control's existing color when absent.
 export struct ColorRole {
@@ -1918,6 +1918,7 @@ export component AppWindow inherits Window {
     in-out property <string> roster-confirm-body;
     in-out property <string> roster-confirm-action;
     in-out property <bool> roster-confirm-destructive: false;
+    in-out property <[RosterPermission]> roster-permissions;
     in-out property <int> active-account-index: 0;
     in-out property <string> active-account-local-id;
     in-out property <string> active-account-name;
@@ -2267,6 +2268,8 @@ export component AppWindow inherits Window {
     callback roster-invite();
     // 1 kick, 2 ban, 3 unban, 4 set level, 5 approve request, 6 deny request
     callback roster-request(int);
+    // A permission key from roster-permissions and the requested level text.
+    callback roster-request-permission(int, string);
     callback roster-confirm();
     callback roster-cancel-confirm();
     callback submit-room-admin(int, string, string);
@@ -5928,6 +5931,7 @@ export component AppWindow inherits Window {
                     selected-restriction: root.roster-selected-restriction;
                     level-input <=> root.roster-level-input;
                     reason-input <=> root.roster-reason-input;
+                    permissions: root.roster-permissions;
                     scope-changed => { root.roster-scope-changed(); }
                     search-edited(text) => { root.roster-search-edited(text); }
                     choose-filter(index) => { root.roster-choose-filter(index); }
@@ -5935,6 +5939,7 @@ export component AppWindow inherits Window {
                     select(key) => { root.roster-select(key); }
                     invite => { root.roster-invite(); }
                     request(kind) => { root.roster-request(kind); }
+                    request-permission(key, level) => { root.roster-request-permission(key, level); }
                     open-settings => { root.open-room-settings(); }
                 }
                 if root.side-panel-tab == 1 : VerticalLayout {

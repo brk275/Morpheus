@@ -10,7 +10,8 @@ pub(crate) use ui::clear_presentation;
 use morpheus_matrix::{
     AdminAction, AdminMember, AdminMembership, AdminOutcome, AdminRequest, MAX_ADMIN_REASON_BYTES,
     MemberExpectation, MemberPower, MembershipCounts, ObservedMembership, ObservedTarget,
-    PowerThresholds, RoomAdminError, RoomAdminSnapshot,
+    PERMISSION_KEYS, PermissionKey, PermissionSetting, PowerThresholds, RoomAdminError,
+    RoomAdminSnapshot,
 };
 
 /// Rows shown at once. Search narrows a larger roster; the count says so.
@@ -46,6 +47,8 @@ const UNREADABLE: &str = "This room returned roles Morpheus cannot read safely. 
 const REFUSED: &str =
     "Your permissions or their role may have changed; review the refreshed roster.";
 const REVIEW: &str = "Review the refreshed roster, then try again.";
+const REFUSED_PERMISSION: &str = "Your permissions may have changed; review them again.";
+const OWN_DEFAULT: &str = "Your own level follows the default, so it changes too.";
 
 pub(crate) const KICK: i32 = 1;
 pub(crate) const BAN: i32 = 2;
@@ -232,6 +235,111 @@ pub(crate) fn shown_text(shown: usize, total: usize, truncated: bool) -> String 
     text
 }
 
+pub(crate) fn permission_label(key: PermissionKey) -> &'static str {
+    match key {
+        PermissionKey::UsersDefault => "Default member level",
+        PermissionKey::EventsDefault => "Send messages",
+        PermissionKey::Invite => "Invite people",
+        PermissionKey::Kick => "Kick members",
+        PermissionKey::Ban => "Ban members",
+        PermissionKey::Redact => "Remove others' messages",
+        PermissionKey::RoomName => "Change the room name",
+        PermissionKey::RoomTopic => "Change the topic",
+        PermissionKey::RoomAvatar => "Change the room avatar",
+        PermissionKey::JoinRules => "Change who can join",
+        PermissionKey::PowerLevels => "Change roles and permissions",
+        PermissionKey::RoomNotification => "Notify everyone with @room",
+    }
+}
+
+pub(crate) fn permission_description(key: PermissionKey) -> &'static str {
+    match key {
+        PermissionKey::UsersDefault => "The level of members who have no level set for them.",
+        PermissionKey::EventsDefault => "Messages, reactions and events without their own rule.",
+        PermissionKey::Invite => "Invite people and approve requests to join.",
+        PermissionKey::Kick => "Remove members or deny requests. Also needs a level above theirs.",
+        PermissionKey::Ban => "Ban members. Unbanning also needs the kick level.",
+        PermissionKey::Redact => "Remove messages sent by other members.",
+        PermissionKey::RoomName => "Edit the room's name.",
+        PermissionKey::RoomTopic => "Edit the room's topic.",
+        PermissionKey::RoomAvatar => "Change or remove the room's avatar.",
+        PermissionKey::JoinRules => "Choose whether the room is public, invite-only or knockable.",
+        PermissionKey::PowerLevels => "Assign levels and change these permissions.",
+        PermissionKey::RoomNotification => "Mention everyone in the room at once.",
+    }
+}
+
+/// Who currently qualifies, in role words where the level matches a role.
+pub(crate) fn permission_summary(
+    setting: PermissionSetting,
+    thresholds: Option<&PowerThresholds>,
+) -> String {
+    let level = setting.level;
+    let default = thresholds.map_or(0, |levels| levels.users_default);
+    if setting.key == PermissionKey::UsersDefault {
+        return format!("Members start at level {level}");
+    }
+    if level <= default {
+        return format!("Everyone · level {level}");
+    }
+    match role(MemberPower::Level(level), thresholds) {
+        "Administrator" => format!("Administrators · level {level}"),
+        "Moderator" => format!("Moderators and above · level {level}"),
+        _ => format!("Level {level} and above"),
+    }
+}
+
+/// Why the selected account cannot change a threshold right now.
+pub(crate) fn permission_restriction(key: PermissionKey, snapshot: &RoomAdminSnapshot) -> String {
+    let own = power_text(snapshot.own_power);
+    let Some(levels) = snapshot.thresholds else {
+        return UNKNOWN_RULES.to_owned();
+    };
+    let needed = levels.change_power_levels;
+    if snapshot.own_power < MemberPower::Level(needed) {
+        return format!("Changing permissions needs level {needed}; you have {own}. {ASK_HIGHER}");
+    }
+    let current = snapshot.permission(key).map_or(needed, |row| row.level);
+    format!("Only someone with level {current} or higher can change this; you have {own}.")
+}
+
+/// Change one threshold, identified by its index in `PERMISSION_KEYS`.
+pub(crate) fn permission_intent(
+    index: i32,
+    level_input: &str,
+    snapshot: &RoomAdminSnapshot,
+) -> Result<Intent, String> {
+    let key = usize::try_from(index)
+        .ok()
+        .and_then(|index| PERMISSION_KEYS.get(index).copied());
+    let Some(setting) = key.and_then(|key| snapshot.permission(key)) else {
+        return Err(UNKNOWN_RULES.to_owned());
+    };
+    if !setting.editable {
+        return Err(permission_restriction(setting.key, snapshot));
+    }
+    let label = permission_label(setting.key);
+    let level = parse_level(level_input)?;
+    if level == setting.level {
+        return Err(format!("{label} already needs level {level}."));
+    }
+    if MemberPower::Level(level) > snapshot.own_power {
+        let own = power_text(snapshot.own_power);
+        return Err(format!("You can set permissions up to your own level, {own}."));
+    }
+    Ok(Intent {
+        action: AdminAction::SetPermission(setting.key, level),
+        user_id: String::new(),
+        name: label.to_owned(),
+        expected: MemberExpectation {
+            membership: None,
+            power: Some(MemberPower::Level(setting.level)),
+        },
+        reason: None,
+        knock: false,
+    })
+}
+
 /// The operator's decision, captured from the row they reviewed. The
 /// session refuses it when the server's state no longer matches `expected`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -254,8 +362,13 @@ impl Intent {
             reason: self.reason.clone(),
         }
     }
-    /// The reviewed row still describes the member in a fresher snapshot.
+    /// The reviewed row still describes the member, or the threshold, in a
+    /// fresher snapshot.
     pub(crate) fn still_matches(&self, snapshot: &RoomAdminSnapshot) -> bool {
+        if let AdminAction::SetPermission(key, _) = self.action {
+            let current = snapshot.permission(key).map(|row| row.level);
+            return current.map(MemberPower::Level) == self.expected.power;
+        }
         let row = snapshot.member(&self.user_id);
         let power = row.map(|member| member.power);
         let reviewed = self.expected.power;
@@ -382,13 +495,13 @@ pub(crate) struct Confirmation {
     pub(crate) destructive: bool,
 }
 
-/// Kick, ban, unban, denying a request and every level change need a
-/// deliberate confirmation. Invitations and approving a request do not.
-pub(crate) fn confirmation(
-    intent: &Intent,
-    own: MemberPower,
-    is_self: bool,
-) -> Option<Confirmation> {
+/// Kick, ban, unban, denying a request, every level change and every
+/// permission change need a deliberate confirmation. Invitations and
+/// approving a request do not.
+pub(crate) fn confirmation(intent: &Intent, snapshot: &RoomAdminSnapshot) -> Option<Confirmation> {
+    let own = snapshot.own_power;
+    let own_row = snapshot.members.iter().find(|member| member.is_self);
+    let is_self = own_row.is_some_and(|member| member.user_id == intent.user_id);
     let name = &intent.name;
     let mut confirmation = match intent.action {
         AdminAction::Invite => return None,
@@ -441,6 +554,41 @@ pub(crate) fn confirmation(
                 destructive: demotion || irreversible,
             }
         }
+        AdminAction::SetPermission(key, level) => {
+            let current = intent.expected.power.unwrap_or(MemberPower::Level(0));
+            let widens = MemberPower::Level(level) < current;
+            let from = power_text(current);
+            // Raising the default gives everyone more power; lowering it can
+            // also lower the operator's own inherited level.
+            let follows_default = own_row.is_some_and(|member| !member.explicit_level);
+            let mut body = if key == PermissionKey::UsersDefault {
+                format!("Members without a level of their own move from {from} to level {level}.")
+            } else if widens {
+                format!("{name} will need level {level} instead of {from}. More members get it.")
+            } else {
+                format!("{name} will need level {level} instead of {from}. Fewer members keep it.")
+            };
+            let own_default = key == PermissionKey::UsersDefault && follows_default;
+            if own_default {
+                body.push(' ');
+                body.push_str(OWN_DEFAULT);
+            }
+            let sensitive = matches!(
+                key,
+                PermissionKey::Kick
+                    | PermissionKey::Ban
+                    | PermissionKey::Redact
+                    | PermissionKey::JoinRules
+                    | PermissionKey::PowerLevels
+            );
+            let raises_default = key == PermissionKey::UsersDefault && !widens;
+            Confirmation {
+                title: format!("Change \u{201c}{name}\u{201d}?"),
+                body,
+                action: "Change permission",
+                destructive: (sensitive && widens) || raises_default || (own_default && widens),
+            }
+        }
     };
     if let Some(reason) = &intent.reason {
         confirmation.body.push_str("\n\nReason, visible to the room: ");
@@ -458,6 +606,7 @@ pub(crate) fn pending_text(intent: &Intent) -> String {
         AdminAction::Ban => "Banning",
         AdminAction::Unban => "Unbanning",
         AdminAction::SetPowerLevel(_) => "Changing the level of",
+        AdminAction::SetPermission(..) => "Changing",
     };
     format!("{verb} {}… Waiting for the homeserver.", intent.name)
 }
@@ -479,6 +628,10 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: &AdminOutcome) -> String {
     let Some(seen) = outcome.observed else {
         return format!("The homeserver accepted the change for {name}. {UNREAD}");
     };
+    if let (AdminAction::SetPermission(..), false) = (intent.action, outcome.confirmed) {
+        let seen = power_text(seen.power);
+        return format!("The homeserver accepted the change, but {name} now needs {seen}.");
+    }
     if !outcome.confirmed {
         let seen = observed_text(seen);
         return format!("The homeserver accepted the change but reports {name} as {seen}.");
@@ -493,10 +646,19 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: &AdminOutcome) -> String {
         AdminAction::SetPowerLevel(level) => {
             format!("{name} now has level {level}. The homeserver confirmed it.")
         }
+        AdminAction::SetPermission(PermissionKey::UsersDefault, level) => {
+            format!("Members now start at level {level}. The homeserver confirmed it.")
+        }
+        AdminAction::SetPermission(_, level) => {
+            format!("{name} now needs level {level}. The homeserver confirmed it.")
+        }
     }
 }
 
 pub(crate) fn permission_text(action: AdminAction, snapshot: &RoomAdminSnapshot) -> String {
+    if let AdminAction::SetPermission(key, _) = action {
+        return permission_restriction(key, snapshot);
+    }
     let own = power_text(snapshot.own_power);
     let Some(levels) = snapshot.thresholds else {
         return UNKNOWN_RULES.to_owned();
@@ -506,7 +668,9 @@ pub(crate) fn permission_text(action: AdminAction, snapshot: &RoomAdminSnapshot)
         AdminAction::Kick => ("Kicking", levels.kick),
         AdminAction::Ban => ("Banning", levels.ban),
         AdminAction::Unban => ("Unbanning", levels.ban.max(levels.kick)),
-        AdminAction::SetPowerLevel(_) => ("Changing levels", levels.change_power_levels),
+        AdminAction::SetPowerLevel(_) | AdminAction::SetPermission(..) => {
+            ("Changing levels", levels.change_power_levels)
+        }
     };
     if action == AdminAction::Invite || snapshot.own_power < MemberPower::Level(needed) {
         format!("{verb} needs level {needed}; you have {own}. {ASK_HIGHER}")
@@ -561,6 +725,23 @@ pub(crate) fn error_text(
     snapshot: Option<&RoomAdminSnapshot>,
 ) -> String {
     let name = &intent.name;
+    if let AdminAction::SetPermission(key, _) = intent.action {
+        match (error, snapshot) {
+            (RoomAdminError::TargetChanged, _) => {
+                return format!("{name} changed on the server. Review it again.");
+            }
+            (RoomAdminError::NotApplicable, _) => {
+                return format!("{name} already needs that level.");
+            }
+            (RoomAdminError::InsufficientPower, Some(snapshot)) => {
+                return permission_restriction(key, snapshot);
+            }
+            (RoomAdminError::Forbidden, _) => {
+                return format!("The homeserver refused this change. {REFUSED_PERMISSION}");
+            }
+            _ => {}
+        }
+    }
     let fixed = match error {
         RoomAdminError::Cancelled | RoomAdminError::AccountChanged => CLOSED,
         RoomAdminError::NotJoined => "Join this room to manage its members.",
@@ -651,6 +832,7 @@ mod tests {
                 redact: 50,
                 change_power_levels: 50,
             }),
+            permissions: Vec::new(),
             room_version: "11".to_owned(),
         }
     }
@@ -703,8 +885,9 @@ mod tests {
 
     #[test]
     fn destructive_moderation_and_role_changes_require_deliberate_confirmation() {
-        let own = MemberPower::Level(100);
-        let review = |intent: &Intent| confirmation(intent, own, false);
+        let jules = member("@jules:example.org", None, AdminMembership::Join);
+        let snapshot = roster(vec![jules.clone()], 100);
+        let review = |intent: &Intent| confirmation(intent, &snapshot);
         assert!(review(&intent(AdminAction::Invite, 0, false)).is_none());
         assert!(review(&intent(AdminAction::Invite, 0, true)).is_none());
         for action in [AdminAction::Kick, AdminAction::Ban] {
@@ -720,8 +903,11 @@ mod tests {
         assert!(!routine.destructive);
         let peer = review(&intent(AdminAction::SetPowerLevel(100), 0, false)).unwrap();
         assert!(peer.destructive, "cannot be lowered again");
+        let mut me = jules;
+        me.is_self = true;
+        let own_snapshot = roster(vec![me], 100);
         let own_demotion = intent(AdminAction::SetPowerLevel(0), 100, false);
-        let own_demotion = confirmation(&own_demotion, own, true).unwrap();
+        let own_demotion = confirmation(&own_demotion, &own_snapshot).unwrap();
         assert!(own_demotion.destructive && own_demotion.body.contains("yourself"));
         let mut reasoned = intent(AdminAction::Ban, 0, false);
         reasoned.reason = Some("spam".to_owned());
@@ -800,6 +986,61 @@ mod tests {
         banned.membership = AdminMembership::Ban;
         assert!(!reviewed.still_matches(&roster(vec![banned], 50)));
         assert!(!reviewed.still_matches(&roster(Vec::new(), 50)));
+    }
+
+    fn with_permissions(mut snapshot: RoomAdminSnapshot, editable: bool) -> RoomAdminSnapshot {
+        snapshot.permissions = PERMISSION_KEYS
+            .iter()
+            .map(|&key| PermissionSetting {
+                key,
+                level: match key {
+                    PermissionKey::UsersDefault => 0,
+                    _ => 50,
+                },
+                editable,
+            })
+            .collect();
+        snapshot
+    }
+    fn index(key: PermissionKey) -> i32 {
+        let position = PERMISSION_KEYS.iter().position(|item| *item == key);
+        i32::try_from(position.unwrap()).unwrap()
+    }
+
+    #[test]
+    fn permission_changes_stay_within_the_operators_level_and_capture_the_reviewed_value() {
+        let snapshot = with_permissions(roster(Vec::new(), 50), true);
+        let kick = index(PermissionKey::Kick);
+        let lowered = permission_intent(kick, " 0 ", &snapshot).unwrap();
+        let expected = AdminAction::SetPermission(PermissionKey::Kick, 0);
+        assert_eq!(lowered.action, expected);
+        assert_eq!(lowered.expected.power, Some(MemberPower::Level(50)));
+        assert!(lowered.still_matches(&snapshot));
+        for refused in ["60", "50", "many"] {
+            assert!(permission_intent(kick, refused, &snapshot).is_err());
+        }
+        assert!(permission_intent(-1, "0", &snapshot).is_err());
+        assert!(permission_intent(12, "0", &snapshot).is_err());
+        let locked = with_permissions(roster(Vec::new(), 50), false);
+        assert!(permission_intent(kick, "0", &locked).is_err());
+        let mut moved = snapshot.clone();
+        moved.permissions[3].level = 40;
+        assert!(!lowered.still_matches(&moved));
+    }
+
+    #[test]
+    fn widening_moderation_and_raising_the_default_are_destructive() {
+        let mut me = member("@me:example.org", None, AdminMembership::Join);
+        me.is_self = true;
+        let snapshot = with_permissions(roster(vec![me], 100), true);
+        let change = |key, level| permission_intent(index(key), level, &snapshot).unwrap();
+        let review = |intent: &Intent| confirmation(intent, &snapshot).unwrap();
+        assert!(review(&change(PermissionKey::Ban, "0")).destructive);
+        assert!(!review(&change(PermissionKey::Ban, "100")).destructive);
+        assert!(!review(&change(PermissionKey::EventsDefault, "0")).destructive);
+        assert!(review(&change(PermissionKey::UsersDefault, "10")).destructive);
+        let lowered = review(&change(PermissionKey::UsersDefault, "-5"));
+        assert!(lowered.destructive && lowered.body.contains(OWN_DEFAULT));
     }
 
     #[test]

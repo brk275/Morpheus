@@ -14,13 +14,14 @@ use std::{
 
 use morpheus_matrix::{
     AccountSelection, AdminAction, AdminMember, AdminMembership, AdminOutcome, MemberPower,
-    RoomAdminError, RoomAdminSession, RoomAdminSnapshot, RoomSettingsCancellation, RosterWatch,
+    PERMISSION_KEYS, PermissionKey, PermissionSetting, RoomAdminError, RoomAdminSession,
+    RoomAdminSnapshot, RoomSettingsCancellation, RosterWatch,
 };
 use slint::{ComponentHandle, ModelRc, VecModel};
 use tokio::{runtime::Handle, sync::Notify};
 
 use super::{Filter, Intent};
-use crate::{AppWindow, RosterMember, live::LiveUi};
+use crate::{AppWindow, RosterMember, RosterPermission, live::LiveUi};
 
 // Sync delivers bursts of member events; one read follows each quiet period.
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(1500);
@@ -178,6 +179,13 @@ impl RoomAdminUi {
         ui.on_roster_request(move |kind| {
             if let Some(ui) = weak.upgrade() {
                 this.request(&ui, kind);
+            }
+        });
+        let this = owner.clone();
+        let weak = ui.as_weak();
+        ui.on_roster_request_permission(move |index, level| {
+            if let Some(ui) = weak.upgrade() {
+                this.request_permission(&ui, index, level.as_str());
             }
         });
         let this = owner.clone();
@@ -512,7 +520,17 @@ impl RoomAdminUi {
         let level = ui.get_roster_level_input();
         let reason = ui.get_roster_reason_input();
         match super::member_intent(kind, member, &level, &reason, &snapshot) {
-            Ok(intent) => self.review(ui, panel, intent, member.is_self, &snapshot),
+            Ok(intent) => self.review(ui, panel, intent, &snapshot),
+            Err(message) => self.reject(ui, &panel, message),
+        }
+    }
+
+    fn request_permission(self: &Arc<Self>, ui: &AppWindow, index: i32, level: &str) {
+        let Some((panel, snapshot)) = self.idle_snapshot(ui) else {
+            return;
+        };
+        match super::permission_intent(index, level, &snapshot) {
+            Ok(intent) => self.review(ui, panel, intent, &snapshot),
             Err(message) => self.reject(ui, &panel, message),
         }
     }
@@ -522,7 +540,7 @@ impl RoomAdminUi {
             return;
         };
         match super::invite_intent(ui.get_roster_invite_input().as_str(), &snapshot) {
-            Ok(intent) => self.review(ui, panel, intent, false, &snapshot),
+            Ok(intent) => self.review(ui, panel, intent, &snapshot),
             Err(message) => self.reject(ui, &panel, message),
         }
     }
@@ -536,16 +554,16 @@ impl RoomAdminUi {
         self.repaint_panel(ui, panel);
     }
 
-    /// Destructive and role changes wait for a deliberate confirmation.
+    /// Destructive, role and permission changes wait for a deliberate
+    /// confirmation.
     fn review(
         self: &Arc<Self>,
         ui: &AppWindow,
         panel: Arc<Panel>,
         intent: Intent,
-        is_self: bool,
         snapshot: &RoomAdminSnapshot,
     ) {
-        if super::confirmation(&intent, snapshot.own_power, is_self).is_none() {
+        if super::confirmation(&intent, snapshot).is_none() {
             self.dispatch(ui, panel, intent);
             return;
         }
@@ -669,6 +687,9 @@ fn reconcile_confirmation(state: &mut PanelState, snapshot: &RoomAdminSnapshot) 
 }
 
 fn reset_inputs(ui: &AppWindow, intent: &Intent, confirmed: bool) {
+    if matches!(intent.action, AdminAction::SetPermission(..)) {
+        return;
+    }
     if intent.action == AdminAction::Invite
         && ui.get_roster_invite_input().trim() == intent.user_id
     {
@@ -698,6 +719,13 @@ fn render(ui: &AppWindow, view: &View) {
     ui.set_roster_loaded(true);
     render_confirmation(ui, view.confirm.as_ref(), snapshot);
     let pending_user = view.pending.as_ref().map(|intent| intent.user_id.as_str());
+    let pending_key = pending_permission(view.pending.as_ref());
+    let permissions = snapshot
+        .permissions
+        .iter()
+        .map(|setting| permission_row(*setting, snapshot, pending_key))
+        .collect::<Vec<_>>();
+    ui.set_roster_permissions(ModelRc::new(VecModel::from(permissions)));
     let query = ui.get_roster_query();
     let filter = Filter::from_index(ui.get_roster_filter());
     let (rows, total) = super::visible(snapshot, query.as_str(), filter);
@@ -734,10 +762,7 @@ fn render_confirmation(ui: &AppWindow, intent: Option<&Intent>, snapshot: &RoomA
         ui.set_roster_confirm_open(false);
         return;
     };
-    let is_self = snapshot
-        .member(&intent.user_id)
-        .is_some_and(|member| member.is_self);
-    let Some(confirmation) = super::confirmation(intent, snapshot.own_power, is_self) else {
+    let Some(confirmation) = super::confirmation(intent, snapshot) else {
         ui.set_roster_confirm_open(false);
         return;
     };
@@ -780,6 +805,38 @@ fn roster_row(
     }
 }
 
+fn permission_row(
+    setting: PermissionSetting,
+    snapshot: &RoomAdminSnapshot,
+    pending: Option<PermissionKey>,
+) -> RosterPermission {
+    let index = PERMISSION_KEYS.iter().position(|key| *key == setting.key);
+    let key = index.and_then(|index| i32::try_from(index).ok());
+    let restriction = if setting.editable {
+        String::new()
+    } else {
+        super::permission_restriction(setting.key, snapshot)
+    };
+    let thresholds = snapshot.thresholds.as_ref();
+    RosterPermission {
+        key: key.unwrap_or(-1),
+        label: super::permission_label(setting.key).into(),
+        description: super::permission_description(setting.key).into(),
+        level: setting.level.to_string().into(),
+        summary: super::permission_summary(setting, thresholds).into(),
+        editable: setting.editable,
+        restriction: restriction.into(),
+        pending: pending == Some(setting.key),
+    }
+}
+
+fn pending_permission(pending: Option<&Intent>) -> Option<PermissionKey> {
+    match pending?.action {
+        AdminAction::SetPermission(key, _) => Some(key),
+        _ => None,
+    }
+}
+
 fn level_input(power: MemberPower) -> String {
     match power {
         MemberPower::Creator => String::new(),
@@ -812,6 +869,7 @@ fn clear_selection(ui: &AppWindow) {
 pub(crate) fn clear_presentation(ui: &AppWindow) {
     ui.set_roster_panel_id("".into());
     ui.set_roster_members(ModelRc::new(VecModel::<RosterMember>::default()));
+    ui.set_roster_permissions(ModelRc::new(VecModel::<RosterPermission>::default()));
     ui.set_roster_summary("".into());
     ui.set_roster_shown_text("".into());
     ui.set_roster_own_role("".into());

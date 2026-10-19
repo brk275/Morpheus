@@ -48,8 +48,9 @@ mod room_admin;
 pub use room_admin::{
     AdminAction, AdminMember, AdminMembership, AdminOutcome, AdminRequest, MAX_ADMIN_REASON_BYTES,
     MAX_ROSTER_MEMBERS, MemberActions, MemberExpectation, MemberPower, MembershipCounts,
-    ObservedMembership, ObservedTarget, OwnAdminPermissions, PowerThresholds, RoomAdminError,
-    RoomAdminSession, RoomAdminSnapshot, RosterWatch,
+    ObservedMembership, ObservedTarget, OwnAdminPermissions, PERMISSION_KEYS, PermissionKey,
+    PermissionSetting, PowerThresholds, RoomAdminError, RoomAdminSession, RoomAdminSnapshot,
+    RosterWatch,
 };
 mod room_settings;
 pub use room_settings::{

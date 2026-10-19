@@ -26,6 +26,21 @@ export struct RosterMember {
     pending: bool,
 }
 
+// One room-wide permission threshold. `key` indexes the controller's fixed
+// permission list and only routes a request; text is produced in Rust.
+export struct RosterPermission {
+    key: int,
+    label: string,
+    description: string,
+    // The exact required level.
+    level: string,
+    summary: string,
+    editable: bool,
+    // Why the selected account cannot change it, when it cannot.
+    restriction: string,
+    pending: bool,
+}
+
 // The window's resolved theme roles for room administration. Optional
 // StyleTokens roles are resolved by the window before they reach this file,
 // so customization and themes apply here exactly as in the root view.
@@ -218,6 +233,7 @@ export component RoomMembersPanel inherits VerticalLayout {
     in property <string> selected-restriction;
     in-out property <string> level-input;
     in-out property <string> reason-input;
+    in property <[RosterPermission]> permissions;
     callback scope-changed();
     callback search-edited(string);
     callback choose-filter(int);
@@ -226,10 +242,17 @@ export component RoomMembersPanel inherits VerticalLayout {
     callback invite();
     // 1 kick, 2 ban, 3 unban, 4 set level, 5 approve request, 6 deny request
     callback request(int);
+    // A permission's key and the requested level text.
+    callback request-permission(int, string);
     callback open-settings();
 
     property <length> row-height: max(50px, 32px * root.text-scale + 18px);
     property <bool> ready: root.available && root.loaded;
+    // 0 members, 1 permissions.
+    property <int> view: 0;
+    property <int> permission-index: -1;
+    property <string> permission-input;
+    property <RosterPermission> chosen: root.permissions[root.permission-index];
 
     init => { root.scope-changed(); }
     changed scope-key => { root.scope-changed(); }
@@ -274,62 +297,30 @@ export component RoomMembersPanel inherits VerticalLayout {
             Text { text: "↻"; color: root.palette.muted; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; }
         }
     }
+    HorizontalLayout {
+        padding-left: 10px; padding-right: 10px; padding-bottom: 6px; spacing: 3px;
+        height: max(34px, 22px * root.text-scale + 12px);
+        for tab[index] in ["Members", "Permissions"] : RosterAction {
+            horizontal-stretch: 1;
+            border-radius: 7px;
+            background: root.view == index ? root.palette.selection : self.has-hover ? root.palette.hover : transparent;
+            focus-color: root.palette.focus;
+            enabled: root.available;
+            accessible-role: tab;
+            accessible-checkable: true;
+            accessible-checked: root.view == index;
+            label: index == 0 ? "Show room members" : "Show room permissions";
+            activated => { root.view = index; }
+            Text {
+                text: tab;
+                color: root.view == index ? root.palette.selection-ink : root.palette.muted;
+                font-size: 11px * root.text-scale; font-weight: 700;
+                horizontal-alignment: center; vertical-alignment: center;
+            }
+        }
+    }
     VerticalLayout {
-        padding-left: 10px; padding-right: 10px; padding-bottom: 6px; spacing: 6px;
-        RosterField {
-            palette: root.palette;
-            text-scale: root.text-scale;
-            placeholder: "Search members by name or Matrix ID";
-            label: "Search room members by name or Matrix ID";
-            enabled: root.ready;
-            text <=> root.query;
-            edited(text) => { root.search-edited(text); }
-        }
-        HorizontalLayout {
-            spacing: 3px;
-            height: max(26px, 18px * root.text-scale + 8px);
-            for chip[index] in ["All", "Joined", "Invited", "Requests", "Banned"] : RosterAction {
-                horizontal-stretch: 1;
-                border-radius: 6px;
-                border-width: 1px;
-                border-color: root.filter == index ? root.palette.accent : root.palette.divider;
-                background: root.filter == index ? root.palette.selection : self.has-hover ? root.palette.hover : transparent;
-                focus-color: root.palette.focus;
-                enabled: root.ready;
-                accessible-role: tab;
-                accessible-checkable: true;
-                accessible-checked: root.filter == index;
-                label: index == 3 ? "Show requests to join" : "Show " + chip + " members";
-                activated => { if root.filter != index { root.choose-filter(index); } }
-                Text {
-                    text: chip;
-                    color: root.filter == index ? root.palette.selection-ink : root.palette.muted;
-                    font-size: 10px * root.text-scale; font-weight: 650;
-                    horizontal-alignment: center; vertical-alignment: center; overflow: elide;
-                }
-            }
-        }
-        if root.ready && root.can-invite : HorizontalLayout {
-            spacing: 6px;
-            RosterField {
-                horizontal-stretch: 1;
-                palette: root.palette;
-                text-scale: root.text-scale;
-                placeholder: "Invite @name:example.org";
-                label: "Matrix user ID to invite to this room";
-                enabled: !root.busy;
-                text <=> root.invite-input;
-                accepted => { if !root.busy && root.invite-input != "" { root.invite(); } }
-            }
-            RosterButton {
-                palette: root.palette;
-                text-scale: root.text-scale;
-                text: "Invite";
-                label: "Invite this Matrix user to the room";
-                enabled: !root.busy && root.invite-input != "";
-                activated => { root.invite(); }
-            }
-        }
+        padding-left: 10px; padding-right: 10px; spacing: 6px;
         if root.available && root.loading : Text {
             text: root.loaded ? "Refreshing members…" : "Loading members…";
             color: root.palette.muted; font-size: 11px * root.text-scale;
@@ -351,104 +342,328 @@ export component RoomMembersPanel inherits VerticalLayout {
             accessible-live-region: polite;
         }
     }
-    if root.ready && root.members.length == 0 : Text {
-        height: 44px;
-        text: root.query != "" ? "No members match this search" : "No members in this list";
-        color: root.palette.muted; font-size: 11px * root.text-scale;
-        horizontal-alignment: center; vertical-alignment: center;
-    }
-    rows := ListView {
+    if root.view == 0 : VerticalLayout {
         vertical-stretch: 1;
-        horizontal-scrollbar-policy: always-off;
-        for member in root.members : RosterAction {
-            width: rows.visible-width;
-            height: root.row-height;
-            focus-color: root.palette.focus;
-            background: member.key == root.selected-key ? root.palette.selection : self.has-hover ? root.palette.hover : transparent;
-            accessible-role: list-item;
-            accessible-label: member.name + ", " + member.user-id + ", " + member.detail + (member.pending ? ", change pending" : "");
-            accessible-item-selectable: true;
-            accessible-item-selected: member.key == root.selected-key;
-            label: member.name;
-            activated => { root.select(member.key); }
+        spacing: 0px;
+        VerticalLayout {
+            padding-left: 10px; padding-right: 10px; padding-top: 6px; padding-bottom: 6px; spacing: 6px;
+            RosterField {
+                palette: root.palette;
+                text-scale: root.text-scale;
+                placeholder: "Search members by name or Matrix ID";
+                label: "Search room members by name or Matrix ID";
+                enabled: root.ready;
+                text <=> root.query;
+                edited(text) => { root.search-edited(text); }
+            }
             HorizontalLayout {
-                padding-left: 12px; padding-right: 10px; spacing: 9px;
-                VerticalLayout {
-                    alignment: center; width: 30px;
-                    Rectangle {
-                        width: 30px; height: 30px; border-radius: 10px;
-                        background: member.accent;
+                spacing: 3px;
+                height: max(26px, 18px * root.text-scale + 8px);
+                for chip[index] in ["All", "Joined", "Invited", "Requests", "Banned"] : RosterAction {
+                    horizontal-stretch: 1;
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: root.filter == index ? root.palette.accent : root.palette.divider;
+                    background: root.filter == index ? root.palette.selection : self.has-hover ? root.palette.hover : transparent;
+                    focus-color: root.palette.focus;
+                    enabled: root.ready;
+                    accessible-role: tab;
+                    accessible-checkable: true;
+                    accessible-checked: root.filter == index;
+                    label: index == 3 ? "Show requests to join" : "Show " + chip + " members";
+                    activated => { if root.filter != index { root.choose-filter(index); } }
+                    Text {
+                        text: chip;
+                        color: root.filter == index ? root.palette.selection-ink : root.palette.muted;
+                        font-size: 10px * root.text-scale; font-weight: 650;
+                        horizontal-alignment: center; vertical-alignment: center; overflow: elide;
+                    }
+                }
+            }
+            if root.ready && root.can-invite : HorizontalLayout {
+                spacing: 6px;
+                RosterField {
+                    horizontal-stretch: 1;
+                    palette: root.palette;
+                    text-scale: root.text-scale;
+                    placeholder: "Invite @name:example.org";
+                    label: "Matrix user ID to invite to this room";
+                    enabled: !root.busy;
+                    text <=> root.invite-input;
+                    accepted => { if !root.busy && root.invite-input != "" { root.invite(); } }
+                }
+                RosterButton {
+                    palette: root.palette;
+                    text-scale: root.text-scale;
+                    text: "Invite";
+                    label: "Invite this Matrix user to the room";
+                    enabled: !root.busy && root.invite-input != "";
+                    activated => { root.invite(); }
+                }
+            }
+        }
+        if root.ready && root.members.length == 0 : Text {
+            height: 44px;
+            text: root.query != "" ? "No members match this search" : "No members in this list";
+            color: root.palette.muted; font-size: 11px * root.text-scale;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
+        rows := ListView {
+            vertical-stretch: 1;
+            horizontal-scrollbar-policy: always-off;
+            for member in root.members : RosterAction {
+                width: rows.visible-width;
+                height: root.row-height;
+                focus-color: root.palette.focus;
+                background: member.key == root.selected-key ? root.palette.selection : self.has-hover ? root.palette.hover : transparent;
+                accessible-role: list-item;
+                accessible-label: member.name + ", " + member.user-id + ", " + member.detail + (member.pending ? ", change pending" : "");
+                accessible-item-selectable: true;
+                accessible-item-selected: member.key == root.selected-key;
+                label: member.name;
+                activated => { root.select(member.key); }
+                HorizontalLayout {
+                    padding-left: 12px; padding-right: 10px; spacing: 9px;
+                    VerticalLayout {
+                        alignment: center; width: 30px;
+                        Rectangle {
+                            width: 30px; height: 30px; border-radius: 10px;
+                            background: member.accent;
+                            Text {
+                                text: member.initials; color: root.palette.avatar-ink;
+                                font-size: 11px; font-weight: 700;
+                                horizontal-alignment: center; vertical-alignment: center;
+                            }
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center; horizontal-stretch: 1; spacing: 1px;
                         Text {
-                            text: member.initials; color: root.palette.avatar-ink;
-                            font-size: 11px; font-weight: 700;
-                            horizontal-alignment: center; vertical-alignment: center;
+                            text: member.is-self ? member.name + " (you)" : member.name;
+                            color: member.key == root.selected-key ? root.palette.selection-ink : root.palette.ink;
+                            font-size: 12px * root.text-scale; font-weight: 700; overflow: elide;
+                        }
+                        Text {
+                            text: member.detail;
+                            color: member.membership == 3 ? root.palette.destructive : root.palette.muted;
+                            font-size: 10px * root.text-scale; overflow: elide;
+                        }
+                    }
+                    if member.pending : Text {
+                        text: "Pending"; color: root.palette.accent;
+                        font-size: 10px * root.text-scale; vertical-alignment: center;
+                    }
+                }
+            }
+        }
+        if root.shown-text != "" : Text {
+            text: root.shown-text;
+            color: root.palette.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
+            horizontal-alignment: center;
+        }
+        if root.available && root.selected-key != "" : Rectangle {
+            background: root.palette.elevated;
+            border-color: root.palette.divider;
+            border-width: 1px;
+            accessible-role: groupbox;
+            accessible-label: "Manage " + root.selected.name;
+            VerticalLayout {
+                padding: 10px; spacing: 6px;
+                HorizontalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: root.selected.is-self ? root.selected.name + " (you)" : root.selected.name;
+                        color: root.palette.ink; font-size: 12px * root.text-scale; font-weight: 700;
+                        horizontal-stretch: 1; overflow: elide; vertical-alignment: center;
+                    }
+                    RosterAction {
+                        width: 26px; height: 26px; border-radius: 6px;
+                        background: self.has-hover ? root.palette.hover : transparent;
+                        focus-color: root.palette.focus;
+                        label: "Close member details";
+                        activated => { root.select(""); }
+                        Text { text: "×"; color: root.palette.muted; font-size: 14px; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+                Text { text: root.selected.user-id; color: root.palette.muted; font-size: 10px * root.text-scale; overflow: elide; }
+                Text { text: root.selected-status; color: root.palette.ink; font-size: 11px * root.text-scale; wrap: word-wrap; }
+                if root.selected-restriction != "" : Text {
+                    text: root.selected-restriction;
+                    color: root.palette.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
+                }
+                if root.selected.can-change-level : VerticalLayout {
+                    spacing: 4px;
+                    Text { text: "POWER LEVEL"; color: root.palette.muted; font-size: 9px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
+                    HorizontalLayout {
+                        spacing: 4px;
+                        for preset in [
+                            { name: "Member", level: root.member-level },
+                            { name: "Moderator", level: 50 },
+                            { name: "Admin", level: 100 },
+                        ] : RosterButton {
+                            horizontal-stretch: 1;
+                            palette: root.palette;
+                            text-scale: root.text-scale;
+                            text: preset.name;
+                            label: "Use the " + preset.name + " level, " + preset.level;
+                            enabled: !root.busy && preset.level <= root.own-level;
+                            activated => { root.level-input = "" + preset.level; }
+                        }
+                    }
+                    HorizontalLayout {
+                        spacing: 5px;
+                        RosterField {
+                            horizontal-stretch: 1;
+                            palette: root.palette;
+                            text-scale: root.text-scale;
+                            placeholder: "Level";
+                            label: "New power level for " + root.selected.name;
+                            enabled: !root.busy;
+                            text <=> root.level-input;
+                            accepted => { if !root.busy { root.request(4); } }
+                        }
+                        RosterButton {
+                            palette: root.palette;
+                            text-scale: root.text-scale;
+                            text: "Apply…";
+                            label: "Review the power level change for " + root.selected.name;
+                            enabled: !root.busy && root.level-input != "" && root.level-input != root.selected.level;
+                            activated => { root.request(4); }
                         }
                     }
                 }
-                VerticalLayout {
-                    alignment: center; horizontal-stretch: 1; spacing: 1px;
-                    Text {
-                        text: member.is-self ? member.name + " (you)" : member.name;
-                        color: member.key == root.selected-key ? root.palette.selection-ink : root.palette.ink;
-                        font-size: 12px * root.text-scale; font-weight: 700; overflow: elide;
-                    }
-                    Text {
-                        text: member.detail;
-                        color: member.membership == 3 ? root.palette.destructive : root.palette.muted;
-                        font-size: 10px * root.text-scale; overflow: elide;
-                    }
+                if root.selected.can-kick || root.selected.can-ban || root.selected.can-unban : RosterField {
+                    palette: root.palette;
+                    text-scale: root.text-scale;
+                    placeholder: "Reason (optional, visible to the room)";
+                    label: "Optional reason, visible to everyone in the room";
+                    enabled: !root.busy;
+                    text <=> root.reason-input;
                 }
-                if member.pending : Text {
-                    text: "Pending"; color: root.palette.accent;
-                    font-size: 10px * root.text-scale; vertical-alignment: center;
+                HorizontalLayout {
+                    spacing: 5px; alignment: start;
+                    if root.selected.can-approve : RosterButton {
+                        palette: root.palette; text-scale: root.text-scale;
+                        text: "Approve"; primary: true;
+                        label: "Approve the request of " + root.selected.name + " to join";
+                        enabled: !root.busy;
+                        activated => { root.request(5); }
+                    }
+                    if root.selected.membership == 2 && root.selected.can-kick : RosterButton {
+                        palette: root.palette; text-scale: root.text-scale;
+                        text: "Deny…"; destructive: true;
+                        label: "Review denying the request of " + root.selected.name;
+                        enabled: !root.busy;
+                        activated => { root.request(6); }
+                    }
+                    if root.selected.membership != 2 && root.selected.can-kick : RosterButton {
+                        palette: root.palette; text-scale: root.text-scale;
+                        text: "Kick…"; destructive: true;
+                        label: "Review kicking " + root.selected.name + " from the room";
+                        enabled: !root.busy;
+                        activated => { root.request(1); }
+                    }
+                    if root.selected.can-ban : RosterButton {
+                        palette: root.palette; text-scale: root.text-scale;
+                        text: "Ban…"; destructive: true;
+                        label: "Review banning " + root.selected.name;
+                        enabled: !root.busy;
+                        activated => { root.request(2); }
+                    }
+                    if root.selected.can-unban : RosterButton {
+                        palette: root.palette; text-scale: root.text-scale;
+                        text: "Unban…";
+                        label: "Review unbanning " + root.selected.name;
+                        enabled: !root.busy;
+                        activated => { root.request(3); }
+                    }
                 }
             }
         }
     }
-    if root.shown-text != "" : Text {
-        text: root.shown-text;
-        color: root.palette.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
-        horizontal-alignment: center;
-    }
-    if root.available && root.selected-key != "" : Rectangle {
-        background: root.palette.elevated;
-        border-color: root.palette.divider;
-        border-width: 1px;
-        accessible-role: groupbox;
-        accessible-label: "Manage " + root.selected.name;
-        VerticalLayout {
-            padding: 10px; spacing: 6px;
-            HorizontalLayout {
-                spacing: 6px;
-                Text {
-                    text: root.selected.is-self ? root.selected.name + " (you)" : root.selected.name;
-                    color: root.palette.ink; font-size: 12px * root.text-scale; font-weight: 700;
-                    horizontal-stretch: 1; overflow: elide; vertical-alignment: center;
+    if root.view == 1 : VerticalLayout {
+        vertical-stretch: 1;
+        spacing: 0px;
+        if root.ready && root.permissions.length == 0 : Text {
+            height: 44px;
+            text: "Morpheus cannot read this room's permission rules.";
+            color: root.palette.muted; font-size: 11px * root.text-scale;
+            horizontal-alignment: center; vertical-alignment: center; wrap: word-wrap;
+        }
+        permission-rows := ListView {
+            vertical-stretch: 1;
+            horizontal-scrollbar-policy: always-off;
+            for permission[index] in root.permissions : RosterAction {
+                width: permission-rows.visible-width;
+                height: root.row-height;
+                focus-color: root.palette.focus;
+                background: index == root.permission-index ? root.palette.selection : self.has-hover ? root.palette.hover : transparent;
+                accessible-role: list-item;
+                accessible-label: permission.label + ", " + permission.summary + (permission.pending ? ", change pending" : "");
+                accessible-item-selectable: true;
+                accessible-item-selected: index == root.permission-index;
+                label: permission.label;
+                activated => {
+                    root.permission-index = index;
+                    root.permission-input = permission.level;
                 }
-                RosterAction {
-                    width: 26px; height: 26px; border-radius: 6px;
-                    background: self.has-hover ? root.palette.hover : transparent;
-                    focus-color: root.palette.focus;
-                    label: "Close member details";
-                    activated => { root.select(""); }
-                    Text { text: "×"; color: root.palette.muted; font-size: 14px; horizontal-alignment: center; vertical-alignment: center; }
-                }
-            }
-            Text { text: root.selected.user-id; color: root.palette.muted; font-size: 10px * root.text-scale; overflow: elide; }
-            Text { text: root.selected-status; color: root.palette.ink; font-size: 11px * root.text-scale; wrap: word-wrap; }
-            if root.selected-restriction != "" : Text {
-                text: root.selected-restriction;
-                color: root.palette.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
-            }
-            if root.selected.can-change-level : VerticalLayout {
-                spacing: 4px;
-                Text { text: "POWER LEVEL"; color: root.palette.muted; font-size: 9px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
                 HorizontalLayout {
+                    padding-left: 12px; padding-right: 10px; spacing: 8px;
+                    VerticalLayout {
+                        alignment: center; horizontal-stretch: 1; spacing: 1px;
+                        Text {
+                            text: permission.label;
+                            color: index == root.permission-index ? root.palette.selection-ink : root.palette.ink;
+                            font-size: 12px * root.text-scale; font-weight: 700; overflow: elide;
+                        }
+                        Text {
+                            text: permission.summary;
+                            color: root.palette.muted; font-size: 10px * root.text-scale; overflow: elide;
+                        }
+                    }
+                    if permission.pending : Text {
+                        text: "Pending"; color: root.palette.accent;
+                        font-size: 10px * root.text-scale; vertical-alignment: center;
+                    }
+                }
+            }
+        }
+        if root.available && root.permission-index >= 0 && root.chosen.key >= 0 : Rectangle {
+            background: root.palette.elevated;
+            border-color: root.palette.divider;
+            border-width: 1px;
+            accessible-role: groupbox;
+            accessible-label: "Change " + root.chosen.label;
+            VerticalLayout {
+                padding: 10px; spacing: 6px;
+                HorizontalLayout {
+                    spacing: 6px;
+                    Text {
+                        text: root.chosen.label;
+                        color: root.palette.ink; font-size: 12px * root.text-scale; font-weight: 700;
+                        horizontal-stretch: 1; overflow: elide; vertical-alignment: center;
+                    }
+                    RosterAction {
+                        width: 26px; height: 26px; border-radius: 6px;
+                        background: self.has-hover ? root.palette.hover : transparent;
+                        focus-color: root.palette.focus;
+                        label: "Close permission details";
+                        activated => { root.permission-index = -1; }
+                        Text { text: "×"; color: root.palette.muted; font-size: 14px; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+                Text { text: root.chosen.description; color: root.palette.muted; font-size: 10px * root.text-scale; wrap: word-wrap; }
+                Text { text: root.chosen.summary; color: root.palette.ink; font-size: 11px * root.text-scale; wrap: word-wrap; }
+                if !root.chosen.editable : Text {
+                    text: root.chosen.restriction;
+                    color: root.palette.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
+                }
+                if root.chosen.editable : HorizontalLayout {
                     spacing: 4px;
                     for preset in [
-                        { name: "Member", level: root.member-level },
-                        { name: "Moderator", level: 50 },
-                        { name: "Admin", level: 100 },
+                        { name: "Everyone", level: root.member-level },
+                        { name: "Moderators", level: 50 },
+                        { name: "Admins", level: 100 },
                     ] : RosterButton {
                         horizontal-stretch: 1;
                         palette: root.palette;
@@ -456,75 +671,29 @@ export component RoomMembersPanel inherits VerticalLayout {
                         text: preset.name;
                         label: "Use the " + preset.name + " level, " + preset.level;
                         enabled: !root.busy && preset.level <= root.own-level;
-                        activated => { root.level-input = "" + preset.level; }
+                        activated => { root.permission-input = "" + preset.level; }
                     }
                 }
-                HorizontalLayout {
+                if root.chosen.editable : HorizontalLayout {
                     spacing: 5px;
                     RosterField {
                         horizontal-stretch: 1;
                         palette: root.palette;
                         text-scale: root.text-scale;
                         placeholder: "Level";
-                        label: "New power level for " + root.selected.name;
+                        label: "Required level for " + root.chosen.label;
                         enabled: !root.busy;
-                        text <=> root.level-input;
-                        accepted => { if !root.busy { root.request(4); } }
+                        text <=> root.permission-input;
+                        accepted => { if !root.busy { root.request-permission(root.chosen.key, root.permission-input); } }
                     }
                     RosterButton {
                         palette: root.palette;
                         text-scale: root.text-scale;
                         text: "Apply…";
-                        label: "Review the power level change for " + root.selected.name;
-                        enabled: !root.busy && root.level-input != "" && root.level-input != root.selected.level;
-                        activated => { root.request(4); }
+                        label: "Review the change to " + root.chosen.label;
+                        enabled: !root.busy && root.permission-input != "" && root.permission-input != root.chosen.level;
+                        activated => { root.request-permission(root.chosen.key, root.permission-input); }
                     }
-                }
-            }
-            if root.selected.can-kick || root.selected.can-ban || root.selected.can-unban : RosterField {
-                palette: root.palette;
-                text-scale: root.text-scale;
-                placeholder: "Reason (optional, visible to the room)";
-                label: "Optional reason, visible to everyone in the room";
-                enabled: !root.busy;
-                text <=> root.reason-input;
-            }
-            HorizontalLayout {
-                spacing: 5px; alignment: start;
-                if root.selected.can-approve : RosterButton {
-                    palette: root.palette; text-scale: root.text-scale;
-                    text: "Approve"; primary: true;
-                    label: "Approve the request of " + root.selected.name + " to join";
-                    enabled: !root.busy;
-                    activated => { root.request(5); }
-                }
-                if root.selected.membership == 2 && root.selected.can-kick : RosterButton {
-                    palette: root.palette; text-scale: root.text-scale;
-                    text: "Deny…"; destructive: true;
-                    label: "Review denying the request of " + root.selected.name;
-                    enabled: !root.busy;
-                    activated => { root.request(6); }
-                }
-                if root.selected.membership != 2 && root.selected.can-kick : RosterButton {
-                    palette: root.palette; text-scale: root.text-scale;
-                    text: "Kick…"; destructive: true;
-                    label: "Review kicking " + root.selected.name + " from the room";
-                    enabled: !root.busy;
-                    activated => { root.request(1); }
-                }
-                if root.selected.can-ban : RosterButton {
-                    palette: root.palette; text-scale: root.text-scale;
-                    text: "Ban…"; destructive: true;
-                    label: "Review banning " + root.selected.name;
-                    enabled: !root.busy;
-                    activated => { root.request(2); }
-                }
-                if root.selected.can-unban : RosterButton {
-                    palette: root.palette; text-scale: root.text-scale;
-                    text: "Unban…";
-                    label: "Review unbanning " + root.selected.name;
-                    enabled: !root.busy;
-                    activated => { root.request(3); }
                 }
             }
         }

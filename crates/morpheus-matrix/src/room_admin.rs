@@ -186,6 +186,52 @@ pub struct PowerThresholds {
     pub change_power_levels: i64,
 }
 
+/// A room-wide threshold in `m.room.power_levels`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PermissionKey {
+    /// The level of members without a level of their own.
+    UsersDefault,
+    /// Messages and other events without a rule of their own.
+    EventsDefault,
+    Invite,
+    Kick,
+    Ban,
+    /// Removing other members' messages.
+    Redact,
+    RoomName,
+    RoomTopic,
+    RoomAvatar,
+    JoinRules,
+    PowerLevels,
+    /// Notifying everyone with `@room`.
+    RoomNotification,
+}
+
+/// Every threshold the room-administration view shows, in display order.
+pub const PERMISSION_KEYS: [PermissionKey; 12] = [
+    PermissionKey::UsersDefault,
+    PermissionKey::EventsDefault,
+    PermissionKey::Invite,
+    PermissionKey::Kick,
+    PermissionKey::Ban,
+    PermissionKey::Redact,
+    PermissionKey::RoomName,
+    PermissionKey::RoomTopic,
+    PermissionKey::RoomAvatar,
+    PermissionKey::JoinRules,
+    PermissionKey::PowerLevels,
+    PermissionKey::RoomNotification,
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PermissionSetting {
+    pub key: PermissionKey,
+    /// The effective level, including inherited defaults.
+    pub level: i64,
+    /// The selected account may change this threshold under the current rules.
+    pub editable: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MembershipCounts {
     pub joined: usize,
@@ -204,12 +250,17 @@ pub struct RoomAdminSnapshot {
     pub own: OwnAdminPermissions,
     /// `None` for a room version whose rules are unknown; every action is denied.
     pub thresholds: Option<PowerThresholds>,
+    /// In `PERMISSION_KEYS` order; empty when the room's rules are unknown.
+    pub permissions: Vec<PermissionSetting>,
     pub room_version: String,
 }
 
 impl RoomAdminSnapshot {
     pub fn member(&self, user_id: &str) -> Option<&AdminMember> {
         self.members.iter().find(|row| row.user_id == user_id)
+    }
+    pub fn permission(&self, key: PermissionKey) -> Option<PermissionSetting> {
+        self.permissions.iter().copied().find(|row| row.key == key)
     }
 }
 
@@ -230,6 +281,9 @@ pub enum AdminAction {
     Ban,
     Unban,
     SetPowerLevel(i64),
+    /// A room-wide threshold. The request's user ID is ignored and its
+    /// expected power is the level the operator reviewed.
+    SetPermission(PermissionKey, i64),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -264,6 +318,8 @@ impl ObservedMembership {
 }
 
 /// The server's state for the target, read after the server accepted a write.
+/// For a threshold change, `power` is the threshold's level and `membership`
+/// is `None`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ObservedTarget {
     pub membership: ObservedMembership,
@@ -357,6 +413,7 @@ impl AccountManager {
                 own_power: MemberPower::Level(0),
                 own: OwnAdminPermissions::default(),
                 thresholds: None,
+                permissions: Vec::new(),
                 room_version: String::new(),
             })),
             overrides: std::sync::Mutex::new(HashMap::new()),
@@ -426,12 +483,12 @@ impl RoomAdminSession {
             .await
             .map_err(|_| RoomAdminError::Unavailable)?;
         self.check()?;
-        let entries = members.iter().filter_map(roster_entry).collect();
-        let entries = {
+        let rows = members.iter().filter_map(roster_entry).collect();
+        let rows = {
             let mut overrides = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
-            apply_overrides(entries, &mut overrides, Instant::now())
+            apply_overrides(rows, &mut overrides, Instant::now())
         };
-        let snapshot = assemble(&self.own_user, levels.as_ref(), entries, &self.room_version);
+        let snapshot = assemble(&self.own_user, levels.as_ref(), rows, &self.room_version);
         Ok(snapshot)
     }
     /// Re-read the roles and the synced roster.
@@ -447,6 +504,9 @@ impl RoomAdminSession {
     /// read the affected state back. Never retried; a failure may still have
     /// reached the homeserver, so callers must refresh rather than resend.
     pub async fn apply(&self, request: AdminRequest) -> Result<AdminOutcome> {
+        if let AdminAction::SetPermission(key, level) = request.action {
+            return self.set_permission(key, level, request.expected.power).await;
+        }
         let target = parse_target(&request.user_id)?;
         let reason = normalize_reason(request.reason.as_deref())?;
         if let AdminAction::SetPowerLevel(level) = request.action {
@@ -487,6 +547,66 @@ impl RoomAdminSession {
             let observed = observed.map(|(target, _)| target);
             Ok(AdminOutcome {
                 confirmed: observed.is_some_and(|seen| confirms(request.action, seen)),
+                observed,
+                snapshot,
+            })
+        })
+        .await
+    }
+    /// Change one room-wide threshold. Matrix rejects a change unless the
+    /// sender may send power levels and both the current and the new value
+    /// are at most the sender's own level; the same rule is checked first.
+    async fn set_permission(
+        &self,
+        key: PermissionKey,
+        level: i64,
+        reviewed: Option<MemberPower>,
+    ) -> Result<AdminOutcome> {
+        let new = Int::try_from(level).map_err(|_| RoomAdminError::InvalidPowerLevel)?;
+        self.run(WRITE_TIMEOUT, async {
+            let power = self.power_state().await?;
+            let levels = room_settings::effective_power_levels(&self.create, power.as_ref())?
+                .ok_or(RoomAdminError::InvalidState)?;
+            let current = i64::from(permission_level(&levels, key));
+            permission_precondition(&levels, &self.own_user, current, level, reviewed)?;
+            let content = permission_content(&levels, power.as_ref(), key, new)?;
+            self.check()?;
+            let request = send_state_event::v3::Request::new_raw(
+                self.room.room_id().to_owned(),
+                StateEventType::RoomPowerLevels,
+                String::new(),
+                content,
+            );
+            self.room
+                .client()
+                .send(request)
+                .with_request_config(write_config())
+                .await
+                .map_err(write_failure)?;
+            self.check()?;
+            // Accepted by the server; a failed read-back is unconfirmed, not failed.
+            let observed = match self.power_state().await {
+                Ok(power) => match self.build(power.as_ref()).await {
+                    Ok(built) => {
+                        let seen = built.permission(key).map(|row| row.level);
+                        let snapshot = self.publish(built)?;
+                        seen.map(|seen| (seen, snapshot))
+                    }
+                    Err(_) => None,
+                },
+                Err(_) => None,
+            };
+            let (observed, snapshot) = match observed {
+                Some((seen, snapshot)) => (Some(seen), snapshot),
+                None => (None, self.snapshot()),
+            };
+            let observed = observed.map(|seen| ObservedTarget {
+                membership: ObservedMembership::None,
+                power: MemberPower::Level(seen),
+            });
+            let action = AdminAction::SetPermission(key, level);
+            Ok(AdminOutcome {
+                confirmed: observed.is_some_and(|seen| confirms(action, seen)),
                 observed,
                 snapshot,
             })
@@ -544,7 +664,7 @@ impl RoomAdminSession {
             }
             AdminAction::SetPowerLevel(level) => {
                 let level = Int::try_from(level).map_err(|_| RoomAdminError::InvalidPowerLevel)?;
-                let content = power_levels_content(levels, power, target, level)?;
+                let content = member_level_content(levels, power, target, level)?;
                 let request = send_state_event::v3::Request::new_raw(
                     room_id,
                     StateEventType::RoomPowerLevels,
@@ -557,6 +677,7 @@ impl RoomAdminSession {
                     .await
                     .map(drop)
             }
+            AdminAction::SetPermission(..) => return Err(RoomAdminError::NotApplicable),
         };
         sent.map_err(write_failure)
     }
@@ -578,7 +699,7 @@ impl RoomAdminSession {
         let levels = room_settings::effective_power_levels(&self.create, power.as_ref())?;
         let power_now = levels
             .as_ref()
-            .map_or(MemberPower::Level(0), |levels| member_power(levels, target));
+            .map_or(MemberPower::Level(0), |rules| member_power(rules, target));
         if !matches!(action, AdminAction::SetPowerLevel(_))
             && let Some(event) = &member
         {
@@ -824,6 +945,7 @@ fn precondition(
             levels.user_can_change_user_power_level(own, target)
                 && MemberPower::Level(level) <= member_power(levels, own)
         }
+        AdminAction::SetPermission(..) => return Err(RoomAdminError::NotApplicable),
     };
     if allowed {
         Ok(())
@@ -838,41 +960,139 @@ fn confirms(action: AdminAction, seen: ObservedTarget) -> bool {
         AdminAction::Invite => matches!(seen.membership, Invite | Join),
         AdminAction::Kick | AdminAction::Unban => seen.membership == Leave,
         AdminAction::Ban => seen.membership == Ban,
-        AdminAction::SetPowerLevel(level) => seen.power == MemberPower::Level(level),
+        AdminAction::SetPowerLevel(level) | AdminAction::SetPermission(_, level) => {
+            seen.power == MemberPower::Level(level)
+        }
     }
 }
 
-/// Change one user's level in the server's current content, preserving every
-/// other field, including ones this client does not understand.
-fn power_levels_content(
+fn permission_level(levels: &RoomPowerLevels, key: PermissionKey) -> Int {
+    match key {
+        PermissionKey::UsersDefault => levels.users_default,
+        PermissionKey::EventsDefault => levels.events_default,
+        PermissionKey::Invite => levels.invite,
+        PermissionKey::Kick => levels.kick,
+        PermissionKey::Ban => levels.ban,
+        PermissionKey::Redact => levels.redact,
+        PermissionKey::RoomName => levels.for_state(StateEventType::RoomName),
+        PermissionKey::RoomTopic => levels.for_state(StateEventType::RoomTopic),
+        PermissionKey::RoomAvatar => levels.for_state(StateEventType::RoomAvatar),
+        PermissionKey::JoinRules => levels.for_state(StateEventType::RoomJoinRules),
+        PermissionKey::PowerLevels => levels.for_state(StateEventType::RoomPowerLevels),
+        PermissionKey::RoomNotification => levels.notifications.room,
+    }
+}
+
+/// Where a threshold lives in the content: a top-level key, an entry of
+/// `events`, or an entry of `notifications`.
+fn permission_field(key: PermissionKey) -> (Option<&'static str>, &'static str) {
+    match key {
+        PermissionKey::UsersDefault => (None, "users_default"),
+        PermissionKey::EventsDefault => (None, "events_default"),
+        PermissionKey::Invite => (None, "invite"),
+        PermissionKey::Kick => (None, "kick"),
+        PermissionKey::Ban => (None, "ban"),
+        PermissionKey::Redact => (None, "redact"),
+        PermissionKey::RoomName => (Some("events"), "m.room.name"),
+        PermissionKey::RoomTopic => (Some("events"), "m.room.topic"),
+        PermissionKey::RoomAvatar => (Some("events"), "m.room.avatar"),
+        PermissionKey::JoinRules => (Some("events"), "m.room.join_rules"),
+        PermissionKey::PowerLevels => (Some("events"), "m.room.power_levels"),
+        PermissionKey::RoomNotification => (Some("notifications"), "room"),
+    }
+}
+
+/// The sender may send power levels and outranks both the current and the
+/// new value (a privileged creator outranks every level).
+fn can_set_permission(
+    levels: &RoomPowerLevels,
+    own: &UserId,
+    current: i64,
+    new: Option<i64>,
+) -> bool {
+    let own_power = member_power(levels, own);
+    levels.user_can_send_state(own, StateEventType::RoomPowerLevels)
+        && own_power >= MemberPower::Level(current)
+        && new.is_none_or(|new| own_power >= MemberPower::Level(new))
+}
+
+fn permission_precondition(
+    levels: &RoomPowerLevels,
+    own: &UserId,
+    current: i64,
+    level: i64,
+    reviewed: Option<MemberPower>,
+) -> Result<()> {
+    if reviewed.is_some_and(|reviewed| reviewed != MemberPower::Level(current)) {
+        return Err(RoomAdminError::TargetChanged);
+    }
+    if current == level {
+        return Err(RoomAdminError::NotApplicable);
+    }
+    if !can_set_permission(levels, own, current, Some(level)) {
+        return Err(RoomAdminError::InsufficientPower);
+    }
+    Ok(())
+}
+
+/// The server's current content, or the effective defaults when the room has
+/// no power-level state. Edits keep every other field, including unknown ones.
+fn current_content(levels: &RoomPowerLevels, power: Option<&StateEnvelope>) -> Result<Value> {
+    if let Some(event) = power {
+        return Ok(event.content.clone());
+    }
+    let content = RoomPowerLevelsEventContent::try_from(levels.clone())
+        .map_err(|_| RoomAdminError::InvalidState)?;
+    serde_json::to_value(content).map_err(|_| RoomAdminError::InvalidState)
+}
+
+/// Set `key` in the content, or in its `section` object when one is given.
+fn set_level(content: &mut Value, section: Option<&str>, key: &str, level: Int) -> Result<()> {
+    let invalid = || RoomAdminError::InvalidState;
+    let mut object = content.as_object_mut().ok_or_else(invalid)?;
+    if let Some(section) = section {
+        let empty = Value::Object(serde_json::Map::new());
+        object = object
+            .entry(section)
+            .or_insert(empty)
+            .as_object_mut()
+            .ok_or_else(invalid)?;
+    }
+    object.insert(key.to_owned(), Value::from(i64::from(level)));
+    Ok(())
+}
+
+fn finish_content(content: &Value) -> Result<Raw<AnyStateEventContent>> {
+    let text = serde_json::to_string(content).map_err(|_| RoomAdminError::InvalidState)?;
+    if text.len() > MAX_POWER_LEVELS_BYTES {
+        return Err(RoomAdminError::InvalidState);
+    }
+    Raw::from_json_string(text).map_err(|_| RoomAdminError::InvalidState)
+}
+
+/// Change one user's level in the server's current content.
+fn member_level_content(
     levels: &RoomPowerLevels,
     power: Option<&StateEnvelope>,
     target: &UserId,
     level: Int,
 ) -> Result<Raw<AnyStateEventContent>> {
-    let mut content = match power {
-        Some(event) => event.content.clone(),
-        None => {
-            let mut levels = levels.clone();
-            levels.users.insert(target.to_owned(), level);
-            let content = RoomPowerLevelsEventContent::try_from(levels)
-                .map_err(|_| RoomAdminError::InvalidState)?;
-            serde_json::to_value(content).map_err(|_| RoomAdminError::InvalidState)?
-        }
-    };
-    let users = content
-        .as_object_mut()
-        .ok_or(RoomAdminError::InvalidState)?
-        .entry("users")
-        .or_insert_with(|| Value::Object(serde_json::Map::new()))
-        .as_object_mut()
-        .ok_or(RoomAdminError::InvalidState)?;
-    users.insert(target.as_str().to_owned(), Value::from(i64::from(level)));
-    let text = serde_json::to_string(&content).map_err(|_| RoomAdminError::InvalidState)?;
-    if text.len() > MAX_POWER_LEVELS_BYTES {
-        return Err(RoomAdminError::InvalidState);
-    }
-    Raw::from_json_string(text).map_err(|_| RoomAdminError::InvalidState)
+    let mut content = current_content(levels, power)?;
+    set_level(&mut content, Some("users"), target.as_str(), level)?;
+    finish_content(&content)
+}
+
+/// Change one room-wide threshold in the server's current content.
+fn permission_content(
+    levels: &RoomPowerLevels,
+    power: Option<&StateEnvelope>,
+    key: PermissionKey,
+    level: Int,
+) -> Result<Raw<AnyStateEventContent>> {
+    let mut content = current_content(levels, power)?;
+    let (section, field) = permission_field(key);
+    set_level(&mut content, section, field, level)?;
+    finish_content(&content)
 }
 
 fn roster_entry(member: &RoomMember) -> Option<RosterEntry> {
@@ -1012,6 +1232,20 @@ fn assemble(
     });
     let truncated = members.len() > MAX_ROSTER_MEMBERS;
     members.truncate(MAX_ROSTER_MEMBERS);
+    let permissions = levels.map_or_else(Vec::new, |levels| {
+        PERMISSION_KEYS
+            .iter()
+            .map(|&key| {
+                let level = i64::from(permission_level(levels, key));
+                let editable = can_set_permission(levels, own, level, None);
+                PermissionSetting {
+                    key,
+                    level,
+                    editable,
+                }
+            })
+            .collect()
+    });
     let (own_power, own_permissions, thresholds) = match levels {
         Some(levels) => (
             member_power(levels, own),
@@ -1041,6 +1275,7 @@ fn assemble(
         own_power,
         own: own_permissions,
         thresholds,
+        permissions,
         room_version: room_version.to_owned(),
     }
 }
@@ -1376,11 +1611,73 @@ mod tests {
             json!({"users": {"@mod:example.org": 50}, "org.example.policy": {"keep": true}}),
         );
         let target = user_id!("@member:example.org");
-        let raw = power_levels_content(&levels, Some(&current), target, Int::from(25u8)).unwrap();
+        let raw = member_level_content(&levels, Some(&current), target, Int::from(25u8)).unwrap();
         let written: Value = serde_json::from_str(raw.json().get()).unwrap();
         assert_eq!(written["users"]["@member:example.org"], json!(25));
         assert_eq!(written["users"]["@mod:example.org"], json!(50));
         assert_eq!(written["org.example.policy"], json!({"keep": true}));
+    }
+
+    #[test]
+    fn thresholds_change_only_within_the_senders_own_level() {
+        let own = user_id!("@mod:example.org");
+        let levels = levels("11", json!({"@mod:example.org": 50}));
+        let check = |current, level, reviewed| {
+            permission_precondition(&levels, own, current, level, reviewed)
+        };
+        assert_eq!(check(50, 0, Some(MemberPower::Level(50))), Ok(()));
+        assert_eq!(check(50, 0, None), Ok(()));
+        assert_eq!(check(50, 60, None), Err(RoomAdminError::InsufficientPower));
+        assert_eq!(check(90, 50, None), Err(RoomAdminError::InsufficientPower));
+        assert_eq!(check(50, 50, None), Err(RoomAdminError::NotApplicable));
+        let reviewed = Some(MemberPower::Level(0));
+        assert_eq!(check(50, 0, reviewed), Err(RoomAdminError::TargetChanged));
+
+        let rows = vec![entry("@mod:example.org", AdminMembership::Join, "$a")];
+        let snapshot = assemble(own, Some(&levels), rows, "11");
+        assert_eq!(snapshot.permissions.len(), PERMISSION_KEYS.len());
+        let kick = snapshot.permission(PermissionKey::Kick).unwrap();
+        assert!(kick.level == 50 && kick.editable);
+        let locked = envelope(
+            "m.room.power_levels",
+            "@casey:example.org",
+            json!({"users": {"@mod:example.org": 50}, "events": {"m.room.power_levels": 100}}),
+        );
+        let create = envelope(
+            "m.room.create",
+            "@casey:example.org",
+            json!({"room_version": "11", "creator": "@casey:example.org"}),
+        );
+        let locked = room_settings::effective_power_levels(&create, Some(&locked))
+            .unwrap()
+            .unwrap();
+        let rows = vec![entry("@mod:example.org", AdminMembership::Join, "$a")];
+        let snapshot = assemble(own, Some(&locked), rows, "11");
+        assert!(snapshot.permissions.iter().all(|row| !row.editable));
+    }
+
+    #[test]
+    fn threshold_writes_edit_one_field_and_keep_unknown_content() {
+        let levels = levels("11", json!({"@mod:example.org": 50}));
+        let current = envelope(
+            "m.room.power_levels",
+            "@casey:example.org",
+            json!({"kick": 50, "events": {"m.room.name": 50}, "org.example.policy": 1}),
+        );
+        let write = |key, level: u8| {
+            let raw = permission_content(&levels, Some(&current), key, Int::from(level));
+            serde_json::from_str::<Value>(raw.unwrap().json().get()).unwrap()
+        };
+        let written = write(PermissionKey::Kick, 0);
+        assert_eq!(written["kick"], json!(0));
+        assert_eq!(written["events"]["m.room.name"], json!(50));
+        assert_eq!(written["org.example.policy"], json!(1));
+        let written = write(PermissionKey::JoinRules, 100);
+        assert_eq!(written["events"]["m.room.join_rules"], json!(100));
+        assert_eq!(written["events"]["m.room.name"], json!(50));
+        let written = write(PermissionKey::RoomNotification, 100);
+        assert_eq!(written["notifications"]["room"], json!(100));
+        assert_eq!(written["kick"], json!(50));
     }
 
     #[test]
