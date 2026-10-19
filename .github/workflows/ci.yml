@@ -1,17 +1,17 @@
-# TEMPORARY narrowly scoped customization expansion verification. NEVER MERGE.
+# TEMPORARY reviewed messaging verification. NEVER MERGE.
 # No installers, physical-device, real-account, installed-app or artifact jobs.
-name: Reviewed customization expansion
-run-name: Customization native UI diagnosis - 62b90fc
+name: Reviewed native messaging
+run-name: Native messaging checks - 0098b78
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: customization-native-ui-62b90fc
+  group: native-messaging-0098b78
   cancel-in-progress: false
 jobs:
   native:
-    name: Customization expansion
+    name: Native messaging
     if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 180
@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 62b90fc9aa8f3b011251b25aed8def4cbadbb69c
+          ref: 0098b784c3a13fda4365984740c06e3176db7bad
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -125,7 +125,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='62b90fc9aa8f3b011251b25aed8def4cbadbb69c'
+          source='0098b784c3a13fda4365984740c06e3176db7bad'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -307,7 +307,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='62b90fc9aa8f3b011251b25aed8def4cbadbb69c'
+          source='0098b784c3a13fda4365984740c06e3176db7bad'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -390,11 +390,26 @@ jobs:
               'sdk_extraction':'Cannot unpack native SDK archive entry',
               'sdk_cache_publish':'Cannot publish verified native SDK cache',
           }
-          needed_app={'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'}
+          needed_app={
+              'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
+              'live::account_presentation_tests::a_withdrawn_search_navigation_held_at_its_commit_changes_nothing',
+              'live::account_presentation_tests::no_refresh_samples_a_reveal_until_it_is_decided_or_given_back',
+              'live::account_presentation_tests::a_focused_view_loaded_out_of_order_never_replaces_the_shown_one',
+              'kept_replies::tests::a_queued_restore_cannot_outlive_a_clear_or_a_room_change',
+              'message_search::tests::search_result_display_sanitizes_untrusted_text_without_changing_ids',
+              'message_search::tests::context_keeps_the_hit_near_the_top_and_stays_bounded',
+              'timeline_model::tests::sparse_edits_across_ten_thousand_shared_rows_notify_only_changed_rows',
+          }
+          needed_matrix={
+              'history::tests::search_rejects_an_aba_selection_and_keeps_the_current_one',
+              'history::tests::a_focused_view_is_owned_only_by_the_selection_that_loaded_it',
+              'tests::homeserver_must_not_send_password_over_plain_http',
+          }
+          allowed_app_ignore={'outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction'}
           checks=(
               ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
-                  '--bin','morpheus-app','account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
-                  '--','--exact','--test-threads=1','--show-output'],40*60,needed_app,set()),
+                  '--bin','morpheus-app','--','--test-threads=1'],40*60,needed_app,allowed_app_ignore),
+              ('matrix_unit',['cargo','test','--locked','-p','morpheus-matrix','--lib','--','--test-threads=1'],20*60,needed_matrix,set()),
           )
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
