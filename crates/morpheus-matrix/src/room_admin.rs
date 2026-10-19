@@ -19,7 +19,7 @@ use matrix_sdk::{
     deserialized_responses::MemberEvent,
     room::RoomMember,
     ruma::{
-        Int, OwnedEventId, OwnedUserId, UserId,
+        Int, OwnedEventId, OwnedUserId, RoomId, UserId,
         api::{
             client::{
                 membership::{
@@ -35,9 +35,11 @@ use matrix_sdk::{
             error::ErrorKind,
         },
         events::{
-            AnyStateEventContent, StateEventType,
+            AnyStateEventContent, EmptyStateKey, StateEventType,
             room::{
                 create::RoomCreateEventContent,
+                guest_access::{GuestAccess, RoomGuestAccessEventContent},
+                history_visibility::{HistoryVisibility, RoomHistoryVisibilityEventContent},
                 member::{MembershipState, RoomMemberEventContent},
                 power_levels::{RoomPowerLevels, RoomPowerLevelsEventContent, UserPowerLevel},
             },
@@ -232,6 +234,52 @@ pub struct PermissionSetting {
     pub editable: bool,
 }
 
+/// Who can read new messages, as `m.room.history_visibility`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryChoice {
+    /// Members, from the point they joined.
+    Joined,
+    /// Members, from the point they were invited.
+    Invited,
+    /// Members, including messages from before they joined.
+    Shared,
+    /// Anyone, including people who have not joined.
+    WorldReadable,
+}
+
+impl HistoryChoice {
+    fn wire(self) -> HistoryVisibility {
+        match self {
+            Self::Joined => HistoryVisibility::Joined,
+            Self::Invited => HistoryVisibility::Invited,
+            Self::Shared => HistoryVisibility::Shared,
+            Self::WorldReadable => HistoryVisibility::WorldReadable,
+        }
+    }
+}
+
+/// History visibility and guest access from fresh state. A value is `None`
+/// when the room uses content a typed rewrite would lose; it stays read-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccessSettings {
+    pub history: Option<HistoryChoice>,
+    pub history_level: i64,
+    pub history_editable: bool,
+    pub guests_can_join: Option<bool>,
+    pub guests_level: i64,
+    pub guests_editable: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccessChange {
+    /// `from` is the value the operator reviewed.
+    History {
+        from: HistoryChoice,
+        to: HistoryChoice,
+    },
+    Guests { allow: bool },
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MembershipCounts {
     pub joined: usize,
@@ -252,6 +300,8 @@ pub struct RoomAdminSnapshot {
     pub thresholds: Option<PowerThresholds>,
     /// In `PERMISSION_KEYS` order; empty when the room's rules are unknown.
     pub permissions: Vec<PermissionSetting>,
+    /// `None` when the room's rules are unknown.
+    pub access: Option<AccessSettings>,
     pub room_version: String,
 }
 
@@ -284,6 +334,8 @@ pub enum AdminAction {
     /// A room-wide threshold. The request's user ID is ignored and its
     /// expected power is the level the operator reviewed.
     SetPermission(PermissionKey, i64),
+    /// History visibility or guest access. The request's user ID is ignored.
+    SetAccess(AccessChange),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -319,7 +371,8 @@ impl ObservedMembership {
 
 /// The server's state for the target, read after the server accepted a write.
 /// For a threshold change, `power` is the threshold's level and `membership`
-/// is `None`.
+/// is `None`. For an access change it only records that the read-back
+/// succeeded; the new value is in the outcome's snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ObservedTarget {
     pub membership: ObservedMembership,
@@ -414,6 +467,7 @@ impl AccountManager {
                 own: OwnAdminPermissions::default(),
                 thresholds: None,
                 permissions: Vec::new(),
+                access: None,
                 room_version: String::new(),
             })),
             overrides: std::sync::Mutex::new(HashMap::new()),
@@ -488,8 +542,19 @@ impl RoomAdminSession {
             let mut overrides = self.overrides.lock().unwrap_or_else(|e| e.into_inner());
             apply_overrides(rows, &mut overrides, Instant::now())
         };
-        let snapshot = assemble(&self.own_user, levels.as_ref(), rows, &self.room_version);
+        let mut snapshot = assemble(&self.own_user, levels.as_ref(), rows, &self.room_version);
+        if let Some(levels) = &levels {
+            let history = self.optional_state(StateEventType::RoomHistoryVisibility).await?;
+            let guests = self.optional_state(StateEventType::RoomGuestAccess).await?;
+            self.check()?;
+            let access = access_settings(levels, &self.own_user, history.as_ref(), guests.as_ref());
+            snapshot.access = Some(access);
+        }
         Ok(snapshot)
+    }
+    async fn optional_state(&self, kind: StateEventType) -> Result<Option<StateEnvelope>> {
+        let state = room_settings::state(&self.room, kind, "").await?;
+        Ok(state)
     }
     /// Re-read the roles and the synced roster.
     pub async fn refresh(&self) -> Result<Arc<RoomAdminSnapshot>> {
@@ -506,6 +571,9 @@ impl RoomAdminSession {
     pub async fn apply(&self, request: AdminRequest) -> Result<AdminOutcome> {
         if let AdminAction::SetPermission(key, level) = request.action {
             return self.set_permission(key, level, request.expected.power).await;
+        }
+        if let AdminAction::SetAccess(change) = request.action {
+            return self.set_access(change).await;
         }
         let target = parse_target(&request.user_id)?;
         let reason = normalize_reason(request.reason.as_deref())?;
@@ -613,6 +681,54 @@ impl RoomAdminSession {
         })
         .await
     }
+    /// Change history visibility or guest access after checking that the
+    /// reviewed value is still current and the account may send that state.
+    async fn set_access(&self, change: AccessChange) -> Result<AdminOutcome> {
+        if matches!(change, AccessChange::History { from, to } if from == to) {
+            return Err(RoomAdminError::NotApplicable);
+        }
+        self.run(WRITE_TIMEOUT, async {
+            let power = self.power_state().await?;
+            let levels = room_settings::effective_power_levels(&self.create, power.as_ref())?
+                .ok_or(RoomAdminError::InvalidState)?;
+            let current = self.optional_state(access_kind(change)).await?;
+            if !access_matches(change, current.as_ref()) {
+                return Err(RoomAdminError::TargetChanged);
+            }
+            if !levels.user_can_send_state(&self.own_user, access_kind(change)) {
+                return Err(RoomAdminError::InsufficientPower);
+            }
+            let request = access_request(self.room.room_id(), change)?;
+            self.check()?;
+            self.room
+                .client()
+                .send(request)
+                .with_request_config(write_config())
+                .await
+                .map_err(write_failure)?;
+            self.check()?;
+            // Accepted by the server; a failed read-back is unconfirmed, not failed.
+            let built = match self.build(power.as_ref()).await {
+                Ok(built) => Some(self.publish(built)?),
+                Err(_) => None,
+            };
+            let confirmed = built
+                .as_ref()
+                .and_then(|snapshot| snapshot.access)
+                .is_some_and(|access| access_applied(change, access));
+            let read_back = ObservedTarget {
+                membership: ObservedMembership::None,
+                power: MemberPower::Level(0),
+            };
+            let observed = built.is_some().then_some(read_back);
+            Ok(AdminOutcome {
+                confirmed,
+                observed,
+                snapshot: built.unwrap_or_else(|| self.snapshot()),
+            })
+        })
+        .await
+    }
     async fn send(
         &self,
         target: &UserId,
@@ -677,7 +793,9 @@ impl RoomAdminSession {
                     .await
                     .map(drop)
             }
-            AdminAction::SetPermission(..) => return Err(RoomAdminError::NotApplicable),
+            AdminAction::SetPermission(..) | AdminAction::SetAccess(_) => {
+                return Err(RoomAdminError::NotApplicable);
+            }
         };
         sent.map_err(write_failure)
     }
@@ -945,7 +1063,9 @@ fn precondition(
             levels.user_can_change_user_power_level(own, target)
                 && MemberPower::Level(level) <= member_power(levels, own)
         }
-        AdminAction::SetPermission(..) => return Err(RoomAdminError::NotApplicable),
+        AdminAction::SetPermission(..) | AdminAction::SetAccess(_) => {
+            return Err(RoomAdminError::NotApplicable);
+        }
     };
     if allowed {
         Ok(())
@@ -963,7 +1083,106 @@ fn confirms(action: AdminAction, seen: ObservedTarget) -> bool {
         AdminAction::SetPowerLevel(level) | AdminAction::SetPermission(_, level) => {
             seen.power == MemberPower::Level(level)
         }
+        // Access changes are confirmed from the rebuilt snapshot instead.
+        AdminAction::SetAccess(_) => false,
     }
+}
+
+/// The content's only field, when it is a string. Any other shape would be
+/// lost by a typed rewrite, so the setting stays read-only.
+fn single_string<'a>(content: &'a Value, key: &str) -> Option<&'a str> {
+    let object = content.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    object.get(key)?.as_str()
+}
+
+fn history_choice(event: Option<&StateEnvelope>) -> Option<HistoryChoice> {
+    // A room without the event behaves as `shared`.
+    let Some(event) = event else {
+        return Some(HistoryChoice::Shared);
+    };
+    match single_string(&event.content, "history_visibility")? {
+        "joined" => Some(HistoryChoice::Joined),
+        "invited" => Some(HistoryChoice::Invited),
+        "shared" => Some(HistoryChoice::Shared),
+        "world_readable" => Some(HistoryChoice::WorldReadable),
+        _ => None,
+    }
+}
+
+fn guests_can_join(event: Option<&StateEnvelope>) -> Option<bool> {
+    // A room without the event forbids guests.
+    let Some(event) = event else {
+        return Some(false);
+    };
+    match single_string(&event.content, "guest_access")? {
+        "can_join" => Some(true),
+        "forbidden" => Some(false),
+        _ => None,
+    }
+}
+
+fn access_settings(
+    levels: &RoomPowerLevels,
+    own: &UserId,
+    history: Option<&StateEnvelope>,
+    guests: Option<&StateEnvelope>,
+) -> AccessSettings {
+    let history = history_choice(history);
+    let guests_can_join = guests_can_join(guests);
+    let history_kind = StateEventType::RoomHistoryVisibility;
+    let guests_kind = StateEventType::RoomGuestAccess;
+    AccessSettings {
+        history,
+        history_level: levels.for_state(history_kind.clone()).into(),
+        history_editable: history.is_some() && levels.user_can_send_state(own, history_kind),
+        guests_can_join,
+        guests_level: levels.for_state(guests_kind.clone()).into(),
+        guests_editable: guests_can_join.is_some() && levels.user_can_send_state(own, guests_kind),
+    }
+}
+
+fn access_kind(change: AccessChange) -> StateEventType {
+    match change {
+        AccessChange::History { .. } => StateEventType::RoomHistoryVisibility,
+        AccessChange::Guests { .. } => StateEventType::RoomGuestAccess,
+    }
+}
+
+fn access_matches(change: AccessChange, current: Option<&StateEnvelope>) -> bool {
+    match change {
+        AccessChange::History { from, .. } => history_choice(current) == Some(from),
+        AccessChange::Guests { allow } => guests_can_join(current) == Some(!allow),
+    }
+}
+
+fn access_applied(change: AccessChange, access: AccessSettings) -> bool {
+    match change {
+        AccessChange::History { to, .. } => access.history == Some(to),
+        AccessChange::Guests { allow } => access.guests_can_join == Some(allow),
+    }
+}
+
+fn access_request(room: &RoomId, change: AccessChange) -> Result<send_state_event::v3::Request> {
+    let room = room.to_owned();
+    let request = match change {
+        AccessChange::History { to, .. } => {
+            let content = RoomHistoryVisibilityEventContent::new(to.wire());
+            send_state_event::v3::Request::new(room, &EmptyStateKey, &content)
+        }
+        AccessChange::Guests { allow } => {
+            let access = if allow {
+                GuestAccess::CanJoin
+            } else {
+                GuestAccess::Forbidden
+            };
+            let content = RoomGuestAccessEventContent::new(access);
+            send_state_event::v3::Request::new(room, &EmptyStateKey, &content)
+        }
+    };
+    request.map_err(|_| RoomAdminError::InvalidState)
 }
 
 fn permission_level(levels: &RoomPowerLevels, key: PermissionKey) -> Int {
@@ -1276,6 +1495,7 @@ fn assemble(
         own: own_permissions,
         thresholds,
         permissions,
+        access: None,
         room_version: room_version.to_owned(),
     }
 }
@@ -1284,7 +1504,7 @@ fn assemble(
 mod tests {
     use super::*;
     use crate::account_selection::Selections;
-    use matrix_sdk::ruma::{EventId, owned_event_id, owned_user_id, user_id};
+    use matrix_sdk::ruma::{EventId, owned_event_id, owned_user_id, room_id, user_id};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1678,6 +1898,50 @@ mod tests {
         let written = write(PermissionKey::RoomNotification, 100);
         assert_eq!(written["notifications"]["room"], json!(100));
         assert_eq!(written["kick"], json!(50));
+    }
+
+    #[test]
+    fn access_settings_edit_only_known_content_and_fence_the_reviewed_value() {
+        let history = |content| {
+            envelope("m.room.history_visibility", "@casey:example.org", content)
+        };
+        assert_eq!(history_choice(None), Some(HistoryChoice::Shared));
+        let joined = history(json!({"history_visibility": "joined"}));
+        assert_eq!(history_choice(Some(&joined)), Some(HistoryChoice::Joined));
+        for unknown in [
+            json!({"history_visibility": "joined", "org.example": 1}),
+            json!({"history_visibility": "org.example.custom"}),
+            json!({}),
+        ] {
+            assert_eq!(history_choice(Some(&history(unknown))), None);
+        }
+        assert_eq!(guests_can_join(None), Some(false));
+        let guests = envelope(
+            "m.room.guest_access",
+            "@casey:example.org",
+            json!({"guest_access": "can_join"}),
+        );
+        assert_eq!(guests_can_join(Some(&guests)), Some(true));
+
+        let widen = AccessChange::History {
+            from: HistoryChoice::Joined,
+            to: HistoryChoice::WorldReadable,
+        };
+        assert!(access_matches(widen, Some(&joined)));
+        assert!(!access_matches(widen, None));
+        assert!(access_matches(AccessChange::Guests { allow: false }, Some(&guests)));
+        assert!(!access_matches(AccessChange::Guests { allow: true }, Some(&guests)));
+        let request = access_request(room_id!("!admin:example.org"), widen).unwrap();
+        assert!(request.body.json().get().contains("world_readable"));
+
+        let levels = levels("11", json!({"@mod:example.org": 50}));
+        let own = user_id!("@mod:example.org");
+        let access = access_settings(&levels, own, Some(&joined), None);
+        assert!(access.history_editable && access.guests_editable);
+        assert_eq!(access.history_level, 50);
+        let member = user_id!("@member:example.org");
+        let locked = access_settings(&levels, member, Some(&joined), None);
+        assert!(!locked.history_editable && !locked.guests_editable);
     }
 
     #[test]

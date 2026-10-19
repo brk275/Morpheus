@@ -29,7 +29,12 @@ export struct RosterMember {
 // One room-wide permission threshold. `key` indexes the controller's fixed
 // permission list and only routes a request; text is produced in Rust.
 export struct RosterPermission {
+    // A threshold's index, or -1 for an access row.
     key: int,
+    // 0 threshold, 1 history visibility, 2 guest access.
+    kind: int,
+    // Access rows: the current option index (guests: 1 allowed), or -1.
+    choice: int,
     label: string,
     description: string,
     // The exact required level.
@@ -244,6 +249,8 @@ export component RoomMembersPanel inherits VerticalLayout {
     callback request(int);
     // A permission's key and the requested level text.
     callback request-permission(int, string);
+    // An access row's kind and the chosen option.
+    callback request-access(int, int);
     callback open-settings();
 
     property <length> row-height: max(50px, 32px * root.text-scale + 18px);
@@ -252,6 +259,7 @@ export component RoomMembersPanel inherits VerticalLayout {
     property <int> view: 0;
     property <int> permission-index: -1;
     property <string> permission-input;
+    property <int> access-choice: -1;
     property <RosterPermission> chosen: root.permissions[root.permission-index];
 
     init => { root.scope-changed(); }
@@ -606,6 +614,7 @@ export component RoomMembersPanel inherits VerticalLayout {
                 activated => {
                     root.permission-index = index;
                     root.permission-input = permission.level;
+                    root.access-choice = permission.choice;
                 }
                 HorizontalLayout {
                     padding-left: 12px; padding-right: 10px; spacing: 8px;
@@ -658,7 +667,7 @@ export component RoomMembersPanel inherits VerticalLayout {
                     text: root.chosen.restriction;
                     color: root.palette.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
                 }
-                if root.chosen.editable : HorizontalLayout {
+                if root.chosen.kind == 0 && root.chosen.editable : HorizontalLayout {
                     spacing: 4px;
                     for preset in [
                         { name: "Everyone", level: root.member-level },
@@ -674,7 +683,7 @@ export component RoomMembersPanel inherits VerticalLayout {
                         activated => { root.permission-input = "" + preset.level; }
                     }
                 }
-                if root.chosen.editable : HorizontalLayout {
+                if root.chosen.kind == 0 && root.chosen.editable : HorizontalLayout {
                     spacing: 5px;
                     RosterField {
                         horizontal-stretch: 1;
@@ -693,6 +702,66 @@ export component RoomMembersPanel inherits VerticalLayout {
                         label: "Review the change to " + root.chosen.label;
                         enabled: !root.busy && root.permission-input != "" && root.permission-input != root.chosen.level;
                         activated => { root.request-permission(root.chosen.key, root.permission-input); }
+                    }
+                }
+                // Same order as HISTORY_CHOICES in room_admin.rs.
+                if root.chosen.kind == 1 && root.chosen.editable : VerticalLayout {
+                    spacing: 3px;
+                    for option[index] in [
+                        "Members, from when they joined",
+                        "Members, from when they were invited",
+                        "Members, including earlier messages",
+                        "Anyone, without joining",
+                    ] : RosterAction {
+                        height: max(28px, 20px * root.text-scale + 8px);
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: root.access-choice == index ? root.palette.accent : root.palette.divider;
+                        background: root.access-choice == index ? root.palette.selection : self.has-hover ? root.palette.hover : transparent;
+                        focus-color: root.palette.focus;
+                        enabled: !root.busy;
+                        accessible-role: radio-button;
+                        accessible-checkable: true;
+                        accessible-checked: root.access-choice == index;
+                        label: index == root.chosen.choice ? option + ", current setting" : option;
+                        activated => { root.access-choice = index; }
+                        Text {
+                            x: 9px; width: parent.width - 18px; height: parent.height;
+                            text: index == root.chosen.choice ? option + " (current)" : option;
+                            color: root.access-choice == index ? root.palette.selection-ink : root.palette.ink;
+                            font-size: 11px * root.text-scale;
+                            vertical-alignment: center; overflow: elide;
+                        }
+                    }
+                    HorizontalLayout {
+                        alignment: end;
+                        RosterButton {
+                            palette: root.palette;
+                            text-scale: root.text-scale;
+                            text: "Apply…";
+                            label: "Review the history visibility change";
+                            enabled: !root.busy && root.access-choice >= 0 && root.access-choice != root.chosen.choice;
+                            activated => { root.request-access(1, root.access-choice); }
+                        }
+                    }
+                }
+                if root.chosen.kind == 2 && root.chosen.editable : HorizontalLayout {
+                    spacing: 5px; alignment: start;
+                    RosterButton {
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        text: "Allow guests…";
+                        label: "Review allowing guest accounts to join";
+                        enabled: !root.busy && root.chosen.choice == 0;
+                        activated => { root.request-access(2, 1); }
+                    }
+                    RosterButton {
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        text: "Stop guests…";
+                        label: "Review stopping guest accounts from joining";
+                        enabled: !root.busy && root.chosen.choice == 1;
+                        activated => { root.request-access(2, 0); }
                     }
                 }
             }

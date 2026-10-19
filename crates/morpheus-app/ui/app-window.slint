@@ -2270,6 +2270,8 @@ export component AppWindow inherits Window {
     callback roster-request(int);
     // A permission key from roster-permissions and the requested level text.
     callback roster-request-permission(int, string);
+    // An access row kind (1 history, 2 guests) and the chosen option.
+    callback roster-request-access(int, int);
     callback roster-confirm();
     callback roster-cancel-confirm();
     callback submit-room-admin(int, string, string);
@@ -5940,6 +5942,7 @@ export component AppWindow inherits Window {
                     invite => { root.roster-invite(); }
                     request(kind) => { root.roster-request(kind); }
                     request-permission(key, level) => { root.roster-request-permission(key, level); }
+                    request-access(kind, choice) => { root.roster-request-access(kind, choice); }
                     open-settings => { root.open-room-settings(); }
                 }
                 if root.side-panel-tab == 1 : VerticalLayout {

@@ -8,10 +8,10 @@ pub(crate) mod ui;
 pub(crate) use ui::clear_presentation;
 
 use morpheus_matrix::{
-    AdminAction, AdminMember, AdminMembership, AdminOutcome, AdminRequest, MAX_ADMIN_REASON_BYTES,
-    MemberExpectation, MemberPower, MembershipCounts, ObservedMembership, ObservedTarget,
-    PERMISSION_KEYS, PermissionKey, PermissionSetting, PowerThresholds, RoomAdminError,
-    RoomAdminSnapshot,
+    AccessChange, AccessSettings, AdminAction, AdminMember, AdminMembership, AdminOutcome,
+    AdminRequest, HistoryChoice, MAX_ADMIN_REASON_BYTES, MemberExpectation, MemberPower,
+    MembershipCounts, ObservedMembership, ObservedTarget, PERMISSION_KEYS, PermissionKey,
+    PermissionSetting, PowerThresholds, RoomAdminError, RoomAdminSnapshot,
 };
 
 /// Rows shown at once. Search narrows a larger roster; the count says so.
@@ -49,6 +49,12 @@ const REFUSED: &str =
 const REVIEW: &str = "Review the refreshed roster, then try again.";
 const REFUSED_PERMISSION: &str = "Your permissions may have changed; review them again.";
 const OWN_DEFAULT: &str = "Your own level follows the default, so it changes too.";
+const CUSTOM_ACCESS: &str = "This room uses a setting Morpheus does not edit.";
+const CUSTOM_HISTORY: &str = "Custom history setting";
+const HISTORY_BODY: &str = "Messages already sent keep the visibility they were sent with.";
+const GUESTS_ALLOW: &str = "Guest accounts can join whenever the room's join rules let them in.";
+const GUESTS_FORBID: &str = "Guest accounts can no longer join. Guests already here stay.";
+const SETTING_CHANGED: &str = "This setting changed on the server. Review it again.";
 
 pub(crate) const KICK: i32 = 1;
 pub(crate) const BAN: i32 = 2;
@@ -56,6 +62,18 @@ pub(crate) const UNBAN: i32 = 3;
 pub(crate) const SET_LEVEL: i32 = 4;
 pub(crate) const APPROVE: i32 = 5;
 pub(crate) const DENY: i32 = 6;
+
+/// Access rows in the permissions view: history visibility and guest access.
+pub(crate) const ACCESS_HISTORY: i32 = 1;
+pub(crate) const ACCESS_GUESTS: i32 = 2;
+/// History options in the panel's order, narrowest first. The Slint option
+/// labels follow the same order.
+pub(crate) const HISTORY_CHOICES: [HistoryChoice; 4] = [
+    HistoryChoice::Joined,
+    HistoryChoice::Invited,
+    HistoryChoice::Shared,
+    HistoryChoice::WorldReadable,
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Filter {
@@ -303,6 +321,154 @@ pub(crate) fn permission_restriction(key: PermissionKey, snapshot: &RoomAdminSna
     format!("Only someone with level {current} or higher can change this; you have {own}.")
 }
 
+pub(crate) fn history_text(choice: HistoryChoice) -> &'static str {
+    match choice {
+        HistoryChoice::Joined => "Members, from when they joined",
+        HistoryChoice::Invited => "Members, from when they were invited",
+        HistoryChoice::Shared => "Members, including earlier messages",
+        HistoryChoice::WorldReadable => "Anyone, without joining",
+    }
+}
+
+/// The choice's index in `HISTORY_CHOICES`; a higher rank shows more.
+fn history_rank(choice: HistoryChoice) -> i32 {
+    match choice {
+        HistoryChoice::Joined => 0,
+        HistoryChoice::Invited => 1,
+        HistoryChoice::Shared => 2,
+        HistoryChoice::WorldReadable => 3,
+    }
+}
+
+/// Display state of one access row in the permissions view.
+pub(crate) struct AccessRow {
+    pub(crate) kind: i32,
+    /// History: index in `HISTORY_CHOICES`. Guests: 1 allowed, 0 not. -1 custom.
+    pub(crate) choice: i32,
+    pub(crate) label: &'static str,
+    pub(crate) description: &'static str,
+    pub(crate) summary: &'static str,
+    pub(crate) editable: bool,
+    pub(crate) restriction: String,
+}
+
+/// Why an access row is read-only, or empty when it can be changed.
+fn access_lock(kind: i32, access: AccessSettings, snapshot: &RoomAdminSnapshot) -> String {
+    let (known, editable, level) = match kind {
+        ACCESS_HISTORY => {
+            let known = access.history.is_some();
+            (known, access.history_editable, access.history_level)
+        }
+        _ => {
+            let known = access.guests_can_join.is_some();
+            (known, access.guests_editable, access.guests_level)
+        }
+    };
+    if editable {
+        String::new()
+    } else if !known {
+        CUSTOM_ACCESS.to_owned()
+    } else {
+        access_restriction(level, snapshot)
+    }
+}
+
+pub(crate) fn access_rows(snapshot: &RoomAdminSnapshot) -> Vec<AccessRow> {
+    let Some(access) = snapshot.access else {
+        return Vec::new();
+    };
+    let guests = match access.guests_can_join {
+        Some(true) => "Guests can join",
+        Some(false) => "Guests cannot join",
+        None => "Custom guest setting",
+    };
+    vec![
+        AccessRow {
+            kind: ACCESS_HISTORY,
+            choice: access.history.map_or(-1, history_rank),
+            label: "History visibility",
+            description: "Who can read new messages in this room.",
+            summary: access.history.map_or(CUSTOM_HISTORY, history_text),
+            editable: access.history_editable,
+            restriction: access_lock(ACCESS_HISTORY, access, snapshot),
+        },
+        AccessRow {
+            kind: ACCESS_GUESTS,
+            choice: access.guests_can_join.map_or(-1, i32::from),
+            label: "Guest access",
+            description: "Whether guest accounts can join when the join rules let them.",
+            summary: guests,
+            editable: access.guests_editable,
+            restriction: access_lock(ACCESS_GUESTS, access, snapshot),
+        },
+    ]
+}
+
+fn access_restriction(level: i64, snapshot: &RoomAdminSnapshot) -> String {
+    let own = power_text(snapshot.own_power);
+    format!("Changing this needs level {level}; you have {own}. {ASK_HIGHER}")
+}
+
+/// The reviewed value of an access change is still the room's value.
+fn access_current(change: AccessChange, access: AccessSettings) -> bool {
+    match change {
+        AccessChange::History { from, .. } => access.history == Some(from),
+        AccessChange::Guests { allow } => access.guests_can_join == Some(!allow),
+    }
+}
+
+/// Change history visibility (`ACCESS_HISTORY`, choice indexes
+/// `HISTORY_CHOICES`) or guest access (`ACCESS_GUESTS`, choice 1 allows).
+pub(crate) fn access_intent(
+    kind: i32,
+    choice: i32,
+    snapshot: &RoomAdminSnapshot,
+) -> Result<Intent, String> {
+    let Some(access) = snapshot.access else {
+        return Err(UNKNOWN_RULES.to_owned());
+    };
+    let (change, name) = match kind {
+        ACCESS_HISTORY => {
+            let from = access.history.ok_or_else(|| CUSTOM_ACCESS.to_owned())?;
+            if !access.history_editable {
+                return Err(access_restriction(access.history_level, snapshot));
+            }
+            let to = usize::try_from(choice)
+                .ok()
+                .and_then(|index| HISTORY_CHOICES.get(index).copied())
+                .ok_or_else(|| "Choose who can read new messages.".to_owned())?;
+            if to == from {
+                return Err("The room already uses that history setting.".to_owned());
+            }
+            (AccessChange::History { from, to }, "History visibility")
+        }
+        ACCESS_GUESTS => {
+            let current = access.guests_can_join;
+            let current = current.ok_or_else(|| CUSTOM_ACCESS.to_owned())?;
+            if !access.guests_editable {
+                return Err(access_restriction(access.guests_level, snapshot));
+            }
+            let allow = choice == 1;
+            if allow == current {
+                return Err("The room already uses that guest setting.".to_owned());
+            }
+            (AccessChange::Guests { allow }, "Guest access")
+        }
+        _ => return Err(UNKNOWN_RULES.to_owned()),
+    };
+    Ok(Intent {
+        action: AdminAction::SetAccess(change),
+        user_id: String::new(),
+        name: name.to_owned(),
+        expected: MemberExpectation {
+            membership: None,
+            power: None,
+        },
+        reason: None,
+        knock: false,
+    })
+}
+
 /// Change one threshold, identified by its index in `PERMISSION_KEYS`.
 pub(crate) fn permission_intent(
     index: i32,
@@ -368,6 +534,10 @@ impl Intent {
         if let AdminAction::SetPermission(key, _) = self.action {
             let current = snapshot.permission(key).map(|row| row.level);
             return current.map(MemberPower::Level) == self.expected.power;
+        }
+        if let AdminAction::SetAccess(change) = self.action {
+            let access = snapshot.access;
+            return access.is_some_and(|access| access_current(change, access));
         }
         let row = snapshot.member(&self.user_id);
         let power = row.map(|member| member.power);
@@ -589,6 +759,24 @@ pub(crate) fn confirmation(intent: &Intent, snapshot: &RoomAdminSnapshot) -> Opt
                 destructive: (sensitive && widens) || raises_default || (own_default && widens),
             }
         }
+        AdminAction::SetAccess(AccessChange::History { from, to }) => Confirmation {
+            title: "Change who can read history?".to_owned(),
+            body: format!("New messages: {}. {HISTORY_BODY}", history_text(to)),
+            action: "Change history",
+            destructive: history_rank(to) > history_rank(from),
+        },
+        AdminAction::SetAccess(AccessChange::Guests { allow: true }) => Confirmation {
+            title: "Allow guests to join?".to_owned(),
+            body: GUESTS_ALLOW.to_owned(),
+            action: "Allow guests",
+            destructive: true,
+        },
+        AdminAction::SetAccess(AccessChange::Guests { allow: false }) => Confirmation {
+            title: "Stop guests from joining?".to_owned(),
+            body: GUESTS_FORBID.to_owned(),
+            action: "Stop guests",
+            destructive: false,
+        },
     };
     if let Some(reason) = &intent.reason {
         confirmation.body.push_str("\n\nReason, visible to the room: ");
@@ -606,7 +794,10 @@ pub(crate) fn pending_text(intent: &Intent) -> String {
         AdminAction::Ban => "Banning",
         AdminAction::Unban => "Unbanning",
         AdminAction::SetPowerLevel(_) => "Changing the level of",
-        AdminAction::SetPermission(..) => "Changing",
+        AdminAction::SetPermission(..) | AdminAction::SetAccess(_) => {
+            let name = &intent.name;
+            return format!("Changing \u{201c}{name}\u{201d}… Waiting for the homeserver.");
+        }
     };
     format!("{verb} {}… Waiting for the homeserver.", intent.name)
 }
@@ -628,6 +819,9 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: &AdminOutcome) -> String {
     let Some(seen) = outcome.observed else {
         return format!("The homeserver accepted the change for {name}. {UNREAD}");
     };
+    if let AdminAction::SetAccess(change) = intent.action {
+        return access_outcome_text(change, outcome.confirmed);
+    }
     if let (AdminAction::SetPermission(..), false) = (intent.action, outcome.confirmed) {
         let seen = power_text(seen.power);
         return format!("The homeserver accepted the change, but {name} now needs {seen}.");
@@ -652,12 +846,41 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: &AdminOutcome) -> String {
         AdminAction::SetPermission(_, level) => {
             format!("{name} now needs level {level}. The homeserver confirmed it.")
         }
+        AdminAction::SetAccess(change) => access_outcome_text(change, outcome.confirmed),
+    }
+}
+
+fn access_outcome_text(change: AccessChange, confirmed: bool) -> String {
+    if !confirmed {
+        return "The homeserver accepted the change, but the room shows another setting.".to_owned();
+    }
+    match change {
+        AccessChange::History { to, .. } => {
+            let text = history_text(to);
+            format!("New messages: {text}. The homeserver confirmed it.")
+        }
+        AccessChange::Guests { allow: true } => {
+            "Guests can now join. The homeserver confirmed it.".to_owned()
+        }
+        AccessChange::Guests { allow: false } => {
+            "Guests can no longer join. The homeserver confirmed it.".to_owned()
+        }
     }
 }
 
 pub(crate) fn permission_text(action: AdminAction, snapshot: &RoomAdminSnapshot) -> String {
     if let AdminAction::SetPermission(key, _) = action {
         return permission_restriction(key, snapshot);
+    }
+    if let AdminAction::SetAccess(change) = action {
+        let Some(access) = snapshot.access else {
+            return UNKNOWN_RULES.to_owned();
+        };
+        let level = match change {
+            AccessChange::History { .. } => access.history_level,
+            AccessChange::Guests { .. } => access.guests_level,
+        };
+        return access_restriction(level, snapshot);
     }
     let own = power_text(snapshot.own_power);
     let Some(levels) = snapshot.thresholds else {
@@ -668,9 +891,9 @@ pub(crate) fn permission_text(action: AdminAction, snapshot: &RoomAdminSnapshot)
         AdminAction::Kick => ("Kicking", levels.kick),
         AdminAction::Ban => ("Banning", levels.ban),
         AdminAction::Unban => ("Unbanning", levels.ban.max(levels.kick)),
-        AdminAction::SetPowerLevel(_) | AdminAction::SetPermission(..) => {
-            ("Changing levels", levels.change_power_levels)
-        }
+        AdminAction::SetPowerLevel(_)
+        | AdminAction::SetPermission(..)
+        | AdminAction::SetAccess(_) => ("Changing levels", levels.change_power_levels),
     };
     if action == AdminAction::Invite || snapshot.own_power < MemberPower::Level(needed) {
         format!("{verb} needs level {needed}; you have {own}. {ASK_HIGHER}")
@@ -725,16 +948,18 @@ pub(crate) fn error_text(
     snapshot: Option<&RoomAdminSnapshot>,
 ) -> String {
     let name = &intent.name;
-    if let AdminAction::SetPermission(key, _) = intent.action {
+    let setting = matches!(
+        intent.action,
+        AdminAction::SetPermission(..) | AdminAction::SetAccess(_)
+    );
+    if setting {
         match (error, snapshot) {
-            (RoomAdminError::TargetChanged, _) => {
-                return format!("{name} changed on the server. Review it again.");
-            }
+            (RoomAdminError::TargetChanged, _) => return SETTING_CHANGED.to_owned(),
             (RoomAdminError::NotApplicable, _) => {
-                return format!("{name} already needs that level.");
+                return "The room already uses that setting.".to_owned();
             }
             (RoomAdminError::InsufficientPower, Some(snapshot)) => {
-                return permission_restriction(key, snapshot);
+                return permission_text(intent.action, snapshot);
             }
             (RoomAdminError::Forbidden, _) => {
                 return format!("The homeserver refused this change. {REFUSED_PERMISSION}");
@@ -833,6 +1058,7 @@ mod tests {
                 change_power_levels: 50,
             }),
             permissions: Vec::new(),
+            access: None,
             room_version: "11".to_owned(),
         }
     }
@@ -1041,6 +1267,55 @@ mod tests {
         assert!(review(&change(PermissionKey::UsersDefault, "10")).destructive);
         let lowered = review(&change(PermissionKey::UsersDefault, "-5"));
         assert!(lowered.destructive && lowered.body.contains(OWN_DEFAULT));
+    }
+
+    fn with_access(editable: bool) -> RoomAdminSnapshot {
+        let mut snapshot = roster(Vec::new(), 50);
+        snapshot.access = Some(AccessSettings {
+            history: Some(HistoryChoice::Joined),
+            history_level: 50,
+            history_editable: editable,
+            guests_can_join: Some(false),
+            guests_level: 50,
+            guests_editable: editable,
+        });
+        snapshot
+    }
+
+    #[test]
+    fn access_changes_are_reviewed_confirmed_and_withdrawn_when_stale() {
+        let snapshot = with_access(true);
+        let open = access_intent(ACCESS_HISTORY, 3, &snapshot).unwrap();
+        let widen = AccessChange::History {
+            from: HistoryChoice::Joined,
+            to: HistoryChoice::WorldReadable,
+        };
+        assert_eq!(open.action, AdminAction::SetAccess(widen));
+        assert!(confirmation(&open, &snapshot).unwrap().destructive);
+        assert!(open.still_matches(&snapshot));
+        let narrow = access_intent(ACCESS_HISTORY, 0, &snapshot);
+        assert!(narrow.is_err(), "already the room's setting");
+        let guests = access_intent(ACCESS_GUESTS, 1, &snapshot).unwrap();
+        assert!(confirmation(&guests, &snapshot).unwrap().destructive);
+        assert!(access_intent(ACCESS_GUESTS, 0, &snapshot).is_err());
+        assert!(access_intent(ACCESS_HISTORY, 3, &with_access(false)).is_err());
+
+        let mut moved = snapshot.clone();
+        if let Some(access) = moved.access.as_mut() {
+            access.history = Some(HistoryChoice::Shared);
+        }
+        assert!(!open.still_matches(&moved));
+        let mut custom = snapshot.clone();
+        if let Some(access) = custom.access.as_mut() {
+            access.history = None;
+        }
+        assert!(access_intent(ACCESS_HISTORY, 3, &custom).is_err());
+
+        let rows = access_rows(&snapshot);
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].choice, rows[1].choice), (0, 0));
+        let unlocked = |row: &AccessRow| row.editable && row.restriction.is_empty();
+        assert!(rows.iter().all(unlocked));
     }
 
     #[test]

@@ -13,9 +13,9 @@ use std::{
 };
 
 use morpheus_matrix::{
-    AccountSelection, AdminAction, AdminMember, AdminMembership, AdminOutcome, MemberPower,
-    PERMISSION_KEYS, PermissionKey, PermissionSetting, RoomAdminError, RoomAdminSession,
-    RoomAdminSnapshot, RoomSettingsCancellation, RosterWatch,
+    AccessChange, AccountSelection, AdminAction, AdminMember, AdminMembership, AdminOutcome,
+    MemberPower, PERMISSION_KEYS, PermissionKey, PermissionSetting, RoomAdminError,
+    RoomAdminSession, RoomAdminSnapshot, RoomSettingsCancellation, RosterWatch,
 };
 use slint::{ComponentHandle, ModelRc, VecModel};
 use tokio::{runtime::Handle, sync::Notify};
@@ -186,6 +186,13 @@ impl RoomAdminUi {
         ui.on_roster_request_permission(move |index, level| {
             if let Some(ui) = weak.upgrade() {
                 this.request_permission(&ui, index, level.as_str());
+            }
+        });
+        let this = owner.clone();
+        let weak = ui.as_weak();
+        ui.on_roster_request_access(move |kind, choice| {
+            if let Some(ui) = weak.upgrade() {
+                this.request_access(&ui, kind, choice);
             }
         });
         let this = owner.clone();
@@ -535,6 +542,16 @@ impl RoomAdminUi {
         }
     }
 
+    fn request_access(self: &Arc<Self>, ui: &AppWindow, kind: i32, choice: i32) {
+        let Some((panel, snapshot)) = self.idle_snapshot(ui) else {
+            return;
+        };
+        match super::access_intent(kind, choice, &snapshot) {
+            Ok(intent) => self.review(ui, panel, intent, &snapshot),
+            Err(message) => self.reject(ui, &panel, message),
+        }
+    }
+
     fn invite(self: &Arc<Self>, ui: &AppWindow) {
         let Some((panel, snapshot)) = self.idle_snapshot(ui) else {
             return;
@@ -687,7 +704,10 @@ fn reconcile_confirmation(state: &mut PanelState, snapshot: &RoomAdminSnapshot) 
 }
 
 fn reset_inputs(ui: &AppWindow, intent: &Intent, confirmed: bool) {
-    if matches!(intent.action, AdminAction::SetPermission(..)) {
+    if matches!(
+        intent.action,
+        AdminAction::SetPermission(..) | AdminAction::SetAccess(_)
+    ) {
         return;
     }
     if intent.action == AdminAction::Invite
@@ -720,11 +740,14 @@ fn render(ui: &AppWindow, view: &View) {
     render_confirmation(ui, view.confirm.as_ref(), snapshot);
     let pending_user = view.pending.as_ref().map(|intent| intent.user_id.as_str());
     let pending_key = pending_permission(view.pending.as_ref());
-    let permissions = snapshot
+    let mut permissions = snapshot
         .permissions
         .iter()
         .map(|setting| permission_row(*setting, snapshot, pending_key))
         .collect::<Vec<_>>();
+    let pending_change = pending_access(view.pending.as_ref());
+    let access = super::access_rows(snapshot).into_iter();
+    permissions.extend(access.map(|row| access_row(row, pending_change)));
     ui.set_roster_permissions(ModelRc::new(VecModel::from(permissions)));
     let query = ui.get_roster_query();
     let filter = Filter::from_index(ui.get_roster_filter());
@@ -820,6 +843,8 @@ fn permission_row(
     let thresholds = snapshot.thresholds.as_ref();
     RosterPermission {
         key: key.unwrap_or(-1),
+        kind: 0,
+        choice: -1,
         label: super::permission_label(setting.key).into(),
         description: super::permission_description(setting.key).into(),
         level: setting.level.to_string().into(),
@@ -827,6 +852,33 @@ fn permission_row(
         editable: setting.editable,
         restriction: restriction.into(),
         pending: pending == Some(setting.key),
+    }
+}
+
+fn access_row(row: super::AccessRow, pending: Option<AccessChange>) -> RosterPermission {
+    let pending = match pending {
+        Some(AccessChange::History { .. }) => row.kind == super::ACCESS_HISTORY,
+        Some(AccessChange::Guests { .. }) => row.kind == super::ACCESS_GUESTS,
+        None => false,
+    };
+    RosterPermission {
+        key: -1,
+        kind: row.kind,
+        choice: row.choice,
+        label: row.label.into(),
+        description: row.description.into(),
+        level: "".into(),
+        summary: row.summary.into(),
+        editable: row.editable,
+        restriction: row.restriction.into(),
+        pending,
+    }
+}
+
+fn pending_access(pending: Option<&Intent>) -> Option<AccessChange> {
+    match pending?.action {
+        AdminAction::SetAccess(change) => Some(change),
+        _ => None,
     }
 }
 
