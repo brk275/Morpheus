@@ -6450,6 +6450,17 @@ export component AppWindow inherits Window {
         playing: root.image-preview-playing;
         reduced-motion: StyleTokens.reduced-motion;
         text-scale: root.text-scale;
+        // Geometry follows the shared corner token. This base has no line,
+        // focus or control-padding tokens, so their built-in values are used;
+        // the integration maps StyleTokens.line-width, focus-width,
+        // control-radius and control-padding here (see the media handoff).
+        style: {
+            radius: StyleTokens.radius * 1.4,
+            control-radius: StyleTokens.radius * 0.7,
+            line-width: 1px,
+            focus-width: 2px,
+            control-padding: 12px,
+        };
         palette: {
             ink: root.ink,
             muted: root.muted,
@@ -6459,6 +6470,8 @@ export component AppWindow inherits Window {
             backdrop: StyleTokens.roles.media-backdrop.present ? StyleTokens.roles.media-backdrop.color : #11131b,
             scrim: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000cc,
             hover: root.hover,
+            pressed: root.hover,
+            disabled: root.muted,
             focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent,
             error: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b
         };
