@@ -3353,10 +3353,24 @@ async fn assert_themed_select(ui: &AppWindow) {
     let last = chosen.borrow().last().cloned();
     assert_eq!(last.as_deref(), Some("Headset"));
 
+    // The wheel moves the choice while the select has focus.
+    let select = control_with_label(ui, label);
+    let center = select.map_to_window(select.geometry().center());
+    let position = slint::LogicalPosition::new(center.x, center.y);
+    ui.window()
+        .dispatch_event(WindowEvent::PointerMoved { position });
+    ui.window().dispatch_event(WindowEvent::PointerScrolled {
+        position,
+        delta_x: 0.0,
+        delta_y: 10.0,
+    });
+    settle(ui).await;
+    assert_eq!(ui.get_audio_microphone_index(), 1, "wheel up");
+
     ui.set_audio_devices_busy(true);
     settle(ui).await;
     key(ui, Key::UpArrow);
-    assert_eq!(ui.get_audio_microphone_index(), 2, "disabled");
+    assert_eq!(ui.get_audio_microphone_index(), 1, "disabled");
 
     ui.set_audio_devices_busy(false);
     ui.set_audio_devices_enabled(false);
