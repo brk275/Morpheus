@@ -3555,6 +3555,54 @@ mod account_presentation_tests {
     }
 
     #[tokio::test]
+    async fn an_addressed_room_never_opens_for_a_stale_navigation_or_another_account() {
+        let (directory, live) = empty_profile();
+        live.is_live.store(true, Ordering::Release);
+        *live.selected_room.lock().await = Some("!kept:example.org".into());
+        *live.selected_space.lock().await = Some("!space:example.org".into());
+        live.space_children.lock().await.insert(
+            "!space:example.org".into(),
+            HashSet::from(["!target:example.org".into()]),
+        );
+        // A banner activation superseded by newer navigation changes nothing.
+        let stale = live.invalidate_navigation();
+        live.invalidate_navigation();
+        assert!(
+            !live
+                .open_room_target_for(
+                    "account",
+                    "!target:example.org".into(),
+                    stale,
+                    Weak::default()
+                )
+                .await
+                .unwrap()
+        );
+        // Neither does a current one for an account that is not active.
+        let current = live.invalidate_navigation();
+        assert!(
+            !live
+                .open_room_target_for(
+                    "account",
+                    "!target:example.org".into(),
+                    current,
+                    Weak::default()
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            live.selected_room.lock().await.as_deref(),
+            Some("!kept:example.org")
+        );
+        assert_eq!(
+            live.selected_space.lock().await.as_deref(),
+            Some("!space:example.org")
+        );
+        close_profile(directory, live).await;
+    }
+
+    #[tokio::test]
     async fn failed_activation_presentation_returns_to_detached_state() {
         let (directory, live) = empty_profile();
         // Simulate stale presentation state without granting core account

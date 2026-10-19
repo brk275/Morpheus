@@ -88,7 +88,8 @@ signing out an account withdraws and forgets its banners.
 ## Opening a banner
 
 Clicking a banner opens its exact account, room and, for a thread reply, the
-thread panel. A banner in the visible account opens directly. For another saved
+thread panel. An invitation banner opens its account, where the invitation
+waits in the room list. A banner in the visible account opens directly. For another saved
 account, or while no account is open, the click goes through the same switch as
 the account menu or Manage accounts: an unfinished security operation still
 blocks it, an active call still asks to be left first, and a protected account

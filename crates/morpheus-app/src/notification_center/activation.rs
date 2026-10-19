@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use morpheus_matrix::{AccountInfo, AccountSelection, MessageInfo};
+use morpheus_matrix::{AccountInfo, AccountSelection, MatrixCoreError, MessageInfo};
 use slint::{ComponentHandle, Model, ModelRc, VecModel, Weak};
 use tokio::{runtime::Handle, sync::mpsc, time::MissedTickBehavior};
 
@@ -32,6 +32,8 @@ const PENDING_TTL: Duration = Duration::from_secs(120);
 const ACCOUNT_GONE: &str = "The account for this notification is no longer saved.";
 const ROOM_GONE: &str = "The room for this notification is no longer joined.";
 const REPLY_OPEN: &str = "Send or cancel the reply or edit you are writing first.";
+const INVITE_OPEN: &str = "Accept or decline this invitation in the room list.";
+const NOT_OPENED: &str = "This notification could not be opened. Try again.";
 
 #[derive(Clone, Debug)]
 struct Pending {
@@ -228,11 +230,20 @@ impl Activator {
         ui.invoke_cancel_room_settings();
         ui.invoke_close_image_preview();
         ui.set_page(0);
-        if other_room {
-            crate::reset_room_search(ui);
-        }
-        let navigation_epoch = self.live.invalidate_navigation();
         let activator = self.clone();
+        if !other_room {
+            // Already open: keep its timeline and scroll position.
+            if let Some(root) = target.thread_root().map(str::to_owned) {
+                self.runtime.spawn(async move {
+                    activator
+                        .open_thread(selection, &account_id, &room_id, &root, generation)
+                        .await;
+                });
+            }
+            return;
+        }
+        crate::reset_room_search(ui);
+        let navigation_epoch = self.live.invalidate_navigation();
         let weak = self.ui.clone();
         self.runtime.spawn(async move {
             let opened = activator
@@ -243,13 +254,28 @@ impl Activator {
                 Ok(true) => {}
                 // Superseded by newer navigation or an account change.
                 Ok(false) => return,
-                Err(_) => {
+                Err(error) => {
                     if activator.is_current(generation)
                         && activator.live.navigation_is_current(navigation_epoch)
                     {
+                        let gone = matches!(error, MatrixCoreError::RoomNotFound(_));
                         let _ = weak.upgrade_in_event_loop(move |ui| {
-                            if ui.get_active_account_local_id().as_str() == account_id {
+                            if ui.get_active_account_local_id().as_str() != account_id {
+                                return;
+                            }
+                            // An invitation banner opens its account; the
+                            // invitation itself waits in the room list.
+                            if gone
+                                && ui
+                                    .get_invitations()
+                                    .iter()
+                                    .any(|invite| invite.id.as_str() == room_id)
+                            {
+                                ui.set_transfer_notice(INVITE_OPEN.into());
+                            } else if gone {
                                 ui.set_session_error(ROOM_GONE.into());
+                            } else {
+                                ui.set_session_error(NOT_OPENED.into());
                             }
                         });
                     }
