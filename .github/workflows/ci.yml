@@ -1,12 +1,12 @@
 # TEMPORARY owner-reviewed layout contracts. NEVER MERGE this workflow.
 name: Reviewed layout contracts
-run-name: Reviewed layout contracts - 67386ee
+run-name: Reviewed layout contracts - 027a2b4
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: layout-contracts-67386ee-${{ github.ref }}
+  group: layout-contracts-027a2b4-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   search:
@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 67386eeb2d91e6f71c74c161b0d3f6320d313824
+          ref: 027a2b4e05b4e3c1836baba502517270355a12fd
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -179,7 +179,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='67386eeb2d91e6f71c74c161b0d3f6320d313824'
+          source='027a2b4e05b4e3c1836baba502517270355a12fd'
           assert subprocess.check_output(['git','rev-parse','HEAD'],cwd=workspace,env=environment,text=True).strip()==source
           assert hashlib.sha256((workspace/'Cargo.lock').read_bytes()).hexdigest()=='8db1e7dcf70013d71a4d9fa8be42a25da4efa1d74edd6711812a2897c0ccf6b7'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
@@ -265,10 +265,14 @@ jobs:
               for function in re.findall(r'#\[test\]\s*(?:#\[[^\]\r\n]+\]\s*)*(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(',text):
                   known_test_ids.add(prefix+function)
           checks=[
-              ('workspace_layout', ['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'workspace_layout::tests::', '--', '--test-threads=1'], 2700, {'workspace_layout::tests::hidden_and_collapsed_panes_restore_to_the_default', 'workspace_layout::tests::the_account_control_stays_bottom_left_in_every_arrangement', 'workspace_layout::tests::presets_change_only_the_arrangement_and_are_recognized', 'workspace_layout::tests::narrow_windows_give_way_in_order_and_keep_the_conversation', 'workspace_layout::tests::the_default_arrangement_matches_the_classic_layout'}, set()),
+              ('workspace_layout', ['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'workspace_layout::tests::', '--', '--test-threads=1'], 2700, {'workspace_layout::tests::hidden_and_collapsed_panes_restore_to_the_default', 'workspace_layout::tests::the_account_control_stays_bottom_left_in_every_arrangement', 'workspace_layout::tests::presets_change_only_the_arrangement_and_are_recognized', 'workspace_layout::tests::narrow_windows_give_way_in_order_and_keep_the_conversation', 'workspace_layout::tests::the_default_arrangement_matches_the_classic_layout', 'workspace_layout::tests::a_dragged_width_commits_once_clamped_and_never_over_an_external_change', 'workspace_layout::tests::a_dragged_pane_lands_exactly_once_at_its_insertion_position', 'workspace_layout::tests::reordering_keeps_hidden_collapsed_and_widths_and_refuses_stale_orders'}, set()),
+              ('voice_rosters', ['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'voice_rosters::', '--', '--test-threads=1'], 2700, {'voice_rosters::tests::only_the_current_scope_selection_and_watcher_may_store_a_roster', 'voice_rosters::tests::unsupported_rooms_stop_while_a_missing_slot_claims_nothing', 'voice_rosters::tests::releasing_a_watcher_stops_and_aborts_its_work', 'voice_rosters::tests::finished_watchers_recover_and_changed_modes_restart_without_a_loop', 'voice_rosters::model::tests::rooms_watched_are_bounded_unique_and_follow_visibility', 'voice_rosters::model::tests::people_are_one_per_user_with_bounded_sanitized_labels', 'voice_rosters::model::tests::presence_never_overstates_and_goes_stale', 'voice_rosters::model::tests::only_passive_dialects_get_a_roster'}, set()),
+              ('passive_observer', ['cargo', 'test', '--locked', '-p', 'morpheus-rtc', '--features', 'native-devices', '--lib', 'observer::tests::', '--', '--test-threads=1'], 2700, {'observer::tests::stable_slot_request_matches_the_pinned_writer_without_ruma_aliasing', 'observer::tests::closed_or_malformed_stable_slot_never_reads_an_unstable_open_slot', 'observer::tests::exact_missing_stable_state_reads_and_validates_the_unstable_slot', 'observer::tests::unavailable_auth_or_non_missing_errors_never_try_an_alias', 'observer::tests::missing_or_closed_unstable_state_cannot_rearm_a_missing_slot', 'observer::tests::slot_requires_explicit_open_known_encryption_and_call_application', 'observer::tests::selected_dialect_never_accepts_the_other_wire_slot_or_legacy', 'observer::tests::membership_claims_and_dual_keys_cannot_conflict', 'observer::tests::absent_current_reference_is_pending_but_duplicates_and_invalid_entries_are_fatal', 'observer::tests::missing_reference_never_masks_a_later_invalid_or_duplicate_participation', 'observer::tests::roster_requires_actual_encrypted_device_and_current_refresh_identity', 'observer::tests::debug_redacts_identity_and_opaque_ids_are_bounded'}, set()),
               ('app_transfer_private_ui', ['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation', '--', '--exact', '--test-threads=1'], 2700, {'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'}, set()),
               ('native_app_build', ['cargo', 'build', '--locked', '-p', 'morpheus-app', '--features', 'native-calls'], 2400, None, set()),
           ]
+          for _name, _args, _seconds, required, _ignored in checks:
+              if required is not None: known_test_ids.update(required)
           # Stop at the first concrete failure; diagnose it before further native work.
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
@@ -337,7 +341,13 @@ jobs:
                   failed_packages=set(re.findall(r'could not compile `([A-Za-z0-9_-]+)`',normalized))
                   # Only reviewed public filenames and numeric compiler spans.
                   # Missing identifiers are admitted only if already in those public sources.
-                  source_files=('crates/morpheus-config/src/lib.rs',
+                  source_files=('crates/morpheus-app/src/voice_rosters/mod.rs',
+                      'crates/morpheus-app/src/voice_rosters/model.rs',
+                      'crates/morpheus-app/src/voice_rosters/tests.rs',
+                      'crates/morpheus-app/ui/voice-rosters.slint',
+                      'crates/morpheus-app/ui/icons.slint',
+                      'crates/morpheus-rtc/src/observer.rs',
+                      'crates/morpheus-config/src/lib.rs',
                       'crates/morpheus-config/src/registry.rs',
                       'crates/morpheus-config/src/diagnostics.rs',
                       'crates/morpheus-config/src/input.rs',
@@ -399,6 +409,7 @@ jobs:
                       locations.extend({'file':path,'line':line,'column':column} for line,column in sorted(spans)[:32])
                   missing=set(re.findall(r'cannot find (?:value|function|type|struct) `([A-Za-z_][A-Za-z0-9_]{0,127})`',normalized))
                   record['failure_diagnostics']={
+                      'ui_timeout_phases':[int(phase) for phase in re.findall(r'morpheus-ui-timeout-phase=([0-9]{1,3})', output)[:8]],
                       'transfer_focus_state':[{'page':int(page),'panel':panel=='true','tab':int(tab),'pending':pending=='true','headings':int(headings)}
                           for page,panel,tab,pending,headings in re.findall(r'MORPHEUS_TRANSFER_FOCUS_STATE page=([0-9]{1,2}) panel=(true|false) tab=([0-9]{1,2}) pending=(true|false) headings=([0-9]{1,3})',output)[:8]],
                       'ui_settings_target_failures':[{'stage':int(stage),'index':int(index),'live':live=='true'}
