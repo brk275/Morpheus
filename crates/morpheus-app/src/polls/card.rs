@@ -176,7 +176,10 @@ mod tests {
         assert!(own.can_vote && own.can_end);
         let other = poll_card(&row(poll(false, true), false, Some("$poll")));
         assert!(other.can_vote && !other.can_end);
-        assert_eq!(poll_card(&row(poll(false, true), false, None)).question, "Lunch?");
+        assert_eq!(
+            poll_card(&row(poll(false, true), false, None)).question,
+            "Lunch?"
+        );
         let mut plain = row(poll(false, true), false, Some("$text"));
         plain.poll = None;
         assert!(!poll_card(&plain).present);

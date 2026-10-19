@@ -22,7 +22,7 @@ pub use image_packs::{
 mod polls;
 pub use polls::{
     MAX_POLL_ANSWER_CHARS, MAX_POLL_ANSWER_COUNT, MAX_POLL_QUESTION_CHARS, MIN_POLL_ANSWER_COUNT,
-    PollAnswerInfo, PollDraft, PollDraftError, PollError, PollInfo, ValidPoll,
+    PollAnswerInfo, PollDraft, PollDraftError, PollError, PollInfo, PollSendKey, ValidPoll,
 };
 mod discovery;
 pub use discovery::{

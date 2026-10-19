@@ -8,7 +8,7 @@ use std::{cell::RefCell, sync::Arc};
 
 use morpheus_matrix::{
     AccountSelection, MAX_POLL_ANSWER_COUNT, MIN_POLL_ANSWER_COUNT, MessageInfo, PollDraft,
-    PollError,
+    PollError, PollSendKey,
 };
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 use tokio::runtime::Handle;
@@ -35,6 +35,9 @@ struct Dialog {
     account_id: String,
     room_id: String,
     draft: PollDraft,
+    /// Reused when the same draft is sent again, so a retry after an
+    /// uncertain send cannot post a second copy; any edit replaces it.
+    key: PollSendKey,
     busy: bool,
 }
 
@@ -171,6 +174,11 @@ fn choose_option(ui: &AppWindow, event_id: &str, option_id: &str, thread_root: &
             draft.event_id = event_id.to_owned();
             draft.chosen = own.iter().map(|id| (*id).to_owned()).collect();
         }
+        // An edit of the poll may have removed answers or lowered its limit.
+        draft
+            .chosen
+            .retain(|id| poll.answers.iter().any(|answer| answer.id == *id));
+        draft.chosen.truncate(limit);
         let accepted = toggle(&mut draft.chosen, option_id, limit);
         draft.ready = differs(&draft.chosen, &own);
         Some(accepted)
@@ -281,6 +289,9 @@ fn vote(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, event_id: &str, thr
         .iter()
         .all(|id| poll.answers.iter().any(|answer| &answer.id == id));
     if poll.ended || !known || chosen.len() > limit {
+        // Fall back to the counted vote instead of keeping an unsendable draft.
+        STATE.with_borrow_mut(|state| state.draft = None);
+        publish_draft(ui);
         set_notice(ui, event_id, &PollError::InvalidChoice.to_string(), true);
         return;
     }
@@ -313,9 +324,8 @@ fn vote(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, event_id: &str, thr
 
 /// Only an own, sent, open poll offers End; the card confirms first.
 fn endable(ui: &AppWindow, event_id: &str, thread_root: &str) -> bool {
-    shown_poll(ui, event_id, thread_root).is_some_and(|info| {
-        info.is_own && info.poll.as_ref().is_some_and(|poll| !poll.ended)
-    })
+    shown_poll(ui, event_id, thread_root)
+        .is_some_and(|info| info.is_own && info.poll.as_ref().is_some_and(|poll| !poll.ended))
 }
 
 fn request_end(ui: &AppWindow, event_id: &str) {
@@ -410,6 +420,8 @@ fn edit_dialog(ui: &AppWindow, edit: impl FnOnce(&mut PollDraft)) {
     let edited = STATE.with_borrow_mut(|state| match state.dialog.as_mut() {
         Some(dialog) if !dialog.busy => {
             edit(&mut dialog.draft);
+            // A different draft is a different poll; never dedupe it away.
+            dialog.key = PollSendKey::new();
             let count = dialog.draft.answers.len().max(1);
             dialog.draft.max_selections = dialog.draft.max_selections.clamp(1, count);
             true
@@ -445,6 +457,7 @@ fn open_dialog(ui: &AppWindow, live: &Arc<LiveUi>) {
             account_id,
             room_id,
             draft,
+            key: PollSendKey::new(),
             busy: false,
         });
     });
@@ -488,9 +501,10 @@ fn submit_dialog(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle) {
             dialog.account_id.clone(),
             dialog.room_id.clone(),
             dialog.draft.clone(),
+            dialog.key.clone(),
         ))
     });
-    let Some((operation, selection, account_id, room_id, draft)) = job else {
+    let Some((operation, selection, account_id, room_id, draft, key)) = job else {
         return;
     };
     publish_dialog(ui);
@@ -499,7 +513,7 @@ fn submit_dialog(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle) {
     handle.spawn(async move {
         let result = live
             .manager
-            .create_poll_for(&selection, &room_id, &draft)
+            .create_poll_for(&selection, &room_id, &draft, &key)
             .await;
         let _ = weak.upgrade_in_event_loop(move |ui| {
             let current = STATE.with_borrow_mut(|state| match state.dialog.as_mut() {
@@ -509,11 +523,19 @@ fn submit_dialog(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle) {
                 }
                 _ => false,
             });
-            if !current || !selection.is_current() || !shows(&ui, &account_id, &room_id) {
+            if !current {
+                return;
+            }
+            if !selection.is_current() || !shows(&ui, &account_id, &room_id) {
+                // Never leave a dialog whose busy state can no longer clear.
+                close_dialog(&ui);
                 return;
             }
             match result {
-                Ok(()) => close_dialog(&ui),
+                Ok(()) => {
+                    close_dialog(&ui);
+                    ui.invoke_focus_composer(false);
+                }
                 Err(error) => {
                     publish_dialog(&ui);
                     let global = ui.global::<PollUiState>();
@@ -692,6 +714,8 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
             && !dialog_busy()
         {
             close_dialog(&ui);
+            // The closed dialog took keyboard focus with it.
+            ui.invoke_focus_composer(false);
         }
     });
 

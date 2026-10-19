@@ -25,7 +25,7 @@ use matrix_sdk::{
     Room, RoomState,
     deserialized_responses::RawSyncOrStrippedState,
     ruma::{
-        EventId, UInt, UserId,
+        EventId, OwnedTransactionId, TransactionId, UInt, UserId,
         api::error::ErrorKind,
         events::{
             MessageLikeEventType,
@@ -85,11 +85,28 @@ pub struct ValidPoll {
     disclosed: bool,
 }
 
+/// The transaction of one draft's create. Retrying the same draft with the
+/// same key lets the homeserver drop a duplicate if the first send arrived.
+#[derive(Clone, Debug)]
+pub struct PollSendKey(OwnedTransactionId);
+
+impl PollSendKey {
+    pub fn new() -> Self {
+        Self(TransactionId::new())
+    }
+}
+
+impl Default for PollSendKey {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PollDraftError {
     #[error("Enter a question.")]
     QuestionMissing,
-    #[error("Keep the question to {} characters or fewer.", MAX_POLL_QUESTION_CHARS)]
+    #[error("Keep the question within {} characters.", MAX_POLL_QUESTION_CHARS)]
     QuestionTooLong,
     #[error("Add at least {} options.", MIN_POLL_ANSWER_COUNT)]
     TooFewAnswers,
@@ -97,7 +114,7 @@ pub enum PollDraftError {
     TooManyAnswers,
     #[error("Fill in or remove the empty option.")]
     AnswerMissing,
-    #[error("Keep each option to {} characters or fewer.", MAX_POLL_ANSWER_CHARS)]
+    #[error("Keep each option within {} characters.", MAX_POLL_ANSWER_CHARS)]
     AnswerTooLong,
     #[error("Each option must be different.")]
     DuplicateAnswer,
@@ -258,11 +275,13 @@ impl ValidPoll {
 impl AccountManager {
     /// Send a new poll to the room, after validation and the room's
     /// permission and send gates. The poll appears from the server's echo.
+    /// A retry of the same draft must pass the same `key`.
     pub async fn create_poll_for(
         &self,
         selection: &AccountSelection,
         room_id: &str,
         draft: &PollDraft,
+        key: &PollSendKey,
     ) -> Result<(), PollError> {
         let poll = draft.validate().map_err(PollError::Draft)?;
         let content = UnstablePollStartEventContent::New(poll.start_content()?);
@@ -279,6 +298,7 @@ impl AccountManager {
             self.ready_to_send(selection, &loaded, &room).await?;
             entered.store(true, Ordering::Release);
             room.send(content)
+                .with_transaction_id(key.0.clone())
                 .await
                 .map(drop)
                 .map_err(|error| send_failure(&error))
@@ -676,7 +696,13 @@ fn display_text(text: &str, max_chars: usize) -> String {
     let line: String = text
         .chars()
         .filter(|character| !hidden_character(*character))
-        .map(|character| if character.is_control() { ' ' } else { character })
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
         .collect();
     let line = line.trim();
     if line.chars().count() <= max_chars {
@@ -719,7 +745,10 @@ mod tests {
         }
         let many: Vec<String> = (0..21).map(|index| index.to_string()).collect();
         let many: Vec<&str> = many.iter().map(String::as_str).collect();
-        assert_eq!(draft(&many, 1).validate(), Err(PollDraftError::TooManyAnswers));
+        assert_eq!(
+            draft(&many, 1).validate(),
+            Err(PollDraftError::TooManyAnswers)
+        );
         let mut long = draft(&["Soup", "Salad"], 1);
         long.question = "q".repeat(301);
         assert_eq!(long.validate(), Err(PollDraftError::QuestionTooLong));

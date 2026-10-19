@@ -208,6 +208,14 @@ export component PollCard inherits Rectangle {
     property <bool> confirming: root.event-id != "" && PollUiState.confirm-end-event-id == root.event-id;
     property <bool> noticed: root.event-id != "" && PollUiState.notice-event-id == root.event-id;
     property <bool> choosable: root.enabled && root.data.can-vote && !root.busy;
+    // A keyboard-activated End/Keep open/confirm swaps the row its button is
+    // in; these carry focus to the button that replaces it.
+    property <bool> refocus-confirm: false;
+    property <bool> refocus-actions: false;
+    changed event-id => {
+        root.refocus-confirm = false;
+        root.refocus-actions = false;
+    }
 
     height: content.preferred-height;
     border-radius: root.corner;
@@ -274,7 +282,16 @@ export component PollCard inherits Rectangle {
                 text: "End poll";
                 enabled: root.enabled && !root.busy;
                 accessible-label: "End the poll " + root.data.question;
-                clicked => { PollUiState.request-end(root.event-id); }
+                init => {
+                    if root.refocus-actions {
+                        root.refocus-actions = false;
+                        self.focus();
+                    }
+                }
+                clicked => {
+                    root.refocus-confirm = self.has-focus;
+                    PollUiState.request-end(root.event-id);
+                }
             }
             if root.data.can-vote : Button {
                 text: root.data.has-vote ? "Change vote" : "Vote";
@@ -300,14 +317,27 @@ export component PollCard inherits Rectangle {
                     text: "Keep open";
                     enabled: !root.busy;
                     accessible-label: "Keep the poll " + root.data.question + " open";
-                    clicked => { PollUiState.cancel-end(); }
+                    // The safe choice takes focus when End was pressed by keyboard.
+                    init => {
+                        if root.refocus-confirm {
+                            root.refocus-confirm = false;
+                            self.focus();
+                        }
+                    }
+                    clicked => {
+                        root.refocus-actions = self.has-focus;
+                        PollUiState.cancel-end();
+                    }
                 }
                 Button {
                     text: "End poll";
                     primary: true;
                     enabled: root.enabled && !root.busy;
                     accessible-label: "Confirm ending the poll " + root.data.question;
-                    clicked => { PollUiState.confirm-end(root.event-id, root.thread-root); }
+                    clicked => {
+                        root.refocus-actions = self.has-focus;
+                        PollUiState.confirm-end(root.event-id, root.thread-root);
+                    }
                 }
             }
         }
