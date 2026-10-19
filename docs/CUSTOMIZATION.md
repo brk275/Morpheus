@@ -50,6 +50,24 @@ Their palette files are embedded in the app. Setting only
 `appearance.theme_pack = "terminal"` selects its colors; use the in-app preset
 or set the fields below to select its fonts and layout too.
 
+### Style examples
+
+[`examples/appearance/styles`](../examples/appearance/styles) holds four
+sparse configurations that combine the settings on this page. Each one uses
+only registry keys, needs no extra theme file, changes no shortcuts or account
+entries, and is checked by the configuration tests. Merge a file's keys into
+your `config.toml` rather than replacing it, then adjust from Settings.
+
+| Example | Character | Settings it combines |
+| --- | --- | --- |
+| [Harbor](../examples/appearance/styles/harbor.toml) | Roomy, cool slate, soft | Spacious density, large radii and padding, circular 40 px avatars, composer and navigation states, sender palette, 140/180 ms fades |
+| [Ledger](../examples/appearance/styles/ledger.toml) | Dense, square, light | Paper palette, compact density, small type, 2 px radii, 24 px avatars, columns, 24-hour clock, text sidebar with direct messages first |
+| [Lantern](../examples/appearance/styles/lantern.toml) | Warm, reading-focused | Amber palette, serif messages at 17 px, larger sender and timestamp text, broad inset, icon and selection states |
+| [Beacon](../examples/appearance/styles/beacon.toml) | Maximum legibility | High-contrast palette, 2 px outlines, 4 px focus ring, larger icons and type, reduced motion |
+
+Custom colors are applied as written; check contrast with your own surfaces
+and text scale. Beacon keeps the built-in high-contrast colors.
+
 ## Navigation
 
 **Settings → Layout → Navigation** edits the same schema-version-1 fields as
@@ -88,6 +106,83 @@ The native projection/focus guards passed on all four targets at `2fddb7f`;
 the sidebar and labeled rail passed Linux visual review. Broader installed
 keyboard and screen-reader checks remain required, including long names, many
 Spaces and 200% text scale.
+
+## Pane order and density
+
+**Settings → Layout** also arranges the panes without hiding navigation:
+
+```toml
+[layout]
+details_side = "left"          # "right" (default) or "left" of the conversation
+direct_messages_first = true   # default false; grouped lists only
+room_density = "compact"       # omitted follows appearance.density
+message_density = "spacious"   # omitted follows appearance.density
+```
+
+The details, members, thread and search panel can sit on either side of the
+conversation. The rail, room list and account control stay where they are, and
+Tab and screen-reader order are unchanged. With grouped lists, direct messages
+can be shown above rooms; next/previous unread shortcuts and the quick switcher
+follow that order. Room-list and message density can each override the global
+density: compact halves message padding and spacious uses about 1.33 times it;
+room rows use the compact, comfortable or spacious row heights. No option can
+hide every navigation surface or the account control, and the protected
+account switch, logout and Manage accounts actions keep their existing
+confirmations. Starting points keep these choices.
+
+## Keyboard shortcuts
+
+**Settings → Keyboard shortcuts** lists every action with its combination and
+a filter by action, group or combination. Activate a combination to record the
+next one you press. Escape or Tab cancels and returns focus to that row, and
+clicking elsewhere also cancels, so focus is never trapped and shortcuts never
+stay paused. A combination can also be typed, for example `Mod+Shift+K`.
+Each change saves at once. A combination already used by another action is not
+saved, and the message names that action. **Default**, **Disable**, **Undo**
+and **Restore all defaults** are available; Undo never overwrites a change made
+elsewhere.
+
+| Action (`[shortcuts]` key) | Default |
+| --- | --- |
+| Switch room (`quick_switcher`) | `Mod+K` |
+| Search current room (`search`) | `Mod+F` |
+| Next / previous unread room (`next_unread`, `previous_unread`) | `Alt+Down`, `Alt+Up` |
+| Next / previous room (`next_room`, `previous_room`) | `Alt+Shift+Down`, `Alt+Shift+Up` |
+| Go to Home (`go_home`) | `Mod+1` |
+| Open Settings (`open_settings`) | `Mod+Shift+S` |
+| Search Settings (`search_settings`) | `Mod+Shift+F` |
+| Focus the message composer (`focus_composer`) | `Mod+L` |
+| Open the emoji picker (`open_emoji_picker`) | `Mod+E` |
+| Show or hide the details panel (`toggle_details_panel`) | `Mod+Shift+D` |
+| Show members (`show_members_panel`) | `Mod+Shift+P` |
+| Show the open thread (`show_thread_panel`) | `Mod+Shift+T` |
+| Open the account menu (`open_account_menu`) | `Mod+Shift+U` |
+
+```toml
+# An excerpt: a [shortcuts] table lists every action you keep.
+[shortcuts]
+quick_switcher = "Mod+K"
+toggle_details_panel = "Ctrl+Shift+D"
+next_room = "Alt+PageDown"
+```
+
+`Mod` is Command on macOS and Ctrl elsewhere; recorded combinations are saved
+with `Mod` so the file works on every platform, and a conflict on either
+platform is rejected. Combinations need Mod, Ctrl, Meta or Alt with A–Z, 0–9, an
+arrow, Home, End, PageUp, PageDown or F1–F12; editing keys (`Mod+A`, `C`, `V`,
+`X`, `Y`, `Z`), window keys (`Q`, `W`, `H`, `M`, `Alt+F4`), Alt with a letter or
+digit, and Shift with a digit are reserved. An existing `[shortcuts]` table is
+used exactly as written: an action it omits stays disabled, so an older file does
+not gain new bindings until you choose **Default** or **Restore all defaults**.
+Unknown actions and malformed combinations reject the edit and keep the last
+valid configuration.
+
+Shortcuts pause in Settings, while recording and in dialogs, and keys a focused
+text field uses keep priority. Room cycling opens conversations only and never
+joins a voice space. No action can send, remove an account, log out, switch
+accounts or change a protected setting; the account menu shortcut only opens the
+menu, whose entries keep their own confirmations. Shortcuts cannot run commands
+or scripts.
 
 ## Room header
 
@@ -241,6 +336,66 @@ weights, line-height controls, background images and arbitrary pane arrangements
 remain future work. The pinned rich-text component does not expose body-weight
 or line-height controls. Theme packs cannot execute code.
 
+### Typography and geometry details
+
+**Settings → Appearance → Typography and geometry details** edits one size at a
+time. Its categories are Text sizes; Corners, borders and focus; Padding; and
+Icons and avatars. A filter and Settings search reach each metric directly, for
+example “focus ring”, “avatar roundness” or “composer padding”. The steppers
+apply at once; a typed whole number applies with Enter, Escape restores the
+field, and an out-of-range number only shows a hint. Undo, Reset to default /
+Use built-in and Reset all work like the color editor: each change is decided
+on the re-read file, and Undo never overwrites a later edit made elsewhere.
+
+Every value is a whole number of logical pixels before text scaling unless the
+unit says percent. An omitted optional field keeps each surface's built-in
+value, so removing it from the file restores the previous look.
+
+| Field | Default | Range | Affects |
+| --- | --- | --- | --- |
+| `typography.sidebar_size` | `13` | 10–24 | Room-list rows, text-sidebar routes and the Space heading |
+| `typography.sender_size` | Omitted | 10–32 | Timeline sender names in every layout; omitted follows each layout's message-based size |
+| `typography.timestamp_size` | Omitted | 8–20 | Timeline clocks and thread-reply clocks; omitted keeps 10 |
+| `typography.composer_size` | Omitted | 10–32 | Message and thread composer text and the composer placeholder; omitted follows `message_size` |
+| `geometry.control_radius` | Omitted | 0–24 | Text buttons and icon buttons; omitted keeps their share of `corner_radius` |
+| `geometry.input_radius` | Omitted | 0–24 | The text fields listed for `input_padding`; omitted keeps each field's corners |
+| `geometry.composer_radius` | Omitted | 0–32 | Message and thread composers |
+| `geometry.border_width` | `1` | 0–4 | Text buttons, text fields, the message composer, attachment cards and reactions |
+| `geometry.focus_width` | `2` | 1–6 | Keyboard focus rings of buttons, actions and text fields |
+| `geometry.control_padding` | `12` | 4–24 | Horizontal padding inside text buttons, scaled with text |
+| `geometry.input_padding` | `10` | 4–20 | Text fields in Settings, discovery, the quick switcher, highlight words and recovery |
+| `geometry.composer_padding` | `10` | 4–24 | Horizontal padding inside both composers |
+| `geometry.icon_size` | `18` | 12–28 | Icons in icon buttons |
+| `geometry.avatar_size` | Omitted | 16–64 | Timeline avatars; omitted keeps 38 in Stacked and 26 in Compact and Columns |
+| `geometry.avatar_roundness` | Omitted | 0–50 % | Every avatar, as a share of its size; 50 draws a circle |
+
+Icon buttons at their default size grow to fit a larger icon (34 logical pixels
+up to 44 at `icon_size = 28`). Room headers, both composers, attachment cards,
+Settings number rows and picker search rows grow by the same amount, so a large
+icon never clips. Buttons with a smaller fixed size, such as the message
+actions, keep their size and draw the icon as large as fits. A narrow timeline
+row reserves room for the tallest of the sender name, message text and shown
+clock before placing the message actions below them.
+
+High contrast draws borders at least one pixel wide even when `border_width` is
+`0`; other palettes respect `0`. Starting points reset these metrics to their
+defaults like other typography and geometry, except `focus_width`, which they
+keep as an accessibility choice. Message bodies use the pinned rich-text
+component, which has no line-height or body-weight property, and the composer
+is a single-line field, so line spacing is not offered.
+
+```toml
+[typography]
+sidebar_size = 14
+timestamp_size = 11
+
+[geometry]
+focus_width = 3
+border_width = 2
+icon_size = 22
+avatar_roundness = 50
+```
+
 ### Motion
 
 Buttons and navigation use a short native fade for decorative hover feedback.
@@ -256,6 +411,19 @@ hover_duration_ms = 120
 
 A value of 0 gives immediate feedback. Reduce motion overrides the duration while
 preserving it, so turning Reduce motion off restores your chosen timing.
+
+Two further decorative fades are off by default and are set separately, in
+**Typography, geometry and motion → Motion** or in TOML:
+
+```toml
+[appearance]
+popup_fade_ms = 120  # account menu, mention/emoji/sticker pickers, quick switcher
+panel_fade_ms = 160  # details panel when it opens
+```
+
+Each accepts 0–1,000 ms. They only fade content in; they never delay focus,
+input or layout, and selection, focus outlines and content change immediately.
+Reduce motion makes every fade immediate without changing the saved values.
 
 Choose **Appearance → Reduce motion** for immediate hover feedback, or set:
 
@@ -287,21 +455,40 @@ controls documented above do have consumers. The monospace font setting covers
 timestamps and security codes; it does not replace every rich-message code
 font.
 
-## Per-account theme
+## Per-account appearance
 
-Each saved account can show its own theme mode. The override is a TOML
-preference keyed by the local account ID, the same key the notification and
-call-mode overrides use:
+Each saved account can show its own theme mode and its own colors. The
+overrides are TOML preferences keyed by the local account ID, the same opaque
+key the notification and call-mode overrides use; they are never looked up by
+display name or Matrix ID:
 
 ```toml
 [appearance]
 theme = "dark"
 
+[colors]
+accent = "#9CD7CD"
+
 [account_overrides."<local account ID>"]
 theme = "light"
+
+[account_overrides."<local account ID>".colors]
+accent = "#B7A4EA"
+canvas = "#F4F1FA"
 ```
 
-The window shows an account's `theme` only after that account has been
+An account's colors are drawn over the global `[colors]` table, which is drawn
+over the theme pack and the built-in palette; any registry token can be set.
+In **Settings → Appearance → Colors and window**, choose **This account** to
+edit the active account's colors and **All accounts** for the global table.
+With **All accounts**, a color the active account sets for itself shows the
+global value when `config.toml` holds one, and the source line says the
+account uses its own color. Undo and Reset all never cross accounts: switching accounts drops their pending
+steps, and with no active account the editor returns to **All accounts**.
+Removing or logging out of an account removes that account's theme and colors
+and leaves every other account and the global preferences untouched.
+
+The window shows an account's `theme` and colors only after that account has been
 activated: a successful switch, a protected activation with the right app
 password, or a startup restore. A wrong password, a cancelled dialog or a
 switch that became stale keeps the current account's appearance. Removing or
@@ -316,7 +503,7 @@ screen. While the active account has an override, a notice under the picker
 names the override, the window keeps showing it, and the global edit applies
 to the other accounts; the TOML entry has to change or be removed for this
 account to follow the global choice. Theme packs (`appearance.theme_pack`),
-fonts, geometry and layout remain global.
+fonts, geometry, sender palettes and layout remain global.
 Invalid edits keep the last valid configuration, including each account's
 last valid theme, until the file is valid again. The override is a local
 presentation preference; it is not written to Matrix.
@@ -452,13 +639,75 @@ colors when applicable. Users choose their own contrast; syntactically valid
 low-contrast colors are not silently replaced. The three shipped presets include
 semantic roles and sender text palettes with source contrast checks.
 
+### Interaction states
+
+A theme file may also include an optional `[states]` table, and every state can
+be overridden in `[colors]` of `config.toml` and in **Settings → Appearance →
+Colors and window** (categories *Inputs and controls* and *Navigation and
+badges*). An unset state follows the color named below, or keeps each
+control's own built-in color, so themes without the table and the three shipped
+presets look exactly as before.
+
+| State | Used for | When unset |
+| --- | --- | --- |
+| `message_hover` | Timeline message under the pointer | Follows `elevated` |
+| `control_hover` | Hover of text buttons and icon buttons | Each button's hover color |
+| `control_pressed` | Layer while a button, room, route or Space is pressed | No pressed layer |
+| `control_disabled` | Text and icons of unavailable buttons | Each button's disabled look |
+| `input_surface` | Text fields in Settings, discovery, the quick switcher, highlight words and recovery | Each field's background |
+| `input_border` | Those fields' borders without keyboard focus | Follows `divider` |
+| `composer_surface` | Message and thread composers | Follows `elevated` |
+| `composer_border` | Message composer border | Follows `divider` |
+| `composer_focus` | Composer border while typing; setting it also outlines the focused thread composer | Follows `composer_border` |
+| `icon` | Quiet icon buttons: message actions, composer tools, room header actions | Follows `muted` |
+| `icon_active` | Primary or switched-on icons such as Send and open pickers | Follows `accent` |
+| `nav_hover` | Room, direct message, route and Space rows under the pointer | Each row's hover color |
+| `nav_selected` | The open room, route or Space | Follows `selection` |
+| `nav_selected_ink` | Its text and icons | Follows `selection_ink` |
+| `mention` | Badge of rooms with unread messages that mention you | Follows `destructive` |
+| `mention_ink` | Number on the mention badge | Follows `destructive_ink` |
+
+Rooms with unread mentions or highlights show a separate `@` badge with the
+mention count instead of the plain unread count; the count comes from the
+Matrix client's read receipts for the active account. Screen readers hear both
+counts in the row description. Badges widen for long counts and large text.
+
+### Sender name colors
+
+**Settings → Appearance → Sender name colors** edits a palette stored in
+`config.toml`; it replaces the theme pack's `[senders]` palette and survives
+choosing a starting point:
+
+```toml
+[chat]
+color_senders = true
+
+[senders]
+colors = ["#C2AEFA", "#9DD8CD", "#F0C28F", "#ACCEFF"]
+```
+
+Each row shows a sample name on the conversation background with its hex value.
+A complete `#RRGGBB` or `#RRGGBBAA` value saves at once; partial input only shows
+a hint. Colors can be moved earlier or later, removed (one always remains) or
+added up to 16. Undo restores the previous palette only while the file still
+holds the palette you saved, and **Use theme colors** removes your palette.
+Colors with less than 4.5:1 contrast against the conversation background are
+marked *Low contrast*. Contrast is measured as the color is drawn: its alpha is
+blended over the background first, so a mostly transparent color is reported
+even when its opaque form would be readable. Colors are never changed for you,
+including their alpha and in the high contrast palette. Each sender keeps the
+slot derived from their Matrix user ID, so a name has the same color in every
+room and account; nothing about senders is stored. With no palette at all,
+names use each sender's identity color, and the first edit starts from those
+colors.
+
 Old eleven-token themes keep their previous per-control fallbacks. Omitting a
 role restores that control's existing color; it does not borrow the value from
 the previously selected theme. Editing colors or removing optional fields
 reloads the active palette. Invalid edits retain the last valid appearance and
 show an error. Any token can also be overridden in the `[colors]` table of `config.toml`,
-which the Settings color editor writes; sender palettes are edited in the theme
-file.
+which the Settings color editor writes; a `[senders]` palette in `config.toml`
+replaces the theme's sender palette (see [Sender name colors](#sender-name-colors)).
 
 To reset custom colors, choose a **Base palette** in Settings; this clears the
 custom theme selection and preserves fonts and geometry. To reset an embedded

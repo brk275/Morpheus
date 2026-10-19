@@ -56,7 +56,9 @@ and remove hand-written comments. Keep a private backup if those matter.
 ## Colors and transparency
 
 The [sparse example](../examples/appearance/config.toml) demonstrates a few
-overrides. Merge its keys instead of replacing an existing configuration:
+overrides, and [`examples/appearance/styles`](../examples/appearance/styles)
+holds fuller styles that also set typography, geometry, interaction states and
+layout. Merge their keys instead of replacing an existing configuration:
 
 ```toml
 [colors]
@@ -76,8 +78,8 @@ opacity_percent = 90
   own colors. Sign-in, account-unlock and recovery surfaces stay opaque.
   Native desktop compositing remains subject to platform verification.
 - Theme files have a different structure: their `[colors]` holds base palette
-  colors and `[roles]` holds semantic colors. Do not paste a theme pack
-  wholesale into `config.toml`.
+  colors, `[roles]` holds semantic colors and `[states]` holds optional
+  interaction states. Do not paste a theme pack wholesale into `config.toml`.
 
 See the [appearance contract](APPEARANCE.md) for inheritance and the
 [customization reference](CUSTOMIZATION.md) for typography, layout, geometry,

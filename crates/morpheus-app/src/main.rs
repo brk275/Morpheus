@@ -9,9 +9,9 @@ mod attachments;
 mod audio_devices;
 #[cfg(feature = "native-calls")]
 mod call_membership;
-mod call_stage;
 #[cfg(feature = "native-calls")]
 mod call_recovery;
+mod call_stage;
 #[cfg(feature = "native-calls")]
 mod calls;
 mod composer_mentions;
@@ -25,6 +25,7 @@ mod live;
 #[cfg(feature = "native-calls")]
 mod local_video;
 mod message_metadata;
+mod metric_editor;
 mod navigation;
 mod notifications;
 #[cfg(feature = "native-calls")]
@@ -33,6 +34,7 @@ mod outgoing_ring;
 mod preview_capture;
 mod room_settings;
 mod security;
+mod sender_palette_editor;
 mod settings_search;
 mod shortcuts;
 mod sso;
@@ -136,6 +138,7 @@ fn room(
             id: id.into(),
             name: name.into(),
             unread,
+            mentions: 0,
             private_room,
             voice_space: false,
             voice_local: false,
@@ -914,20 +917,38 @@ fn apply_config(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
     appearance::apply_theme(ui, config, theme);
     // After the theme, so the workspace reads the colors now shown.
     appearance_editor::project(ui, config, theme);
+    metric_editor::project(ui, config);
+    sender_palette_editor::project(ui, config, theme);
     shortcuts::apply_config(ui, config);
     audio_devices::apply_config(ui, config);
     image_previews::apply_config(ui, config);
     // The theme mode follows the window's active account: its configured
     // override, else the global appearance. Only this accepted configuration
     // replaces the remembered preferences.
-    appearance::remember_theme_preferences(config);
+    appearance::remember_theme_preferences(config, theme);
     appearance::apply_theme_mode(ui);
     ui.set_font_scale_percent(config.appearance.scale_percent.into());
-    ui.set_density_mode(match config.appearance.density {
+    let density_index = |density: Density| match density {
         Density::Compact => 0,
         Density::Comfortable => 1,
         Density::Spacious => 2,
+    };
+    ui.set_density_mode(density_index(config.appearance.density));
+    // Omitted pane densities follow the global density.
+    let layout = &config.layout;
+    ui.set_room_density_mode(density_index(
+        layout.room_density.unwrap_or(config.appearance.density),
+    ));
+    ui.set_message_density_mode(density_index(
+        layout.message_density.unwrap_or(config.appearance.density),
+    ));
+    ui.set_details_side(match layout.details_side {
+        morpheus_config::DetailsSide::Right => 0,
+        morpheus_config::DetailsSide::Left => 1,
     });
+    ui.set_direct_messages_first(layout.direct_messages_first);
+    ui.set_room_density_choice(layout.room_density.map_or(-1, density_index));
+    ui.set_message_density_choice(layout.message_density.map_or(-1, density_index));
     ui.set_sort_unread_first(config.layout.sort_unread_first);
     apply_notification_settings(ui, config);
     apply_room_sort(ui);
@@ -4555,6 +4576,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let setting_store = store.clone();
     appearance::install_callbacks(&ui, &store);
     appearance_editor::register(&ui, &store);
+    metric_editor::register(&ui, &store);
+    sender_palette_editor::register(&ui, &store);
     settings_search::register(&ui);
     ui.on_choose_theme(move |index| {
         if let Some(ui) = weak.upgrade() {

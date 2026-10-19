@@ -1,0 +1,41 @@
+# Lantern: warm and unhurried, tuned for long reading. Amber surfaces, a
+# serif message face, larger text and generous spacing. A sparse example:
+# merge these keys into config.toml.
+schema_version = 1
+
+[appearance]
+theme = "dark"
+
+[colors]
+rail = "#14110D"
+sidebar = "#191510"
+canvas = "#1E1913"
+panel = "#231D16"
+elevated = "#2B241B"
+hover = "#332A1F"
+ink = "#F1E6D6"
+muted = "#B9A78F"
+divider = "#3A3024"
+accent = "#E3A456"
+accent_ink = "#22170B"
+link = "#F0BE7A"
+focus = "#9FD3C7"
+selection = "#4A3A26"
+selection_ink = "#FFF4E4"
+message_hover = "#262018"
+icon = "#C9B79E"
+icon_active = "#E3A456"
+
+[typography]
+message_font_family = "serif"
+message_size = 17
+sender_size = 16
+timestamp_size = 12
+composer_size = 17
+
+[geometry]
+corner_radius = 10
+message_gap = 16
+content_padding = 32
+avatar_size = 44
+avatar_roundness = 35

@@ -3090,6 +3090,7 @@ fn room_item(room: &RoomInfo, voice_local: bool, voice_shared: bool) -> RoomItem
         id: room.room_id.as_str().into(),
         name: room.name.as_str().into(),
         unread: room.unread_notifications.min(i32::MAX as u64) as i32,
+        mentions: room.unread_mentions.min(i32::MAX as u64) as i32,
         private_room: room.is_direct,
         voice_space: voice_local || voice_shared,
         voice_local,

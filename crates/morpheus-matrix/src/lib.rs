@@ -245,6 +245,11 @@ pub struct RoomInfo {
     pub avatar_mxc: Option<String>,
     pub unread_messages: u64,
     pub unread_notifications: u64,
+    /// Unread messages that mention this account or match its highlight
+    /// rules, counted by the SDK from read receipts. Older serialized
+    /// snapshots without the field read as zero.
+    #[serde(default)]
+    pub unread_mentions: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3905,6 +3910,7 @@ async fn room_info(room: &Room) -> RoomInfo {
         avatar_mxc: room.avatar_url().map(|url| url.to_string()),
         unread_messages: room.num_unread_messages(),
         unread_notifications: room.num_unread_notifications(),
+        unread_mentions: room.num_unread_mentions(),
     }
 }
 

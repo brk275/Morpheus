@@ -175,6 +175,10 @@ pub struct Config {
     /// theme mode, and survive choosing a starting point.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub colors: BTreeMap<String, String>,
+    /// Sender-name colors that replace the theme pack's palette. Each sender
+    /// keeps the slot derived from their Matrix user ID; no sender is stored.
+    #[serde(skip_serializing_if = "SenderColors::is_empty")]
+    pub senders: SenderColors,
     pub window: WindowStyle,
 }
 
@@ -212,6 +216,7 @@ impl Default for Config {
             experimental: Experimental::default(),
             account_overrides: BTreeMap::new(),
             colors: BTreeMap::new(),
+            senders: SenderColors::default(),
             window: WindowStyle::default(),
         }
     }
@@ -222,25 +227,19 @@ impl Config {
         if self.schema_version != SCHEMA_VERSION {
             return Err(ConfigError::Version);
         }
-        validate_range(
-            "appearance.scale_percent",
-            self.appearance.scale_percent,
-            75,
-            200,
-        )?;
-        validate_range(
-            "appearance.hover_duration_ms",
-            self.appearance.hover_duration_ms,
-            0,
-            1000,
-        )?;
-        validate_range(
-            "layout.room_list_width",
-            self.layout.room_list_width,
-            180,
-            480,
-        )?;
-        validate_range("layout.details_width", self.layout.details_width, 200, 520)?;
+        for (key, value) in [
+            ("appearance.scale_percent", self.appearance.scale_percent),
+            (
+                "appearance.hover_duration_ms",
+                self.appearance.hover_duration_ms,
+            ),
+            ("appearance.popup_fade_ms", self.appearance.popup_fade_ms),
+            ("appearance.panel_fade_ms", self.appearance.panel_fade_ms),
+            ("layout.room_list_width", self.layout.room_list_width),
+            ("layout.details_width", self.layout.details_width),
+        ] {
+            validate_field(key, value)?;
+        }
         validate_font_family("appearance.font_family", &self.appearance.font_family)?;
         self.typography.validate()?;
         self.geometry.validate()?;
@@ -258,6 +257,8 @@ impl Config {
                 return Err(field_error(format!("colors.{id}"), Problem::Color));
             }
         }
+        self.senders
+            .validate(|field, problem| field_error(field, problem))?;
         let (minimum, maximum) = (
             *registry::WINDOW_OPACITY_RANGE.start(),
             *registry::WINDOW_OPACITY_RANGE.end(),
@@ -303,6 +304,22 @@ impl Config {
                     Problem::CallModeConflict,
                 ));
             }
+            // The account ID is never part of a field path; token IDs are
+            // registry names, never file content.
+            for (id, value) in &overrides.colors {
+                if registry::color_token(id).is_none() {
+                    return Err(field_error(
+                        "account_overrides.<account>.colors",
+                        Problem::UnknownColorToken,
+                    ));
+                }
+                if registry::parse_hex_color(value).is_none() {
+                    return Err(field_error(
+                        format!("account_overrides.<account>.colors.{id}"),
+                        Problem::Color,
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -314,11 +331,16 @@ impl Config {
 
     /// Materialize a built-in style into the same preferences edited by TOML
     /// and Settings. No hidden preset layer overrides subsequent custom edits.
-    /// Account, notification, shortcut and media preferences are untouched.
+    /// Account, notification, shortcut and media preferences are untouched,
+    /// and so is the focus ring width, an accessibility choice like the text
+    /// scale and reduced motion.
     pub fn apply_style_preset(&mut self, preset: BuiltInStylePreset) {
         self.appearance.theme_pack = Some(preset.theme_name().into());
         self.typography = Typography::default();
-        self.geometry = Geometry::default();
+        self.geometry = Geometry {
+            focus_width: self.geometry.focus_width,
+            ..Geometry::default()
+        };
         self.chat = ChatStyle::default();
         match preset {
             BuiltInStylePreset::Nocturne => {
@@ -554,6 +576,40 @@ impl Config {
                 .unwrap_or(true)
     }
 
+    /// The color overrides `account_id` sees: the global `[colors]` table,
+    /// then that account's own entries. No account, an empty or unknown ID
+    /// and an account without colors all see the global table.
+    pub fn colors_for(&self, account_id: Option<&str>) -> BTreeMap<String, String> {
+        let mut colors = self.colors.clone();
+        if let Some(overrides) = account_id
+            .filter(|id| !id.is_empty())
+            .and_then(|id| self.account_overrides.get(id))
+        {
+            colors.extend(
+                overrides
+                    .colors
+                    .iter()
+                    .map(|(id, value)| (id.clone(), value.clone())),
+            );
+        }
+        colors
+    }
+
+    /// Remove one account's appearance preferences, its theme mode and its
+    /// colors, and nothing of any other account. The entry itself goes once
+    /// nothing else remains in it. Returns whether anything changed.
+    pub fn clear_account_appearance(&mut self, account_id: &str) -> bool {
+        let Some(overrides) = self.account_overrides.get_mut(account_id) else {
+            return false;
+        };
+        let changed = overrides.theme.take().is_some() || !overrides.colors.is_empty();
+        overrides.colors.clear();
+        if *overrides == AccountOverrides::default() {
+            self.account_overrides.remove(account_id);
+        }
+        changed
+    }
+
     /// The theme mode to show while `account_id` is the active account. An
     /// account without a `theme` override, an unknown ID and no active account
     /// all use the global `appearance.theme`. Theme packs stay global.
@@ -597,6 +653,10 @@ pub struct Appearance {
     pub reduce_motion: bool,
     /// Duration of Morpheus decorative hover fades; reduce_motion overrides it.
     pub hover_duration_ms: u16,
+    /// Decorative fade-in of menus, pickers and the quick switcher; 0 is off.
+    pub popup_fade_ms: u16,
+    /// Decorative fade-in of the details panel; 0 is off.
+    pub panel_fade_ms: u16,
 }
 
 impl Default for Appearance {
@@ -609,6 +669,8 @@ impl Default for Appearance {
             scale_percent: 100,
             reduce_motion: false,
             hover_duration_ms: 90,
+            popup_fade_ms: 0,
+            panel_fade_ms: 0,
         }
     }
 }
@@ -616,6 +678,8 @@ impl Default for Appearance {
 /// Message typography is independent of interface scale and its font family.
 /// `None` inherits `appearance.font_family`; fonts are installed family names,
 /// never URLs or paths. Missing families use the renderer's normal fallback.
+/// Sizes are logical pixels before text scaling; an omitted optional size
+/// keeps its surface's built-in size.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Typography {
@@ -624,6 +688,14 @@ pub struct Typography {
     pub message_size: u16,
     /// Omission preserves each sender surface's existing weight.
     pub sender_weight: Option<u16>,
+    /// Room-list rows and text-sidebar routes.
+    pub sidebar_size: u16,
+    /// Timeline sender names; omission follows each layout's message size.
+    pub sender_size: Option<u16>,
+    /// Timeline and thread-reply clocks; omission keeps 10.
+    pub timestamp_size: Option<u16>,
+    /// Composer text and placeholder; omission follows `message_size`.
+    pub composer_size: Option<u16>,
 }
 
 impl Default for Typography {
@@ -633,6 +705,10 @@ impl Default for Typography {
             monospace_font_family: "monospace".into(),
             message_size: 14,
             sender_weight: None,
+            sidebar_size: 13,
+            sender_size: None,
+            timestamp_size: None,
+            composer_size: None,
         }
     }
 }
@@ -646,9 +722,19 @@ impl Typography {
             "typography.monospace_font_family",
             &self.monospace_font_family,
         )?;
-        validate_range("typography.message_size", self.message_size, 10, 32)?;
+        validate_field("typography.message_size", self.message_size)?;
         if let Some(weight) = self.sender_weight {
-            validate_range("typography.sender_weight", weight, 100, 900)?;
+            validate_field("typography.sender_weight", weight)?;
+        }
+        validate_field("typography.sidebar_size", self.sidebar_size)?;
+        for (key, value) in [
+            ("typography.sender_size", self.sender_size),
+            ("typography.timestamp_size", self.timestamp_size),
+            ("typography.composer_size", self.composer_size),
+        ] {
+            if let Some(value) = value {
+                validate_field(key, value)?;
+            }
         }
         Ok(())
     }
@@ -662,6 +748,8 @@ impl Typography {
 
 /// Pixel values are logical pixels before desktop DPI scaling. The app's text
 /// scale remains independent so users can enlarge text without widening panes.
+/// An omitted optional value keeps each surface's built-in proportion of
+/// `corner_radius` or its built-in size.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Geometry {
@@ -669,6 +757,23 @@ pub struct Geometry {
     pub message_gap: u16,
     pub content_padding: u16,
     pub rail_width: u16,
+    /// Text and icon buttons.
+    pub control_radius: Option<u16>,
+    /// Text fields.
+    pub input_radius: Option<u16>,
+    /// Message and thread composers.
+    pub composer_radius: Option<u16>,
+    pub border_width: u16,
+    /// Keyboard focus rings. Presets keep it, like the text scale.
+    pub focus_width: u16,
+    pub control_padding: u16,
+    pub input_padding: u16,
+    pub composer_padding: u16,
+    pub icon_size: u16,
+    /// Timeline avatars; omission keeps each message layout's size.
+    pub avatar_size: Option<u16>,
+    /// Percent of each avatar's size; 50 draws a circle.
+    pub avatar_roundness: Option<u16>,
 }
 
 impl Default for Geometry {
@@ -678,16 +783,161 @@ impl Default for Geometry {
             message_gap: 12,
             content_padding: 24,
             rail_width: 70,
+            control_radius: None,
+            input_radius: None,
+            composer_radius: None,
+            border_width: 1,
+            focus_width: 2,
+            control_padding: 12,
+            input_padding: 10,
+            composer_padding: 10,
+            icon_size: 18,
+            avatar_size: None,
+            avatar_roundness: None,
         }
     }
 }
 
 impl Geometry {
     fn validate(&self) -> Result<(), ConfigError> {
-        validate_range("geometry.corner_radius", self.corner_radius, 0, 24)?;
-        validate_range("geometry.message_gap", self.message_gap, 0, 32)?;
-        validate_range("geometry.content_padding", self.content_padding, 0, 48)?;
-        validate_range("geometry.rail_width", self.rail_width, 44, 100)
+        for (key, value) in [
+            ("geometry.corner_radius", self.corner_radius),
+            ("geometry.message_gap", self.message_gap),
+            ("geometry.content_padding", self.content_padding),
+            ("geometry.rail_width", self.rail_width),
+            ("geometry.border_width", self.border_width),
+            ("geometry.focus_width", self.focus_width),
+            ("geometry.control_padding", self.control_padding),
+            ("geometry.input_padding", self.input_padding),
+            ("geometry.composer_padding", self.composer_padding),
+            ("geometry.icon_size", self.icon_size),
+        ] {
+            validate_field(key, value)?;
+        }
+        for (key, value) in [
+            ("geometry.control_radius", self.control_radius),
+            ("geometry.input_radius", self.input_radius),
+            ("geometry.composer_radius", self.composer_radius),
+            ("geometry.avatar_size", self.avatar_size),
+            ("geometry.avatar_roundness", self.avatar_roundness),
+        ] {
+            if let Some(value) = value {
+                validate_field(key, value)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The stored value of one editor metric: `Inherited` when an optional
+/// metric is omitted and its surfaces keep their built-in value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricValue {
+    Set(u16),
+    Inherited,
+}
+
+impl MetricValue {
+    pub fn set(self) -> Option<u16> {
+        match self {
+            Self::Set(value) => Some(value),
+            Self::Inherited => None,
+        }
+    }
+}
+
+enum MetricSlot<'a> {
+    Required(&'a mut u16),
+    Optional(&'a mut Option<u16>),
+}
+
+impl Config {
+    /// One editor metric by its registry key; `None` for any other key.
+    pub fn metric(&self, key: &str) -> Option<MetricValue> {
+        let (typography, geometry) = (&self.typography, &self.geometry);
+        let appearance = &self.appearance;
+        let required = |value: u16| Some(MetricValue::Set(value));
+        let optional =
+            |value: Option<u16>| Some(value.map_or(MetricValue::Inherited, MetricValue::Set));
+        match key {
+            "typography.sidebar_size" => required(typography.sidebar_size),
+            "typography.sender_size" => optional(typography.sender_size),
+            "typography.timestamp_size" => optional(typography.timestamp_size),
+            "typography.composer_size" => optional(typography.composer_size),
+            "geometry.control_radius" => optional(geometry.control_radius),
+            "geometry.input_radius" => optional(geometry.input_radius),
+            "geometry.composer_radius" => optional(geometry.composer_radius),
+            "geometry.border_width" => required(geometry.border_width),
+            "geometry.focus_width" => required(geometry.focus_width),
+            "geometry.control_padding" => required(geometry.control_padding),
+            "geometry.input_padding" => required(geometry.input_padding),
+            "geometry.composer_padding" => required(geometry.composer_padding),
+            "geometry.icon_size" => required(geometry.icon_size),
+            "geometry.avatar_size" => optional(geometry.avatar_size),
+            "geometry.avatar_roundness" => optional(geometry.avatar_roundness),
+            "appearance.popup_fade_ms" => required(appearance.popup_fade_ms),
+            "appearance.panel_fade_ms" => required(appearance.panel_fade_ms),
+            _ => None,
+        }
+    }
+
+    fn metric_slot(&mut self, key: &str) -> Option<MetricSlot<'_>> {
+        let (typography, geometry) = (&mut self.typography, &mut self.geometry);
+        let appearance = &mut self.appearance;
+        Some(match key {
+            "typography.sidebar_size" => MetricSlot::Required(&mut typography.sidebar_size),
+            "typography.sender_size" => MetricSlot::Optional(&mut typography.sender_size),
+            "typography.timestamp_size" => MetricSlot::Optional(&mut typography.timestamp_size),
+            "typography.composer_size" => MetricSlot::Optional(&mut typography.composer_size),
+            "geometry.control_radius" => MetricSlot::Optional(&mut geometry.control_radius),
+            "geometry.input_radius" => MetricSlot::Optional(&mut geometry.input_radius),
+            "geometry.composer_radius" => MetricSlot::Optional(&mut geometry.composer_radius),
+            "geometry.border_width" => MetricSlot::Required(&mut geometry.border_width),
+            "geometry.focus_width" => MetricSlot::Required(&mut geometry.focus_width),
+            "geometry.control_padding" => MetricSlot::Required(&mut geometry.control_padding),
+            "geometry.input_padding" => MetricSlot::Required(&mut geometry.input_padding),
+            "geometry.composer_padding" => MetricSlot::Required(&mut geometry.composer_padding),
+            "geometry.icon_size" => MetricSlot::Required(&mut geometry.icon_size),
+            "geometry.avatar_size" => MetricSlot::Optional(&mut geometry.avatar_size),
+            "geometry.avatar_roundness" => MetricSlot::Optional(&mut geometry.avatar_roundness),
+            "appearance.popup_fade_ms" => MetricSlot::Required(&mut appearance.popup_fade_ms),
+            "appearance.panel_fade_ms" => MetricSlot::Required(&mut appearance.panel_fade_ms),
+            _ => return None,
+        })
+    }
+
+    /// Set one editor metric, or return it to its default with `Inherited`:
+    /// an optional metric is then omitted and a required one takes the
+    /// registry default. Values are validated against the registry range
+    /// before anything changes. Returns whether the configuration changed.
+    pub fn set_metric(&mut self, key: &str, value: MetricValue) -> Result<bool, ConfigError> {
+        let Some((field, _)) = registry::metric_field(key) else {
+            return Err(ConfigError::Invalid(
+                "this version has no such appearance metric".into(),
+            ));
+        };
+        if let MetricValue::Set(value) = value {
+            validate_field(field.key, value)?;
+        }
+        let default = field
+            .integer_default()
+            .and_then(|value| u16::try_from(value).ok());
+        let Some(slot) = self.metric_slot(key) else {
+            return Err(ConfigError::Invalid(
+                "this version has no such appearance metric".into(),
+            ));
+        };
+        let changed = match slot {
+            MetricSlot::Required(current) => {
+                let next = value
+                    .set()
+                    .or(default)
+                    .expect("required metrics have a registry default");
+                std::mem::replace(current, next) != next
+            }
+            MetricSlot::Optional(current) => std::mem::replace(current, value.set()) != value.set(),
+        };
+        Ok(changed)
     }
 }
 
@@ -754,8 +1004,8 @@ impl Default for ChatStyle {
 
 impl ChatStyle {
     fn validate(&self) -> Result<(), ConfigError> {
-        validate_range("chat.nickname_width", self.nickname_width, 64, 240)?;
-        validate_range("chat.timestamp_width", self.timestamp_width, 48, 160)
+        validate_field("chat.nickname_width", self.nickname_width)?;
+        validate_field("chat.timestamp_width", self.timestamp_width)
     }
 }
 
@@ -789,6 +1039,19 @@ fn validate_range(name: &str, value: u16, minimum: u16, maximum: u16) -> Result<
         ));
     }
     Ok(())
+}
+
+/// Check one integer field against its range in `registry::FIELDS`, the same
+/// table the schema output, Settings search and the metric editor read.
+fn validate_field(key: &str, value: u16) -> Result<(), ConfigError> {
+    let Some((minimum, maximum)) = registry::integer_range(key) else {
+        // Every validated key is documented; the registry test checks it.
+        return Err(ConfigError::Invalid(
+            "this version has no such integer setting".into(),
+        ));
+    };
+    let bound = |limit: i64| u16::try_from(limit).unwrap_or(u16::MAX);
+    validate_range(key, value, bound(minimum), bound(maximum))
 }
 
 /// A theme file name: ASCII letters, digits, `-` or `_`, never a path.
@@ -873,6 +1136,24 @@ pub struct Layout {
     pub show_space_labels: bool,
     pub group_direct_messages: bool,
     pub sort_unread_first: bool,
+    /// Side of the conversation that shows the details panel.
+    pub details_side: DetailsSide,
+    /// With grouped lists, show direct messages above rooms.
+    pub direct_messages_first: bool,
+    /// Room-list row density; omission follows `appearance.density`.
+    pub room_density: Option<Density>,
+    /// Timeline message spacing density; omission follows `appearance.density`.
+    pub message_density: Option<Density>,
+}
+
+/// Where the details panel sits. Navigation and the account control stay in
+/// place either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DetailsSide {
+    #[default]
+    Right,
+    Left,
 }
 
 impl Default for Layout {
@@ -885,6 +1166,10 @@ impl Default for Layout {
             show_space_labels: false,
             group_direct_messages: true,
             sort_unread_first: false,
+            details_side: DetailsSide::Right,
+            direct_messages_first: false,
+            room_density: None,
+            message_density: None,
         }
     }
 }
@@ -980,6 +1265,11 @@ pub struct AccountOverrides {
     pub legacy_element_call_rooms: Vec<String>,
     /// Account-local rooms explicitly using Element Call's sticky 2025 dialect.
     pub element_call_matrix_2_0_rooms: Vec<String>,
+    /// Sparse color overrides while this account is active, keyed like the
+    /// global `[colors]` table and drawn over it. Never resolved from a
+    /// display name or Matrix ID: only the local account ID keys them.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub colors: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1009,30 +1299,79 @@ impl RoomCallMode {
     }
 }
 
+/// The default binding of every action, as written to a new `config.toml`.
+/// An existing `[shortcuts]` table is used exactly as written: an action it
+/// omits stays disabled, so a file never gains a binding silently.
 pub fn default_shortcuts() -> BTreeMap<String, String> {
-    BTreeMap::from([
-        ("quick_switcher".into(), "Mod+K".into()),
-        ("search".into(), "Mod+F".into()),
-        ("next_unread".into(), "Alt+Down".into()),
-        ("previous_unread".into(), "Alt+Up".into()),
-    ])
+    ShortcutAction::ALL
+        .into_iter()
+        .filter_map(|action| Some((action.name().into(), action.default_binding()?.into())))
+        .collect()
 }
 
-/// Supported commands, shared by the TOML validator and the desktop dispatcher.
+/// Where an action appears in the shortcut editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutGroup {
+    Navigation,
+    Composer,
+    Search,
+    Panels,
+    Account,
+}
+
+impl ShortcutGroup {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Navigation => "Navigation",
+            Self::Composer => "Composer",
+            Self::Search => "Search",
+            Self::Panels => "Panels",
+            Self::Account => "Account",
+        }
+    }
+}
+
+/// Supported commands, shared by the TOML validator, the in-app editor and
+/// the desktop dispatcher. Each one moves focus, opens a view or toggles a
+/// panel. None of them sends, removes, logs out, switches accounts or
+/// changes a protected setting, so no binding can trigger such an action;
+/// those keep their own confirmation flows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShortcutAction {
     QuickSwitcher,
     Search,
     NextUnread,
     PreviousUnread,
+    NextRoom,
+    PreviousRoom,
+    GoHome,
+    OpenSettings,
+    SearchSettings,
+    FocusComposer,
+    OpenEmojiPicker,
+    ToggleDetailsPanel,
+    ShowMembersPanel,
+    ShowThreadPanel,
+    OpenAccountMenu,
 }
 
 impl ShortcutAction {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 15] = [
         Self::QuickSwitcher,
         Self::Search,
         Self::NextUnread,
         Self::PreviousUnread,
+        Self::NextRoom,
+        Self::PreviousRoom,
+        Self::GoHome,
+        Self::OpenSettings,
+        Self::SearchSettings,
+        Self::FocusComposer,
+        Self::OpenEmojiPicker,
+        Self::ToggleDetailsPanel,
+        Self::ShowMembersPanel,
+        Self::ShowThreadPanel,
+        Self::OpenAccountMenu,
     ];
 
     pub fn name(self) -> &'static str {
@@ -1041,7 +1380,78 @@ impl ShortcutAction {
             Self::Search => "search",
             Self::NextUnread => "next_unread",
             Self::PreviousUnread => "previous_unread",
+            Self::NextRoom => "next_room",
+            Self::PreviousRoom => "previous_room",
+            Self::GoHome => "go_home",
+            Self::OpenSettings => "open_settings",
+            Self::SearchSettings => "search_settings",
+            Self::FocusComposer => "focus_composer",
+            Self::OpenEmojiPicker => "open_emoji_picker",
+            Self::ToggleDetailsPanel => "toggle_details_panel",
+            Self::ShowMembersPanel => "show_members_panel",
+            Self::ShowThreadPanel => "show_thread_panel",
+            Self::OpenAccountMenu => "open_account_menu",
         }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::QuickSwitcher => "Switch room",
+            Self::Search => "Search current room",
+            Self::NextUnread => "Next unread room",
+            Self::PreviousUnread => "Previous unread room",
+            Self::NextRoom => "Next room",
+            Self::PreviousRoom => "Previous room",
+            Self::GoHome => "Go to Home",
+            Self::OpenSettings => "Open Settings",
+            Self::SearchSettings => "Search Settings",
+            Self::FocusComposer => "Focus the message composer",
+            Self::OpenEmojiPicker => "Open the emoji picker",
+            Self::ToggleDetailsPanel => "Show or hide the details panel",
+            Self::ShowMembersPanel => "Show members",
+            Self::ShowThreadPanel => "Show the open thread",
+            Self::OpenAccountMenu => "Open the account menu",
+        }
+    }
+
+    pub fn group(self) -> ShortcutGroup {
+        match self {
+            Self::QuickSwitcher
+            | Self::NextUnread
+            | Self::PreviousUnread
+            | Self::NextRoom
+            | Self::PreviousRoom
+            | Self::GoHome
+            | Self::OpenSettings => ShortcutGroup::Navigation,
+            Self::FocusComposer | Self::OpenEmojiPicker => ShortcutGroup::Composer,
+            Self::Search | Self::SearchSettings => ShortcutGroup::Search,
+            Self::ToggleDetailsPanel | Self::ShowMembersPanel | Self::ShowThreadPanel => {
+                ShortcutGroup::Panels
+            }
+            Self::OpenAccountMenu => ShortcutGroup::Account,
+        }
+    }
+
+    /// The binding a new configuration and Restore defaults use. Each one
+    /// passes [`Shortcut::parse`] and none conflicts on either platform.
+    pub fn default_binding(self) -> Option<&'static str> {
+        Some(match self {
+            Self::QuickSwitcher => "Mod+K",
+            Self::Search => "Mod+F",
+            Self::NextUnread => "Alt+Down",
+            Self::PreviousUnread => "Alt+Up",
+            Self::NextRoom => "Alt+Shift+Down",
+            Self::PreviousRoom => "Alt+Shift+Up",
+            Self::GoHome => "Mod+1",
+            Self::OpenSettings => "Mod+Shift+S",
+            Self::SearchSettings => "Mod+Shift+F",
+            Self::FocusComposer => "Mod+L",
+            Self::OpenEmojiPicker => "Mod+E",
+            Self::ToggleDetailsPanel => "Mod+Shift+D",
+            Self::ShowMembersPanel => "Mod+Shift+P",
+            Self::ShowThreadPanel => "Mod+Shift+T",
+            Self::OpenAccountMenu => "Mod+Shift+U",
+        })
     }
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -1173,6 +1583,15 @@ impl Shortcut {
         Ok(shortcut)
     }
 
+    /// Whether both combinations are the same keys on macOS or elsewhere. A
+    /// configuration is portable, so either platform's alias conflicts.
+    pub fn conflicts_with(&self, other: &Shortcut) -> bool {
+        self.key == other.key
+            && [false, true]
+                .into_iter()
+                .any(|macos| self.modifiers(macos) == other.modifiers(macos))
+    }
+
     pub fn modifiers(&self, macos: bool) -> ShortcutModifiers {
         let mut modifiers = self.modifiers;
         if self.primary {
@@ -1228,11 +1647,7 @@ pub fn validate_shortcuts(values: &BTreeMap<String, String>) -> Result<(), Confi
         for (_, other) in &bindings {
             // A config is portable: reject an alias conflict on either platform,
             // even when the file is currently being edited on the other one.
-            if other.key == shortcut.key
-                && [false, true]
-                    .into_iter()
-                    .any(|macos| other.modifiers(macos) == shortcut.modifiers(macos))
-            {
+            if other.conflicts_with(&shortcut) {
                 return Err(field_error(
                     format!("shortcuts.{name}"),
                     Problem::ShortcutConflict,
@@ -1434,6 +1849,9 @@ pub struct ThemePack {
     /// Sender-name text colors. Avatar backgrounds keep their own palette.
     #[serde(default, skip_serializing_if = "SenderColors::is_empty")]
     pub senders: SenderColors,
+    /// Optional interaction states; see [`ThemeStates`].
+    #[serde(default, skip_serializing_if = "ThemeStates::is_empty")]
+    pub states: ThemeStates,
 }
 
 impl ThemePack {
@@ -1452,17 +1870,34 @@ impl ThemePack {
                 validate_theme_color(&format!("roles.{label}"), value)?;
             }
         }
-        if let Some(colors) = &self.senders.colors {
-            if !(1..=MAX_SENDER_COLORS).contains(&colors.len()) {
-                return Err(theme_error(
-                    "senders.colors",
-                    Problem::PaletteLength {
-                        maximum: MAX_SENDER_COLORS,
-                    },
-                ));
+        for (label, value) in self.states.entries() {
+            if let Some(value) = value {
+                validate_theme_color(&format!("states.{label}"), value)?;
             }
-            for (index, value) in colors.iter().enumerate() {
-                validate_theme_color(&format!("senders.colors[{index}]"), value)?;
+        }
+        self.senders
+            .validate(|field, problem| theme_error(field, problem))
+    }
+}
+
+impl SenderColors {
+    /// 1 to [`MAX_SENDER_COLORS`] colors, each `#RRGGBB` or `#RRGGBBAA`.
+    /// `error` builds the theme or `config.toml` error for a field path.
+    fn validate(&self, error: fn(String, Problem) -> ConfigError) -> Result<(), ConfigError> {
+        let Some(colors) = &self.colors else {
+            return Ok(());
+        };
+        if !(1..=MAX_SENDER_COLORS).contains(&colors.len()) {
+            return Err(error(
+                "senders.colors".into(),
+                Problem::PaletteLength {
+                    maximum: MAX_SENDER_COLORS,
+                },
+            ));
+        }
+        for (index, value) in colors.iter().enumerate() {
+            if registry::parse_hex_color(value).is_none() {
+                return Err(error(format!("senders.colors[{index}]"), Problem::Color));
             }
         }
         Ok(())
@@ -1580,6 +2015,81 @@ impl ThemeRoles {
     }
 
     /// The theme's value for one role token, if it sets one.
+    pub fn get(&self, id: &str) -> Option<&str> {
+        self.entries()
+            .into_iter()
+            .find(|(name, _)| *name == id)
+            .and_then(|(_, value)| value)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries().iter().all(|(_, value)| value.is_none())
+    }
+}
+
+/// Optional interaction states. Each one follows an existing color, or keeps
+/// each control's own state, until a theme pack or `config.toml` sets it, so
+/// themes without this table and the shipped presets keep their look.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ThemeStates {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_hover: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_hover: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_pressed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub control_disabled: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_surface: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_border: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub composer_surface: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub composer_border: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub composer_focus: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon_active: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nav_hover: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nav_selected: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nav_selected_ink: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mention: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mention_ink: Option<String>,
+}
+
+impl ThemeStates {
+    pub fn entries(&self) -> [(&'static str, Option<&str>); 16] {
+        [
+            ("message_hover", self.message_hover.as_deref()),
+            ("control_hover", self.control_hover.as_deref()),
+            ("control_pressed", self.control_pressed.as_deref()),
+            ("control_disabled", self.control_disabled.as_deref()),
+            ("input_surface", self.input_surface.as_deref()),
+            ("input_border", self.input_border.as_deref()),
+            ("composer_surface", self.composer_surface.as_deref()),
+            ("composer_border", self.composer_border.as_deref()),
+            ("composer_focus", self.composer_focus.as_deref()),
+            ("icon", self.icon.as_deref()),
+            ("icon_active", self.icon_active.as_deref()),
+            ("nav_hover", self.nav_hover.as_deref()),
+            ("nav_selected", self.nav_selected.as_deref()),
+            ("nav_selected_ink", self.nav_selected_ink.as_deref()),
+            ("mention", self.mention.as_deref()),
+            ("mention_ink", self.mention_ink.as_deref()),
+        ]
+    }
+
+    /// The theme's value for one state token, if it sets one.
     pub fn get(&self, id: &str) -> Option<&str> {
         self.entries()
             .into_iter()
@@ -1927,6 +2437,7 @@ mod tests {
             },
             roles: ThemeRoles::default(),
             senders: SenderColors::default(),
+            states: ThemeStates::default(),
         };
         fs::write(
             theme_directory.join("aurora.toml"),
@@ -2585,6 +3096,226 @@ mod tests {
     }
 
     #[test]
+    fn account_colors_layer_over_global_colors_for_that_account_only() {
+        let mut config = Config::default();
+        config.colors.insert("canvas".into(), "#111111".into());
+        config.colors.insert("link".into(), "#222222".into());
+        config
+            .account_overrides
+            .entry("first".into())
+            .or_default()
+            .colors
+            .insert("canvas".into(), "#333333".into());
+        config.validate().unwrap();
+        let first = config.colors_for(Some("first"));
+        assert_eq!(first.get("canvas").map(String::as_str), Some("#333333"));
+        assert_eq!(first.get("link").map(String::as_str), Some("#222222"));
+        for other in [Some("second"), Some(""), None] {
+            assert_eq!(config.colors_for(other), config.colors, "{other:?}");
+        }
+        let encoded = toml::to_string_pretty(&config).unwrap();
+        assert_eq!(toml::from_str::<Config>(&encoded).unwrap(), config);
+        // Sanitized errors never name the account or repeat the value.
+        for raw in [
+            "[account_overrides.secretaccount.colors]\nnot_a_token = '#123456'\n",
+            "[account_overrides.secretaccount.colors]\ncanvas = 'secret'\n",
+        ] {
+            let error = toml::from_str::<Config>(raw)
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("account_overrides.<account>.colors"),
+                "{error}"
+            );
+            assert!(!error.contains("secret"), "{error}");
+        }
+    }
+
+    #[test]
+    fn clearing_one_accounts_appearance_is_narrow() {
+        let mut config = Config::default();
+        config.colors.insert("canvas".into(), "#111111".into());
+        for account in ["first", "second"] {
+            let overrides = config.account_overrides.entry(account.into()).or_default();
+            overrides.theme = Some(ThemeMode::Light);
+            overrides.colors.insert("accent".into(), "#445566".into());
+        }
+        config
+            .account_overrides
+            .get_mut("first")
+            .unwrap()
+            .notifications_enabled = Some(false);
+        let second = config.account_overrides["second"].clone();
+        assert!(config.clear_account_appearance("first"));
+        assert!(!config.clear_account_appearance("first"));
+        let first = &config.account_overrides["first"];
+        assert_eq!((first.theme, first.colors.is_empty()), (None, true));
+        // Its other preferences stay, as do every other account and global.
+        assert_eq!(first.notifications_enabled, Some(false));
+        assert_eq!(config.account_overrides["second"], second);
+        assert_eq!(config.colors.len(), 1);
+        // An entry left with nothing is removed.
+        assert!(config.clear_account_appearance("second"));
+        assert!(!config.account_overrides.contains_key("second"));
+        assert!(!config.clear_account_appearance("unknown"));
+    }
+
+    #[test]
+    fn pane_composition_and_fades_default_off_round_trip_and_survive_presets() {
+        let old: Config =
+            toml::from_str("schema_version = 1\n[layout]\nroom_list_width = 260\n").unwrap();
+        assert_eq!(old.layout.details_side, DetailsSide::Right);
+        assert!(!old.layout.direct_messages_first);
+        assert_eq!(
+            (old.layout.room_density, old.layout.message_density),
+            (None, None)
+        );
+        assert_eq!(
+            (old.appearance.popup_fade_ms, old.appearance.panel_fade_ms),
+            (0, 0)
+        );
+        let text = "[layout]\ndetails_side = 'left'\ndirect_messages_first = true\nroom_density = 'spacious'\nmessage_density = 'compact'\n[appearance]\npopup_fade_ms = 160\npanel_fade_ms = 240\nreduce_motion = true\n";
+        let mut config: Config = toml::from_str(text).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.layout.details_side, DetailsSide::Left);
+        assert_eq!(config.layout.room_density, Some(Density::Spacious));
+        assert_eq!(config.layout.message_density, Some(Density::Compact));
+        assert_eq!(
+            toml::from_str::<Config>(&toml::to_string(&config).unwrap()).unwrap(),
+            config
+        );
+        let original = config.clone();
+        for preset in BuiltInStylePreset::ALL {
+            config.apply_style_preset(preset);
+            assert_eq!(config.layout.details_side, DetailsSide::Left);
+            assert!(config.layout.direct_messages_first);
+            assert_eq!(config.layout.room_density, original.layout.room_density);
+            assert_eq!(
+                config.layout.message_density,
+                original.layout.message_density
+            );
+            assert_eq!(config.appearance.popup_fade_ms, 160);
+            assert_eq!(config.appearance.panel_fade_ms, 240);
+            assert!(config.appearance.reduce_motion);
+        }
+        for bad in [
+            "[layout]\ndetails_side = 'top'\n",
+            "[layout]\nroom_density = 'tiny'\n",
+            "[layout]\nmessage_density = 1\n",
+            "[layout]\ndirect_messages_first = 'yes'\n",
+        ] {
+            assert!(toml::from_str::<Config>(bad).is_err(), "{bad}");
+        }
+        for bad in [
+            "[appearance]\npopup_fade_ms = 1001\n",
+            "[appearance]\npanel_fade_ms = 1001\n",
+        ] {
+            assert!(
+                toml::from_str::<Config>(bad).unwrap().validate().is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn interaction_states_are_optional_validated_and_absent_from_shipped_presets() {
+        let legacy: ThemePack =
+            toml::from_str(include_str!("../../../themes/aurora.toml")).unwrap();
+        let encoded = toml::to_string_pretty(&legacy).unwrap();
+        assert!(!encoded.contains("[states]"));
+        // Presets keep their exact look: every state follows its color.
+        for preset in BuiltInStylePreset::ALL {
+            assert!(preset.theme().unwrap().states.is_empty(), "{preset:?}");
+        }
+        // Every state is a registry token of the State source, and back.
+        for (name, _) in ThemeStates::default().entries() {
+            assert_eq!(
+                registry::color_token(name).map(|token| token.source),
+                Some(registry::TokenSource::State),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            registry::COLOR_TOKENS
+                .iter()
+                .filter(|token| token.source == registry::TokenSource::State)
+                .count(),
+            ThemeStates::default().entries().len()
+        );
+        let themed: ThemePack = toml::from_str(&format!(
+            "{encoded}\n[states]\nmention = '#AA3344'\ncontrol_pressed = '#00000033'\n"
+        ))
+        .unwrap();
+        themed.validate().unwrap();
+        assert_eq!(themed.states.get("mention"), Some("#AA3344"));
+        assert_eq!(themed.states.get("nav_hover"), None);
+        assert_eq!(
+            toml::from_str::<ThemePack>(&toml::to_string_pretty(&themed).unwrap()).unwrap(),
+            themed
+        );
+        for (state, _) in ThemeStates::default().entries() {
+            let text = format!("{encoded}\n[states]\n{state} = 'tomato'\n");
+            let error = toml::from_str::<ThemePack>(&text)
+                .unwrap()
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&format!("states.{state}")), "{error}");
+            assert!(!error.contains("tomato"), "{error}");
+        }
+        let typo = format!("{encoded}\n[states]\nhoverr = '#123456'\n");
+        assert!(toml::from_str::<ThemePack>(&typo).is_err());
+        // A config.toml override reaches a state token like any color.
+        let mut config = Config::default();
+        config.colors.insert("mention".into(), "#AA3344".into());
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn config_sender_palette_is_bounded_round_trips_and_survives_presets() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let mut config = store.load_or_create().unwrap();
+        assert!(
+            !fs::read_to_string(store.path())
+                .unwrap()
+                .contains("[senders]")
+        );
+        config.senders.colors = Some(vec!["#C2AEFA".into(), "#9dd8cd80".into()]);
+        store.save(&config).unwrap();
+        assert_eq!(store.load().unwrap(), config);
+        let valid = fs::read(store.path()).unwrap();
+        for preset in BuiltInStylePreset::ALL {
+            let mut themed = config.clone();
+            themed.apply_style_preset(preset);
+            assert_eq!(themed.senders, config.senders, "{preset:?}");
+        }
+        for (colors, field) in [
+            (vec![], "senders.colors"),
+            (
+                vec!["#123456".to_owned(); MAX_SENDER_COLORS + 1],
+                "senders.colors",
+            ),
+            (vec!["#123456".into(), "secret".into()], "senders.colors[1]"),
+        ] {
+            let mut bad = config.clone();
+            bad.senders.colors = Some(colors);
+            let error = store.save(&bad).unwrap_err().to_string();
+            assert!(
+                error.contains(field) && !error.contains("secret"),
+                "{error}"
+            );
+            assert_eq!(fs::read(store.path()).unwrap(), valid);
+        }
+        assert!(toml::from_str::<Config>("[senders]\ncolours = ['#123456']\n").is_err());
+        // Removing the table restores the theme's palette.
+        fs::write(store.path(), "schema_version = 1\n").unwrap();
+        assert!(store.load().unwrap().senders.is_empty());
+    }
+
+    #[test]
     fn custom_theme_contrast_is_an_authors_choice() {
         let mut theme = BuiltInStylePreset::Paper.theme().unwrap();
         // Validation checks the declarative format, not user aesthetic choices.
@@ -3126,6 +3857,163 @@ mod tests {
         assert!(!format!("{error} {error:?}").contains("secret"));
     }
 
+    #[test]
+    fn every_editor_metric_is_a_bounded_field_with_one_accessor() {
+        use registry::{MetricGroup, metric_field, metric_fields};
+        let defaults = Config::default();
+        let mut count = 0;
+        for (field, editor) in metric_fields() {
+            count += 1;
+            let key = field.key;
+            let (minimum, maximum) = field.integer_range().expect("metrics are integers");
+            assert!(minimum >= 0 && minimum < maximum, "{key}");
+            assert!(!editor.label.is_empty() && !field.inactive, "{key}");
+            assert!(MetricGroup::ALL.contains(&editor.group), "{key}");
+            assert!(editor.step >= 1 && i64::from(editor.step) <= maximum - minimum);
+            // Omission is documented exactly when the field is optional, and
+            // stepping from it starts inside the range.
+            assert_eq!(field.optional(), editor.inherit.is_some(), "{key}");
+            if let Some(inherit) = editor.inherit {
+                assert!(!inherit.text.is_empty(), "{key}");
+                assert!(
+                    (minimum..=maximum).contains(&i64::from(inherit.start)),
+                    "{key}"
+                );
+            }
+            assert_eq!(metric_field(key).map(|(found, _)| found.key), Some(key));
+            match defaults.metric(key).expect(key) {
+                MetricValue::Inherited => assert!(field.optional(), "{key}"),
+                MetricValue::Set(value) => {
+                    assert_eq!(field.integer_default(), Some(i64::from(value)), "{key}")
+                }
+            }
+            let mut config = Config::default();
+            for value in [minimum, maximum] {
+                let value = u16::try_from(value).unwrap();
+                config.set_metric(key, MetricValue::Set(value)).unwrap();
+                assert_eq!(config.metric(key), Some(MetricValue::Set(value)), "{key}");
+                config.validate().unwrap();
+                let restored: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+                assert_eq!(restored.metric(key), Some(MetricValue::Set(value)), "{key}");
+            }
+            // A rejected value changes nothing.
+            let before = config.clone();
+            for value in [minimum - 1, maximum + 1] {
+                if let Ok(value) = u16::try_from(value) {
+                    assert!(config.set_metric(key, MetricValue::Set(value)).is_err());
+                    assert_eq!(config, before, "{key} changed on a rejected value");
+                }
+            }
+            // Resetting returns exactly this metric to its default.
+            assert!(config.set_metric(key, MetricValue::Inherited).unwrap());
+            assert!(!config.set_metric(key, MetricValue::Inherited).unwrap());
+            assert_eq!(config, defaults, "{key} reset left another change");
+        }
+        assert_eq!(count, 17);
+        // Fields without editor metadata are not metrics.
+        for key in [
+            "typography.message_size",
+            "geometry.corner_radius",
+            "colors.link",
+            "geometry",
+            "",
+        ] {
+            assert_eq!(defaults.metric(key), None, "{key}");
+            assert!(
+                Config::default()
+                    .set_metric(key, MetricValue::Set(1))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn metric_edits_reject_invalid_files_without_repeating_values_and_recover() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::at(directory.path().join("config.toml"));
+        let mut custom = Config::default();
+        for (key, value) in [
+            ("geometry.focus_width", 4),
+            ("typography.sender_size", 17),
+            ("geometry.avatar_roundness", 50),
+            ("geometry.border_width", 0),
+        ] {
+            custom.set_metric(key, MetricValue::Set(value)).unwrap();
+        }
+        store.save(&custom).unwrap();
+        let last_valid = fs::read(store.path()).unwrap();
+        let updates = store.watch_with_theme(Duration::from_millis(10));
+        let next = || updates.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(next().unwrap().config, custom);
+        for (raw, rejected) in [
+            ("[geometry]\nfocus_width = 0\n", "0"),
+            ("[geometry]\nfocus_width = 7\n", "7"),
+            ("[geometry]\nborder_width = 5\n", "5"),
+            ("[geometry]\nicon_size = 29\n", "29"),
+            ("[geometry]\navatar_roundness = 51\n", "51"),
+            ("[typography]\nsidebar_size = 9\n", "9"),
+            ("[typography]\nsender_size = 33\n", "33"),
+        ] {
+            let error = toml::from_str::<Config>(raw)
+                .unwrap()
+                .validate()
+                .unwrap_err();
+            let shown = error.to_string();
+            assert!(matches!(error, ConfigError::Field { .. }), "{raw}");
+            assert!(!shown.contains(rejected), "{raw}: {shown}");
+            fs::write(store.path(), raw).unwrap();
+            assert!(next().is_err(), "{raw}");
+            // A rejected external edit stays as written for correction.
+            assert_eq!(fs::read_to_string(store.path()).unwrap(), raw);
+            assert!(store.save(&custom).is_ok());
+            assert_eq!(next().unwrap().config, custom);
+        }
+        for raw in [
+            "[geometry]\nfocus_width = \"wide\"\n",
+            "[geometry]\nfocus_widht = 2\n",
+            "[typography]\ncomposer_size = -1\n",
+            "[geometry]\navatar_size = 1.5\n",
+        ] {
+            assert!(toml::from_str::<Config>(raw).is_err(), "{raw}");
+        }
+        fs::write(store.path(), &last_valid).unwrap();
+        // Omitting every metric restores the built-in defaults, not the
+        // values a previous watcher result carried.
+        fs::write(store.path(), "schema_version = 1\n").unwrap();
+        let restored = loop {
+            let config = next().unwrap().config;
+            if config != custom {
+                break config;
+            }
+        };
+        assert_eq!(restored.typography, Typography::default());
+        assert_eq!(restored.geometry, Geometry::default());
+    }
+
+    #[test]
+    fn presets_reset_style_metrics_but_keep_the_focus_ring_width() {
+        let mut config = Config::default();
+        for (key, value) in [
+            ("geometry.focus_width", 5),
+            ("geometry.icon_size", 24),
+            ("geometry.control_radius", 0),
+            ("typography.composer_size", 20),
+            ("typography.sidebar_size", 16),
+        ] {
+            config.set_metric(key, MetricValue::Set(value)).unwrap();
+        }
+        for preset in BuiltInStylePreset::ALL {
+            let mut themed = config.clone();
+            themed.apply_style_preset(preset);
+            themed.validate().unwrap();
+            assert_eq!(themed.geometry.focus_width, 5, "{preset:?}");
+            assert_eq!(themed.geometry.icon_size, 18, "{preset:?}");
+            assert_eq!(themed.geometry.control_radius, None, "{preset:?}");
+            assert_eq!(themed.typography.composer_size, None, "{preset:?}");
+            assert_eq!(themed.typography.sidebar_size, 13, "{preset:?}");
+        }
+    }
+
     /// `registry::FIELDS` is what the schema output and documentation print,
     /// so it must not drift from the real schema and validator.
     #[test]
@@ -3150,6 +4038,9 @@ mod tests {
             match path.first().map(String::as_str) {
                 Some("colors") => "colors.<token>".into(),
                 Some("shortcuts") => "shortcuts.<action>".into(),
+                Some("account_overrides") if path.get(2).is_some_and(|key| key == "colors") => {
+                    "account_overrides.<account>.colors.<token>".into()
+                }
                 Some("account_overrides") => {
                     format!("account_overrides.<account>.{}", path[2..].join("."))
                 }
@@ -3162,10 +4053,21 @@ mod tests {
         full.appearance.theme_pack = Some("paper".into());
         full.typography.message_font_family = Some("serif".into());
         full.typography.sender_weight = Some(600);
+        full.typography.sender_size = Some(15);
+        full.typography.timestamp_size = Some(11);
+        full.typography.composer_size = Some(16);
+        full.geometry.control_radius = Some(4);
+        full.geometry.input_radius = Some(5);
+        full.geometry.composer_radius = Some(6);
+        full.geometry.avatar_size = Some(30);
+        full.geometry.avatar_roundness = Some(50);
+        full.layout.room_density = Some(Density::Compact);
+        full.layout.message_density = Some(Density::Spacious);
         full.media.microphone_device = Some("alsa:microphone".into());
         full.media.speaker_device = Some("alsa:speaker".into());
         full.media.camera_device = Some("camera".into());
         full.colors.insert("link".into(), "#123456".into());
+        full.senders.colors = Some(vec!["#123456".into()]);
         full.account_overrides.insert(
             "account".into(),
             AccountOverrides {
@@ -3174,6 +4076,7 @@ mod tests {
                 local_voice_rooms: vec!["!a:example.org".into()],
                 legacy_element_call_rooms: vec!["!b:example.org".into()],
                 element_call_matrix_2_0_rooms: vec!["!c:example.org".into()],
+                colors: BTreeMap::from([("link".into(), "#123456".into())]),
             },
         );
         full.validate().unwrap();
@@ -3254,6 +4157,13 @@ mod tests {
                     FieldKind::Color => (
                         vec!["\"#123456\"".into(), "\"#12345678\"".into()],
                         vec!["\"#12345\"".into()],
+                    ),
+                    FieldKind::ColorList => (
+                        vec![
+                            "[\"#123456\"]".into(),
+                            "[\"#12345678\", \"#abcdef\"]".into(),
+                        ],
+                        vec!["[]".into(), "[\"red\"]".into()],
                     ),
                     FieldKind::DeviceId => {
                         (vec!["\"alsa:device\"".into()], vec!["\"no-host\"".into()])

@@ -62,10 +62,14 @@ pub(crate) fn apply_room_order(ui: &AppWindow) {
 /// are ignored for traversal without conflating equal display names.
 pub(crate) fn visible_rooms(ui: &AppWindow) -> Vec<RoomItem> {
     let rooms = if ui.get_group_direct_messages() {
-        ui.get_channels()
-            .iter()
-            .chain(ui.get_direct_messages().iter())
-            .collect::<Vec<_>>()
+        let (channels, direct) = (ui.get_channels(), ui.get_direct_messages());
+        // The grouped sections are shown in either order.
+        let (first, second) = if ui.get_direct_messages_first() {
+            (direct, channels)
+        } else {
+            (channels, direct)
+        };
+        first.iter().chain(second.iter()).collect::<Vec<_>>()
     } else {
         ui.get_combined_rooms()
             .iter()
