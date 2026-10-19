@@ -43,8 +43,6 @@ component SearchAction inherits Rectangle {
     in property <string> label;
     in property <bool> enabled: true;
     in property <color> focus-color;
-    // The window's focus ring width (StyleTokens.focus-width).
-    in property <length> focus-width: 2px;
     out property <bool> has-hover: hit.has-hover;
     out property <bool> has-focus: keyboard-focus.has-focus;
     callback activated();
@@ -74,21 +72,19 @@ component SearchAction inherits Rectangle {
     if keyboard-focus.has-focus : Rectangle {
         x: 0px; y: 0px; width: root.width; height: root.height;
         border-radius: root.border-radius;
-        border-width: root.focus-width;
+        border-width: 2px;
         border-color: root.focus-color;
         background: transparent;
     }
 }
 
-
-// One filter text field, drawn with the window's line and focus widths.
+// One filter text field, drawn like the panel's search field (1px line,
+// 2px focus ring, SearchPalette colors) so root can map it to StyleTokens.
 // Tab reaches it; Return searches now; Escape closes the filters.
 component FilterField inherits Rectangle {
     in property <SearchPalette> palette;
     in property <length> radius: 6px;
     in property <float> text-scale: 1;
-    in property <length> line-width: 1px;
-    in property <length> focus-width: 2px;
     in property <string> placeholder;
     in property <string> label;
     in property <bool> enabled: true;
@@ -101,7 +97,7 @@ component FilterField inherits Rectangle {
     border-radius: root.radius;
     height: max(30px, 20px * root.text-scale + 10px);
     background: root.palette.elevated;
-    border-width: input.has-focus ? root.focus-width : root.line-width;
+    border-width: input.has-focus ? 2px : 1px;
     border-color: input.has-focus ? root.palette.focus : root.palette.divider;
     if root.text == "" : Text {
         x: 8px; width: parent.width - 16px; height: parent.height;
@@ -178,9 +174,6 @@ export component MessageSearchPanel inherits VerticalLayout {
     in-out property <int> filter-attachment;
     in-out property <bool> filters-open;
     in property <string> filter-error;
-    // The window's line and focus ring widths (StyleTokens).
-    in property <length> line-width: 1px;
-    in property <length> focus-width: 2px;
     // The query text changed; the controller debounces and cancels.
     callback edited(string);
     // A filter changed; the controller debounces and cancels likewise.
@@ -334,11 +327,10 @@ export component MessageSearchPanel inherits VerticalLayout {
                 horizontal-stretch: 0;
                 width: filters-label.preferred-width + 20px;
                 border-radius: root.radius * 0.7;
-                border-width: root.line-width;
+                border-width: 1px;
                 border-color: root.filters-open || root.active-filters > 0 ? root.palette.accent : root.palette.divider;
                 background: root.filters-open ? root.palette.selection : self.has-hover ? root.palette.hover : transparent;
                 focus-color: root.palette.focus;
-                focus-width: root.focus-width;
                 enabled: root.available;
                 accessible-checkable: true;
                 accessible-checked: root.filters-open;
@@ -355,11 +347,10 @@ export component MessageSearchPanel inherits VerticalLayout {
             if root.filter-sender != "" : SearchAction {
                 horizontal-stretch: 1; min-width: 0px;
                 border-radius: root.radius * 0.7;
-                border-width: root.line-width;
+                border-width: 1px;
                 border-color: root.palette.accent;
                 background: self.has-hover ? root.palette.hover : root.palette.elevated;
                 focus-color: root.palette.focus;
-                focus-width: root.focus-width;
                 label: "Remove the sender filter, " + root.filter-sender;
                 activated => { root.filter-sender = ""; root.filters-edited(); }
                 Text {
@@ -372,11 +363,10 @@ export component MessageSearchPanel inherits VerticalLayout {
             if root.filter-since != "" || root.filter-until != "" : SearchAction {
                 horizontal-stretch: 1; min-width: 0px;
                 border-radius: root.radius * 0.7;
-                border-width: root.line-width;
+                border-width: 1px;
                 border-color: root.palette.accent;
                 background: self.has-hover ? root.palette.hover : root.palette.elevated;
                 focus-color: root.palette.focus;
-                focus-width: root.focus-width;
                 label: "Remove the date filter";
                 activated => { root.filter-since = ""; root.filter-until = ""; root.filters-edited(); }
                 Text {
@@ -389,11 +379,10 @@ export component MessageSearchPanel inherits VerticalLayout {
             if root.filter-attachment != 0 : SearchAction {
                 horizontal-stretch: 1; min-width: 0px;
                 border-radius: root.radius * 0.7;
-                border-width: root.line-width;
+                border-width: 1px;
                 border-color: root.palette.accent;
                 background: self.has-hover ? root.palette.hover : root.palette.elevated;
                 focus-color: root.palette.focus;
-                focus-width: root.focus-width;
                 label: "Remove the attachment filter";
                 activated => { root.filter-attachment = 0; root.filters-edited(); }
                 Text {
@@ -417,8 +406,7 @@ export component MessageSearchPanel inherits VerticalLayout {
                 }
                 FilterField {
                     horizontal-stretch: 1;
-                    palette: root.palette; text-scale: root.text-scale; radius: root.radius * 0.6;
-                    line-width: root.line-width; focus-width: root.focus-width;
+                    palette: root.palette; text-scale: root.text-scale; radius: root.radius * 0.7;
                     enabled: root.available;
                     placeholder: "@name:example.org";
                     label: "Only messages from this sender, by full user ID";
@@ -438,8 +426,7 @@ export component MessageSearchPanel inherits VerticalLayout {
                 }
                 FilterField {
                     horizontal-stretch: 1;
-                    palette: root.palette; text-scale: root.text-scale; radius: root.radius * 0.6;
-                    line-width: root.line-width; focus-width: root.focus-width;
+                    palette: root.palette; text-scale: root.text-scale; radius: root.radius * 0.7;
                     enabled: root.available;
                     placeholder: "From YYYY-MM-DD";
                     label: "Only messages sent on or after this day, written YYYY-MM-DD";
@@ -450,8 +437,7 @@ export component MessageSearchPanel inherits VerticalLayout {
                 }
                 FilterField {
                     horizontal-stretch: 1;
-                    palette: root.palette; text-scale: root.text-scale; radius: root.radius * 0.6;
-                    line-width: root.line-width; focus-width: root.focus-width;
+                    palette: root.palette; text-scale: root.text-scale; radius: root.radius * 0.7;
                     enabled: root.available;
                     placeholder: "To YYYY-MM-DD";
                     label: "Only messages sent on or before this day, written YYYY-MM-DD";
@@ -467,11 +453,10 @@ export component MessageSearchPanel inherits VerticalLayout {
                 for choice[option] in ["Any message", "With attachment", "No attachment"] : SearchAction {
                     horizontal-stretch: 1;
                     border-radius: root.radius * 0.7;
-                    border-width: root.line-width;
+                    border-width: 1px;
                     border-color: root.filter-attachment == option ? root.palette.accent : root.palette.divider;
                     background: root.filter-attachment == option ? root.palette.selection : self.has-hover ? root.palette.hover : transparent;
                     focus-color: root.palette.focus;
-                    focus-width: root.focus-width;
                     enabled: root.available;
                     accessible-checkable: true;
                     accessible-checked: root.filter-attachment == option;
