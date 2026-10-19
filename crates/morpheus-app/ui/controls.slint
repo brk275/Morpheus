@@ -23,6 +23,9 @@ export component ActionRect inherits Rectangle {
     in property <bool> cancel-on-escape: false;
     // Zero-sized targets can round outside a scroll clip and lose focus on release.
     in property <bool> reveal-full-control: true;
+    // False draws the control unchanged but keeps it out of keyboard focus
+    // and pointer input, for preview samples that must never act.
+    in property <bool> interactive: true;
     out property <bool> has-hover: hit.has-hover;
     out property <bool> has-pressed: hit.pressed;
     out property <bool> has-focus: keyboard-focus.has-focus;
@@ -43,7 +46,7 @@ export component ActionRect inherits Rectangle {
         height: root.reveal-full-control ? root.height : 0px;
         // Accessible focus uses the same reason as a pointer focus request.
         focus-on-click: true;
-        enabled: root.enabled;
+        enabled: root.enabled && root.interactive;
         focus-gained(reason) => { root.focus-state-changed(true); }
         focus-lost(reason) => { root.focus-state-changed(false); }
         key-pressed(event) => {
@@ -63,7 +66,7 @@ export component ActionRect inherits Rectangle {
         }
     }
     hit := TouchArea {
-        enabled: root.enabled;
+        enabled: root.enabled && root.interactive;
         mouse-cursor: pointer;
         clicked => { keyboard-focus.focus(); root.activated(); }
     }
@@ -142,6 +145,9 @@ export component TokenButton inherits ActionRect {
     in property <bool> primary: false;
     in property <ControlColors> colors;
     in property <float> text-scale: 1;
+    // Preview samples only: 1 draws hover, 2 pressed, 3 the focus ring,
+    // whatever the pointer and keyboard do. Live buttons keep 0.
+    in property <int> sample-state: 0;
     label: root.text;
     min-width: max(32px, caption.preferred-width + 2 * StyleTokens.control-padding * root.text-scale);
     min-height: max(30px, 16px * root.text-scale + 12px);
@@ -156,14 +162,14 @@ export component TokenButton inherits ActionRect {
     focus-color: root.primary ? root.colors.accent-ink : root.colors.ink;
     HoverSurface {
         width: parent.width; height: parent.height; border-radius: parent.border-radius;
-        highlighted: root.enabled && root.has-hover;
+        highlighted: root.enabled && (root.has-hover || root.sample-state == 1);
         background: root.primary ? root.colors.accent-ink.transparentize(0.85)
             : StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.colors.hover;
     }
     // Drawn only when pressed; a secondary button needs a theme's pressed state.
     Rectangle {
         width: parent.width; height: parent.height; border-radius: parent.border-radius;
-        background: !root.enabled || !root.has-pressed ? transparent
+        background: !root.enabled || !(root.has-pressed || root.sample-state == 2) ? transparent
             : root.primary ? root.colors.accent-ink.transparentize(0.75)
             : StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color : transparent;
     }
@@ -180,5 +186,11 @@ export component TokenButton inherits ActionRect {
         horizontal-alignment: center;
         vertical-alignment: center;
         overflow: elide;
+    }
+    if root.sample-state == 3 : Rectangle {
+        border-radius: parent.border-radius;
+        border-width: StyleTokens.focus-width;
+        border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.focus-color;
+        background: transparent;
     }
 }

@@ -3147,6 +3147,47 @@ async fn assert_shortcut_customization(ui: &AppWindow, directory: &std::path::Pa
 /// the preview, and a save that would change the look during it is refused.
 /// Apply saves the profile's look over the re-read file and keeps every other
 /// setting; an invalid settings file is never overwritten; Delete asks first.
+/// The Settings live preview draws synthetic samples that never take focus
+/// or pointer input. Its advanced-editor links only reveal their editor, and
+/// hiding it is session state.
+async fn assert_live_preview(ui: &AppWindow) {
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    ui.set_font_scale_percent(100);
+    ui.set_settings_search_query("".into());
+    ui.invoke_settings_search("".into());
+    ui.set_page(1);
+    settle(ui).await;
+    assert!(ui.get_appearance_preview_shown(), "the preview starts shown");
+    // Samples sit between the toggle and the links in the tree; Tab skips
+    // every one of them.
+    tab_to_control(ui, "Hide the live preview");
+    key(ui, Key::Tab);
+    assert!(
+        focused_control_has_label(ui, "Go to the color editor"),
+        "a preview sample took keyboard focus"
+    );
+    key(ui, Key::Return);
+    settle(ui).await;
+    assert_eq!(ui.get_settings_revealed_id(), "appearance.colors");
+    ui.set_page(0);
+    settle(ui).await;
+    ui.set_page(1);
+    settle(ui).await;
+    tab_to_control(ui, "Hide the live preview");
+    key(ui, Key::Return);
+    settle(ui).await;
+    assert!(!ui.get_appearance_preview_shown());
+    assert!(
+        focused_control_has_label(ui, "Show the live preview"),
+        "the toggle keeps focus"
+    );
+    key(ui, Key::Return);
+    settle(ui).await;
+    assert!(ui.get_appearance_preview_shown());
+    ui.set_page(0);
+    settle(ui).await;
+}
+
 async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     use morpheus_config::style_profiles::ProfileStore;
     use morpheus_config::{ConfigStore, LoadedConfig};
@@ -3399,6 +3440,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     assert_shortcut_customization(&ui, directory.path()).await;
     phase.set(18);
     assert_style_profiles(&ui, directory.path()).await;
+    phase.set(19);
+    assert_live_preview(&ui).await;
     phase.set(15);
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),
