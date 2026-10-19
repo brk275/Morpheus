@@ -128,6 +128,7 @@ pub struct TileView {
     pub pinned: bool,
     pub microphone_muted: bool,
     pub speaking: bool,
+    pub hand_raised: bool,
     pub frame_slot: Option<usize>,
 }
 
@@ -140,6 +141,8 @@ pub struct StageLayout {
     pub pages: usize,
     /// Tiles across every page, excluding the featured tile.
     pub tile_count: usize,
+    /// A media transport is reconnecting; pictures may freeze meanwhile.
+    pub media_degraded: bool,
 }
 
 #[derive(Clone, Default)]
@@ -411,6 +414,7 @@ struct Stage<M> {
     presented: bool,
     speaking: HashSet<String>,
     undecryptable: HashSet<String>,
+    media_degraded: bool,
     planner: Planner,
     presenter: Presenter,
     /// Last constraints sent for each remote video stream on the roster.
@@ -430,6 +434,7 @@ impl<M: StageMedia> Stage<M> {
             presented: false,
             speaking: HashSet::new(),
             undecryptable: HashSet::new(),
+            media_degraded: false,
             planner: Planner::default(),
             presenter: Presenter::default(),
             constraints: HashMap::new(),
@@ -489,7 +494,10 @@ impl<M: StageMedia> Stage<M> {
                 }
                 true
             }
-            RtcCallEvent::StreamUnmuted { .. } | RtcCallEvent::ParticipantJoined { .. } => true,
+            RtcCallEvent::StreamUnmuted { .. }
+            | RtcCallEvent::ParticipantJoined { .. }
+            | RtcCallEvent::HandRaised { .. }
+            | RtcCallEvent::HandLowered { .. } => true,
             RtcCallEvent::ParticipantLeft { member_id } => {
                 self.presenter.release_member(member_id);
                 self.speaking.remove(member_id);
@@ -518,6 +526,10 @@ impl<M: StageMedia> Stage<M> {
                 self.undecryptable.remove(member_id);
                 false
             }
+            RtcCallEvent::MediaConnectionState { degraded } => {
+                self.media_degraded = *degraded;
+                false
+            }
             _ => false,
         }
     }
@@ -542,6 +554,7 @@ impl<M: StageMedia> Stage<M> {
         for tile in layout.featured.iter_mut().chain(layout.tiles.iter_mut()) {
             tile.frame_slot = self.presenter.slot_of(&tile.key);
         }
+        layout.media_degraded = self.media_degraded;
         if *self.layout != layout {
             self.layout = Arc::new(layout);
             self.revision += 1;
@@ -758,6 +771,7 @@ impl Planner {
                 page,
                 pages,
                 tile_count,
+                media_degraded: false,
             },
             decode,
         }
@@ -827,6 +841,7 @@ impl Planner {
                     stream.kind == RtcStreamKind::Microphone && stream.muted
                 }),
             speaking: person && input.speaking.contains(&participant.member_id),
+            hand_raised: person && participant.hand_raised_at_ms.is_some(),
             frame_slot: None,
             key,
         }
@@ -871,6 +886,7 @@ impl Planner {
                         pinned: true,
                         microphone_muted: false,
                         speaking: false,
+                        hand_raised: false,
                         frame_slot: None,
                     },
                     until: input.now + DEPARTED_PLACEHOLDER,

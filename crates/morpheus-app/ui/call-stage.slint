@@ -30,6 +30,7 @@ export struct CallTileItem {
     is-local: bool,
     mic-muted: bool,
     speaking: bool,
+    hand-raised: bool,
 }
 
 export struct CallStagePalette {
@@ -123,12 +124,18 @@ component StageTile inherits Rectangle {
         + (root.has-frame ? ", video" : ", " + root.tile.status)
         + (root.tile.pinned ? ", pinned" : "")
         + (root.tile.mic-muted ? ", microphone muted" : "")
+        + (root.tile.hand-raised ? ", hand raised" : "")
         + (root.tile.speaking ? ", speaking" : "");
     accessible-enabled: root.can-pin;
     accessible-action-default => {
         if root.can-pin { root.toggle-pin(); }
     }
 
+    // A pin change or tile rebuild recreates elements; the stage asks the
+    // new element for the tile that had focus.
+    init => {
+        if root.focus-requested { keyboard-focus.focus(); }
+    }
     changed focus-requested => {
         if root.focus-requested { keyboard-focus.focus(); }
     }
@@ -185,7 +192,8 @@ component StageTile inherits Rectangle {
                 padding-right: 8px;
                 Text {
                     text: (root.tile.screen ? "Screen · " : "") + root.tile.name
-                        + (root.tile.mic-muted ? " · mic muted" : "");
+                        + (root.tile.mic-muted ? " · mic muted" : "")
+                        + (root.tile.hand-raised ? " · hand raised" : "");
                     color: root.palette.ink;
                     font-size: 11px * root.text-scale;
                     font-weight: 650;
@@ -204,7 +212,7 @@ component StageTile inherits Rectangle {
         border-radius: 6px;
         background: root.palette.accent;
         pinned-text := Text {
-            text: root.tile.departed ? "Pinned · gone" : "Pinned";
+            text: "Pinned";
             color: root.palette.accent-ink;
             font-size: 10px * root.text-scale;
             font-weight: 750;
@@ -302,6 +310,7 @@ export component CallStage inherits Rectangle {
     in property <int> page: 0;
     in property <int> pages: 1;
     in property <int> tile-count: 0;
+    in property <bool> media-degraded: false;
     in property <[CallParticipantItem]> participants;
     in property <bool> call-connected: false;
     in property <bool> calls-enabled: false;
@@ -319,8 +328,10 @@ export component CallStage inherits Rectangle {
     property <length> inset: 12px;
     property <length> gap: 10px;
     property <length> roster-width: 212px;
-    property <bool> roster-shown: root.show-roster && root.width >= 700px;
-    property <length> pager-height: root.pages > 1 ? 40px : 0px;
+    property <bool> roster-fits: root.width >= 700px;
+    property <bool> roster-shown: root.show-roster && root.roster-fits;
+    // Paging controls and, while the roster is hidden, its "People" button.
+    property <length> pager-height: root.pages > 1 || (root.roster-fits && !root.show-roster) ? 40px : 0px;
     property <length> controls-height: root.can-open-slot ? 64px : 0px;
     property <length> stage-x: root.inset;
     property <length> stage-y: root.inset;
@@ -329,6 +340,8 @@ export component CallStage inherits Rectangle {
     property <int> count: root.tiles.length;
     // The tile that should hold keyboard focus; tiles report focus changes.
     property <int> focus-target: -1;
+    // The tile to refocus after a pin change rebuilds the stage.
+    property <int> restore-focus: -1;
 
     // Featured mode: the featured tile above a row of page tiles.
     property <length> strip-height: root.count > 0 ? min(120px, root.stage-height * 0.26) : 0px;
@@ -355,12 +368,29 @@ export component CallStage inherits Rectangle {
         min((root.stage-width - (columns - 1) * root.gap) / columns, (root.stage-height - (rows - 1) * root.gap) / rows * 16 / 9)
     }
 
+    // Pin or unpin `id`, keeping keyboard focus on that tile once it moves.
+    function toggle(id: int) {
+        root.restore-focus = id;
+        root.pin-tile(id);
+    }
+
     // Escape unpins; it is left to other handlers when nothing is pinned.
-    function unpin-featured() -> bool {
-        if root.featured-visible && root.featured.pinned {
+    function escape-from(id: int) -> bool {
+        let pinned = root.featured-visible && root.featured.pinned;
+        if pinned {
+            root.restore-focus = id;
             root.pin-tile(root.featured.id);
         }
-        root.featured-visible && root.featured.pinned
+        pinned
+    }
+
+    function tile-focus(id: int, on: bool) {
+        if on {
+            root.focus-target = id;
+            root.restore-focus = -1;
+        } else if root.focus-target == id {
+            root.focus-target = -1;
+        }
     }
 
     // Arrow keys: index -1 is the featured tile, then the page in order.
@@ -423,14 +453,12 @@ export component CallStage inherits Rectangle {
         corner: root.corner;
         motion: root.motion;
         featured: true;
-        focus-requested: root.focus-target == root.featured.id;
-        toggle-pin => { root.pin-tile(root.featured.id); }
-        escape-pressed => { root.unpin-featured() }
+        focus-requested: root.focus-target == root.featured.id || root.restore-focus == root.featured.id;
+        toggle-pin => { root.toggle(root.featured.id); }
+        escape-pressed => { root.escape-from(root.featured.id) }
         page(delta) => { root.page-tiles(delta); }
         navigate(dx, dy) => { root.navigate(-1, dx, dy); }
-        focused(on) => {
-            if on { root.focus-target = root.featured.id; }
-        }
+        focused(on) => { root.tile-focus(root.featured.id, on); }
     }
 
     for item[index] in root.tiles : StageTile {
@@ -448,14 +476,12 @@ export component CallStage inherits Rectangle {
         text-scale: root.text-scale;
         corner: root.corner;
         motion: root.motion;
-        focus-requested: root.focus-target == item.id;
-        toggle-pin => { root.pin-tile(item.id); }
-        escape-pressed => { root.unpin-featured() }
+        focus-requested: root.focus-target == item.id || root.restore-focus == item.id;
+        toggle-pin => { root.toggle(item.id); }
+        escape-pressed => { root.escape-from(item.id) }
         page(delta) => { root.page-tiles(delta); }
         navigate(dx, dy) => { root.navigate(index, dx, dy); }
-        focused(on) => {
-            if on { root.focus-target = item.id; }
-        }
+        focused(on) => { root.tile-focus(item.id, on); }
     }
 
     if root.pages > 1 : HorizontalLayout {
@@ -518,14 +544,35 @@ export component CallStage inherits Rectangle {
         Text {
             x: 12px;
             y: 10px;
-            width: parent.width - 24px;
+            width: parent.width - 76px;
             height: 24px;
             text: "PARTICIPANTS · " + root.participants.length;
             color: root.palette.muted;
             font-size: 10px * root.text-scale;
             font-weight: 750;
             letter-spacing: 1px;
+            overflow: elide;
             accessible-live-region: polite;
+        }
+        StageAction {
+            x: parent.width - self.width - 8px;
+            y: 8px;
+            width: 48px;
+            height: 26px;
+            border-radius: 7px;
+            background: self.has-hover ? root.palette.hover : root.palette.panel;
+            label: "Hide participant list";
+            focus-color: root.palette.focus;
+            activated => { root.show-roster = false; }
+            Text {
+                text: "Hide";
+                color: root.palette.muted;
+                font-size: 11px * root.text-scale;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                accessible-role: none;
+            }
         }
         if root.participants.length == 0 : Text {
             x: 12px;
@@ -566,6 +613,49 @@ export component CallStage inherits Rectangle {
                     }
                 }
             }
+        }
+    }
+
+    if root.roster-fits && !root.show-roster : StageAction {
+        x: root.stage-x + root.stage-width - self.width;
+        y: root.stage-y + root.stage-height + 7px;
+        width: people-text.preferred-width + 20px;
+        height: 30px;
+        border-radius: 8px;
+        background: self.has-hover ? root.palette.hover : root.palette.panel;
+        label: "Show participant list, " + root.participants.length + " in call";
+        focus-color: root.palette.focus;
+        activated => { root.show-roster = true; }
+        people-text := Text {
+            text: "People · " + root.participants.length;
+            color: root.palette.ink;
+            font-size: 11px * root.text-scale;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+    }
+
+    // MatrixRTC reports a degraded media connection while a transport
+    // reconnects; pictures can freeze until it recovers.
+    if root.media-degraded : Rectangle {
+        x: root.stage-x + (root.stage-width - self.width) / 2;
+        y: root.stage-y + 8px;
+        width: min(root.stage-width - 16px, degraded-text.preferred-width + 24px);
+        height: 28px;
+        border-radius: 8px;
+        background: root.palette.panel;
+        border-color: root.palette.divider;
+        border-width: 1px;
+        degraded-text := Text {
+            text: "Media connection interrupted · reconnecting";
+            color: root.palette.ink;
+            font-size: 11px * root.text-scale;
+            font-weight: 650;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            accessible-live-region: polite;
         }
     }
 

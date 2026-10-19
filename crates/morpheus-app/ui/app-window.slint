@@ -2176,6 +2176,7 @@ export component AppWindow inherits Window {
     in-out property <int> native-call-page: 0;
     in-out property <int> native-call-pages: 1;
     in-out property <int> native-call-tile-count: 0;
+    in-out property <bool> native-call-media-degraded: false;
     callback pin-native-call-tile(int);
     callback page-native-call-tiles(int);
     callback native-call-stage-presented(bool);
@@ -5571,6 +5572,7 @@ export component AppWindow inherits Window {
                         page: root.native-call-page;
                         pages: root.native-call-pages;
                         tile-count: root.native-call-tile-count;
+                        media-degraded: root.native-call-media-degraded;
                         participants: root.native-call-participants;
                         call-connected: root.call-connected;
                         calls-enabled: root.native-call-enabled;

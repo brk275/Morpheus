@@ -176,6 +176,7 @@ fn clear(ui: &AppWindow, applied: &mut Applied) {
     ui.set_native_call_page(0);
     ui.set_native_call_pages(1);
     ui.set_native_call_tile_count(0);
+    ui.set_native_call_media_degraded(false);
     let frames = ui.get_native_call_frames();
     for slot in 0..frames.row_count() {
         frames.set_row_data(slot, Image::default());
@@ -215,6 +216,7 @@ fn apply_layout(ui: &AppWindow, layout: &StageLayout) {
     ui.set_native_call_page(to_int(layout.page));
     ui.set_native_call_pages(to_int(layout.pages.max(1)));
     ui.set_native_call_tile_count(to_int(layout.tile_count));
+    ui.set_native_call_media_degraded(layout.media_degraded);
 }
 
 fn find_tile(layout: &StageLayout, id: i32) -> Option<&TileView> {
@@ -253,6 +255,7 @@ fn tile_item(tile: &TileView) -> CallTileItem {
         is_local: tile.is_local,
         mic_muted: tile.microphone_muted,
         speaking: tile.speaking,
+        hand_raised: tile.hand_raised,
     }
 }
 
