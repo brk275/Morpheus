@@ -578,8 +578,9 @@ fn marker_index(body: &str) -> Option<usize> {
 }
 
 /// Direct counts over the window's message model: rows carrying a fixture
-/// marker and distinct fixture indices. Undecryptable events never reach the
-/// model, so the distinct count is also the number of decrypted events.
+/// marker and distinct fixture indices. Undecryptable events reach the model
+/// only as fixed notices without a marker, so the distinct count is also the
+/// number of decrypted events.
 fn fixture_rows<'a>(bodies: impl Iterator<Item = &'a str>) -> (usize, usize) {
     let mut seen = vec![false; EVENTS + 1];
     let (mut marked, mut distinct) = (0, 0);

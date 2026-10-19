@@ -736,6 +736,60 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         });
     });
 
+    // Declining sends a user cancellation to the requesting device; the
+    // app-wide watcher then retires its banner.
+    let weak = ui.as_weak();
+    let decline_live = live.clone();
+    let decline_handle = handle.clone();
+    ui.on_decline_incoming_verification(move || {
+        let Some(window) = weak.upgrade() else { return };
+        if !window.get_live_session()
+            || window.get_sas_stage() != IDLE
+            || window.get_sas_busy()
+            || decline_live.security_gate.blocked()
+        {
+            return;
+        }
+        let account_id = window.get_active_account_local_id().to_string();
+        let user_id = window.get_sas_incoming_user_id().to_string();
+        let flow_id = window.get_sas_incoming_flow_id().to_string();
+        if account_id.is_empty() || user_id.is_empty() || flow_id.is_empty() {
+            return;
+        }
+        let operation = next_operation(&window);
+        window.set_sas_busy(true);
+        window.set_sas_incoming_loading(false);
+        window.set_sas_error("".into());
+        let live = decline_live.clone();
+        let weak = weak.clone();
+        decline_handle.spawn(async move {
+            let result = {
+                let _transition = live.account_transition.lock().await;
+                live.manager
+                    .decline_verification_for(&account_id, &user_id, &flow_id)
+                    .await
+            };
+            let _ = weak.upgrade_in_event_loop(move |window| {
+                if !same_account(&window, &account_id, operation)
+                    || window.get_sas_incoming_flow_id().as_str() != flow_id
+                {
+                    return;
+                }
+                window.set_sas_busy(false);
+                match result {
+                    Ok(()) => {
+                        window.set_sas_incoming_flow_id("".into());
+                        window.set_sas_incoming_user_id("".into());
+                        window.set_sas_notice("Verification request declined.".into());
+                    }
+                    Err(_) => window.set_sas_error(
+                        "Could not decline this request. It may have expired.".into(),
+                    ),
+                }
+            });
+        });
+    });
+
     let weak = ui.as_weak();
     let request_live = live.clone();
     let request_handle = handle.clone();

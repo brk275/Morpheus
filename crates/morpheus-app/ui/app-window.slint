@@ -2500,6 +2500,7 @@ export component AppWindow inherits Window {
     callback request-own-verification();
     callback refresh-incoming-verification();
     callback accept-incoming-verification();
+    callback decline-incoming-verification();
     callback refresh-sas-verification();
     callback start-sas-verification();
     callback confirm-sas-verification();
@@ -5294,6 +5295,7 @@ export component AppWindow inherits Window {
                                 can-request: !root.security-busy && root.security-recovery-key == "" && root.security-device-status == "Unverified";
                                 poll-incoming => { root.refresh-incoming-verification(); }
                                 accept-incoming => { root.accept-incoming-verification(); }
+                                decline-incoming => { root.decline-incoming-verification(); }
                                 request-own => { root.request-own-verification(); }
                                 refresh => { root.refresh-sas-verification(); }
                                 start => { root.start-sas-verification(); }

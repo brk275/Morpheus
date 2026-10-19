@@ -91,6 +91,8 @@ export component SasVerificationPanel inherits Rectangle {
     in property <bool> can-request;
     callback poll-incoming();
     callback accept-incoming();
+    // Tells the other device no; nothing is trusted or changed here.
+    callback decline-incoming();
     callback request-own();
     callback refresh();
     callback start();
@@ -122,6 +124,9 @@ export component SasVerificationPanel inherits Rectangle {
     }
     changed stage => { if root.stage == 0 { root.check-incoming(); } }
     changed blocked => { if !root.blocked { root.check-incoming(); } }
+    // Which incoming action is running, for its button label.
+    property <bool> declining;
+    changed busy => { if !root.busy { root.declining = false; } }
     // Slow fallback in case the watcher is resubscribing.
     Timer {
         interval: 30s;
@@ -161,10 +166,22 @@ export component SasVerificationPanel inherits Rectangle {
                 accessible-live-region: polite;
             }
             Button {
-                text: root.busy ? "Accepting…" : "Review request";
+                text: root.busy && !root.declining ? "Accepting…" : "Review request";
                 enabled: !root.busy && !root.blocked;
                 accessible-label: "Accept incoming verification request from another device on this account";
-                clicked => { root.accept-incoming(); }
+                clicked => {
+                    root.declining = false;
+                    root.accept-incoming();
+                }
+            }
+            Button {
+                text: root.busy && root.declining ? "Declining…" : "Decline";
+                enabled: !root.busy && !root.blocked;
+                accessible-label: "Decline the verification request from another device on this account";
+                clicked => {
+                    root.declining = true;
+                    root.decline-incoming();
+                }
             }
         }
         if root.stage == 0 : HorizontalLayout {
