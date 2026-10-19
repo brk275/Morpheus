@@ -1,7 +1,9 @@
 // Native viewer for one explicitly opened image attachment. Rust fetches and
 // decodes only on request, one at a time, and never prefetches neighbours;
 // this file lays out fit, zoom and pan and reports navigation, cancel, retry,
-// save and close. Zoom and pan change immediately, with no animation.
+// save and close. Zoom and pan change immediately, with no animation. The
+// window passes its resolved semantic colors and appearance preferences in;
+// this file cannot import the window's globals.
 
 export struct ViewerPalette {
     ink: color,
@@ -11,9 +13,30 @@ export struct ViewerPalette {
     surface: color,
     backdrop: color,
     scrim: color,
+    // The control hover state, else the window's hover color.
     hover: color,
+    // The control pressed state, else the hover color.
+    pressed: color,
+    // The control disabled state; used only when `disabled-set`, otherwise an
+    // unavailable action keeps its built-in dimming.
+    disabled: color,
+    disabled-set: bool,
     focus: color,
     error: color,
+}
+
+// Resolved existing appearance preferences; no settings store of its own.
+// At the default preferences every value equals the viewer's built-in look.
+export struct ViewerStyle {
+    dialog-radius: length,
+    stage-radius: length,
+    control-radius: length,
+    line-width: length,
+    focus-width: length,
+    // Horizontal padding inside an action, each side.
+    action-padding: length,
+    // The configured icon size relative to the built-in one, for glyphs.
+    glyph-scale: float,
 }
 
 // A keyboard and pointer action with a text label.
@@ -22,15 +45,21 @@ component ViewerAction inherits Rectangle {
     in property <string> label;
     in property <bool> enabled: true;
     in property <bool> primary: false;
+    // A one-character symbol (arrows, + and -) that follows the icon size.
+    in property <bool> glyph: false;
     in property <ViewerPalette> palette;
+    in property <ViewerStyle> style;
     in property <float> text-scale: 1;
     out property <bool> has-focus: keyboard-focus.has-focus;
     callback activated();
-    width: max(32px, action-text.preferred-width + 18px);
-    height: 30px;
-    border-radius: 7px;
-    background: root.primary && root.enabled ? root.palette.accent : (hit.has-hover && root.enabled ? root.palette.hover : transparent);
-    opacity: root.enabled ? 1 : 0.45;
+    width: max(32px, action-text.preferred-width + 2 * root.style.action-padding);
+    // 30 px by default; large text or icons grow it rather than clip.
+    height: max(30px, 14px * root.text-scale + 8px, 18px * root.style.glyph-scale + 12px);
+    border-radius: root.style.control-radius;
+    background: root.primary && root.enabled ? root.palette.accent
+        : hit.pressed && root.enabled ? root.palette.pressed
+        : hit.has-hover && root.enabled ? root.palette.hover : transparent;
+    opacity: root.enabled || root.palette.disabled-set ? 1 : 0.45;
     forward-focus: keyboard-focus;
     accessible-role: button;
     accessible-label: root.label;
@@ -40,8 +69,9 @@ component ViewerAction inherits Rectangle {
     }
     action-text := Text {
         text: root.text;
-        color: root.primary && root.enabled ? root.palette.accent-ink : root.palette.ink;
-        font-size: 12px * root.text-scale;
+        color: !root.enabled && root.palette.disabled-set ? root.palette.disabled
+            : root.primary && root.enabled ? root.palette.accent-ink : root.palette.ink;
+        font-size: 12px * root.text-scale * (root.glyph ? root.style.glyph-scale : 1);
         font-weight: 700;
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -68,7 +98,7 @@ component ViewerAction inherits Rectangle {
     }
     if keyboard-focus.has-focus : Rectangle {
         border-radius: parent.border-radius;
-        border-width: 2px;
+        border-width: root.style.focus-width;
         border-color: root.palette.focus;
         background: transparent;
     }
@@ -89,6 +119,7 @@ export component MediaViewer inherits Rectangle {
     in property <bool> has-next: false;
     in property <bool> can-save: false;
     in property <ViewerPalette> palette;
+    in property <ViewerStyle> style;
     in property <float> text-scale: 1;
     callback close();
     callback previous();
@@ -223,8 +254,8 @@ export component MediaViewer inherits Rectangle {
             y: (parent.height - self.height) / 2;
             width: min(1100px, parent.width - 48px);
             height: min(820px, parent.height - 48px);
-            border-radius: 14px;
-            border-width: 1px;
+            border-radius: root.style.dialog-radius;
+            border-width: root.style.line-width;
             border-color: root.palette.accent;
             background: root.palette.surface;
             accessible-role: region;
@@ -255,6 +286,7 @@ export component MediaViewer inherits Rectangle {
                         label: "Save " + root.title + " to a location you choose";
                         enabled: root.can-save;
                         palette: root.palette;
+                        style: root.style;
                         text-scale: root.text-scale;
                         activated => { root.save(); }
                     }
@@ -263,6 +295,7 @@ export component MediaViewer inherits Rectangle {
                         label: "Close image preview";
                         primary: true;
                         palette: root.palette;
+                        style: root.style;
                         text-scale: root.text-scale;
                         activated => { root.close(); }
                     }
@@ -277,7 +310,7 @@ export component MediaViewer inherits Rectangle {
                     preferred-height: 0px;
                     vertical-stretch: 1;
                     background: root.palette.backdrop;
-                    border-radius: 9px;
+                    border-radius: root.style.stage-radius;
                     clip: true;
                     if root.loaded : Image {
                         x: (parent.width - self.width) / 2 + root.pan-x;
@@ -292,7 +325,7 @@ export component MediaViewer inherits Rectangle {
                     if !root.loaded : Text {
                         text: root.loading ? "Loading…" : "▧";
                         color: root.palette.muted;
-                        font-size: root.loading ? 16px * root.text-scale : 54px;
+                        font-size: root.loading ? 16px * root.text-scale : 54px * root.style.glyph-scale;
                         horizontal-alignment: center;
                         vertical-alignment: center;
                         accessible-role: none;
@@ -335,7 +368,9 @@ export component MediaViewer inherits Rectangle {
                         y: (parent.height - self.height) / 2;
                         text: "‹";
                         label: "Previous image";
+                        glyph: true;
                         palette: root.palette;
+                        style: root.style;
                         text-scale: root.text-scale;
                         background: root.palette.surface;
                         activated => { root.previous(); }
@@ -347,7 +382,9 @@ export component MediaViewer inherits Rectangle {
                         y: (parent.height - self.height) / 2;
                         text: "›";
                         label: "Next image";
+                        glyph: true;
                         palette: root.palette;
+                        style: root.style;
                         text-scale: root.text-scale;
                         background: root.palette.surface;
                         activated => { root.next(); }
@@ -371,6 +408,7 @@ export component MediaViewer inherits Rectangle {
                         text: root.loading ? "Cancel" : "Try again";
                         label: root.loading ? "Cancel loading this image" : "Try loading this image again";
                         palette: root.palette;
+                        style: root.style;
                         text-scale: root.text-scale;
                         activated => {
                             if root.loading { root.cancel-loading(); } else { root.retry(); }
@@ -380,7 +418,9 @@ export component MediaViewer inherits Rectangle {
                         text: "−";
                         label: "Zoom out";
                         enabled: root.loaded && root.zoom > 1;
+                        glyph: true;
                         palette: root.palette;
+                        style: root.style;
                         text-scale: root.text-scale;
                         activated => { root.zoom-by(0.8); }
                     }
@@ -391,6 +431,7 @@ export component MediaViewer inherits Rectangle {
                         label: "Fit image to the window";
                         enabled: root.loaded && root.zoom != 1;
                         palette: root.palette;
+                        style: root.style;
                         text-scale: root.text-scale;
                         activated => { root.reset-view(); }
                     }
@@ -398,7 +439,9 @@ export component MediaViewer inherits Rectangle {
                         text: "+";
                         label: "Zoom in";
                         enabled: root.loaded && root.zoom < 8;
+                        glyph: true;
                         palette: root.palette;
+                        style: root.style;
                         text-scale: root.text-scale;
                         activated => { root.zoom-by(1.25); }
                     }

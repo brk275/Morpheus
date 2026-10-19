@@ -5350,10 +5350,20 @@ export component AppWindow inherits Window {
                                 accent: root.accent,
                                 accent-ink: root.accent-ink,
                                 surface: root.panel,
-                                hover: root.hover,
+                                hover: StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover,
+                                pressed: StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color
+                                    : StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover,
                                 divider: root.divider,
                                 focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent,
                                 error: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b
+                            };
+                            // The queue's built-in look at the default preferences.
+                            style: {
+                                row-radius: StyleTokens.radius * 0.7,
+                                control-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.6,
+                                row-line-width: StyleTokens.high-contrast ? StyleTokens.line-width : 0px,
+                                focus-width: StyleTokens.focus-width,
+                                action-padding: StyleTokens.control-padding * 2 / 3,
                             };
                             send => { root.send-attachments(); }
                             action(id, kind) => { root.attachment-action(id, kind); }
@@ -8300,9 +8310,23 @@ export component AppWindow inherits Window {
             surface: root.dialog-surface,
             backdrop: StyleTokens.roles.media-backdrop.present ? StyleTokens.roles.media-backdrop.color : #11131b,
             scrim: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000cc,
-            hover: root.hover,
+            hover: StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover,
+            pressed: StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color
+                : StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover,
+            disabled: StyleTokens.states.control-disabled.color,
+            disabled-set: StyleTokens.states.control-disabled.present,
             focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent,
             error: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b
+        };
+        // The viewer's built-in look at the default preferences.
+        style: {
+            dialog-radius: StyleTokens.radius * 1.4,
+            stage-radius: StyleTokens.radius * 0.9,
+            control-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.7,
+            line-width: StyleTokens.line-width,
+            focus-width: StyleTokens.focus-width,
+            action-padding: StyleTokens.control-padding * 0.75,
+            glyph-scale: StyleTokens.icon-size / 18px,
         };
         close => { root.dismiss-image-preview(); }
         previous => { root.preview-adjacent-image(-1); }

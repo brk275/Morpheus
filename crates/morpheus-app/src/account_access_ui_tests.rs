@@ -3694,6 +3694,19 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     assert!(focused_control_has_label(&ui, "Zoom in"));
     key(&ui, Key::Tab);
     assert!(focused_control_has_label(&ui, "Close image preview"));
+    // At 200% text each action grows to fit its label (30 px by default)
+    // and stays inside the window.
+    ui.set_font_scale_percent(200);
+    settle(&ui).await;
+    for label in ["Close image preview", "Zoom in", "Previous image"] {
+        let bounds = control_bounds(&ui, label);
+        assert_eq!(bounds.len(), 1, "{label}");
+        let height = bounds[0].bottom - bounds[0].top;
+        assert!(height >= 35.5, "{label}: {height} px at 200%");
+        assert!(inside_window(&ui, bounds[0]), "{label} at 200%");
+    }
+    ui.set_font_scale_percent(100);
+    settle(&ui).await;
     ui.set_image_preview_open(false);
     ui.set_image_preview_loaded(false);
     ui.set_image_preview_has_previous(false);
