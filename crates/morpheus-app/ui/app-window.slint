@@ -3751,6 +3751,12 @@ export component AppWindow inherits Window {
     // The fill of an ordinary action: a theme's pressed state while pressed,
     // its control hover state (else the built-in hover color) while hovered,
     // otherwise the action's own surface.
+    // Text fields: a theme's input surface, else the field's own surface.
+    // While focused a field's outline uses the focus role and width.
+    pure function input-fill(idle: color) -> color {
+        return StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : idle;
+    }
+    property <color> field-focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent;
     pure function control-fill(hovered: bool, pressed: bool, idle: color) -> color {
         return pressed && StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color
             : hovered ? (StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover)
@@ -9350,17 +9356,26 @@ export component AppWindow inherits Window {
                 Rectangle { height: 6px; vertical-stretch: 0; background: transparent; }
                 Text { text: "HOMESERVER"; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; letter-spacing: 1px; vertical-stretch: 0; }
                 Rectangle {
-                    height: 42px * root.text-scale; vertical-stretch: 0; background: root.elevated; border-radius: StyleTokens.radius * 0.8; border-color: root.divider; border-width: StyleTokens.line-width; clip: true;
+                    height: 42px * root.text-scale; vertical-stretch: 0; background: root.input-fill(root.elevated);
+                    border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.8;
+                    border-color: login-homeserver-input.has-focus ? root.field-focus : root.input-border-color;
+                    border-width: login-homeserver-input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width; clip: true;
                     login-homeserver-input := ThemedTextInput { x: 11px; width: parent.width - 22px; height: parent.height; single-line: true; text <=> root.login-homeserver; color: root.ink; font-size: 13px * root.text-scale; vertical-alignment: center; accessible-label: "Homeserver URL"; }
                 }
                 Text { text: "MATRIX ID OR USERNAME"; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; letter-spacing: 1px; vertical-stretch: 0; }
                 Rectangle {
-                    height: 42px * root.text-scale; vertical-stretch: 0; background: root.elevated; border-radius: StyleTokens.radius * 0.8; border-color: root.divider; border-width: StyleTokens.line-width; clip: true;
-                    ThemedTextInput { x: 11px; width: parent.width - 22px; height: parent.height; single-line: true; text <=> root.login-username; color: root.ink; font-size: 13px * root.text-scale; vertical-alignment: center; accessible-label: "Matrix ID or username"; }
+                    height: 42px * root.text-scale; vertical-stretch: 0; background: root.input-fill(root.elevated);
+                    border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.8;
+                    border-color: login-username-input.has-focus ? root.field-focus : root.input-border-color;
+                    border-width: login-username-input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width; clip: true;
+                    login-username-input := ThemedTextInput { x: 11px; width: parent.width - 22px; height: parent.height; single-line: true; text <=> root.login-username; color: root.ink; font-size: 13px * root.text-scale; vertical-alignment: center; accessible-label: "Matrix ID or username"; }
                 }
                 Text { text: "PASSWORD"; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; letter-spacing: 1px; vertical-stretch: 0; }
                 Rectangle {
-                    height: 42px * root.text-scale; vertical-stretch: 0; background: root.elevated; border-radius: StyleTokens.radius * 0.8; border-color: root.divider; border-width: StyleTokens.line-width; clip: true;
+                    height: 42px * root.text-scale; vertical-stretch: 0; background: root.input-fill(root.elevated);
+                    border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.8;
+                    border-color: login-password-input.has-focus ? root.field-focus : root.input-border-color;
+                    border-width: login-password-input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width; clip: true;
                     login-password-input := ThemedTextInput {
                         x: 11px; width: parent.width - 22px; height: parent.height;
                         text <=> root.login-password; single-line: true; input-type: password;
@@ -9654,7 +9669,9 @@ export component AppWindow inherits Window {
                             if root.access-mode == 0 || root.access-mode == 2 || root.access-mode == 3 : Text { text: "Current app password"; color: root.ink; font-size: 12px * root.text-scale; vertical-stretch: 0; }
                             Rectangle {
                                 visible: root.access-mode == 0 || root.access-mode == 2 || root.access-mode == 3;
-                                height: self.visible ? 42px * root.text-scale : 0px; vertical-stretch: 0; background: root.elevated; border-radius: StyleTokens.radius * 0.8;
+                                height: self.visible ? 42px * root.text-scale : 0px; vertical-stretch: 0; background: root.input-fill(root.elevated);
+                                border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.8;
+                                border-color: root.field-focus; border-width: access-current.has-focus ? StyleTokens.focus-width : 0px;
                                 access-current := ThemedTextInput {
                                     x: 12px; width: parent.width - 24px; height: parent.height; single-line: true; input-type: password;
                                     enabled: parent.visible && !root.access-busy; text <=> root.access-current-password;
@@ -9665,7 +9682,9 @@ export component AppWindow inherits Window {
                             if root.access-mode == 1 || root.access-mode == 2 : Text { text: "New app password"; color: root.ink; font-size: 12px * root.text-scale; vertical-stretch: 0; }
                             Rectangle {
                                 visible: root.access-mode == 1 || root.access-mode == 2;
-                                height: self.visible ? 42px * root.text-scale : 0px; vertical-stretch: 0; background: root.elevated; border-radius: StyleTokens.radius * 0.8;
+                                height: self.visible ? 42px * root.text-scale : 0px; vertical-stretch: 0; background: root.input-fill(root.elevated);
+                                border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.8;
+                                border-color: root.field-focus; border-width: access-new.has-focus ? StyleTokens.focus-width : 0px;
                                 access-new := ThemedTextInput {
                                     x: 12px; width: parent.width - 24px; height: parent.height; single-line: true; input-type: password;
                                     enabled: parent.visible && !root.access-busy; text <=> root.access-new-password;
@@ -9675,7 +9694,9 @@ export component AppWindow inherits Window {
                             if root.access-mode == 1 || root.access-mode == 2 : Text { text: "Confirm new password"; color: root.ink; font-size: 12px * root.text-scale; vertical-stretch: 0; }
                             Rectangle {
                                 visible: root.access-mode == 1 || root.access-mode == 2;
-                                height: self.visible ? 42px * root.text-scale : 0px; vertical-stretch: 0; background: root.elevated; border-radius: StyleTokens.radius * 0.8;
+                                height: self.visible ? 42px * root.text-scale : 0px; vertical-stretch: 0; background: root.input-fill(root.elevated);
+                                border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.8;
+                                border-color: root.field-focus; border-width: access-confirm.has-focus ? StyleTokens.focus-width : 0px;
                                 access-confirm := ThemedTextInput {
                                     x: 12px; width: parent.width - 24px; height: parent.height; single-line: true; input-type: password;
                                     enabled: parent.visible && !root.access-busy; text <=> root.access-confirm-password;
