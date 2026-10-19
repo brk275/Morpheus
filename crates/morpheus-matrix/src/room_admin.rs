@@ -110,6 +110,16 @@ pub enum RoomAdminError {
     InvalidPowerLevel,
     #[error("Use a reason of at most 512 bytes")]
     InvalidReason,
+    #[error("Enter a room ID, room address or Matrix link")]
+    InvalidRoom,
+    #[error("No room uses that address")]
+    RoomNotFound,
+    #[error("The servers that know this room are unknown")]
+    NoRoute,
+    #[error("This link uses content that cannot be edited safely")]
+    UnsupportedContent,
+    #[error("This change would touch too many entries at once")]
+    TooManyChanges,
 }
 type Result<T> = std::result::Result<T, RoomAdminError>;
 
@@ -890,7 +900,7 @@ fn roster_event_type(kind: serde_json::Result<Option<String>>) -> bool {
     )
 }
 
-async fn guarded<T>(
+pub(crate) async fn guarded<T>(
     selection: &AccountSelection,
     cancellation: &RoomSettingsCancellation,
     limit: Duration,
@@ -907,13 +917,13 @@ async fn guarded<T>(
     Ok(result)
 }
 
-fn write_config() -> RequestConfig {
+pub(crate) fn write_config() -> RequestConfig {
     RequestConfig::new().retry_limit(0).timeout(REQUEST_TIMEOUT)
 }
 
 // Keep only a fixed category. Never retain reflected response bodies, URLs or
 // Retry-After text, and never resend a moderation write automatically.
-fn write_failure(error: HttpError) -> RoomAdminError {
+pub(crate) fn write_failure(error: HttpError) -> RoomAdminError {
     let Some(error) = error.as_client_api_error() else {
         return RoomAdminError::Unavailable;
     };
@@ -945,7 +955,7 @@ fn normalize_reason(reason: Option<&str>) -> Result<Option<String>> {
     Ok(Some(reason.to_owned()))
 }
 
-fn bounded(text: &str, maximum: usize) -> String {
+pub(crate) fn bounded(text: &str, maximum: usize) -> String {
     if text.len() <= maximum {
         return text.to_owned();
     }
@@ -971,7 +981,7 @@ fn observed(event: Option<&StateEnvelope>) -> Result<ObservedMembership> {
     })
 }
 
-fn member_power(levels: &RoomPowerLevels, user: &UserId) -> MemberPower {
+pub(crate) fn member_power(levels: &RoomPowerLevels, user: &UserId) -> MemberPower {
     match levels.for_user(user) {
         UserPowerLevel::Int(level) => MemberPower::Level(level.into()),
         _ => MemberPower::Creator,

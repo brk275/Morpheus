@@ -1,5 +1,6 @@
 import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView, Slider, SpinBox } from "std-widgets.slint";
 import { MemberActionDialog, RoomMembersPanel, RosterMember, RosterPalette, RosterPermission } from "room-admin.slint";
+import { SpaceManagerPage, SpaceManagerView, SpaceRow } from "space-manager.slint";
 
 // Optional overrides retain each control's existing color when absent.
 export struct ColorRole {
@@ -1875,7 +1876,8 @@ export component AppWindow inherits Window {
         if mode != root.navigation-mode && root.navigation-focus-owner == root.navigation-mode
             && !root.show-sign-in && !root.manage-accounts-open && !root.access-open
             && !root.account-menu-open && !root.room-actions-open && !root.room-admin-open
-            && !root.roster-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog
+            && !root.roster-confirm-open && !root.space-manager-view.confirm-open
+            && !root.native-capture-picker-open && !root.leave-call-dialog
             && !root.quick-switcher-open && !root.image-preview-open && root.security-recovery-key == "" {
             account-trigger.focus();
         }
@@ -1919,6 +1921,16 @@ export component AppWindow inherits Window {
     in-out property <string> roster-confirm-action;
     in-out property <bool> roster-confirm-destructive: false;
     in-out property <[RosterPermission]> roster-permissions;
+    // Native Space management: space-manager.slint, owned by space_management/ui.rs.
+    // `space-manager-view.panel-id` fences every asynchronous result to one page.
+    in-out property <SpaceManagerView> space-manager-view;
+    in-out property <[SpaceRow]> space-manager-rows;
+    in-out property <string> space-manager-query;
+    in-out property <string> space-manager-target-input;
+    in-out property <bool> space-manager-target-suggested: false;
+    in-out property <string> space-manager-target-order;
+    in-out property <bool> space-manager-suggested: false;
+    in-out property <string> space-manager-order;
     in-out property <int> active-account-index: 0;
     in-out property <string> active-account-local-id;
     in-out property <string> active-account-name;
@@ -2274,6 +2286,14 @@ export component AppWindow inherits Window {
     callback roster-request-access(int, int);
     callback roster-confirm();
     callback roster-cancel-confirm();
+    callback space-manager-scope-changed();
+    // Action codes are listed on SpaceManagerPage.action.
+    callback space-manager-action(int);
+    callback space-manager-select(string);
+    callback space-manager-search-edited(string);
+    callback space-manager-choose-filter(int);
+    callback space-manager-confirm();
+    callback space-manager-cancel-confirm();
     callback submit-room-admin(int, string, string);
     callback open-room-settings();
     callback cancel-room-settings();
@@ -2489,7 +2509,7 @@ export component AppWindow inherits Window {
     in-out property <int> room-action-operation: 0;
     in-out property <bool> stress-timeline-active: false;
     out property <int> side-panel-tab: 0;
-    in-out property <int> page: 0; // 0 chat, 1 settings, 2 call stage
+    in-out property <int> page: 0; // 0 chat, 1 settings, 2 call stage, 3 discover, 4 Space management
     changed page => {
         root.cancel-room-settings();
         root.close-image-preview();
@@ -3008,11 +3028,24 @@ export component AppWindow inherits Window {
                             background: transparent;
                             Text {
                                 x: 8px;
+                                width: parent.width - 16px - (root.live-session && root.active-space-id != "" ? 80px * root.text-scale : 0px);
                                 text: "v   " + (root.active-space-id == "" ? "Home" : root.active-space-name);
                                 color: root.ink;
                                 font-size: 13px * root.text-scale;
                                 font-weight: 650;
                                 vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            if root.live-session && root.active-space-id != "" : TextAction {
+                                x: parent.width - self.width - 4px;
+                                y: (parent.height - self.height) / 2;
+                                width: 76px * root.text-scale;
+                                height: 26px;
+                                ink: root.ink; muted: root.muted; surface: transparent; hover-surface: root.hover;
+                                outline: root.divider; text-scale: root.text-scale;
+                                text: "Manage";
+                                accessible-label: "Manage Space " + root.active-space-name + ": its rooms, order and links";
+                                activated => { root.page = 4; }
                             }
                         }
                         if root.invitations.length > 0 : Text {
@@ -3282,13 +3315,13 @@ export component AppWindow inherits Window {
                         padding-bottom: 14px;
                         spacing: 11px;
                         Text {
-                            text: root.page == 1 ? "⚙" : root.page == 2 ? "☏" : root.page == 3 ? "⌕" : "#";
+                            text: root.page == 1 ? "⚙" : root.page == 2 ? "☏" : root.page == 3 ? "⌕" : root.page == 4 ? "◇" : "#";
                             color: root.muted;
                             font-size: 20px * root.text-scale;
                             vertical-alignment: center;
                         }
                         if root.page != 0 || root.conversation-header-mode != 2 : Text {
-                            text: root.page == 1 ? "Settings" : root.page == 2 ? "Voice & video" : root.page == 3 ? "Discover rooms" : root.active-room-name;
+                            text: root.page == 1 ? "Settings" : root.page == 2 ? "Voice & video" : root.page == 3 ? "Discover rooms" : root.page == 4 ? "Manage Space" : root.active-room-name;
                             color: root.ink;
                             font-size: 16px * root.text-scale;
                             font-weight: 750;
@@ -3310,7 +3343,7 @@ export component AppWindow inherits Window {
                         }
                         if root.page != 0 || root.conversation-header-mode != 2 : Rectangle { width: 1px; height: 24px; background: root.divider; }
                         if root.page != 0 || root.conversation-header-mode != 2 : Text {
-                            text: root.page == 0 ? root.active-room-topic : root.page == 1 ? "Make Morpheus yours" : root.page == 3 ? "Public rooms on your Matrix homeserver" : "The Workshop";
+                            text: root.page == 0 ? root.active-room-topic : root.page == 1 ? "Make Morpheus yours" : root.page == 3 ? "Public rooms on your Matrix homeserver" : root.page == 4 ? root.active-space-name : "The Workshop";
                             color: root.muted;
                             font-size: 12px * root.text-scale;
                             vertical-alignment: center;
@@ -4182,6 +4215,27 @@ export component AppWindow inherits Window {
                     }
                 }
 
+                if root.page == 4 : SpaceManagerPage {
+                    vertical-stretch: 1;
+                    palette: root.roster-palette;
+                    text-scale: root.text-scale;
+                    available: root.live-session && root.active-space-id != "";
+                    scope-key: root.active-account-local-id + "\n" + root.active-space-id;
+                    view: root.space-manager-view;
+                    rows: root.space-manager-rows;
+                    query <=> root.space-manager-query;
+                    target-input <=> root.space-manager-target-input;
+                    target-suggested <=> root.space-manager-target-suggested;
+                    target-order <=> root.space-manager-target-order;
+                    suggested <=> root.space-manager-suggested;
+                    order <=> root.space-manager-order;
+                    scope-changed => { root.space-manager-scope-changed(); }
+                    action(code) => { root.space-manager-action(code); }
+                    select(key) => { root.space-manager-select(key); }
+                    search-edited(text) => { root.space-manager-search-edited(text); }
+                    choose-filter(index) => { root.space-manager-choose-filter(index); }
+                    close => { root.page = 0; }
+                }
                 if root.page == 1 : Rectangle {
                     height: settings-search.preferred-height + 20px;
                     background: transparent;
@@ -6881,6 +6935,19 @@ export component AppWindow inherits Window {
         busy: root.roster-busy;
         confirm => { root.roster-confirm(); account-trigger.focus(); }
         cancel => { root.roster-cancel-confirm(); account-trigger.focus(); }
+    }
+
+    if root.space-manager-view.confirm-open && root.live-session : MemberActionDialog {
+        x: 0px; y: 0px; width: root.width; height: root.height;
+        palette: root.roster-palette;
+        text-scale: root.text-scale;
+        title: root.space-manager-view.confirm-title;
+        body: root.space-manager-view.confirm-body;
+        action-text: root.space-manager-view.confirm-action;
+        destructive: root.space-manager-view.confirm-destructive;
+        busy: root.space-manager-view.busy;
+        confirm => { root.space-manager-confirm(); account-trigger.focus(); }
+        cancel => { root.space-manager-cancel-confirm(); account-trigger.focus(); }
     }
 
     if root.native-capture-picker-open && root.page == 2 && root.live-session && root.native-call-joined : FocusScope {

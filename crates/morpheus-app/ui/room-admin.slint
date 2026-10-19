@@ -73,7 +73,7 @@ export struct RosterPalette {
 
 // The window's keyboard path: Tab reaches it, Return or Space activates it,
 // a click focuses it first. A modal dialog can keep Tab inside itself.
-component RosterAction inherits Rectangle {
+export component RosterAction inherits Rectangle {
     in property <string> label;
     in property <bool> enabled: true;
     in property <color> focus-color;
@@ -121,7 +121,7 @@ component RosterAction inherits Rectangle {
     }
 }
 
-component RosterButton inherits RosterAction {
+export component RosterButton inherits RosterAction {
     in property <string> text;
     in property <RosterPalette> palette;
     in property <float> text-scale: 1;
@@ -167,7 +167,7 @@ component RosterInput inherits TextInput {
     single-line: true;
 }
 
-component RosterField inherits Rectangle {
+export component RosterField inherits Rectangle {
     in property <RosterPalette> palette;
     in property <float> text-scale: 1;
     in property <string> placeholder;

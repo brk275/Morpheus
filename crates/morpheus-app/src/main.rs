@@ -33,6 +33,7 @@ mod room_settings;
 mod security;
 mod settings_search;
 mod shortcuts;
+mod space_management;
 mod sso;
 #[cfg(not(morpheus_timeline_acceptance))]
 mod startup_error;
@@ -1609,6 +1610,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let room_settings =
         room_settings::RoomSettingsUi::register(&ui, live.clone(), runtime.handle());
     let room_admin = room_admin::ui::RoomAdminUi::register(&ui, live.clone(), runtime.handle());
+    let space_manager =
+        space_management::ui::SpaceManagerUi::register(&ui, live.clone(), runtime.handle());
     ui.set_native_call_enabled(cfg!(feature = "native-calls"));
     ui.set_native_call_status("Select a room to check call availability".into());
     let update_activity = updater::UpdateActivity::default();
@@ -4714,6 +4717,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let acceptance = acceptance.start(&ui, live.clone(), runtime.handle().clone())?;
     let ui_result = ui.run();
     room_admin.shutdown(&ui);
+    space_manager.shutdown(&ui);
     room_settings.shutdown(&ui);
     image_previews.shutdown(&ui);
     #[cfg(feature = "native-calls")]

@@ -1,0 +1,462 @@
+import { ListView } from "std-widgets.slint";
+import { RosterAction, RosterButton, RosterField, RosterPalette } from "room-admin.slint";
+
+// One link in the Space's hierarchy. `key` routes a selection only; the
+// controller re-resolves it against its loaded links, so a row never
+// authorizes a change. Display text is sanitized in Rust.
+export struct SpaceRow {
+    key: string,
+    room-id: string,
+    name: string,
+    initials: string,
+    accent: color,
+    detail: string,
+    // 1 for an entry of the managed Space itself.
+    depth: int,
+    is-space: bool,
+    joined: bool,
+    direct: bool,
+    suggested: bool,
+    // Listed again through another parent; not expanded twice.
+    repeated: bool,
+    // A change for this entry is waiting for the homeserver.
+    pending: bool,
+}
+
+// Everything the page shows apart from rows and text inputs, set at once by
+// the controller after each result.
+export struct SpaceManagerView {
+    // Fences every asynchronous result to one open page.
+    panel-id: string,
+    space-name: string,
+    loaded: bool,
+    loading: bool,
+    busy: bool,
+    can-manage: bool,
+    has-more: bool,
+    // 0 all, 1 joined, 2 not joined, 3 Spaces
+    filter: int,
+    permission: string,
+    summary: string,
+    pending-text: string,
+    error: string,
+    notice: string,
+    selected-key: string,
+    selected: SpaceRow,
+    selected-detail: string,
+    can-join: bool,
+    can-edit: bool,
+    can-move-up: bool,
+    can-move-down: bool,
+    // The resolved room waiting to be added, as one description.
+    target: string,
+    target-ready: bool,
+    confirm-open: bool,
+    confirm-title: string,
+    confirm-body: string,
+    confirm-action: string,
+    confirm-destructive: bool,
+}
+
+// A labelled check box with the window's keyboard path.
+component SpaceToggle inherits RosterAction {
+    in property <RosterPalette> palette;
+    in property <float> text-scale: 1;
+    in property <string> text;
+    in-out property <bool> checked;
+    accessible-role: checkbox;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    label: root.text;
+    focus-color: root.palette.focus;
+    border-radius: 6px;
+    min-height: max(28px, 20px * root.text-scale + 8px);
+    background: self.has-hover ? root.palette.hover : transparent;
+    activated => { root.checked = !root.checked; }
+    HorizontalLayout {
+        padding-left: 6px; padding-right: 6px; spacing: 8px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 16px; height: 16px; border-radius: 4px;
+                border-width: 2px;
+                border-color: root.checked ? root.palette.accent : root.palette.muted;
+                background: root.checked ? root.palette.accent : transparent;
+                if root.checked : Text {
+                    text: "✓"; color: root.palette.accent-ink;
+                    font-size: 11px; font-weight: 700;
+                    horizontal-alignment: center; vertical-alignment: center;
+                }
+            }
+        }
+        Text {
+            text: root.text; color: root.enabled ? root.palette.ink : root.palette.muted;
+            font-size: 11px * root.text-scale; vertical-alignment: center;
+            horizontal-stretch: 1; overflow: elide;
+        }
+    }
+}
+
+// Space hierarchy browsing and entry management for the active Space. The
+// window owns every property; this page presents them and reports input.
+// Nothing here claims a server result: pending, error and notice text come
+// from the controller after the homeserver answers and the state is read back.
+export component SpaceManagerPage inherits VerticalLayout {
+    in property <RosterPalette> palette;
+    in property <float> text-scale: 1;
+    // A live account with an active Space.
+    in property <bool> available;
+    // The visible account and Space. A change reopens the page for them.
+    in property <string> scope-key;
+    in property <SpaceManagerView> view;
+    in property <[SpaceRow]> rows;
+    in-out property <string> query;
+    in-out property <string> target-input;
+    in-out property <bool> target-suggested;
+    in-out property <string> target-order;
+    in-out property <bool> suggested;
+    in-out property <string> order;
+    callback scope-changed();
+    // 0 refresh, 1 load more, 2 find, 3 clear found, 4 add, 5 save,
+    // 6 move up, 7 move down, 8 remove, 9 join
+    callback action(int);
+    callback select(string);
+    callback search-edited(string);
+    callback choose-filter(int);
+    callback close();
+
+    property <length> row-height: max(48px, 32px * root.text-scale + 16px);
+    property <bool> ready: root.available && root.view.loaded;
+
+    init => { root.scope-changed(); }
+    changed scope-key => { root.scope-changed(); }
+
+    padding: 20px;
+    spacing: 10px;
+
+    HorizontalLayout {
+        spacing: 8px;
+        VerticalLayout {
+            horizontal-stretch: 1; spacing: 3px;
+            Text {
+                text: root.view.space-name != "" ? "Manage " + root.view.space-name : "Manage Space";
+                color: root.palette.ink; font-size: 20px * root.text-scale; font-weight: 750;
+                overflow: elide;
+            }
+            Text {
+                text: root.available ? root.view.permission : "Choose a Space in the sidebar to see and manage its rooms.";
+                color: root.palette.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+            }
+        }
+        VerticalLayout {
+            alignment: start;
+            RosterButton {
+                palette: root.palette; text-scale: root.text-scale;
+                text: "Refresh";
+                label: "Load this Space's rooms again from your homeserver";
+                enabled: root.available && !root.view.busy;
+                activated => { root.action(0); }
+            }
+        }
+        VerticalLayout {
+            alignment: start;
+            RosterButton {
+                palette: root.palette; text-scale: root.text-scale;
+                text: "Back to chat";
+                label: "Close Space management and return to the conversation";
+                activated => { root.close(); }
+            }
+        }
+    }
+    if root.available && root.view.loading : Text {
+        text: root.view.loaded ? "Refreshing the Space…" : "Loading the Space from your homeserver…";
+        color: root.palette.muted; font-size: 11px * root.text-scale;
+        accessible-live-region: polite;
+    }
+    if root.view.pending-text != "" : Text {
+        text: root.view.pending-text;
+        color: root.palette.accent; font-size: 11px * root.text-scale; wrap: word-wrap;
+        accessible-live-region: polite;
+    }
+    if root.view.error != "" : Text {
+        text: root.view.error;
+        color: root.palette.error; font-size: 11px * root.text-scale; wrap: word-wrap;
+        accessible-live-region: assertive;
+    }
+    if root.view.notice != "" : Text {
+        text: root.view.notice;
+        color: root.palette.ink; font-size: 11px * root.text-scale; wrap: word-wrap;
+        accessible-live-region: polite;
+    }
+    HorizontalLayout {
+        vertical-stretch: 1;
+        spacing: 16px;
+        VerticalLayout {
+            horizontal-stretch: 3;
+            spacing: 8px;
+            RosterField {
+                palette: root.palette;
+                text-scale: root.text-scale;
+                placeholder: "Search this Space by name, address or ID";
+                label: "Search the rooms and Spaces listed in this Space";
+                enabled: root.ready;
+                text <=> root.query;
+                edited(text) => { root.search-edited(text); }
+            }
+            HorizontalLayout {
+                spacing: 3px;
+                height: max(26px, 18px * root.text-scale + 8px);
+                for chip[index] in ["All", "Joined", "Not joined", "Spaces"] : RosterAction {
+                    horizontal-stretch: 1;
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: root.view.filter == index ? root.palette.accent : root.palette.divider;
+                    background: root.view.filter == index ? root.palette.selection : self.has-hover ? root.palette.hover : transparent;
+                    focus-color: root.palette.focus;
+                    enabled: root.ready;
+                    accessible-role: tab;
+                    accessible-checkable: true;
+                    accessible-checked: root.view.filter == index;
+                    label: "Show " + chip;
+                    activated => { if root.view.filter != index { root.choose-filter(index); } }
+                    Text {
+                        text: chip;
+                        color: root.view.filter == index ? root.palette.selection-ink : root.palette.muted;
+                        font-size: 10px * root.text-scale; font-weight: 650;
+                        horizontal-alignment: center; vertical-alignment: center; overflow: elide;
+                    }
+                }
+            }
+            if root.ready : Text {
+                text: root.view.summary;
+                color: root.palette.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
+                accessible-live-region: polite;
+            }
+            if root.ready && root.rows.length == 0 : Text {
+                height: 44px;
+                text: root.query != "" ? "Nothing in this Space matches the search" : "This Space has no rooms or Spaces yet";
+                color: root.palette.muted; font-size: 11px * root.text-scale;
+                vertical-alignment: center;
+            }
+            entries := ListView {
+                vertical-stretch: 1;
+                horizontal-scrollbar-policy: always-off;
+                for row in root.rows : RosterAction {
+                    width: entries.visible-width;
+                    height: root.row-height;
+                    focus-color: root.palette.focus;
+                    background: row.key == root.view.selected-key ? root.palette.selection : self.has-hover ? root.palette.hover : transparent;
+                    accessible-role: list-item;
+                    accessible-label: row.name + ", level " + row.depth + " in the Space, " + row.detail + (row.pending ? ", change pending" : "");
+                    accessible-item-selectable: true;
+                    accessible-item-selected: row.key == root.view.selected-key;
+                    label: row.name;
+                    activated => { root.select(row.key); }
+                    HorizontalLayout {
+                        padding-left: 10px + (row.depth - 1) * 18px; padding-right: 10px; spacing: 9px;
+                        VerticalLayout {
+                            alignment: center; width: 28px;
+                            Rectangle {
+                                width: 28px; height: 28px;
+                                border-radius: row.is-space ? 8px : 14px;
+                                background: row.accent;
+                                Text {
+                                    text: row.initials; color: root.palette.avatar-ink;
+                                    font-size: 10px; font-weight: 700;
+                                    horizontal-alignment: center; vertical-alignment: center;
+                                }
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center; horizontal-stretch: 1; spacing: 1px;
+                            Text {
+                                text: row.name;
+                                color: row.key == root.view.selected-key ? root.palette.selection-ink : root.palette.ink;
+                                font-size: 12px * root.text-scale; font-weight: row.direct ? 700 : 500;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: row.detail;
+                                color: root.palette.muted; font-size: 10px * root.text-scale; overflow: elide;
+                            }
+                        }
+                        if row.pending : Text {
+                            text: "Pending"; color: root.palette.accent;
+                            font-size: 10px * root.text-scale; vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+            if root.ready && root.view.has-more : HorizontalLayout {
+                alignment: start;
+                RosterButton {
+                    palette: root.palette; text-scale: root.text-scale;
+                    text: "Load more";
+                    label: "Load the next page of this Space from your homeserver";
+                    enabled: !root.view.busy;
+                    activated => { root.action(1); }
+                }
+            }
+        }
+        VerticalLayout {
+            horizontal-stretch: 2;
+            min-width: 260px;
+            spacing: 10px;
+            if root.available && root.view.selected-key != "" : Rectangle {
+                background: root.palette.elevated;
+                border-color: root.palette.divider; border-width: 1px; border-radius: 10px;
+                accessible-role: groupbox;
+                accessible-label: "Selected entry " + root.view.selected.name;
+                VerticalLayout {
+                    padding: 12px; spacing: 6px;
+                    HorizontalLayout {
+                        spacing: 6px;
+                        Text {
+                            text: root.view.selected.name;
+                            color: root.palette.ink; font-size: 13px * root.text-scale; font-weight: 700;
+                            horizontal-stretch: 1; overflow: elide; vertical-alignment: center;
+                        }
+                        RosterAction {
+                            width: 26px; height: 26px; border-radius: 6px;
+                            background: self.has-hover ? root.palette.hover : transparent;
+                            focus-color: root.palette.focus;
+                            label: "Close entry details";
+                            activated => { root.select(""); }
+                            Text { text: "×"; color: root.palette.muted; font-size: 14px; horizontal-alignment: center; vertical-alignment: center; }
+                        }
+                    }
+                    Text { text: root.view.selected.room-id; color: root.palette.muted; font-size: 10px * root.text-scale; overflow: elide; }
+                    Text { text: root.view.selected-detail; color: root.palette.ink; font-size: 11px * root.text-scale; wrap: word-wrap; }
+                    if root.view.can-join : HorizontalLayout {
+                        alignment: start;
+                        RosterButton {
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: root.view.selected.is-space ? "Join this Space…" : "Join this room…";
+                            label: "Review joining " + root.view.selected.name + " only";
+                            enabled: !root.view.busy;
+                            primary: true;
+                            activated => { root.action(9); }
+                        }
+                    }
+                    if root.view.can-edit : SpaceToggle {
+                        palette: root.palette; text-scale: root.text-scale;
+                        text: "Suggested to members";
+                        enabled: !root.view.busy;
+                        checked <=> root.suggested;
+                    }
+                    if root.view.can-edit : RosterField {
+                        palette: root.palette; text-scale: root.text-scale;
+                        placeholder: "Order key (optional, sorts A to Z)";
+                        label: "Order key for " + root.view.selected.name + "; empty for none";
+                        enabled: !root.view.busy;
+                        text <=> root.order;
+                    }
+                    if root.view.can-edit : HorizontalLayout {
+                        spacing: 5px; alignment: start;
+                        RosterButton {
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: "Save…";
+                            label: "Review the changes to " + root.view.selected.name;
+                            enabled: !root.view.busy;
+                            activated => { root.action(5); }
+                        }
+                        RosterButton {
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: "Move up";
+                            label: "Review moving " + root.view.selected.name + " up one place";
+                            enabled: !root.view.busy && root.view.can-move-up;
+                            activated => { root.action(6); }
+                        }
+                        RosterButton {
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: "Move down";
+                            label: "Review moving " + root.view.selected.name + " down one place";
+                            enabled: !root.view.busy && root.view.can-move-down;
+                            activated => { root.action(7); }
+                        }
+                    }
+                    if root.view.can-edit : HorizontalLayout {
+                        alignment: start;
+                        RosterButton {
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: "Remove from Space…";
+                            label: "Review removing the link to " + root.view.selected.name + "; the room itself stays";
+                            destructive: true;
+                            enabled: !root.view.busy;
+                            activated => { root.action(8); }
+                        }
+                    }
+                }
+            }
+            if root.ready && root.view.can-manage : Rectangle {
+                background: root.palette.elevated;
+                border-color: root.palette.divider; border-width: 1px; border-radius: 10px;
+                accessible-role: groupbox;
+                accessible-label: "Add a room or Space";
+                VerticalLayout {
+                    padding: 12px; spacing: 6px;
+                    Text { text: "ADD A ROOM OR SPACE"; color: root.palette.muted; font-size: 9px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
+                    Text {
+                        text: "Enter a room ID, an address like #room:server, or a matrix.to or matrix: link. Nothing is joined.";
+                        color: root.palette.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 5px;
+                        RosterField {
+                            horizontal-stretch: 1;
+                            palette: root.palette; text-scale: root.text-scale;
+                            placeholder: "!room:server, #room:server or link";
+                            label: "Room or Space to add, by ID, address or Matrix link";
+                            enabled: !root.view.busy;
+                            text <=> root.target-input;
+                            accepted => { if !root.view.busy && root.target-input != "" { root.action(2); } }
+                        }
+                        RosterButton {
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: "Find";
+                            label: "Find this room without joining it";
+                            enabled: !root.view.busy && root.target-input != "";
+                            activated => { root.action(2); }
+                        }
+                    }
+                    if root.view.target != "" : Text {
+                        text: root.view.target;
+                        color: root.palette.ink; font-size: 11px * root.text-scale; wrap: word-wrap;
+                    }
+                    if root.view.target-ready : SpaceToggle {
+                        palette: root.palette; text-scale: root.text-scale;
+                        text: "Suggest it to members";
+                        enabled: !root.view.busy;
+                        checked <=> root.target-suggested;
+                    }
+                    if root.view.target-ready : RosterField {
+                        palette: root.palette; text-scale: root.text-scale;
+                        placeholder: "Order key (optional)";
+                        label: "Order key for the new entry; empty for none";
+                        enabled: !root.view.busy;
+                        text <=> root.target-order;
+                    }
+                    if root.view.target-ready : HorizontalLayout {
+                        spacing: 5px; alignment: start;
+                        RosterButton {
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: "Add…";
+                            label: "Review adding this entry to the Space";
+                            primary: true;
+                            enabled: !root.view.busy;
+                            activated => { root.action(4); }
+                        }
+                        RosterButton {
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: "Clear";
+                            label: "Forget the found room";
+                            enabled: !root.view.busy;
+                            activated => { root.action(3); }
+                        }
+                    }
+                }
+            }
+            Rectangle { vertical-stretch: 1; }
+        }
+    }
+}

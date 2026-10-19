@@ -47,6 +47,10 @@ const UNREADABLE: &str = "This room returned roles Morpheus cannot read safely. 
 const REFUSED: &str =
     "Your permissions or their role may have changed; review the refreshed roster.";
 const REVIEW: &str = "Review the refreshed roster, then try again.";
+pub(crate) const NO_ROUTE: &str =
+    "The servers that know this room are unknown. Join it first, or use its address or a link.";
+pub(crate) const UNSUPPORTED_CONTENT: &str =
+    "This entry uses content Morpheus cannot change without losing information.";
 const REFUSED_PERMISSION: &str = "Your permissions may have changed; review them again.";
 const OWN_DEFAULT: &str = "Your own level follows the default, so it changes too.";
 const CUSTOM_ACCESS: &str = "This room uses a setting Morpheus does not edit.";
@@ -978,6 +982,11 @@ pub(crate) fn error_text(
         RoomAdminError::InvalidUserId => BAD_USER_ID,
         RoomAdminError::InvalidPowerLevel => "That power level is outside the range Matrix allows.",
         RoomAdminError::InvalidReason => LONG_REASON,
+        RoomAdminError::InvalidRoom => "Enter a room ID, room address or Matrix link.",
+        RoomAdminError::RoomNotFound => "No room uses that address.",
+        RoomAdminError::NoRoute => NO_ROUTE,
+        RoomAdminError::UnsupportedContent => UNSUPPORTED_CONTENT,
+        RoomAdminError::TooManyChanges => "This change would rewrite too many entries at once.",
         RoomAdminError::InsufficientPower => {
             return snapshot.map_or_else(
                 || "Your current power level does not allow this change.".to_owned(),

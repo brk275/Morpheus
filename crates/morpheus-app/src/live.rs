@@ -1404,6 +1404,7 @@ impl LiveUi {
             draft_recovery::clear_recovery_ui(&ui);
             ui.set_room_actions_open(false);
             crate::room_admin::clear_presentation(&ui);
+            crate::space_management::clear_presentation(&ui);
             ui.set_quick_switcher_open(false);
             ui.set_show_sign_in(true);
             ui.set_login_loading(false);
@@ -2850,6 +2851,7 @@ fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::Securi
     ui.set_quick_switcher_match_count(0);
     ui.set_quick_switcher_account_index(-1);
     crate::room_admin::clear_presentation(ui);
+    crate::space_management::clear_presentation(ui);
     ui.set_quick_switcher_query("".into());
     ui.set_quick_switcher_account_id("".into());
     ui.set_quick_switcher_space_id("".into());

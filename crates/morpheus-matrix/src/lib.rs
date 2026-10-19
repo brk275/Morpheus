@@ -60,6 +60,13 @@ pub use room_settings::{
     RoomSettingsCancellation, RoomSettingsError, RoomSettingsPermissions, RoomSettingsSession,
     RoomSettingsSnapshot,
 };
+mod space_management;
+pub use space_management::{
+    HIERARCHY_MAX_DEPTH, HIERARCHY_PAGE_LIMIT, HierarchyPage, MAX_HIERARCHY_PAGES, MAX_ORDER_BYTES,
+    MAX_REORDER_WRITES, MAX_VIA_SERVERS, NodeAccess, RouteSource, SpaceChildLink, SpaceNode,
+    SpacePermissions, SpaceSession, SpaceTarget, SpaceWriteOutcome, key_between, reorder_plan,
+    sort_links, valid_order,
+};
 mod rich_text;
 pub use account_selection::AccountSelection;
 pub use admin::RoomMemberInfo;
