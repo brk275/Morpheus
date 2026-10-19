@@ -16,6 +16,7 @@
 //! the server reports are dropped as soon as the list arrives.
 
 use std::{
+    collections::HashMap,
     fmt,
     future::Future,
     sync::{
@@ -65,6 +66,13 @@ pub const MAX_DEVICE_SESSIONS: usize = 200;
 pub const MAX_DEVICE_NAME_CHARS: usize = 64;
 // Longest device ID Morpheus accepts from the person or the server.
 const MAX_DEVICE_ID_BYTES: usize = 255;
+// Reject an oversized or ambiguous server roster instead of truncating it:
+// a partial read must never be used as proof that a session was signed out.
+const MAX_SERVER_DEVICE_SESSIONS: usize = 4096;
+const MAX_DEVICE_NAME_INPUT_BYTES: usize = 4096;
+const MAX_AUTH_SESSION_BYTES: usize = 4096;
+const MAX_AUTH_FLOWS: usize = 32;
+const MAX_BROWSER_PAGE_BYTES: usize = 16 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -239,7 +247,10 @@ pub enum SignOutStep {
     /// Enter this account's password to authorize it.
     Password(SignOutChallenge),
     /// Finish the homeserver's page in the system browser, then continue.
-    Browser { challenge: SignOutChallenge, page: Url },
+    Browser {
+        challenge: SignOutChallenge,
+        page: Url,
+    },
     /// The sign-in provider signs sessions out on its own page; Morpheus
     /// cannot observe the result and refreshes the list instead.
     ProviderPage { page: Url },
@@ -369,6 +380,7 @@ impl DeviceSessions {
         let found = found.ok_or(DeviceSessionError::NotFound)?;
         if found.name.as_deref() == Some(name.as_str()) {
             let snapshot = self.compose(listed).await.ok();
+            self.ensure_scope()?;
             return Ok(RenameOutcome {
                 confirmed: true,
                 snapshot,
@@ -402,6 +414,7 @@ impl DeviceSessions {
             Some(after) => self.compose(after).await.ok(),
             None => None,
         };
+        self.ensure_scope()?;
         Ok(RenameOutcome {
             confirmed,
             snapshot,
@@ -449,7 +462,9 @@ impl DeviceSessions {
         let listed: Vec<&str> = listed.iter().map(|row| row.device_id.as_str()).collect();
         sign_out_target(&device_id, &self.device_id, &listed)?;
         if self.sign_out == SignOutMethod::ProviderPage {
-            let page = self.guarded(READ_TIMEOUT, self.provider_page(&device_id)).await?;
+            let page = self
+                .guarded(READ_TIMEOUT, self.provider_page(&device_id))
+                .await?;
             return Ok(page);
         }
         let request = delete_devices::v3::Request::new(vec![device_id.clone()]);
@@ -514,7 +529,9 @@ impl DeviceSessions {
                 let after = self.guarded(READ_TIMEOUT, self.server_sessions()).await;
                 let gone = match after {
                     Ok(after) => find(&after, device_id.as_str()).is_none(),
-                    Err(DeviceSessionError::Cancelled) => return Err(DeviceSessionError::Cancelled),
+                    Err(DeviceSessionError::Cancelled) => {
+                        return Err(DeviceSessionError::Cancelled);
+                    }
                     Err(DeviceSessionError::AccountChanged) => {
                         return Err(DeviceSessionError::AccountChanged);
                     }
@@ -525,7 +542,12 @@ impl DeviceSessions {
             Err(error) => match error.as_uiaa_response() {
                 Some(info) => {
                     let homeserver = self.client.homeserver();
-                    Ok(challenge_step(&homeserver, &self.selection, device_id, info))
+                    Ok(challenge_step(
+                        &homeserver,
+                        &self.selection,
+                        device_id,
+                        info,
+                    ))
                 }
                 None => Err(request_error(&error)),
             },
@@ -549,8 +571,7 @@ impl DeviceSessions {
     async fn server_sessions(&self) -> Result<Vec<ServerSession>> {
         let request = self.client.send(get_devices::v3::Request::new());
         let response = request.await.map_err(|error| request_error(&error))?;
-        let devices = response.devices.into_iter();
-        Ok(devices.filter_map(server_session).collect())
+        checked_server_sessions(response.devices)
     }
 
     /// Join the server's list with this device's crypto store.
@@ -578,9 +599,22 @@ impl DeviceSessions {
             VerificationState::Unknown => None,
         };
         let devices = encryption.get_user_devices(&self.user_id).await.ok();
-        let devices = devices.map(|devices| {
-            let trust = |device: Device| (device.device_id().to_string(), device_trust(&device));
-            devices.devices().map(trust).collect()
+        let devices = devices.and_then(|devices| {
+            let mut known = HashMap::new();
+            for (index, device) in devices
+                .devices()
+                .take(MAX_SERVER_DEVICE_SESSIONS + 1)
+                .enumerate()
+            {
+                if index == MAX_SERVER_DEVICE_SESSIONS {
+                    return None;
+                }
+                if parse_device_id(device.device_id().as_str()).is_err() {
+                    return None;
+                }
+                known.insert(device.device_id().to_string(), device_trust(&device));
+            }
+            Some(known)
         });
         let identity = encryption.get_user_identity(&self.user_id).await;
         let status = encryption.cross_signing_status().await;
@@ -640,7 +674,7 @@ struct ServerSession {
 
 fn server_session(listed: device::Device) -> Option<ServerSession> {
     let device_id = listed.device_id.to_string();
-    if device_id.is_empty() || device_id.len() > MAX_DEVICE_ID_BYTES {
+    if parse_device_id(&device_id).is_err() {
         return None;
     }
     let name = listed.display_name.as_deref().and_then(bounded_device_name);
@@ -652,9 +686,25 @@ fn server_session(listed: device::Device) -> Option<ServerSession> {
     })
 }
 
+fn checked_server_sessions(listed: Vec<device::Device>) -> Result<Vec<ServerSession>> {
+    if listed.len() > MAX_SERVER_DEVICE_SESSIONS {
+        return Err(DeviceSessionError::Unavailable);
+    }
+    let mut seen = std::collections::HashSet::with_capacity(listed.len());
+    let mut sessions = Vec::with_capacity(listed.len());
+    for device in listed {
+        let session = server_session(device).ok_or(DeviceSessionError::Unavailable)?;
+        if !seen.insert(session.device_id.clone()) {
+            return Err(DeviceSessionError::Unavailable);
+        }
+        sessions.push(session);
+    }
+    Ok(sessions)
+}
+
 struct CryptoView {
     /// `None` when the crypto store could not be read.
-    devices: Option<Vec<(String, DeviceTrust)>>,
+    devices: Option<HashMap<String, DeviceTrust>>,
     cross_signing: CrossSigningState,
     this_device_verified: Option<bool>,
 }
@@ -664,8 +714,10 @@ impl CryptoView {
         let Some(devices) = &self.devices else {
             return DeviceTrust::Unknown;
         };
-        let found = devices.iter().find(|(id, _)| id == device_id);
-        found.map_or(DeviceTrust::NoKeys, |(_, trust)| *trust)
+        devices
+            .get(device_id)
+            .copied()
+            .unwrap_or(DeviceTrust::NoKeys)
     }
 }
 
@@ -769,6 +821,12 @@ fn challenge_step(
     let Some(session) = info.session.as_deref() else {
         return unsupported;
     };
+    if session.is_empty()
+        || session.len() > MAX_AUTH_SESSION_BYTES
+        || info.flows.len() > MAX_AUTH_FLOWS
+    {
+        return unsupported;
+    }
     let offers = |stage: &str| {
         info.flows.iter().any(|flow| match flow.stages.as_slice() {
             [only] => only.as_str() == stage,
@@ -815,7 +873,10 @@ fn fallback_page(homeserver: &Url, stage: &str, session: &str) -> Option<Url> {
 /// HTTPS without embedded credentials, or plain HTTP only for loopback
 /// development servers, as homeserver validation allows.
 fn browser_page_allowed(page: &Url) -> bool {
-    if !page.username().is_empty() || page.password().is_some() {
+    if page.as_str().len() > MAX_BROWSER_PAGE_BYTES
+        || !page.username().is_empty()
+        || page.password().is_some()
+    {
         return false;
     }
     let loopback = match page.host() {
@@ -830,8 +891,14 @@ fn browser_page_allowed(page: &Url) -> bool {
 /// Trimmed, bounded and free of control or direction-override characters;
 /// `None` when nothing printable remains.
 pub fn bounded_device_name(name: &str) -> Option<String> {
-    let cleaned: String = name.chars().filter(|&c| !hidden(c)).collect();
-    let bounded: String = cleaned.trim().chars().take(MAX_DEVICE_NAME_CHARS).collect();
+    let bounded: String = name
+        .char_indices()
+        .take_while(|(offset, _)| *offset < MAX_DEVICE_NAME_INPUT_BYTES)
+        .map(|(_, character)| character)
+        .filter(|&character| !hidden(character))
+        .skip_while(|character| character.is_whitespace())
+        .take(MAX_DEVICE_NAME_CHARS)
+        .collect();
     let bounded = bounded.trim_end();
     (!bounded.is_empty()).then(|| bounded.to_owned())
 }
@@ -910,10 +977,7 @@ mod tests {
     use crate::account_selection::Selections;
     use matrix_sdk::ruma::{
         MilliSecondsSinceUnixEpoch, UInt,
-        api::{
-            client::uiaa::AuthFlow,
-            error::StandardErrorBody,
-        },
+        api::{client::uiaa::AuthFlow, error::StandardErrorBody},
     };
 
     fn runtime() -> tokio::runtime::Runtime {
@@ -932,9 +996,8 @@ mod tests {
     }
 
     fn uiaa(stages: &[&[&str]], session: Option<&str>) -> UiaaInfo {
-        let flow = |stages: &&[&str]| {
-            AuthFlow::new(stages.iter().map(|&stage| stage.into()).collect())
-        };
+        let flow =
+            |stages: &&[&str]| AuthFlow::new(stages.iter().map(|&stage| stage.into()).collect());
         let mut info = UiaaInfo::new(stages.iter().map(flow).collect());
         info.session = session.map(str::to_owned);
         info
@@ -948,10 +1011,47 @@ mod tests {
         assert_eq!(bounded_device_name(" \u{200b}\t "), None);
         let long = bounded_device_name(&"x".repeat(200)).unwrap();
         assert_eq!(long.chars().count(), MAX_DEVICE_NAME_CHARS);
+        // A hostile prefix cannot force an unbounded temporary allocation
+        // or make the sanitizer scan arbitrary server-controlled text.
+        let excessive = format!("{}hidden tail", " ".repeat(MAX_DEVICE_NAME_INPUT_BYTES));
+        assert_eq!(bounded_device_name(&excessive), None);
+        let unicode = bounded_device_name(&"界".repeat(200)).unwrap();
+        assert_eq!(unicode.chars().count(), MAX_DEVICE_NAME_CHARS);
         assert!(parse_device_id("ABCDEF").is_ok());
         for bad in ["", "AB CD", "AB\u{202e}CD", &"x".repeat(300)] {
             assert_eq!(parse_device_id(bad), Err(DeviceSessionError::NotFound));
         }
+    }
+
+    #[test]
+    fn invalid_or_partial_server_rosters_cannot_be_used_as_sign_out_confirmation() {
+        let duplicate = vec![
+            device::Device::new("SAME".into()),
+            device::Device::new("SAME".into()),
+        ];
+        assert_eq!(
+            checked_server_sessions(duplicate),
+            Err(DeviceSessionError::Unavailable)
+        );
+        let deceptive = vec![device::Device::new("OTHER\u{202e}".into())];
+        assert_eq!(
+            checked_server_sessions(deceptive),
+            Err(DeviceSessionError::Unavailable)
+        );
+        let oversized = (0..MAX_SERVER_DEVICE_SESSIONS + 1)
+            .map(|index| device::Device::new(format!("D{index}").into()))
+            .collect();
+        assert_eq!(
+            checked_server_sessions(oversized),
+            Err(DeviceSessionError::Unavailable)
+        );
+        let complete = checked_server_sessions(vec![
+            device::Device::new("THIS".into()),
+            device::Device::new("OTHER".into()),
+        ])
+        .unwrap();
+        assert_eq!(complete.len(), 2);
+        assert!(find(&complete, "OTHER").is_some());
     }
 
     #[test]
@@ -993,10 +1093,16 @@ mod tests {
     fn trust_follows_cross_signing_then_local_trust_and_blocking_wins() {
         assert_eq!(trust_from(true, true, true, true), DeviceTrust::Blocked);
         assert_eq!(trust_from(false, true, false, true), DeviceTrust::Verified);
-        assert_eq!(trust_from(false, false, true, false), DeviceTrust::LocallyTrusted);
+        assert_eq!(
+            trust_from(false, false, true, false),
+            DeviceTrust::LocallyTrusted
+        );
         let unconfirmed = trust_from(false, false, false, true);
         assert_eq!(unconfirmed, DeviceTrust::SignedUnconfirmed);
-        assert_eq!(trust_from(false, false, false, false), DeviceTrust::Unverified);
+        assert_eq!(
+            trust_from(false, false, false, false),
+            DeviceTrust::Unverified
+        );
         let unread = CryptoView {
             devices: None,
             cross_signing: CrossSigningState::Unknown,
@@ -1004,7 +1110,7 @@ mod tests {
         };
         assert_eq!(unread.trust("ANY"), DeviceTrust::Unknown);
         let read = CryptoView {
-            devices: Some(vec![("KNOWN".into(), DeviceTrust::Verified)]),
+            devices: Some(HashMap::from([("KNOWN".into(), DeviceTrust::Verified)])),
             ..unread
         };
         assert_eq!(read.trust("KNOWN"), DeviceTrust::Verified);
@@ -1032,6 +1138,21 @@ mod tests {
         let homeserver = Url::parse("https://matrix.example.org/").unwrap();
         let device: OwnedDeviceId = "OTHER".into();
         let this: OwnedDeviceId = "THIS".into();
+
+        for session in [String::new(), "s".repeat(MAX_AUTH_SESSION_BYTES + 1)] {
+            let excessive = uiaa(&[&[PASSWORD_STAGE]], Some(&session));
+            assert!(matches!(
+                challenge_step(&homeserver, &selection, device.clone(), &excessive),
+                SignOutStep::Unsupported(_)
+            ));
+        }
+        let mut excessive_flows = uiaa(&[&[PASSWORD_STAGE]], Some("bounded"));
+        excessive_flows.flows =
+            vec![AuthFlow::new(vec![PASSWORD_STAGE.into()]); MAX_AUTH_FLOWS + 1];
+        assert!(matches!(
+            challenge_step(&homeserver, &selection, device.clone(), &excessive_flows),
+            SignOutStep::Unsupported(_)
+        ));
 
         let info = uiaa(&[&[PASSWORD_STAGE], &[SSO_STAGE]], Some("s3cr3t-session"));
         let SignOutStep::Password(challenge) =
@@ -1100,6 +1221,12 @@ mod tests {
         assert!(fallback_page(&loopback, SSO_STAGE, "abc").is_some());
         let credentials = Url::parse("https://user:secret@matrix.example.org/").unwrap();
         assert!(!browser_page_allowed(&credentials));
+        let oversized = Url::parse(&format!(
+            "https://matrix.example.org/{}",
+            "x".repeat(MAX_BROWSER_PAGE_BYTES)
+        ))
+        .unwrap();
+        assert!(!browser_page_allowed(&oversized));
     }
 
     #[test]
