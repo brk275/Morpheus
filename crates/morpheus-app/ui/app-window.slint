@@ -2289,7 +2289,7 @@ component MetricValueEditor inherits VerticalLayout {
 
 // The sample name of one sender color, drawn on the conversation background.
 component SenderColorSample inherits Rectangle {
-    in property <SenderColorRow> row;
+    in property <SenderColorRow> palette-entry;
     in property <color> canvas;
     in property <color> outline;
     in property <string> sample-font-family;
@@ -2299,16 +2299,16 @@ component SenderColorSample inherits Rectangle {
     border-width: StyleTokens.line-width; border-color: root.outline;
     Text {
         x: 8px; width: parent.width - 16px; height: parent.height;
-        text: "Sample name " + (root.row.index + 1); color: root.row.swatch;
+        text: "Sample name " + (root.palette-entry.index + 1); color: root.palette-entry.swatch;
         font-family: root.sample-font-family; font-size: 12px * root.text-scale; font-weight: 650;
         vertical-alignment: center; overflow: elide;
-        accessible-label: "Sample of sender color " + (root.row.index + 1) + (root.row.readable ? "" : ", low contrast on the conversation background");
+        accessible-label: "Sample of sender color " + (root.palette-entry.index + 1) + (root.palette-entry.readable ? "" : ", low contrast on the conversation background");
     }
 }
 
 // The contrast note and the order and remove actions of one sender color.
 component SenderColorActions inherits HorizontalLayout {
-    in property <SenderColorRow> row;
+    in property <SenderColorRow> palette-entry;
     in property <int> count;
     in property <color> ink;
     in property <color> muted;
@@ -2318,26 +2318,26 @@ component SenderColorActions inherits HorizontalLayout {
     callback moved(int, int);
     callback removed(int);
     spacing: 8px;
-    if !root.row.readable : Text {
+    if !root.palette-entry.readable : Text {
         text: "Low contrast"; color: root.muted; font-size: 10px * root.text-scale; vertical-alignment: center;
     }
     IconAction {
-        icon: "▲"; label: "Move sender color " + (root.row.index + 1) + " earlier";
+        icon: "▲"; label: "Move sender color " + (root.palette-entry.index + 1) + " earlier";
         ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
-        enabled: root.row.index > 0;
-        activated => { root.moved(root.row.index, -1); }
+        enabled: root.palette-entry.index > 0;
+        activated => { root.moved(root.palette-entry.index, -1); }
     }
     IconAction {
-        icon: "▼"; label: "Move sender color " + (root.row.index + 1) + " later";
+        icon: "▼"; label: "Move sender color " + (root.palette-entry.index + 1) + " later";
         ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
-        enabled: root.row.index < root.count - 1;
-        activated => { root.moved(root.row.index, 1); }
+        enabled: root.palette-entry.index < root.count - 1;
+        activated => { root.moved(root.palette-entry.index, 1); }
     }
     IconAction {
-        icon: "×"; label: "Remove sender color " + (root.row.index + 1);
+        icon: "×"; label: "Remove sender color " + (root.palette-entry.index + 1);
         ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
         enabled: root.count > 1;
-        activated => { root.removed(root.row.index); }
+        activated => { root.removed(root.palette-entry.index); }
     }
 }
 
@@ -2386,7 +2386,7 @@ component SenderPaletteEditor inherits VerticalLayout {
             spacing: 8px;
             if !root.stacked : SenderColorSample {
                 width: 128px * root.text-scale;
-                row: row; canvas: root.canvas; outline: root.outline;
+                palette-entry: row; canvas: root.canvas; outline: root.outline;
                 sample-font-family: root.sample-font-family; text-scale: root.text-scale;
             }
             Rectangle {
@@ -2408,7 +2408,7 @@ component SenderPaletteEditor inherits VerticalLayout {
                 }
             }
             if !root.stacked : SenderColorActions {
-                row: row; count: root.rows.length;
+                palette-entry: row; count: root.rows.length;
                 ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
                 text-scale: root.text-scale;
                 moved(index, direction) => { root.moved(index, direction); }
@@ -2421,11 +2421,11 @@ component SenderPaletteEditor inherits VerticalLayout {
             spacing: 8px;
             SenderColorSample {
                 horizontal-stretch: 1; min-width: 48px; preferred-width: 128px * root.text-scale;
-                row: row; canvas: root.canvas; outline: root.outline;
+                palette-entry: row; canvas: root.canvas; outline: root.outline;
                 sample-font-family: root.sample-font-family; text-scale: root.text-scale;
             }
             SenderColorActions {
-                row: row; count: root.rows.length;
+                palette-entry: row; count: root.rows.length;
                 ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
                 text-scale: root.text-scale;
                 moved(index, direction) => { root.moved(index, direction); }
