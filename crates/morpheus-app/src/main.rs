@@ -2259,7 +2259,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ui) = weak.upgrade() {
             ui.invoke_cancel_room_settings();
             ui.invoke_close_image_preview();
-            ui.invoke_reset_pinned_messages();
         }
         if switch_live.is_live.load(Ordering::Acquire) {
             if let Some(window) = weak.upgrade()
@@ -2301,7 +2300,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(ui) = weak.upgrade() {
             ui.invoke_cancel_room_settings();
             ui.invoke_close_image_preview();
-            ui.invoke_reset_pinned_messages();
         }
         if room_live.is_live.load(Ordering::Acquire) {
             let Some(window) = weak.upgrade() else {
@@ -4459,7 +4457,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         window.invoke_cancel_room_settings();
         window.invoke_close_image_preview();
-        window.invoke_reset_pinned_messages();
         if !logout_live.is_live.load(Ordering::Acquire) {
             if window.get_call_connected() {
                 window.set_pending_account_index(-3);
