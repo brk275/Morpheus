@@ -2474,16 +2474,23 @@ impl LiveUi {
         self.focused.lock().unwrap_or_else(|error| error.into_inner())
     }
 
+    /// Sample the feed generation only while holding the slot: a commit
+    /// installs its view and generation under the same lock, so a newer
+    /// view committed meanwhile is never mistaken for a stale one.
     fn drop_stale_focus(&self) {
+        let mut slot = self.focus_slot();
         let current = self.generation.load(Ordering::Acquire);
-        self.focus_slot().drop_stale(current);
+        slot.drop_stale(current);
     }
 
     /// The focused view shown in `room_id` under the current feed, for
     /// paging exactly that view. Capture it when the user acts.
     pub(crate) fn focused_view(&self, room_id: &str) -> Option<morpheus_matrix::FocusedView> {
-        let current = self.generation.load(Ordering::Acquire);
-        let view = self.focus_slot().view(current);
+        let view = {
+            let slot = self.focus_slot();
+            let current = self.generation.load(Ordering::Acquire);
+            slot.view(current)
+        };
         view.filter(|view| view.room_id() == room_id)
     }
 

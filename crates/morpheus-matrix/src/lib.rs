@@ -1726,7 +1726,8 @@ impl AccountManager {
 
     /// Toggle a reaction on a message shown in a focused conversation view.
     /// Its row may be absent from the live timeline, so the view's own
-    /// timeline sends it; the view must belong to the expected account.
+    /// timeline sends it. The view must belong to the expected account's
+    /// current selection epoch, not merely to the same account ID.
     pub async fn toggle_focused_reaction_for(
         &self,
         expected_account_id: &str,
@@ -1734,10 +1735,18 @@ impl AccountManager {
         event_id: &str,
         reaction: &str,
     ) -> Result<bool> {
-        if view.account_id() != expected_account_id {
+        let owned = || match self.account_selection(expected_account_id) {
+            Some(current) => view.owned_by(&current),
+            None => false,
+        };
+        if !owned() {
             return Err(MatrixCoreError::SelectedAccountChanged);
         }
         let state = self.state.lock().await;
+        // The state lock can wait through an account transition.
+        if !owned() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
         let loaded = selected_loaded_for(&state, expected_account_id)?;
         gate_room_send(loaded, view.room_id()).await?;
         let item_id = TimelineEventItemId::EventId(parse_event_id(event_id)?);

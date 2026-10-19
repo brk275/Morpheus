@@ -23,7 +23,9 @@ const MAX_FOCUS_CONTEXT: u16 = 50;
 /// clone ends it.
 #[derive(Clone)]
 pub struct FocusedView {
-    account_id: String,
+    /// The exact selection that loaded it: its timeline belongs to that
+    /// selection's client and to nothing selected later.
+    selection: AccountSelection,
     room_id: String,
     timeline: Arc<Timeline>,
 }
@@ -33,14 +35,23 @@ impl FocusedView {
         &self.room_id
     }
 
-    pub(crate) fn account_id(&self) -> &str {
-        &self.account_id
+    /// Only the selection that loaded the view, while current, may act on
+    /// it; a later selection of the same account ID may not.
+    pub(crate) fn owned_by(&self, selection: &AccountSelection) -> bool {
+        view_owned_by(&self.selection, selection)
     }
 
     /// Its rows are only in this timeline, so actions on them use it.
     pub(crate) fn timeline(&self) -> &Arc<Timeline> {
         &self.timeline
     }
+}
+
+/// A view loaded under `view` may be used under `selection` only when that
+/// is the same selection epoch and it is still current: A -> B -> A, removal
+/// and signing in again all create a new epoch for the same account ID.
+fn view_owned_by(view: &AccountSelection, selection: &AccountSelection) -> bool {
+    selection.is_current() && view.same_epoch(selection)
 }
 
 /// How far a bounded backward reveal through history got.
@@ -196,11 +207,11 @@ impl AccountManager {
                 .await
                 .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
             let view = FocusedView {
-                account_id: selection.account_id().to_owned(),
+                selection: selection.clone(),
                 room_id: room_id.to_owned(),
                 timeline: Arc::new(timeline),
             };
-            let account_id = view.account_id.clone();
+            let account_id = selection.account_id().to_owned();
             let timeline = view.timeline.clone();
             let feed = message_feed_from_timeline(account_id, room_id, timeline).await;
             Ok((view, feed))
@@ -209,8 +220,9 @@ impl AccountManager {
     }
 
     /// Page exactly `view` to older (`backwards`) or newer messages under the
-    /// caller's selection, which must be the view's account. Returns true
-    /// when that end of the room was reached.
+    /// caller's selection, which must be the very selection epoch that loaded
+    /// the view and still current. Returns true when that end of the room
+    /// was reached.
     pub async fn paginate_focused_selected(
         &self,
         selection: &AccountSelection,
@@ -218,7 +230,7 @@ impl AccountManager {
         backwards: bool,
         count: u16,
     ) -> Result<bool> {
-        if view.account_id != selection.account_id() {
+        if !view.owned_by(selection) {
             return Err(MatrixCoreError::SelectedAccountChanged);
         }
         let timeline = view.timeline.clone();
@@ -563,6 +575,25 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(page, MessageSearchPage::default());
+            drop(manager);
+            fs::remove_dir_all(directory).unwrap();
+        });
+    }
+
+    #[test]
+    fn a_focused_view_is_owned_only_by_the_selection_that_loaded_it() {
+        runtime().block_on(async {
+            let (directory, manager, account) = fixture(None).await;
+            let loading = manager.account_selection(&account.id).unwrap();
+            assert!(view_owned_by(&loading, &loading));
+            // The same account selected again (A -> B -> A, removal and
+            // signing in again) is a new epoch: it cannot use the old view.
+            manager.publish_active_account(None);
+            manager.publish_active_account(Some(account.clone()));
+            let fresh = manager.account_selection(&account.id).unwrap();
+            assert!(!view_owned_by(&loading, &fresh));
+            assert!(!view_owned_by(&loading, &loading));
+            assert!(view_owned_by(&fresh, &fresh));
             drop(manager);
             fs::remove_dir_all(directory).unwrap();
         });
