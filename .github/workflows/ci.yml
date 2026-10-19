@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
-name: Reviewed native poll SDK fixed checks
-run-name: Native poll SDK fixed checks - 3b0c0cc - ${{ inputs.platform }}
+name: Reviewed pinned-message focused checks
+run-name: Pinned-message focused checks - 3682101 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: native-poll-sdk-fixed-3b0c0cc-${{ github.ref }}
+  group: pinned-focused-3682101-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 3b0c0ccee501b715b30f258ce7722b97940e6a85
+          ref: 3682101c7b5ea95dbade286f1dadf25bf6a14ebe
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -135,7 +135,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='3b0c0ccee501b715b30f258ce7722b97940e6a85'
+          source='3682101c7b5ea95dbade286f1dadf25bf6a14ebe'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -379,7 +379,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='3b0c0ccee501b715b30f258ce7722b97940e6a85'
+          source='3682101c7b5ea95dbade286f1dadf25bf6a14ebe'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -459,12 +459,11 @@ jobs:
               'sdk_extraction':'Cannot unpack native SDK archive entry',
               'sdk_cache_publish':'Cannot publish verified native SDK cache',
           }
-          # Diagnose only the failed SDK lib-test compilation. Core8/app5/UI1
-          # already passed; do not repeat them. Added fixed process/resource
-          # classifications and known SDK source spans; raw output stays private.
+          # First focused execution of fully reviewed pin source. No unrelated
+          # MatrixRTC/config/package/device cases. All selected cases required.
           checks=[
-              ('sdk_poll',['cargo', 'test', '--locked', '-p', 'matrix-sdk-ui', '--lib', 'timeline::tests::polls::', '--', '--test-threads=1'],4200,
-                  {'timeline::tests::polls::test_morpheus_duplicate_pending_ends_do_not_stop_later_pending_votes', 'timeline::tests::polls::test_morpheus_earliest_valid_end_wins_even_when_received_later', 'timeline::tests::polls::test_morpheus_known_moderator_may_end_another_users_poll', 'timeline::tests::polls::test_morpheus_pending_invalid_end_does_not_drop_a_pending_vote', 'timeline::tests::polls::test_morpheus_pending_moderator_end_is_checked_when_start_arrives', 'timeline::tests::polls::test_morpheus_unauthorized_poll_end_keeps_poll_open_and_creator_can_end', 'timeline::tests::polls::test_a_somewhat_complex_voting_session_yields_the_expected_outcome', 'timeline::tests::polls::test_adding_response_doesnt_clear_latest_json_edit', 'timeline::tests::polls::test_edited_poll_is_displayed', 'timeline::tests::polls::test_ending_a_poll_sets_end_time_to_results', 'timeline::tests::polls::test_ending_poll_doesnt_clear_latest_json_edit', 'timeline::tests::polls::test_events_received_before_start_are_not_lost', 'timeline::tests::polls::test_multiple_end_events_are_discarded', 'timeline::tests::polls::test_only_the_last_vote_from_a_user_is_counted', 'timeline::tests::polls::test_poll_contains_relations', 'timeline::tests::polls::test_poll_is_displayed', 'timeline::tests::polls::test_votes_after_end_are_discarded', 'timeline::tests::polls::test_voting_adds_the_vote_to_the_results'},set()),
+              ('core_pinned',['cargo','test','--locked','-p','morpheus-matrix','--lib','pinned_messages::tests::','--','--test-threads=1'],4200,{'pinned_messages::tests::rows_report_redacted_undecryptable_and_unsupported_events_honestly', 'pinned_messages::tests::duplicate_content_fields_are_refused_instead_of_lost_on_write', 'pinned_messages::tests::pin_preserves_unknown_fields_and_entries_byte_for_byte', 'pinned_messages::tests::permission_follows_authoritative_power_levels', 'pinned_messages::tests::attachments_threads_replies_and_edits_are_described_without_media', 'pinned_messages::tests::a_list_that_is_not_an_array_is_never_replaced', 'pinned_messages::tests::display_text_is_bounded_and_single_line', 'pinned_messages::tests::adding_is_bounded_but_removing_is_not', 'pinned_messages::tests::unpin_removes_every_occurrence_and_keeps_the_rest', 'pinned_messages::tests::state_envelope_must_match_the_exact_request', 'pinned_messages::tests::absent_or_redacted_list_gains_only_the_pinned_field', 'pinned_messages::tests::requested_state_already_present_sends_nothing', 'pinned_messages::tests::plaintext_in_an_encrypted_room_and_device_problems_are_flagged', 'pinned_messages::tests::sync_batches_select_only_relevant_room_changes'},set()),
+              ('app_pinned',['cargo','test','--locked','-p','morpheus-app','--features','native-calls','--bin','morpheus-app','--','--test-threads=1'],4200,{'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation', 'pinned_messages::view::tests::summaries_count_shown_hidden_and_unsupported_entries', 'pinned_messages::tests::row_flags_follow_the_last_published_set', 'pinned_messages::view::tests::filter_matches_sender_text_and_status_case_insensitively', 'pinned_messages::view::tests::rows_are_sanitized_and_say_why_text_is_missing', 'pinned_messages::view::tests::errors_are_fixed_text_and_account_changes_are_silent', 'pinned_messages::tests::rows_update_in_place_and_end_in_the_requested_order'},{'outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction'}),
           ]
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
@@ -533,7 +532,11 @@ jobs:
                   failed_packages=set(re.findall(r'could not compile `([A-Za-z0-9_-]+)`',normalized))
                   # Only known public production file names and numeric spans.
                   # Never publish compiler text, source snippets or raw paths.
-                  ui_files=('vendor/matrix-sdk-ui/src/timeline/tests/polls.rs',
+                  ui_files=('crates/morpheus-matrix/src/pinned_messages.rs',
+                      'crates/morpheus-app/src/pinned_messages/mod.rs',
+                      'crates/morpheus-app/src/pinned_messages/view.rs',
+                      'crates/morpheus-app/ui/pinned-messages.slint',
+                      'vendor/matrix-sdk-ui/src/timeline/tests/polls.rs',
                       'vendor/matrix-sdk-ui/src/timeline/tests/mod.rs',
                       'vendor/matrix-sdk-ui/src/timeline/traits.rs',
                       'vendor/matrix-sdk-ui/src/timeline/controller/aggregations.rs',
