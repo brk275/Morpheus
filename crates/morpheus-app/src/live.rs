@@ -2914,7 +2914,7 @@ fn apply_snapshot(
             })
             .collect::<Vec<_>>(),
     )));
-    crate::room_organization::remember(&view.rooms);
+    crate::room_organization::remember(&view.active.id, &view.rooms);
     crate::apply_room_sort(ui);
     ui.set_stress_timeline_active(false);
     if let Some(room_id) = view.selected {

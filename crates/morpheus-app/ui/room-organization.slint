@@ -8,7 +8,8 @@ export global RoomOrganizationState {
     // Section presentation for this session only; nothing is saved.
     in-out property <bool> favourites-collapsed: false;
     in-out property <bool> low-priority-collapsed: false;
-    // A change waiting for the homeserver; that room's menus are disabled.
+    // The room whose change waits for the homeserver, for the visible
+    // account; while set, every organization menu is disabled.
     in-out property <string> pending-room;
     // The open room, for the room header menu.
     in-out property <bool> active-favourite: false;
@@ -99,8 +100,8 @@ export component RoomSectionHeader inherits Rectangle {
 }
 
 // The open room's organization menu in the room header. Return, Space,
-// the Menu key, Shift+F10 or a click opens it; the menu itself is keyboard
-// navigable.
+// the Menu key, Shift+F10, a click or a right click opens it; the menu
+// itself is keyboard navigable.
 export component RoomOrganizationButton inherits Rectangle {
     in property <string> room-id;
     in property <string> room-name;
@@ -110,7 +111,7 @@ export component RoomOrganizationButton inherits Rectangle {
     in property <color> focus-color;
     in property <length> radius: 9px;
 
-    property <bool> choosable: root.enabled && RoomOrganizationState.pending-room != root.room-id;
+    property <bool> choosable: root.enabled && RoomOrganizationState.pending-room == "";
 
     width: 34px;
     height: 34px;
@@ -121,7 +122,7 @@ export component RoomOrganizationButton inherits Rectangle {
     accessible-label: "Organize " + root.room-name + (RoomOrganizationState.active-favourite ? ", in Favorites" : (RoomOrganizationState.active-low-priority ? ", low priority" : ""));
     accessible-enabled: root.enabled;
     accessible-action-default => {
-        if root.enabled {
+        if root.choosable {
             room-menu.show({ x: 0px, y: root.height });
         }
     }
@@ -198,6 +199,13 @@ export component RoomOrganizationButton inherits Rectangle {
                 button-focus.focus();
                 if root.choosable {
                     room-menu.show({ x: 0px, y: root.height });
+                }
+            }
+            // This area takes every button, so the menu area under it never
+            // sees a right click; open the menu here instead.
+            pointer-event(event) => {
+                if event.button == PointerEventButton.right && event.kind == PointerEventKind.down && root.choosable {
+                    room-menu.show({ x: self.mouse-x, y: self.mouse-y });
                 }
             }
         }

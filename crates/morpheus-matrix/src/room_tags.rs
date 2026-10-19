@@ -5,16 +5,20 @@
 //! written with its own request, so tags this module does not touch, such as
 //! user `u.*` tags or other apps' tags, are never rewritten. Favourite and low
 //! priority are kept mutually exclusive, as the pinned SDK does: adding one
-//! removes the other. A tag whose stored info carries fields other than
-//! `order` is never rewritten, because the typed request would drop them; a
-//! change that would do so is refused before anything is sent.
+//! removes the other. Adding a tag the room already has leaves it as stored.
+//! A favourite tag whose stored info carries fields other than `order` is
+//! never reordered, because the typed request would drop them; such a
+//! reorder is refused before anything is sent.
 //!
 //! Every entry point is bound to the caller's `AccountSelection`; the room
 //! must be joined when the request starts. A request already handed to the
 //! homeserver cannot be recalled by a later switch; the caller only loses
 //! the result, and sync brings the stored state back.
 
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
 
 use matrix_sdk::{
     Client,
@@ -32,7 +36,9 @@ use super::*;
 
 /// Favourites reordered in one request at most.
 pub const MAX_TAG_ORDER_WRITES: usize = 100;
-const TAG_TIMEOUT: Duration = Duration::from_secs(60);
+/// Bound on one change; a reorder adds `ORDER_WRITE_TIMEOUT` per room.
+const TAG_TIMEOUT: Duration = Duration::from_secs(30);
+const ORDER_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const FAVOURITE: &str = "m.favourite";
 const LOW_PRIORITY: &str = "m.lowpriority";
 
@@ -197,17 +203,27 @@ impl AccountManager {
     }
 
     /// Run one bounded request under `selection`; revocation or a timeout
-    /// ends the wait and its result is never returned.
+    /// ends the wait and its result is never returned. `written` counts the
+    /// homeserver's accepted writes, so a timeout after one is reported as
+    /// partly saved rather than as nothing saved.
     async fn under_tag_selection<T>(
         &self,
         selection: &AccountSelection,
+        timeout: Duration,
+        written: &AtomicUsize,
         request: impl std::future::Future<Output = std::result::Result<T, RoomTagError>>,
     ) -> std::result::Result<T, RoomTagError> {
         let result = selection
-            .guard(tokio::time::timeout(TAG_TIMEOUT, request))
+            .guard(tokio::time::timeout(timeout, request))
             .await
-            .ok_or(RoomTagError::AccountChanged)?
-            .map_err(|_| RoomTagError::NotConfirmed)??;
+            .ok_or(RoomTagError::AccountChanged)?;
+        let result = match result {
+            Ok(result) => result?,
+            Err(_) if written.load(Ordering::Acquire) > 0 => {
+                return Err(RoomTagError::PartlySaved);
+            }
+            Err(_) => return Err(RoomTagError::NotConfirmed),
+        };
         if !self.owns_tag_selection(selection) {
             return Err(RoomTagError::AccountChanged);
         }
@@ -215,8 +231,7 @@ impl AccountManager {
     }
 
     /// Apply one explicit organization change to a joined room. Unrelated
-    /// tags are untouched. Adding a tag the room already has, where the
-    /// stored tag carries other fields, is refused before any request.
+    /// tags are untouched, and a tag the room already has is not rewritten.
     pub async fn change_room_tags_selected(
         &self,
         selection: &AccountSelection,
@@ -225,46 +240,39 @@ impl AccountManager {
     ) -> std::result::Result<(), RoomTagError> {
         let client = self.tag_client(selection).await?;
         let room = Self::joined_room(&client, room_id)?;
-        self.under_tag_selection(selection, async move {
+        let written = AtomicUsize::new(0);
+        let request = async {
             let tags = stored_tags(&room).await?;
-            let (add, add_info, remove) = match change {
-                RoomTagChange::Favourite(order) => {
-                    (Some(TagName::Favorite), tag_info(order), Some(LOW_PRIORITY))
-                }
-                RoomTagChange::LowPriority => {
-                    // Keep a stored low-priority order when re-adding.
-                    let order = tags.get(LOW_PRIORITY).and_then(tag_order);
-                    (Some(TagName::LowPriority), tag_info(order), Some(FAVOURITE))
-                }
-                RoomTagChange::RemoveFavourite => (None, TagInfo::new(), Some(FAVOURITE)),
-                RoomTagChange::RemoveLowPriority => (None, TagInfo::new(), Some(LOW_PRIORITY)),
+            let (add, order, remove) = match change {
+                RoomTagChange::Favourite(order) => (Some(FAVOURITE), order, Some(LOW_PRIORITY)),
+                RoomTagChange::LowPriority => (Some(LOW_PRIORITY), None, Some(FAVOURITE)),
+                RoomTagChange::RemoveFavourite => (None, None, Some(FAVOURITE)),
+                RoomTagChange::RemoveLowPriority => (None, None, Some(LOW_PRIORITY)),
             };
-            if let Some(name) = &add
-                && carries_other_fields(&tags, name.as_ref())
+            if let Some(name) = add
+                && !tags.contains_key(name)
             {
-                return Err(RoomTagError::UnsupportedTagData);
-            }
-            let mut written = false;
-            if let Some(name) = add {
-                room.set_tag(name, add_info)
+                room.set_tag(TagName::from(name), tag_info(order))
                     .await
                     .map_err(|_| RoomTagError::NotConfirmed)?;
-                written = true;
+                written.fetch_add(1, Ordering::AcqRel);
             }
             if let Some(name) = remove
                 && tags.contains_key(name)
             {
                 room.remove_tag(TagName::from(name)).await.map_err(|_| {
-                    if written {
+                    if written.load(Ordering::Acquire) > 0 {
                         RoomTagError::PartlySaved
                     } else {
                         RoomTagError::NotConfirmed
                     }
                 })?;
+                written.fetch_add(1, Ordering::AcqRel);
             }
-            Ok(())
-        })
-        .await
+            Ok::<(), RoomTagError>(())
+        };
+        self.under_tag_selection(selection, TAG_TIMEOUT, &written, request)
+            .await
     }
 
     /// Write new favourite orders, at most `MAX_TAG_ORDER_WRITES` rooms.
@@ -283,7 +291,9 @@ impl AccountManager {
             .into_iter()
             .map(|(room_id, order)| Ok((Self::joined_room(&client, &room_id)?, order)))
             .collect::<std::result::Result<Vec<_>, RoomTagError>>()?;
-        self.under_tag_selection(selection, async move {
+        let timeout = TAG_TIMEOUT + ORDER_WRITE_TIMEOUT * rooms.len() as u32;
+        let written = AtomicUsize::new(0);
+        let request = async {
             for (room, _) in &rooms {
                 let tags = stored_tags(room).await?;
                 if !tags.contains_key(FAVOURITE) {
@@ -293,20 +303,22 @@ impl AccountManager {
                     return Err(RoomTagError::UnsupportedTagData);
                 }
             }
-            for (written, (room, order)) in rooms.iter().enumerate() {
+            for (room, order) in &rooms {
                 room.set_tag(TagName::Favorite, tag_info(Some(*order)))
                     .await
                     .map_err(|_| {
-                        if written > 0 {
+                        if written.load(Ordering::Acquire) > 0 {
                             RoomTagError::PartlySaved
                         } else {
                             RoomTagError::NotConfirmed
                         }
                     })?;
+                written.fetch_add(1, Ordering::AcqRel);
             }
-            Ok(())
-        })
-        .await
+            Ok::<(), RoomTagError>(())
+        };
+        self.under_tag_selection(selection, timeout, &written, request)
+            .await
     }
 }
 

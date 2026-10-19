@@ -7,11 +7,10 @@
 //! are not resorted by unread state; unread-first applies to the other lists
 //! as before. Tags never widen what the current Home or Space view shows.
 
-use morpheus_matrix::TagOrder;
 use slint::{Model, ModelRc, VecModel};
 use std::collections::HashSet;
 
-use crate::{AppWindow, NavigationRoomItem, RoomItem};
+use crate::{AppWindow, NavigationRoomItem, RoomItem, room_organization::RoomTags};
 
 struct RoomOrder {
     channels: Vec<RoomItem>,
@@ -25,16 +24,21 @@ fn room_order(
     channels: Vec<RoomItem>,
     direct_messages: Vec<RoomItem>,
     unread_first: bool,
-    order_of: impl Fn(&str) -> Option<TagOrder>,
+    tags_of: impl Fn(&str) -> RoomTags,
 ) -> RoomOrder {
     let mut favourites = Vec::new();
     let mut low_priority = Vec::new();
+    // Every row carries the tags its menu acts on; a room tagged both ways
+    // is listed under Favorites.
     let mut keep = |rooms: Vec<RoomItem>, direct: bool| {
         let mut kept = Vec::with_capacity(rooms.len());
-        for room in rooms {
-            if room.favourite {
+        for mut room in rooms {
+            let tags = tags_of(room.id.as_str());
+            room.favourite = tags.favourite;
+            room.low_priority = tags.low_priority;
+            if tags.favourite {
                 favourites.push(NavigationRoomItem { room, direct });
-            } else if room.low_priority {
+            } else if tags.low_priority {
                 low_priority.push(NavigationRoomItem { room, direct });
             } else {
                 kept.push(room);
@@ -47,7 +51,7 @@ fn room_order(
     // Ordered rooms first by their order, then the rest by name; identity
     // breaks ties, never the display name alone.
     let tag_key = |entry: &NavigationRoomItem| {
-        let order = order_of(entry.room.id.as_str());
+        let order = tags_of(entry.room.id.as_str()).order;
         (
             order.is_none(),
             order,
@@ -94,7 +98,7 @@ pub(crate) fn apply_room_order(ui: &AppWindow) {
         ui.get_unsorted_channels().iter().collect(),
         ui.get_unsorted_direct_messages().iter().collect(),
         ui.get_sort_unread_first(),
-        crate::room_organization::order_of,
+        crate::room_organization::tags,
     );
     ui.set_channels(ModelRc::new(VecModel::from(order.channels)));
     ui.set_direct_messages(ModelRc::new(VecModel::from(order.direct_messages)));
@@ -153,7 +157,7 @@ mod tests {
     fn merged_names_do_not_conflate_room_dm_or_voice_identity() {
         let channels = vec![room("!z", "same", 0, false), room("!c", "Zebra", 1, true)];
         let directs = vec![room("!a", "SAME", 0, true), room("!b", "Aster", 0, false)];
-        let order = room_order(channels, directs, false, |_| None);
+        let order = room_order(channels, directs, false, |_| RoomTags::default());
         let identities = order
             .combined
             .iter()
@@ -197,7 +201,7 @@ mod tests {
     fn unread_partition_spans_types_and_reverting_restores_filtered_order() {
         let channels = vec![room("!c", "Cedar", 0, false), room("!a", "Aster", 2, false)];
         let directs = vec![room("!d", "Delta", 3, false), room("!b", "Birch", 0, false)];
-        let order = room_order(channels.clone(), directs.clone(), true, |_| None);
+        let order = room_order(channels.clone(), directs.clone(), true, |_| RoomTags::default());
         assert_eq!(
             order
                 .combined
@@ -208,7 +212,7 @@ mod tests {
         );
         assert_eq!(order.channels[0].id, "!a");
         assert_eq!(order.direct_messages[0].id, "!d");
-        let restored = room_order(channels, directs, false, |_| None);
+        let restored = room_order(channels, directs, false, |_| RoomTags::default());
         assert_eq!(restored.channels[0].id, "!c");
         assert_eq!(restored.direct_messages[0].id, "!d");
         assert_eq!(
@@ -220,7 +224,7 @@ mod tests {
             ["!a", "!b", "!c", "!d"]
         );
         assert!(
-            room_order(Vec::new(), Vec::new(), true, |_| None)
+            room_order(Vec::new(), Vec::new(), true, |_| RoomTags::default())
                 .combined
                 .is_empty()
         );
@@ -228,28 +232,32 @@ mod tests {
 
     #[test]
     fn tagged_rooms_form_ordered_sections_without_changing_their_identity() {
-        let tagged = |id: &str, name: &str, unread, favourite, low_priority| RoomItem {
-            favourite,
-            low_priority,
-            ..room(id, name, unread, false)
-        };
+        use morpheus_matrix::TagOrder;
+
         let channels = vec![
-            tagged("!f2", "Beta", 0, true, false),
-            tagged("!n", "Normal", 4, false, false),
-            tagged("!l", "Later", 9, false, true),
-            tagged("!f3", "Alpha", 1, true, false),
+            room("!f2", "Beta", 0, false),
+            room("!n", "Normal", 4, false),
+            room("!l", "Later", 9, false),
+            room("!f3", "Alpha", 1, false),
         ];
-        let directs = vec![
-            tagged("!f1", "Zed", 0, true, false),
-            // Another client may set both tags; Favorites wins.
-            tagged("!both", "Both", 0, true, true),
-        ];
-        let orders = |id: &str| match id {
-            "!f1" => TagOrder::new(0.1),
-            "!f2" => TagOrder::new(0.2),
-            _ => None,
+        let directs = vec![room("!f1", "Zed", 0, false), room("!both", "Both", 0, false)];
+        let tags = |id: &str| {
+            let (favourite, low_priority, order) = match id {
+                "!f1" => (true, false, TagOrder::new(0.1)),
+                "!f2" => (true, false, TagOrder::new(0.2)),
+                "!f3" => (true, false, None),
+                // Another client may set both tags; Favorites wins.
+                "!both" => (true, true, None),
+                "!l" => (false, true, None),
+                _ => (false, false, None),
+            };
+            RoomTags {
+                favourite,
+                low_priority,
+                order,
+            }
         };
-        let order = room_order(channels, directs, true, orders);
+        let order = room_order(channels, directs, true, tags);
         let ids = |entries: &[NavigationRoomItem]| {
             entries
                 .iter()
@@ -267,14 +275,18 @@ mod tests {
                 ("!both".to_owned(), true),
             ]
         );
+        // Rows carry the tags their menus act on.
+        let both = &order.favourites[3].room;
+        assert!(both.favourite && both.low_priority);
         assert_eq!(ids(&order.low_priority), [("!l".to_owned(), false)]);
+        assert!(order.low_priority[0].room.low_priority);
         assert_eq!(
             order
                 .channels
                 .iter()
-                .map(|room| room.id.as_str())
+                .map(|room| (room.id.as_str(), room.favourite, room.low_priority))
                 .collect::<Vec<_>>(),
-            ["!n"]
+            [("!n", false, false)]
         );
         assert!(order.direct_messages.is_empty());
         assert_eq!(order.combined.len(), 1);

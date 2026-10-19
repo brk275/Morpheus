@@ -2,24 +2,30 @@
 //! from the standard Matrix `m.favourite` and `m.lowpriority` tags, the room
 //! context menu and the room header menu, and accessible favorite reordering.
 //!
-//! The tags are the account's server state (`morpheus_matrix::room_tags`);
-//! nothing here persists them locally or claims a change before the
-//! homeserver accepted it. Sections only partition the rooms the current
-//! Home or Space view already shows, so Space membership, direct-message
-//! grouping and the user's sorting are unchanged; see `crate::navigation`.
-//! A change is one explicit choice for one room, one change at a time, fenced
-//! by the account selection it started under.
+//! The tags are the account's server state (`morpheus_matrix::room_tags`).
+//! This module keeps, on the UI thread only and never on disk:
+//! - every joined room's tags from the visible account's latest snapshot, so
+//!   decisions and favorite order use the whole account, not just the rooms
+//!   the current Home or Space view shows;
+//! - writes the homeserver confirmed but sync has not returned yet, applied
+//!   over the snapshot for a short time so the list and a following move see
+//!   them; a snapshot that already shows them, an account change or the time
+//!   limit ends them;
+//! - at most one change in flight per account.
+//!
+//! Sections only partition the rooms the current view already shows; see
+//! `crate::navigation`. A change is one explicit choice for one room, fenced
+//! by the account selection it started under; nothing is shown as saved
+//! before the homeserver accepted it.
 
 use std::{
     cell::RefCell,
     collections::HashMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
-use morpheus_matrix::{RoomInfo, RoomTagChange, RoomTagError, TagOrder};
+use morpheus_matrix::{RoomInfo, RoomMembership, RoomTagChange, RoomTagError, TagOrder};
 use slint::{ComponentHandle, Model, ModelRc, VecModel, Weak};
 use tokio::runtime::Handle;
 
@@ -35,81 +41,214 @@ const MOVE_DOWN: i32 = 5;
 
 /// Neighbouring orders closer than this are renumbered instead of split.
 const MIN_ORDER_GAP: f64 = 1e-9;
+/// A confirmed write is shown at most this long before sync returns it.
+const CONFIRMED_LIFETIME: Duration = Duration::from_secs(30);
 
-thread_local! {
-    /// Tag orders of the visible account's rooms from its latest room
-    /// snapshot. UI thread only; replaced by every snapshot.
-    static ORDERS: RefCell<HashMap<String, TagOrder>> = RefCell::new(HashMap::new());
+/// One room's organization tags.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RoomTags {
+    pub(crate) favourite: bool,
+    pub(crate) low_priority: bool,
+    /// Order of the favourite tag, else of the low-priority tag.
+    pub(crate) order: Option<TagOrder>,
 }
 
-/// Remember a room snapshot's tag orders. Called where the snapshot is
-/// applied, before the room lists are ordered.
-pub(crate) fn remember(rooms: &[RoomInfo]) {
-    ORDERS.with(|orders| {
-        let mut orders = orders.borrow_mut();
-        orders.clear();
-        orders.extend(
-            rooms
-                .iter()
-                .filter_map(|room| Some((room.room_id.clone(), room.tag_order?))),
-        );
+struct Confirmed {
+    account: String,
+    tags: RoomTags,
+    until: Instant,
+}
+
+struct Pending {
+    account: String,
+    room: String,
+    operation: u64,
+}
+
+#[derive(Default)]
+struct State {
+    /// Account of the latest snapshot.
+    account: String,
+    /// Tags and case-folded names of that account's joined rooms (no Spaces).
+    stored: HashMap<String, (RoomTags, String)>,
+    confirmed: HashMap<String, Confirmed>,
+    pending: Option<Pending>,
+    next_operation: u64,
+}
+
+impl State {
+    fn tags(&self, room_id: &str) -> RoomTags {
+        match self.confirmed.get(room_id) {
+            Some(confirmed) if confirmed.account == self.account => confirmed.tags,
+            _ => self
+                .stored
+                .get(room_id)
+                .map(|(tags, _)| *tags)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Every favourite of the account in tag order: ordered rooms first by
+    /// order, the rest by name, room ID breaking ties.
+    fn favourites(&self) -> Vec<(String, Option<TagOrder>)> {
+        let mut favourites = self
+            .stored
+            .iter()
+            .filter_map(|(room_id, (_, name))| {
+                let tags = self.tags(room_id);
+                tags.favourite
+                    .then(|| (room_id.clone(), name.clone(), tags.order))
+            })
+            .collect::<Vec<_>>();
+        favourites.sort_by(|a, b| {
+            (a.2.is_none(), a.2, &a.1, &a.0).cmp(&(b.2.is_none(), b.2, &b.1, &b.0))
+        });
+        favourites
+            .into_iter()
+            .map(|(room_id, _, order)| (room_id, order))
+            .collect()
+    }
+
+    fn pending_here(&self) -> Option<&Pending> {
+        self.pending
+            .as_ref()
+            .filter(|pending| pending.account == self.account)
+    }
+}
+
+thread_local! {
+    static STATE: RefCell<State> = RefCell::new(State::default());
+}
+
+fn with_state<T>(work: impl FnOnce(&mut State) -> T) -> T {
+    STATE.with(|state| work(&mut state.borrow_mut()))
+}
+
+/// Remember the visible account's room snapshot. Called where the snapshot
+/// is applied, before the room lists are ordered.
+pub(crate) fn remember(account_id: &str, rooms: &[RoomInfo]) {
+    let now = Instant::now();
+    with_state(|state| {
+        state.account = account_id.to_owned();
+        state.stored = rooms
+            .iter()
+            .filter(|room| room.membership == RoomMembership::Joined && !room.is_space)
+            .map(|room| {
+                let tags = RoomTags {
+                    favourite: room.favourite,
+                    low_priority: room.low_priority,
+                    order: room.tag_order,
+                };
+                (room.room_id.clone(), (tags, room.name.to_lowercase()))
+            })
+            .collect();
+        let stored = &state.stored;
+        state.confirmed.retain(|room_id, confirmed| {
+            confirmed.account == account_id
+                && now < confirmed.until
+                && stored.get(room_id).map(|(tags, _)| *tags) != Some(confirmed.tags)
+        });
     });
 }
 
-/// Forget the departed account's sections and orders.
+/// The tags of a visible room: a confirmed write, else the snapshot.
+pub(crate) fn tags(room_id: &str) -> RoomTags {
+    with_state(|state| state.tags(room_id))
+}
+
+/// Forget the departed account's sections and state.
 pub(crate) fn clear(ui: &AppWindow) {
-    remember(&[]);
+    with_state(|state| {
+        let next_operation = state.next_operation;
+        *state = State {
+            next_operation,
+            ..State::default()
+        };
+    });
     ui.set_favourite_rooms(ModelRc::new(VecModel::<NavigationRoomItem>::default()));
     ui.set_low_priority_rooms(ModelRc::new(VecModel::<NavigationRoomItem>::default()));
-    let global = ui.global::<RoomOrganizationState>();
-    global.set_pending_room("".into());
     publish_active(ui);
 }
 
-/// The remembered tag order of a visible room.
-pub(crate) fn order_of(room_id: &str) -> Option<TagOrder> {
-    ORDERS.with(|orders| orders.borrow().get(room_id).copied())
-}
-
-/// What one menu choice asks the homeserver for.
+/// What one menu choice asks the homeserver for, and the tags each written
+/// room has once it is accepted.
 #[derive(Debug, PartialEq)]
 enum Request {
-    Change(RoomTagChange),
+    Change(RoomTagChange, RoomTags),
     Orders(Vec<(String, TagOrder)>),
 }
 
-/// Plan one menu choice for `room_id`. `favourites` is the displayed
-/// Favorites section, in order, with each room's stored order.
-fn plan(action: i32, room_id: &str, favourites: &[(String, Option<TagOrder>)]) -> Option<Request> {
+/// Plan one menu choice for `room_id`, whose tags are `current`.
+/// `favourites` is the account's whole Favorites order and `visible` the
+/// displayed Favorites section. A choice that would change nothing, or a
+/// move without a visible neighbour, plans nothing.
+fn plan(
+    action: i32,
+    room_id: &str,
+    current: RoomTags,
+    favourites: &[(String, Option<TagOrder>)],
+    visible: &[String],
+) -> Option<Request> {
     match action {
-        ADD_FAVOURITE => {
-            let order = append_order(favourites);
-            Some(Request::Change(RoomTagChange::Favourite(order)))
+        ADD_FAVOURITE if !current.favourite || current.low_priority => {
+            // An existing favourite tag is kept as stored, order included.
+            let order = if current.favourite {
+                current.order
+            } else {
+                append_order(favourites)
+            };
+            let expected = RoomTags {
+                favourite: true,
+                low_priority: false,
+                order,
+            };
+            let change = RoomTagChange::Favourite((!current.favourite).then_some(order).flatten());
+            Some(Request::Change(change, expected))
         }
-        REMOVE_FAVOURITE => Some(Request::Change(RoomTagChange::RemoveFavourite)),
-        LOW_PRIORITY => Some(Request::Change(RoomTagChange::LowPriority)),
-        NORMAL_PRIORITY => Some(Request::Change(RoomTagChange::RemoveLowPriority)),
-        MOVE_UP | MOVE_DOWN => {
-            let index = favourites.iter().position(|(id, _)| id == room_id)?;
-            let orders = favourites
-                .iter()
-                .map(|(_, order)| *order)
-                .collect::<Vec<_>>();
-            let writes = plan_move(&orders, index, action == MOVE_UP)?;
-            Some(Request::Orders(
-                writes
-                    .into_iter()
-                    .map(|(position, order)| (favourites[position].0.clone(), order))
-                    .collect(),
-            ))
+        REMOVE_FAVOURITE if current.favourite => {
+            let expected = RoomTags {
+                favourite: false,
+                low_priority: current.low_priority,
+                // The low-priority order of a room tagged both ways is not
+                // known here; sync supplies it.
+                order: None,
+            };
+            Some(Request::Change(RoomTagChange::RemoveFavourite, expected))
+        }
+        LOW_PRIORITY if !current.low_priority || current.favourite => {
+            let expected = RoomTags {
+                favourite: false,
+                low_priority: true,
+                order: None,
+            };
+            Some(Request::Change(RoomTagChange::LowPriority, expected))
+        }
+        NORMAL_PRIORITY if current.low_priority => {
+            let expected = RoomTags {
+                favourite: current.favourite,
+                low_priority: false,
+                order: current.favourite.then_some(current.order).flatten(),
+            };
+            Some(Request::Change(RoomTagChange::RemoveLowPriority, expected))
+        }
+        MOVE_UP | MOVE_DOWN if current.favourite => {
+            let up = action == MOVE_UP;
+            let index = visible.iter().position(|id| id == room_id)?;
+            let neighbour = if up {
+                visible.get(index.checked_sub(1)?)?
+            } else {
+                visible.get(index + 1)?
+            };
+            let writes = plan_reorder(favourites, room_id, neighbour, up)?;
+            (!writes.is_empty()).then_some(Request::Orders(writes))
         }
         _ => None,
     }
 }
 
-/// An order placing a new favourite after the ordered ones. Rooms without
-/// an order sort after ordered rooms, so a new favourite next to them gets
-/// none and joins them by name.
+/// An order placing a new favourite after the account's ordered favourites.
+/// Rooms without an order sort after ordered rooms, so next to them a new
+/// favourite gets none and joins them by name.
 fn append_order(favourites: &[(String, Option<TagOrder>)]) -> Option<TagOrder> {
     match favourites.last() {
         None => TagOrder::new(0.5),
@@ -120,30 +259,38 @@ fn append_order(favourites: &[(String, Option<TagOrder>)]) -> Option<TagOrder> {
     }
 }
 
-/// Orders to write so the favourite at `index` moves one place up or down.
-/// One write between its new neighbours when their orders leave room;
-/// otherwise the whole list is renumbered evenly in its new order, writing
-/// only rooms whose order changes. `None` when it cannot move that way.
-fn plan_move(
-    orders: &[Option<TagOrder>],
-    index: usize,
+/// Orders to write so `moving` sits just before (`up`) or after `neighbour`
+/// in the account's whole Favorites order, where favourites hidden by the
+/// current view keep their place. One write between its new neighbours when
+/// their orders leave room; otherwise the whole order is renumbered evenly,
+/// writing only rooms whose order changes.
+fn plan_reorder(
+    favourites: &[(String, Option<TagOrder>)],
+    moving: &str,
+    neighbour: &str,
     up: bool,
-) -> Option<Vec<(usize, TagOrder)>> {
-    let len = orders.len();
-    let target = if up { index.checked_sub(1)? } else { index + 1 };
-    if index >= len || target >= len {
+) -> Option<Vec<(String, TagOrder)>> {
+    if moving == neighbour {
         return None;
     }
-    // Moving one place swaps the room with its neighbour.
-    let mut sequence = (0..len).collect::<Vec<_>>();
-    sequence.swap(index, target);
-    let lower = match target.checked_sub(1) {
+    let from = favourites.iter().position(|(id, _)| id == moving)?;
+    let mut sequence = (0..favourites.len())
+        .filter(|&position| position != from)
+        .collect::<Vec<_>>();
+    let anchor = sequence
+        .iter()
+        .position(|&position| favourites[position].0 == neighbour)?;
+    let at = if up { anchor } else { anchor + 1 };
+    sequence.insert(at, from);
+    let order_at = |position: usize| favourites[sequence[position]].1.map(TagOrder::value);
+    let lower = match at.checked_sub(1) {
         None => Some(0.0),
-        Some(below) => orders[sequence[below]].map(TagOrder::value),
+        Some(below) => order_at(below),
     };
-    let upper = match sequence.get(target + 1) {
-        None => Some(1.0),
-        Some(&above) => orders[above].map(TagOrder::value),
+    let upper = if at + 1 < sequence.len() {
+        order_at(at + 1)
+    } else {
+        Some(1.0)
     };
     if let (Some(lower), Some(upper)) = (lower, upper)
         && upper - lower > MIN_ORDER_GAP
@@ -151,19 +298,39 @@ fn plan_move(
         && lower < middle.value()
         && middle.value() < upper
     {
-        return Some(vec![(index, middle)]);
+        return Some(vec![(moving.to_owned(), middle)]);
     }
-    let step = 1.0 / (len as f64 + 1.0);
+    let step = 1.0 / (sequence.len() as f64 + 1.0);
     Some(
         sequence
             .iter()
             .enumerate()
-            .filter_map(|(position, &original)| {
-                let order = TagOrder::new(step * (position as f64 + 1.0))?;
-                (orders[original] != Some(order)).then_some((original, order))
+            .filter_map(|(rank, &position)| {
+                let order = TagOrder::new(step * (rank as f64 + 1.0))?;
+                let (room_id, current) = &favourites[position];
+                (*current != Some(order)).then(|| (room_id.clone(), order))
             })
             .collect(),
     )
+}
+
+/// The tags a confirmed request leaves on each written room.
+fn confirmed_tags(request: &Request, before: impl Fn(&str) -> RoomTags) -> Vec<(String, RoomTags)> {
+    match request {
+        Request::Change(_, _) => Vec::new(),
+        Request::Orders(orders) => orders
+            .iter()
+            .map(|(room_id, order)| {
+                let current = before(room_id);
+                let tags = RoomTags {
+                    favourite: true,
+                    low_priority: current.low_priority,
+                    order: Some(*order),
+                };
+                (room_id.clone(), tags)
+            })
+            .collect(),
+    }
 }
 
 /// Fixed wording per failure; nothing from the server is shown.
@@ -189,11 +356,6 @@ pub(crate) struct Organizer {
     live: Arc<LiveUi>,
     ui: Weak<AppWindow>,
     runtime: Handle,
-    /// The latest change; an older one's result only clears its own state.
-    operation: AtomicU64,
-    /// Account of the change in flight. Another account's change does not
-    /// block this one, and cannot touch its rooms.
-    pending_account: Mutex<String>,
 }
 
 pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, runtime: Handle) -> Arc<Organizer> {
@@ -201,8 +363,6 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, runtime: Handle) -> Ar
         live,
         ui: ui.as_weak(),
         runtime,
-        operation: AtomicU64::new(0),
-        pending_account: Mutex::new(String::new()),
     });
     let global = ui.global::<RoomOrganizationState>();
     let handler = organizer.clone();
@@ -217,96 +377,144 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, runtime: Handle) -> Ar
 }
 
 impl Organizer {
-    fn pending_account(&self) -> std::sync::MutexGuard<'_, String> {
-        self.pending_account
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-    }
-
-    /// One explicit menu choice for a room in the visible account.
+    /// One explicit menu choice for a room of the visible account. A menu
+    /// whose row was rebuilt meanwhile reports an empty room, which, like any
+    /// room this account has not joined, does nothing.
     fn organize(self: &Arc<Self>, room_id: &str, action: i32) {
         let Some(ui) = self.ui.upgrade() else {
             return;
         };
-        let global = ui.global::<RoomOrganizationState>();
         let account_id = ui.get_active_account_local_id().to_string();
-        // One change at a time per account; its menus are disabled meanwhile.
-        if !ui.get_live_session()
-            || (!global.get_pending_room().is_empty() && *self.pending_account() == account_id)
-        {
+        if !ui.get_live_session() || account_id.is_empty() || room_id.is_empty() {
             return;
         }
         let Some(selection) = self.live.manager.account_selection(&account_id) else {
             return;
         };
-        let favourites = ui
+        let visible = ui
             .get_favourite_rooms()
             .iter()
-            .map(|entry| {
-                let id = entry.room.id.to_string();
-                let order = order_of(&id);
-                (id, order)
-            })
+            .map(|entry| entry.room.id.to_string())
             .collect::<Vec<_>>();
-        let Some(request) = plan(action, room_id, &favourites) else {
+        let started = with_state(|state| {
+            if state.account != account_id
+                || !state.stored.contains_key(room_id)
+                || state.pending_here().is_some()
+            {
+                return None;
+            }
+            let request = plan(
+                action,
+                room_id,
+                state.tags(room_id),
+                &state.favourites(),
+                &visible,
+            )?;
+            state.next_operation = state.next_operation.wrapping_add(1);
+            let operation = state.next_operation;
+            state.pending = Some(Pending {
+                account: account_id.clone(),
+                room: room_id.to_owned(),
+                operation,
+            });
+            Some((request, operation))
+        });
+        let Some((request, operation)) = started else {
             return;
         };
-        if matches!(&request, Request::Orders(orders) if orders.is_empty()) {
-            return;
-        }
-        let operation = self.operation.fetch_add(1, Ordering::AcqRel) + 1;
-        *self.pending_account() = account_id;
-        global.set_pending_room(room_id.into());
+        publish_active(&ui);
         let organizer = self.clone();
         let room_id = room_id.to_owned();
         self.runtime.spawn(async move {
             let manager = organizer.live.manager.clone();
-            let result = match request {
-                Request::Change(change) => {
+            let result = match &request {
+                Request::Change(change, _) => {
                     manager
-                        .change_room_tags_selected(&selection, &room_id, change)
+                        .change_room_tags_selected(&selection, &room_id, *change)
                         .await
                 }
                 Request::Orders(orders) => {
                     manager
-                        .set_favourite_orders_selected(&selection, orders)
+                        .set_favourite_orders_selected(&selection, orders.clone())
                         .await
                 }
             };
             let weak = organizer.ui.clone();
             let _ = weak.upgrade_in_event_loop(move |ui| {
-                if organizer.operation.load(Ordering::Acquire) != operation {
-                    return;
-                }
-                ui.global::<RoomOrganizationState>()
-                    .set_pending_room("".into());
-                // The room list follows the stored tags once sync returns
-                // them; only a failure for the still-visible account is told.
-                if let Err(error) = result
-                    && selection.is_current()
-                    && ui.get_active_account_local_id().as_str() == selection.account_id()
-                    && let Some(text) = failure_text(error)
-                {
-                    ui.set_session_error(text.into());
-                }
+                finish(&ui, operation, &selection, &room_id, &request, result);
             });
         });
     }
 }
 
-/// Publish the open room's organization for the room header menu. Called
-/// after the sections are rebuilt and when the open room changes.
+/// Apply one change's result on the UI thread.
+fn finish(
+    ui: &AppWindow,
+    operation: u64,
+    selection: &morpheus_matrix::AccountSelection,
+    room_id: &str,
+    request: &Request,
+    result: Result<(), RoomTagError>,
+) {
+    let account = selection.account_id();
+    let visible = with_state(|state| {
+        if state
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.operation == operation)
+        {
+            state.pending = None;
+        }
+        let visible = selection.is_current() && state.account == account;
+        if visible && result.is_ok() {
+            // Accepted by the homeserver: shown until sync returns it.
+            let until = Instant::now() + CONFIRMED_LIFETIME;
+            let mut written = confirmed_tags(request, |id| state.tags(id));
+            if let Request::Change(_, expected) = request {
+                written.push((room_id.to_owned(), *expected));
+            }
+            for (room, tags) in written {
+                state.confirmed.insert(
+                    room,
+                    Confirmed {
+                        account: account.to_owned(),
+                        tags,
+                        until,
+                    },
+                );
+            }
+        }
+        visible
+    });
+    // Rebuild the sections with what the homeserver accepted, and clear the
+    // pending state either way.
+    crate::navigation::apply_room_order(ui);
+    if let Err(error) = result
+        && visible
+        && ui.get_active_account_local_id().as_str() == account
+        && let Some(text) = failure_text(error)
+    {
+        ui.set_session_error(text.into());
+    }
+}
+
+/// Publish the open room's organization and the pending room for the menus.
+/// Called after the sections are rebuilt and when the open room changes.
 pub(crate) fn publish_active(ui: &AppWindow) {
     let active = ui.get_active_room_id();
+    let (tags, pending) = with_state(|state| {
+        let pending = state
+            .pending_here()
+            .map(|pending| pending.room.clone())
+            .unwrap_or_default();
+        (state.tags(active.as_str()), pending)
+    });
     let favourites = ui.get_favourite_rooms();
     let index = favourites.iter().position(|entry| entry.room.id == active);
-    let low_priority = ui
-        .get_low_priority_rooms()
-        .iter()
-        .any(|entry| entry.room.id == active);
     let global = ui.global::<RoomOrganizationState>();
-    global.set_active_favourite(index.is_some());
-    global.set_active_low_priority(low_priority);
+    global.set_pending_room(pending.into());
+    global.set_active_favourite(tags.favourite);
+    global.set_active_low_priority(tags.low_priority);
     global.set_active_can_move_up(index.is_some_and(|index| index > 0));
     global.set_active_can_move_down(
         index.is_some_and(|index| index + 1 < favourites.row_count()),
@@ -321,91 +529,180 @@ mod tests {
         TagOrder::new(value)
     }
 
-    fn favourites(orders: &[Option<TagOrder>]) -> Vec<(String, Option<TagOrder>)> {
+    fn list(orders: &[(&str, Option<TagOrder>)]) -> Vec<(String, Option<TagOrder>)> {
         orders
             .iter()
-            .enumerate()
-            .map(|(index, order)| (format!("!{index}:example.org"), *order))
+            .map(|(id, order)| ((*id).to_owned(), *order))
             .collect()
     }
 
-    /// The single write of a move, as (room position, order value).
-    fn single(writes: Option<Vec<(usize, TagOrder)>>) -> (usize, f64) {
+    fn ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    fn favourite(order: Option<TagOrder>) -> RoomTags {
+        RoomTags {
+            favourite: true,
+            low_priority: false,
+            order,
+        }
+    }
+
+    /// The single write of a move, as (room, order value).
+    fn single(writes: Option<Vec<(String, TagOrder)>>) -> (String, f64) {
         let writes = writes.expect("the room can move");
         assert_eq!(writes.len(), 1, "{writes:?}");
-        (writes[0].0, writes[0].1.value())
+        (writes[0].0.clone(), writes[0].1.value())
+    }
+
+    fn close(actual: (String, f64), room: &str, value: f64) {
+        assert_eq!(actual.0, room);
+        assert!((actual.1 - value).abs() < 1e-12, "{actual:?}");
     }
 
     #[test]
     fn a_move_writes_one_order_between_its_new_neighbours() {
-        let orders = [order(0.2), order(0.4), order(0.6)];
-        let close = |actual: (usize, f64), expected: (usize, f64)| {
-            assert_eq!(actual.0, expected.0);
-            assert!((actual.1 - expected.1).abs() < 1e-12, "{actual:?}");
+        let all = list(&[("a", order(0.2)), ("b", order(0.4)), ("c", order(0.6))]);
+        close(single(plan_reorder(&all, "b", "a", true)), "b", 0.1);
+        close(single(plan_reorder(&all, "b", "c", false)), "b", 0.8);
+        close(single(plan_reorder(&all, "a", "b", false)), "a", 0.5);
+        assert_eq!(plan_reorder(&all, "a", "a", true), None);
+        assert_eq!(plan_reorder(&all, "x", "a", true), None);
+    }
+
+    #[test]
+    fn hidden_favourites_keep_their_place_when_a_visible_one_moves() {
+        // The current Space shows a and c; b is a favourite hidden here.
+        let all = list(&[("a", order(0.2)), ("b", order(0.4)), ("c", order(0.6))]);
+        let visible = ids(&["a", "c"]);
+        let request = plan(MOVE_UP, "c", favourite(order(0.6)), &all, &visible).unwrap();
+        // c lands just before a, below the start; b stays between a and c's
+        // old place.
+        let Request::Orders(writes) = request else {
+            panic!("a move writes orders");
         };
-        // Up to the top: between the start of the range and 0.2.
-        close(single(plan_move(&orders, 1, true)), (1, 0.1));
-        // Down to the end: between 0.6 and the end of the range.
-        close(single(plan_move(&orders, 1, false)), (1, 0.8));
-        // Down from the top: between 0.4 and 0.6.
-        close(single(plan_move(&orders, 0, false)), (0, 0.5));
-        // Edges cannot move further.
-        assert_eq!(plan_move(&orders, 0, true), None);
-        assert_eq!(plan_move(&orders, 2, false), None);
-        assert_eq!(plan_move(&orders, 3, false), None);
+        close(single(Some(writes)), "c", 0.1);
     }
 
     #[test]
     fn missing_or_crowded_orders_renumber_only_what_changes() {
-        // Unordered rooms: every room gets an even order in the new sequence.
-        let unordered = [None, None, None];
+        let unordered = list(&[("a", None), ("b", None), ("c", None)]);
         assert_eq!(
-            plan_move(&unordered, 2, true),
+            plan_reorder(&unordered, "c", "b", true),
             Some(vec![
-                (0, order(0.25).unwrap()),
-                (2, order(0.5).unwrap()),
-                (1, order(0.75).unwrap()),
+                ("a".to_owned(), order(0.25).unwrap()),
+                ("c".to_owned(), order(0.5).unwrap()),
+                ("b".to_owned(), order(0.75).unwrap()),
             ])
         );
-        // Equal neighbours leave no gap; a room already at its even order is
-        // not rewritten.
-        let crowded = [order(0.25), order(0.25), order(0.75)];
+        let crowded = list(&[("a", order(0.25)), ("b", order(0.25)), ("c", order(0.75))]);
         assert_eq!(
-            plan_move(&crowded, 2, true),
-            Some(vec![(2, order(0.5).unwrap()), (1, order(0.75).unwrap())])
+            plan_reorder(&crowded, "c", "b", true),
+            Some(vec![
+                ("c".to_owned(), order(0.5).unwrap()),
+                ("b".to_owned(), order(0.75).unwrap()),
+            ])
         );
     }
 
     #[test]
-    fn menu_choices_plan_one_explicit_change() {
-        let list = favourites(&[order(0.25), order(0.75)]);
+    fn menu_choices_plan_one_change_and_nothing_redundant() {
+        let all = list(&[("a", order(0.25)), ("b", order(0.75))]);
+        let visible = ids(&["a", "b"]);
+        let normal = RoomTags::default();
         assert_eq!(
-            plan(ADD_FAVOURITE, "!new:example.org", &list),
-            Some(Request::Change(RoomTagChange::Favourite(order(0.875))))
+            plan(ADD_FAVOURITE, "new", normal, &all, &visible),
+            Some(Request::Change(
+                RoomTagChange::Favourite(order(0.875)),
+                favourite(order(0.875))
+            ))
         );
         assert_eq!(
-            plan(ADD_FAVOURITE, "!new:example.org", &[]),
-            Some(Request::Change(RoomTagChange::Favourite(order(0.5))))
+            plan(ADD_FAVOURITE, "new", normal, &[], &[]),
+            Some(Request::Change(
+                RoomTagChange::Favourite(order(0.5)),
+                favourite(order(0.5))
+            ))
         );
         // Next to unordered favourites a new one has no order either.
-        let unordered = favourites(&[order(0.25), None]);
+        let unordered = list(&[("a", order(0.25)), ("b", None)]);
         assert_eq!(
-            plan(ADD_FAVOURITE, "!new:example.org", &unordered),
-            Some(Request::Change(RoomTagChange::Favourite(None)))
+            plan(ADD_FAVOURITE, "new", normal, &unordered, &visible),
+            Some(Request::Change(RoomTagChange::Favourite(None), favourite(None)))
         );
+        // An existing favourite keeps its tag: adding again only drops the
+        // other tag of a room tagged both ways, and never rewrites the order.
+        let both = RoomTags {
+            favourite: true,
+            low_priority: true,
+            order: order(0.25),
+        };
         assert_eq!(
-            plan(LOW_PRIORITY, "!0:example.org", &list),
-            Some(Request::Change(RoomTagChange::LowPriority))
+            plan(ADD_FAVOURITE, "a", both, &all, &visible),
+            Some(Request::Change(
+                RoomTagChange::Favourite(None),
+                favourite(order(0.25))
+            ))
         );
+        assert_eq!(plan(ADD_FAVOURITE, "a", favourite(order(0.25)), &all, &visible), None);
+        assert_eq!(plan(REMOVE_FAVOURITE, "new", normal, &all, &visible), None);
+        assert_eq!(plan(NORMAL_PRIORITY, "a", favourite(order(0.25)), &all, &visible), None);
         assert_eq!(
-            plan(MOVE_DOWN, "!0:example.org", &list),
-            Some(Request::Orders(vec![(
-                "!0:example.org".to_owned(),
-                order(0.875).unwrap()
-            )]))
+            plan(MOVE_DOWN, "a", favourite(order(0.25)), &all, &visible),
+            Some(Request::Orders(vec![("a".to_owned(), order(0.875).unwrap())]))
         );
-        // Only listed favourites move; unknown actions do nothing.
-        assert_eq!(plan(MOVE_UP, "!other:example.org", &list), None);
-        assert_eq!(plan(9, "!0:example.org", &list), None);
+        // A non-favourite, an edge or an unknown action moves nothing.
+        assert_eq!(plan(MOVE_UP, "new", normal, &all, &visible), None);
+        assert_eq!(plan(MOVE_UP, "a", favourite(order(0.25)), &all, &visible), None);
+        assert_eq!(plan(9, "a", favourite(order(0.25)), &all, &visible), None);
+    }
+
+    #[test]
+    fn confirmed_writes_show_until_sync_returns_them_for_that_account_only() {
+        let room = |id: &str, favourite: bool, order: Option<TagOrder>| RoomInfo {
+            room_id: id.into(),
+            name: id.into(),
+            topic: None,
+            membership: RoomMembership::Joined,
+            is_direct: false,
+            is_space: false,
+            avatar_mxc: None,
+            favourite,
+            low_priority: false,
+            tag_order: order,
+            unread_messages: 0,
+            unread_notifications: 0,
+        };
+        remember("alice", &[room("!a", false, None)]);
+        with_state(|state| {
+            state.confirmed.insert(
+                "!a".into(),
+                Confirmed {
+                    account: "alice".into(),
+                    tags: favourite(order(0.5)),
+                    until: Instant::now() + CONFIRMED_LIFETIME,
+                },
+            )
+        });
+        // A snapshot that has not caught up keeps showing the accepted write.
+        remember("alice", &[room("!a", false, None)]);
+        assert_eq!(tags("!a"), favourite(order(0.5)));
+        // One that shows it ends the overlay.
+        remember("alice", &[room("!a", true, order(0.5))]);
+        assert!(with_state(|state| state.confirmed.is_empty()));
+        // Another account never sees it.
+        with_state(|state| {
+            state.confirmed.insert(
+                "!a".into(),
+                Confirmed {
+                    account: "alice".into(),
+                    tags: favourite(order(0.25)),
+                    until: Instant::now() + CONFIRMED_LIFETIME,
+                },
+            )
+        });
+        remember("bob", &[room("!a", false, None)]);
+        assert_eq!(tags("!a"), RoomTags::default());
+        assert!(with_state(|state| state.confirmed.is_empty()));
     }
 }

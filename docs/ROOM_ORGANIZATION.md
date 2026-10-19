@@ -36,26 +36,34 @@ the other. A room another client tagged both ways is shown in Favorites;
 removing it from Favorites leaves it in Low priority. Other tags, such as
 personal `u.*` tags or another app's tags, are never changed.
 
-Moving a favorite writes one standard `order` value between its new neighbours
-when there is room. Otherwise, or when favorites have no order yet, Morpheus
-renumbers the Favorites evenly in the displayed order and writes only the rooms
-whose order changes, at most 100 at a time. A new favorite is placed after the
-ordered ones.
+The order is the account's, shared by every view: a Space shows only some
+favorites, so moving one places it just before or after its visible neighbour
+in the account's whole Favorites order, and favorites the current view hides
+keep their place. Morpheus writes one standard `order` value between the new
+neighbours when there is room. Otherwise, or when favorites have no order yet,
+it renumbers the account's Favorites evenly in the new order and writes only the
+rooms whose order changes, at most 100 at a time. A new favorite is placed after
+the account's ordered favorites.
 
-A tag whose stored data has fields other than `order` was written by another
-app; Morpheus never rewrites it and reports that the room was left unchanged.
-Removing a tag removes it with its data, as the user asked.
+Adding a tag a room already has leaves it as stored, order included; for a room
+tagged both ways it only removes the other tag. A favorite tag whose stored data
+has fields other than `order` was written by another app; Morpheus never
+reorders it and reports that the room was left unchanged. Removing a tag
+removes it with its data, as the user asked.
 
 ## Server state and errors
 
 Each change is one explicit choice for one room, bound to the account that was
-visible when it was made; switching accounts discards its result. While it
-waits for the homeserver, that room's menu is disabled. The room list shows
-the stored tags as sync returns them: nothing is shown as saved before the
-homeserver accepted it, and a failure leaves the room where it was with a fixed
-message. A change the homeserver accepted only in part (for example, a
-favorite added but the low-priority tag not removed) is reported as such, and
-the list shows what was stored.
+visible when it was made; switching accounts discards its result. One change
+runs at a time per account, and the organization menus wait for it. Once the
+homeserver accepts it, the room list shows the change; until sync returns the
+stored tags, for at most 30 seconds, Morpheus applies the accepted change over
+its last copy, so a following move starts from it. Nothing is shown as saved
+before the homeserver accepted it, and a failure leaves the room where it was
+with a fixed message. A change the homeserver accepted only in part (for
+example, a favorite added but the low-priority tag not removed, or a reorder
+that timed out after some writes) is reported as such, and the list shows what
+was stored. A menu whose row was rebuilt while it was open does nothing.
 
 Only joined rooms can be changed. A room left or re-joined keeps whatever tags
 its account data holds on the homeserver.

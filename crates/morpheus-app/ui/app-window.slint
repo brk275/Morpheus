@@ -565,7 +565,7 @@ component OrganizableRoomRow inherits Rectangle {
         focus-on-click: false;
         focus-on-tab-navigation: false;
         key-pressed(event) => {
-            if root.organizable && (event.text == Key.Menu || (event.modifiers.shift && event.text == Key.F10)) {
+            if root.organizable && RoomOrganizationState.pending-room == "" && (event.text == Key.Menu || (event.modifiers.shift && event.text == Key.F10)) {
                 row-menu.show({ x: 0px, y: root.height });
                 accept
             } else {
@@ -591,7 +591,8 @@ component OrganizableRoomRow inherits Rectangle {
         }
     }
     row-menu := ContextMenuArea {
-        enabled: root.organizable && RoomOrganizationState.pending-room != root.room.id;
+        // One change at a time per account; every menu waits for it.
+        enabled: root.organizable && RoomOrganizationState.pending-room == "";
         Menu {
             MenuItem {
                 title: root.room.favourite ? "Remove from Favorites" : "Add to Favorites";
