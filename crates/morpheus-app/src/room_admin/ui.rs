@@ -519,6 +519,14 @@ impl RoomAdminUi {
         let Some((panel, snapshot)) = self.idle_snapshot(ui) else {
             return;
         };
+        if kind == super::BAN_ID {
+            let input = ui.get_roster_invite_input();
+            match super::ban_intent(input.as_str(), &snapshot) {
+                Ok(intent) => self.review(ui, panel, intent, &snapshot),
+                Err(message) => self.reject(ui, &panel, message),
+            }
+            return;
+        }
         let key = ui.get_roster_selected_key();
         let Some(member) = snapshot.member(key.as_str()) else {
             clear_selection(ui);
@@ -710,9 +718,8 @@ fn reset_inputs(ui: &AppWindow, intent: &Intent, confirmed: bool) {
     ) {
         return;
     }
-    if intent.action == AdminAction::Invite
-        && ui.get_roster_invite_input().trim() == intent.user_id
-    {
+    let by_id = matches!(intent.action, AdminAction::Invite | AdminAction::Ban);
+    if by_id && ui.get_roster_invite_input().trim() == intent.user_id {
         ui.set_roster_invite_input("".into());
     }
     if ui.get_roster_selected_key().as_str() != intent.user_id {
@@ -762,6 +769,7 @@ fn render(ui: &AppWindow, view: &View) {
     ui.set_roster_shown_text(super::shown_text(shown, total, snapshot.truncated).into());
     ui.set_roster_own_role(super::own_role_text(snapshot).into());
     ui.set_roster_can_invite(snapshot.own.invite);
+    ui.set_roster_can_ban_id(snapshot.own.ban);
     ui.set_roster_own_level(ui_level(snapshot.own_power));
     let thresholds = snapshot.thresholds;
     let default = thresholds.map_or(0, |levels| levels.users_default);
@@ -935,6 +943,7 @@ pub(crate) fn clear_presentation(ui: &AppWindow) {
     ui.set_roster_error("".into());
     ui.set_roster_notice("".into());
     ui.set_roster_can_invite(false);
+    ui.set_roster_can_ban_id(false);
     ui.set_roster_own_level(0);
     ui.set_roster_member_level(0);
     ui.set_roster_query("".into());

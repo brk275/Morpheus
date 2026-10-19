@@ -34,12 +34,15 @@ const DENY_BODY: &str =
 const KICK_BODY: &str =
     "They leave the room now and can rejoin if the room's access rules allow it.";
 const BAN_BODY: &str = "They leave the room and cannot rejoin until someone unbans them.";
+const BAN_ABSENT_BODY: &str =
+    "They are not in the room now. They cannot join or be invited until someone unbans them.";
 const UNBAN_BODY: &str =
     "They can join again if the room's access rules allow it. This does not invite them.";
 const REMOVE_BODY: &str = "including files and reactions, are removed for everyone, newest \
      first. This cannot be undone. Older messages and their changes to the room stay.";
 const REMOVE_UNFINISHED: &str =
     "Removing messages did not finish. Some may already be gone; check the conversation.";
+const LEAVE_INSTEAD: &str = "Use Leave room to remove yourself.";
 const SELF_DEMOTION: &str =
     "You cannot raise it again yourself; someone with a higher level would have to.";
 const DEMOTION: &str = "They lose permissions that need a higher level.";
@@ -76,6 +79,8 @@ pub(crate) const SET_LEVEL: i32 = 4;
 pub(crate) const APPROVE: i32 = 5;
 pub(crate) const DENY: i32 = 6;
 pub(crate) const REMOVE_MESSAGES: i32 = 7;
+/// Ban the Matrix user ID typed in the invite field.
+pub(crate) const BAN_ID: i32 = 8;
 
 /// Access rows in the permissions view: history visibility, guest access and
 /// end-to-end encryption.
@@ -730,15 +735,7 @@ pub(crate) fn member_intent(
 /// Invite by Matrix user ID. The roster may be bounded, so the session still
 /// checks the server's current membership before sending anything.
 pub(crate) fn invite_intent(input: &str, snapshot: &RoomAdminSnapshot) -> Result<Intent, String> {
-    let user_id = input.trim();
-    let shaped = user_id.len() <= MAX_USER_ID_BYTES
-        && user_id.starts_with('@')
-        && user_id.contains(':')
-        && !user_id.chars().any(char::is_whitespace)
-        && !user_id.chars().any(char::is_control);
-    if !shaped {
-        return Err(BAD_USER_ID.to_owned());
-    }
+    let user_id = shaped_user_id(input)?;
     if !snapshot.own.invite {
         return Err(permission_text(AdminAction::Invite, snapshot));
     }
@@ -759,6 +756,59 @@ pub(crate) fn invite_intent(input: &str, snapshot: &RoomAdminSnapshot) -> Result
             reason: None,
             knock: listed.is_some(),
         }),
+    }
+}
+
+/// Ban by Matrix user ID, including someone who already left or never
+/// joined. A listed member is reviewed as their row shows them; the session
+/// still checks the server's current membership and levels before sending.
+pub(crate) fn ban_intent(input: &str, snapshot: &RoomAdminSnapshot) -> Result<Intent, String> {
+    let user_id = shaped_user_id(input)?;
+    if !snapshot.own.ban {
+        return Err(permission_text(AdminAction::Ban, snapshot));
+    }
+    let existing = snapshot.member(user_id);
+    let name = existing.map_or_else(|| crate::directory_plain_text(user_id, 260), display_name);
+    let expected = match existing {
+        Some(member) if member.is_self => return Err(LEAVE_INSTEAD.to_owned()),
+        Some(member) if member.membership == AdminMembership::Ban => {
+            return Err(format!("{name} is already banned."));
+        }
+        Some(member) if member.power == MemberPower::Creator => return Err(CREATOR.to_owned()),
+        Some(member) if !member.actions.ban => {
+            return Err(permission_text(AdminAction::Ban, snapshot));
+        }
+        Some(member) => MemberExpectation {
+            membership: Some(member.membership),
+            power: Some(member.power),
+        },
+        None => MemberExpectation {
+            membership: None,
+            power: None,
+        },
+    };
+    Ok(Intent {
+        action: AdminAction::Ban,
+        user_id: user_id.to_owned(),
+        name,
+        expected,
+        reason: None,
+        knock: false,
+    })
+}
+
+/// A full Matrix user ID as typed, trimmed; the session parses it exactly.
+fn shaped_user_id(input: &str) -> Result<&str, String> {
+    let user_id = input.trim();
+    let shaped = user_id.len() <= MAX_USER_ID_BYTES
+        && user_id.starts_with('@')
+        && user_id.contains(':')
+        && !user_id.chars().any(char::is_whitespace)
+        && !user_id.chars().any(char::is_control);
+    if shaped {
+        Ok(user_id)
+    } else {
+        Err(BAD_USER_ID.to_owned())
     }
 }
 
@@ -792,12 +842,16 @@ pub(crate) fn confirmation(intent: &Intent, snapshot: &RoomAdminSnapshot) -> Opt
             action: "Kick",
             destructive: true,
         },
-        AdminAction::Ban => Confirmation {
-            title: format!("Ban {name}?"),
-            body: BAN_BODY.to_owned(),
-            action: "Ban",
-            destructive: true,
-        },
+        AdminAction::Ban => {
+            let absent = intent.expected.membership.is_none();
+            let body = if absent { BAN_ABSENT_BODY } else { BAN_BODY };
+            Confirmation {
+                title: format!("Ban {name}?"),
+                body: body.to_owned(),
+                action: "Ban",
+                destructive: true,
+            }
+        }
         AdminAction::Unban => Confirmation {
             title: format!("Unban {name}?"),
             body: UNBAN_BODY.to_owned(),
@@ -1178,8 +1232,8 @@ pub(crate) fn error_text(
             _ => {}
         }
     }
-    let removing = intent.action == AdminAction::RemoveMessages;
-    if removing && matches!(error, RoomAdminError::Unavailable | RoomAdminError::TimedOut) {
+    let unfinished = error == RoomAdminError::Unavailable || error == RoomAdminError::TimedOut;
+    if intent.action == AdminAction::RemoveMessages && unfinished {
         return REMOVE_UNFINISHED.to_owned();
     }
     let fixed = match error {
@@ -1189,7 +1243,7 @@ pub(crate) fn error_text(
         RoomAdminError::RateLimited => "The homeserver is limiting requests. Wait, then try again.",
         RoomAdminError::InvalidState => UNREADABLE,
         RoomAdminError::CreatorProtected => CREATOR,
-        RoomAdminError::SelfTarget => "Use Leave room to remove yourself.",
+        RoomAdminError::SelfTarget => LEAVE_INSTEAD,
         RoomAdminError::InvalidUserId => BAD_USER_ID,
         RoomAdminError::InvalidPowerLevel => "That power level is outside the range Matrix allows.",
         RoomAdminError::InvalidReason => LONG_REASON,
@@ -1484,6 +1538,43 @@ mod tests {
         assert_eq!(approval.expected.membership, Some(AdminMembership::Knock));
         snapshot.own.invite = false;
         assert!(invite_intent("@new:example.org", &snapshot).is_err());
+    }
+
+    #[test]
+    fn bans_by_id_reach_people_outside_the_room_and_need_ban_permission() {
+        let mut joined = member("@in:example.org", None, AdminMembership::Join);
+        joined.actions.ban = true;
+        let mut own = member("@me:example.org", None, AdminMembership::Join);
+        own.is_self = true;
+        let members = vec![
+            joined,
+            own,
+            member("@banned:example.org", None, AdminMembership::Ban),
+            member("@peer:example.org", None, AdminMembership::Join),
+        ];
+        let mut snapshot = roster(members, 50);
+        let refused = [
+            "@me:example.org",
+            "@banned:example.org",
+            "@peer:example.org",
+            "name",
+        ];
+        for refused in refused {
+            assert!(ban_intent(refused, &snapshot).is_err());
+        }
+        let gone = ban_intent(" @spam:example.org ", &snapshot).unwrap();
+        assert_eq!(gone.action, AdminAction::Ban);
+        assert_eq!(gone.user_id, "@spam:example.org");
+        assert_eq!(gone.expected.membership, None);
+        assert_eq!(gone.expected.power, None);
+        assert!(gone.still_matches(&snapshot));
+        let review = confirmation(&gone, &snapshot).unwrap();
+        assert!(review.destructive && review.body.starts_with("They are not in the room now."));
+        let listed = ban_intent("@in:example.org", &snapshot).unwrap();
+        assert_eq!(listed.expected.membership, Some(AdminMembership::Join));
+        assert_eq!(confirmation(&listed, &snapshot).unwrap().body, BAN_BODY);
+        snapshot.own.ban = false;
+        assert!(ban_intent("@spam:example.org", &snapshot).is_err());
     }
 
     #[test]
