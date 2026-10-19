@@ -54,7 +54,7 @@ use crate::{
     },
     outgoing_ring::{InvitationOutcome, OutgoingRing},
     updater::{CallLease as UpdateCallLease, UpdateActivity, UpdateError},
-    video_render::{RosterUpdate, VideoUpdate, run_remote_video},
+    video_render::{RosterUpdate, StageRequest, VideoUpdate, run_remote_video},
     voice_spaces::VoiceSpaces,
 };
 
@@ -367,6 +367,8 @@ struct Shared {
     invitation: watch::Sender<InvitationUpdate>,
     video: watch::Sender<VideoUpdate>,
     roster: watch::Sender<RosterUpdate>,
+    // Call-stage pin/page/visibility requests; see `choose_stage`.
+    stage: watch::Sender<StageRequest>,
     audio: watch::Sender<AudioUpdate>,
     local_video: watch::Sender<LocalVideoStatus>,
     active_capture_workers: Arc<AtomicUsize>,
@@ -523,6 +525,7 @@ impl CallController {
                 invitation: watch::channel(InvitationUpdate::default()).0,
                 video,
                 roster,
+                stage: watch::channel(StageRequest::default()).0,
                 audio,
                 local_video,
                 active_capture_workers: Arc::new(AtomicUsize::new(0)),
@@ -551,6 +554,23 @@ impl CallController {
 
     pub fn subscribe_roster(&self) -> watch::Receiver<RosterUpdate> {
         self.shared.roster.subscribe()
+    }
+
+    /// Pin, unpin or page the call stage only for the call generation the
+    /// UI observed. The stage discards another generation's choices.
+    pub fn choose_stage(&self, token: u64, change: impl FnOnce(&mut StageRequest)) {
+        if token != 0 && self.video_token() == token {
+            self.shared
+                .stage
+                .send_modify(|request| request.choose(token, change));
+        }
+    }
+
+    /// Whether a call stage is on screen. A hidden stage decodes no video.
+    pub fn set_stage_presented(&self, presented: bool) {
+        self.shared
+            .stage
+            .send_if_modified(|request| request.present(presented));
     }
 
     pub fn subscribe_audio(&self) -> watch::Receiver<AudioUpdate> {
@@ -1531,6 +1551,7 @@ impl CallWorker {
                 self.token,
                 self.shared.video.clone(),
                 self.shared.roster.clone(),
+                self.shared.stage.subscribe(),
                 &self.shared.active_video_token,
             );
             tokio::pin!(audio);
@@ -2226,6 +2247,7 @@ mod tests {
             invitation: watch::channel(InvitationUpdate::default()).0,
             video,
             roster,
+            stage: watch::channel(StageRequest::default()).0,
             audio,
             local_video,
             active_capture_workers: Arc::new(AtomicUsize::new(0)),
@@ -2307,6 +2329,7 @@ mod tests {
             invitation: watch::channel(InvitationUpdate::default()).0,
             video,
             roster,
+            stage: watch::channel(StageRequest::default()).0,
             audio,
             local_video,
             active_capture_workers: Arc::new(AtomicUsize::new(0)),
