@@ -148,6 +148,7 @@ export component DeviceSessionsPanel inherits VerticalLayout {
     property <color> selection-ink: StyleTokens.roles.selection-ink.present ? StyleTokens.roles.selection-ink.color : root.colors.ink;
     property <length> row-height: max(48px, 30px * root.text-scale + 18px);
     property <bool> ready: root.view.available && root.view.loaded;
+    property <bool> can-refresh: !root.view.loading && !root.view.busy;
     property <string> rename-text;
     // Prefill the rename field whenever another session is selected.
     property <string> shown-key: root.view.selected-key;
@@ -167,7 +168,7 @@ export component DeviceSessionsPanel inherits VerticalLayout {
     changed reveal-request => {
         if root.reveal-request > 0 {
             root.reveal-at(refresh-action.absolute-position.y);
-            if refresh-action.enabled {
+            if root.can-refresh {
                 refresh-action.focus();
                 if refresh-action.has-focus { root.revealed("security.devices"); }
             } else {
@@ -205,7 +206,7 @@ export component DeviceSessionsPanel inherits VerticalLayout {
                 colors: root.colors; text-scale: root.text-scale;
                 text: root.view.loading ? "Loading…" : "Refresh";
                 label: "Refresh the sessions signed in to this account";
-                enabled: !root.view.loading && !root.view.busy;
+                enabled: root.can-refresh;
                 activated => { root.refresh(); }
                 focus-state-changed(focused) => { if focused { root.reveal-at(self.absolute-position.y); } }
             }
@@ -430,6 +431,8 @@ export component DeviceSessionsPanel inherits VerticalLayout {
                             label: "Sign out " + root.view.selected.name + ", session " + root.view.selected.device-id + ", now";
                             enabled: !root.view.busy;
                             activated => { root.confirm-sign-out(); }
+                            cancel-on-escape: true;
+                            cancelled => { root.cancel-sign-out(); }
                             focus-state-changed(focused) => { if focused { root.reveal-at(self.absolute-position.y); } }
                         }
                         if root.view.stage == 3 || root.view.stage == 4 : TokenButton {
@@ -438,6 +441,8 @@ export component DeviceSessionsPanel inherits VerticalLayout {
                             label: root.view.stage == 3 ? "Open your homeserver's confirmation page in the system browser" : "Open your sign-in provider's page for this session in the system browser";
                             enabled: !root.view.busy;
                             activated => { root.open-page(); }
+                            cancel-on-escape: true;
+                            cancelled => { root.cancel-sign-out(); }
                         }
                         if root.view.stage == 3 : TokenButton {
                             colors: root.colors; text-scale: root.text-scale;
@@ -445,6 +450,8 @@ export component DeviceSessionsPanel inherits VerticalLayout {
                             label: "Continue signing out after confirming in the browser";
                             enabled: !root.view.busy && root.view.page-opened;
                             activated => { root.continue-sign-out(); }
+                            cancel-on-escape: true;
+                            cancelled => { root.cancel-sign-out(); }
                         }
                         if root.view.stage == 4 : TokenButton {
                             colors: root.colors; text-scale: root.text-scale;
@@ -452,12 +459,16 @@ export component DeviceSessionsPanel inherits VerticalLayout {
                             label: "Close this step and refresh the session list";
                             enabled: !root.view.busy;
                             activated => { root.continue-sign-out(); }
+                            cancel-on-escape: true;
+                            cancelled => { root.cancel-sign-out(); }
                         }
                         TokenButton {
                             colors: root.colors; text-scale: root.text-scale;
                             text: root.view.stage == 5 ? "Close" : "Cancel";
                             label: root.view.stage == 6 ? "Stop waiting; the sign-out may still complete" : root.view.stage == 5 ? "Close this step" : "Cancel signing out this session";
                             activated => { root.cancel-sign-out(); }
+                            cancel-on-escape: true;
+                            cancelled => { root.cancel-sign-out(); }
                         }
                     }
                 }
