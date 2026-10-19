@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
 name: Reviewed beta four-platform native checks
-run-name: Reviewed native candidate - 62b90fc - ${{ inputs.platform }}
+run-name: Reviewed native candidate - f7d2e7f - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: beta-native-62b90fc-${{ github.ref }}
+  group: beta-native-f7d2e7f-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 62b90fc9aa8f3b011251b25aed8def4cbadbb69c
+          ref: f7d2e7fe9ad0383811ef7fd090f8d6c3a446525c
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -135,7 +135,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='62b90fc9aa8f3b011251b25aed8def4cbadbb69c'
+          source='f7d2e7fe9ad0383811ef7fd090f8d6c3a446525c'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -379,7 +379,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='62b90fc9aa8f3b011251b25aed8def4cbadbb69c'
+          source='f7d2e7fe9ad0383811ef7fd090f8d6c3a446525c'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -454,6 +454,12 @@ jobs:
               'sdk_cache_publish':'Cannot publish verified native SDK cache',
           }
           needed_app={
+              'kept_replies::tests::a_queued_restore_cannot_outlive_a_clear_or_a_room_change',
+              'live::account_presentation_tests::a_focused_view_loaded_out_of_order_never_replaces_the_shown_one',
+              'live::account_presentation_tests::a_withdrawn_search_navigation_held_at_its_commit_changes_nothing',
+              'live::account_presentation_tests::no_refresh_samples_a_reveal_until_it_is_decided_or_given_back',
+              'message_search::tests::context_keeps_the_hit_near_the_top_and_stays_bounded',
+              'message_search::tests::search_result_display_sanitizes_untrusted_text_without_changing_ids',
               'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
               'discovery_tests::timeline_link_handler_accepts_only_browser_urls',
               'discovery_tests::call_stage_uses_joined_room_even_after_chat_navigation',
@@ -468,6 +474,8 @@ jobs:
               'calls::tests::late_recovery_status_cannot_overwrite_a_leave',
           }
           needed_matrix={
+              'history::tests::a_focused_view_is_owned_only_by_the_selection_that_loaded_it',
+              'history::tests::search_rejects_an_aba_selection_and_keeps_the_current_one',
               'tests::homeserver_must_not_send_password_over_plain_http',
               'tests::registry_rejects_path_like_account_ids',
               'tests::sso_redirect_must_be_private_loopback_listener',
@@ -495,14 +503,9 @@ jobs:
                   '--bin','morpheus-app','--','--test-threads=1'],40*60,needed_app,allowed_app_ignore),
               ('matrix_unit',['cargo','test','--locked','-p','morpheus-matrix','--lib','--','--test-threads=1'],20*60,needed_matrix,set()),
           ]
-          # Linux RTC/config inputs are identical to accepted40b/812 evidence.
-          # New account-readiness accessors invalidate the older Matrix evidence.
-          if os.environ['RUNNER_OS']!='Linux':
-              checks.extend([
-                  ('config_unit',['cargo','test','--locked','-p','morpheus-config','--lib','--','--test-threads=1'],10*60,needed_config,set()),
-                  ('rtc_native_unit',['cargo','test','--locked','-p','morpheus-rtc','--features','native-devices',
-                      '--lib','--','--test-threads=1'],20*60,needed_rtc,set()),
-              ])
+          # Config/RTC source, manifests, lock, toolchain, build and vendor inputs
+          # are identical to accepted all4 source62b90fc/run39200849224.
+          # Run only changed app/controller and Matrix inputs on all4.
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
               result=bounded(args,name,seconds)
