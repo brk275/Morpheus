@@ -2101,8 +2101,8 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
         "Shortcuts",
         "Settings › Keyboard shortcuts",
         "Keyboard shortcuts",
-        "Change or disable shortcuts for switching and searching.",
-        &["shortcut", "hotkey", "keybinding", "keys", "keyboard"],
+        "Record, type, disable or restore shortcuts for rooms, the composer, search and panels.",
+        &["shortcut", "hotkey", "keybinding", "keys", "keyboard", "record", "conflict"],
     ),
     target(
         "advanced.config_file",

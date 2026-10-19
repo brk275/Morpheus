@@ -50,6 +50,24 @@ Their palette files are embedded in the app. Setting only
 `appearance.theme_pack = "terminal"` selects its colors; use the in-app preset
 or set the fields below to select its fonts and layout too.
 
+### Style examples
+
+[`examples/appearance/styles`](../examples/appearance/styles) holds four
+sparse configurations that combine the settings on this page. Each one uses
+only registry keys, needs no extra theme file, changes no shortcuts or account
+entries, and is checked by the configuration tests. Merge a file's keys into
+your `config.toml` rather than replacing it, then adjust from Settings.
+
+| Example | Character | Settings it combines |
+| --- | --- | --- |
+| [Harbor](../examples/appearance/styles/harbor.toml) | Roomy, cool slate, soft | Spacious density, large radii and padding, circular 40 px avatars, composer and navigation states, sender palette, 140/180 ms fades |
+| [Ledger](../examples/appearance/styles/ledger.toml) | Dense, square, light | Paper palette, compact density, small type, 2 px radii, 24 px avatars, columns, 24-hour clock, text sidebar with direct messages first |
+| [Lantern](../examples/appearance/styles/lantern.toml) | Warm, reading-focused | Amber palette, serif messages at 17 px, larger sender and timestamp text, broad inset, icon and selection states |
+| [Beacon](../examples/appearance/styles/beacon.toml) | Maximum legibility | High-contrast palette, 2 px outlines, 4 px focus ring, larger icons and type, reduced motion |
+
+Custom colors are applied as written; check contrast with your own surfaces
+and text scale. Beacon keeps the built-in high-contrast colors.
+
 ## Navigation
 
 **Settings → Layout → Navigation** edits the same schema-version-1 fields as
@@ -116,8 +134,9 @@ confirmations. Starting points keep these choices.
 
 **Settings → Keyboard shortcuts** lists every action with its combination and
 a filter by action, group or combination. Activate a combination to record the
-next one you press; Escape cancels and Tab cancels and moves on, so focus is
-never trapped. A combination can also be typed, for example `Mod+Shift+K`.
+next one you press. Escape or Tab cancels and returns focus to that row, and
+clicking elsewhere also cancels, so focus is never trapped and shortcuts never
+stay paused. A combination can also be typed, for example `Mod+Shift+K`.
 Each change saves at once. A combination already used by another action is not
 saved, and the message names that action. **Default**, **Disable**, **Undo**
 and **Restore all defaults** are available; Undo never overwrites a change made
@@ -140,6 +159,7 @@ elsewhere.
 | Open the account menu (`open_account_menu`) | `Mod+Shift+U` |
 
 ```toml
+# An excerpt: a [shortcuts] table lists every action you keep.
 [shortcuts]
 quick_switcher = "Mod+K"
 toggle_details_panel = "Ctrl+Shift+D"

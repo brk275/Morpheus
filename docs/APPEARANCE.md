@@ -123,9 +123,11 @@ valid appearance and shows a fixed error. Settings writes the same keys.
 
 ## Color tokens
 
-36 tokens, all consumed by the interface. **Base** tokens are the theme pack's
-eleven required colors; **Role** tokens are optional theme roles. Fallbacks
-apply when neither `[colors]` nor the theme sets the token.
+52 tokens, all consumed by the interface. **Base** tokens are the theme pack's
+eleven required colors; **Role** tokens are optional theme roles; **State**
+tokens are optional interaction states in a theme pack's `[states]` table.
+Fallbacks apply when neither `[colors]` nor the theme sets the token, so an
+unset state keeps the previous look.
 
 | Group | Token | Source | Fallback |
 | --- | --- | --- | --- |
@@ -160,6 +162,22 @@ apply when neither `[colors]` nor the theme sets the token.
 | Inputs and controls | `divider` | Base | built-in palette |
 | Calls | `voice` | Role | `#78C8B1` |
 | Avatars | `avatar_ink` | Role (new) | `#FFFFFF` |
+| Surfaces | `message_hover` | State | `elevated` |
+| Inputs and controls | `control_hover` | State | each control's built-in hover, about `#32394B` |
+| Inputs and controls | `control_pressed` | State | no pressed layer |
+| Inputs and controls | `control_disabled` | State | each control's built-in disabled color, about `#A7AFC1` |
+| Inputs and controls | `input_surface` | State | each field's built-in surface, about `#272D3B` |
+| Inputs and controls | `input_border` | State | `divider` |
+| Inputs and controls | `composer_surface` | State | `elevated` |
+| Inputs and controls | `composer_border` | State | `divider` |
+| Inputs and controls | `composer_focus` | State | `composer_border` |
+| Inputs and controls | `icon` | State | `muted` |
+| Inputs and controls | `icon_active` | State | `accent` |
+| Navigation and badges | `nav_hover` | State | the built-in row hover, about `#272D3B` |
+| Navigation and badges | `nav_selected` | State | `selection` |
+| Navigation and badges | `nav_selected_ink` | State | `selection_ink` |
+| Navigation and badges | `mention` | State | `destructive` |
+| Navigation and badges | `mention_ink` | State | `destructive_ink` |
 
 Custom colors are the owner's choice: syntactically valid low-contrast values
 are applied as written. The shipped presets set every role explicitly and keep
