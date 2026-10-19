@@ -1803,10 +1803,21 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
     assert!(!ui.get_color_editor().can_undo);
     assert!(!ui.get_color_editor().hint.is_empty());
 
-    // Arming Reset all keeps single-color undo; the removal takes the
-    // overrides the file holds then, including an undelivered one.
+    // A queued selection outside the current group/filter must reveal that
+    // exact color, not silently edit the first color in the old group.
+    ui.invoke_color_filter_changed("canvas".into());
+    settle(ui).await;
+    let before_selection = std::fs::read_to_string(store.path()).unwrap();
     ui.invoke_color_token_chosen("link".into());
     settle(ui).await;
+    assert_eq!(ui.get_color_selected_id(), "link");
+    assert!(ui.get_color_filter().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(store.path()).unwrap(),
+        before_selection
+    );
+    // Arming Reset all keeps single-color undo; the removal takes the
+    // overrides the file holds then, including an undelivered one.
     ui.invoke_color_hex_edited("#010203".into());
     settle(ui).await;
     ui.invoke_color_reset_all();

@@ -106,6 +106,17 @@ pub(super) fn register(ui: &AppWindow, store: &ConfigStore) {
         let Some(token) = registry::color_token(id.as_str()) else {
             return;
         };
+        // A queued click can name a token from the previous group/filter.
+        // Honor that exact allowlisted ID instead of projecting a different
+        // group's first token and editing the wrong color next.
+        let group = usize::try_from(ui.get_color_group_index()).unwrap_or(0);
+        if !shown_tokens(group, ui.get_color_filter().as_str())
+            .iter()
+            .any(|shown| shown.id == token.id)
+        {
+            select_token(&ui, token);
+            return;
+        }
         ui.set_color_selected_id(token.id.into());
         clear_hint();
         reproject(&ui, true);
