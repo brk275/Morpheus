@@ -323,8 +323,9 @@ presentation preference; it is not written to Matrix.
 
 ## Notifications
 
-The Notifications section edits desktop notifications, sounds, message previews
-and local highlight words or phrases. Each highlight is trimmed, repeated
+The Notifications section edits desktop notifications, sounds, message previews,
+room and sender names in banners, local highlight words or phrases, the
+account's default levels and searchable per-room levels. Each highlight is trimmed, repeated
 whitespace is collapsed, duplicates are rejected without regard to case, and
 hidden control or direction characters are rejected. The editor accepts up to 32
 highlights of at most 64 characters each. Saved changes appear in the app when
@@ -337,11 +338,14 @@ The corresponding TOML fields are:
 enabled = true
 sounds = true
 show_message_preview = false
+show_room_and_sender = true
 highlight_words = ["release", "urgent"]
 ```
 
 Message previews are off by default because a desktop banner may show
-decrypted text. Matrix push rules and operating-system notification settings
+decrypted text. With `show_room_and_sender = false` a banner names only the
+account and never previews text. Per-room levels and default levels are Matrix
+push rules, chosen in the same section; see [notifications](NOTIFICATIONS.md). Matrix push rules and operating-system notification settings
 still decide whether a banner or sound is delivered.
 
 ## Theme files

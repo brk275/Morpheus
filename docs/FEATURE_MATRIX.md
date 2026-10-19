@@ -29,7 +29,7 @@ See [account access](ACCOUNT_ACCESS.md) for password and removal behavior.
 | Emoji and images | Offline Unicode emoji search; explicit, bounded PNG/baseline-JPEG attachment viewer; encrypted image previews off by default. | Full picker interaction, platform font coverage and viewer accessibility. |
 | Search | Account-scoped encrypted local index, room/cross-room queries and event context. | All-room UI, large histories and cross-platform interaction. |
 | Administration | Room details, avatars, supported join rules, member roles, invite/kick/ban/unban and redaction controls. | Permission-error UI, roster refresh and full administration QA. |
-| Notifications | Active-account native alerts with room visibility, privacy, sound, age and duplicate policies. | Visible/audible notification acceptance on each platform. |
+| Notifications | Active-account native alerts with room visibility, privacy, sound, age and duplicate policies; searchable per-room and default Matrix push-rule levels; private read receipts for the visible room; click-to-open of the exact account, room and thread through the protected switch; per-room replacement and withdrawal where the OS backend supports it. | Visible/audible notification acceptance, click activation and withdrawal on each platform; push-rule and receipt behavior against real homeservers. |
 
 Encrypted formatting, drafts, attachments, search and moderation have live
 fixture coverage. Search has been tested through both native sliding sync and

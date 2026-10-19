@@ -23,6 +23,8 @@ mod live;
 mod local_video;
 mod message_metadata;
 mod navigation;
+mod navigation_target;
+mod notification_center;
 mod notifications;
 #[cfg(feature = "native-calls")]
 mod outgoing_ring;
@@ -896,6 +898,7 @@ fn apply_room_sort(ui: &AppWindow) {
 
 fn apply_notification_settings(ui: &AppWindow, config: &Config) {
     ui.set_notifications_enabled(config.notifications.enabled);
+    notification_center::apply_config(ui, config);
     ui.set_notification_sounds(config.notifications.sounds);
     ui.set_notification_show_preview(config.notifications.show_message_preview);
     ui.set_notification_highlight_words(ModelRc::new(VecModel::from(
@@ -1910,6 +1913,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui.as_weak(),
         runtime.handle(),
     );
+    let notification_controls = notification_center::register(
+        &ui,
+        live.clone(),
+        notifications.clone(),
+        store.clone(),
+        runtime.handle(),
+    );
 
     let watch = store.watch_with_theme(Duration::from_millis(700));
     let weak = ui.as_weak();
@@ -2362,6 +2372,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let switch_state = state.clone();
     let switch_live = live.clone();
     let switch_access = account_access.clone();
+    let switch_activator = notification_controls.activator.clone();
     #[cfg(feature = "native-calls")]
     let switch_calls = calls.clone();
     ui.on_switch_account(move |index| {
@@ -2370,6 +2381,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.invoke_close_image_preview();
         }
         if switch_live.is_live.load(Ordering::Acquire) {
+            // Choosing an account ends a waiting notification target unless
+            // it is that target's own account.
+            let chosen = weak.upgrade().and_then(|window| {
+                window
+                    .get_account_options()
+                    .iter()
+                    .find(|account| account.index == index)
+                    .map(|account| account.local_id.to_string())
+            });
+            switch_activator.user_navigated(chosen.as_deref());
             if let Some(window) = weak.upgrade()
                 && security::block_account_change(&window, &switch_live.security_gate)
             {
@@ -2405,12 +2426,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let room_state = state.clone();
     let room_live = live.clone();
     let room_handle = runtime.handle().clone();
+    let room_activator = notification_controls.activator.clone();
     ui.on_open_room(move |room_id| {
         if let Some(ui) = weak.upgrade() {
             ui.invoke_cancel_room_settings();
             ui.invoke_close_image_preview();
         }
         if room_live.is_live.load(Ordering::Acquire) {
+            room_activator.user_navigated(None);
             let Some(window) = weak.upgrade() else {
                 return;
             };
@@ -3397,10 +3420,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     let space_live = live.clone();
     let space_handle = runtime.handle().clone();
+    let space_activator = notification_controls.activator.clone();
     ui.on_select_space(move |space_id| {
         if !space_live.is_live.load(Ordering::Acquire) {
             return;
         }
+        space_activator.user_navigated(None);
         let Some(window) = weak.upgrade() else {
             return;
         };

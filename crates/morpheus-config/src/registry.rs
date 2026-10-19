@@ -794,6 +794,12 @@ pub const FIELDS: &[FieldSpec] = &[
         "Decrypted text in desktop notifications.",
     ),
     field(
+        "notifications.show_room_and_sender",
+        Bool,
+        "true",
+        "Room names and senders in desktop notifications; off names only the account.",
+    ),
+    field(
         "notifications.highlight_words",
         FieldKind::TextList,
         "[]",
@@ -1222,6 +1228,30 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
         "Words and phrases that mark a notification as a highlight.",
         &["keywords", "mentions", "highlight", "alert words"],
     ),
+    target(
+        "notifications.identity",
+        "Notifications",
+        "Settings › Notifications",
+        "Room and sender in notifications",
+        "Show or hide room names and senders in desktop notifications.",
+        &["privacy", "lock screen", "sender", "room name", "hide"],
+    ),
+    live(target(
+        "notifications.defaults",
+        "Notifications",
+        "Settings › Notifications › Defaults",
+        "Default notification level",
+        "All messages, or mentions and keywords, for rooms and direct messages.",
+        &["default", "direct messages", "dm", "group", "all messages"],
+    )),
+    live(target(
+        "notifications.rooms",
+        "Notifications",
+        "Settings › Notifications › Rooms",
+        "Room notification rules",
+        "Search rooms and choose all messages, mentions and keywords, or mute.",
+        &["mute", "mentions", "keywords", "per room", "push rules", "room notifications"],
+    )),
     accounts(
         target(
             "accounts.manage",

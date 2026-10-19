@@ -895,6 +895,9 @@ pub struct Notifications {
     pub enabled: bool,
     pub sounds: bool,
     pub show_message_preview: bool,
+    /// Room names and senders in desktop banners. Off, a banner names only
+    /// the account and never previews message text.
+    pub show_room_and_sender: bool,
     pub highlight_words: Vec<String>,
 }
 
@@ -904,6 +907,7 @@ impl Default for Notifications {
             enabled: true,
             sounds: true,
             show_message_preview: false,
+            show_room_and_sender: true,
             highlight_words: Vec::new(),
         }
     }

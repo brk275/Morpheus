@@ -1,0 +1,613 @@
+// Notification privacy, Matrix default levels and per-room rules for the
+// visible account. Rust (notification_center::rules) owns every value in
+// NotificationRulesState; this file only presents it and reports choices.
+
+// One joined room's rule. `room-id` routes a choice and is never shown;
+// `name` is sanitized in Rust.
+export struct NotificationRoomItem {
+    room-id: string,
+    name: string,
+    // 0 follows the account default, 1 all messages, 2 mentions and
+    // keywords, 3 muted.
+    mode: int,
+    // The level that applies now: 1, 2 or 3.
+    effective: int,
+    direct: bool,
+    // A change for this room is waiting for the homeserver.
+    pending: bool,
+}
+
+// Room rules and defaults are the account's push rules on its homeserver;
+// they apply on every device of the account.
+export global NotificationRulesState {
+    in-out property <bool> show-room-and-sender: true;
+    // At most 100 rooms matching the search, sorted like the room list.
+    in-out property <[NotificationRoomItem]> rooms;
+    // Rooms matching the search, including ones past the listed bound.
+    in-out property <int> matching: 0;
+    // Joined rooms of the account.
+    in-out property <int> total: 0;
+    in-out property <bool> loading: false;
+    in-out property <string> error;
+    in-out property <string> notice;
+    // 0 unknown, 1 all messages, 2 mentions and keywords.
+    in-out property <int> default-group: 0;
+    in-out property <int> default-direct: 0;
+    // Encrypted and unencrypted rooms of this kind have different defaults;
+    // the encrypted one is shown and a choice sets both.
+    in-out property <bool> default-group-mixed: false;
+    in-out property <bool> default-direct-mixed: false;
+    in-out property <bool> defaults-busy: false;
+    // Load the visible account's rules again.
+    callback refresh();
+    // The search text changed.
+    callback search(string);
+    // Room ID and level: 0 default, 1 all, 2 mentions and keywords, 3 mute.
+    callback choose-room-mode(string, int);
+    // Two-person rooms (true) or group rooms (false), level 1 or 2.
+    callback choose-default(bool, int);
+    callback set-show-room-and-sender(bool);
+}
+
+// The window's resolved theme roles; optional StyleTokens roles are resolved
+// by the window before they reach this file.
+export struct NotificationPalette {
+    ink: color,
+    muted: color,
+    panel: color,
+    elevated: color,
+    hover: color,
+    accent: color,
+    divider: color,
+    error: color,
+    selection: color,
+    // Used only when the theme defines selection ink.
+    selection-ink: color,
+    has-selection-ink: bool,
+    focus: color,
+}
+
+// A focusable action with the window's keyboard path: Tab reaches it,
+// Return or Space activates it, a click focuses it first.
+component RuleAction inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <bool> checkable: false;
+    in property <bool> checked: false;
+    in property <color> focus-color;
+    out property <bool> has-hover: hit.has-hover;
+    out property <bool> has-focus: keyboard-focus.has-focus;
+    callback activated();
+    // Focus arrived, at this absolute y; the page scrolls it into view.
+    callback focused-at(length);
+    forward-focus: keyboard-focus;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-checkable: root.checkable;
+    accessible-checked: root.checked;
+    accessible-action-default => {
+        if root.enabled {
+            root.activated();
+        }
+    }
+    @children
+    keyboard-focus := FocusScope {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        focus-on-click: true;
+        enabled: root.enabled;
+        focus-gained(reason) => {
+            root.focused-at(root.absolute-position.y);
+        }
+        key-pressed(event) => {
+            if event.text == Key.Space || event.text == Key.Return {
+                if root.enabled {
+                    root.activated();
+                }
+                accept
+            } else {
+                reject
+            }
+        }
+    }
+    hit := TouchArea {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => {
+            keyboard-focus.focus();
+            root.activated();
+        }
+    }
+    if keyboard-focus.has-focus: Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        border-radius: root.border-radius;
+        border-width: 2px;
+        border-color: root.focus-color;
+        background: transparent;
+    }
+}
+
+// One choice of a segmented level control.
+component RuleOption inherits RuleAction {
+    in property <string> text;
+    in property <bool> selected;
+    in property <NotificationPalette> palette;
+    in property <float> text-scale: 1;
+    checkable: true;
+    checked: root.selected;
+    focus-color: root.palette.focus;
+    min-width: option-layout.min-width;
+    preferred-width: option-layout.preferred-width;
+    horizontal-stretch: 0;
+    min-height: max(30px, 22px * root.text-scale);
+    border-radius: 7px;
+    border-width: 1px;
+    border-color: root.selected ? root.palette.accent : root.palette.divider;
+    background: root.selected ? root.palette.selection : (root.enabled && root.has-hover ? root.palette.hover : root.palette.panel);
+    option-layout := HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 9px;
+        Text {
+            text: root.text;
+            color: root.selected && root.palette.has-selection-ink ? root.palette.selection-ink : (root.enabled ? root.palette.ink : root.palette.muted);
+            font-size: 11px * root.text-scale;
+            font-weight: root.selected ? 700 : 500;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// The default level of group rooms or of two-person rooms.
+component DefaultLevelRow inherits Rectangle {
+    in property <NotificationPalette> palette;
+    in property <float> text-scale: 1;
+    in property <length> radius: 10px;
+    in property <bool> direct;
+    // 0 unknown, 1 all messages, 2 mentions and keywords.
+    in property <int> level;
+    in property <bool> mixed;
+    in property <bool> choosable;
+    out property <bool> first-focused: all-option.has-focus;
+    callback choose(int);
+    callback focused-at(length);
+    public function focus-first() {
+        all-option.focus();
+    }
+
+    property <string> kind-name: root.direct ? "direct messages" : "rooms";
+    min-height: max(56px, 40px * root.text-scale);
+    border-radius: root.radius;
+    background: root.palette.elevated;
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 8px;
+        padding-top: 8px;
+        padding-bottom: 8px;
+        spacing: 8px;
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            spacing: 2px;
+            Text {
+                text: root.direct ? "Direct messages" : "Rooms";
+                color: root.palette.ink;
+                font-size: 12px * root.text-scale;
+                font-weight: 700;
+            }
+            Text {
+                text: (root.direct ? "Rooms with exactly two members" : "Rooms with more members") + (root.mixed ? " · unencrypted rooms differ" : "");
+                color: root.palette.muted;
+                font-size: 10px * root.text-scale;
+                wrap: word-wrap;
+            }
+        }
+        HorizontalLayout {
+            alignment: end;
+            spacing: 4px;
+            all-option := RuleOption {
+                palette: root.palette;
+                text-scale: root.text-scale;
+                text: "All";
+                label: "All messages by default in " + root.kind-name;
+                selected: root.level == 1;
+                enabled: root.choosable;
+                focused-at(offset) => {
+                    root.focused-at(offset);
+                }
+                activated => {
+                    root.choose(1);
+                }
+            }
+            RuleOption {
+                palette: root.palette;
+                text-scale: root.text-scale;
+                text: "Mentions";
+                label: "Only mentions and keywords by default in " + root.kind-name;
+                selected: root.level == 2;
+                enabled: root.choosable;
+                focused-at(offset) => {
+                    root.focused-at(offset);
+                }
+                activated => {
+                    root.choose(2);
+                }
+            }
+        }
+    }
+}
+
+// One room's rule: follow the default, all messages, mentions and
+// keywords, or mute.
+component RoomRuleRow inherits Rectangle {
+    in property <NotificationPalette> palette;
+    in property <float> text-scale: 1;
+    in property <length> radius: 10px;
+    in property <NotificationRoomItem> room;
+    in property <bool> choosable;
+    callback choose(int);
+    callback focused-at(length);
+
+    pure function level-name(level: int) -> string {
+        if level == 1 {
+            return "All messages";
+        }
+        if level == 2 {
+            return "Mentions and keywords";
+        }
+        if level == 3 {
+            return "Muted";
+        }
+        return "Not loaded";
+    }
+    pure function detail() -> string {
+        if root.room.pending {
+            return "Saving…";
+        }
+        return (root.room.mode == 0 ? "Default · " : "This room · ") + root.level-name(root.room.effective) + (root.room.direct ? " · Direct message" : "");
+    }
+
+    min-height: max(56px, 40px * root.text-scale);
+    border-radius: root.radius;
+    background: root.palette.elevated;
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 8px;
+        padding-top: 8px;
+        padding-bottom: 8px;
+        spacing: 8px;
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            spacing: 2px;
+            Text {
+                text: root.room.name;
+                color: root.palette.ink;
+                font-size: 12px * root.text-scale;
+                font-weight: 700;
+                overflow: elide;
+            }
+            Text {
+                text: root.detail();
+                color: root.palette.muted;
+                font-size: 10px * root.text-scale;
+                overflow: elide;
+            }
+        }
+        HorizontalLayout {
+            alignment: end;
+            spacing: 4px;
+            RuleOption {
+                palette: root.palette;
+                text-scale: root.text-scale;
+                text: "Default";
+                label: "Use the default level in " + root.room.name;
+                selected: root.room.mode == 0;
+                enabled: root.choosable;
+                focused-at(offset) => {
+                    root.focused-at(offset);
+                }
+                activated => {
+                    root.choose(0);
+                }
+            }
+            RuleOption {
+                palette: root.palette;
+                text-scale: root.text-scale;
+                text: "All";
+                label: "All messages in " + root.room.name;
+                selected: root.room.mode == 1;
+                enabled: root.choosable;
+                focused-at(offset) => {
+                    root.focused-at(offset);
+                }
+                activated => {
+                    root.choose(1);
+                }
+            }
+            RuleOption {
+                palette: root.palette;
+                text-scale: root.text-scale;
+                text: "Mentions";
+                label: "Only mentions and keywords in " + root.room.name;
+                selected: root.room.mode == 2;
+                enabled: root.choosable;
+                focused-at(offset) => {
+                    root.focused-at(offset);
+                }
+                activated => {
+                    root.choose(2);
+                }
+            }
+            RuleOption {
+                palette: root.palette;
+                text-scale: root.text-scale;
+                text: "Mute";
+                label: "Mute " + root.room.name;
+                selected: root.room.mode == 3;
+                enabled: root.choosable;
+                focused-at(offset) => {
+                    root.focused-at(offset);
+                }
+                activated => {
+                    root.choose(3);
+                }
+            }
+        }
+    }
+}
+
+// The Notifications section's privacy switch, default levels and searchable
+// room rules. The window reveals a control by raising its request counter;
+// the control then reports its absolute position and its registry ID.
+export component NotificationRules inherits VerticalLayout {
+    in property <NotificationPalette> palette;
+    in property <float> text-scale: 1;
+    in property <length> radius: 10px;
+    // Signed in to a live account.
+    in property <bool> live;
+    // The visible account; a change reloads its rules.
+    in property <string> account-key;
+    in property <int> identity-reveal;
+    in property <int> defaults-reveal;
+    in property <int> rooms-reveal;
+    // Scroll so a control at this absolute y is visible.
+    callback reveal(length);
+    // A revealed control took focus.
+    callback revealed(string);
+
+    property <bool> rules-ready: root.live && !NotificationRulesState.loading;
+
+    pure function status() -> string {
+        if !root.live {
+            return "";
+        }
+        if NotificationRulesState.loading {
+            return "Loading rules…";
+        }
+        if NotificationRulesState.error != "" {
+            return NotificationRulesState.error;
+        }
+        if NotificationRulesState.notice != "" {
+            return NotificationRulesState.notice;
+        }
+        if NotificationRulesState.total == 0 {
+            return "No joined rooms";
+        }
+        if NotificationRulesState.matching == 0 {
+            return "No rooms match";
+        }
+        if NotificationRulesState.matching > NotificationRulesState.rooms.length {
+            return "Showing " + NotificationRulesState.rooms.length + " of " + NotificationRulesState.matching + " matching rooms; refine the search";
+        }
+        return NotificationRulesState.matching + " of " + NotificationRulesState.total + " rooms";
+    }
+
+    spacing: 10px;
+
+    init => {
+        NotificationRulesState.refresh();
+    }
+    changed account-key => {
+        NotificationRulesState.refresh();
+    }
+    changed live => {
+        NotificationRulesState.refresh();
+    }
+    changed identity-reveal => {
+        if root.identity-reveal > 0 {
+            root.reveal(identity.absolute-position.y);
+            identity.focus();
+            if identity.has-focus {
+                root.revealed("notifications.identity");
+            }
+        }
+    }
+    changed defaults-reveal => {
+        if root.defaults-reveal > 0 {
+            root.reveal(group-defaults.absolute-position.y);
+            group-defaults.focus-first();
+            if group-defaults.first-focused {
+                root.revealed("notifications.defaults");
+            }
+        }
+    }
+    changed rooms-reveal => {
+        if root.rooms-reveal > 0 {
+            root.reveal(search-input.absolute-position.y);
+            search-input.focus();
+            if search-input.has-focus {
+                root.revealed("notifications.rooms");
+            }
+        }
+    }
+
+    identity := RuleAction {
+        height: max(68px, 50px * root.text-scale);
+        border-radius: root.radius;
+        background: root.palette.elevated;
+        focus-color: root.palette.focus;
+        label: "Show room and sender names in desktop notifications";
+        checkable: true;
+        checked: NotificationRulesState.show-room-and-sender;
+        focused-at(offset) => {
+            root.reveal(offset);
+        }
+        activated => {
+            NotificationRulesState.set-show-room-and-sender(!NotificationRulesState.show-room-and-sender);
+        }
+        HorizontalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            spacing: 12px;
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 1;
+                spacing: 3px;
+                Text {
+                    text: "Room and sender names";
+                    color: root.palette.ink;
+                    font-size: 13px * root.text-scale;
+                    font-weight: 700;
+                }
+                Text {
+                    text: NotificationRulesState.show-room-and-sender ? "Shown with the account" : "Hidden; banners name only the account and never preview text";
+                    color: root.palette.muted;
+                    font-size: 11px * root.text-scale;
+                    wrap: word-wrap;
+                }
+            }
+            Text {
+                text: NotificationRulesState.show-room-and-sender ? "✓" : "○";
+                color: root.palette.accent;
+                font-size: 20px * root.text-scale;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    Text {
+        text: "Default level";
+        color: root.palette.ink;
+        font-size: 13px * root.text-scale;
+        font-weight: 700;
+    }
+    Text {
+        text: root.live ? "Matrix rules on your homeserver; they apply on all devices of this account. Mentions and keywords notify unless a room is muted." : "Sign in to choose notification levels for rooms.";
+        color: root.palette.muted;
+        font-size: 11px * root.text-scale;
+        wrap: word-wrap;
+    }
+    group-defaults := DefaultLevelRow {
+        palette: root.palette;
+        text-scale: root.text-scale;
+        radius: root.radius;
+        direct: false;
+        level: NotificationRulesState.default-group;
+        mixed: NotificationRulesState.default-group-mixed;
+        choosable: root.rules-ready && !NotificationRulesState.defaults-busy;
+        focused-at(offset) => {
+            root.reveal(offset);
+        }
+        choose(choice) => {
+            NotificationRulesState.choose-default(false, choice);
+        }
+    }
+    DefaultLevelRow {
+        palette: root.palette;
+        text-scale: root.text-scale;
+        radius: root.radius;
+        direct: true;
+        level: NotificationRulesState.default-direct;
+        mixed: NotificationRulesState.default-direct-mixed;
+        choosable: root.rules-ready && !NotificationRulesState.defaults-busy;
+        focused-at(offset) => {
+            root.reveal(offset);
+        }
+        choose(choice) => {
+            NotificationRulesState.choose-default(true, choice);
+        }
+    }
+
+    Text {
+        text: "Rooms";
+        color: root.palette.ink;
+        font-size: 13px * root.text-scale;
+        font-weight: 700;
+    }
+    Rectangle {
+        height: max(38px, 26px * root.text-scale);
+        border-radius: 8px;
+        background: root.palette.panel;
+        border-width: 1px;
+        border-color: search-input.has-focus ? root.palette.accent : root.palette.divider;
+        search-input := TextInput {
+            x: 10px;
+            width: parent.width - 20px;
+            height: parent.height;
+            vertical-alignment: center;
+            single-line: true;
+            enabled: root.live;
+            color: root.palette.ink;
+            font-size: 12px * root.text-scale;
+            accessible-label: "Search rooms for notification rules";
+            changed has-focus => {
+                if self.has-focus {
+                    root.reveal(self.absolute-position.y);
+                }
+            }
+            edited => {
+                NotificationRulesState.search(self.text);
+            }
+            key-pressed(event) => {
+                if event.text == Key.Escape && self.text != "" {
+                    self.text = "";
+                    NotificationRulesState.search("");
+                    accept
+                } else {
+                    reject
+                }
+            }
+        }
+        if search-input.text == "": Text {
+            x: 10px;
+            width: parent.width - 20px;
+            height: parent.height;
+            vertical-alignment: center;
+            text: "Search rooms";
+            color: root.palette.muted;
+            font-size: 12px * root.text-scale;
+            accessible-role: none;
+        }
+    }
+    Text {
+        text: root.status();
+        color: NotificationRulesState.error != "" ? root.palette.error : root.palette.muted;
+        font-size: 11px * root.text-scale;
+        wrap: word-wrap;
+        accessible-live-region: polite;
+    }
+    for entry in NotificationRulesState.rooms: RoomRuleRow {
+        palette: root.palette;
+        text-scale: root.text-scale;
+        radius: root.radius;
+        room: entry;
+        choosable: root.rules-ready && !entry.pending;
+        focused-at(offset) => {
+            root.reveal(offset);
+        }
+        choose(choice) => {
+            NotificationRulesState.choose-room-mode(entry.room-id, choice);
+        }
+    }
+}

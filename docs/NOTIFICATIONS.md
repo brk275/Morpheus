@@ -26,6 +26,7 @@ recalled if the account or preview setting changes at that instant.
 enabled = true
 sounds = true
 show_message_preview = false
+show_room_and_sender = true
 highlight_words = ["release", "urgent"]
 
 [account_overrides."<local account ID>"]
@@ -35,10 +36,75 @@ notifications_enabled = false
 Message previews are off by default. With previews off, a banner contains the
 room, account, sender, and a generic “New message” label. With previews on, it
 may include decrypted message text; unreadable encrypted events remain generic.
+With `show_room_and_sender = false` (Settings › Notifications › Room and
+sender names), a banner names only the account and says “New message” or “New
+invitation”; it never previews text, whatever `show_message_preview` says.
 Local highlight words mark an SDK-approved notification as a highlight; they
 do not override a muted room. Sounds play only when both the local switch and
 the Matrix push action request a sound. The operating system's notification and
 Focus settings still control presentation.
+
+## Room rules and default levels
+
+Settings › Notifications lists the visible account's joined rooms (Spaces
+excluded), searchable by name, with each room's level: follow the account
+default, all messages, mentions and keywords, or mute. The account defaults for
+group rooms and for rooms with exactly two members are either all messages or
+mentions and keywords; Matrix keeps separate encrypted and unencrypted default
+rules, and a choice here sets both (the list notes when they differ). These are
+the account's Matrix push rules on its homeserver, written through the SDK's
+notification-settings API, so they apply on every device of the account and are
+what the SDK evaluates before an event reaches Morpheus. A change is shown as
+saved only after the homeserver accepts it, and is applied to local delivery at
+once (for two minutes, until sync returns the updated rules). The list shows at
+most 100 matching rooms at a time and reads at most 2,000 rooms. Requests and
+results are bound to the account selection that made them; a switch discards
+their results. Errors use fixed wording.
+
+## Read state and withdrawal
+
+While a room is on screen (the window is shown and not minimized, the
+conversation page is open and the room is selected), Morpheus marks its live
+timeline, and an open thread's, read with a private read receipt after each sync
+batch and when it comes into view. Unread and mention counts therefore clear in
+Morpheus and on the account's other devices, while other members see no read
+marker. The scroll position is not considered.
+
+A shown banner is remembered only as an opaque token with its account, room,
+event and thread IDs, at most 32 of them and for at most 24 hours; no message
+text is kept and nothing is written to disk. A newer message in the same room
+replaces that room's banner, and banners of a room that was read here or
+elsewhere are withdrawn, where the platform allows: the Linux desktop
+notification service supports both through `CloseNotification`; the pinned
+macOS and Windows backends have no withdrawal API, so their banners stay until
+the user or the OS dismisses them. Quitting withdraws what it can. Removing or
+signing out an account withdraws and forgets its banners.
+
+## Opening a banner
+
+Clicking a banner opens its exact account, room and, for a thread reply, the
+thread panel. A banner in the visible account opens directly. For another saved
+account, or while no account is open, the click goes through the same switch as
+the account menu or Manage accounts: an unfinished security operation still
+blocks it, an active call still asks to be left first, and a protected account
+still asks for the local app password. The target then waits as one request and
+opens only if that exact account becomes active within two minutes; a newer
+click, a switch to any other account, choosing a room or Space, or a removed
+account ends it, so an A → B → A sequence never navigates for the earlier
+request. A banner resolves once; a dismissed, replaced, expired or unknown banner
+opens nothing, and an old banner never brings back a removed account or a reused
+local ID for a different Matrix user. While a reply or edit is being written in
+another room, the click is refused with a notice instead of discarding it. Up to
+eight banners listen for clicks at a time; beyond that a banner is shown without
+click handling. On macOS the click also brings Morpheus forward; on Linux and
+Windows a minimized window is restored, but raising it is up to the desktop.
+Opening an older event at its exact position is left to the message-search
+focused view; a banner's event is normally the newest message, shown at the
+bottom of the opened room.
+
+These behaviors were written against the pinned SDK and `notify-rust` sources
+and have not been run. Click activation, withdrawal, private receipts against a
+real homeserver, and push-rule changes on each platform remain to be accepted.
 
 [Incoming-call sounds](INCOMING_CALLS.md) use a separate native speaker path
 and the same local enabled/sounds preferences. They do not yet integrate with

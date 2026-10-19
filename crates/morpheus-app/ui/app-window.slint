@@ -1,4 +1,7 @@
 import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView, Slider, SpinBox } from "std-widgets.slint";
+import { NotificationRules } from "notification-settings.slint";
+// Rust drives the notification rules through this global.
+export { NotificationRoomItem, NotificationRulesState } from "notification-settings.slint";
 
 // Optional overrides retain each control's existing color when absent.
 export struct ColorRole {
@@ -5058,6 +5061,31 @@ export component AppWindow inherits Window {
                                     activated => { root.remove-highlight-word(word); }
                                 }
                             }
+                        }
+                        NotificationRules {
+                            palette: {
+                                ink: root.ink,
+                                muted: root.muted,
+                                panel: root.panel,
+                                elevated: root.elevated,
+                                hover: root.hover,
+                                accent: root.accent,
+                                divider: root.divider,
+                                error: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e47483,
+                                selection: StyleTokens.roles.selection.present ? StyleTokens.roles.selection.color : root.hover,
+                                selection-ink: StyleTokens.roles.selection-ink.color,
+                                has-selection-ink: StyleTokens.roles.selection-ink.present,
+                                focus: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent,
+                            };
+                            text-scale: root.text-scale;
+                            radius: StyleTokens.radius;
+                            live: root.live-session;
+                            account-key: root.active-account-local-id;
+                            identity-reveal: root.reveal-request("notifications.identity");
+                            defaults-reveal: root.reveal-request("notifications.defaults");
+                            rooms-reveal: root.reveal-request("notifications.rooms");
+                            reveal(offset) => { settings-scroll.reveal(offset - settings-content.absolute-position.y); }
+                            revealed(id) => { root.settings-revealed-id = id; }
                         }
                         Rectangle { height: 1px; background: root.divider; }
                         Text { text: "Accounts"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }

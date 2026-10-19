@@ -52,9 +52,14 @@ pub use room_settings::{
     RoomSettingsCancellation, RoomSettingsError, RoomSettingsPermissions, RoomSettingsSession,
     RoomSettingsSnapshot,
 };
+mod notification_rules;
 mod rich_text;
 pub use account_selection::AccountSelection;
 pub use admin::RoomMemberInfo;
+pub use notification_rules::{
+    MAX_NOTIFICATION_ROOMS, NotificationDefaults, NotificationMode, RoomNotificationRule,
+    RoomUnreadCounts,
+};
 
 use std::{
     collections::{HashMap, HashSet},
