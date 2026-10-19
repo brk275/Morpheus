@@ -1228,6 +1228,14 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
         "Words and phrases that mark a notification as a highlight.",
         &["keywords", "mentions", "highlight", "alert words"],
     ),
+    live(target(
+        "notifications.account",
+        "Notifications",
+        "Settings › Notifications",
+        "Notifications for this account",
+        "Turn desktop notifications and call alerts off for the active account only.",
+        &["account", "silence", "mute account", "per account", "work account"],
+    )),
     target(
         "notifications.identity",
         "Notifications",

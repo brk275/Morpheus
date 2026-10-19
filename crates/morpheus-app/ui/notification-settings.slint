@@ -21,6 +21,8 @@ export struct NotificationRoomItem {
 // they apply on every device of the account.
 export global NotificationRulesState {
     in-out property <bool> show-room-and-sender: true;
+    // The visible account's own switch; off silences only this account.
+    in-out property <bool> account-enabled: true;
     // At most 100 rooms matching the search, sorted like the room list.
     in-out property <[NotificationRoomItem]> rooms;
     // Rooms matching the search, including ones past the listed bound.
@@ -47,6 +49,7 @@ export global NotificationRulesState {
     // Two-person rooms (true) or group rooms (false), level 1 or 2.
     callback choose-default(bool, int);
     callback set-show-room-and-sender(bool);
+    callback set-account-enabled(bool);
 }
 
 // The window's resolved theme roles; optional StyleTokens roles are resolved
@@ -378,6 +381,10 @@ export component NotificationRules inherits VerticalLayout {
     in property <bool> live;
     // The visible account; a change reloads its rules.
     in property <string> account-key;
+    in property <string> account-handle;
+    // Desktop notifications are on for all accounts.
+    in property <bool> all-enabled: true;
+    in property <int> account-reveal;
     in property <int> identity-reveal;
     in property <int> defaults-reveal;
     in property <int> rooms-reveal;
@@ -424,6 +431,15 @@ export component NotificationRules inherits VerticalLayout {
     changed live => {
         NotificationRulesState.refresh();
     }
+    changed account-reveal => {
+        if root.account-reveal > 0 {
+            root.reveal(account-switch.absolute-position.y);
+            account-switch.focus();
+            if account-switch.has-focus {
+                root.revealed("notifications.account");
+            }
+        }
+    }
     changed identity-reveal => {
         if root.identity-reveal > 0 {
             root.reveal(identity.absolute-position.y);
@@ -448,6 +464,51 @@ export component NotificationRules inherits VerticalLayout {
             search-input.focus();
             if search-input.has-focus {
                 root.revealed("notifications.rooms");
+            }
+        }
+    }
+
+    account-switch := RuleAction {
+        height: max(68px, 50px * root.text-scale);
+        border-radius: root.radius;
+        background: root.palette.elevated;
+        focus-color: root.palette.focus;
+        enabled: root.live;
+        label: "Desktop notifications for this account, " + root.account-handle;
+        checkable: true;
+        checked: root.live && NotificationRulesState.account-enabled;
+        focused-at(offset) => {
+            root.reveal(offset);
+        }
+        activated => {
+            NotificationRulesState.set-account-enabled(!NotificationRulesState.account-enabled);
+        }
+        HorizontalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            spacing: 12px;
+            VerticalLayout {
+                alignment: center;
+                horizontal-stretch: 1;
+                spacing: 3px;
+                Text {
+                    text: "This account";
+                    color: root.palette.ink;
+                    font-size: 13px * root.text-scale;
+                    font-weight: 700;
+                }
+                Text {
+                    text: !root.live ? "Sign in to choose notifications for an account" : (!NotificationRulesState.account-enabled ? root.account-handle + " · Off; other accounts are unaffected" : (root.all-enabled ? root.account-handle + " · On" : root.account-handle + " · On, but desktop notifications are off for all accounts"));
+                    color: root.palette.muted;
+                    font-size: 11px * root.text-scale;
+                    wrap: word-wrap;
+                }
+            }
+            Text {
+                text: root.live && NotificationRulesState.account-enabled ? "✓" : "○";
+                color: root.palette.accent;
+                font-size: 20px * root.text-scale;
+                vertical-alignment: center;
             }
         }
     }

@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard, atomic::Ordering};
 
-use morpheus_config::{Config, ConfigStore};
+use morpheus_config::{AccountOverrides, Config, ConfigStore};
 use morpheus_matrix::{
     AccountSelection, MatrixCoreError, NotificationDefaults, NotificationMode,
     RoomNotificationRule,
@@ -92,6 +92,7 @@ pub(super) struct Rules {
     notifications: Arc<DesktopNotifications>,
     ui: Weak<AppWindow>,
     runtime: Handle,
+    store: ConfigStore,
     state: Mutex<State>,
 }
 
@@ -108,6 +109,7 @@ impl Rules {
             notifications,
             ui: ui.as_weak(),
             runtime,
+            store: store.clone(),
             state: Mutex::new(State::default()),
         });
         let global = ui.global::<NotificationRulesState>();
@@ -134,7 +136,41 @@ impl Rules {
                 |config| config.notifications.show_room_and_sender = show,
             );
         });
+        let account = rules.clone();
+        global.on_set_account_enabled(move |enabled| account.set_account_enabled(enabled));
         rules
+    }
+
+    /// Turn desktop notifications (and incoming-call alerts) on or off for the
+    /// visible account only, as `account_overrides.<account>.notifications_enabled`.
+    fn set_account_enabled(&self, enabled: bool) {
+        let Some(ui) = self.ui.upgrade() else {
+            return;
+        };
+        let account_id = ui.get_active_account_local_id().to_string();
+        if !ui.get_live_session() || account_id.is_empty() {
+            return;
+        }
+        crate::save_notification_config_change(
+            &ui,
+            &self.store,
+            &self.notifications,
+            &self.live.voice_spaces,
+            |config| {
+                let unused = {
+                    let overrides = config
+                        .account_overrides
+                        .entry(account_id.clone())
+                        .or_default();
+                    // On follows the global switch; only off is stored.
+                    overrides.notifications_enabled = (!enabled).then_some(false);
+                    *overrides == AccountOverrides::default()
+                };
+                if unused {
+                    config.account_overrides.remove(&account_id);
+                }
+            },
+        );
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -177,6 +213,10 @@ impl Rules {
             publish(&global, &state);
             state.operation
         };
+        // The account's own switch follows the file for the newly shown account.
+        if let Ok(config) = self.store.load() {
+            apply_account_switch(&global, &config, &account_id);
+        }
         global.set_error("".into());
         global.set_notice("".into());
         global.set_defaults_busy(false);
@@ -411,10 +451,21 @@ impl Rules {
     }
 }
 
-/// The privacy switch follows each accepted configuration.
+/// The privacy and account switches follow each accepted configuration.
 pub(super) fn apply_config(ui: &AppWindow, config: &Config) {
-    ui.global::<NotificationRulesState>()
-        .set_show_room_and_sender(config.notifications.show_room_and_sender);
+    let global = ui.global::<NotificationRulesState>();
+    global.set_show_room_and_sender(config.notifications.show_room_and_sender);
+    apply_account_switch(&global, config, ui.get_active_account_local_id().as_str());
+}
+
+fn apply_account_switch(global: &NotificationRulesState<'_>, config: &Config, account_id: &str) {
+    global.set_account_enabled(
+        config
+            .account_overrides
+            .get(account_id)
+            .and_then(|overrides| overrides.notifications_enabled)
+            .unwrap_or(true),
+    );
 }
 
 fn apply_defaults(global: &NotificationRulesState<'_>, defaults: NotificationDefaults) {

@@ -44,6 +44,11 @@ do not override a muted room. Sounds play only when both the local switch and
 the Matrix push action request a sound. The operating system's notification and
 Focus settings still control presentation.
 
+Settings › Notifications › This account turns desktop notifications and
+incoming-call alerts off for the visible account only, stored as that account's
+`notifications_enabled = false` override; turning it on again removes the
+override so the account follows the global switch.
+
 ## Room rules and default levels
 
 Settings › Notifications lists the visible account's joined rooms (Spaces

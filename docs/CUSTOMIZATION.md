@@ -324,8 +324,9 @@ presentation preference; it is not written to Matrix.
 ## Notifications
 
 The Notifications section edits desktop notifications, sounds, message previews,
-room and sender names in banners, local highlight words or phrases, the
-account's default levels and searchable per-room levels. Each highlight is trimmed, repeated
+room and sender names in banners, local highlight words or phrases, a switch
+for the visible account only, the account's default levels and searchable
+per-room levels. Each highlight is trimmed, repeated
 whitespace is collapsed, duplicates are rejected without regard to case, and
 hidden control or direction characters are rejected. The editor accepts up to 32
 highlights of at most 64 characters each. Saved changes appear in the app when
