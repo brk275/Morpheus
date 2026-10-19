@@ -1986,10 +1986,8 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
     // pointer release commits.
     let track = control_with_label(ui, "Window background opacity, percent");
     let center = track.map_to_window(track.geometry().center());
-    let near_start = slint::LogicalPosition::new(
-        center.x - track.geometry().size.width * 0.45,
-        center.y,
-    );
+    let near_start =
+        slint::LogicalPosition::new(center.x - track.geometry().size.width * 0.45, center.y);
     ui.window().dispatch_event(WindowEvent::PointerMoved {
         position: near_start,
     });
