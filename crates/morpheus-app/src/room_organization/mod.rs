@@ -136,6 +136,10 @@ struct Confirmed {
     /// earlier state is behind, even when it equals `tags` (a favourite
     /// added and removed again before sync returned either).
     earlier: Vec<RoomTags>,
+    /// Once old states were discarded, a matching snapshot can be an old
+    /// state too. Keep the bounded overlay until its normal expiry instead
+    /// of treating that ambiguous match as confirmation.
+    history_truncated: bool,
     until: Instant,
 }
 
@@ -144,6 +148,9 @@ impl Confirmed {
     /// snapshot showing an earlier state drops the states before it, which
     /// sync has passed.
     fn waits_for(&mut self, stored: RoomTags) -> bool {
+        if self.history_truncated {
+            return true;
+        }
         match self.earlier.iter().position(|earlier| *earlier == stored) {
             Some(reached) => {
                 self.earlier.drain(..reached);
@@ -345,6 +352,9 @@ impl State {
             .confirmed(room)
             .map(|previous| previous.earlier.clone())
             .unwrap_or_default();
+        let previously_truncated = self
+            .confirmed(room)
+            .is_some_and(|previous| previous.history_truncated);
         if let Some((_, shown)) = before.iter().find(|(id, _)| id == room) {
             earlier.push(*shown);
         }
@@ -356,6 +366,7 @@ impl State {
             known,
             exact,
             earlier,
+            history_truncated: previously_truncated || excess > 0,
             until: Instant::now() + CONFIRMED_LIFETIME,
         };
         // The latest snapshot may already end it.
@@ -1265,6 +1276,31 @@ mod tests {
             state.confirmed.get_mut("!b").unwrap().until = Instant::now();
         });
         remember("alice", &[joined("!b", none)]);
+        assert!(with_state(|state| state.confirmed.is_empty()));
+    }
+
+    #[test]
+    fn discarded_history_cannot_falsely_confirm_a_repeated_order() {
+        with_state(|state| *state = State::default());
+        let initial = favourite(order(0.1));
+        remember("fixture", &[joined("!history", initial)]);
+        for value in [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.1] {
+            with_state(|state| {
+                let before = [("!history".to_owned(), state.tags("!history"))];
+                let request = Request::Orders(vec![("!history".to_owned(), order(value).unwrap())]);
+                state.record("fixture", &request, "!history", &before);
+            });
+        }
+        // This is both the original snapshot and the latest accepted order.
+        // The oldest states no longer fit; neither can prove the other passed.
+        remember("fixture", &[joined("!history", initial)]);
+        with_state(|state| {
+            let overlay = state.confirmed.get_mut("!history").unwrap();
+            assert!(overlay.history_truncated);
+            assert!(overlay.earlier.len() <= MAX_EARLIER);
+            overlay.until = Instant::now();
+        });
+        remember("fixture", &[joined("!history", initial)]);
         assert!(with_state(|state| state.confirmed.is_empty()));
     }
 

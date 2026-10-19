@@ -59,10 +59,11 @@ runs at a time per account, and the organization menus wait for it. Once the
 homeserver accepts it, the room list shows the change; until sync returns the
 stored tags, for at most 30 seconds, Morpheus applies the accepted change over
 its last copy, so a following choice or move starts from it and is decided by
-what the homeserver holds. Sync reports changes in order, so an older report
-that arrives late (for example, from before a favorite was added and removed
-again) never undoes a newer change. Nothing is shown as saved before the
-homeserver accepted it.
+what the homeserver holds. Earlier snapshots cannot prematurely confirm a
+newer change that returns to the same tag state. If rapid changes exceed the
+bounded history, the accepted change stays shown until the 30-second limit
+rather than treating an ambiguous snapshot as confirmation. Nothing is shown
+as saved before the homeserver accepted it.
 
 A refusal made before anything was sent leaves the room where it was with a
 fixed message. When a change fails after a request was sent, or was saved only
@@ -82,7 +83,9 @@ still applies the change it names: it does nothing when the room already has
 that result, and on a room another client tagged both ways it removes the other
 tag. When rooms are added, removed or reordered while a menu is open, its row
 is replaced and the choice does nothing rather than act on another room. The
-room header's menu acts on the room it was opened for.
+room header's menu acts on the room and account selection it was opened for.
+It closes on account changes or detach, and each captured choice can be used
+only once.
 
 Only joined rooms can be changed. A room left or re-joined keeps whatever tags
 its account data holds on the homeserver.
