@@ -5,16 +5,18 @@
 
 use std::{
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use morpheus_matrix::{DeviceTrust, OwnDeviceInfo};
+use morpheus_matrix::{AccountManager, DeviceTrust, OwnDeviceInfo, VerificationSnapshot};
 use slint::{ComponentHandle, Model, ModelRc, VecModel, Weak};
 use tokio::runtime::Handle;
 
 use crate::{AppWindow, TrustedDeviceItem, live::LiveUi};
 
 const DAY_MS: u64 = 86_400_000;
+/// Bound for one wait on a pending request's change streams.
+const RETIRE_CHECK: Duration = Duration::from_secs(60);
 
 fn next_operation(ui: &AppWindow) -> i32 {
     let operation = ui.get_encryption_devices_operation().wrapping_add(1);
@@ -119,9 +121,33 @@ fn publish_incoming(weak: &Weak<AppWindow>, account_id: &str, flow_id: String) {
     });
 }
 
+/// Resolves once the SDK reports this request completed, expired or
+/// cancelled. Never resolves after an error: the caller's account watch
+/// owns that case, so a failing lookup cannot spin.
+async fn request_retired(
+    manager: &AccountManager,
+    account_id: &str,
+    user_id: &str,
+    flow_id: &str,
+) -> bool {
+    let mut seen = VerificationSnapshot::default();
+    loop {
+        let next = manager
+            .wait_verification_change_for(account_id, user_id, flow_id, seen, RETIRE_CHECK)
+            .await;
+        match next {
+            Ok(next) if next.finished() => return true,
+            Ok(next) => seen = next,
+            Err(_) => return std::future::pending().await,
+        }
+    }
+}
+
 /// Point to verification requests from this account's other devices
 /// anywhere in the app, not only while Settings polls. Only the newest
-/// pending flow ID is shown; reviewing still happens in the SAS panel. Each
+/// pending flow ID is shown; reviewing still happens in the SAS panel. The
+/// newest request is followed through the SDK's change streams, so one that
+/// completes, expires or is cancelled retires the notice at once. Each
 /// receiver belongs to one account's client, so resubscribe on every change.
 fn watch_incoming_requests(ui: &AppWindow, live: Arc<LiveUi>, handle: &Handle) {
     let weak = ui.as_weak();
@@ -132,13 +158,25 @@ fn watch_incoming_requests(ui: &AppWindow, live: Arc<LiveUi>, handle: &Handle) {
             let mut account_changed = false;
             let subscription = manager.subscribe_incoming_verification_requests().await;
             if let Ok((account_id, mut requests)) = subscription {
+                // A retired request is never followed again, even if a stale
+                // list still names it, so retiring cannot loop.
+                let mut retired: Option<String> = None;
                 loop {
                     let newest = requests
                         .borrow_and_update()
                         .last()
-                        .map(|request| request.flow_id.clone())
-                        .unwrap_or_default();
-                    publish_incoming(&weak, &account_id, newest);
+                        .map(|request| (request.flow_id.clone(), request.other_user_id.clone()));
+                    let flow = newest.as_ref().map(|(flow, _)| flow.clone());
+                    publish_incoming(&weak, &account_id, flow.clone().unwrap_or_default());
+                    let follow = newest.filter(|(flow, _)| retired.as_ref() != Some(flow));
+                    let retirement = async {
+                        match &follow {
+                            Some((flow, user)) => {
+                                request_retired(manager, &account_id, user, flow).await
+                            }
+                            None => std::future::pending().await,
+                        }
+                    };
                     tokio::select! {
                         changed = requests.changed() => {
                             if changed.is_err() {
@@ -151,6 +189,14 @@ fn watch_incoming_requests(ui: &AppWindow, live: Arc<LiveUi>, handle: &Handle) {
                             }
                             account_changed = true;
                             break;
+                        }
+                        _ = retirement => {
+                            retired = flow;
+                            // Prune the finished request; the list update
+                            // wakes this loop and republishes.
+                            if manager.account_selection(&account_id).is_some() {
+                                let _ = manager.pending_own_verification_requests().await;
+                            }
                         }
                     }
                 }

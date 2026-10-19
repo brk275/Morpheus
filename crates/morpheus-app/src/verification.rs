@@ -1,11 +1,14 @@
 //! Own-device SAS verification in Settings. The UI never confirms a SAS flow
 //! until the person checks the values on both devices and opts in explicitly.
 
-use std::sync::Arc;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use morpheus_matrix::{
     DeviceVerificationStatus, MatrixCoreError, SasPresentation, VerificationCancel,
-    VerificationCancelKind, VerificationInfo,
+    VerificationCancelKind, VerificationInfo, VerificationSnapshot,
 };
 use slint::ComponentHandle;
 use tokio::runtime::Handle;
@@ -18,6 +21,109 @@ const READY_TO_START: i32 = 2;
 const WAITING_FOR_VALUES: i32 = 3;
 const COMPARING: i32 = 4;
 const WAITING_FOR_COMPLETION: i32 = 5;
+/// Bound for one wait on the SDK's change streams; a quiet flow is still
+/// checked this often as a fallback.
+const FLOW_FALLBACK: Duration = Duration::from_secs(30);
+const ENDED_NOTICE: &str = "Verification ended. Check this device's status above.";
+const ACCEPTED_NOTICE: &str =
+    "Request accepted. Waiting for the requesting device to start comparison.";
+
+/// The one SDK-driven watcher of the visible flow. A new flow replaces it and
+/// every clear of the flow UI aborts it, so no late update outlives its flow.
+static FLOW_WATCHER: Mutex<Option<tokio::task::AbortHandle>> = Mutex::new(None);
+
+fn stop_flow_watcher() {
+    let previous = FLOW_WATCHER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    if let Some(previous) = previous {
+        previous.abort();
+    }
+}
+
+/// Follow one flow through the SDK's request and SAS change streams while it
+/// is shown, so progress, cancellation and expiry arrive without polling and
+/// while Settings is closed. Comparison and confirmation stay explicit.
+fn start_flow_watcher(
+    window: &AppWindow,
+    live: &Arc<LiveUi>,
+    handle: &Handle,
+    account_id: String,
+    user_id: String,
+    flow_id: String,
+) {
+    let weak = window.as_weak();
+    let watch_live = live.clone();
+    let refresh_handle = handle.clone();
+    let task = handle.spawn(async move {
+        let mut seen = VerificationSnapshot::default();
+        loop {
+            let next = watch_live
+                .manager
+                .wait_verification_change_for(
+                    &account_id,
+                    &user_id,
+                    &flow_id,
+                    seen,
+                    FLOW_FALLBACK,
+                )
+                .await;
+            // An account change ends this watcher; it also clears the flow UI.
+            let Ok(next) = next else { break };
+            seen = next;
+            let finished = next.finished();
+            let live = watch_live.clone();
+            let handle = refresh_handle.clone();
+            let account = account_id.clone();
+            let flow = flow_id.clone();
+            let _ = weak.upgrade_in_event_loop(move |window| {
+                if window.get_active_account_local_id().as_str() != account
+                    || window.get_sas_flow_id().as_str() != flow
+                {
+                    return;
+                }
+                let finished = finished.then_some(flow.as_str());
+                refresh_flow(&window, &live, &handle, finished);
+            });
+            if finished {
+                break;
+            }
+        }
+    });
+    let previous = FLOW_WATCHER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .replace(task.abort_handle());
+    if let Some(previous) = previous {
+        previous.abort();
+    }
+}
+
+/// Show a flow that this device requested or accepted and start following it.
+fn begin_flow(
+    window: &AppWindow,
+    live: &Arc<LiveUi>,
+    handle: &Handle,
+    info: VerificationInfo,
+    notice: String,
+) {
+    let account_id = window.get_active_account_local_id().to_string();
+    window.set_sas_flow_id(info.flow_id.as_str().into());
+    window.set_sas_other_user_id(info.other_user_id.as_str().into());
+    window.set_sas_request_initiator(info.we_started);
+    window.set_sas_stage(WAITING_FOR_REQUEST);
+    window.set_sas_error("".into());
+    window.set_sas_notice(notice.into());
+    start_flow_watcher(
+        window,
+        live,
+        handle,
+        account_id,
+        info.other_user_id,
+        info.flow_id,
+    );
+}
 
 fn next_operation(ui: &AppWindow) -> i32 {
     let next = ui.get_sas_operation().wrapping_add(1);
@@ -138,6 +244,7 @@ fn verified_after_pruned_completion(
 
 /// Invalidate all late callbacks before changing the visible Matrix account.
 pub(crate) fn clear_ui(ui: &AppWindow) {
+    stop_flow_watcher();
     next_operation(ui);
     ui.set_sas_stage(IDLE);
     ui.set_sas_busy(false);
@@ -184,6 +291,8 @@ pub(crate) fn request_device(
     ui.set_sas_error("".into());
     ui.set_sas_notice(format!("Sending a verification request to {device_name}…").into());
     let weak = ui.as_weak();
+    let flow_live = live.clone();
+    let flow_handle = handle.clone();
     handle.spawn(async move {
         let _transition = live.account_transition.lock().await;
         let result = live
@@ -197,14 +306,9 @@ pub(crate) fn request_device(
             window.set_sas_busy(false);
             match result {
                 Ok(info) => {
-                    window.set_sas_flow_id(info.flow_id.into());
-                    window.set_sas_other_user_id(info.other_user_id.into());
-                    window.set_sas_request_initiator(info.we_started);
-                    window.set_sas_stage(WAITING_FOR_REQUEST);
-                    window.set_sas_notice(
-                        format!("Approve the request on {device_name}, then compare the values.")
-                            .into(),
-                    );
+                    let notice =
+                        format!("Approve the request on {device_name}, then compare the values.");
+                    begin_flow(&window, &flow_live, &flow_handle, info, notice);
                 }
                 Err(_) => {
                     window.set_sas_notice("".into());
@@ -213,6 +317,161 @@ pub(crate) fn request_device(
                             .into(),
                     );
                 }
+            }
+        });
+    });
+}
+
+/// Check the visible flow's progress. The watcher passes the flow it saw
+/// finish: that check runs even while another action is pending, because a
+/// finished flow must retire at once; every other check waits for pending
+/// actions so it never overtakes an explicit comparison or confirmation.
+fn refresh_flow(window: &AppWindow, live: &Arc<LiveUi>, handle: &Handle, finished: Option<&str>) {
+    let stage = window.get_sas_stage();
+    let allowed = match finished {
+        Some(flow_id) => stage != IDLE && window.get_sas_flow_id().as_str() == flow_id,
+        None => {
+            !window.get_sas_busy()
+                && !live.security_gate.blocked()
+                && matches!(
+                    stage,
+                    WAITING_FOR_REQUEST | WAITING_FOR_VALUES | WAITING_FOR_COMPLETION
+                )
+        }
+    };
+    if !window.get_live_session() || !allowed {
+        return;
+    }
+    let retiring = finished.is_some();
+    let account_id = window.get_active_account_local_id().to_string();
+    let user_id = window.get_sas_other_user_id().to_string();
+    let flow_id = window.get_sas_flow_id().to_string();
+    if account_id.is_empty() || user_id.is_empty() || flow_id.is_empty() {
+        return;
+    }
+    let operation = next_operation(window);
+    window.set_sas_busy(true);
+    let live = live.clone();
+    let weak = window.as_weak();
+    handle.spawn(async move {
+        let _transition = live.account_transition.lock().await;
+        if !active_account_is(&live, &account_id).await {
+            return;
+        }
+        let outcome = live
+            .manager
+            .verification_outcome_for(&account_id, &user_id, &flow_id)
+            .await;
+        let cancel = outcome.as_ref().ok().and_then(|outcome| outcome.cancel);
+        let info = outcome.map(|outcome| outcome.info);
+        // Only the device that sent the request starts SAS. After the
+        // responder accepted that request, it waits for the incoming SAS
+        // start and accepts the method without confirming the values.
+        let incoming_sas = if stage == WAITING_FOR_REQUEST
+            && info
+                .as_ref()
+                .is_ok_and(|info| !info.we_started && !info.is_cancelled && !info.is_done)
+        {
+            Some(
+                live.manager
+                    .accept_sas_if_available(&user_id, &flow_id)
+                    .await,
+            )
+        } else {
+            None
+        };
+        let values = if stage == WAITING_FOR_VALUES
+            && info
+                .as_ref()
+                .is_ok_and(|info| !info.is_cancelled && !info.is_done)
+        {
+            Some(live.manager.sas_presentation(&user_id, &flow_id).await)
+        } else {
+            None
+        };
+        // The SDK can remove a finished request before this poll sees
+        // `is_done`. In that case, trust status is the durable result.
+        let device_status = if stage == WAITING_FOR_COMPLETION && request_was_pruned(&info) {
+            live.manager
+                .security_info()
+                .await
+                .ok()
+                .map(|status| status.device_verification)
+        } else {
+            None
+        };
+        let pruned_and_verified = verified_after_pruned_completion(stage, &info, device_status);
+        let _ = weak.upgrade_in_event_loop(move |window| {
+            if !same_flow(&window, &account_id, operation, &flow_id) {
+                return;
+            }
+            window.set_sas_busy(false);
+            match info {
+                Ok(info) if info.is_cancelled => {
+                    clear_ui(&window);
+                    window.set_sas_error(cancel_message(cancel).into());
+                }
+                Ok(info) if info.is_done => {
+                    clear_ui(&window);
+                    window.set_sas_notice("Device verification completed.".into());
+                    window.invoke_refresh_security();
+                    window.invoke_refresh_encryption_devices();
+                }
+                Err(_) if pruned_and_verified => {
+                    clear_ui(&window);
+                    window.set_sas_notice("This device is Verified.".into());
+                    window.invoke_refresh_security();
+                    window.invoke_refresh_encryption_devices();
+                }
+                Ok(info) if stage == WAITING_FOR_REQUEST && info.we_started && info.is_ready => {
+                    window.set_sas_stage(READY_TO_START);
+                    window
+                        .set_sas_notice("The other device accepted. Start comparison.".into());
+                    window.set_sas_error("".into());
+                }
+                Ok(info) if stage == WAITING_FOR_REQUEST && !info.we_started => {
+                    match incoming_sas {
+                        Some(Ok(true)) => {
+                            window.set_sas_stage(WAITING_FOR_VALUES);
+                            window.set_sas_notice(
+                                "Comparison started. Waiting for values on both devices.".into(),
+                            );
+                            window.set_sas_error("".into());
+                        }
+                        Some(Err(_)) => window.set_sas_error(
+                            "Could not accept comparison. Keep both devices open and retry."
+                                .into(),
+                        ),
+                        _ => {}
+                    }
+                }
+                Ok(_) if stage == WAITING_FOR_VALUES => match values {
+                    Some(Ok(Some(presentation))) => {
+                        if let Some((emoji, decimals)) = comparison_labels(presentation) {
+                            window.set_sas_emoji(emoji.into());
+                            window.set_sas_decimals(decimals.into());
+                            window.set_sas_compared(false);
+                            window.set_sas_stage(COMPARING);
+                            window.set_sas_notice("".into());
+                            window.set_sas_error("".into());
+                        }
+                    }
+                    Some(Err(_)) => window.set_sas_error(
+                        "Comparison values are not available yet. Keep both devices open.".into(),
+                    ),
+                    _ => {}
+                },
+                Err(_) if retiring => {
+                    // The watcher saw this flow end and the SDK forgot it.
+                    clear_ui(&window);
+                    window.set_sas_error(ENDED_NOTICE.into());
+                    window.invoke_refresh_security();
+                    window.invoke_refresh_encryption_devices();
+                }
+                Ok(_) => window.set_sas_error("".into()),
+                Err(_) => window.set_sas_error(
+                    "Could not check verification status. Try Check status again.".into(),
+                ),
             }
         });
     });
@@ -289,6 +548,8 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         window.set_sas_error("".into());
         let live = accept_live.clone();
         let weak = weak.clone();
+        let flow_live = accept_live.clone();
+        let flow_handle = accept_handle.clone();
         accept_handle.spawn(async move {
             let _transition = live.account_transition.lock().await;
             if !active_account_is(&live, &account_id).await {
@@ -307,16 +568,18 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
                 window.set_sas_busy(false);
                 match result {
                     Ok(()) => {
-                        window.set_sas_flow_id(flow_id.into());
-                        window.set_sas_other_user_id(user_id.into());
-                        window.set_sas_request_initiator(false);
                         window.set_sas_incoming_flow_id("".into());
                         window.set_sas_incoming_user_id("".into());
-                        window.set_sas_stage(WAITING_FOR_REQUEST);
-                        window.set_sas_notice(
-                            "Request accepted. Waiting for the requesting device to start comparison."
-                                .into(),
-                        );
+                        let info = VerificationInfo {
+                            flow_id,
+                            other_user_id: user_id,
+                            we_started: false,
+                            is_ready: true,
+                            is_done: false,
+                            is_cancelled: false,
+                        };
+                        let notice = ACCEPTED_NOTICE.to_owned();
+                        begin_flow(&window, &flow_live, &flow_handle, info, notice);
                     }
                     Err(_) => window.set_sas_error(
                         "Could not accept this request. It may have expired; refresh Settings."
@@ -351,6 +614,8 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         window.set_sas_notice("Sending a request to your other device…".into());
         let live = request_live.clone();
         let weak = weak.clone();
+        let flow_live = request_live.clone();
+        let flow_handle = request_handle.clone();
         request_handle.spawn(async move {
             let _transition = live.account_transition.lock().await;
             if !active_account_is(&live, &account_id).await {
@@ -364,13 +629,8 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
                 window.set_sas_busy(false);
                 match result {
                     Ok(info) => {
-                        window.set_sas_flow_id(info.flow_id.into());
-                        window.set_sas_other_user_id(info.other_user_id.into());
-                        window.set_sas_request_initiator(info.we_started);
-                        window.set_sas_stage(WAITING_FOR_REQUEST);
-                        window.set_sas_notice(
-                            "Approve this request on your other verified device.".into(),
-                        );
+                        let notice = "Approve this request on your other verified device.";
+                        begin_flow(&window, &flow_live, &flow_handle, info, notice.into());
                     }
                     Err(_) => {
                         window.set_sas_notice("".into());
@@ -388,147 +648,9 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
     let refresh_live = live.clone();
     let refresh_handle = handle.clone();
     ui.on_refresh_sas_verification(move || {
-        let Some(window) = weak.upgrade() else { return };
-        let stage = window.get_sas_stage();
-        if !window.get_live_session()
-            || window.get_sas_busy()
-            || refresh_live.security_gate.blocked()
-            || !matches!(
-                stage,
-                WAITING_FOR_REQUEST | WAITING_FOR_VALUES | WAITING_FOR_COMPLETION
-            )
-        {
-            return;
+        if let Some(window) = weak.upgrade() {
+            refresh_flow(&window, &refresh_live, &refresh_handle, None);
         }
-        let account_id = window.get_active_account_local_id().to_string();
-        let user_id = window.get_sas_other_user_id().to_string();
-        let flow_id = window.get_sas_flow_id().to_string();
-        if account_id.is_empty() || user_id.is_empty() || flow_id.is_empty() {
-            return;
-        }
-        let operation = next_operation(&window);
-        window.set_sas_busy(true);
-        let live = refresh_live.clone();
-        let weak = weak.clone();
-        refresh_handle.spawn(async move {
-            let _transition = live.account_transition.lock().await;
-            if !active_account_is(&live, &account_id).await {
-                return;
-            }
-            let outcome = live
-                .manager
-                .verification_outcome_for(&account_id, &user_id, &flow_id)
-                .await;
-            let cancel = outcome.as_ref().ok().and_then(|outcome| outcome.cancel);
-            let info = outcome.map(|outcome| outcome.info);
-            // Only the device that sent the request starts SAS. After the
-            // responder accepted that request, it waits for the incoming SAS
-            // start and accepts the method without confirming the values.
-            let incoming_sas = if stage == WAITING_FOR_REQUEST
-                && info
-                    .as_ref()
-                    .is_ok_and(|info| !info.we_started && !info.is_cancelled && !info.is_done)
-            {
-                Some(
-                    live.manager
-                        .accept_sas_if_available(&user_id, &flow_id)
-                        .await,
-                )
-            } else {
-                None
-            };
-            let values = if stage == WAITING_FOR_VALUES
-                && info
-                    .as_ref()
-                    .is_ok_and(|info| !info.is_cancelled && !info.is_done)
-            {
-                Some(live.manager.sas_presentation(&user_id, &flow_id).await)
-            } else {
-                None
-            };
-            // The SDK can remove a finished request before this poll sees
-            // `is_done`. In that case, trust status is the durable result.
-            let device_status = if stage == WAITING_FOR_COMPLETION && request_was_pruned(&info) {
-                live.manager
-                    .security_info()
-                    .await
-                    .ok()
-                    .map(|status| status.device_verification)
-            } else {
-                None
-            };
-            let pruned_and_verified = verified_after_pruned_completion(stage, &info, device_status);
-            let _ = weak.upgrade_in_event_loop(move |window| {
-                if !same_flow(&window, &account_id, operation, &flow_id) {
-                    return;
-                }
-                window.set_sas_busy(false);
-                match info {
-                    Ok(info) if info.is_cancelled => {
-                        clear_ui(&window);
-                        window.set_sas_error(cancel_message(cancel).into());
-                    }
-                    Ok(info) if info.is_done => {
-                        clear_ui(&window);
-                        window.set_sas_notice("Device verification completed.".into());
-                        window.invoke_refresh_security();
-                        window.invoke_refresh_encryption_devices();
-                    }
-                    Err(_) if pruned_and_verified => {
-                        clear_ui(&window);
-                        window.set_sas_notice("This device is Verified.".into());
-                        window.invoke_refresh_security();
-                        window.invoke_refresh_encryption_devices();
-                    }
-                    Ok(info)
-                        if stage == WAITING_FOR_REQUEST && info.we_started && info.is_ready =>
-                    {
-                        window.set_sas_stage(READY_TO_START);
-                        window
-                            .set_sas_notice("The other device accepted. Start comparison.".into());
-                        window.set_sas_error("".into());
-                    }
-                    Ok(info) if stage == WAITING_FOR_REQUEST && !info.we_started => {
-                        match incoming_sas {
-                            Some(Ok(true)) => {
-                                window.set_sas_stage(WAITING_FOR_VALUES);
-                                window.set_sas_notice(
-                                    "Comparison started. Waiting for values on both devices."
-                                        .into(),
-                                );
-                                window.set_sas_error("".into());
-                            }
-                            Some(Err(_)) => window.set_sas_error(
-                                "Could not accept comparison. Keep both devices open and retry."
-                                    .into(),
-                            ),
-                            _ => {}
-                        }
-                    }
-                    Ok(_) if stage == WAITING_FOR_VALUES => match values {
-                        Some(Ok(Some(presentation))) => {
-                            if let Some((emoji, decimals)) = comparison_labels(presentation) {
-                                window.set_sas_emoji(emoji.into());
-                                window.set_sas_decimals(decimals.into());
-                                window.set_sas_compared(false);
-                                window.set_sas_stage(COMPARING);
-                                window.set_sas_notice("".into());
-                                window.set_sas_error("".into());
-                            }
-                        }
-                        Some(Err(_)) => window.set_sas_error(
-                            "Comparison values are not available yet. Keep both devices open."
-                                .into(),
-                        ),
-                        _ => {}
-                    },
-                    Ok(_) => window.set_sas_error("".into()),
-                    Err(_) => window.set_sas_error(
-                        "Could not check verification status. Try Check status again.".into(),
-                    ),
-                }
-            });
-        });
     });
 
     let weak = ui.as_weak();

@@ -4,8 +4,12 @@
 //! trusts a device by itself: trust changes only through a SAS flow the user
 //! compared and confirmed on both devices.
 
+use std::time::Duration;
+
+use futures_util::{StreamExt, stream::BoxStream};
 use matrix_sdk::{
     Client,
+    encryption::verification::{SasVerification, VerificationRequest},
     ruma::{
         OwnedDeviceId,
         events::key::verification::{VerificationMethod, cancel::CancelCode},
@@ -68,6 +72,41 @@ pub struct VerificationOutcome {
     pub info: VerificationInfo,
     /// Why the flow stopped, when it was cancelled.
     pub cancel: Option<VerificationCancel>,
+}
+
+/// A comparable summary of one self-verification request and its SAS.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerificationSnapshot {
+    /// The SDK still knows this request.
+    pub found: bool,
+    pub ready: bool,
+    pub done: bool,
+    pub cancelled: bool,
+    pub sas_started: bool,
+    pub sas_presentable: bool,
+    pub sas_finished: bool,
+}
+
+impl VerificationSnapshot {
+    /// No further change can follow: completed, cancelled or forgotten.
+    pub fn finished(&self) -> bool {
+        !self.found || self.done || self.cancelled
+    }
+
+    fn of(request: Option<&VerificationRequest>, sas: Option<&SasVerification>) -> Self {
+        let Some(request) = request else {
+            return Self::default();
+        };
+        Self {
+            found: true,
+            ready: request.is_ready(),
+            done: request.is_done(),
+            cancelled: request.is_cancelled(),
+            sas_started: sas.is_some(),
+            sas_presentable: sas.is_some_and(|sas| sas.can_be_presented()),
+            sas_finished: sas.is_some_and(|sas| sas.is_done() || sas.is_cancelled()),
+        }
+    }
 }
 
 impl AccountManager {
@@ -204,10 +243,63 @@ impl AccountManager {
         Ok(VerificationOutcome { info, cancel })
     }
 
+    /// Wait until this request or its SAS differs from `seen`, at most
+    /// `limit`, using the SDK's change streams rather than polling. Returns
+    /// the latest snapshot; it equals `seen` only when the limit passed. A
+    /// default `seen` returns the current snapshot at once.
+    pub async fn wait_verification_change_for(
+        &self,
+        expected_account_id: &str,
+        user_id: &str,
+        flow_id: &str,
+        seen: VerificationSnapshot,
+        limit: Duration,
+    ) -> Result<VerificationSnapshot> {
+        let client = self.encryption_client_for(expected_account_id).await?;
+        ensure_own_user(&client, user_id)?;
+        let user_id = parse_user_id(user_id)?;
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            let encryption = client.encryption();
+            let request = encryption
+                .get_verification_request(&user_id, flow_id)
+                .await;
+            let sas = encryption
+                .get_verification(&user_id, flow_id)
+                .await
+                .and_then(|verification| verification.sas());
+            // Subscribe before reading, so a change between the read and the
+            // wait is still delivered.
+            let mut request_changes = request
+                .as_ref()
+                .map(|request| request.changes().map(|_| ()).boxed());
+            let mut sas_changes = sas.as_ref().map(|sas| sas.changes().map(|_| ()).boxed());
+            let current = VerificationSnapshot::of(request.as_ref(), sas.as_ref());
+            if current != seen || current.finished() {
+                return Ok(current);
+            }
+            let changed = tokio::select! {
+                Some(()) = next_change(&mut request_changes) => true,
+                Some(()) = next_change(&mut sas_changes) => true,
+                () = tokio::time::sleep_until(deadline) => false,
+            };
+            if !changed {
+                return Ok(current);
+            }
+        }
+    }
+
     async fn encryption_client_for(&self, expected_account_id: &str) -> Result<Client> {
         let state = self.state.lock().await;
         let loaded = selected_loaded_for(&state, expected_account_id)?;
         Ok(loaded.client.clone())
+    }
+}
+
+async fn next_change(changes: &mut Option<BoxStream<'static, ()>>) -> Option<()> {
+    match changes {
+        Some(changes) => changes.next().await,
+        None => std::future::pending().await,
     }
 }
 

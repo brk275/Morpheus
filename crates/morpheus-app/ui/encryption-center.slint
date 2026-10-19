@@ -97,11 +97,8 @@ export component SasVerificationPanel inherits Rectangle {
     background: root.palette.elevated;
     height: content.preferred-height;
 
-    Timer {
-        interval: 3s;
-        running: root.active && !root.busy && (root.stage == 1 || root.stage == 3 || root.stage == 5);
-        triggered => { root.refresh(); }
-    }
+    // Flow progress arrives from the SDK's change streams (see
+    // src/verification.rs); only this panel's incoming-request list polls.
     Timer {
         interval: 3s;
         running: root.active && root.stage == 0 && !root.incoming-loading && !root.blocked;
@@ -151,7 +148,7 @@ export component SasVerificationPanel inherits Rectangle {
         }
         if root.stage != 0 : Text {
             text: root.stage == 1 ? (root.request-initiator
-                ? "Approve the verification request on your other device. Morpheus checks for its response while Settings is open."
+                ? "Approve the verification request on your other device. Morpheus shows its response as soon as it arrives."
                 : "Request accepted. Waiting for the requesting device to start the comparison.")
                 : root.stage == 2 ? "The other device accepted. Start the short authentication string comparison."
                 : root.stage == 3 ? "Waiting for the other device to accept the comparison. Keep both devices open."

@@ -58,6 +58,12 @@ pub use admin::RoomMemberInfo;
 mod encryption;
 pub use encryption::{
     DeviceTrust, OwnDeviceInfo, VerificationCancel, VerificationCancelKind, VerificationOutcome,
+    VerificationSnapshot,
+};
+mod device_sessions;
+pub use device_sessions::{
+    DeviceSignOutBlocker, DeviceSignOutChallenge, DeviceSignOutStep, MAX_DEVICE_NAME_CHARS,
+    bounded_device_name,
 };
 
 use std::{
