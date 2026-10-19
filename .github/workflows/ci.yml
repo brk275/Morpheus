@@ -1,13 +1,13 @@
 # TEMPORARY narrowly scoped native call feature verification. NEVER MERGE.
 # No installers, physical-device, real-account, installed-app or artifact jobs.
 name: Reviewed native call feature integration
-run-name: Native call feature integration - 9c9fcfe
+run-name: Native call feature integration - 40b1bad
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: native-call-feature-9c9fcfe
+  group: native-call-feature-40b1bad
   cancel-in-progress: false
 jobs:
   native:
@@ -21,7 +21,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 9c9fcfe21d6a51080ab5e093c7168c34d3691705
+          ref: 40b1bad9ef13aef51c9996a07fdd3c195d1c11e2
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -125,7 +125,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='9c9fcfe21d6a51080ab5e093c7168c34d3691705'
+          source='40b1bad9ef13aef51c9996a07fdd3c195d1c11e2'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -307,7 +307,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='9c9fcfe21d6a51080ab5e093c7168c34d3691705'
+          source='40b1bad9ef13aef51c9996a07fdd3c195d1c11e2'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
