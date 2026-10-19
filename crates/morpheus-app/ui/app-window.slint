@@ -2992,7 +2992,8 @@ export component AppWindow inherits Window {
     }
     // Session only and never saved: whether Settings shows the live preview.
     in-out property <bool> appearance-preview-shown: true;
-    property <ControlColors> preview-button-colors: {
+    // Colors of TokenButtons drawn on the window's own surfaces.
+    property <ControlColors> button-colors: {
         ink: root.ink,
         muted: root.muted,
         surface: root.elevated,
@@ -5412,11 +5413,11 @@ export component AppWindow inherits Window {
                                 accepted => { if root.live-session && !root.directory-loading { root.query-public-rooms(false); } }
                             }
                         }
-                        Button {
+                        TokenButton { colors: root.button-colors; text-scale: root.text-scale;
                             width: 93px; text: root.directory-loading ? "Searching…" : "Search";
-                            accessible-label: "Search public Matrix rooms";
+                            label: "Search public Matrix rooms";
                             enabled: root.live-session && !root.directory-loading;
-                            clicked => { root.query-public-rooms(false); }
+                            activated => { root.query-public-rooms(false); }
                         }
                     }
                     Text {
@@ -5449,11 +5450,11 @@ export component AppWindow inherits Window {
                                 accepted => { if root.live-session && !root.directory-join-busy { root.join-discovery-target(root.directory-join-input, "", "", "", false); } }
                             }
                         }
-                        Button {
+                        TokenButton { colors: root.button-colors; text-scale: root.text-scale;
                             width: 93px; text: root.directory-join-busy ? "Joining…" : "Join";
-                            accessible-label: "Join room by Matrix link or alias";
+                            label: "Join room by Matrix link or alias";
                             enabled: root.live-session && !root.directory-join-busy;
-                            clicked => { root.join-discovery-target(root.directory-join-input, "", "", "", false); }
+                            activated => { root.join-discovery-target(root.directory-join-input, "", "", "", false); }
                         }
                     }
                     if root.directory-join-error != "" : Text {
@@ -5469,11 +5470,11 @@ export component AppWindow inherits Window {
                             color: root.ink; font-size: 12px * root.text-scale; font-weight: 750;
                             vertical-alignment: center; horizontal-stretch: 1;
                         }
-                        if root.directory-next-batch != "" : Button {
+                        if root.directory-next-batch != "" : TokenButton { colors: root.button-colors; text-scale: root.text-scale;
                             width: 105px; text: root.directory-loading ? "Loading…" : "Load more";
-                            accessible-label: "Load more public rooms";
+                            label: "Load more public rooms";
                             enabled: !root.directory-loading && !root.directory-join-busy;
-                            clicked => { root.query-public-rooms(true); }
+                            activated => { root.query-public-rooms(true); }
                         }
                     }
                     if root.directory-loading : Text {
@@ -5515,11 +5516,11 @@ export component AppWindow inherits Window {
                                         color: root.muted; font-size: 11px * root.text-scale; overflow: elide;
                                     }
                                 }
-                                Button {
+                                TokenButton { colors: root.button-colors; text-scale: root.text-scale;
                                     width: 76px; text: root.directory-join-busy && root.directory-joining-room-id == room.id ? "Joining…" : "Join";
-                                    accessible-label: "Join public room " + room.title;
+                                    label: "Join public room " + room.title;
                                     enabled: root.live-session && !root.directory-join-busy;
-                                    clicked => { root.join-discovery-target(room.id, room.canonical-alias, room.route-server, room.title, room.is-space); }
+                                    activated => { root.join-discovery-target(room.id, room.canonical-alias, room.route-server, room.title, room.is-space); }
                                 }
                             }
                         }
@@ -5799,7 +5800,7 @@ export component AppWindow inherits Window {
                                     alignment: start;
                                     for sample[index] in ["Button", "Hover", "Pressed", "Focus", "Disabled", "Primary"] : TokenButton {
                                         text: sample;
-                                        colors: root.preview-button-colors;
+                                        colors: root.button-colors;
                                         text-scale: root.text-scale;
                                         sample-state: index >= 1 && index <= 3 ? index : 0;
                                         enabled: index != 4;
@@ -7309,7 +7310,7 @@ export component AppWindow inherits Window {
                             accessible-label: "Speaker for the next call";
                             selected(value) => { root.select-audio-speaker(value); }
                         }
-                        Button { text: root.audio-devices-busy ? "Finding devices…" : "Refresh audio devices"; enabled: root.audio-devices-enabled && !root.audio-devices-busy; clicked => { root.refresh-audio-devices(); } }
+                        TokenButton { colors: root.button-colors; text-scale: root.text-scale; text: root.audio-devices-busy ? "Finding devices…" : "Refresh audio devices"; enabled: root.audio-devices-enabled && !root.audio-devices-busy; activated => { root.refresh-audio-devices(); } }
                         // Read-only and focusable, so search can reveal it while devices are unavailable.
                         audio-status-field := ThemedTextInput {
                             text: root.audio-device-notice != "" ? root.audio-device-notice : "Choose Refresh audio devices to list devices.";
@@ -7396,7 +7397,7 @@ export component AppWindow inherits Window {
                         }
                         HorizontalLayout {
                             spacing: 10px;
-                            Button {
+                            TokenButton { colors: root.button-colors; text-scale: root.text-scale;
                                 property <int> reveal-request: root.reveal-request("updates");
                                 // Keyboard focus and search share the same bounded reveal.
                                 changed has-focus => {
@@ -7418,13 +7419,13 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                 }
-                                text: "Check for updates"; enabled: root.update-can-check; clicked => { root.check-for-updates(); } }
-                            Button { text: "Download update"; enabled: root.update-can-download; clicked => { root.download-update(); } }
+                                text: "Check for updates"; enabled: root.update-can-check; activated => { root.check-for-updates(); } }
+                            TokenButton { colors: root.button-colors; text-scale: root.text-scale; text: "Download update"; enabled: root.update-can-download; activated => { root.download-update(); } }
                         }
                         HorizontalLayout {
                             spacing: 10px;
-                            Button { text: "Discard update"; enabled: root.update-can-discard; clicked => { root.discard-update(); } }
-                            Button { text: "Restart to update"; primary: true; enabled: root.update-can-restart && !root.call-connected && !root.security-busy && root.security-recovery-key == ""; clicked => { root.restart-to-update(); } }
+                            TokenButton { colors: root.button-colors; text-scale: root.text-scale; text: "Discard update"; enabled: root.update-can-discard; activated => { root.discard-update(); } }
+                            TokenButton { colors: root.button-colors; text-scale: root.text-scale; text: "Restart to update"; primary: true; enabled: root.update-can-restart && !root.call-connected && !root.security-busy && root.security-recovery-key == ""; activated => { root.restart-to-update(); } }
                         }
                         Rectangle { height: 1px; background: root.divider; }
                         Text { text: "About"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
@@ -8519,9 +8520,9 @@ export component AppWindow inherits Window {
                         accessible-live-region: polite;
                     }
                     Rectangle { vertical-stretch: 1; background: transparent; }
-                    close-quick-switcher := Button {
+                    close-quick-switcher := TokenButton { colors: root.button-colors; text-scale: root.text-scale;
                         text: "Close";
-                        clicked => { root.close-quick-switcher(); }
+                        activated => { root.close-quick-switcher(); }
                     }
                 }
             }
