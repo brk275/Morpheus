@@ -879,6 +879,17 @@ export component RoomMembersPanel inherits VerticalLayout {
                         activated => { root.request-address(root.address-input); }
                     }
                 }
+                if root.chosen.kind == 7 && root.chosen.editable && root.chosen.choice == 1 : HorizontalLayout {
+                    alignment: start;
+                    RosterButton {
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        text: "Remove main…";
+                        label: "Review removing the room's main address; the address keeps working";
+                        enabled: !root.busy;
+                        activated => { root.request-access(7, 0); }
+                    }
+                }
                 if root.chosen.kind == 6 && root.chosen.editable : HorizontalLayout {
                     spacing: 5px; alignment: start;
                     RosterButton {

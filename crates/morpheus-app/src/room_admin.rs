@@ -722,7 +722,7 @@ fn access_current(change: AccessChange, access: AccessSettings) -> bool {
         AccessChange::Encrypt => !access.encrypted,
         AccessChange::Publish { publish } => access.listed == Some(!publish),
         // Checked against the snapshot's address settings instead.
-        AccessChange::Address => true,
+        AccessChange::Address | AccessChange::ClearAddress => true,
         // Checked against the snapshot's version settings or block list instead.
         AccessChange::Upgrade | AccessChange::Servers { .. } => true,
     }
@@ -788,6 +788,20 @@ pub(crate) fn access_intent(
                 return Err("The room directory already shows it that way.".to_owned());
             }
             (AccessChange::Publish { publish }, "Room directory")
+        }
+        ACCESS_ADDRESS => {
+            let addresses = snapshot.addresses.as_ref();
+            let addresses = addresses.ok_or_else(|| UNKNOWN_RULES.to_owned())?;
+            if !addresses.known {
+                return Err(CUSTOM_ADDRESS.to_owned());
+            }
+            if !addresses.editable {
+                return Err(access_restriction(addresses.level, snapshot));
+            }
+            if addresses.main.is_none() || choice != 0 {
+                return Err("The room has no main address to remove.".to_owned());
+            }
+            (AccessChange::ClearAddress, "Main address")
         }
         ACCESS_UPGRADE => {
             let upgrade = snapshot.upgrade.as_ref();
@@ -883,6 +897,12 @@ impl Intent {
                 return false;
             };
             return servers.editable && blocks(&servers.denied, &self.user_id) != block;
+        }
+        if self.action == AdminAction::SetAccess(AccessChange::ClearAddress) {
+            let Some(addresses) = &snapshot.addresses else {
+                return false;
+            };
+            return addresses.editable && addresses.main.is_some();
         }
         if self.action == AdminAction::SetAccess(AccessChange::Address) {
             let Some(addresses) = &snapshot.addresses else {
@@ -1263,6 +1283,16 @@ pub(crate) fn confirmation(intent: &Intent, snapshot: &RoomAdminSnapshot) -> Opt
                 destructive: false,
             }
         }
+        AdminAction::SetAccess(AccessChange::ClearAddress) => {
+            let main = snapshot.addresses.as_ref().and_then(|a| a.main.as_deref());
+            let main = crate::directory_plain_text(main.unwrap_or_default(), 260);
+            Confirmation {
+                title: "Remove the main address?".to_owned(),
+                body: format!("{main} keeps working, but the room no longer shows a main address."),
+                action: "Remove main address",
+                destructive: false,
+            }
+        }
         AdminAction::SetAccess(AccessChange::Publish { publish: true }) => Confirmation {
             title: "List this room in the room directory?".to_owned(),
             body: LIST_BODY.to_owned(),
@@ -1380,6 +1410,13 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: &AdminOutcome) -> String {
             (true, true) => format!("Blocked {server}. The homeserver confirmed it."),
             (false, true) => format!("Unblocked {server}. The homeserver confirmed it."),
             _ => SERVERS_UNCONFIRMED.to_owned(),
+        };
+    }
+    if intent.action == AdminAction::SetAccess(AccessChange::ClearAddress) {
+        return if outcome.confirmed {
+            "The room no longer shows a main address. The homeserver confirmed it.".to_owned()
+        } else {
+            ADDRESS_UNCONFIRMED.to_owned()
         };
     }
     if intent.action == AdminAction::SetAccess(AccessChange::Address) {
@@ -1506,7 +1543,9 @@ fn access_outcome_text(change: AccessChange, confirmed: bool) -> String {
             "The room is no longer listed in the room directory. The homeserver confirmed it."
                 .to_owned()
         }
-        AccessChange::Address => "The main address changed.".to_owned(),
+        AccessChange::Address | AccessChange::ClearAddress => {
+            "The main address changed.".to_owned()
+        }
     }
 }
 
@@ -1525,7 +1564,9 @@ pub(crate) fn permission_text(action: AdminAction, snapshot: &RoomAdminSnapshot)
             AccessChange::Upgrade => snapshot.upgrade.as_ref().map_or(100, |up| up.level),
             AccessChange::Servers { .. } => snapshot.servers.as_ref().map_or(100, |acl| acl.level),
             AccessChange::Publish { .. } => access.listing_level,
-            AccessChange::Address => snapshot.addresses.as_ref().map_or(100, |a| a.level),
+            AccessChange::Address | AccessChange::ClearAddress => {
+                snapshot.addresses.as_ref().map_or(100, |a| a.level)
+            }
         };
         return access_restriction(level, snapshot);
     }
@@ -2231,6 +2272,22 @@ mod tests {
         }
         let custom = address_intent("lounge", &snapshot);
         assert_eq!(custom, Err(CUSTOM_ADDRESS.to_owned()));
+        // Removing the main address keeps the address itself working.
+        if let Some(addresses) = snapshot.addresses.as_mut() {
+            addresses.known = true;
+            addresses.editable = true;
+        }
+        let clear = access_intent(ACCESS_ADDRESS, 0, &snapshot).unwrap();
+        let clearing = AdminAction::SetAccess(AccessChange::ClearAddress);
+        assert_eq!(clear.action, clearing);
+        assert!(clear.still_matches(&snapshot));
+        let review = confirmation(&clear, &snapshot).unwrap();
+        assert!(review.body.starts_with("#lounge:example.org keeps working"));
+        if let Some(addresses) = snapshot.addresses.as_mut() {
+            addresses.main = None;
+        }
+        assert!(!clear.still_matches(&snapshot));
+        assert!(access_intent(ACCESS_ADDRESS, 0, &snapshot).is_err());
     }
 
     #[test]

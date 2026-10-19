@@ -334,6 +334,8 @@ pub enum AccessChange {
     /// Make the request's user ID, a room address on the account's
     /// homeserver, the room's main address, creating it there when free.
     Address,
+    /// Stop showing a main address; the address itself keeps working.
+    ClearAddress,
 }
 
 /// The room's addresses from `m.room.canonical_alias`.
@@ -906,12 +908,13 @@ impl RoomAdminSession {
         })
         .await
     }
-    /// Make an address on the account's homeserver the room's main address.
-    /// The address is created there for this room when it is free, and
-    /// refused when it belongs to another room; only the `alias` field of
-    /// the room's address content changes.
-    async fn set_main_address(&self, input: &str) -> Result<AdminOutcome> {
-        let alias = checked_alias(input, self.own_user.server_name())?;
+    /// Make an address on the account's homeserver the room's main address,
+    /// or with `None` stop showing one. A new address is created there for
+    /// this room when it is free, and refused when it belongs to another
+    /// room; only the `alias` field of the room's address content changes.
+    async fn set_main_address(&self, input: Option<&str>) -> Result<AdminOutcome> {
+        let server = self.own_user.server_name();
+        let alias = input.map(|input| checked_alias(input, server)).transpose()?;
         self.run(WRITE_TIMEOUT, async {
             let power = self.power_state().await?;
             let levels = room_settings::effective_power_levels(&self.create, power.as_ref())?
@@ -922,8 +925,11 @@ impl RoomAdminSession {
             }
             let current = self.optional_state(kind.clone()).await?;
             let current = current.as_ref().map(|event| &event.content);
-            let content = main_address_content(current, alias.as_str())?;
-            self.claim_alias(&alias).await?;
+            let wanted = alias.as_ref().map(|alias| alias.as_str());
+            let content = main_address_content(current, wanted)?;
+            if let Some(alias) = &alias {
+                self.claim_alias(alias).await?;
+            }
             let content = finish_content(&content)?;
             let room_id = self.room.room_id().to_owned();
             let request =
@@ -948,7 +954,7 @@ impl RoomAdminSession {
                 power: MemberPower::Level(0),
             };
             Ok(AdminOutcome {
-                confirmed: main == Some(alias.as_str()),
+                confirmed: main == wanted,
                 observed: built.is_some().then_some(read_back),
                 snapshot: built.unwrap_or_else(|| self.snapshot()),
                 replacement: None,
@@ -1009,7 +1015,10 @@ impl RoomAdminSession {
             return self.set_listing(publish).await;
         }
         if request.action == AdminAction::SetAccess(AccessChange::Address) {
-            return self.set_main_address(&request.user_id).await;
+            return self.set_main_address(Some(&request.user_id)).await;
+        }
+        if request.action == AdminAction::SetAccess(AccessChange::ClearAddress) {
+            return self.set_main_address(None).await;
         }
         if let AdminAction::SetAccess(change) = request.action {
             return self.set_access(change).await;
@@ -1782,7 +1791,9 @@ fn access_kind(change: AccessChange) -> StateEventType {
         AccessChange::Encrypt => StateEventType::RoomEncryption,
         AccessChange::Upgrade => StateEventType::RoomTombstone,
         AccessChange::Servers { .. } => StateEventType::RoomServerAcl,
-        AccessChange::Publish { .. } | AccessChange::Address => StateEventType::RoomCanonicalAlias,
+        AccessChange::Publish { .. } | AccessChange::Address | AccessChange::ClearAddress => {
+            StateEventType::RoomCanonicalAlias
+        }
     }
 }
 
@@ -1796,7 +1807,7 @@ fn access_matches(change: AccessChange, current: Option<&StateEnvelope>) -> bool
         // Checked against the block list, the directory or the address by
         // their own paths.
         AccessChange::Servers { .. } | AccessChange::Publish { .. } => false,
-        AccessChange::Address => false,
+        AccessChange::Address | AccessChange::ClearAddress => false,
     }
 }
 
@@ -1809,7 +1820,7 @@ fn access_applied(change: AccessChange, access: AccessSettings) -> bool {
         AccessChange::Upgrade | AccessChange::Servers { .. } => false,
         AccessChange::Publish { publish } => access.listed == Some(publish),
         // Confirmed from the address settings.
-        AccessChange::Address => false,
+        AccessChange::Address | AccessChange::ClearAddress => false,
     }
 }
 
@@ -1838,7 +1849,8 @@ fn access_request(room: &RoomId, change: AccessChange) -> Result<send_state_even
         AccessChange::Upgrade
         | AccessChange::Servers { .. }
         | AccessChange::Publish { .. }
-        | AccessChange::Address => {
+        | AccessChange::Address
+        | AccessChange::ClearAddress => {
             return Err(RoomAdminError::NotApplicable);
         }
     };
@@ -1907,10 +1919,10 @@ fn checked_alias(input: &str, server: &ServerName) -> Result<OwnedRoomAliasId> {
     RoomAliasId::parse(&alias).map_err(|_| RoomAdminError::InvalidUserId)
 }
 
-/// The address content with `alias` as the main address. The new main
-/// address is no longer also listed as an alternative; everything else is
-/// kept. Content Morpheus cannot keep intact is refused, never rewritten.
-fn main_address_content(current: Option<&Value>, alias: &str) -> Result<Value> {
+/// The address content with `alias` as the main address, or none. A new
+/// main address is no longer also listed as an alternative; everything else
+/// is kept. Content Morpheus cannot keep intact is refused, never rewritten.
+fn main_address_content(current: Option<&Value>, alias: Option<&str>) -> Result<Value> {
     let mut object = match current {
         None => Map::new(),
         Some(Value::Object(object)) => object.clone(),
@@ -1920,11 +1932,15 @@ fn main_address_content(current: Option<&Value>, alias: &str) -> Result<Value> {
     if main.is_some_and(|main| !main.is_string()) {
         return Err(RoomAdminError::InvalidState);
     }
-    if main.and_then(Value::as_str) == Some(alias) {
+    if main.and_then(Value::as_str) == alias {
         return Err(RoomAdminError::NotApplicable);
     }
     let alternatives = string_list(object.get("alt_aliases"));
     let mut alternatives = alternatives.ok_or(RoomAdminError::InvalidState)?;
+    let Some(alias) = alias else {
+        object.remove("alias");
+        return Ok(Value::Object(object));
+    };
     if object.contains_key("alt_aliases") {
         alternatives.retain(|other| other != alias);
         object.insert("alt_aliases".to_owned(), Value::from(alternatives));
@@ -2670,20 +2686,26 @@ mod tests {
             let refused = checked_alias(input, own);
             assert_eq!(refused, Err(RoomAdminError::InvalidUserId));
         }
-        let first = main_address_content(None, lounge).unwrap();
+        let first = main_address_content(None, Some(lounge)).unwrap();
         assert_eq!(first, json!({"alias": lounge}));
         let current = json!({
             "alias": "#old:example.org",
             "alt_aliases": [lounge, "#x:example.org"],
             "custom": 1
         });
-        let moved = main_address_content(Some(&current), lounge).unwrap();
+        let moved = main_address_content(Some(&current), Some(lounge)).unwrap();
         let expected = json!({"alias": lounge, "alt_aliases": ["#x:example.org"], "custom": 1});
         assert_eq!(moved, expected);
-        let again = main_address_content(Some(&moved), lounge);
+        let again = main_address_content(Some(&moved), Some(lounge));
         assert_eq!(again, Err(RoomAdminError::NotApplicable));
+        // Clearing keeps the alternatives and every other field.
+        let cleared = main_address_content(Some(&moved), None).unwrap();
+        let expected = json!({"alt_aliases": ["#x:example.org"], "custom": 1});
+        assert_eq!(cleared, expected);
+        let none = main_address_content(Some(&cleared), None);
+        assert_eq!(none, Err(RoomAdminError::NotApplicable));
         for odd in [json!({"alias": 5}), json!({"alt_aliases": lounge}), json!([])] {
-            let refused = main_address_content(Some(&odd), lounge);
+            let refused = main_address_content(Some(&odd), Some(lounge));
             assert_eq!(refused, Err(RoomAdminError::InvalidState));
         }
 

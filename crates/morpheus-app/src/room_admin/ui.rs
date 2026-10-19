@@ -924,7 +924,9 @@ fn access_row(row: super::AccessRow, pending: Option<AccessChange>) -> RosterPer
         Some(AccessChange::Upgrade) => row.kind == super::ACCESS_UPGRADE,
         Some(AccessChange::Servers { .. }) => row.kind == super::ACCESS_SERVERS,
         Some(AccessChange::Publish { .. }) => row.kind == super::ACCESS_DIRECTORY,
-        Some(AccessChange::Address) => row.kind == super::ACCESS_ADDRESS,
+        Some(AccessChange::Address | AccessChange::ClearAddress) => {
+            row.kind == super::ACCESS_ADDRESS
+        }
         None => false,
     };
     RosterPermission {
