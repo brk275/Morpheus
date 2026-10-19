@@ -5173,16 +5173,20 @@ export component AppWindow inherits Window {
                                         corner: StyleTokens.radius * 0.9;
                                     }
                                     if message.attachment-is-image && message.event-id != "" : ActionRect {
-                                        height: 67px; border-radius: StyleTokens.radius * 1;
-                                        background: self.has-hover ? root.hover : root.elevated;
+                                        // 67 px by default; large text grows it instead of clipping.
+                                        height: max(67px, 22px * root.text-scale + 30px); border-radius: StyleTokens.radius * 1;
+                                        background: self.has-pressed && StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color
+                                            : self.has-hover ? (StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover)
+                                            : root.elevated;
                                         border-width: StyleTokens.line-width; border-color: root.divider; focus-color: root.accent;
                                         label: "Preview image " + message.attachment;
                                         enabled: root.live-session;
                                         activated => { root.preview-image-attachment(message.event-id, message.attachment); }
                                         HorizontalLayout {
                                             padding: 11px; spacing: 12px;
-                                            Rectangle { width: 45px; border-radius: StyleTokens.radius * 0.8; background: root.panel;
-                                                Text { text: "▧"; color: root.accent; font-size: 27px; horizontal-alignment: center; vertical-alignment: center; }
+                                            // The picture glyph follows the configured icon size.
+                                            Rectangle { width: 45px * (StyleTokens.icon-size / 18px); border-radius: StyleTokens.radius * 0.8; background: root.panel;
+                                                Text { text: "▧"; color: root.accent; font-size: 27px * (StyleTokens.icon-size / 18px); horizontal-alignment: center; vertical-alignment: center; }
                                             }
                                             VerticalLayout { spacing: 3px;
                                                 Text { text: message.attachment; color: root.ink; font-size: 12px * root.text-scale; overflow: elide; }
@@ -8028,10 +8032,17 @@ export component AppWindow inherits Window {
                                         text-scale: root.text-scale;
                                         corner: StyleTokens.radius * 0.8;
                                     }
-                                    if reply.attachment-is-image && reply.event-id != "" : Button {
-                                        text: "Preview image"; accessible-label: "Preview image " + reply.attachment;
-                                        enabled: root.live-session;
-                                        clicked => { root.preview-image-attachment(reply.event-id, reply.attachment); }
+                                    // The window's token-drawn action: control radius, padding,
+                                    // line and focus widths and control states apply.
+                                    if reply.attachment-is-image && reply.event-id != "" : HorizontalLayout {
+                                        alignment: start;
+                                        TextAction {
+                                            text: "Preview image"; label: "Preview image " + reply.attachment;
+                                            enabled: root.live-session;
+                                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                                            outline: root.divider; text-scale: root.text-scale;
+                                            activated => { root.preview-image-attachment(reply.event-id, reply.attachment); }
+                                        }
                                     }
                                     // The timeline pin rule: shown once the pinned list is known, for
                                     // anyone who may change it, and as a disabled marker on pinned
