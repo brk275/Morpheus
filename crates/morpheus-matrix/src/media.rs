@@ -1630,6 +1630,49 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[tokio::test]
+    async fn upload_limits_reject_foreign_revoked_and_aba_selections_before_client_access() {
+        let root =
+            std::env::temp_dir().join(format!("morpheus-upload-limit-{}", uuid::Uuid::new_v4()));
+        let manager = AccountManager::open(&root).unwrap();
+        manager.selections.replace(Some("synthetic-account"));
+        manager.state.lock().await.active_account_id = Some("synthetic-account".into());
+        let original = manager.account_selection("synthetic-account").unwrap();
+        manager.selections.replace(Some("other-account"));
+        manager.selections.replace(Some("synthetic-account"));
+        assert!(matches!(
+            manager.attachment_upload_limit_selected(&original).await,
+            Err(MatrixCoreError::SelectedAccountChanged)
+        ));
+        let foreign = crate::account_selection::Selections::default();
+        foreign.replace(Some("synthetic-account"));
+        assert!(matches!(
+            manager
+                .attachment_upload_limit_selected(
+                    &foreign.for_account("synthetic-account").unwrap()
+                )
+                .await,
+            Err(MatrixCoreError::SelectedAccountChanged)
+        ));
+        let current = manager.account_selection("synthetic-account").unwrap();
+        {
+            let locked = manager.state.lock().await;
+            let waiting = manager.attachment_upload_limit_selected(&current);
+            tokio::pin!(waiting);
+            assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+            manager.selections.replace(Some("other-account"));
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(2), waiting)
+                    .await
+                    .unwrap(),
+                Err(MatrixCoreError::SelectedAccountChanged)
+            ));
+            drop(locked);
+        }
+        drop(manager);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn file_read_rejects_oversized_input() {
         let path = std::env::temp_dir().join(format!("morpheus-media-{}", uuid::Uuid::new_v4()));
