@@ -2474,7 +2474,7 @@ async fn assert_metric_workspace_and_extremes(ui: &AppWindow, directory: &std::p
     settle(ui).await;
     for (button, input) in [
         (
-            "Attach file".to_owned(),
+            "Attach files".to_owned(),
             format!("Message composer for {}", ui.get_active_room_name()),
         ),
         (
