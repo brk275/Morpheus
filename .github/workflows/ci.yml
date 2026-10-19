@@ -1,16 +1,16 @@
 # TEMPORARY owner-reviewed transfer contracts. NEVER MERGE this workflow.
-name: Reviewed transfer focus
-run-name: Reviewed transfer focus - abb2991
+name: Reviewed layout contracts
+run-name: Reviewed layout contracts - 067944e
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: transfer-focus-abb2991-${{ github.ref }}
+  group: layout-contracts-067944e-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   search:
-    name: Transfer focus Linux x64
+    name: Layout contracts Linux x64
     if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false
     runs-on: ubuntu-24.04
     timeout-minutes: 240
@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: abb2991f8b9eb0729d388d19395baf05cdf01ff3
+          ref: 067944e70e261a1b4b6841b621f803e760dd7d46
           path: candidate
           fetch-depth: 0
           persist-credentials: false
@@ -179,7 +179,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='abb2991f8b9eb0729d388d19395baf05cdf01ff3'
+          source='067944e70e261a1b4b6841b621f803e760dd7d46'
           assert subprocess.check_output(['git','rev-parse','HEAD'],cwd=workspace,env=environment,text=True).strip()==source
           assert hashlib.sha256((workspace/'Cargo.lock').read_bytes()).hexdigest()=='8db1e7dcf70013d71a4d9fa8be42a25da4efa1d74edd6711812a2897c0ccf6b7'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
@@ -256,6 +256,8 @@ jobs:
               'sdk_cache_publish':'Cannot publish verified native SDK cache',
           }
           checks=[
+              ('config_layout_schema', ['cargo', 'test', '--locked', '-p', 'morpheus-config', '--lib', '--', '--test-threads=1'], 2700, {'registry::tests::setting_targets_are_unique_and_searchable_by_their_aliases', 'tests::the_field_reference_agrees_with_the_real_schema', 'tests::pane_arrangements_validate_and_keep_older_files_working'}, set()),
+              ('workspace_layout', ['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'workspace_layout::tests::', '--', '--test-threads=1'], 2700, {'workspace_layout::tests::hidden_and_collapsed_panes_restore_to_the_default', 'workspace_layout::tests::the_account_control_stays_bottom_left_in_every_arrangement', 'workspace_layout::tests::presets_change_only_the_arrangement_and_are_recognized', 'workspace_layout::tests::narrow_windows_give_way_in_order_and_keep_the_conversation', 'workspace_layout::tests::the_default_arrangement_matches_the_classic_layout'}, set()),
               ('app_transfer_private_ui', ['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation', '--', '--exact', '--test-threads=1'], 2700, {'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'}, set()),
               ('native_app_build', ['cargo', 'build', '--locked', '-p', 'morpheus-app', '--features', 'native-calls'], 2400, None, set()),
           ]
@@ -327,7 +329,8 @@ jobs:
                   failed_packages=set(re.findall(r'could not compile `([A-Za-z0-9_-]+)`',normalized))
                   # Only reviewed public filenames and numeric compiler spans.
                   # Missing identifiers are admitted only if already in those public sources.
-                  source_files=('crates/morpheus-app/src/attachment_workbench.rs',
+                  source_files=('crates/morpheus-app/src/workspace_layout.rs',
+                      'crates/morpheus-app/src/attachment_workbench.rs',
                       'crates/morpheus-app/src/attachments.rs',
                       'crates/morpheus-app/ui/transfer-center.slint',
                       'crates/morpheus-matrix/src/media.rs',
@@ -383,6 +386,8 @@ jobs:
                       locations.extend({'file':path,'line':line,'column':column} for line,column in sorted(spans)[:32])
                   missing=set(re.findall(r'cannot find (?:value|function|type|struct) `([A-Za-z_][A-Za-z0-9_]{0,127})`',normalized))
                   record['failure_diagnostics']={
+                      'transfer_focus_state':[{'page':int(page),'panel':panel=='true','tab':int(tab),'pending':pending=='true','headings':int(headings)}
+                          for page,panel,tab,pending,headings in re.findall(r'MORPHEUS_TRANSFER_FOCUS_STATE page=([0-9]{1,2}) panel=(true|false) tab=([0-9]{1,2}) pending=(true|false) headings=([0-9]{1,3})',output)[:8]],
                       'ui_settings_target_failures':[{'stage':int(stage),'index':int(index),'live':live=='true'}
                           for stage,index,live in re.findall(r'MORPHEUS_SETTINGS_TARGET_FAILURE stage=([01]) index=([0-9]{1,3}) live=(true|false)',output)[:8]],
                       'source_locations':locations,
