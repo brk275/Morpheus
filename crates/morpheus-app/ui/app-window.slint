@@ -797,7 +797,8 @@ component MentionPopup inherits Rectangle {
             width: mention-list.visible-width; height: 36px * root.text-scale + 10px;
             label: item.name + " " + item.key + (index == root.current ? ", selected" : "");
             focus-color: root.accent; border-radius: StyleTokens.radius * 0.5;
-            background: index == root.current || self.has-hover ? root.hover : root.surface;
+            background: index == root.current ? root.hover
+                : self.has-hover ? (StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover) : root.surface;
             activated => { root.choose(item.key); }
             VerticalLayout {
                 padding: 5px; spacing: 2px;
@@ -889,7 +890,8 @@ component EmojiPopup inherits Rectangle {
             for item[index] in root.items : ActionRect {
                 width: emoji-list.visible-width; height: 34px * root.text-scale + 6px;
                 label: "Insert " + item.name + " " + item.symbol + (index == root.current ? ", selected" : "");
-                background: index == root.current || self.has-hover ? root.hover : root.surface;
+                background: index == root.current ? root.hover
+                : self.has-hover ? (StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover) : root.surface;
                 border-radius: StyleTokens.radius * 0.5; focus-color: root.accent; cancel-on-escape: true;
                 cancelled => { root.dismiss(); }
                 activated => { root.choose(item.key); }
@@ -1036,7 +1038,8 @@ component StickerList inherits Rectangle {
         for item[index] in root.items : ActionRect {
             width: sticker-list.visible-width; height: root.row-height;
             label: "Sticker " + item.label + " from " + item.pack + (index == root.current ? ", selected" : "");
-            background: index == root.current || self.has-hover ? root.hover : root.surface;
+            background: index == root.current ? root.hover
+                : self.has-hover ? (StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover) : root.surface;
             border-radius: StyleTokens.radius * 0.5; focus-color: root.accent; cancel-on-escape: true;
             cancelled => { root.dismiss(); }
             activated => { root.highlight(item.key); }
