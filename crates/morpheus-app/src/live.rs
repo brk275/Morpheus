@@ -1452,6 +1452,7 @@ impl LiveUi {
             ui.invoke_cancel_room_settings();
             ui.invoke_close_image_preview();
             crate::reset_room_search(&ui);
+            crate::kept_replies::forget_all();
             crate::reset_attachment_view(&ui);
             clear_account_context(&ui, &gate);
             ui.set_live_session(false);
@@ -3111,6 +3112,10 @@ fn apply_snapshot(
     let selection_changed = account_changed || ui.get_active_room_id().as_str() != next_room_id;
     if account_changed {
         clear_account_context(ui, security_gate);
+        crate::kept_replies::forget_all();
+    } else if selection_changed {
+        // A reply being typed in the room being left is kept for its return.
+        crate::kept_replies::leaving_room(ui);
     }
     if selection_changed {
         ui.set_room_admin_open(false);
@@ -3320,6 +3325,8 @@ fn apply_snapshot(
     if account_changed {
         // A conversation target that waited for this account opens now.
         crate::message_search::account_shown(ui);
+    } else if selection_changed {
+        crate::kept_replies::entered_room(ui);
     }
 }
 

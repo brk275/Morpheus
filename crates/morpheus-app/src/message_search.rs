@@ -84,7 +84,7 @@ const FOCUS_FAILED: &str =
     "The conversation around this message could not be opened, so it is shown here.";
 const NEWER_FAILED: &str = "Could not load newer messages. Check sync and retry.";
 const KEEP_COMPOSER: &str =
-    "Send or cancel the reply or edit in this room before opening another conversation.";
+    "Save or cancel the edit in this room before opening another conversation.";
 // Keep in step with MAX_RESULTS.
 const RESULT_LIMIT: &str = "showing the first 200; refine the search to narrow them";
 
@@ -786,10 +786,10 @@ fn open(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, room_id: &str,
     let Some(item) = listed(window, room_id, event_id) else {
         return;
     };
-    // A reply or edit has no saved draft; leaving its room would drop the
-    // typed text. Keep it and say why the hit did not open.
+    // An edit has no saved draft and cannot be restored; leaving its room
+    // would drop the typed text. Keep it and say why the hit did not open.
     let elsewhere = window.get_active_room_id().as_str() != room_id;
-    if elsewhere && unsent_reply_or_edit(window) {
+    if elsewhere && unsent_edit(window) {
         window.set_room_search_notice(KEEP_COMPOSER.into());
         return;
     }
@@ -838,8 +838,9 @@ fn open(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, room_id: &str,
 /// - The room is opened like a room-list click (revealing its Space), a
 ///   loaded event is scrolled to, an older one opens the conversation around
 ///   it with Return to live, and a thread target opens the thread panel.
-/// - A reply or edit being typed in another room is never dropped: the open
-///   is refused with a session error. Drafts are kept as for any navigation.
+/// - An edit being typed in another room is never dropped: the open is
+///   refused with a session error. A reply is kept for its room and drafts
+///   are kept as for any navigation.
 pub(crate) fn open_conversation(
     window: &AppWindow,
     live: &Arc<LiveUi>,
@@ -924,7 +925,7 @@ fn activate(
         return;
     };
     let elsewhere = window.get_active_room_id().as_str() != target.room_id;
-    if elsewhere && unsent_reply_or_edit(window) {
+    if elsewhere && unsent_edit(window) {
         window.set_session_error(KEEP_COMPOSER.into());
         return;
     }
@@ -1247,8 +1248,10 @@ fn reset_history(window: &AppWindow) {
     window.set_focus_newer_loading(false);
 }
 
-fn unsent_reply_or_edit(window: &AppWindow) -> bool {
-    window.get_composer_mode() != 0 && !window.get_composer_text().trim().is_empty()
+/// An edit being typed: it has no saved draft and cannot be restored over
+/// its reloaded baseline. A reply is kept per room (see kept_replies).
+fn unsent_edit(window: &AppWindow) -> bool {
+    window.get_composer_mode() == 2 && !window.get_composer_text().trim().is_empty()
 }
 
 /// The nearby messages of a hit, or `None` once its account selection ended.

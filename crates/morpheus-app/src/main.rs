@@ -18,6 +18,7 @@ mod drafts;
 mod image_previews;
 #[cfg(feature = "native-calls")]
 mod incoming_ring;
+mod kept_replies;
 mod live;
 #[cfg(feature = "native-calls")]
 mod local_video;
