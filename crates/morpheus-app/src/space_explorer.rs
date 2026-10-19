@@ -104,27 +104,36 @@ pub(crate) struct Row {
     pub(crate) missing: bool,
 }
 
+fn status(
+    membership: Option<RoomMembership>,
+    missing: bool,
+    unsupported: bool,
+    join_rule: SpaceJoinRule,
+) -> Status {
+    match membership {
+        Some(RoomMembership::Joined) => return Status::Joined,
+        Some(RoomMembership::Invited) => return Status::Invited,
+        Some(RoomMembership::Banned) => return Status::Banned,
+        _ => {}
+    }
+    if missing {
+        return Status::Unavailable;
+    }
+    if unsupported {
+        return Status::Unsupported;
+    }
+    match join_rule {
+        SpaceJoinRule::Public => Status::Public,
+        SpaceJoinRule::Restricted | SpaceJoinRule::KnockRestricted => Status::Restricted,
+        SpaceJoinRule::Knock => Status::Knock,
+        SpaceJoinRule::Invite | SpaceJoinRule::Private => Status::InviteOnly,
+        SpaceJoinRule::Other => Status::UnknownRule,
+    }
+}
+
 impl Row {
     pub(crate) fn status(&self) -> Status {
-        match self.membership {
-            Some(RoomMembership::Joined) => return Status::Joined,
-            Some(RoomMembership::Invited) => return Status::Invited,
-            Some(RoomMembership::Banned) => return Status::Banned,
-            _ => {}
-        }
-        if self.missing {
-            return Status::Unavailable;
-        }
-        if self.unsupported {
-            return Status::Unsupported;
-        }
-        match self.join_rule {
-            SpaceJoinRule::Public => Status::Public,
-            SpaceJoinRule::Restricted | SpaceJoinRule::KnockRestricted => Status::Restricted,
-            SpaceJoinRule::Knock => Status::Knock,
-            SpaceJoinRule::Invite | SpaceJoinRule::Private => Status::InviteOnly,
-            SpaceJoinRule::Other => Status::UnknownRule,
-        }
+        status(self.membership, self.missing, self.unsupported, self.join_rule)
     }
     fn matches(&self, query: &str) -> bool {
         [&self.name, &self.alias, &self.topic, &self.room_id]
@@ -144,6 +153,8 @@ pub(crate) struct Level {
     links: Option<Vec<SpaceChildInfo>>,
     pub(crate) links_truncated: bool,
     pub(crate) membership: Option<RoomMembership>,
+    /// The Space's own join rule and room type, once its entry arrived.
+    rule: Option<(SpaceJoinRule, bool)>,
     linked: HashMap<String, RoomMembership>,
     pub(crate) rows: Vec<Row>,
     seen: HashSet<String>,
@@ -293,6 +304,7 @@ impl Explorer {
                 level.name = label(name, &level.space_id);
             }
             level.links_truncated = space.links_truncated;
+            level.rule = Some((space.node.join_rule, space.node.unsupported_type));
             level.links = Some(space.node.children);
         }
         level
@@ -389,16 +401,24 @@ impl Explorer {
     pub(crate) fn join_target(&self, room_id: &str) -> Option<JoinTarget> {
         let level = self.top();
         if level.space_id == room_id {
-            let joinable = !matches!(
-                level.membership,
-                Some(RoomMembership::Joined | RoomMembership::Banned)
-            );
+            // A Space the homeserver could not describe may still admit a
+            // deliberate join; the server decides.
+            let status = level.rule.map(|(rule, unsupported)| {
+                status(level.membership, false, unsupported, rule)
+            });
+            let joinable = match status {
+                Some(status) => status.joinable(),
+                None => !matches!(
+                    level.membership,
+                    Some(RoomMembership::Joined | RoomMembership::Banned)
+                ),
+            };
             return joinable.then(|| JoinTarget {
                 room_id: level.space_id.clone(),
                 name: level.name.clone(),
                 via: level.via.clone(),
                 is_space: true,
-                restricted: false,
+                restricted: status == Some(Status::Restricted),
             });
         }
         let row = level.rows.iter().find(|row| row.room_id == room_id)?;

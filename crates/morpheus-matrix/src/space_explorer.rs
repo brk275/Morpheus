@@ -228,17 +228,21 @@ fn level_entry(mut chunk: SpaceHierarchyRoomsChunk) -> SpaceLevelEntry {
     }
 }
 
-// A fixed category only; never reflected server text.
+// A fixed category only; never reflected server text. A homeserver that
+// is not in a Space answers with 403, whatever error code it uses.
 fn level_failure(error: &HttpError) -> SpaceLevelError {
     if matches!(error, HttpError::ResponseTooLarge { .. }) {
         return SpaceLevelError::TooLarge;
     }
     match error.client_api_error_kind() {
-        Some(ErrorKind::Forbidden) => SpaceLevelError::Forbidden,
-        Some(ErrorKind::NotFound) => SpaceLevelError::NotFound,
-        Some(ErrorKind::LimitExceeded(_)) => SpaceLevelError::RateLimited,
-        Some(ErrorKind::Unrecognized) => SpaceLevelError::Unsupported,
-        Some(ErrorKind::InvalidParam) => SpaceLevelError::InvalidToken,
+        Some(ErrorKind::LimitExceeded(_)) => return SpaceLevelError::RateLimited,
+        Some(ErrorKind::Unrecognized) => return SpaceLevelError::Unsupported,
+        Some(ErrorKind::InvalidParam) => return SpaceLevelError::InvalidToken,
+        _ => {}
+    }
+    match error.as_client_api_error().map(|error| error.status_code.as_u16()) {
+        Some(403) => SpaceLevelError::Forbidden,
+        Some(404) => SpaceLevelError::NotFound,
         _ => SpaceLevelError::Unavailable,
     }
 }

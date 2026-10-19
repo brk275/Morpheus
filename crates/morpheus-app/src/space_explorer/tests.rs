@@ -267,6 +267,22 @@ fn results_for_a_departed_level_or_explorer_are_dropped() {
 }
 
 #[test]
+fn the_shown_space_is_joinable_only_as_its_own_rule_allows() {
+    let (mut explorer, first) = opened();
+    let mut space = node(ROOT, true, &[]);
+    space.join_rule = SpaceJoinRule::Invite;
+    assert!(explorer.apply(&first, Ok(page(ROOT, Some(space), Vec::new(), None))));
+    assert!(explorer.join_target(ROOT).is_none(), "invite only, not invited");
+
+    let (mut explorer, first) = opened();
+    let mut space = node(ROOT, true, &[]);
+    space.join_rule = SpaceJoinRule::Restricted;
+    assert!(explorer.apply(&first, Ok(page(ROOT, Some(space), Vec::new(), None))));
+    let target = explorer.join_target(ROOT).expect("a restricted Space may be tried");
+    assert!(target.restricted && target.is_space);
+}
+
+#[test]
 fn statuses_decide_what_may_be_joined_or_opened() {
     let row = |rule, membership, unsupported| Row {
         room_id: "!r:example.org".into(),
