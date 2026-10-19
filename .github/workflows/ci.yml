@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
 name: Reviewed attachment focused checks
-run-name: Settings studio focused checks - 0c24e4d - ${{ inputs.platform }}
+run-name: Themed inputs focused checks - 6a08c39 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: settings-studio-0c24e4d-${{ github.ref }}
+  group: themed-inputs-6a08c39-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 0c24e4dc5c89c7acb1cb4f300fcba5baea0e1660
+          ref: 6a08c39b4c5d3478fe296c47cd4e1b18ba3f4264
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -135,7 +135,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='0c24e4dc5c89c7acb1cb4f300fcba5baea0e1660'
+          source='6a08c39b4c5d3478fe296c47cd4e1b18ba3f4264'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text(encoding='utf-8').strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -379,7 +379,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='0c24e4dc5c89c7acb1cb4f300fcba5baea0e1660'
+          source='6a08c39b4c5d3478fe296c47cd4e1b18ba3f4264'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -460,12 +460,7 @@ jobs:
           needed_settings={'settings_search::tests::listed_section_keys_are_registry_keys_and_find_their_section', 'settings_search::tests::an_exact_section_key_always_leads_once_within_the_bound', 'settings_search::tests::a_typed_config_key_finds_its_field', 'settings_search::tests::typed_input_is_bounded_before_normalization_and_key_matching', 'settings_search::tests::exact_field_results_name_their_config_key_and_sections_none'}
           needed_permit={'style_profiles::tests::the_dialog_permit_admits_one_operation_at_a_time'}
           checks=[
-              ('app_settings_search',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
-                  '--bin','morpheus-app','settings_search::tests::','--','--test-threads=1'],4200,needed_settings,set()),
-              ('app_style_permit',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
-                  '--bin','morpheus-app','style_profiles::tests::the_dialog_permit_admits_one_operation_at_a_time',
-                  '--','--exact','--test-threads=1'],4200,needed_permit,set()),
-              ('app_settings_ui',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
+              ('app_themed_ui',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
                   '--bin','morpheus-app','account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
                   '--','--exact','--test-threads=1'],4200,needed_ui,set()),
           ]
