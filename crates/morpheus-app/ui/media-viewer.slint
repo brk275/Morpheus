@@ -1,7 +1,8 @@
 // Native viewer for one explicitly opened image attachment. Rust fetches and
 // decodes only on request, one at a time, and never prefetches neighbours;
 // this file lays out fit, zoom and pan and reports navigation, cancel, retry,
-// save and close. Zoom and pan change immediately, with no animation.
+// playback, save and close. Zoom and pan change immediately, with no
+// animation; an animated picture plays only when Rust says so.
 
 export struct ViewerPalette {
     ink: color,
@@ -74,10 +75,13 @@ component ViewerAction inherits Rectangle {
     }
 }
 
-// The modal viewer. Escape closes; Tab moves between Close, Save and the
-// loading action; Left/Right open the previous/next loaded image, or pan
-// while zoomed; Up/Down pan; +, - and 0 zoom in, out and back to fit.
+// The modal viewer. Escape closes; Tab moves between Close, Save, Play and
+// the loading action; Left/Right open the previous/next loaded image, or pan
+// while zoomed; Up/Down pan; +, - and 0 zoom in, out and back to fit; K plays
+// or pauses an animation and R replays it.
 export component MediaViewer inherits Rectangle {
+    // Changes when another item opens; zoom and pan reset then.
+    in property <string> item-key;
     in property <image> image;
     in property <bool> loaded: false;
     in property <bool> loading: false;
@@ -89,8 +93,13 @@ export component MediaViewer inherits Rectangle {
     in property <bool> has-previous: false;
     in property <bool> has-next: false;
     in property <bool> can-save: false;
+    in property <bool> animated: false;
+    in property <bool> playing: false;
+    in property <bool> reduced-motion: false;
     in property <ViewerPalette> palette;
     in property <float> text-scale: 1;
+    callback toggle-playback();
+    callback replay();
     callback close();
     callback previous();
     callback next();
@@ -113,7 +122,11 @@ export component MediaViewer inherits Rectangle {
     property <length> pan-limit-x: max(0px, (root.shown-width - stage.width) / 2);
     property <length> pan-limit-y: max(0px, (root.shown-height - stage.height) / 2);
 
-    changed image => { root.reset-view(); }
+    changed item-key => { root.reset-view(); }
+    // Turning on reduced motion stops a playing animation at once.
+    changed reduced-motion => {
+        if root.reduced-motion && root.playing { root.toggle-playback(); }
+    }
 
     function reset-view() {
         root.zoom = 1;
@@ -133,17 +146,41 @@ export component MediaViewer inherits Rectangle {
         root.pan-y = clamp(y, -root.pan-limit-y, root.pan-limit-y);
     }
 
-    // Close → Save → loading action → Close, skipping disabled actions.
-    function tab(forward: bool) {
-        let can-load = root.loading || root.failed;
-        if save-action.has-focus {
-            if forward && can-load { load-action.focus(); } else { close-action.focus(); }
-        } else if load-action.has-focus {
-            if !forward && root.can-save { save-action.focus(); } else { close-action.focus(); }
-        } else if forward {
-            if root.can-save { save-action.focus(); } else if can-load { load-action.focus(); } else { close-action.focus(); }
+    // Tab order: Close (0), Save (1), Play/Pause (2), loading action (3).
+    pure function action-enabled(index: int) -> bool {
+        index == 1 ? root.can-save
+            : index == 2 ? root.animated && root.loaded
+            : index == 3 ? root.loading || root.failed
+            : true
+    }
+
+    function focus-action(index: int) {
+        if index == 1 {
+            save-action.focus();
+        } else if index == 2 {
+            play-action.focus();
+        } else if index == 3 {
+            load-action.focus();
         } else {
-            if can-load { load-action.focus(); } else if root.can-save { save-action.focus(); } else { close-action.focus(); }
+            close-action.focus();
+        }
+    }
+
+    // Move to the next enabled action; Close is always enabled.
+    function tab(forward: bool) {
+        let current = save-action.has-focus ? 1 : (play-action.has-focus ? 2 : (load-action.has-focus ? 3 : 0));
+        let step = forward ? 1 : 3;
+        let first = mod(current + step, 4);
+        let second = mod(current + 2 * step, 4);
+        let third = mod(current + 3 * step, 4);
+        if root.action-enabled(first) {
+            root.focus-action(first);
+        } else if root.action-enabled(second) {
+            root.focus-action(second);
+        } else if root.action-enabled(third) {
+            root.focus-action(third);
+        } else {
+            close-action.focus();
         }
     }
 
@@ -187,6 +224,12 @@ export component MediaViewer inherits Rectangle {
                 accept
             } else if event.text == "0" {
                 root.reset-view();
+                accept
+            } else if (event.text == "k" || event.text == "K") && root.animated {
+                root.toggle-playback();
+                accept
+            } else if (event.text == "r" || event.text == "R") && root.animated {
+                root.replay();
                 accept
             } else {
                 reject
@@ -331,6 +374,25 @@ export component MediaViewer inherits Rectangle {
                         horizontal-stretch: 1;
                         accessible-label: "Image preview status: " + root.status;
                         accessible-live-region: polite;
+                    }
+                    play-action := ViewerAction {
+                        visible: root.animated && root.loaded;
+                        enabled: root.animated && root.loaded;
+                        text: root.playing ? "Pause" : "Play";
+                        label: root.playing ? "Pause the animation" : "Play the animation";
+                        primary: !root.playing;
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        activated => { root.toggle-playback(); }
+                    }
+                    ViewerAction {
+                        visible: root.animated && root.loaded;
+                        enabled: root.animated && root.loaded;
+                        text: "Replay";
+                        label: "Replay the animation from its first frame";
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        activated => { root.replay(); }
                     }
                     load-action := ViewerAction {
                         visible: root.loading || root.failed;

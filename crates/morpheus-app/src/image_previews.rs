@@ -2,17 +2,22 @@
 //! at a time and no decoded cache is retained. A cancelled codec call already
 //! entered on its dedicated worker cannot be recalled, but its permit remains
 //! held until exit and its result cannot publish to a revoked selection/view.
+//! An animated GIF or WebP plays on that same worker, which then keeps the
+//! permit until playback stops.
+mod animation;
 pub(crate) mod avatar;
 mod decode;
 
-use crate::{AppWindow, live::LiveUi};
+use crate::{AppWindow, StyleTokens, live::LiveUi};
+use animation::{Control, Playback};
 use morpheus_config::{Config, ConfigStore};
 use morpheus_matrix::{AccountManager, AccountSelection};
-use slint::{ComponentHandle, Model, SharedString};
+use slint::{ComponentHandle, Model, Rgba8Pixel, SharedPixelBuffer, SharedString};
 use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{Receiver, SyncSender, sync_channel},
     },
     time::Duration,
 };
@@ -39,10 +44,10 @@ impl PreviewError {
                 "This image could not be loaded. Check the room and preview privacy setting."
             }
             Self::TooLarge => {
-                "Preview limit: 8 MiB, 4096 pixels per side, and 4 megapixels. You can still save the attachment."
+                "Preview limit: 8 MiB, 4096 pixels per side, 4 megapixels and 1000 animation frames. You can still save the attachment."
             }
             Self::Unsupported => {
-                "Preview supports static 8-bit PNG and baseline JPEG. Animation, progressive JPEG, WebP, audio and video previews are not supported yet."
+                "Preview supports 8-bit PNG, baseline JPEG, GIF and WebP; animated GIF and WebP can play. Animated PNG, progressive JPEG, SVG, audio and video previews are not supported yet."
             }
             Self::Invalid => {
                 "This image could not be decoded safely. You can still save the attachment."
@@ -116,10 +121,25 @@ impl Drop for Permit {
     }
 }
 
+/// Playback commands for the current request's animation; dropping the
+/// sender stops the worker at its next wait.
+const PLAYER_COMMANDS: usize = 4;
+/// How long a new request waits for a stopping worker to release its permit.
+const ADMIT_WAIT: Duration = Duration::from_secs(3);
+
+/// The newest animation picture for one request, waiting for the window.
+struct Frame {
+    request: u64,
+    buffer: SharedPixelBuffer<Rgba8Pixel>,
+    playback: Playback,
+}
+
 #[derive(Default)]
 struct State {
     request: Option<Arc<Request>>,
-    pending: Option<(u64, Result<Pixels, PreviewError>)>,
+    pending: Option<(u64, Result<Pixels, PreviewError>, Option<&'static str>)>,
+    player: Option<SyncSender<Control>>,
+    frame: Option<Frame>,
 }
 #[derive(Default)]
 pub struct ImagePreviews {
@@ -127,6 +147,37 @@ pub struct ImagePreviews {
     worker: Arc<AtomicBool>,
     sequence: AtomicU64,
     queued: AtomicBool,
+    frame_queued: AtomicBool,
+}
+
+/// What the worker found in the decrypted plaintext.
+enum Decoded {
+    Still(Pixels, Option<&'static str>),
+    /// Frames now arrive through `ImagePreviews::show_frame`.
+    Animated,
+}
+
+/// What a request's worker needs to play an animation.
+struct Player {
+    commands: Receiver<Control>,
+    autoplay: bool,
+    sink: Arc<ImagePreviews>,
+    weak: slint::Weak<AppWindow>,
+}
+
+fn playback_status(width: u32, height: u32, playback: Playback) -> String {
+    let state = if playback.playing {
+        "playing"
+    } else if playback.ended {
+        "finished · Replay starts it again"
+    } else {
+        "paused · press Play or K"
+    };
+    let format = playback.format.label();
+    match playback.note {
+        Some(note) => format!("{width} × {height} · animated {format} · {state} · {note}"),
+        None => format!("{width} × {height} · animated {format} · {state}"),
+    }
 }
 
 fn clear(ui: &AppWindow) {
@@ -135,6 +186,8 @@ fn clear(ui: &AppWindow) {
     ui.set_image_preview_loaded(false);
     ui.set_image_preview_loading(false);
     ui.set_image_preview_failed(false);
+    ui.set_image_preview_animated(false);
+    ui.set_image_preview_playing(false);
     ui.set_image_preview_status("".into());
     ui.set_image_preview_title("".into());
     ui.set_image_preview_event_id("".into());
@@ -177,6 +230,8 @@ fn publish_position(ui: &AppWindow, event: &str) {
 }
 
 pub fn apply_config(ui: &AppWindow, config: &Config) {
+    // Read when a viewer opens; an animation already open keeps its state.
+    ui.set_image_previews_autoplay(config.media.autoplay_animated_media);
     let enabled = config.media.previews_in_encrypted_rooms;
     if ui.get_image_previews_encrypted_enabled() != enabled {
         // Runs synchronously on the UI thread for each Settings save and each
@@ -196,26 +251,117 @@ impl ImagePreviews {
             request.cancel.stop();
         }
         state.pending = None;
+        // Its worker stops at its next wait; no waiting picture survives.
+        state.player = None;
+        state.frame = None;
+    }
+
+    /// Send a playback command to the current animation, if one plays.
+    fn control(&self, control: Control) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .player
+            .as_ref()
+            .is_some_and(|player| player.try_send(control).is_ok())
+    }
+
+    fn take_current_frame(&self) -> Option<(Arc<Request>, Frame)> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let frame = state.frame.take()?;
+        let request = state.request.as_ref()?;
+        if request.id != frame.request || !request.current() {
+            return None;
+        }
+        Some((request.clone(), frame))
+    }
+
+    /// Called on the worker for every picture. Only the newest waits, and at
+    /// most one window update is queued; a newer view or close discards it.
+    fn show_frame(
+        self: &Arc<Self>,
+        request: &Arc<Request>,
+        picture: &animation::Picture,
+        playback: Playback,
+        weak: &slint::Weak<AppWindow>,
+    ) {
+        if !request.current() {
+            return;
+        }
+        // Copied here, off the UI thread; a dropped picture frees its copy.
+        let buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+            picture.rgba.as_slice(),
+            picture.width,
+            picture.height,
+        );
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state
+                .request
+                .as_ref()
+                .is_none_or(|active| active.id != request.id)
+            {
+                return;
+            }
+            state.frame = Some(Frame {
+                request: request.id,
+                buffer,
+                playback,
+            });
+        }
+        if self.frame_queued.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let owner = self.clone();
+        if weak
+            .upgrade_in_event_loop(move |ui| {
+                owner.frame_queued.store(false, Ordering::Release);
+                let Some((request, frame)) = owner.take_current_frame() else {
+                    return;
+                };
+                if !request.current() || !view_matches(&ui, &request) {
+                    return;
+                }
+                let (width, height) = (frame.buffer.width(), frame.buffer.height());
+                ui.set_image_preview_image(slint::Image::from_rgba8(frame.buffer));
+                ui.set_image_preview_loaded(true);
+                ui.set_image_preview_loading(false);
+                ui.set_image_preview_failed(false);
+                ui.set_image_preview_animated(true);
+                ui.set_image_preview_playing(frame.playback.playing);
+                // Announce only state changes, never every picture.
+                let status = playback_status(width, height, frame.playback);
+                if ui.get_image_preview_status().as_str() != status {
+                    ui.set_image_preview_status(status.into());
+                }
+            })
+            .is_err()
+        {
+            self.frame_queued.store(false, Ordering::Release);
+            self.cancel();
+        }
     }
     pub fn shutdown(&self, ui: &AppWindow) {
         self.cancel();
         clear(ui);
     }
 
-    fn take_current_result(&self) -> Option<(Arc<Request>, Result<Pixels, PreviewError>)> {
+    fn take_current_result(
+        &self,
+    ) -> Option<(Arc<Request>, Result<Pixels, PreviewError>, Option<&'static str>)> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        let (id, result) = state.pending.take()?;
+        let (id, result, note) = state.pending.take()?;
         let request = state.request.as_ref()?;
         if request.id != id || !request.current() {
             return None;
         }
-        Some((request.clone(), result))
+        Some((request.clone(), result, note))
     }
 
     fn present(
         self: &Arc<Self>,
         request: &Arc<Request>,
         result: Result<Pixels, PreviewError>,
+        note: Option<&'static str>,
         weak: &slint::Weak<AppWindow>,
     ) {
         {
@@ -228,7 +374,7 @@ impl ImagePreviews {
             {
                 return;
             }
-            state.pending = Some((request.id, result));
+            state.pending = Some((request.id, result, note));
         }
         if self.queued.swap(true, Ordering::AcqRel) {
             return;
@@ -237,7 +383,7 @@ impl ImagePreviews {
         if weak
             .upgrade_in_event_loop(move |ui| {
                 owner.queued.store(false, Ordering::Release);
-                let Some((request, result)) = owner.take_current_result() else {
+                let Some((request, result, note)) = owner.take_current_result() else {
                     return;
                 };
                 if !request.current() || !view_matches(&ui, &request) {
@@ -257,13 +403,15 @@ impl ImagePreviews {
                         ui.set_image_preview_image(slint::Image::from_rgba8(buffer));
                         ui.set_image_preview_loaded(true);
                         ui.set_image_preview_failed(false);
-                        ui.set_image_preview_status(
-                            format!(
-                                "{} × {} · preview stays in memory",
-                                pixels.width, pixels.height
-                            )
-                            .into(),
+                        let status = format!(
+                            "{} × {} · preview stays in memory",
+                            pixels.width, pixels.height
                         );
+                        let status = match note {
+                            Some(note) => format!("{status} · {note}"),
+                            None => status,
+                        };
+                        ui.set_image_preview_status(status.into());
                     }
                     Err(error) => {
                         ui.set_image_preview_failed(error.retryable());
@@ -361,6 +509,33 @@ impl ImagePreviews {
                 ui.set_image_preview_status("Loading cancelled.".into());
             });
         }
+        {
+            let context = context.clone();
+            ui.on_toggle_image_preview_playback(move || {
+                let Some(ui) = context.weak.upgrade() else {
+                    return;
+                };
+                if ui.get_image_preview_animated() {
+                    let control = if ui.get_image_preview_playing() {
+                        Control::Pause
+                    } else {
+                        Control::Play
+                    };
+                    context.controller.control(control);
+                }
+            });
+        }
+        {
+            let context = context.clone();
+            ui.on_replay_image_preview(move || {
+                let Some(ui) = context.weak.upgrade() else {
+                    return;
+                };
+                if ui.get_image_preview_animated() {
+                    context.controller.control(Control::Replay);
+                }
+            });
+        }
         owner
     }
 }
@@ -409,24 +584,41 @@ impl Opener {
         ui.set_image_preview_loading(true);
         publish_position(ui, event);
         ui.set_image_preview_open(true);
-        controller
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .request = Some(request.clone());
-        let Some(permit) = Permit::acquire(&controller.worker) else {
-            controller.present(&request, Err(PreviewError::Busy), &self.weak);
-            return;
-        };
+        let (player, commands) = sync_channel(PLAYER_COMMANDS);
+        {
+            let mut state = controller.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.request = Some(request.clone());
+            state.player = Some(player);
+        }
+        // Animation never starts by itself under reduced motion or while
+        // autoplay is off (the default); the first frame waits for Play.
+        let autoplay = ui.get_image_previews_autoplay()
+            && !ui.global::<StyleTokens>().get_reduced_motion();
         let event = event.to_owned();
         let encrypted = ui.get_image_previews_encrypted_enabled();
         let manager = self.live.manager.clone();
         let controller = controller.clone();
         let weak = self.weak.clone();
         self.runtime.spawn(async move {
-            let result = fetch_decode(manager, request.clone(), event, encrypted, permit).await;
-            if let Some(result) = result {
-                controller.present(&request, result, &weak);
+            match admit(&controller.worker, &request).await {
+                Some(permit) => {
+                    let player = Player {
+                        commands,
+                        autoplay,
+                        sink: controller.clone(),
+                        weak: weak.clone(),
+                    };
+                    match fetch_decode(manager, request.clone(), event, encrypted, permit, player)
+                        .await
+                    {
+                        Some(Ok(Decoded::Still(pixels, note))) => {
+                            controller.present(&request, Ok(pixels), note, &weak);
+                        }
+                        Some(Err(error)) => controller.present(&request, Err(error), None, &weak),
+                        Some(Ok(Decoded::Animated)) | None => {}
+                    }
+                }
+                None => controller.present(&request, Err(PreviewError::Busy), None, &weak),
             }
             if request.current() {
                 request.cancelled().await;
@@ -471,13 +663,29 @@ fn publication_context_matches(
         && actual_room == expected_room
 }
 
+/// The single decode permit, waiting briefly for a stopping worker (such as
+/// an animation that was just closed) to release it.
+async fn admit(gate: &Arc<AtomicBool>, request: &Request) -> Option<Permit> {
+    let deadline = tokio::time::Instant::now() + ADMIT_WAIT;
+    loop {
+        if let Some(permit) = Permit::acquire(gate) {
+            return Some(permit);
+        }
+        if !request.current() || tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 async fn fetch_decode(
     manager: Arc<AccountManager>,
     request: Arc<Request>,
     event: String,
     encrypted: bool,
     permit: Permit,
-) -> Option<Result<Pixels, PreviewError>> {
+    player: Player,
+) -> Option<Result<Decoded, PreviewError>> {
     let downloaded = tokio::select! {
         biased;
         _ = request.cancelled() => return None,
@@ -499,26 +707,84 @@ async fn fetch_decode(
             if !work.current() {
                 return;
             }
-            let result = downloaded
-                .into_plaintext()
-                .map_err(|_| PreviewError::Invalid)
-                .and_then(|download| {
-                    let bytes = Zeroizing::new(download.bytes);
-                    if !work.current() {
-                        return Err(PreviewError::Unavailable);
-                    }
-                    decode::decode(bytes)
-                });
-            if work.current() {
-                let _ = sender.send(result);
+            let bytes = match downloaded.into_plaintext() {
+                Ok(download) => Zeroizing::new(download.bytes),
+                Err(_) => {
+                    let _ = sender.send(Err(PreviewError::Invalid));
+                    return;
+                }
+            };
+            if !work.current() {
+                return;
             }
+            let Some(format) = animation::Format::sniff(&bytes) else {
+                let result = decode::decode(bytes).map(|pixels| Decoded::Still(pixels, None));
+                if work.current() {
+                    let _ = sender.send(result);
+                }
+                return;
+            };
+            let mut pass = match animation::Pass::open(format, &bytes) {
+                Ok(animation::Opened::Animated(pass)) => pass,
+                Ok(animation::Opened::Still(pixels)) => {
+                    let _ = sender.send(Ok(Decoded::Still(pixels, None)));
+                    return;
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    return;
+                }
+            };
+            let first = match pass.next_frame() {
+                Ok(Some(first)) => first,
+                Ok(None) => {
+                    let _ = sender.send(Err(PreviewError::Invalid));
+                    return;
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    return;
+                }
+            };
+            if !pass.playable() {
+                let note = "Shown still: animations over 2 megapixels don't play.";
+                let _ = sender.send(Ok(Decoded::Still(first.into_pixels(), Some(note))));
+                return;
+            }
+            let second = match pass.next_frame() {
+                Ok(Some(second)) => second,
+                // A single picture, or a broken second frame: show the first.
+                Ok(None) | Err(_) => {
+                    let _ = sender.send(Ok(Decoded::Still(first.into_pixels(), None)));
+                    return;
+                }
+            };
+            if !work.current() || sender.send(Ok(Decoded::Animated)).is_err() {
+                return;
+            }
+            let Player {
+                commands,
+                autoplay,
+                sink,
+                weak,
+            } = player;
+            animation::play(
+                &bytes,
+                pass,
+                first,
+                second,
+                &commands,
+                autoplay,
+                &|| work.current(),
+                &|picture, playback| sink.show_frame(&work, picture, playback, &weak),
+            );
         });
     if spawned.is_err() {
         return Some(Err(PreviewError::Unavailable));
     }
     // The dedicated worker is detached, not Tokio's shutdown-critical pool.
     // Cancellation drops its receiver; the worker keeps the sole permit until
-    // its already-entered bounded codec operation finishes.
+    // its already-entered bounded codec operation or playback ends.
     tokio::select! {
         biased;
         _ = request.cancelled() => None,
@@ -587,6 +853,7 @@ mod tests {
                 height: 1,
                 rgba: Zeroizing::new(vec![1, 2, 3, 4]),
             }),
+            None,
         ));
         owner.cancel();
         assert!(owner.state.lock().unwrap().pending.is_none());

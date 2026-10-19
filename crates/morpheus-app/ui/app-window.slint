@@ -2287,6 +2287,8 @@ export component AppWindow inherits Window {
     callback preview-adjacent-image(int);
     callback retry-image-preview();
     callback cancel-image-preview-loading();
+    callback toggle-image-preview-playback();
+    callback replay-image-preview();
     in-out property <bool> image-preview-open: false;
     in-out property <bool> image-preview-loaded: false;
     in-out property <bool> image-preview-loading: false;
@@ -2298,6 +2300,10 @@ export component AppWindow inherits Window {
     in-out property <string> image-preview-position;
     in-out property <bool> image-preview-has-previous: false;
     in-out property <bool> image-preview-has-next: false;
+    in-out property <bool> image-preview-animated: false;
+    in-out property <bool> image-preview-playing: false;
+    // media.autoplay_animated_media; reduced motion still prevents autoplay.
+    in-out property <bool> image-previews-autoplay: false;
     in-out property <string> image-preview-token;
     in-out property <string> image-preview-account-id;
     in-out property <string> image-preview-room-id;
@@ -6429,6 +6435,7 @@ export component AppWindow inherits Window {
     }
 
     if root.image-preview-open && root.image-preview-account-id == root.active-account-local-id && root.image-preview-room-id == root.active-room-id : MediaViewer {
+        item-key: root.image-preview-event-id;
         image: root.image-preview-image;
         loaded: root.image-preview-loaded;
         loading: root.image-preview-loading;
@@ -6439,6 +6446,9 @@ export component AppWindow inherits Window {
         has-previous: root.image-preview-has-previous;
         has-next: root.image-preview-has-next;
         can-save: root.image-preview-event-id != "" && root.downloading-event-id == "";
+        animated: root.image-preview-animated;
+        playing: root.image-preview-playing;
+        reduced-motion: StyleTokens.reduced-motion;
         text-scale: root.text-scale;
         palette: {
             ink: root.ink,
@@ -6457,6 +6467,8 @@ export component AppWindow inherits Window {
         next => { root.preview-adjacent-image(1); }
         cancel-loading => { root.cancel-image-preview-loading(); }
         retry => { root.retry-image-preview(); }
+        toggle-playback => { root.toggle-image-preview-playback(); }
+        replay => { root.replay-image-preview(); }
         save => { root.save-attachment(root.image-preview-event-id, root.image-preview-title); }
     }
 

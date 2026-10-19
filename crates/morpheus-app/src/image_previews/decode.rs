@@ -10,7 +10,7 @@ pub(super) const MAX_SIDE: u32 = 4096;
 pub(super) const MAX_PIXELS: usize = 4 * 1024 * 1024;
 const MAX_DECODER_ALLOC: u64 = 32 * 1024 * 1024;
 
-fn size(width: u32, height: u32) -> Result<usize, PreviewError> {
+pub(super) fn size(width: u32, height: u32) -> Result<usize, PreviewError> {
     let pixels = (width as usize)
         .checked_mul(height as usize)
         .ok_or(PreviewError::TooLarge)?;
