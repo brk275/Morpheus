@@ -451,6 +451,8 @@ export component IdentityWarningBanner inherits Rectangle {
     in property <float> text-scale: 1;
     // Display name, or the user ID when the member has none.
     in property <string> name;
+    // Their Matrix ID, shown under the warning since names are not unique.
+    in property <string> user-id;
     // 1: the identity changed; 2: a verified identity changed.
     in property <int> kind;
     // Further members with a warning in this room.
@@ -484,6 +486,13 @@ export component IdentityWarningBanner inherits Rectangle {
                 font-size: 11px * root.text-scale;
                 wrap: word-wrap;
                 accessible-live-region: polite;
+            }
+            if root.user-id != "" && root.user-id != root.name : Text {
+                text: root.user-id;
+                color: root.palette.muted;
+                font-size: 10px * root.text-scale;
+                wrap: word-wrap;
+                accessible-label: "Matrix ID " + root.user-id;
             }
             if root.error != "" : Text {
                 text: root.error;
