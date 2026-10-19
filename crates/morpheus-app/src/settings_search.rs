@@ -139,3 +139,24 @@ fn request_settings_reveal(ui: &AppWindow) {
     let serial = ui.get_settings_reveal_serial();
     ui.set_settings_reveal_serial(serial.checked_add(1).unwrap_or(1).max(1));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exact_field_results_name_their_config_key_and_sections_none() {
+        let token = registry::color_result("color:link").expect("the link token");
+        assert_eq!(result_item(SearchHit::Color(token)).key, "colors.link");
+
+        for (field, editor) in registry::metric_fields() {
+            let item = result_item(SearchHit::Metric(field, editor));
+            assert_eq!(item.key, field.key);
+            // The key is registry text, never a value or a path.
+            assert!(!item.key.contains('/') && !item.key.contains('\\'));
+        }
+
+        let section = registry::setting_target("appearance.colors").expect("the colors section");
+        assert!(result_item(SearchHit::Setting(section)).key.is_empty());
+    }
+}
