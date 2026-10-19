@@ -54,12 +54,14 @@ pub use room_settings::{
 };
 mod notification_rules;
 mod rich_text;
+mod room_tags;
 pub use account_selection::AccountSelection;
 pub use admin::RoomMemberInfo;
 pub use notification_rules::{
     MAX_NOTIFICATION_KEYWORDS, MAX_NOTIFICATION_KEYWORD_CHARS, MAX_NOTIFICATION_ROOMS,
     NotificationDefaults, NotificationMode, RoomNotificationRule, RoomUnreadCounts,
 };
+pub use room_tags::{MAX_TAG_ORDER_WRITES, RoomTagChange, RoomTagError, TagOrder};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -248,6 +250,15 @@ pub struct RoomInfo {
     pub is_direct: bool,
     pub is_space: bool,
     pub avatar_mxc: Option<String>,
+    /// Standard `m.favourite` and `m.lowpriority` tags; Morpheus keeps them
+    /// exclusive when it writes them, but another client may set both.
+    #[serde(default)]
+    pub favourite: bool,
+    #[serde(default)]
+    pub low_priority: bool,
+    /// Order of the favourite tag, else of the low-priority tag.
+    #[serde(default)]
+    pub tag_order: Option<TagOrder>,
     pub unread_messages: u64,
     pub unread_notifications: u64,
 }
@@ -3900,6 +3911,7 @@ async fn room_info(room: &Room) -> RoomInfo {
         .await
         .map(|name| name.to_string())
         .unwrap_or_else(|_| room_id.clone());
+    let tags = room_tags::tag_summary(room).await;
     RoomInfo {
         room_id,
         name,
@@ -3908,6 +3920,9 @@ async fn room_info(room: &Room) -> RoomInfo {
         is_direct: room.is_direct().await.unwrap_or(false),
         is_space: room.is_space(),
         avatar_mxc: room.avatar_url().map(|url| url.to_string()),
+        favourite: tags.favourite,
+        low_priority: tags.low_priority,
+        tag_order: tags.order,
         unread_messages: room.num_unread_messages(),
         unread_notifications: room.num_unread_notifications(),
     }

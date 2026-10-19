@@ -76,6 +76,9 @@ preserves that ordering within each section. DM and voice-room identities,
 unread badges and normal open/join actions remain distinct. The quick switcher
 and next/previous unread shortcuts follow the displayed order. Invitations keep
 their separate controls. Space membership and account selection do not change.
+Favorites and Low priority sections come from the account's Matrix room tags
+and keep their tag order; unread-first sorting does not reorder them. See
+[room organization](ROOM_ORGANIZATION.md).
 
 Settings and file edits update the current view without restarting sync. If a
 mode change removes the focused navigation control, focus moves to the account

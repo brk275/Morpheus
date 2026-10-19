@@ -30,6 +30,7 @@ mod notifications;
 mod outgoing_ring;
 #[cfg(debug_assertions)]
 mod preview_capture;
+mod room_organization;
 mod room_settings;
 mod security;
 mod settings_search;
@@ -141,6 +142,8 @@ fn room(
             voice_space: false,
             voice_local: false,
             voice_shared: false,
+            favourite: false,
+            low_priority: false,
         },
         topic: topic.into(),
         messages,
@@ -1920,6 +1923,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         store.clone(),
         runtime.handle(),
     );
+    let _room_organizer = room_organization::register(&ui, live.clone(), runtime.handle().clone());
 
     let watch = store.watch_with_theme(Duration::from_millis(700));
     let weak = ui.as_weak();

@@ -1,6 +1,13 @@
 //! Presentation ordering over the already account/Space-filtered room models.
 //! This module never selects an account, changes membership, or opens a room.
+//!
+//! Rooms tagged `m.favourite` or `m.lowpriority` move out of the room and
+//! direct-message lists into the Favorites and Low priority sections. Those
+//! sections keep their tag order (rooms without an order follow by name) and
+//! are not resorted by unread state; unread-first applies to the other lists
+//! as before. Tags never widen what the current Home or Space view shows.
 
+use morpheus_matrix::TagOrder;
 use slint::{Model, ModelRc, VecModel};
 use std::collections::HashSet;
 
@@ -10,13 +17,46 @@ struct RoomOrder {
     channels: Vec<RoomItem>,
     direct_messages: Vec<RoomItem>,
     combined: Vec<NavigationRoomItem>,
+    favourites: Vec<NavigationRoomItem>,
+    low_priority: Vec<NavigationRoomItem>,
 }
 
 fn room_order(
-    mut channels: Vec<RoomItem>,
-    mut direct_messages: Vec<RoomItem>,
+    channels: Vec<RoomItem>,
+    direct_messages: Vec<RoomItem>,
     unread_first: bool,
+    order_of: impl Fn(&str) -> Option<TagOrder>,
 ) -> RoomOrder {
+    let mut favourites = Vec::new();
+    let mut low_priority = Vec::new();
+    let mut keep = |rooms: Vec<RoomItem>, direct: bool| {
+        let mut kept = Vec::with_capacity(rooms.len());
+        for room in rooms {
+            if room.favourite {
+                favourites.push(NavigationRoomItem { room, direct });
+            } else if room.low_priority {
+                low_priority.push(NavigationRoomItem { room, direct });
+            } else {
+                kept.push(room);
+            }
+        }
+        kept
+    };
+    let mut channels = keep(channels, false);
+    let mut direct_messages = keep(direct_messages, true);
+    // Ordered rooms first by their order, then the rest by name; identity
+    // breaks ties, never the display name alone.
+    let tag_key = |entry: &NavigationRoomItem| {
+        let order = order_of(entry.room.id.as_str());
+        (
+            order.is_none(),
+            order,
+            entry.room.name.to_lowercase(),
+            entry.room.id.clone(),
+        )
+    };
+    favourites.sort_by_cached_key(tag_key);
+    low_priority.sort_by_cached_key(tag_key);
     let mut combined = channels
         .iter()
         .cloned()
@@ -44,6 +84,8 @@ fn room_order(
         channels,
         direct_messages,
         combined,
+        favourites,
+        low_priority,
     }
 }
 
@@ -52,16 +94,22 @@ pub(crate) fn apply_room_order(ui: &AppWindow) {
         ui.get_unsorted_channels().iter().collect(),
         ui.get_unsorted_direct_messages().iter().collect(),
         ui.get_sort_unread_first(),
+        crate::room_organization::order_of,
     );
     ui.set_channels(ModelRc::new(VecModel::from(order.channels)));
     ui.set_direct_messages(ModelRc::new(VecModel::from(order.direct_messages)));
     ui.set_combined_rooms(ModelRc::new(VecModel::from(order.combined)));
+    ui.set_favourite_rooms(ModelRc::new(VecModel::from(order.favourites)));
+    ui.set_low_priority_rooms(ModelRc::new(VecModel::from(order.low_priority)));
+    crate::room_organization::publish_active(ui);
 }
 
 /// Keyboard navigation follows the same displayed list order; duplicate IDs
 /// are ignored for traversal without conflating equal display names.
 pub(crate) fn visible_rooms(ui: &AppWindow) -> Vec<RoomItem> {
-    let rooms = if ui.get_group_direct_messages() {
+    // Favorites, then the room lists, then Low priority, as displayed. A
+    // collapsed section keeps its place so its rooms stay reachable.
+    let middle = if ui.get_group_direct_messages() {
         ui.get_channels()
             .iter()
             .chain(ui.get_direct_messages().iter())
@@ -72,6 +120,13 @@ pub(crate) fn visible_rooms(ui: &AppWindow) -> Vec<RoomItem> {
             .map(|entry| entry.room)
             .collect::<Vec<_>>()
     };
+    let rooms = ui
+        .get_favourite_rooms()
+        .iter()
+        .map(|entry| entry.room)
+        .chain(middle)
+        .chain(ui.get_low_priority_rooms().iter().map(|entry| entry.room))
+        .collect::<Vec<_>>();
     let mut seen = HashSet::new();
     rooms
         .into_iter()
@@ -98,7 +153,7 @@ mod tests {
     fn merged_names_do_not_conflate_room_dm_or_voice_identity() {
         let channels = vec![room("!z", "same", 0, false), room("!c", "Zebra", 1, true)];
         let directs = vec![room("!a", "SAME", 0, true), room("!b", "Aster", 0, false)];
-        let order = room_order(channels, directs, false);
+        let order = room_order(channels, directs, false, |_| None);
         let identities = order
             .combined
             .iter()
@@ -142,7 +197,7 @@ mod tests {
     fn unread_partition_spans_types_and_reverting_restores_filtered_order() {
         let channels = vec![room("!c", "Cedar", 0, false), room("!a", "Aster", 2, false)];
         let directs = vec![room("!d", "Delta", 3, false), room("!b", "Birch", 0, false)];
-        let order = room_order(channels.clone(), directs.clone(), true);
+        let order = room_order(channels.clone(), directs.clone(), true, |_| None);
         assert_eq!(
             order
                 .combined
@@ -153,7 +208,7 @@ mod tests {
         );
         assert_eq!(order.channels[0].id, "!a");
         assert_eq!(order.direct_messages[0].id, "!d");
-        let restored = room_order(channels, directs, false);
+        let restored = room_order(channels, directs, false, |_| None);
         assert_eq!(restored.channels[0].id, "!c");
         assert_eq!(restored.direct_messages[0].id, "!d");
         assert_eq!(
@@ -164,6 +219,64 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["!a", "!b", "!c", "!d"]
         );
-        assert!(room_order(Vec::new(), Vec::new(), true).combined.is_empty());
+        assert!(
+            room_order(Vec::new(), Vec::new(), true, |_| None)
+                .combined
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn tagged_rooms_form_ordered_sections_without_changing_their_identity() {
+        let tagged = |id: &str, name: &str, unread, favourite, low_priority| RoomItem {
+            favourite,
+            low_priority,
+            ..room(id, name, unread, false)
+        };
+        let channels = vec![
+            tagged("!f2", "Beta", 0, true, false),
+            tagged("!n", "Normal", 4, false, false),
+            tagged("!l", "Later", 9, false, true),
+            tagged("!f3", "Alpha", 1, true, false),
+        ];
+        let directs = vec![
+            tagged("!f1", "Zed", 0, true, false),
+            // Another client may set both tags; Favorites wins.
+            tagged("!both", "Both", 0, true, true),
+        ];
+        let orders = |id: &str| match id {
+            "!f1" => TagOrder::new(0.1),
+            "!f2" => TagOrder::new(0.2),
+            _ => None,
+        };
+        let order = room_order(channels, directs, true, orders);
+        let ids = |entries: &[NavigationRoomItem]| {
+            entries
+                .iter()
+                .map(|entry| (entry.room.id.to_string(), entry.direct))
+                .collect::<Vec<_>>()
+        };
+        // Ordered first by order, then unordered by name; unread state does
+        // not reorder a tagged section.
+        assert_eq!(
+            ids(&order.favourites),
+            [
+                ("!f1".to_owned(), true),
+                ("!f2".to_owned(), false),
+                ("!f3".to_owned(), false),
+                ("!both".to_owned(), true),
+            ]
+        );
+        assert_eq!(ids(&order.low_priority), [("!l".to_owned(), false)]);
+        assert_eq!(
+            order
+                .channels
+                .iter()
+                .map(|room| room.id.as_str())
+                .collect::<Vec<_>>(),
+            ["!n"]
+        );
+        assert!(order.direct_messages.is_empty());
+        assert_eq!(order.combined.len(), 1);
     }
 }

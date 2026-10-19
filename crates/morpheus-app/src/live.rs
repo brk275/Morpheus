@@ -1396,6 +1396,7 @@ impl LiveUi {
             ));
             ui.set_unsorted_channels(ModelRc::new(VecModel::<RoomItem>::default()));
             ui.set_unsorted_direct_messages(ModelRc::new(VecModel::<RoomItem>::default()));
+            crate::room_organization::clear(&ui);
             ui.set_messages(ModelRc::new(VecModel::<MessageItem>::default()));
             ui.set_thread_messages(ModelRc::new(VecModel::<MessageItem>::default()));
             ui.set_members(ModelRc::new(VecModel::<MemberItem>::default()));
@@ -2913,6 +2914,7 @@ fn apply_snapshot(
             })
             .collect::<Vec<_>>(),
     )));
+    crate::room_organization::remember(&view.rooms);
     crate::apply_room_sort(ui);
     ui.set_stress_timeline_active(false);
     if let Some(room_id) = view.selected {
@@ -3089,6 +3091,8 @@ fn room_item(room: &RoomInfo, voice_local: bool, voice_shared: bool) -> RoomItem
         voice_space: voice_local || voice_shared,
         voice_local,
         voice_shared,
+        favourite: room.favourite,
+        low_priority: room.low_priority,
     }
 }
 

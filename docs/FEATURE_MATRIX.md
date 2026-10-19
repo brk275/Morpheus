@@ -52,6 +52,7 @@ for sending and receiving; see the [policy](INVITATION_HISTORY_POLICY.md).
 | Nocturne, Terminal and Paper presets; editable TOML themes; independent fonts, scale, density and geometry. | Platform font coverage, installed controls and reload edge cases. |
 | Stacked/compact/nickname-column messages; avatar, timestamp and sender styling; semantic colors. | Complete rendered-text and accessibility checks. |
 | Rail/sidebar navigation, optional Space labels, grouped/combined conversations, unread ordering and pane sizes. | Long names, large Space lists and physical keyboard navigation. |
+| Favorites and Low priority sections from Matrix `m.favourite`/`m.lowpriority` tags, room and header menus, accessible favorite reordering with standard order values. | Tag writes on real homeservers, other clients' orders, context menus per platform, keyboard and screen-reader use. |
 | Highlights, notifications, editable shortcuts and next-call audio-device preferences. | Actual sound/routing behavior and unavailable-device handling on hardware. |
 
 Configuration and generated-UI guards have passed across all four native targets.
