@@ -336,8 +336,7 @@ async fn get_most_recent_edit_excluding(
     // original event when there is no valid edit.
     let latest = related
         .iter()
-        .rev()
-        .find(|edit| {
+        .filter(|edit| {
             if edit.event_id().is_some_and(|id| excluded == Some(id)) {
                 return false;
             }
@@ -356,6 +355,11 @@ async fn get_most_recent_edit_excluding(
                 edit.encryption_info().map(|info| &**info),
             )
             .is_ok()
+        })
+        .max_by(|left, right| {
+            left.timestamp()
+                .cmp(&right.timestamp())
+                .then_with(|| left.event_id().cmp(&right.event_id()))
         })
         .unwrap_or(&original_ev);
 
@@ -1063,8 +1067,9 @@ mod tests {
                 &client,
                 JoinedRoomBuilder::new(room_id).add_timeline_bulk(vec![
                     f.text_msg("firsttext").event_id(original).server_ts(1_000_u64).into_raw_sync(),
-                    edit(older, "olderbody", 2_000_u64),
                     edit(newer, "newestbody", 3_000_u64),
+                    // Arrival order must not make an older edit win.
+                    edit(older, "olderbody", 2_000_u64),
                 ]),
             )
             .await;

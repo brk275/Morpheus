@@ -73,6 +73,8 @@ compatibility.
   parsing the already-redacted cache entry, restores the latest remaining valid
   edit, and excludes the redacted event explicitly. Redacting the original
   removes its replacement too. The original message date remains unchanged.
+  Valid replacements are selected by normalized timestamp and then event ID,
+  so out-of-order arrival cannot select an older edit.
 - `src/search_index/mod.rs`: `SearchIndexGuard::search_filtered(query:
   Option<&str>, &SearchFilter, max, offset, room_id)`. It mirrors the
   existing `pub(crate) search`, creating the room index when missing, and
