@@ -30,7 +30,9 @@ export struct SpaceManagerView {
     panel-id: string,
     space-name: string,
     loaded: bool,
-    loading: bool,
+    // What the read in flight is doing; empty when no read runs. A read can
+    // be stopped; a write cannot.
+    loading-text: string,
     busy: bool,
     can-manage: bool,
     has-more: bool,
@@ -45,6 +47,8 @@ export struct SpaceManagerView {
     selected: SpaceRow,
     selected-detail: string,
     can-join: bool,
+    // The selection is a joined Space that can be shown here instead.
+    can-open: bool,
     can-edit: bool,
     can-move-up: bool,
     can-move-down: bool,
@@ -118,7 +122,7 @@ export component SpaceManagerPage inherits VerticalLayout {
     in-out property <string> order;
     callback scope-changed();
     // 0 refresh, 1 load more, 2 find, 3 clear found, 4 add, 5 save,
-    // 6 move up, 7 move down, 8 remove, 9 join
+    // 6 move up, 7 move down, 8 remove, 9 join, 10 open sub-Space, 11 stop read
     callback action(int);
     callback select(string);
     callback search-edited(string);
@@ -168,10 +172,20 @@ export component SpaceManagerPage inherits VerticalLayout {
             }
         }
     }
-    if root.available && root.view.loading : Text {
-        text: root.view.loaded ? "Refreshing the Space…" : "Loading the Space from your homeserver…";
-        color: root.palette.muted; font-size: 11px * root.text-scale;
-        accessible-live-region: polite;
+    if root.available && root.view.loading-text != "" : HorizontalLayout {
+        spacing: 8px;
+        Text {
+            text: root.view.loading-text;
+            color: root.palette.muted; font-size: 11px * root.text-scale;
+            vertical-alignment: center; horizontal-stretch: 1; wrap: word-wrap;
+            accessible-live-region: polite;
+        }
+        RosterButton {
+            palette: root.palette; text-scale: root.text-scale;
+            text: "Stop";
+            label: "Stop this read; nothing has been changed";
+            activated => { root.action(11); }
+        }
     }
     if root.view.pending-text != "" : Text {
         text: root.view.pending-text;
@@ -327,6 +341,16 @@ export component SpaceManagerPage inherits VerticalLayout {
                     }
                     Text { text: root.view.selected.room-id; color: root.palette.muted; font-size: 10px * root.text-scale; overflow: elide; }
                     Text { text: root.view.selected-detail; color: root.palette.ink; font-size: 11px * root.text-scale; wrap: word-wrap; }
+                    if root.view.can-open : HorizontalLayout {
+                        alignment: start;
+                        RosterButton {
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: "Manage this Space";
+                            label: "Show " + root.view.selected.name + " here to manage its own entries; this selects it in the sidebar";
+                            enabled: !root.view.busy;
+                            activated => { root.action(10); }
+                        }
+                    }
                     if root.view.can-join : HorizontalLayout {
                         alignment: start;
                         RosterButton {

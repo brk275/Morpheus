@@ -98,6 +98,20 @@ pub struct SpaceChildLink {
     content: Value,
 }
 
+impl SpaceChildLink {
+    /// The link a server reporting this content would describe, or `None` for
+    /// a removed link. Writes still compare a link with the server's current
+    /// state before changing anything.
+    pub fn from_content(
+        parent_id: &str,
+        room_id: &str,
+        origin_server_ts: u64,
+        content: Value,
+    ) -> Option<Self> {
+        link_from_content(parent_id, room_id, origin_server_ts, content)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HierarchyPage {
     pub nodes: Vec<SpaceNode>,

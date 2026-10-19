@@ -17,7 +17,7 @@ use morpheus_matrix::{
 use slint::{ComponentHandle, ModelRc, VecModel};
 use tokio::{runtime::Handle, sync::Notify};
 
-use super::{Change, Filter, Intent, Row};
+use super::{Change, Filter, Intent, Reading, Row};
 use crate::{AppWindow, SpaceManagerView, SpaceRow, live::LiveUi};
 
 const SECURITY_BUSY: &str = "Finish the open account security step before changing the Space.";
@@ -34,6 +34,8 @@ pub(crate) const MOVE_UP: i32 = 6;
 pub(crate) const MOVE_DOWN: i32 = 7;
 pub(crate) const REMOVE: i32 = 8;
 pub(crate) const JOIN: i32 = 9;
+pub(crate) const OPEN_SPACE: i32 = 10;
+pub(crate) const STOP: i32 = 11;
 
 struct Panel {
     id: u64,
@@ -42,6 +44,8 @@ struct Panel {
     space_name: String,
     cancellation: RoomSettingsCancellation,
     wake: Notify,
+    /// The read generation the operator stopped; 0 for none.
+    stop: AtomicU64,
     state: Mutex<PanelState>,
 }
 
@@ -55,6 +59,8 @@ struct PanelState {
     pages: usize,
     loaded: bool,
     progress: Progress,
+    /// The read in flight, if the busy operation is a read.
+    reading: Option<Reading>,
     /// A write finished; the hierarchy is read again before anything else.
     stale: bool,
     selected: Option<String>,
@@ -128,6 +134,22 @@ impl Panel {
             tokio::select! { biased; _ = self.selection.revoked() => return, _ = notified => {} }
         }
     }
+    fn stop(&self, generation: u64) {
+        self.stop.store(generation, Ordering::Release);
+        self.wake.notify_waiters();
+    }
+    /// Completes once the operator stops the read with this generation.
+    async fn stopped(&self, generation: u64) {
+        loop {
+            let notified = self.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.stop.load(Ordering::Acquire) == generation {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 enum Done {
@@ -145,6 +167,7 @@ enum Done {
 enum Failure {
     Admin(RoomAdminError),
     Join,
+    Stopped,
 }
 
 impl From<RoomAdminError> for Failure {
@@ -316,6 +339,7 @@ impl SpaceManagerUi {
             space_name,
             cancellation: RoomSettingsCancellation::new(),
             wake: Notify::new(),
+            stop: AtomicU64::new(0),
             state: Mutex::new(PanelState::default()),
         });
         *self.current.lock().unwrap_or_else(|e| e.into_inner()) = Some(panel.clone());
@@ -380,8 +404,42 @@ impl SpaceManagerUi {
             MOVE_UP | MOVE_DOWN => self.review_move(ui, panel, action == MOVE_UP),
             REMOVE => self.review_remove(ui, panel),
             JOIN => self.review_join(ui, panel),
+            OPEN_SPACE => self.open_selected_space(ui, &panel),
+            STOP => self.stop_read(&panel),
             _ => {}
         }
+    }
+
+    /// Stop the read in flight. Nothing was written, so nothing is left
+    /// half-done; the generation still fences the late completion.
+    fn stop_read(&self, panel: &Panel) {
+        let generation = {
+            let state = panel.lock();
+            if !state.progress.busy || state.reading.is_none() {
+                return;
+            }
+            state.progress.generation
+        };
+        panel.stop(generation);
+    }
+
+    /// Show a joined sub-Space here so its own links can be managed. This
+    /// only navigates: the sidebar selects that Space as if it was picked there.
+    fn open_selected_space(&self, ui: &AppWindow, panel: &Panel) {
+        let space = {
+            let state = panel.lock();
+            if state.progress.busy || state.confirm.is_some() {
+                return;
+            }
+            let row = state.selected_row();
+            row.and_then(|row| super::openable_space(row, &state.nodes, &panel.space))
+        };
+        let Some((space_id, name)) = space else {
+            return;
+        };
+        ui.set_active_space_id(space_id.as_str().into());
+        ui.set_active_space_name(name.into());
+        ui.invoke_select_space(space_id.into());
     }
 
     /// Read the first page and permissions again, or the next page.
@@ -400,12 +458,21 @@ impl SpaceManagerUi {
         let Some(generation) = self.begin(ui, &panel) else {
             return;
         };
+        {
+            let mut state = panel.lock();
+            state.reading = Some(match fresh {
+                true if state.loaded => Reading::Refresh,
+                true => Reading::First,
+                false => Reading::More,
+            });
+        }
         self.repaint_panel(ui, &panel);
         let this = self.clone();
         self.runtime.spawn(async move {
             let session = panel.lock().session.clone();
             let result = tokio::select! { biased;
                 _ = panel.cancelled() => return,
+                _ = panel.stopped(generation) => Err(Failure::Stopped),
                 result = async {
                     let session = match session {
                         Some(session) => session,
@@ -434,6 +501,7 @@ impl SpaceManagerUi {
         };
         {
             let mut state = panel.lock();
+            state.reading = Some(Reading::Find);
             state.target = None;
             state.error.clear();
             state.notice.clear();
@@ -444,6 +512,7 @@ impl SpaceManagerUi {
             let session = panel.lock().session.clone();
             let result = tokio::select! { biased;
                 _ = panel.cancelled() => return,
+                _ = panel.stopped(generation) => Err(Failure::Stopped),
                 result = async {
                     let session = session.ok_or(RoomAdminError::Unavailable)?;
                     let target = session.resolve_target(&input).await?;
@@ -683,6 +752,7 @@ impl SpaceManagerUi {
                 return;
             }
             state.pending = None;
+            let reading = state.reading.take();
             if !active {
                 return;
             }
@@ -712,6 +782,10 @@ impl SpaceManagerUi {
                     state.stale |= intent.is_some() && super::reread_after(error);
                 }
                 Err(Failure::Join) => state.error = JOIN_FAILED.to_owned(),
+                Err(Failure::Stopped) => {
+                    let stopped = reading.map_or("Stopped.", super::stopped_text);
+                    state.notice = stopped.to_owned();
+                }
             }
         }
         let this = self.clone();
@@ -867,12 +941,15 @@ fn render(
     let joinable = selected
         .and_then(|row| row.node)
         .is_some_and(|index| state.nodes[index].membership != Some(RoomMembership::Joined));
+    let openable = selected
+        .and_then(|row| super::openable_space(row, &state.nodes, &panel.space))
+        .is_some();
     let confirmation = state.confirm.as_ref().map(super::confirmation);
     let mut view = SpaceManagerView {
         panel_id: previous.panel_id,
         space_name: panel.space_name.as_str().into(),
         loaded: state.loaded,
-        loading: state.progress.busy && state.pending.is_none(),
+        loading_text: state.reading.map_or("", super::reading_text).into(),
         busy: state.progress.busy,
         can_manage,
         has_more: state.next_batch.is_some(),
@@ -889,6 +966,7 @@ fn render(
         notice: state.notice.as_str().into(),
         selected_key: state.selected.clone().unwrap_or_default().into(),
         can_join: joinable,
+        can_open: openable,
         can_edit: editable,
         can_move_up: editable && position.is_some_and(|index| index > 0),
         can_move_down: editable && position.is_some_and(|index| index + 1 < direct.len()),

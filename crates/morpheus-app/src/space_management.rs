@@ -48,6 +48,34 @@ impl Filter {
     }
 }
 
+/// The read in flight, which the operator may stop. Writes cannot be stopped:
+/// one already handed to the homeserver may still apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reading {
+    First,
+    Refresh,
+    More,
+    Find,
+}
+
+pub(crate) fn reading_text(reading: Reading) -> &'static str {
+    match reading {
+        Reading::First => "Loading the Space from your homeserver…",
+        Reading::Refresh => "Refreshing the Space…",
+        Reading::More => "Loading more of the Space…",
+        Reading::Find => "Finding the room through your homeserver…",
+    }
+}
+
+pub(crate) fn stopped_text(reading: Reading) -> &'static str {
+    match reading {
+        Reading::First => "Stopped loading the Space. Refresh to try again.",
+        Reading::Refresh => "Stopped refreshing. The list may be out of date.",
+        Reading::More => "Stopped loading more. The entries already shown are kept.",
+        Reading::Find => "Stopped finding the room. Nothing was added.",
+    }
+}
+
 /// One link in the flattened hierarchy below the managed Space.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Row {
@@ -245,6 +273,21 @@ pub(crate) fn selected_detail(row: &Row, nodes: &[SpaceNode], can_manage: bool) 
         text.push_str(" Your level does not allow changing links.");
     }
     text
+}
+
+/// A joined Space below the managed one, which can be shown here to manage
+/// its own links: its room ID and title.
+pub(crate) fn openable_space(
+    row: &Row,
+    nodes: &[SpaceNode],
+    space_id: &str,
+) -> Option<(String, String)> {
+    let node = &nodes[row.node?];
+    let joined = node.membership == Some(RoomMembership::Joined);
+    if !node.is_space || !joined || node.room_id == space_id {
+        return None;
+    }
+    Some((node.room_id.clone(), title(&node.room_id, Some(node))))
 }
 
 /// An empty or whitespace-only field means no order key.
@@ -544,4 +587,101 @@ pub(crate) fn reread_after(error: RoomAdminError) -> bool {
             | RoomAdminError::RoomNotFound
             | RoomAdminError::NoRoute
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const SPACE: &str = "!space:example.org";
+
+    fn link(parent: &str, room: &str, ts: u64) -> SpaceChildLink {
+        let content = json!({"via": ["example.org"]});
+        SpaceChildLink::from_content(parent, room, ts, content).unwrap()
+    }
+    fn node(room: &str, joined: bool, children: Vec<SpaceChildLink>) -> SpaceNode {
+        SpaceNode {
+            room_id: room.to_owned(),
+            name: None,
+            topic: None,
+            canonical_alias: None,
+            is_space: !children.is_empty(),
+            joined_members: 1,
+            access: NodeAccess::Public,
+            world_readable: false,
+            membership: joined.then_some(RoomMembership::Joined),
+            children,
+            children_truncated: false,
+        }
+    }
+
+    #[test]
+    fn cycles_and_shared_children_are_listed_but_expanded_once() {
+        let a = "!a:example.org";
+        let b = "!b:example.org";
+        let nodes = [
+            node(SPACE, true, vec![link(SPACE, a, 1), link(SPACE, b, 2)]),
+            node(a, true, vec![link(a, b, 1), link(a, SPACE, 2)]),
+            node(b, true, vec![link(b, a, 1)]),
+        ];
+        let rows = rows(SPACE, &nodes);
+        let listed = rows
+            .iter()
+            .map(|row| (row.link.room_id.as_str(), row.depth, row.repeated))
+            .collect::<Vec<_>>();
+        let expected = [
+            (a, 1, false),
+            (b, 2, false),
+            (a, 3, true),
+            (SPACE, 2, true),
+            (b, 1, true),
+        ];
+        assert_eq!(listed, expected);
+    }
+
+    #[test]
+    fn depth_is_capped_and_filters_split_joined_from_not_joined() {
+        let a = "!a:example.org";
+        let b = "!b:example.org";
+        let c = "!c:example.org";
+        let d = "!d:example.org";
+        let nodes = [
+            node(SPACE, true, vec![link(SPACE, a, 1)]),
+            node(a, true, vec![link(a, b, 1)]),
+            node(b, false, vec![link(b, c, 1)]),
+            node(c, true, vec![link(c, d, 1)]),
+        ];
+        let rows = rows(SPACE, &nodes);
+        let depths = rows.iter().map(|row| row.depth).collect::<Vec<_>>();
+        assert_eq!(depths, [1, 2, 3]);
+        let (joined, total) = visible(&rows, &nodes, "", Filter::Joined);
+        assert_eq!((joined.len(), total), (2, 2));
+        let (others, _) = visible(&rows, &nodes, "", Filter::NotJoined);
+        assert_eq!(others[0].link.room_id, b);
+        let (found, _) = visible(&rows, &nodes, "!C:EXAMPLE", Filter::All);
+        assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn unlink_is_destructive_and_only_joined_sub_spaces_open_here() {
+        let a = "!a:example.org";
+        let nodes = [
+            node(SPACE, true, vec![link(SPACE, a, 1)]),
+            node(a, true, vec![link(a, SPACE, 1)]),
+        ];
+        let rows = rows(SPACE, &nodes);
+        let opened = openable_space(&rows[0], &nodes, SPACE);
+        assert_eq!(opened.map(|(id, _)| id).as_deref(), Some(a));
+        assert!(openable_space(&rows[1], &nodes, SPACE).is_none());
+        let link = rows[0].link.clone();
+        let intent = Intent {
+            change: Change::Unlink { link },
+            name: "Room".to_owned(),
+            space: "Space".to_owned(),
+        };
+        let confirmation = confirmation(&intent);
+        assert!(confirmation.destructive);
+        assert!(confirmation.body.contains("Nobody leaves"));
+    }
 }
