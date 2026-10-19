@@ -4593,12 +4593,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             return;
         };
+        // Without recovery, logging out can lose encrypted history for good:
+        // ask first. The confirmation resumes this same selection.
+        if window.get_account_recovery_off() {
+            *logout_pending.borrow_mut() = Some(selection);
+            window.set_logout_key_warning(true);
+            return;
+        }
         #[cfg(feature = "native-calls")]
         if ask_to_leave_call(&weak, &logout_calls, -3) {
             *logout_pending.borrow_mut() = Some(selection);
             return;
         }
         logout_perform(selection);
+    });
+    // "Log out anyway" from the missing-recovery warning continues the same
+    // logout, still behind the leave-call confirmation.
+    let weak = ui.as_weak();
+    let unprotected_pending = pending_logout.clone();
+    let unprotected_perform = perform_logout.clone();
+    #[cfg(feature = "native-calls")]
+    let unprotected_calls = calls.clone();
+    ui.on_log_out_without_recovery(move || {
+        if let Some(window) = weak.upgrade() {
+            window.set_logout_key_warning(false);
+        }
+        let Some(selection) = unprotected_pending.borrow_mut().take() else {
+            return;
+        };
+        #[cfg(feature = "native-calls")]
+        if ask_to_leave_call(&weak, &unprotected_calls, -3) {
+            *unprotected_pending.borrow_mut() = Some(selection);
+            return;
+        }
+        unprotected_perform(selection);
     });
     let weak = ui.as_weak();
     let resume_live = live.clone();

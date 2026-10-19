@@ -1879,6 +1879,7 @@ export component AppWindow inherits Window {
             && !root.show-sign-in && !root.manage-accounts-open && !root.access-open
             && !root.account-menu-open && !root.room-actions-open && !root.room-admin-open
             && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog
+            && !root.logout-key-warning
             && !root.quick-switcher-open && !root.image-preview-open && root.security-recovery-key == "" {
             account-trigger.focus();
         }
@@ -2213,6 +2214,9 @@ export component AppWindow inherits Window {
     // 1 verification, 2 the recovery key; hidden for this account view.
     in-out property <int> device-setup-need;
     in-out property <bool> device-setup-dismissed;
+    // The live account has no recovery; logout asks first (src/main.rs).
+    in-out property <bool> account-recovery-off;
+    in-out property <bool> logout-key-warning: false;
     property <EncryptionPalette> encryption-palette: {
         ink: root.ink,
         muted: root.muted,
@@ -2524,6 +2528,7 @@ export component AppWindow inherits Window {
     callback review-person-request();
     callback decline-person-request();
     callback device-setup-scope-changed();
+    callback log-out-without-recovery();
 
     in-out property <bool> account-menu-open: false;
     in-out property <bool> manage-accounts-open: false;
@@ -2625,7 +2630,7 @@ export component AppWindow inherits Window {
     property <int> composer-focus-request: 0;
 
     in-out property <int> thread-mention-index: 0;
-    out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.access-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && root.security-recovery-key == "" && !root.quick-switcher-open && !root.image-preview-open;
+    out property <bool> mention-ui-allowed: root.live-session && root.page == 0 && !root.show-sign-in && !root.account-menu-open && !root.manage-accounts-open && !root.access-open && !root.room-actions-open && !root.room-admin-open && !root.member-confirm-open && !root.native-capture-picker-open && !root.leave-call-dialog && !root.logout-key-warning && root.security-recovery-key == "" && !root.quick-switcher-open && !root.image-preview-open;
     changed mention-ui-allowed => { if !root.mention-ui-allowed { root.mention-context-changed(); root.sticker-context-changed(); } }
     // Input IDs live inside conditional subtrees; callbacks cross that boundary.
     in-out property <int> composer-caret: -1;
@@ -7476,6 +7481,90 @@ export component AppWindow inherits Window {
                         cancelled => { root.cancel-pending-log-out(); root.leave-call-dialog = false; root.pending-account-index = -1; account-trigger.focus(); }
                         activated => { root.confirm-leave-call(root.pending-account-index); }
                         Text { text: root.leave-call-busy ? "Checking…" : root.native-leave-unconfirmed ? "Continue if safe" : "Leave call"; color: root.accent-ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+            }
+        }
+        }
+    }
+
+    // Logging out with recovery off can lose encrypted history for good.
+    // Cancel and Set up recovery drop the pending logout; only Log out anyway
+    // continues it (still behind the leave-call confirmation).
+    if root.logout-key-warning : FocusScope {
+        init => { cancel-unprotected-logout.focus(); }
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.cancel-pending-log-out();
+                root.logout-key-warning = false;
+                account-trigger.focus();
+                accept
+            } else { reject }
+        }
+        Rectangle {
+        background: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
+        TouchArea { width: parent.width; height: parent.height; }
+        Rectangle {
+            x: (parent.width - 480px) / 2;
+            y: (parent.height - 250px) / 2;
+            width: 480px;
+            height: 250px;
+            background: root.elevated;
+            border-color: root.divider;
+            border-width: 1px;
+            border-radius: 14px;
+            accessible-role: region;
+            accessible-label: "Log out without recovery";
+            VerticalLayout {
+                padding: 22px;
+                spacing: 13px;
+                Text { text: "Log out without recovery?"; color: root.ink; font-size: 19px * root.text-scale; font-weight: 750; }
+                Text { text: "Recovery isn't set up for this account. After you log out, encrypted messages can only be read on another signed-in device that has their keys. Set up recovery first to keep them."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                Rectangle { vertical-stretch: 1; background: transparent; }
+                HorizontalLayout {
+                    spacing: 9px;
+                    alignment: end;
+                    cancel-unprotected-logout := ActionRect {
+                        width: 96px; height: 36px; border-radius: 8px; background: root.panel;
+                        focus-color: root.accent;
+                        label: "Cancel logout";
+                        trap-tab: true;
+                        cancel-on-escape: true;
+                        next-focus => { setup-before-logout.focus(); }
+                        previous-focus => { confirm-unprotected-logout.focus(); }
+                        cancelled => { root.cancel-pending-log-out(); root.logout-key-warning = false; account-trigger.focus(); }
+                        activated => { root.cancel-pending-log-out(); root.logout-key-warning = false; account-trigger.focus(); }
+                        Text { text: "Cancel"; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    setup-before-logout := ActionRect {
+                        width: 148px; height: 36px; border-radius: 8px; background: root.accent;
+                        focus-color: root.accent-ink;
+                        label: "Set up recovery instead of logging out";
+                        trap-tab: true;
+                        cancel-on-escape: true;
+                        next-focus => { confirm-unprotected-logout.focus(); }
+                        previous-focus => { cancel-unprotected-logout.focus(); }
+                        cancelled => { root.cancel-pending-log-out(); root.logout-key-warning = false; account-trigger.focus(); }
+                        activated => {
+                            root.cancel-pending-log-out();
+                            root.logout-key-warning = false;
+                            root.open-security();
+                            root.settings-search-choose("security.recovery");
+                        }
+                        Text { text: "Set up recovery"; color: root.accent-ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    confirm-unprotected-logout := ActionRect {
+                        width: 140px; height: 36px; border-radius: 8px;
+                        background: StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : #e47483;
+                        focus-color: StyleTokens.roles.destructive-ink.present ? StyleTokens.roles.destructive-ink.color : #10131b;
+                        label: "Log out without recovery";
+                        trap-tab: true;
+                        cancel-on-escape: true;
+                        next-focus => { cancel-unprotected-logout.focus(); }
+                        previous-focus => { setup-before-logout.focus(); }
+                        cancelled => { root.cancel-pending-log-out(); root.logout-key-warning = false; account-trigger.focus(); }
+                        activated => { root.log-out-without-recovery(); }
+                        Text { text: "Log out anyway"; color: StyleTokens.roles.destructive-ink.present ? StyleTokens.roles.destructive-ink.color : #10131b; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                     }
                 }
             }

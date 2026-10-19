@@ -2686,10 +2686,13 @@ async fn exercise_account_ui(runtime: Handle) {
     // The departed account's device-setup prompt and its dismissal.
     ui.set_device_setup_need(1);
     ui.set_device_setup_dismissed(true);
+    ui.set_account_recovery_off(true);
     ui.set_security_key_file_passphrase("synthetic key file passphrase".into());
     ui.set_security_key_file_confirm("synthetic key file passphrase".into());
     settle(&ui).await;
     assert_eq!(control_bounds(&ui, "One-time Matrix recovery key").len(), 1);
+    // An open missing-recovery logout warning closes with the account.
+    ui.set_logout_key_warning(true);
     live.account_detached(ui.as_weak()).await;
     settle(&ui).await;
     assert!(!ui.get_live_session());
@@ -2758,6 +2761,8 @@ async fn exercise_account_ui(runtime: Handle) {
     assert!(ui.get_person_request_error().is_empty());
     assert_eq!(ui.get_device_setup_need(), 0);
     assert!(!ui.get_device_setup_dismissed());
+    assert!(!ui.get_account_recovery_off());
+    assert!(!ui.get_logout_key_warning());
     assert!(ui.get_security_key_file_passphrase().is_empty());
     assert!(ui.get_security_key_file_confirm().is_empty());
     assert!(manager.active_account().await.is_none());

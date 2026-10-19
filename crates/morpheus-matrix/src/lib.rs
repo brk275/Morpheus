@@ -57,9 +57,9 @@ pub use account_selection::AccountSelection;
 pub use admin::RoomMemberInfo;
 mod encryption;
 pub use encryption::{
-    DeviceSetupNeed, DeviceTrust, MIN_KEY_FILE_PASSPHRASE_CHARS, OwnDeviceInfo, PersonRequestWatch,
-    PersonVerificationRequest, VerificationCancel, VerificationCancelKind, VerificationOutcome,
-    VerificationSnapshot,
+    DeviceSetup, DeviceSetupNeed, DeviceTrust, MIN_KEY_FILE_PASSPHRASE_CHARS, OwnDeviceInfo,
+    PersonRequestWatch, PersonVerificationRequest, VerificationCancel, VerificationCancelKind,
+    VerificationOutcome, VerificationSnapshot,
 };
 mod device_sessions;
 pub use device_sessions::{

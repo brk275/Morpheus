@@ -2,6 +2,7 @@
 //! recovery key where recovery is incomplete. One task follows the live
 //! account's SDK state under the selection captured for it. The prompt only
 //! opens Security settings; it never verifies, recovers or resets anything.
+//! The same state tells logout to warn first when recovery is off.
 
 use std::sync::{
     Arc, Mutex,
@@ -42,13 +43,16 @@ fn need_code(need: DeviceSetupNeed) -> i32 {
     }
 }
 
-/// Stop following and hide the prompt. Called on every account change,
-/// logout and detach; the scope change starts the next watch.
+/// Stop following and hide the prompt and any logout warning. Called on
+/// every account change, logout and detach; the scope change starts the
+/// next watch.
 pub(crate) fn clear_ui(ui: &AppWindow) {
     stop_watcher();
     GENERATION.fetch_add(1, Ordering::AcqRel);
     ui.set_device_setup_need(0);
     ui.set_device_setup_dismissed(false);
+    ui.set_account_recovery_off(false);
+    ui.set_logout_key_warning(false);
 }
 
 fn follow(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle) {
@@ -63,16 +67,17 @@ fn follow(ui: &AppWindow, live: &Arc<LiveUi>, handle: &Handle) {
     let manager = live.manager.clone();
     let weak = ui.as_weak();
     let task = handle.spawn(async move {
-        let Ok(mut needs) = manager.watch_device_setup_for(&account_id).await else {
+        let Ok(mut states) = manager.watch_device_setup_for(&account_id).await else {
             return;
         };
-        while let Some(Some(need)) = selection.guard(needs.next()).await {
+        while let Some(Some(setup)) = selection.guard(states.next()).await {
             let shown = account_id.clone();
             let _ = weak.upgrade_in_event_loop(move |ui| {
                 if GENERATION.load(Ordering::Acquire) == generation
                     && scope(&ui).as_deref() == Some(shown.as_str())
                 {
-                    ui.set_device_setup_need(need_code(need));
+                    ui.set_device_setup_need(need_code(setup.need));
+                    ui.set_account_recovery_off(setup.recovery_off);
                 }
             });
         }

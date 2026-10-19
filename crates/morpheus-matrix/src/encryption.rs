@@ -89,6 +89,15 @@ pub enum DeviceSetupNeed {
     EnterRecoveryKey,
 }
 
+/// This device's setup need, plus whether the account has no recovery at
+/// all: logging out the last device holding its keys then loses encrypted
+/// history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeviceSetup {
+    pub need: DeviceSetupNeed,
+    pub recovery_off: bool,
+}
+
 enum DeviceStateChange {
     Verification(VerificationState),
     Recovery(RecoveryState),
@@ -519,12 +528,13 @@ impl AccountManager {
     }
 
     /// Follow what this device still needs (verification, or the recovery
-    /// key) through the SDK's state subscribers: the current need first,
-    /// then every change. Nothing is changed here.
+    /// key) and whether recovery is off, through the SDK's state
+    /// subscribers: the current state first, then every change. Nothing is
+    /// changed here.
     pub async fn watch_device_setup_for(
         &self,
         expected_account_id: &str,
-    ) -> Result<BoxStream<'static, DeviceSetupNeed>> {
+    ) -> Result<BoxStream<'static, DeviceSetup>> {
         let client = self.encryption_client_for(expected_account_id).await?;
         let encryption = client.encryption();
         let verification = encryption
@@ -541,7 +551,10 @@ impl AccountManager {
                 DeviceStateChange::Verification(state) => latest.0 = state,
                 DeviceStateChange::Recovery(state) => latest.1 = state,
             }
-            std::future::ready(Some(device_setup_need(latest.0, latest.1)))
+            std::future::ready(Some(DeviceSetup {
+                need: device_setup_need(latest.0, latest.1),
+                recovery_off: latest.1 == RecoveryState::Disabled,
+            }))
         });
         Ok(needs.boxed())
     }
