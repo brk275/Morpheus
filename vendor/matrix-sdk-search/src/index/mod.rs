@@ -455,7 +455,7 @@ impl RoomIndex {
         let term = Term::from_field_text(self.schema.primary_key(), event_id.as_str());
         let query = TermQuery::new(term, IndexRecordOption::Basic);
         let Some((_, address)) =
-            searcher.search(&query, &TopDocs::with_limit(1))?.into_iter().next()
+            searcher.search(&query, &TopDocs::with_limit(1).order_by_score())?.into_iter().next()
         else {
             return Ok(None);
         };
