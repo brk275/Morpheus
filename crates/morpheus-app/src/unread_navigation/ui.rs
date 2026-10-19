@@ -501,13 +501,15 @@ fn request_receipt(
     if view.hold_receipts {
         return;
     }
-    let read_through = view.read_through.as_deref().and_then(|key| index_of(rows, key));
+    let read_through = view.read_through.as_deref();
+    let read_through = read_through.and_then(|key| index_of(rows, key));
     let requested = view
         .requested
         .as_deref()
         .and_then(|event_id| index_of_event(rows, event_id));
     let floor = read_through.max(requested);
-    let caught_up = view.caught_up.as_deref().and_then(|key| index_of(rows, key));
+    let caught_up = view.caught_up.as_deref();
+    let caught_up = caught_up.and_then(|key| index_of(rows, key));
     let Some(seen) = seen else {
         return;
     };
@@ -692,7 +694,7 @@ impl Controller {
                 room.positioned = true;
             }
             room.layout = Layout {
-                viewport: reports.first().map_or(0.0, |report| report.geometry.viewport),
+                viewport: reports.first().map_or(0.0, |row| row.geometry.viewport),
                 rows: reports
                     .iter()
                     .map(|report| {
@@ -748,7 +750,8 @@ impl Controller {
             Some(key) => index_of(&rows, key).map(|index| index + 1),
             None => Some(0),
         };
-        let count = unread_below(&rows, last_readable.max(seen_index), divider_index, fresh_from);
+        let reached = last_readable.max(seen_index);
+        let count = unread_below(&rows, reached, divider_index, fresh_from);
         let show_jump = live_feed && !room.at_latest && !rows.is_empty();
         publish_unread(ui, room, show_jump, count);
     }
@@ -1011,7 +1014,7 @@ fn keep_in_place(room: &mut RoomState, ui: &AppWindow, rows: &[Arc<MessageInfo>]
             {
                 room.divider = Some(Divider {
                     event_id: event_id.to_owned(),
-                    after: first_new.checked_sub(1).map(|index| rows[index].key.clone()),
+                    after: first_new.checked_sub(1).map(|at| rows[at].key.clone()),
                     earlier: false,
                 });
             }

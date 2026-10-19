@@ -408,13 +408,22 @@ mod tests {
         ];
         let glimpsed: HashSet<String> = ["b", "d", "e"].map(str::to_owned).into();
         // "b" was read before; "c" is the reader's own; "d" and "e" were seen.
-        assert_eq!(receipt_frontier(&rows, Some(1), None, 4, &glimpsed), Some(4));
+        assert_eq!(
+            receipt_frontier(&rows, Some(1), None, 4, &glimpsed),
+            Some(4)
+        );
         // Opened at the bottom: "a" was never on screen, so nothing moves.
         assert_eq!(receipt_frontier(&rows, None, None, 4, &glimpsed), None);
         // Jump to latest covers what it skipped.
-        assert_eq!(receipt_frontier(&rows, None, Some(4), 4, &glimpsed), Some(4));
+        assert_eq!(
+            receipt_frontier(&rows, None, Some(4), 4, &glimpsed),
+            Some(4)
+        );
         // Never past the newest row seen for the full dwell.
-        assert_eq!(receipt_frontier(&rows, Some(1), None, 3, &glimpsed), Some(3));
+        assert_eq!(
+            receipt_frontier(&rows, Some(1), None, 3, &glimpsed),
+            Some(3)
+        );
         assert_eq!(receipt_frontier(&[], None, None, 0, &glimpsed), None);
     }
 
@@ -446,7 +455,10 @@ mod tests {
             key: "k11".to_owned(),
             top: 40.0,
         };
-        assert_eq!(correction(&target, 11, 20, &reports), Correction::Shift(40.0));
+        assert_eq!(
+            correction(&target, 11, 20, &reports),
+            Correction::Shift(40.0)
+        );
         // The same move is impossible when row 11 is the last row: done.
         assert_eq!(correction(&target, 11, 12, &reports), Correction::Done);
         let placed = ScrollTarget::Row {
@@ -457,7 +469,10 @@ mod tests {
         let end = ScrollTarget::End;
         assert_eq!(correction(&end, 11, 12, &reports), Correction::Done);
         assert_eq!(correction(&end, 15, 16, &reports), Correction::Shift(400.0));
-        assert_eq!(correction(&target, 7, 20, &reports), Correction::Shift(-320.0));
+        assert_eq!(
+            correction(&target, 7, 20, &reports),
+            Correction::Shift(-320.0)
+        );
         assert_eq!(correction(&end, 3, 4, &[]), Correction::Unknown);
         assert_eq!(anchor(&reports), Some(("k10".to_owned(), -20.0)));
     }
