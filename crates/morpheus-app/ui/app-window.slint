@@ -7484,8 +7484,11 @@ export component AppWindow inherits Window {
     if root.manage-accounts-open : FocusScope {
         in property <int> focus-request: root.account-focus-request;
         focus-on-tab-navigation: false;
-        init => { if !root.access-open { manage-close.focus(); } }
-        changed focus-request => {
+        // Search can request a control before this conditional subtree exists.
+        // Apply it on creation as well as later focus requests.
+        init => { self.focus-requested-control(); }
+        changed focus-request => { self.focus-requested-control(); }
+        function focus-requested-control() {
             if root.manage-accounts-open && !root.access-open {
                 if root.manage-accounts-focus == "add" {
                     manage-add.focus();

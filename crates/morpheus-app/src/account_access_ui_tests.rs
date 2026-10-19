@@ -1937,6 +1937,14 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
     ui.on_refresh_security(move || counted.set(counted.get() + 1));
     let counted = actions.clone();
     ui.on_select_audio_microphone(move |_| counted.set(counted.get() + 1));
+    let counted = actions.clone();
+    ui.on_add_account(move || counted.set(counted.get() + 1));
+    let counted = actions.clone();
+    ui.on_open_app_password(move |_| counted.set(counted.get() + 1));
+    let counted = actions.clone();
+    ui.on_activate_saved_account(move |_| counted.set(counted.get() + 1));
+    let counted = actions.clone();
+    ui.on_remove_saved_account(move |_| counted.set(counted.get() + 1));
     let before = std::fs::read_to_string(store.path()).unwrap();
     let live = ui.get_live_session();
     ui.set_live_session(true);
@@ -1955,18 +1963,37 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
             // Fixed registry position and availability only; never emit account
             // identifiers, search text, config contents or arbitrary errors.
             eprintln!(
-                "MORPHEUS_SETTINGS_TARGET_FAILURE index={index} live={}",
+                "MORPHEUS_SETTINGS_TARGET_FAILURE stage=0 index={index} live={}",
                 ui.get_live_session()
             );
         }
         assert!(requested, "{}", target.id);
         settle(ui).await;
+        if ui.get_settings_revealed_id() != target.id {
+            eprintln!(
+                "MORPHEUS_SETTINGS_TARGET_FAILURE stage=1 index={index} live={}",
+                ui.get_live_session()
+            );
+        }
         assert_eq!(
             ui.get_settings_revealed_id(),
             target.id,
             "{} has no destination",
             target.id
         );
+        let account_label = match target.id {
+            "accounts.manage" => Some("Add account"),
+            "accounts.remove" => Some("Done"),
+            "accounts.switch_password" => Some(if ui.get_app_password_enabled() {
+                "Change password"
+            } else {
+                "Set app password"
+            }),
+            _ => None,
+        };
+        if let Some(label) = account_label {
+            assert!(focused_control_has_label(ui, label), "{} focus", target.id);
+        }
     }
     for (target, label) in [
         ("appearance.reduce_motion", "Reduce motion, off"),
