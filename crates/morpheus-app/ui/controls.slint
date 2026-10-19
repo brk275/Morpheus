@@ -41,7 +41,7 @@ export component ActionRect inherits Rectangle {
     forward-focus: keyboard-focus;
     accessible-role: button;
     accessible-label: label;
-    accessible-enabled: enabled;
+    accessible-enabled: root.can-act;
     accessible-action-default => { if root.can-act { root.activated(); } }
     @children
     keyboard-focus := FocusScope {
