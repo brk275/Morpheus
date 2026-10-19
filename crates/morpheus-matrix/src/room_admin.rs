@@ -19,10 +19,11 @@ use matrix_sdk::{
     deserialized_responses::MemberEvent,
     room::RoomMember,
     ruma::{
-        Int, OwnedEventId, OwnedUserId, RoomId, RoomVersionId, ServerName, TransactionId, UInt,
-        UserId,
+        Int, OwnedEventId, OwnedRoomAliasId, OwnedUserId, RoomAliasId, RoomId, RoomVersionId,
+        ServerName, TransactionId, UInt, UserId,
         api::{
             client::{
+                alias::{create_alias, get_alias},
                 directory::{get_room_visibility, set_room_visibility},
                 discovery::get_capabilities,
                 membership::{
@@ -92,6 +93,9 @@ const REMOVAL_BUDGET: Duration = Duration::from_secs(45);
 /// Blocked servers a room may list for Morpheus to edit the list.
 pub const MAX_BLOCKED_SERVERS: usize = 200;
 pub const MAX_SERVER_BYTES: usize = 255;
+pub const MAX_ALIAS_BYTES: usize = 255;
+/// Other published addresses a snapshot keeps.
+const MAX_ALTERNATIVE_ADDRESSES: usize = 20;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RoomAdminError {
@@ -327,6 +331,25 @@ pub enum AccessChange {
     /// List the room in, or remove it from, the homeserver's public room
     /// directory.
     Publish { publish: bool },
+    /// Make the request's user ID, a room address on the account's
+    /// homeserver, the room's main address, creating it there when free.
+    Address,
+}
+
+/// The room's addresses from `m.room.canonical_alias`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AddressSettings {
+    /// The main address, if the room has one.
+    pub main: Option<String>,
+    /// Other published addresses, at most 20.
+    pub alternatives: Vec<String>,
+    /// The content is one Morpheus edits without loss.
+    pub known: bool,
+    pub level: i64,
+    /// Known, and the account may change the main address.
+    pub editable: bool,
+    /// The account's homeserver, where new addresses are created.
+    pub server: String,
 }
 
 /// Homeservers the room blocks with `m.room.server_acl`. People on a blocked
@@ -387,6 +410,8 @@ pub struct RoomAdminSnapshot {
     pub upgrade: Option<UpgradeSettings>,
     /// `None` when the room's rules are unknown.
     pub servers: Option<ServerAclSettings>,
+    /// `None` when the room's rules are unknown.
+    pub addresses: Option<AddressSettings>,
 }
 
 impl RoomAdminSnapshot {
@@ -639,6 +664,7 @@ impl AccountManager {
                 room_version: String::new(),
                 upgrade: None,
                 servers: None,
+                addresses: None,
             })),
             overrides: std::sync::Mutex::new(HashMap::new()),
             operation: Mutex::new(()),
@@ -737,6 +763,9 @@ impl RoomAdminSession {
             let acl = self.optional_state(StateEventType::RoomServerAcl).await?;
             self.check()?;
             snapshot.servers = Some(server_acl_settings(levels, &self.own_user, acl.as_ref()));
+            let main = self.optional_state(StateEventType::RoomCanonicalAlias).await?;
+            self.check()?;
+            snapshot.addresses = Some(address_settings(levels, &self.own_user, main.as_ref()));
         }
         Ok(snapshot)
     }
@@ -877,6 +906,82 @@ impl RoomAdminSession {
         })
         .await
     }
+    /// Make an address on the account's homeserver the room's main address.
+    /// The address is created there for this room when it is free, and
+    /// refused when it belongs to another room; only the `alias` field of
+    /// the room's address content changes.
+    async fn set_main_address(&self, input: &str) -> Result<AdminOutcome> {
+        let alias = checked_alias(input, self.own_user.server_name())?;
+        self.run(WRITE_TIMEOUT, async {
+            let power = self.power_state().await?;
+            let levels = room_settings::effective_power_levels(&self.create, power.as_ref())?
+                .ok_or(RoomAdminError::InvalidState)?;
+            let kind = StateEventType::RoomCanonicalAlias;
+            if !levels.user_can_send_state(&self.own_user, kind.clone()) {
+                return Err(RoomAdminError::InsufficientPower);
+            }
+            let current = self.optional_state(kind.clone()).await?;
+            let current = current.as_ref().map(|event| &event.content);
+            let content = main_address_content(current, alias.as_str())?;
+            self.claim_alias(&alias).await?;
+            let content = finish_content(&content)?;
+            let room_id = self.room.room_id().to_owned();
+            let request =
+                send_state_event::v3::Request::new_raw(room_id, kind, String::new(), content);
+            self.check()?;
+            self.room
+                .client()
+                .send(request)
+                .with_request_config(write_config())
+                .await
+                .map_err(write_failure)?;
+            self.check()?;
+            // Accepted by the server; a failed read-back is unconfirmed, not failed.
+            let built = match self.build(power.as_ref()).await {
+                Ok(built) => Some(self.publish(built)?),
+                Err(_) => None,
+            };
+            let addresses = built.as_ref().and_then(|built| built.addresses.as_ref());
+            let main = addresses.and_then(|addresses| addresses.main.as_deref());
+            let read_back = ObservedTarget {
+                membership: ObservedMembership::None,
+                power: MemberPower::Level(0),
+            };
+            Ok(AdminOutcome {
+                confirmed: main == Some(alias.as_str()),
+                observed: built.is_some().then_some(read_back),
+                snapshot: built.unwrap_or_else(|| self.snapshot()),
+                replacement: None,
+                removal: None,
+            })
+        })
+        .await
+    }
+    /// Make sure the address exists on the account's homeserver and points
+    /// to this room, creating it when it is free.
+    async fn claim_alias(&self, alias: &RoomAliasId) -> Result<()> {
+        let client = self.room.client();
+        let lookup = client
+            .send(get_alias::v3::Request::new(alias.to_owned()))
+            .with_request_config(write_config())
+            .await;
+        match lookup {
+            Ok(found) if found.room_id.as_str() == self.room.room_id().as_str() => return Ok(()),
+            // Taken by another room: never moved.
+            Ok(_) => return Err(RoomAdminError::NotApplicable),
+            Err(error) if missing(&error) => {}
+            Err(error) => return Err(write_failure(error)),
+        }
+        self.check()?;
+        let room_id = self.room.room_id().to_owned();
+        let request = create_alias::v3::Request::new(alias.to_owned(), room_id);
+        client
+            .send(request)
+            .with_request_config(write_config())
+            .await
+            .map_err(write_failure)?;
+        self.check()
+    }
     async fn optional_state(&self, kind: StateEventType) -> Result<Option<StateEnvelope>> {
         let state = room_settings::state(&self.room, kind, "").await?;
         Ok(state)
@@ -902,6 +1007,9 @@ impl RoomAdminSession {
         }
         if let AdminAction::SetAccess(AccessChange::Publish { publish }) = request.action {
             return self.set_listing(publish).await;
+        }
+        if request.action == AdminAction::SetAccess(AccessChange::Address) {
+            return self.set_main_address(&request.user_id).await;
         }
         if let AdminAction::SetAccess(change) = request.action {
             return self.set_access(change).await;
@@ -1674,7 +1782,7 @@ fn access_kind(change: AccessChange) -> StateEventType {
         AccessChange::Encrypt => StateEventType::RoomEncryption,
         AccessChange::Upgrade => StateEventType::RoomTombstone,
         AccessChange::Servers { .. } => StateEventType::RoomServerAcl,
-        AccessChange::Publish { .. } => StateEventType::RoomCanonicalAlias,
+        AccessChange::Publish { .. } | AccessChange::Address => StateEventType::RoomCanonicalAlias,
     }
 }
 
@@ -1685,8 +1793,10 @@ fn access_matches(change: AccessChange, current: Option<&StateEnvelope>) -> bool
         // Any encryption event, even one this client cannot read, means it
         // is on already; it is never replaced.
         AccessChange::Encrypt | AccessChange::Upgrade => current.is_none(),
-        // Checked against the block list or the directory by their own paths.
+        // Checked against the block list, the directory or the address by
+        // their own paths.
         AccessChange::Servers { .. } | AccessChange::Publish { .. } => false,
+        AccessChange::Address => false,
     }
 }
 
@@ -1698,6 +1808,8 @@ fn access_applied(change: AccessChange, access: AccessSettings) -> bool {
         // Confirmed from the tombstone or the block list, not from these settings.
         AccessChange::Upgrade | AccessChange::Servers { .. } => false,
         AccessChange::Publish { publish } => access.listed == Some(publish),
+        // Confirmed from the address settings.
+        AccessChange::Address => false,
     }
 }
 
@@ -1723,11 +1835,108 @@ fn access_request(room: &RoomId, change: AccessChange) -> Result<send_state_even
         }
         // An upgrade is its own request, and the block list keeps fields
         // this client does not edit, so neither is a typed state event.
-        AccessChange::Upgrade | AccessChange::Servers { .. } | AccessChange::Publish { .. } => {
+        AccessChange::Upgrade
+        | AccessChange::Servers { .. }
+        | AccessChange::Publish { .. }
+        | AccessChange::Address => {
             return Err(RoomAdminError::NotApplicable);
         }
     };
     request.map_err(|_| RoomAdminError::InvalidState)
+}
+
+/// The room's addresses. The content is known when it is an object whose
+/// `alias` is absent or a string and whose `alt_aliases` is absent or a list
+/// of strings.
+fn address_settings(
+    levels: &RoomPowerLevels,
+    own: &UserId,
+    event: Option<&StateEnvelope>,
+) -> AddressSettings {
+    let kind = StateEventType::RoomCanonicalAlias;
+    let level = levels.for_state(kind.clone()).into();
+    let allowed = levels.user_can_send_state(own, kind);
+    let server = own.server_name().to_string();
+    let Some(content) = event.map(|event| &event.content) else {
+        return AddressSettings {
+            main: None,
+            alternatives: Vec::new(),
+            known: true,
+            level,
+            editable: allowed,
+            server,
+        };
+    };
+    let main = content.get("alias");
+    let alternatives = string_list(content.get("alt_aliases"));
+    let known = content.is_object() && main.is_none_or(Value::is_string) && alternatives.is_some();
+    let main = main.and_then(Value::as_str);
+    let alternatives = alternatives
+        .unwrap_or_default()
+        .iter()
+        .take(MAX_ALTERNATIVE_ADDRESSES)
+        .map(|alias| bounded(alias, MAX_ALIAS_BYTES))
+        .collect();
+    AddressSettings {
+        main: main.map(|alias| bounded(alias, MAX_ALIAS_BYTES)),
+        alternatives,
+        known,
+        level,
+        editable: known && allowed,
+        server,
+    }
+}
+
+/// A room address on the account's homeserver, from `#name:server` or just
+/// the name. Names keep to lowercase letters, digits and `._=-`.
+fn checked_alias(input: &str, server: &ServerName) -> Result<OwnedRoomAliasId> {
+    let input = input.trim().to_ascii_lowercase();
+    let suffix = format!(":{}", server.as_str().to_ascii_lowercase());
+    let name = match input.strip_prefix('#') {
+        Some(full) => full.strip_suffix(&suffix).ok_or(RoomAdminError::InvalidUserId)?,
+        None => input.as_str(),
+    };
+    let allowed = |byte: u8| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'=' | b'-');
+    if name.is_empty() || !name.bytes().all(allowed) {
+        return Err(RoomAdminError::InvalidUserId);
+    }
+    let alias = format!("#{name}:{server}");
+    if alias.len() > MAX_ALIAS_BYTES {
+        return Err(RoomAdminError::InvalidUserId);
+    }
+    RoomAliasId::parse(&alias).map_err(|_| RoomAdminError::InvalidUserId)
+}
+
+/// The address content with `alias` as the main address. The new main
+/// address is no longer also listed as an alternative; everything else is
+/// kept. Content Morpheus cannot keep intact is refused, never rewritten.
+fn main_address_content(current: Option<&Value>, alias: &str) -> Result<Value> {
+    let mut object = match current {
+        None => Map::new(),
+        Some(Value::Object(object)) => object.clone(),
+        Some(_) => return Err(RoomAdminError::InvalidState),
+    };
+    let main = object.get("alias");
+    if main.is_some_and(|main| !main.is_string()) {
+        return Err(RoomAdminError::InvalidState);
+    }
+    if main.and_then(Value::as_str) == Some(alias) {
+        return Err(RoomAdminError::NotApplicable);
+    }
+    let alternatives = string_list(object.get("alt_aliases"));
+    let mut alternatives = alternatives.ok_or(RoomAdminError::InvalidState)?;
+    if object.contains_key("alt_aliases") {
+        alternatives.retain(|other| other != alias);
+        object.insert("alt_aliases".to_owned(), Value::from(alternatives));
+    }
+    object.insert("alias".to_owned(), Value::from(alias));
+    Ok(Value::Object(object))
+}
+
+/// The homeserver has nothing under that name.
+fn missing(error: &HttpError) -> bool {
+    let error = error.as_client_api_error();
+    error.is_some_and(|error| error.status_code.as_u16() == 404)
 }
 
 /// The blocked servers of `m.room.server_acl`. The list is known only when
@@ -2189,6 +2398,7 @@ fn assemble(
         room_version: room_version.to_owned(),
         upgrade: None,
         servers: None,
+        addresses: None,
     }
 }
 
@@ -2441,6 +2651,51 @@ mod tests {
         assert_eq!(full.removable.len(), MAX_REMOVED_MESSAGES);
         assert!(full.more);
         assert_eq!(full.removable[0].as_str(), "$spam0");
+    }
+
+    #[test]
+    fn main_addresses_are_made_on_the_own_server_and_keep_other_fields() {
+        let own = matrix_sdk::ruma::server_name!("example.org");
+        let lounge = "#lounge:example.org";
+        assert_eq!(checked_alias(" Lounge ", own).unwrap().as_str(), lounge);
+        assert_eq!(checked_alias(lounge, own).unwrap().as_str(), lounge);
+        let invalid = [
+            "",
+            "#lounge:other.org",
+            "two words",
+            "#:example.org",
+            "@me:example.org",
+        ];
+        for input in invalid {
+            let refused = checked_alias(input, own);
+            assert_eq!(refused, Err(RoomAdminError::InvalidUserId));
+        }
+        let first = main_address_content(None, lounge).unwrap();
+        assert_eq!(first, json!({"alias": lounge}));
+        let current = json!({
+            "alias": "#old:example.org",
+            "alt_aliases": [lounge, "#x:example.org"],
+            "custom": 1
+        });
+        let moved = main_address_content(Some(&current), lounge).unwrap();
+        let expected = json!({"alias": lounge, "alt_aliases": ["#x:example.org"], "custom": 1});
+        assert_eq!(moved, expected);
+        let again = main_address_content(Some(&moved), lounge);
+        assert_eq!(again, Err(RoomAdminError::NotApplicable));
+        for odd in [json!({"alias": 5}), json!({"alt_aliases": lounge}), json!([])] {
+            let refused = main_address_content(Some(&odd), lounge);
+            assert_eq!(refused, Err(RoomAdminError::InvalidState));
+        }
+
+        let levels = levels("11", json!({"@mod:example.org": 50}));
+        let moderator = user_id!("@mod:example.org");
+        let event = envelope("m.room.canonical_alias", "@mod:example.org", current);
+        let settings = address_settings(&levels, moderator, Some(&event));
+        assert_eq!(settings.main.as_deref(), Some("#old:example.org"));
+        assert_eq!(settings.alternatives.len(), 2);
+        assert!(settings.known && settings.editable && settings.server == "example.org");
+        let member = user_id!("@member:example.org");
+        assert!(!address_settings(&levels, member, None).editable);
     }
 
     #[test]

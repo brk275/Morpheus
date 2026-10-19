@@ -46,12 +46,13 @@ pub use account_access::{
 mod admin;
 mod room_admin;
 pub use room_admin::{
-    AccessChange, AccessSettings, AdminAction, AdminMember, AdminMembership, AdminOutcome,
-    AdminRequest, HistoryChoice, MAX_ADMIN_REASON_BYTES, MAX_BLOCKED_SERVERS, MAX_REMOVED_MESSAGES,
-    MAX_ROSTER_MEMBERS, MAX_SERVER_BYTES, MemberActions, MemberExpectation, MemberPower,
-    MembershipCounts, MessageRemoval, ObservedMembership, ObservedTarget, OwnAdminPermissions,
-    PERMISSION_KEYS, PermissionKey, PermissionSetting, PowerThresholds, RoomAdminError,
-    RoomAdminSession, RoomAdminSnapshot, RosterWatch, ServerAclSettings, UpgradeSettings,
+    AccessChange, AccessSettings, AddressSettings, AdminAction, AdminMember, AdminMembership,
+    AdminOutcome, AdminRequest, HistoryChoice, MAX_ADMIN_REASON_BYTES, MAX_ALIAS_BYTES,
+    MAX_BLOCKED_SERVERS, MAX_REMOVED_MESSAGES, MAX_ROSTER_MEMBERS, MAX_SERVER_BYTES, MemberActions,
+    MemberExpectation, MemberPower, MembershipCounts, MessageRemoval, ObservedMembership,
+    ObservedTarget, OwnAdminPermissions, PERMISSION_KEYS, PermissionKey, PermissionSetting,
+    PowerThresholds, RoomAdminError, RoomAdminSession, RoomAdminSnapshot, RosterWatch,
+    ServerAclSettings, UpgradeSettings,
 };
 mod room_settings;
 pub use room_settings::{

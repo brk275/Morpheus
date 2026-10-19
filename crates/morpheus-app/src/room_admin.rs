@@ -8,11 +8,12 @@ pub(crate) mod ui;
 pub(crate) use ui::clear_presentation;
 
 use morpheus_matrix::{
-    AccessChange, AccessSettings, AdminAction, AdminMember, AdminMembership, AdminOutcome,
-    AdminRequest, HistoryChoice, MAX_ADMIN_REASON_BYTES, MAX_BLOCKED_SERVERS, MAX_REMOVED_MESSAGES,
-    MAX_SERVER_BYTES, MemberExpectation, MemberPower, MembershipCounts, MessageRemoval,
-    ObservedMembership, ObservedTarget, PERMISSION_KEYS, PermissionKey, PermissionSetting,
-    PowerThresholds, RoomAdminError, RoomAdminSnapshot, ServerAclSettings, UpgradeSettings,
+    AccessChange, AccessSettings, AddressSettings, AdminAction, AdminMember, AdminMembership,
+    AdminOutcome, AdminRequest, HistoryChoice, MAX_ADMIN_REASON_BYTES, MAX_ALIAS_BYTES,
+    MAX_BLOCKED_SERVERS, MAX_REMOVED_MESSAGES, MAX_SERVER_BYTES, MemberExpectation, MemberPower,
+    MembershipCounts, MessageRemoval, ObservedMembership, ObservedTarget, PERMISSION_KEYS,
+    PermissionKey, PermissionSetting, PowerThresholds, RoomAdminError, RoomAdminSnapshot,
+    ServerAclSettings, UpgradeSettings,
 };
 
 /// Rows shown at once. Search narrows a larger roster; the count says so.
@@ -84,6 +85,10 @@ const CUSTOM_SERVERS: &str =
     "This room limits servers with an allow list or settings Morpheus does not edit.";
 const BLOCK_BODY: &str = "can no longer join, send messages or receive new ones in this room. \
      Members already here stay listed but are cut off. Other rooms are unaffected.";
+const CUSTOM_ADDRESS: &str = "This room's addresses use settings Morpheus does not edit.";
+const ADDRESS_TAKEN: &str = "That address already belongs to another room. Choose another name.";
+const ADDRESS_UNCONFIRMED: &str =
+    "The homeserver accepted the change, but the room shows another main address.";
 const LISTING_UNKNOWN: &str = "Your homeserver did not say whether it lists this room.";
 const LIST_BODY: &str = "People on your homeserver, and people searching from other servers, \
      can find this room by its name, topic and address. Who can join is unchanged.";
@@ -112,6 +117,7 @@ pub(crate) const ACCESS_ENCRYPTION: i32 = 3;
 pub(crate) const ACCESS_UPGRADE: i32 = 4;
 pub(crate) const ACCESS_SERVERS: i32 = 5;
 pub(crate) const ACCESS_DIRECTORY: i32 = 6;
+pub(crate) const ACCESS_ADDRESS: i32 = 7;
 /// History options in the panel's order, narrowest first. The Slint option
 /// labels follow the same order.
 pub(crate) const HISTORY_CHOICES: [HistoryChoice; 4] = [
@@ -481,6 +487,9 @@ pub(crate) fn access_rows(snapshot: &RoomAdminSnapshot) -> Vec<AccessRow> {
         editable: access.listing_editable,
         restriction: access_lock(ACCESS_DIRECTORY, access, snapshot),
     });
+    if let Some(addresses) = &snapshot.addresses {
+        rows.push(address_row(addresses, snapshot));
+    }
     if let Some(upgrade) = &snapshot.upgrade {
         rows.push(upgrade_row(upgrade, snapshot));
     }
@@ -488,6 +497,79 @@ pub(crate) fn access_rows(snapshot: &RoomAdminSnapshot) -> Vec<AccessRow> {
         rows.push(servers_row(servers, snapshot));
     }
     rows
+}
+
+fn address_row(addresses: &AddressSettings, snapshot: &RoomAdminSnapshot) -> AccessRow {
+    let main = addresses.main.as_deref();
+    let main = main.map(|main| crate::directory_plain_text(main, 100));
+    let mut summary = main.unwrap_or_else(|| "No main address".to_owned());
+    match addresses.alternatives.len() {
+        0 => {}
+        1 => summary.push_str(" · 1 other address"),
+        count => summary.push_str(&format!(" · {count} other addresses")),
+    }
+    let restriction = if addresses.editable {
+        String::new()
+    } else if !addresses.known {
+        CUSTOM_ADDRESS.to_owned()
+    } else {
+        access_restriction(addresses.level, snapshot)
+    };
+    AccessRow {
+        kind: ACCESS_ADDRESS,
+        choice: i32::from(addresses.main.is_some()),
+        label: "Main address",
+        description: "The address people use to find and share this room, like #name:server.",
+        summary,
+        editable: addresses.editable,
+        restriction,
+    }
+}
+
+/// A room address on the account's homeserver from a name or a full
+/// `#name:server`, as the session accepts it.
+fn parse_address(input: &str, server: &str) -> Result<String, String> {
+    let bad = || format!("Use a name, or #name:{server}. Addresses are made on your homeserver.");
+    let input = input.trim().to_ascii_lowercase();
+    let suffix = format!(":{}", server.to_ascii_lowercase());
+    let name = match input.strip_prefix('#') {
+        Some(full) => full.strip_suffix(&suffix).ok_or_else(bad)?,
+        None => input.as_str(),
+    };
+    let allowed = |byte: u8| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'=' | b'-');
+    let alias = format!("#{name}:{server}");
+    if name.is_empty() || !name.bytes().all(allowed) || alias.len() > MAX_ALIAS_BYTES {
+        return Err(bad());
+    }
+    Ok(alias)
+}
+
+/// Make an address the room's main address. The session creates it on the
+/// account's homeserver when it is free and refuses one another room uses.
+pub(crate) fn address_intent(input: &str, snapshot: &RoomAdminSnapshot) -> Result<Intent, String> {
+    let addresses = snapshot.addresses.as_ref();
+    let addresses = addresses.ok_or_else(|| UNKNOWN_RULES.to_owned())?;
+    if !addresses.known {
+        return Err(CUSTOM_ADDRESS.to_owned());
+    }
+    if !addresses.editable {
+        return Err(access_restriction(addresses.level, snapshot));
+    }
+    let alias = parse_address(input, &addresses.server)?;
+    if addresses.main.as_deref() == Some(alias.as_str()) {
+        return Err("That is already the main address.".to_owned());
+    }
+    Ok(Intent {
+        action: AdminAction::SetAccess(AccessChange::Address),
+        user_id: alias,
+        name: "Main address".to_owned(),
+        expected: MemberExpectation {
+            membership: None,
+            power: None,
+        },
+        reason: None,
+        knock: false,
+    })
 }
 
 fn servers_row(servers: &ServerAclSettings, snapshot: &RoomAdminSnapshot) -> AccessRow {
@@ -639,6 +721,8 @@ fn access_current(change: AccessChange, access: AccessSettings) -> bool {
         AccessChange::Guests { allow } => access.guests_can_join == Some(!allow),
         AccessChange::Encrypt => !access.encrypted,
         AccessChange::Publish { publish } => access.listed == Some(!publish),
+        // Checked against the snapshot's address settings instead.
+        AccessChange::Address => true,
         // Checked against the snapshot's version settings or block list instead.
         AccessChange::Upgrade | AccessChange::Servers { .. } => true,
     }
@@ -799,6 +883,13 @@ impl Intent {
                 return false;
             };
             return servers.editable && blocks(&servers.denied, &self.user_id) != block;
+        }
+        if self.action == AdminAction::SetAccess(AccessChange::Address) {
+            let Some(addresses) = &snapshot.addresses else {
+                return false;
+            };
+            let main = addresses.main.as_deref();
+            return addresses.editable && main != Some(self.user_id.as_str());
         }
         if let AdminAction::SetAccess(AccessChange::Upgrade) = self.action {
             let upgrade = snapshot.upgrade.as_ref();
@@ -1154,6 +1245,24 @@ pub(crate) fn confirmation(intent: &Intent, snapshot: &RoomAdminSnapshot) -> Opt
             action: "Turn on encryption",
             destructive: true,
         },
+        AdminAction::SetAccess(AccessChange::Address) => {
+            let alias = crate::directory_plain_text(&intent.user_id, 260);
+            let previous = snapshot.addresses.as_ref().and_then(|a| a.main.as_deref());
+            let mut body = format!(
+                "If your homeserver has no {alias} yet, Morpheus creates it there for this room. \
+                 Everyone sees it as the room's address."
+            );
+            if let Some(previous) = previous {
+                let previous = crate::directory_plain_text(previous, 260);
+                body.push_str(&format!(" {previous} keeps working but is no longer the main one."));
+            }
+            Confirmation {
+                title: format!("Make {alias} the main address?"),
+                body,
+                action: "Set main address",
+                destructive: false,
+            }
+        }
         AdminAction::SetAccess(AccessChange::Publish { publish: true }) => Confirmation {
             title: "List this room in the room directory?".to_owned(),
             body: LIST_BODY.to_owned(),
@@ -1273,6 +1382,14 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: &AdminOutcome) -> String {
             _ => SERVERS_UNCONFIRMED.to_owned(),
         };
     }
+    if intent.action == AdminAction::SetAccess(AccessChange::Address) {
+        let alias = crate::directory_plain_text(&intent.user_id, 260);
+        return if outcome.confirmed {
+            format!("{alias} is now the main address. The homeserver confirmed it.")
+        } else {
+            ADDRESS_UNCONFIRMED.to_owned()
+        };
+    }
     if let AdminAction::SetAccess(change) = intent.action {
         return access_outcome_text(change, outcome.confirmed);
     }
@@ -1389,6 +1506,7 @@ fn access_outcome_text(change: AccessChange, confirmed: bool) -> String {
             "The room is no longer listed in the room directory. The homeserver confirmed it."
                 .to_owned()
         }
+        AccessChange::Address => "The main address changed.".to_owned(),
     }
 }
 
@@ -1407,6 +1525,7 @@ pub(crate) fn permission_text(action: AdminAction, snapshot: &RoomAdminSnapshot)
             AccessChange::Upgrade => snapshot.upgrade.as_ref().map_or(100, |up| up.level),
             AccessChange::Servers { .. } => snapshot.servers.as_ref().map_or(100, |acl| acl.level),
             AccessChange::Publish { .. } => access.listing_level,
+            AccessChange::Address => snapshot.addresses.as_ref().map_or(100, |a| a.level),
         };
         return access_restriction(level, snapshot);
     }
@@ -1482,6 +1601,13 @@ pub(crate) fn error_text(
         intent.action,
         AdminAction::SetPermission(..) | AdminAction::SetAccess(_)
     );
+    let address = intent.action == AdminAction::SetAccess(AccessChange::Address);
+    if address && error == RoomAdminError::NotApplicable {
+        return ADDRESS_TAKEN.to_owned();
+    }
+    if address && error == RoomAdminError::InvalidUserId {
+        return "Use a name made of lowercase letters, digits and . _ = -".to_owned();
+    }
     if setting {
         match (error, snapshot) {
             (RoomAdminError::TargetChanged, _) => return SETTING_CHANGED.to_owned(),
@@ -1598,6 +1724,7 @@ mod tests {
             room_version: "11".to_owned(),
             upgrade: None,
             servers: None,
+            addresses: None,
         }
     }
     fn intent(action: AdminAction, level: i64, knock: bool) -> Intent {
@@ -2065,6 +2192,45 @@ mod tests {
         assert_eq!((rows[3].kind, rows[3].choice), (ACCESS_DIRECTORY, 0));
         let unlocked = |row: &AccessRow| row.editable && row.restriction.is_empty();
         assert!(rows.iter().all(unlocked));
+    }
+
+    #[test]
+    fn main_addresses_are_reviewed_on_the_own_server_and_taken_ones_explained() {
+        let mut snapshot = with_access(true);
+        let unknown = address_intent("lounge", &snapshot);
+        assert_eq!(unknown, Err(UNKNOWN_RULES.to_owned()));
+        snapshot.addresses = Some(AddressSettings {
+            main: Some("#old:example.org".to_owned()),
+            alternatives: vec!["#x:example.org".to_owned()],
+            known: true,
+            level: 50,
+            editable: true,
+            server: "example.org".to_owned(),
+        });
+        let row = access_rows(&snapshot).pop().unwrap();
+        assert_eq!(row.kind, ACCESS_ADDRESS);
+        assert_eq!(row.summary, "#old:example.org · 1 other address");
+        let set = address_intent(" Lounge ", &snapshot).unwrap();
+        assert_eq!(set.user_id, "#lounge:example.org");
+        assert!(set.still_matches(&snapshot));
+        let review = confirmation(&set, &snapshot).unwrap();
+        assert!(!review.destructive && review.body.contains("#old:example.org keeps working"));
+        for refused in ["#lounge:other.org", "two words", "#old:example.org", ""] {
+            assert!(address_intent(refused, &snapshot).is_err());
+        }
+        let taken = error_text(RoomAdminError::NotApplicable, &set, Some(&snapshot));
+        assert_eq!(taken, ADDRESS_TAKEN);
+        // Set meanwhile: the review is withdrawn.
+        if let Some(addresses) = snapshot.addresses.as_mut() {
+            addresses.main = Some("#lounge:example.org".to_owned());
+        }
+        assert!(!set.still_matches(&snapshot));
+        if let Some(addresses) = snapshot.addresses.as_mut() {
+            addresses.known = false;
+            addresses.editable = false;
+        }
+        let custom = address_intent("lounge", &snapshot);
+        assert_eq!(custom, Err(CUSTOM_ADDRESS.to_owned()));
     }
 
     #[test]

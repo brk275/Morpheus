@@ -204,6 +204,13 @@ impl RoomAdminUi {
         });
         let this = owner.clone();
         let weak = ui.as_weak();
+        ui.on_roster_request_address(move |address| {
+            if let Some(ui) = weak.upgrade() {
+                this.request_address(&ui, address.as_str());
+            }
+        });
+        let this = owner.clone();
+        let weak = ui.as_weak();
         ui.on_roster_confirm(move || {
             if let Some(ui) = weak.upgrade() {
                 this.confirm(&ui);
@@ -562,6 +569,16 @@ impl RoomAdminUi {
         }
     }
 
+    fn request_address(self: &Arc<Self>, ui: &AppWindow, address: &str) {
+        let Some((panel, snapshot)) = self.idle_snapshot(ui) else {
+            return;
+        };
+        match super::address_intent(address, &snapshot) {
+            Ok(intent) => self.review(ui, panel, intent, &snapshot),
+            Err(message) => self.reject(ui, &panel, message),
+        }
+    }
+
     fn request_server(self: &Arc<Self>, ui: &AppWindow, block: bool, server: &str) {
         let Some((panel, snapshot)) = self.idle_snapshot(ui) else {
             return;
@@ -740,6 +757,9 @@ fn reset_inputs(ui: &AppWindow, intent: &Intent, confirmed: bool) {
     {
         ui.set_roster_server_input("".into());
     }
+    if intent.action == AdminAction::SetAccess(AccessChange::Address) && confirmed {
+        ui.set_roster_address_input("".into());
+    }
     if matches!(
         intent.action,
         AdminAction::SetPermission(..) | AdminAction::SetAccess(_)
@@ -904,6 +924,7 @@ fn access_row(row: super::AccessRow, pending: Option<AccessChange>) -> RosterPer
         Some(AccessChange::Upgrade) => row.kind == super::ACCESS_UPGRADE,
         Some(AccessChange::Servers { .. }) => row.kind == super::ACCESS_SERVERS,
         Some(AccessChange::Publish { .. }) => row.kind == super::ACCESS_DIRECTORY,
+        Some(AccessChange::Address) => row.kind == super::ACCESS_ADDRESS,
         None => false,
     };
     RosterPermission {
@@ -959,6 +980,7 @@ fn clear_selection(ui: &AppWindow) {
     ui.set_roster_level_input("".into());
     ui.set_roster_reason_input("".into());
     ui.set_roster_server_input("".into());
+    ui.set_roster_address_input("".into());
 }
 
 /// Remove every roster value from the window, including private member

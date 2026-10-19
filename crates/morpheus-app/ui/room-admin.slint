@@ -34,10 +34,10 @@ export struct RosterPermission {
     // A threshold's index, or -1 for an access row.
     key: int,
     // 0 threshold, 1 history visibility, 2 guest access, 3 encryption, 4 room version,
-    // 5 blocked servers, 6 room directory listing.
+    // 5 blocked servers, 6 room directory listing, 7 main address.
     kind: int,
     // Access rows: the current option index (guests: 1 allowed; encryption:
-    // 1 on; blocked servers: how many; directory: 1 listed), or -1.
+    // 1 on; blocked servers: how many; directory: 1 listed; address: 1 set), or -1.
     choice: int,
     label: string,
     description: string,
@@ -242,6 +242,8 @@ export component RoomMembersPanel inherits VerticalLayout {
     in-out property <string> invite-input;
     // The server typed in the blocked-servers editor.
     in-out property <string> server-input;
+    // The address typed in the main-address editor.
+    in-out property <string> address-input;
     in property <string> selected-key;
     in property <RosterMember> selected;
     in property <string> selected-status;
@@ -265,6 +267,8 @@ export component RoomMembersPanel inherits VerticalLayout {
     callback request-access(int, int);
     // Block (true) or unblock a server name or pattern.
     callback request-server(bool, string);
+    // Make a room address the main address.
+    callback request-address(string);
     callback open-settings();
 
     property <length> row-height: max(50px, 32px * root.text-scale + 18px);
@@ -852,6 +856,27 @@ export component RoomMembersPanel inherits VerticalLayout {
                         label: "Review unblocking this server";
                         enabled: !root.busy && root.server-input != "" && root.chosen.choice > 0;
                         activated => { root.request-server(false, root.server-input); }
+                    }
+                }
+                if root.chosen.kind == 7 && root.chosen.editable : HorizontalLayout {
+                    spacing: 5px;
+                    RosterField {
+                        horizontal-stretch: 1;
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        placeholder: "name or #name:yourserver";
+                        label: "Address to make the main address of this room";
+                        enabled: !root.busy;
+                        text <=> root.address-input;
+                        accepted => { if !root.busy && root.address-input != "" { root.request-address(root.address-input); } }
+                    }
+                    RosterButton {
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        text: "Set as main…";
+                        label: "Review making this the room's main address";
+                        enabled: !root.busy && root.address-input != "";
+                        activated => { root.request-address(root.address-input); }
                     }
                 }
                 if root.chosen.kind == 6 && root.chosen.editable : HorizontalLayout {
