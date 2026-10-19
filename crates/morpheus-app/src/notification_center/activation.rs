@@ -34,6 +34,7 @@ const ROOM_GONE: &str = "The room for this notification is no longer joined.";
 const REPLY_OPEN: &str = "Send or cancel the reply or edit you are writing first.";
 const INVITE_OPEN: &str = "Accept or decline this invitation in the room list.";
 const NOT_OPENED: &str = "This notification could not be opened. Try again.";
+const DIALOG_OPEN: &str = "Finish the open account dialog, then open the notification again.";
 
 #[derive(Clone, Debug)]
 struct Pending {
@@ -181,6 +182,13 @@ impl Activator {
         if live_session && ui.get_active_account_local_id().as_str() == target.account_id() {
             self.slot().clear();
             self.navigate(ui, target, generation);
+            return;
+        }
+        // A banner must not replace an app-password or leave-call dialog the
+        // user is already answering.
+        if ui.get_access_open() || ui.get_leave_call_dialog() {
+            self.slot().clear();
+            ui.set_session_error(DIALOG_OPEN.into());
             return;
         }
         self.slot().wait(generation, target.clone(), Instant::now());

@@ -107,7 +107,9 @@ account ends it, so an A → B → A sequence never navigates for the earlier
 request. A banner resolves once; a dismissed, replaced, expired or unknown banner
 opens nothing, and an old banner never brings back a removed account or a reused
 local ID for a different Matrix user. While a reply or edit is being written in
-another room, the click is refused with a notice instead of discarding it. Up to
+another room, the click is refused with a notice instead of discarding it, and
+a click for another account never replaces an app-password or leave-call dialog
+that is already open. Up to
 eight banners listen for clicks at a time; beyond that a banner is shown without
 click handling. On macOS the click also brings Morpheus forward; on Linux and
 Windows a minimized window is restored, but raising it is up to the desktop.
