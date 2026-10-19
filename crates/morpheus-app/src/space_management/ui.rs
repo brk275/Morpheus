@@ -13,8 +13,9 @@ use std::sync::{
 use morpheus_matrix::{
     AccountSelection, AdminAction, AdminRequest, ChildKind, CreatedChild, HierarchyPage,
     MAX_CHILD_NAME_BYTES, MAX_HIERARCHY_PAGES, MAX_LINKS_AT_ONCE, MatrixLinkTarget,
-    MemberExpectation, RoomAdminError, RoomMembership, RoomSettingsCancellation, SpaceChildLink,
-    SpaceNode, SpacePermissions, SpaceSession, SpaceTarget, SpaceWriteOutcome,
+    MemberExpectation, RoomAdminError, RoomMembership, RoomSettingsCancellation, RoomSettingsError,
+    RoomSettingsSession, RoomSettingsSnapshot, SpaceChildLink, SpaceNode, SpacePermissions,
+    SpaceSession, SpaceTarget, SpaceWriteOutcome,
 };
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use tokio::{runtime::Handle, sync::Notify};
@@ -47,6 +48,9 @@ pub(crate) const CLOSE_ROOMS: i32 = 17;
 pub(crate) const CHOOSE_REMOVALS: i32 = 18;
 pub(crate) const REMOVE_PICKED: i32 = 19;
 pub(crate) const INVITE: i32 = 20;
+pub(crate) const EDIT_ABOUT: i32 = 21;
+pub(crate) const SAVE_ABOUT: i32 = 22;
+pub(crate) const CLOSE_ABOUT: i32 = 23;
 /// Spaces remembered for Back, newest last.
 const MAX_TRAIL: usize = 8;
 
@@ -83,6 +87,8 @@ struct PanelState {
     rooms: Option<Vec<SpaceTarget>>,
     /// The list of direct entries to remove several of is open.
     removing: bool,
+    /// The Space's own settings while its name and topic are being edited.
+    about: Option<(Arc<RoomSettingsSession>, RoomSettingsSnapshot)>,
     /// Room IDs picked from the open list, at most `MAX_LINKS_AT_ONCE`.
     picked: HashSet<String>,
     /// The change waiting for the homeserver.
@@ -180,6 +186,7 @@ enum Done {
     },
     Resolved(SpaceTarget),
     Rooms(Vec<SpaceTarget>),
+    About(Arc<RoomSettingsSession>, RoomSettingsSnapshot),
     Written(SpaceWriteOutcome),
     Created(CreatedChild),
     Joined,
@@ -195,6 +202,26 @@ impl From<RoomAdminError> for Failure {
     fn from(error: RoomAdminError) -> Self {
         Self::Admin(error)
     }
+}
+
+impl Failure {
+    fn admin(self) -> RoomAdminError {
+        match self {
+            Self::Admin(error) => error,
+            Self::Join | Self::Stopped => RoomAdminError::Unavailable,
+        }
+    }
+}
+
+/// A Space settings failure in the page's fixed categories: a changed
+/// baseline is a changed entry, a refused permission a missing level.
+fn settings_failure(error: RoomSettingsError) -> Failure {
+    let error = match error {
+        RoomSettingsError::BaselineChanged => RoomAdminError::TargetChanged,
+        RoomSettingsError::PermissionDenied => RoomAdminError::InsufficientPower,
+        other => RoomAdminError::from(other),
+    };
+    Failure::Admin(error)
 }
 
 pub(crate) struct SpaceManagerUi {
@@ -472,6 +499,9 @@ impl SpaceManagerUi {
             CHOOSE_REMOVALS => self.choose_removals(ui, &panel),
             REMOVE_PICKED => self.review_removals(ui, panel),
             INVITE => self.review_invite(ui, panel),
+            EDIT_ABOUT => self.open_about(ui, panel),
+            SAVE_ABOUT => self.review_about(ui, panel),
+            CLOSE_ABOUT => self.close_about(ui, &panel),
             _ => {}
         }
     }
@@ -859,6 +889,81 @@ impl SpaceManagerUi {
         }
     }
 
+    /// Read the Space's own name, topic and the account's right to change
+    /// them. This reads only.
+    fn open_about(self: &Arc<Self>, ui: &AppWindow, panel: Arc<Panel>) {
+        if !self.idle(&panel) {
+            return;
+        }
+        let Some(generation) = self.begin(ui, &panel) else {
+            return;
+        };
+        {
+            let mut state = panel.lock();
+            state.reading = Some(Reading::About);
+            state.error.clear();
+            state.notice.clear();
+        }
+        self.repaint_panel(ui, &panel);
+        let this = self.clone();
+        self.runtime.spawn(async move {
+            let result = tokio::select! { biased;
+                _ = panel.cancelled() => return,
+                _ = panel.stopped(generation) => Err(Failure::Stopped),
+                result = async {
+                    let opened = this.live.manager.open_room_settings_for(&panel.selection, &panel.space, panel.cancellation.clone()).await;
+                    let settings = opened.map_err(settings_failure)?;
+                    let snapshot = settings.snapshot();
+                    Ok::<_, Failure>(Done::About(Arc::new(settings), snapshot))
+                } => result,
+            };
+            this.finish(panel, generation, None, result);
+        });
+    }
+
+    fn close_about(&self, ui: &AppWindow, panel: &Panel) {
+        panel.lock().about = None;
+        ui.set_space_manager_about_name("".into());
+        ui.set_space_manager_about_topic("".into());
+        self.repaint_panel(ui, panel);
+    }
+
+    fn review_about(self: &Arc<Self>, ui: &AppWindow, panel: Arc<Panel>) {
+        if !self.idle(&panel) {
+            return;
+        }
+        let current = {
+            let state = panel.lock();
+            let about = state.about.as_ref().map(|(_, snapshot)| snapshot);
+            about.map(|about| (about.name.clone(), about.topic.clone(), about.permissions.clone()))
+        };
+        let Some((name, topic, permissions)) = current else {
+            return;
+        };
+        let typed_name = ui.get_space_manager_about_name();
+        let typed_topic = ui.get_space_manager_about_topic();
+        // A topic on several lines is shown read-only; one-line fields would flatten it.
+        let multiline = topic.contains('\n');
+        let typed_topic = if multiline {
+            topic.as_str()
+        } else {
+            typed_topic.as_str()
+        };
+        let change = super::about_change(&typed_name, typed_topic, (&name, &topic));
+        let change = match change {
+            Ok(change) => change,
+            Err(message) => return self.reject(ui, &panel, message),
+        };
+        let renames = matches!(&change, Change::About { name: Some(_), .. });
+        let retopics = matches!(&change, Change::About { topic: Some(_), .. });
+        if (renames && !permissions.name) || (retopics && !permissions.topic) {
+            let message = super::error_text(RoomAdminError::InsufficientPower);
+            return self.reject(ui, &panel, message);
+        }
+        let space = panel.space_name.clone();
+        self.review(ui, panel, change, space);
+    }
+
     fn review_invite(self: &Arc<Self>, ui: &AppWindow, panel: Arc<Panel>) {
         let allowed = panel.lock().permissions.is_some_and(|p| p.invite);
         if !self.idle(&panel) || !allowed {
@@ -988,12 +1093,13 @@ impl SpaceManagerUi {
         let Some(generation) = self.begin(ui, &panel) else {
             return;
         };
-        let session = {
+        let (session, about) = {
             let mut state = panel.lock();
             state.pending = Some(intent.clone());
             state.error.clear();
             state.notice.clear();
-            state.session.clone()
+            let about = state.about.as_ref().map(|(settings, _)| settings.clone());
+            (state.session.clone(), about)
         };
         self.repaint_panel(ui, &panel);
         let this = self.clone();
@@ -1009,6 +1115,31 @@ impl SpaceManagerUi {
                         Change::Link { target, suggested, order } => session.link(&target, suggested, order.as_deref()).await?,
                         Change::LinkMany { targets, suggested } => session.link_many(&targets, suggested).await?,
                         Change::UnlinkMany { links } => session.unlink_many(&links).await?,
+                        Change::About { name: new_name, topic } => {
+                            // The name first, then the topic; each re-checks its baseline and is read back.
+                            let settings = about.ok_or(RoomAdminError::Unavailable)?;
+                            let requested = usize::from(new_name.is_some()) + usize::from(topic.is_some());
+                            let mut outcome = SpaceWriteOutcome { accepted: 0, requested, confirmed: true, stopped: None };
+                            if let Some(new_name) = &new_name {
+                                let saved = settings.set_name(new_name).await.map_err(settings_failure)?;
+                                outcome.accepted += 1;
+                                outcome.confirmed &= saved.name == *new_name;
+                            }
+                            if let Some(topic) = &topic {
+                                match settings.set_topic(topic).await {
+                                    Ok(saved) => {
+                                        outcome.accepted += 1;
+                                        outcome.confirmed &= saved.topic == *topic;
+                                    }
+                                    Err(error) if outcome.accepted == 0 => return Err(settings_failure(error)),
+                                    Err(error) => {
+                                        outcome.stopped = Some(settings_failure(error).admin());
+                                        outcome.confirmed = false;
+                                    }
+                                }
+                            }
+                            outcome
+                        }
                         Change::Invite { user_id } => {
                             // The room-administration path: fresh membership and levels, one send, a read-back.
                             let admin = this.live.manager.open_room_admin_for(&panel.selection, &panel.space, panel.cancellation.clone()).await?;
@@ -1052,6 +1183,7 @@ impl SpaceManagerUi {
         // Release the generation even for a retired panel; paint only an active one.
         let active = self.active(&panel);
         let mut joined = false;
+        let mut about_fields = None;
         let succeeded = result.is_ok();
         {
             let mut state = panel.lock();
@@ -1071,6 +1203,10 @@ impl SpaceManagerUi {
                     fresh,
                 }) => apply_page(&mut state, &panel.space, session, permissions, page, fresh),
                 Ok(Done::Resolved(target)) => state.target = Some(target),
+                Ok(Done::About(settings, snapshot)) => {
+                    about_fields = Some((snapshot.name.clone(), snapshot.topic.clone()));
+                    state.about = Some((settings, snapshot));
+                }
                 Ok(Done::Rooms(rooms)) => {
                     state.rooms = Some(rooms);
                     state.removing = false;
@@ -1111,6 +1247,10 @@ impl SpaceManagerUi {
         }
         let this = self.clone();
         let _ = self.ui.upgrade_in_event_loop(move |ui| {
+            if let Some((name, topic)) = &about_fields {
+                ui.set_space_manager_about_name(name.as_str().into());
+                ui.set_space_manager_about_topic(topic.as_str().into());
+            }
             if joined && ui.get_page() == 4 {
                 // The join flow already selected the joined room, which may
                 // also have closed this Space's page; show the room.
@@ -1241,6 +1381,7 @@ fn settle(state: &mut PanelState, intent: &Intent, outcome: SpaceWriteOutcome) {
             state.rooms = None;
             state.picked.clear();
         }
+        Change::About { .. } if outcome.accepted > 0 => state.about = None,
         // The refreshed hierarchy no longer lists what was removed.
         Change::UnlinkMany { .. } if outcome.accepted > 0 => {
             state.removing = false;
@@ -1266,6 +1407,10 @@ fn reset_inputs(ui: &AppWindow, intent: &Intent) {
             ui.set_space_manager_pick_query("".into());
         }
         Change::Invite { .. } => ui.set_space_manager_invite_input("".into()),
+        Change::About { .. } => {
+            ui.set_space_manager_about_name("".into());
+            ui.set_space_manager_about_topic("".into());
+        }
         Change::Create { .. } => {
             ui.set_space_manager_create_name("".into());
             ui.set_space_manager_create_is_space(false);
@@ -1291,6 +1436,11 @@ fn refreshed(model: ModelRc<SpacePick>, picks: Vec<SpacePick>) -> Option<ModelRc
         }
     }
     None
+}
+
+/// The account may change the topic here, and it fits a one-line field.
+fn editable_topic(about: &RoomSettingsSnapshot) -> bool {
+    about.permissions.topic && !about.topic.contains('\n')
 }
 
 /// The open list of this Space's direct entries that can be removed.
@@ -1399,6 +1549,10 @@ fn render(
         ..SpaceManagerView::default()
     };
     view.can_invite = state.permissions.is_some_and(|granted| granted.invite);
+    let about = state.about.as_ref().map(|(_, snapshot)| snapshot);
+    view.about_open = about.is_some();
+    view.about_name_allowed = about.is_some_and(|about| about.permissions.name);
+    view.about_topic_allowed = about.is_some_and(editable_topic);
     view.rooms_open = state.rooms.is_some();
     view.removing_open = state.removing;
     view.picked = i32::try_from(state.picked.len()).unwrap_or(i32::MAX);
@@ -1448,6 +1602,8 @@ pub(crate) fn clear_presentation(ui: &AppWindow) {
     ui.set_space_manager_query("".into());
     ui.set_space_manager_pick_query("".into());
     ui.set_space_manager_invite_input("".into());
+    ui.set_space_manager_about_name("".into());
+    ui.set_space_manager_about_topic("".into());
     ui.set_space_manager_target_input("".into());
     ui.set_space_manager_target_order("".into());
     ui.set_space_manager_target_suggested(false);

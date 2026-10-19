@@ -77,6 +77,7 @@ pub(crate) enum Reading {
     More,
     Find,
     Rooms,
+    About,
 }
 
 pub(crate) fn reading_text(reading: Reading) -> &'static str {
@@ -86,6 +87,7 @@ pub(crate) fn reading_text(reading: Reading) -> &'static str {
         Reading::More => "Loading more of the Space…",
         Reading::Find => "Finding the room through your homeserver…",
         Reading::Rooms => "Listing the rooms you have joined…",
+        Reading::About => "Reading the Space's name and topic…",
     }
 }
 
@@ -96,6 +98,7 @@ pub(crate) fn stopped_text(reading: Reading) -> &'static str {
         Reading::More => "Stopped loading more. The entries already shown are kept.",
         Reading::Find => "Stopped finding the room. Nothing was added.",
         Reading::Rooms => "Stopped listing your rooms. Nothing was added.",
+        Reading::About => "Stopped reading the name and topic. Nothing was changed.",
     }
 }
 
@@ -398,6 +401,11 @@ pub(crate) enum Change {
     },
     /// Invite one person to the Space itself.
     Invite { user_id: String },
+    /// Rename the Space or change its topic; `None` keeps that one.
+    About {
+        name: Option<String>,
+        topic: Option<String>,
+    },
     /// Create a new room, or a sub-Space, inside the Space and list it there.
     Create {
         name: String,
@@ -429,7 +437,7 @@ impl Intent {
             Change::Join { room_id, .. } => room_id.as_str(),
             // New entries are not rows yet, and several entries mark none.
             Change::Create { .. } | Change::LinkMany { .. } | Change::UnlinkMany { .. } => "",
-            Change::Invite { .. } => "",
+            Change::Invite { .. } | Change::About { .. } => "",
         }
     }
     /// Every reviewed link is still listed unchanged by a fresher load.
@@ -445,6 +453,7 @@ impl Intent {
             | Change::LinkMany { .. }
             | Change::Join { .. }
             | Change::Invite { .. }
+            | Change::About { .. }
             | Change::Create { .. } => true,
         }
     }
@@ -598,6 +607,33 @@ pub(crate) fn confirmation(intent: &Intent) -> Confirmation {
                 destructive: false,
             }
         }
+        Change::About { name, topic } => {
+            let mut body = String::new();
+            if let Some(name) = name {
+                let name = crate::directory_plain_text(name, MAX_NAME_CHARS);
+                body.push_str(&format!("New name: {name}. "));
+            }
+            match topic.as_deref() {
+                Some("") => body.push_str("The topic is removed. "),
+                Some(topic) => {
+                    let topic = crate::directory_plain_text(topic, 240);
+                    body.push_str(&format!("New topic: {topic} "));
+                }
+                None => {}
+            }
+            body.push_str("Everyone who can see the Space sees the change.");
+            let title = match (name.is_some(), topic.is_some()) {
+                (true, true) => format!("Change the name and topic of {space}?"),
+                (true, false) => format!("Rename {space}?"),
+                _ => format!("Change the topic of {space}?"),
+            };
+            Confirmation {
+                title,
+                body,
+                action: "Save",
+                destructive: false,
+            }
+        }
         Change::Invite { .. } => Confirmation {
             title: format!("Invite {name} to {space}?"),
             body: format!("{INVITE_BODY_START} {space} {INVITE_BODY_END}"),
@@ -655,6 +691,7 @@ pub(crate) fn pending_text(intent: &Intent) -> String {
         Change::Reorder { .. } => "Moving",
         Change::Join { .. } => "Joining",
         Change::Invite { .. } => "Inviting",
+        Change::About { .. } => "Saving the name and topic of",
         Change::Create { .. } => "Creating",
     };
     format!("{verb} {}… Waiting for the homeserver.", intent.name)
@@ -671,6 +708,9 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: SpaceWriteOutcome) -> Strin
     }
     if let Change::UnlinkMany { .. } = intent.change {
         return unlinked_text(name, &intent.space, outcome);
+    }
+    if let Change::About { .. } = intent.change {
+        return about_text(outcome);
     }
     if let Some(error) = outcome.stopped {
         let (accepted, requested) = (outcome.accepted, outcome.requested);
@@ -695,6 +735,7 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: SpaceWriteOutcome) -> Strin
             let space = &intent.space;
             format!("Invited {name} to {space}. The homeserver confirmed it.")
         }
+        Change::About { .. } => about_text(outcome),
         Change::Create { .. } => format!("Created {name}."),
     }
 }
@@ -735,6 +776,40 @@ fn unlinked_text(name: &str, space: &str, outcome: SpaceWriteOutcome) -> String 
         );
     }
     format!("Removed {name} from {space}; the rooms themselves are unchanged.")
+}
+
+/// What saving the name and topic did; the name is saved first.
+fn about_text(outcome: SpaceWriteOutcome) -> String {
+    if let Some(error) = outcome.stopped {
+        let reason = error_text(error);
+        return format!("The new name was saved, but the topic was not: {reason}");
+    }
+    if !outcome.confirmed {
+        return "The homeserver accepted the change, but reading it back differed.".to_owned();
+    }
+    "Saved. The homeserver confirmed it.".to_owned()
+}
+
+/// The name and topic edits that differ from what the Space has now.
+pub(crate) fn about_change(
+    name: &str,
+    topic: &str,
+    current: (&str, &str),
+) -> Result<Change, String> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 1024 || name.chars().any(char::is_control) {
+        return Err("Enter a name of up to 1024 bytes, on one line.".to_owned());
+    }
+    if topic.len() > 16 * 1024 {
+        return Err("Keep the topic to at most 16 KiB.".to_owned());
+    }
+    let topic = topic.trim();
+    let name = (name != current.0.trim()).then(|| name.to_owned());
+    let topic = (topic != current.1.trim()).then(|| topic.to_owned());
+    if name.is_none() && topic.is_none() {
+        return Err("The name and topic are unchanged.".to_owned());
+    }
+    Ok(Change::About { name, topic })
 }
 
 /// A full Matrix user ID as typed, trimmed; the session parses it exactly.
@@ -1089,6 +1164,38 @@ mod tests {
         let confirmation = confirmation(&intent);
         assert!(confirmation.destructive);
         assert!(confirmation.body.contains("Nobody leaves"));
+    }
+
+    #[test]
+    fn editing_the_space_name_and_topic_saves_only_what_changed() {
+        let current = ("Crew", "Old topic");
+        let unchanged = about_change(" Crew ", " Old topic ", current).unwrap_err();
+        assert_eq!(unchanged, "The name and topic are unchanged.");
+        let renamed = about_change("Crew HQ", "Old topic", current).unwrap();
+        let expected = Change::About {
+            name: Some("Crew HQ".to_owned()),
+            topic: None,
+        };
+        assert_eq!(renamed, expected);
+        assert!(about_change("", "Old topic", current).is_err());
+        assert!(about_change("Two\nlines", "Old topic", current).is_err());
+        let cleared = about_change("Crew", "", current).unwrap();
+        let intent = Intent {
+            change: cleared,
+            name: "Crew".to_owned(),
+            space: "Crew".to_owned(),
+        };
+        let review = confirmation(&intent);
+        assert!(!review.destructive && review.title == "Change the topic of Crew?");
+        assert!(review.body.starts_with("The topic is removed."));
+        let partial = SpaceWriteOutcome {
+            accepted: 1,
+            requested: 2,
+            confirmed: false,
+            stopped: Some(RoomAdminError::TargetChanged),
+        };
+        let text = outcome_text(&intent, partial);
+        assert!(text.starts_with("The new name was saved, but the topic was not:"));
     }
 
     #[test]

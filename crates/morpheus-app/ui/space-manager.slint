@@ -78,6 +78,11 @@ export struct SpaceManagerView {
     removing-open: bool,
     // The account may invite people to the Space.
     can-invite: bool,
+    // The Space's name and topic are open for editing, and which of them the
+    // account may change.
+    about-open: bool,
+    about-name-allowed: bool,
+    about-topic-allowed: bool,
     confirm-open: bool,
     confirm-title: string,
     confirm-body: string,
@@ -191,6 +196,9 @@ export component SpaceManagerPage inherits VerticalLayout {
     in-out property <string> pick-query;
     // The Matrix user ID typed to invite to the Space.
     in-out property <string> invite-input;
+    // The Space's name and topic as edited.
+    in-out property <string> about-name;
+    in-out property <string> about-topic;
     in-out property <string> query;
     in-out property <string> target-input;
     in-out property <bool> target-suggested;
@@ -208,7 +216,8 @@ export component SpaceManagerPage inherits VerticalLayout {
     // 12 create a room here, 13 back to the previous Space, 14 list an upgraded
     // room's replacement in its place, 15 list your joined rooms, 16 add the
     // picked rooms, 17 close either pick list, 18 list entries to remove,
-    // 19 remove the picked entries, 20 invite the typed user to the Space
+    // 19 remove the picked entries, 20 invite the typed user to the Space,
+    // 21 edit the Space's name and topic, 22 review saving them, 23 close
     callback action(int);
     callback select(string);
     // Pick or unpick one listed joined room by its room ID.
@@ -691,6 +700,62 @@ export component SpaceManagerPage inherits VerticalLayout {
                             primary: true;
                             enabled: !root.view.busy && root.create-name != "";
                             activated => { root.action(12); }
+                        }
+                    }
+                }
+            }
+            if root.ready : Rectangle {
+                background: root.palette.elevated;
+                border-color: root.palette.divider; border-width: 1px; border-radius: 10px;
+                accessible-role: groupbox;
+                accessible-label: "Name and topic of this Space";
+                VerticalLayout {
+                    padding: 12px; spacing: 6px;
+                    Text { text: "NAME AND TOPIC"; color: root.palette.muted; font-size: 9px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
+                    if !root.view.about-open : HorizontalLayout {
+                        alignment: start;
+                        RosterButton {
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: "Edit name and topic…";
+                            label: "Read this Space's name and topic to change them";
+                            enabled: !root.view.busy;
+                            activated => { root.action(21); }
+                        }
+                    }
+                    if root.view.about-open : RosterField {
+                        palette: root.palette; text-scale: root.text-scale;
+                        placeholder: "Space name";
+                        label: "Name of this Space";
+                        enabled: !root.view.busy && root.view.about-name-allowed;
+                        text <=> root.about-name;
+                    }
+                    if root.view.about-open : RosterField {
+                        palette: root.palette; text-scale: root.text-scale;
+                        placeholder: "Topic (optional)";
+                        label: "Topic of this Space";
+                        enabled: !root.view.busy && root.view.about-topic-allowed;
+                        text <=> root.about-topic;
+                    }
+                    if root.view.about-open && !(root.view.about-name-allowed && root.view.about-topic-allowed) : Text {
+                        text: "Some of these cannot be changed with your level, or the topic spans several lines.";
+                        color: root.palette.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
+                    }
+                    if root.view.about-open : HorizontalLayout {
+                        spacing: 5px; alignment: start;
+                        RosterButton {
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: "Save…";
+                            label: "Review the new name and topic";
+                            primary: true;
+                            enabled: !root.view.busy && (root.view.about-name-allowed || root.view.about-topic-allowed);
+                            activated => { root.action(22); }
+                        }
+                        RosterButton {
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: "Close";
+                            label: "Stop editing without saving";
+                            enabled: !root.view.busy;
+                            activated => { root.action(23); }
                         }
                     }
                 }
