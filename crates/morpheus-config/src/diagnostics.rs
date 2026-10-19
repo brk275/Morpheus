@@ -86,6 +86,8 @@ pub const CODES: &[(&str, &str)] = &[
 pub enum FileKind {
     Config,
     Theme,
+    /// A style profile; see [`crate::style_profiles`].
+    Profile,
 }
 
 impl FileKind {
@@ -93,6 +95,7 @@ impl FileKind {
         match self {
             Self::Config => "config",
             Self::Theme => "theme",
+            Self::Profile => "style profile",
         }
     }
 }
@@ -370,6 +373,10 @@ fn patterns(file: FileKind) -> Vec<Vec<&'static str>> {
             vec!["states", "<state>"],
             vec!["senders", "colors"],
         ],
+        FileKind::Profile => crate::style_profiles::schema_paths()
+            .into_iter()
+            .map(|key| key.split('.').collect())
+            .collect(),
     }
 }
 
