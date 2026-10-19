@@ -62,9 +62,9 @@ pub use room_settings::{
 };
 mod space_management;
 pub use space_management::{
-    CreatedChild, HIERARCHY_MAX_DEPTH, HIERARCHY_PAGE_LIMIT, HierarchyPage, MAX_CHILD_NAME_BYTES,
-    MAX_HIERARCHY_PAGES, MAX_ORDER_BYTES, MAX_REORDER_WRITES, MAX_VIA_SERVERS, NodeAccess,
-    RouteSource, SpaceChildLink, SpaceNode, SpacePermissions, SpaceSession, SpaceTarget,
+    ChildKind, CreatedChild, HIERARCHY_MAX_DEPTH, HIERARCHY_PAGE_LIMIT, HierarchyPage,
+    MAX_CHILD_NAME_BYTES, MAX_HIERARCHY_PAGES, MAX_ORDER_BYTES, MAX_REORDER_WRITES, MAX_VIA_SERVERS,
+    NodeAccess, RouteSource, SpaceChildLink, SpaceNode, SpacePermissions, SpaceSession, SpaceTarget,
     SpaceWriteOutcome, key_between, reorder_plan, sort_links, valid_order,
 };
 mod rich_text;

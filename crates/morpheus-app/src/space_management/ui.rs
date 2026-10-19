@@ -10,9 +10,9 @@ use std::sync::{
 };
 
 use morpheus_matrix::{
-    AccountSelection, CreatedChild, HierarchyPage, MAX_CHILD_NAME_BYTES, MAX_HIERARCHY_PAGES,
-    MatrixLinkTarget, RoomAdminError, RoomMembership, RoomSettingsCancellation, SpaceChildLink,
-    SpaceNode, SpacePermissions, SpaceSession, SpaceTarget, SpaceWriteOutcome,
+    AccountSelection, ChildKind, CreatedChild, HierarchyPage, MAX_CHILD_NAME_BYTES,
+    MAX_HIERARCHY_PAGES, MatrixLinkTarget, RoomAdminError, RoomMembership, RoomSettingsCancellation,
+    SpaceChildLink, SpaceNode, SpacePermissions, SpaceSession, SpaceTarget, SpaceWriteOutcome,
 };
 use slint::{ComponentHandle, ModelRc, VecModel};
 use tokio::{runtime::Handle, sync::Notify};
@@ -37,6 +37,9 @@ pub(crate) const JOIN: i32 = 9;
 pub(crate) const OPEN_SPACE: i32 = 10;
 pub(crate) const STOP: i32 = 11;
 pub(crate) const CREATE: i32 = 12;
+pub(crate) const BACK: i32 = 13;
+/// Spaces remembered for Back, newest last.
+const MAX_TRAIL: usize = 8;
 
 struct Panel {
     id: u64,
@@ -184,6 +187,23 @@ pub(crate) struct SpaceManagerUi {
     live: Arc<LiveUi>,
     runtime: Handle,
     ui: slint::Weak<AppWindow>,
+    trail: Mutex<Trail>,
+}
+
+/// The Spaces left through "Manage this Space", so Back returns to them.
+#[derive(Default)]
+struct Trail {
+    entries: Vec<TrailEntry>,
+    /// The next page opened comes from that navigation, not from the user
+    /// opening Space management afresh (which starts a new trail).
+    navigating: bool,
+}
+
+#[derive(Clone)]
+struct TrailEntry {
+    account_id: String,
+    space_id: String,
+    name: String,
 }
 
 impl SpaceManagerUi {
@@ -194,6 +214,7 @@ impl SpaceManagerUi {
             live,
             runtime: runtime.clone(),
             ui: ui.as_weak(),
+            trail: Mutex::new(Trail::default()),
         });
         let this = owner.clone();
         let weak = ui.as_weak();
@@ -312,7 +333,18 @@ impl SpaceManagerUi {
         clear_presentation(ui);
     }
 
+    fn trail(&self) -> MutexGuard<'_, Trail> {
+        self.trail.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn open(self: &Arc<Self>, ui: &AppWindow) {
+        {
+            let mut trail = self.trail();
+            if !trail.navigating {
+                trail.entries.clear();
+            }
+            trail.navigating = false;
+        }
         let space = ui.get_active_space_id().to_string();
         let live = ui.get_live_session() && self.live.is_live.load(Ordering::Acquire);
         if !live || space.is_empty() {
@@ -409,6 +441,7 @@ impl SpaceManagerUi {
             OPEN_SPACE => self.open_selected_space(ui, &panel),
             STOP => self.stop_read(&panel),
             CREATE => self.review_create(ui, panel),
+            BACK => self.back_to_parent(ui, &panel),
             _ => {}
         }
     }
@@ -440,9 +473,56 @@ impl SpaceManagerUi {
         let Some((space_id, name)) = space else {
             return;
         };
+        {
+            let mut trail = self.trail();
+            if trail.entries.len() >= MAX_TRAIL {
+                trail.entries.remove(0);
+            }
+            trail.entries.push(TrailEntry {
+                account_id: panel.selection.account_id().to_owned(),
+                space_id: panel.space.clone(),
+                name: panel.space_name.clone(),
+            });
+            trail.navigating = true;
+        }
         ui.set_active_space_id(space_id.as_str().into());
         ui.set_active_space_name(name.into());
         ui.invoke_select_space(space_id.into());
+    }
+
+    /// Return to the Space this one was opened from with "Manage this
+    /// Space". This only navigates, like choosing it in the sidebar.
+    fn back_to_parent(&self, ui: &AppWindow, panel: &Panel) {
+        if panel.lock().progress.busy {
+            return;
+        }
+        let entry = {
+            let mut trail = self.trail();
+            let entry = trail.entries.pop();
+            let same = entry
+                .as_ref()
+                .is_some_and(|entry| entry.account_id == panel.selection.account_id());
+            if !same {
+                trail.entries.clear();
+                return;
+            }
+            trail.navigating = true;
+            entry
+        };
+        let Some(entry) = entry else {
+            return;
+        };
+        ui.set_active_space_id(entry.space_id.as_str().into());
+        ui.set_active_space_name(entry.name.as_str().into());
+        ui.invoke_select_space(entry.space_id.into());
+    }
+
+    /// The Space Back returns to, for this account.
+    fn back_name(&self, account_id: &str) -> String {
+        let trail = self.trail();
+        let entry = trail.entries.last();
+        let entry = entry.filter(|entry| entry.account_id == account_id);
+        entry.map(|entry| entry.name.clone()).unwrap_or_default()
     }
 
     /// Read the first page and permissions again, or the next page.
@@ -568,6 +648,7 @@ impl SpaceManagerUi {
         let shown = crate::directory_plain_text(&name, 100);
         let change = Change::Create {
             name,
+            is_space: ui.get_space_manager_create_is_space(),
             members_only: ui.get_space_manager_create_members_only(),
             suggested: ui.get_space_manager_create_suggested(),
         };
@@ -744,8 +825,9 @@ impl SpaceManagerUi {
                         Change::Update { link, suggested, order } => session.update(&link, suggested, order.as_deref()).await?,
                         Change::Unlink { link } => session.unlink(&link).await?,
                         Change::Reorder { plan, .. } => session.reorder(&plan).await?,
-                        Change::Create { name: room_name, members_only, suggested } => {
-                            let created = session.create_child(&room_name, members_only, suggested).await?;
+                        Change::Create { name: room_name, is_space, members_only, suggested } => {
+                            let kind = if is_space { ChildKind::Space } else { ChildKind::Room };
+                            let created = session.create_child(&room_name, kind, members_only, suggested).await?;
                             return Ok(Done::Created(created));
                         }
                         Change::Join { room_id, via, is_space } => {
@@ -886,10 +968,11 @@ impl SpaceManagerUi {
         let previous = ui.get_space_manager_view();
         let query = ui.get_space_manager_query();
         let filter = Filter::from_index(previous.filter);
-        let (view, rows) = {
+        let (mut view, rows) = {
             let state = panel.lock();
             render(&state, panel, previous, query.as_str(), filter)
         };
+        view.back_name = self.back_name(panel.selection.account_id()).into();
         ui.set_space_manager_rows(ModelRc::new(VecModel::from(rows)));
         ui.set_space_manager_view(view);
     }
@@ -955,6 +1038,7 @@ fn reset_inputs(ui: &AppWindow, intent: &Intent) {
         }
         Change::Create { .. } => {
             ui.set_space_manager_create_name("".into());
+            ui.set_space_manager_create_is_space(false);
             ui.set_space_manager_create_suggested(false);
         }
         _ => {}
@@ -1075,6 +1159,7 @@ pub(crate) fn clear_presentation(ui: &AppWindow) {
     ui.set_space_manager_order("".into());
     ui.set_space_manager_suggested(false);
     ui.set_space_manager_create_name("".into());
+    ui.set_space_manager_create_is_space(false);
     ui.set_space_manager_create_members_only(true);
     ui.set_space_manager_create_suggested(false);
 }

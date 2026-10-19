@@ -172,6 +172,15 @@ pub struct SpaceWriteOutcome {
     pub stopped: Option<RoomAdminError>,
 }
 
+/// What `create_child` makes inside the Space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildKind {
+    /// An encrypted room for conversation.
+    Room,
+    /// A sub-Space that can list its own rooms.
+    Space,
+}
+
 /// A room `create_child` made inside the Space.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreatedChild {
@@ -499,21 +508,23 @@ impl SpaceSession {
         .await
     }
 
-    /// Create an encrypted room whose canonical parent is this Space, then
-    /// list it here. With `members_only`, members of this Space may join it;
-    /// otherwise people need an invitation. The account becomes the new
-    /// room's administrator. The link's only route server is this account's
-    /// homeserver, the only server that knows the room yet. Nobody else
-    /// joins, and nothing else changes.
+    /// Create an encrypted room, or a sub-Space, whose canonical parent is
+    /// this Space, then list it here. With `members_only`, members of this
+    /// Space may join it; otherwise people need an invitation. The account
+    /// becomes its administrator. The link's only route server is this
+    /// account's homeserver, the only server that knows the room yet.
+    /// Nobody else joins, and nothing else changes.
     pub async fn create_child(
         &self,
         name: &str,
+        kind: ChildKind,
         members_only: bool,
         suggested: bool,
     ) -> Result<CreatedChild> {
         let name = checked_name(name)?;
         let server = self.own_user.server_name().to_owned();
-        let request = child_room_request(name, self.space.room_id(), &server, members_only);
+        let space = self.space.room_id();
+        let request = child_room_request(name, kind, space, &server, members_only);
         self.run(WRITE_TIMEOUT, async {
             self.require_manage().await?;
             self.check()?;
@@ -593,11 +604,13 @@ fn checked_name(name: &str) -> Result<&str> {
     valid.then_some(name).ok_or(RoomAdminError::InvalidName)
 }
 
-/// The creation request of a room inside `space`: encrypted from its first
-/// event, naming `space` as its canonical parent, and joinable by the
-/// Space's members when `members_only`, else by invitation.
+/// The creation request of a room inside `space`: a room encrypted from its
+/// first event, or a sub-Space (Spaces hold no messages to encrypt), naming
+/// `space` as its canonical parent, and joinable by the Space's members when
+/// `members_only`, else by invitation.
 fn child_room_request(
     name: &str,
+    kind: ChildKind,
     space: &RoomId,
     server: &ServerName,
     members_only: bool,
@@ -605,9 +618,18 @@ fn child_room_request(
     let mut request = create_room::v3::Request::new();
     request.name = Some(name.to_owned());
     request.preset = Some(create_room::v3::RoomPreset::PrivateChat);
-    let encryption = RoomEncryptionEventContent::with_recommended_defaults();
-    let encryption = InitialStateEvent::with_empty_state_key(encryption);
-    request.initial_state.push(encryption.to_raw_any());
+    match kind {
+        ChildKind::Room => {
+            let encryption = RoomEncryptionEventContent::with_recommended_defaults();
+            let encryption = InitialStateEvent::with_empty_state_key(encryption);
+            request.initial_state.push(encryption.to_raw_any());
+        }
+        ChildKind::Space => {
+            let mut creation = create_room::v3::CreationContent::new();
+            creation.room_type = Some(RoomType::Space);
+            request.creation_content = Raw::new(&creation).ok();
+        }
+    }
     let mut parent = SpaceParentEventContent::new(vec![server.to_owned()]);
     parent.canonical = true;
     let parent = InitialStateEvent::new(space.to_owned(), parent);
@@ -1140,14 +1162,21 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let open = child_room_request("Planning", &space, &server, false);
+        let open = child_room_request("Planning", ChildKind::Room, &space, &server, false);
         let text = state(&open);
         assert_eq!(open.name.as_deref(), Some("Planning"));
         assert!(text.contains("m.room.encryption") && text.contains("m.megolm.v1.aes-sha2"));
         assert!(text.contains("m.space.parent") && text.contains("\"canonical\":true"));
         assert!(text.contains("!space:example.org") && !text.contains("restricted"));
-        let members = state(&child_room_request("Planning", &space, &server, true));
+        let members = child_room_request("Planning", ChildKind::Room, &space, &server, true);
+        let members = state(&members);
         assert!(members.contains("restricted") && members.contains("m.room_membership"));
+        // A sub-Space is typed as a Space, parented the same way, and not encrypted.
+        let nested = child_room_request("Crew", ChildKind::Space, &space, &server, true);
+        let creation = nested.creation_content.as_ref().unwrap().json().get();
+        assert!(creation.contains("m.space"));
+        let nested = state(&nested);
+        assert!(nested.contains("m.space.parent") && !nested.contains("m.room.encryption"));
 
         assert_eq!(checked_name("  Planning  "), Ok("Planning"));
         for name in ["", "   ", "Plan\nning"] {
@@ -1184,7 +1213,7 @@ mod tests {
             send(session.update(link, true, Some("a")));
             send(session.unlink(link));
             send(session.reorder(&[]));
-            send(session.create_child("Planning", true, false));
+            send(session.create_child("Planning", ChildKind::Room, true, false));
         }
     }
 }

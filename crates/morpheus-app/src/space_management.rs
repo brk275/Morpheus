@@ -353,9 +353,10 @@ pub(crate) enum Change {
         via: Vec<String>,
         is_space: bool,
     },
-    /// Create a new room inside the Space and list it there.
+    /// Create a new room, or a sub-Space, inside the Space and list it there.
     Create {
         name: String,
+        is_space: bool,
         members_only: bool,
         suggested: bool,
     },
@@ -493,6 +494,7 @@ pub(crate) fn confirmation(intent: &Intent) -> Confirmation {
             }
         }
         Change::Create {
+            is_space,
             members_only,
             suggested,
             ..
@@ -502,9 +504,14 @@ pub(crate) fn confirmation(intent: &Intent) -> Confirmation {
             } else {
                 "People need an invitation to join it".to_owned()
             };
+            let what = if *is_space {
+                "a new Space"
+            } else {
+                "a new encrypted room"
+            };
             let mut body = format!(
-                "Morpheus creates a new encrypted room and lists it in {space}. {who}, and you \
-                 are its administrator. {CREATE_BODY}"
+                "Morpheus creates {what} and lists it in {space}. {who}, and you are its \
+                 administrator. {CREATE_BODY}"
             );
             if *suggested {
                 body.push_str(" It is suggested to members.");
@@ -725,6 +732,7 @@ mod tests {
     fn creating_a_room_is_reviewed_and_a_failed_listing_is_reported() {
         let change = Change::Create {
             name: "Planning".to_owned(),
+            is_space: false,
             members_only: true,
             suggested: false,
         };
@@ -735,6 +743,7 @@ mod tests {
         };
         let review = confirmation(&intent);
         assert!(!review.destructive && review.body.contains("Members of Crew can join it"));
+        assert!(review.body.contains("a new encrypted room"));
         assert!(intent.still_matches(&[]));
         let listed = CreatedChild {
             room_id: "!new:example.org".to_owned(),

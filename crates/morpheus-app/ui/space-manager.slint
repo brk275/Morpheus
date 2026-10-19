@@ -55,6 +55,8 @@ export struct SpaceManagerView {
     // The resolved room waiting to be added, as one description.
     target: string,
     target-ready: bool,
+    // The Space this one was opened from with "Manage this Space", or empty.
+    back-name: string,
     confirm-open: bool,
     confirm-title: string,
     confirm-body: string,
@@ -122,12 +124,13 @@ export component SpaceManagerPage inherits VerticalLayout {
     in-out property <string> order;
     // A new room made inside this Space.
     in-out property <string> create-name;
+    in-out property <bool> create-is-space;
     in-out property <bool> create-members-only: true;
     in-out property <bool> create-suggested;
     callback scope-changed();
     // 0 refresh, 1 load more, 2 find, 3 clear found, 4 add, 5 save,
     // 6 move up, 7 move down, 8 remove, 9 join, 10 open sub-Space, 11 stop read,
-    // 12 create a room here
+    // 12 create a room here, 13 back to the previous Space
     callback action(int);
     callback select(string);
     callback search-edited(string);
@@ -155,6 +158,16 @@ export component SpaceManagerPage inherits VerticalLayout {
             Text {
                 text: root.available ? root.view.permission : "Choose a Space in the sidebar to see and manage its rooms.";
                 color: root.palette.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+            }
+        }
+        if root.available && root.view.back-name != "" : VerticalLayout {
+            alignment: start;
+            RosterButton {
+                palette: root.palette; text-scale: root.text-scale;
+                text: "Back";
+                label: "Back to managing " + root.view.back-name;
+                enabled: !root.view.busy;
+                activated => { root.action(13); }
             }
         }
         VerticalLayout {
@@ -489,21 +502,29 @@ export component SpaceManagerPage inherits VerticalLayout {
                 background: root.palette.elevated;
                 border-color: root.palette.divider; border-width: 1px; border-radius: 10px;
                 accessible-role: groupbox;
-                accessible-label: "Create a room in this Space";
+                accessible-label: "Create a room or Space in this Space";
                 VerticalLayout {
                     padding: 12px; spacing: 6px;
-                    Text { text: "CREATE A ROOM HERE"; color: root.palette.muted; font-size: 9px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
+                    Text { text: "CREATE HERE"; color: root.palette.muted; font-size: 9px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
                     Text {
-                        text: "A new encrypted room, listed in this Space. You become its administrator; nobody else is invited.";
+                        text: root.create-is-space
+                            ? "A new Space, listed in this Space, that can hold its own rooms. You become its administrator; nobody else is invited."
+                            : "A new encrypted room, listed in this Space. You become its administrator; nobody else is invited.";
                         color: root.palette.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
                     }
                     RosterField {
                         palette: root.palette; text-scale: root.text-scale;
-                        placeholder: "Room name";
-                        label: "Name of the new room";
+                        placeholder: root.create-is-space ? "Space name" : "Room name";
+                        label: root.create-is-space ? "Name of the new Space" : "Name of the new room";
                         enabled: !root.view.busy;
                         text <=> root.create-name;
                         accepted => { if !root.view.busy && root.create-name != "" { root.action(12); } }
+                    }
+                    SpaceToggle {
+                        palette: root.palette; text-scale: root.text-scale;
+                        text: "Make it a Space";
+                        enabled: !root.view.busy;
+                        checked <=> root.create-is-space;
                     }
                     SpaceToggle {
                         palette: root.palette; text-scale: root.text-scale;
@@ -522,7 +543,7 @@ export component SpaceManagerPage inherits VerticalLayout {
                         RosterButton {
                             palette: root.palette; text-scale: root.text-scale;
                             text: "Create…";
-                            label: "Review creating this room in the Space";
+                            label: root.create-is-space ? "Review creating this Space inside the Space" : "Review creating this room in the Space";
                             primary: true;
                             enabled: !root.view.busy && root.create-name != "";
                             activated => { root.action(12); }
