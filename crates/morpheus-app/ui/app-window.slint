@@ -1515,8 +1515,12 @@ component StyleNumberSetting inherits Rectangle {
     in property <color> surface;
     in property <color> hover-surface;
     in property <float> text-scale: 1;
+    // The built-in value; a Default action appears while the value differs.
+    // Negative offers no such action.
+    in property <int> default-value: -1;
     callback changed-value(int);
-    out property <bool> has-focus: decrease.has-focus || increase.has-focus;
+    property <bool> reset-focused: false;
+    out property <bool> has-focus: decrease.has-focus || increase.has-focus || root.reset-focused;
     // At its minimum the decrease action is disabled; focus the other one.
     public function focus-control() {
         if root.value > root.minimum { decrease.focus(); } else { increase.focus(); }
@@ -1533,6 +1537,23 @@ component StyleNumberSetting inherits Rectangle {
             enabled: root.value > root.minimum; activated => { root.changed-value(max(root.minimum, root.value - root.step)); } }
         increase := IconAction { icon: "+"; label: "Increase " + root.label; ink: root.ink; surface: root.surface; hover-surface: root.hover-surface;
             enabled: root.value < root.maximum; activated => { root.changed-value(min(root.maximum, root.value + root.step)); } }
+        if root.default-value >= 0 && root.value != root.default-value : VerticalLayout {
+            alignment: center;
+            TextAction {
+                text: "Default";
+                label: "Reset " + root.label + " to its default, " + root.default-value + root.suffix;
+                ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+                outline: root.muted.transparentize(0.6); text-scale: root.text-scale;
+                focus-state-changed(focused) => { root.reset-focused = focused; }
+                // This action disappears once the value is the default, so the
+                // stepper takes focus first and the row keeps it.
+                activated => {
+                    root.reset-focused = false;
+                    root.focus-control();
+                    root.changed-value(root.default-value);
+                }
+            }
+        }
     }
 }
 
@@ -6078,7 +6099,7 @@ export component AppWindow inherits Window {
                         Text { text: "Use immediate hover feedback for buttons and navigation.";
                             color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
                         StyleNumberSetting {
-                            label: "Hover fade duration"; value: StyleTokens.hover-duration-ms;
+                            label: "Hover fade duration"; value: StyleTokens.hover-duration-ms; default-value: 90;
                             minimum: 0; maximum: 1000; step: 10; suffix: " ms";
                             property <int> reveal-request: root.reveal-request("appearance.hover_duration");
                             changed has-focus => {
@@ -6381,7 +6402,7 @@ export component AppWindow inherits Window {
                                     if self.has-focus { root.settings-revealed-id = "appearance.message_size"; }
                                 }
                             }
-                            label: "Message font size"; value: root.message-font-size; minimum: 10; maximum: 32;
+                            label: "Message font size"; value: root.message-font-size; minimum: 10; maximum: 32; default-value: 14;
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
                             changed-value(value) => { root.change-style-number(0, value); } }
                         StyleNumberSetting {
@@ -6560,7 +6581,7 @@ export component AppWindow inherits Window {
                         }
                         Text { text: "Brackets and alignment apply to the nickname column in Columns layout. Screen readers hear the plain name.";
                             color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
-                        StyleNumberSetting { label: "Timestamp column width"; value: root.timestamp-width-px; minimum: 48; maximum: 160; step: 4;
+                        StyleNumberSetting { label: "Timestamp column width"; value: root.timestamp-width-px; minimum: 48; maximum: 160; step: 4; default-value: 72;
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
                             changed-value(value) => { root.change-style-number(6, value); } }
                         Text { text: "Clock style updates messages and thread replies. Column width applies in Columns layout. Narrow columns shorten displayed times; screen readers can read the full time. Sending and failed messages always keep their status.";
@@ -6581,7 +6602,7 @@ export component AppWindow inherits Window {
                                     if self.has-focus { root.settings-revealed-id = "appearance.geometry"; }
                                 }
                             }
-                            label: "Corner radius"; value: root.corner-radius-px; minimum: 0; maximum: 24;
+                            label: "Corner radius"; value: root.corner-radius-px; minimum: 0; maximum: 24; default-value: 10;
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
                             changed-value(value) => { root.change-style-number(1, value); } }
                         StyleNumberSetting {
@@ -6599,10 +6620,10 @@ export component AppWindow inherits Window {
                                     if self.has-focus { root.settings-revealed-id = "appearance.spacing"; }
                                 }
                             }
-                            label: "Message spacing"; value: root.message-gap-px; minimum: 0; maximum: 32;
+                            label: "Message spacing"; value: root.message-gap-px; minimum: 0; maximum: 32; default-value: 12;
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
                             changed-value(value) => { root.change-style-number(2, value); } }
-                        StyleNumberSetting { label: "Conversation inset"; value: root.content-padding-px; minimum: 0; maximum: 48; step: 2;
+                        StyleNumberSetting { label: "Conversation inset"; value: root.content-padding-px; minimum: 0; maximum: 48; step: 2; default-value: 24;
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
                             changed-value(value) => { root.change-style-number(3, value); } }
                         StyleNumberSetting {
@@ -6620,10 +6641,10 @@ export component AppWindow inherits Window {
                                     if self.has-focus { root.settings-revealed-id = "appearance.rail_width"; }
                                 }
                             }
-                            label: "Space rail width"; value: root.rail-width-px; minimum: 44; maximum: 100; step: 2;
+                            label: "Space rail width"; value: root.rail-width-px; minimum: 44; maximum: 100; step: 2; default-value: 70;
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
                             changed-value(value) => { root.change-style-number(4, value); } }
-                        StyleNumberSetting { label: "Nickname column width"; value: root.nickname-width-px; minimum: 64; maximum: 240; step: 8;
+                        StyleNumberSetting { label: "Nickname column width"; value: root.nickname-width-px; minimum: 64; maximum: 240; step: 8; default-value: 128;
                             ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; text-scale: root.text-scale;
                             changed-value(value) => { root.change-style-number(5, value); } }
                         Text { text: "Typography, geometry and motion"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
