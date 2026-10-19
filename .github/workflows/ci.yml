@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
 name: Reviewed beta four-platform native checks
-run-name: Reviewed attachment integration - a825a99 - ${{ inputs.platform }}
+run-name: Attachment affected checks - adccb7a - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -9,20 +9,20 @@ on:
         description: Select only affected native platforms
         type: choice
         required: true
-        default: all
-        options: [all, non-intel, macos-arm64, macos-intel, windows, linux]
+        default: pending-platforms
+        options: [pending-platforms, macos-arm64, macos-intel, windows]
 permissions:
   contents: read
 concurrency:
-  group: beta-native-a825a99-${{ github.ref }}
+  group: beta-native-adccb7a-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
     name: Native ${{ matrix.name }}
-    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false && contains(fromJSON('["all","non-intel","macos-arm64","macos-intel","windows","linux"]'), inputs.platform)
+    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false && contains(fromJSON('["pending-platforms","macos-arm64","macos-intel","windows"]'), inputs.platform)
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(inputs.platform == 'non-intel' && '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"},{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"},{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}' || inputs.platform == 'macos-arm64' && '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"}]}' || inputs.platform == 'macos-intel' && '{"include":[{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"}]}' || inputs.platform == 'windows' && '{"include":[{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"}]}' || inputs.platform == 'linux' && '{"include":[{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}' || '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"},{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"},{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"},{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}') }}
+      matrix: ${{ fromJSON(inputs.platform == 'macos-arm64' && '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"}]}' || inputs.platform == 'macos-intel' && '{"include":[{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"}]}' || inputs.platform == 'windows' && '{"include":[{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"}]}' || '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"},{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"},{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"}]}') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     env:
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: a825a991a3825106f5bd09d8fc5d70033ab951c2
+          ref: adccb7ac9aa9fc4a8b6e2b15c53cf1d105387f7e
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -135,9 +135,9 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='a825a991a3825106f5bd09d8fc5d70033ab951c2'
+          source='adccb7ac9aa9fc4a8b6e2b15c53cf1d105387f7e'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
-          if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
+          if identity['reason'] or identity['code']!=0 or identity['log'].read_text(encoding='utf-8').strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
           archives={
               ('Linux','X64'):('linux_x64.tar.gz','551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'),
@@ -183,8 +183,8 @@ jobs:
               'source-scan',240,8*1024*1024)
           # Source reports/logs stay private. Never print findings or contributor content.
           try:
-              findings=json.loads(report.read_text()) if report.stat().st_size<=8*1024*1024 else None
-              counts=re.findall(r'([0-9]+) commits scanned',scan['log'].read_text(errors='replace'))
+              findings=json.loads(report.read_text(encoding='utf-8')) if report.stat().st_size<=8*1024*1024 else None
+              counts=re.findall(r'([0-9]+) commits scanned',scan['log'].read_text(encoding='utf-8',errors='replace'))
               passed=(scan['reason'] is None and scan['code']==0 and findings==[]
                   and len(counts)==1 and int(counts[0])>0)
           except (OSError,ValueError): passed=False; counts=[]
@@ -379,7 +379,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='a825a991a3825106f5bd09d8fc5d70033ab951c2'
+          source='adccb7ac9aa9fc4a8b6e2b15c53cf1d105387f7e'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -415,7 +415,7 @@ jobs:
           # package identities, never a server/build response, path or raw log line.
           import tomllib
           locked={(package['name'],package['version']) for package in
-              tomllib.loads((workspace/'Cargo.lock').read_text())['package']}
+              tomllib.loads((workspace/'Cargo.lock').read_text(encoding='utf-8'))['package']}
           failure_markers={
               'custom_build_command':'failed to run custom build command',
               'cxx_bridge':'cxxbridge',
@@ -505,14 +505,21 @@ jobs:
           }
           needed_matrix.update({'media::tests::file_read_rejects_oversized_input', 'media::tests::sticker_previews_keep_encrypted_context_and_size_guards', 'media::preview_tests::preview_stream_enforces_smaller_limit_without_declared_size', 'media::tests::sticker_encrypted_extension_never_falls_back_to_plain_url', 'media::preview_tests::preview_decryption_consumes_eof_hash_and_rejects_tampering', 'media::tests::cdn_dns_accepts_only_public_addresses', 'media::tests::guarded_cdn_client_never_connects_to_loopback', 'media::tests::long_media_authorities_keep_their_endpoint_components', 'media::tests::malformed_media_is_rejected_before_any_homeserver_request', 'media::tests::sticker_sources_must_be_valid_matrix_media_addresses', 'media::tests::cdn_resolver_rejects_loopback_at_connection_resolution', 'media::tests::media_address_limits_are_checked_before_endpoint_construction', 'media::tests::owned_upload_rejects_cancelled_closed_and_aba_selections_before_io', 'media::tests::streamed_download_rejects_an_oversized_body', 'media::tests::media_redirects_validate_targets_before_request', 'media::tests::sticker_metadata_preserves_image_hints_without_source_or_body', 'media::preview_tests::preview_requires_image_and_each_encryption_context_opt_in', 'media::tests::filenames_and_mime_types_are_validated'})
           checks=[
-              ('native_app_build',['cargo','build','--locked','-p','morpheus-app','--features','native-calls'],70*60,None,set()),
-              ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
-                  '--bin','morpheus-app','--','--test-threads=1'],40*60,needed_app,allowed_app_ignore),
-              ('matrix_unit',['cargo','test','--locked','-p','morpheus-matrix','--lib','--','--test-threads=1'],20*60,needed_matrix,set()),
+              ('app_ui_only',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
+                  '--bin','morpheus-app','account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
+                  '--','--exact','--test-threads=1'],40*60,
+                  {'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'},set()),
           ]
-          # Config/RTC and SDK source, locks, compiler and dependencies are unchanged.
-          # SDK18 evidence is tracked separately in the prior matrix and Windows-only lane.
-          # This integration changes native UI/controllers and Matrix attachment admission logic.
+          if os.environ['RUNNER_OS']=='Windows':
+              checks=[
+                  ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
+                      '--bin','morpheus-app','--','--test-threads=1'],40*60,needed_app,allowed_app_ignore),
+                  ('matrix_unit',['cargo','test','--locked','-p','morpheus-matrix','--lib','--','--test-threads=1'],20*60,needed_matrix,set()),
+              ]
+          # Native builds passed on all four platforms at a825; adccb changes only a cfg(test) label.
+          # Mac non-UI/controller and Matrix suites passed unchanged; rerun only their failed UI case.
+          # Windows app/core records were lost to the old cp1252 diagnostic reader; recover those only.
+          # Linux actual UI passed separately at this exact source. No duplicate Linux or native build.
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
               result=bounded(args,name,seconds)
@@ -527,13 +534,13 @@ jobs:
                   '--report-format','json','--report-path',str(report)],name+'-scan',60,8*1024*1024)
               try:
                   clean=(scanned['reason'] is None and scanned['code']==0
-                      and report.stat().st_size<=8*1024*1024 and json.loads(report.read_text())==[])
+                      and report.stat().st_size<=8*1024*1024 and json.loads(report.read_text(encoding='utf-8'))==[])
               except (OSError,ValueError): clean=False
               if not clean:
                   print(json.dumps({'check':name,'status':'failed','reason':'private_log_scan_failed',
                       'source':source,'raw_logs_public':False},sort_keys=True),flush=True)
                   raise SystemExit(1)
-              output=result['log'].read_text(errors='replace')
+              output=result['log'].read_text(encoding='utf-8',errors='replace')
               passed=result['reason'] is None and result['code']==0
               record={'check':name,'status':'passed' if passed else 'failed','reason':result['reason'],
                   'source':source,'exit_code':result['code'],'log_bytes':result['bytes'],
@@ -581,6 +588,7 @@ jobs:
                   # Only reviewed public filenames and numeric compiler spans.
                   # Missing identifiers are admitted only if already in those public sources.
                   source_files=('crates/morpheus-app/src/main.rs',
+                      'crates/morpheus-app/src/account_access_ui_tests.rs',
                       'crates/morpheus-app/src/live.rs',
                       'crates/morpheus-app/src/timeline_model.rs',
                       'crates/morpheus-app/src/pinned_messages/mod.rs',
@@ -595,7 +603,7 @@ jobs:
                   for path in source_files:
                       file=workspace/path
                       if not file.is_file(): continue
-                      text=file.read_text()
+                      text=file.read_text(encoding='utf-8')
                       public_identifiers.update(re.findall(r'\b[A-Za-z_][A-Za-z0-9_]{0,127}\b',text))
                       line_limit=len(text.splitlines())+1
                       spans={(int(line),int(column)) for line,column in re.findall(re.escape(path)+r':([0-9]{1,7}):([0-9]{1,5})',normalized)
