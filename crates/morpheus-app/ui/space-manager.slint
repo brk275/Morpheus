@@ -50,6 +50,9 @@ export struct SpaceManagerView {
     // The selection is a joined Space that can be shown here instead.
     can-open: bool,
     can-edit: bool,
+    // The selection is a direct entry whose room was upgraded; its
+    // replacement can be listed in its place.
+    can-replace: bool,
     can-move-up: bool,
     can-move-down: bool,
     // The resolved room waiting to be added, as one description.
@@ -130,7 +133,8 @@ export component SpaceManagerPage inherits VerticalLayout {
     callback scope-changed();
     // 0 refresh, 1 load more, 2 find, 3 clear found, 4 add, 5 save,
     // 6 move up, 7 move down, 8 remove, 9 join, 10 open sub-Space, 11 stop read,
-    // 12 create a room here, 13 back to the previous Space
+    // 12 create a room here, 13 back to the previous Space, 14 list an upgraded
+    // room's replacement in its place
     callback action(int);
     callback select(string);
     callback search-edited(string);
@@ -415,6 +419,17 @@ export component SpaceManagerPage inherits VerticalLayout {
                             label: "Review moving " + root.view.selected.name + " down one place";
                             enabled: !root.view.busy && root.view.can-move-down;
                             activated => { root.action(7); }
+                        }
+                    }
+                    if root.view.can-replace : HorizontalLayout {
+                        alignment: start;
+                        RosterButton {
+                            palette: root.palette; text-scale: root.text-scale;
+                            text: "Use the new room…";
+                            label: "Review listing the room that replaced " + root.view.selected.name + " in its place";
+                            primary: true;
+                            enabled: !root.view.busy;
+                            activated => { root.action(14); }
                         }
                     }
                     if root.view.can-edit : HorizontalLayout {

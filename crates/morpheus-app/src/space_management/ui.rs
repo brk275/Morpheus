@@ -38,6 +38,7 @@ pub(crate) const OPEN_SPACE: i32 = 10;
 pub(crate) const STOP: i32 = 11;
 pub(crate) const CREATE: i32 = 12;
 pub(crate) const BACK: i32 = 13;
+pub(crate) const REPLACE: i32 = 14;
 /// Spaces remembered for Back, newest last.
 const MAX_TRAIL: usize = 8;
 
@@ -442,6 +443,7 @@ impl SpaceManagerUi {
             STOP => self.stop_read(&panel),
             CREATE => self.review_create(ui, panel),
             BACK => self.back_to_parent(ui, &panel),
+            REPLACE => self.review_replace(ui, panel),
             _ => {}
         }
     }
@@ -702,6 +704,19 @@ impl SpaceManagerUi {
         }
     }
 
+    fn review_replace(self: &Arc<Self>, ui: &AppWindow, panel: Arc<Panel>) {
+        if !self.idle(&panel) {
+            return;
+        }
+        let Some((row, name)) = self.selected(&panel) else {
+            return;
+        };
+        if let Some(replacement) = row.link.replaced_by.clone() {
+            let link = row.link;
+            self.review(ui, panel, Change::Replace { link, replacement }, name);
+        }
+    }
+
     fn review_join(self: &Arc<Self>, ui: &AppWindow, panel: Arc<Panel>) {
         if !self.idle(&panel) {
             return;
@@ -824,6 +839,7 @@ impl SpaceManagerUi {
                         Change::Link { target, suggested, order } => session.link(&target, suggested, order.as_deref()).await?,
                         Change::Update { link, suggested, order } => session.update(&link, suggested, order.as_deref()).await?,
                         Change::Unlink { link } => session.unlink(&link).await?,
+                        Change::Replace { link, .. } => session.replace(&link).await?,
                         Change::Reorder { plan, .. } => session.reorder(&plan).await?,
                         Change::Create { name: room_name, is_space, members_only, suggested } => {
                             let kind = if is_space { ChildKind::Space } else { ChildKind::Room };
@@ -1023,7 +1039,9 @@ fn apply_page(
 fn settle(state: &mut PanelState, intent: &Intent, outcome: SpaceWriteOutcome) {
     match intent.change {
         Change::Link { .. } if outcome.confirmed => state.target = None,
-        Change::Unlink { .. } if outcome.confirmed => state.selected = None,
+        Change::Unlink { .. } | Change::Replace { .. } if outcome.confirmed => {
+            state.selected = None;
+        }
         _ => {}
     }
 }
@@ -1100,6 +1118,7 @@ fn render(
         can_join: joinable,
         can_open: openable,
         can_edit: editable,
+        can_replace: editable && selected.is_some_and(|row| row.link.replaced_by.is_some()),
         can_move_up: editable && position.is_some_and(|index| index > 0),
         can_move_down: editable && position.is_some_and(|index| index + 1 < direct.len()),
         target: state

@@ -29,6 +29,8 @@ const UNLINK_BODY: &str =
 const JOIN_BODY: &str = "You join only this one, not the rest of the Space. Members can see it.";
 const MOVE_BODY: &str = "Everyone in the Space sees the new order.";
 const CREATE_BODY: &str = "Nobody else is invited, and nothing already in the Space changes.";
+const REPLACE_BODY: &str =
+    "Nobody joins or leaves, and the old room keeps its history and stays in other Spaces.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Filter {
@@ -247,6 +249,9 @@ pub(crate) fn row_detail(row: &Row, nodes: &[SpaceNode]) -> String {
     if row.repeated {
         parts.push("Also listed above".to_owned());
     }
+    if row.link.replaced_by.is_some() {
+        parts.push("Replaced by a newer room".to_owned());
+    }
     parts.join(" · ")
 }
 
@@ -272,6 +277,10 @@ pub(crate) fn selected_detail(row: &Row, nodes: &[SpaceNode], can_manage: bool) 
         text.push_str(" This link uses content Morpheus will not rewrite.");
     } else if row.direct() && !can_manage {
         text.push_str(" Your level does not allow changing links.");
+    }
+    if let Some(replacement) = &row.link.replaced_by {
+        let id = crate::directory_plain_text(replacement, 260);
+        text.push_str(&format!("\n\nThis room was upgraded. Its replacement is {id}."));
     }
     text
 }
@@ -344,6 +353,11 @@ pub(crate) enum Change {
         order: Option<String>,
     },
     Unlink { link: SpaceChildLink },
+    /// List the room that replaced an upgraded child in its place.
+    Replace {
+        link: SpaceChildLink,
+        replacement: String,
+    },
     Reorder {
         plan: Vec<(SpaceChildLink, String)>,
         up: bool,
@@ -375,18 +389,24 @@ impl Intent {
     pub(crate) fn room_id(&self) -> &str {
         match &self.change {
             Change::Link { target, .. } => target.room_id.as_str(),
-            Change::Update { link, .. } | Change::Unlink { link } => link.room_id.as_str(),
+            Change::Update { link, .. }
+            | Change::Unlink { link }
+            | Change::Replace { link, .. } => link.room_id.as_str(),
             Change::Reorder { plan, .. } => {
                 plan.first().map_or("", |(link, _)| link.room_id.as_str())
             }
             Change::Join { room_id, .. } => room_id.as_str(),
+            // The room does not exist yet, so no row is marked.
+            Change::Create { .. } => "",
         }
     }
     /// Every reviewed link is still listed unchanged by a fresher load.
     pub(crate) fn still_matches(&self, direct: &[SpaceChildLink]) -> bool {
         let listed = |link: &SpaceChildLink| direct.iter().any(|item| item == link);
         match &self.change {
-            Change::Update { link, .. } | Change::Unlink { link } => listed(link),
+            Change::Update { link, .. }
+            | Change::Unlink { link }
+            | Change::Replace { link, .. } => listed(link),
             Change::Reorder { plan, .. } => plan.iter().all(|(link, _)| listed(link)),
             Change::Link { .. } | Change::Join { .. } | Change::Create { .. } => true,
         }
@@ -473,6 +493,26 @@ pub(crate) fn confirmation(intent: &Intent) -> Confirmation {
             action: "Remove link",
             destructive: true,
         },
+        Change::Replace { link, replacement } => {
+            let id = crate::directory_plain_text(replacement, 260);
+            let suggested = if link.suggested {
+                "suggested"
+            } else {
+                "not suggested"
+            };
+            let order = link.order.as_deref().unwrap_or("none");
+            let order = crate::directory_plain_text(order, 60);
+            Confirmation {
+                title: format!("List the new room for {name}?"),
+                body: format!(
+                    "{name} was upgraded to {id}. {space} lists the new room in its place \
+                     ({suggested}, order key {order}), then removes the link to the old room. \
+                     {REPLACE_BODY}"
+                ),
+                action: "Use new room",
+                destructive: false,
+            }
+        }
         Change::Reorder { plan, up } => {
             let direction = if *up { "up" } else { "down" };
             let count = plan.len();
@@ -531,6 +571,7 @@ pub(crate) fn pending_text(intent: &Intent) -> String {
         Change::Link { .. } => "Adding",
         Change::Update { .. } => "Updating",
         Change::Unlink { .. } => "Removing",
+        Change::Replace { .. } => "Replacing",
         Change::Reorder { .. } => "Moving",
         Change::Join { .. } => "Joining",
         Change::Create { .. } => "Creating",
@@ -541,6 +582,9 @@ pub(crate) fn pending_text(intent: &Intent) -> String {
 /// Report only what the homeserver accepted and what reading it back showed.
 pub(crate) fn outcome_text(intent: &Intent, outcome: SpaceWriteOutcome) -> String {
     let name = &intent.name;
+    if let Change::Replace { .. } = intent.change {
+        return replaced_text(name, &intent.space, outcome);
+    }
     if let Some(error) = outcome.stopped {
         let (accepted, requested) = (outcome.accepted, outcome.requested);
         let reason = error_text(error);
@@ -555,10 +599,29 @@ pub(crate) fn outcome_text(intent: &Intent, outcome: SpaceWriteOutcome) -> Strin
         Change::Link { .. } => format!("Added {name}. The homeserver confirmed the link."),
         Change::Update { .. } => format!("Updated {name}. The homeserver confirmed it."),
         Change::Unlink { .. } => format!("Removed the link to {name}; the room is unchanged."),
+        Change::Replace { .. } => replaced_text(name, &intent.space, outcome),
         Change::Reorder { .. } => format!("Moved {name}. The homeserver confirmed the order."),
         Change::Join { .. } => format!("Joined {name}."),
         Change::Create { .. } => format!("Created {name}."),
     }
+}
+
+/// What replacing an upgraded room did: the new room is listed first, so a
+/// failure after that leaves both listed rather than neither.
+fn replaced_text(name: &str, space: &str, outcome: SpaceWriteOutcome) -> String {
+    if let Some(error) = outcome.stopped {
+        let reason = error_text(error);
+        return format!(
+            "{space} now lists the new room for {name}, but removing the old link failed: \
+             {reason}"
+        );
+    }
+    if !outcome.confirmed {
+        return format!(
+            "The homeserver accepted the changes for {name}, but reading them back differed."
+        );
+    }
+    format!("{space} now lists the new room for {name}. The homeserver confirmed it.")
 }
 
 /// The notice and error after a room was created inside the Space: listing
@@ -745,6 +808,8 @@ mod tests {
         assert!(!review.destructive && review.body.contains("Members of Crew can join it"));
         assert!(review.body.contains("a new encrypted room"));
         assert!(intent.still_matches(&[]));
+        // The room does not exist yet, so no row is marked pending.
+        assert_eq!(intent.room_id(), "");
         let listed = CreatedChild {
             room_id: "!new:example.org".to_owned(),
             linked: true,
@@ -784,5 +849,56 @@ mod tests {
         let confirmation = confirmation(&intent);
         assert!(confirmation.destructive);
         assert!(confirmation.body.contains("Nobody leaves"));
+    }
+
+    #[test]
+    fn an_upgraded_room_is_replaced_in_place_and_a_partial_result_is_reported() {
+        let (old, new) = ("!old:example.org", "!new:example.org");
+        let mut replaced = link(SPACE, old, 1);
+        replaced.replaced_by = Some(new.to_owned());
+        let nodes = [
+            node(SPACE, true, vec![replaced.clone()]),
+            node(old, true, Vec::new()),
+        ];
+        let rows = rows(SPACE, &nodes);
+        assert!(row_detail(&rows[0], &nodes).ends_with("Replaced by a newer room"));
+        let detail = selected_detail(&rows[0], &nodes, true);
+        assert!(detail.ends_with("This room was upgraded. Its replacement is !new:example.org."));
+        let change = Change::Replace {
+            link: replaced.clone(),
+            replacement: new.to_owned(),
+        };
+        let intent = Intent {
+            change,
+            name: "Old".to_owned(),
+            space: "Crew".to_owned(),
+        };
+        assert_eq!(intent.room_id(), old);
+        assert!(intent.still_matches(std::slice::from_ref(&replaced)));
+        assert!(!intent.still_matches(&[link(SPACE, old, 2)]));
+        let review = confirmation(&intent);
+        assert!(!review.destructive && review.body.contains("Nobody joins or leaves"));
+        assert!(review.body.contains("upgraded to !new:example.org"));
+        assert_eq!(
+            pending_text(&intent),
+            "Replacing Old… Waiting for the homeserver."
+        );
+        let both = SpaceWriteOutcome {
+            accepted: 2,
+            requested: 2,
+            confirmed: true,
+            stopped: None,
+        };
+        assert_eq!(
+            outcome_text(&intent, both),
+            "Crew now lists the new room for Old. The homeserver confirmed it."
+        );
+        // The new room is listed first, so a later failure leaves both listed.
+        let half = SpaceWriteOutcome {
+            accepted: 1,
+            stopped: Some(RoomAdminError::Forbidden),
+            ..both
+        };
+        assert!(outcome_text(&intent, half).contains("removing the old link failed"));
     }
 }

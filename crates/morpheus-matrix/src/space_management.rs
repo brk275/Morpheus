@@ -105,6 +105,9 @@ pub struct SpaceChildLink {
     pub origin_server_ts: u64,
     /// The content can be edited without losing fields or changing meaning.
     pub editable: bool,
+    /// The room that replaced the linked room, from this account's synced
+    /// copy of its tombstone; `None` when the account knows of none.
+    pub replaced_by: Option<String>,
     content: Value,
 }
 
@@ -560,6 +563,91 @@ impl SpaceSession {
         .await
     }
 
+    /// List the room that replaced a direct child, with the old link's
+    /// suggested flag and order key, then remove the old room's link. The
+    /// replacement comes from a fresh read of the old room's tombstone and is
+    /// listed first, so the Space never lists neither. Nobody joins or
+    /// leaves, and the old room keeps its history.
+    pub async fn replace(&self, link: &SpaceChildLink) -> Result<SpaceWriteOutcome> {
+        let old = self.direct_child(link)?;
+        self.run(WRITE_TIMEOUT, async {
+            self.require_manage().await?;
+            let current = self.child_state(&old).await?;
+            if current.as_ref() != Some(&link.content) {
+                return Err(RoomAdminError::TargetChanged);
+            }
+            let (new, via) = self.replacement(&old).await?;
+            if new == old || new.as_str() == self.space_id() {
+                return Err(RoomAdminError::InvalidState);
+            }
+            let existing = self.child_state(&new).await?;
+            let mut outcome = SpaceWriteOutcome {
+                accepted: 0,
+                requested: 1,
+                confirmed: true,
+                stopped: None,
+            };
+            // A replacement the Space already lists keeps its own link.
+            if !existing.as_ref().is_some_and(is_linked) {
+                let order = link.order.as_deref();
+                let content = link_content(existing.as_ref(), &via, link.suggested, order)?;
+                self.send_child(&new, &content).await?;
+                let after = self.child_state(&new).await.ok().flatten();
+                outcome.requested = 2;
+                outcome.accepted = 1;
+                outcome.confirmed = after.as_ref() == Some(&content);
+            }
+            // From here a failure is reported with what was accepted.
+            match self.send_child(&old, &Value::Object(Map::new())).await {
+                Ok(()) => {
+                    outcome.accepted += 1;
+                    let after = self.child_state(&old).await;
+                    let removed = after.is_ok_and(|after| after.is_none_or(|v| !is_linked(&v)));
+                    outcome.confirmed &= removed;
+                }
+                Err(error) if outcome.accepted == 0 => return Err(error),
+                Err(error) => outcome.stopped = Some(error),
+            }
+            Ok(outcome)
+        })
+        .await
+    }
+
+    /// The room that replaced `old`, from a fresh read of its tombstone, and
+    /// route servers for it: the routing algorithm over its members when
+    /// this account joined it, else the server of whoever upgraded the room,
+    /// where the replacement was created.
+    async fn replacement(&self, old: &RoomId) -> Result<(OwnedRoomId, Vec<String>)> {
+        let client = self.space.client();
+        let room = client.get_room(old).ok_or(RoomAdminError::NotApplicable)?;
+        let tombstone = room_settings::state(&room, StateEventType::RoomTombstone, "")
+            .await
+            .map_err(|error| match RoomAdminError::from(error) {
+                // Reading the old room's state was refused: nothing to replace.
+                RoomAdminError::InsufficientPower => RoomAdminError::NotApplicable,
+                error => error,
+            })?;
+        self.check()?;
+        let tombstone = tombstone.ok_or(RoomAdminError::NotApplicable)?;
+        let new = tombstone
+            .content
+            .get("replacement_room")
+            .and_then(Value::as_str)
+            .and_then(|id| RoomId::parse(id).ok())
+            .ok_or(RoomAdminError::InvalidState)?;
+        let joined = client
+            .get_room(&new)
+            .filter(|room| room.state() == RoomState::Joined);
+        let members = match joined {
+            Some(room) => room.route().await.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        self.check()?;
+        let upgrader = vec![tombstone.sender.server_name().to_owned()];
+        let (via, _) = choose_route(members, upgrader, &[])?;
+        Ok((new, via))
+    }
+
     fn direct_child(&self, link: &SpaceChildLink) -> Result<OwnedRoomId> {
         if link.parent_id != self.space_id() {
             return Err(RoomAdminError::NotApplicable);
@@ -682,6 +770,9 @@ fn space_node(client: &Client, chunk: SpaceHierarchyRoomsChunk) -> SpaceNode {
         .take(MAX_CHILDREN_PER_NODE)
         .filter_map(|raw| parse_child_link(&room_id, raw.json().get()))
         .collect::<Vec<_>>();
+    for link in &mut children {
+        link.replaced_by = successor(client, &link.room_id);
+    }
     sort_links(&mut children);
     SpaceNode {
         name: summary
@@ -700,6 +791,14 @@ fn space_node(client: &Client, chunk: SpaceHierarchyRoomsChunk) -> SpaceNode {
         children_truncated,
         room_id,
     }
+}
+
+/// The replacement of a room this account has synced and that has a
+/// tombstone. Nothing is fetched.
+fn successor(client: &Client, room_id: &str) -> Option<String> {
+    let room = client.get_room(&RoomId::parse(room_id).ok()?)?;
+    let successor = room.successor_room()?;
+    Some(successor.room_id.to_string())
 }
 
 fn node_access(rule: &JoinRuleSummary) -> NodeAccess {
@@ -786,6 +885,7 @@ fn link_from_content(
         order,
         origin_server_ts,
         editable,
+        replaced_by: None,
         content,
     })
 }
@@ -1130,6 +1230,8 @@ mod tests {
         let late = parse_child_link(parent, &event("!late:example.org", invalid_order, 9));
         let late = late.unwrap();
         assert!(late.order.is_none() && late.editable);
+        // Server content never claims a replacement; only a synced tombstone does.
+        assert!(late.replaced_by.is_none());
         let content = json!({"via": ["example.org"], "order": "z"});
         let keyed = event("!keyed:example.org", content, 5);
         let early = event("!early:example.org", json!({"via": ["example.org"]}), 2);
@@ -1214,6 +1316,7 @@ mod tests {
             send(session.unlink(link));
             send(session.reorder(&[]));
             send(session.create_child("Planning", ChildKind::Room, true, false));
+            send(session.replace(link));
         }
     }
 }

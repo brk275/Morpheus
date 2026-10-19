@@ -611,7 +611,7 @@ fn require_baseline(expected: &Option<Value>, current: &Option<Value>) -> Result
 pub(crate) struct StateEnvelope {
     pub(crate) event_id: OwnedEventId,
     room_id: OwnedRoomId,
-    sender: OwnedUserId,
+    pub(crate) sender: OwnedUserId,
     #[serde(rename = "type")]
     event_type: StateEventType,
     state_key: String,
