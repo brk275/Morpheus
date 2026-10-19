@@ -11,7 +11,9 @@ members = [
     "vendor/matrix-rtc-livekit",
     "vendor/matrix-rtc-core",
     "vendor/cargo-packager-updater",
+    "vendor/matrix-sdk",
     "vendor/matrix-sdk-base",
+    "vendor/matrix-sdk-search",
     "vendor/matrix-sdk-ui",
     "vendor/webrtc-sys-build",
 ]
@@ -56,3 +58,8 @@ matrix-rtc-core = { path = "vendor/matrix-rtc-core" }
 matrix-sdk-base = { path = "vendor/matrix-sdk-base" }
 # Keep locally consumed custom room state available through native sliding sync.
 matrix-sdk-ui = { path = "vendor/matrix-sdk-ui" }
+
+# Typed local search restrictions and normalized replacement indexing.
+# Dependency resolution and compatibility remain subject to hosted verification.
+matrix-sdk = { path = "vendor/matrix-sdk" }
+matrix-sdk-search = { path = "vendor/matrix-sdk-search" }

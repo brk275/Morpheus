@@ -1,0 +1,96 @@
+{
+  "repository": "https://github.com/matrix-org/matrix-rust-sdk",
+  "revision": "c6ad52ecc09eaa36601f55effb0a48a533eb87dd",
+  "crate": "matrix-sdk-search",
+  "version": "0.19.1",
+  "license_file": "LICENSE (repository root at the same revision)",
+  "upstream_entry_count": 14,
+  "regular_file_count": 14,
+  "omitted_entries": [],
+  "upstream_files": [
+    {
+      "path": "CHANGELOG.md",
+      "sha256": "ccd337b21ad3d841e1c2f3973c7eb0ddc23bc6893c6104bb58c7c7e7e9dabf9c",
+      "git_blob": "55eabce8339e45435c60779eac47728c3d65804d",
+      "bytes": 2471
+    },
+    {
+      "path": "Cargo.toml",
+      "sha256": "f3c4eb4b221d13ed9cd43acda63e61ce95ae82a5ed9765cd97f43eaf0a4be370",
+      "git_blob": "a7427b05e1c96df01c6cc3691de4e80ac3fa830c",
+      "bytes": 1352
+    },
+    {
+      "path": "README.md",
+      "sha256": "737d0fe9f3a026472253da6bd42996a663a269c0ec8effade115b88bc20932e9",
+      "git_blob": "183214ea470225915b517c3f7ee42eb7c0b328f9",
+      "bytes": 1344
+    },
+    {
+      "path": "changelog.d/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "git_blob": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "bytes": 0
+    },
+    {
+      "path": "changelog.d/7059.feature.md",
+      "sha256": "0deb55e14731c0826f6e5748e400379e3be8ab4ea74ef2e474be24078ef3be51",
+      "git_blob": "4b5bf173ffd4cd5687d60f64a70d2924753fa336",
+      "bytes": 169
+    },
+    {
+      "path": "src/encrypted/encrypted_dir.rs",
+      "sha256": "56bfc8540ce4c5b805e775729920431e9cb60e3ee0f479feeb343d65f87871e1",
+      "git_blob": "b769d59217bbdb6b5f5472eb3ae66a13d30a2f44",
+      "bytes": 26709
+    },
+    {
+      "path": "src/encrypted/encrypted_stream.rs",
+      "sha256": "f0d5a656a122d8a79d12d40bf7d3db6caee695b3dc6e7f74068a9b293e690715",
+      "git_blob": "572cd7ee84c2bc2b7f9cbcc6715d318675560d28",
+      "bytes": 12531
+    },
+    {
+      "path": "src/encrypted/mod.rs",
+      "sha256": "6f750f8d07a648d4bb78ed4235723573c01dea0dc679b84dbb9b28b7671b0194",
+      "git_blob": "8300d6d9155346522bf31ad38baa6761e3e0f3cd",
+      "bytes": 49
+    },
+    {
+      "path": "src/error.rs",
+      "sha256": "e052e9dac09ee13a8b108fc01a88264ee319ccfdb787975176fefdc24b0a91cf",
+      "git_blob": "b00fb5c4045b02d1755d91e0e258b1aac3904f89",
+      "bytes": 3352
+    },
+    {
+      "path": "src/index/builder.rs",
+      "sha256": "64f393c3f85251cb3c7b95ee4311e1af062f4d6ec11c16f467fe2ab899e252b6",
+      "git_blob": "ed3fef8540b589ee38c34f5fea3eb1dff9984d96",
+      "bytes": 4812
+    },
+    {
+      "path": "src/index/mod.rs",
+      "sha256": "30fe0fa2d7f97f945df68db82df1309e3eed02c737d81e4f0ea59c8fde60a0a1",
+      "git_blob": "ca786ad42227d28458d0fa574fd4780572a6369e",
+      "bytes": 31033
+    },
+    {
+      "path": "src/lib.rs",
+      "sha256": "f384ce324a0260ac56295c4b0f55f46d04785a0c18ba80d98334fb0855c15284",
+      "git_blob": "1ce36ab406d3ae922f022bf6c8e2f819c83a2db8",
+      "bytes": 383
+    },
+    {
+      "path": "src/schema.rs",
+      "sha256": "0301b2f28886463c8ca35aa17369970ab445d121a1e89367c605d4c5a4669668",
+      "git_blob": "80aa6100c9617165f7d97f5f5648b8cff86f3f02",
+      "bytes": 4929
+    },
+    {
+      "path": "src/writer.rs",
+      "sha256": "1d00e1774d899ed81dd11babc239e70072defe3d2613109150deae4cdc6e22ab",
+      "git_blob": "73e4e135297a432ff1cd67ade3edcb9c7f7f2097",
+      "bytes": 1825
+    }
+  ]
+}

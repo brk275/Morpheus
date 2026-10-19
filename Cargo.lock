@@ -5606,7 +5606,6 @@ dependencies = [
 [[package]]
 name = "matrix-sdk"
 version = "0.19.1"
-source = "git+https://github.com/matrix-org/matrix-rust-sdk?rev=c6ad52ecc09eaa36601f55effb0a48a533eb87dd#c6ad52ecc09eaa36601f55effb0a48a533eb87dd"
 dependencies = [
  "anymap2",
  "as_variant",
@@ -5829,7 +5828,6 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-search"
 version = "0.19.1"
-source = "git+https://github.com/matrix-org/matrix-rust-sdk?rev=c6ad52ecc09eaa36601f55effb0a48a533eb87dd#c6ad52ecc09eaa36601f55effb0a48a533eb87dd"
 dependencies = [
  "aes 0.9.3",
  "byteorder",

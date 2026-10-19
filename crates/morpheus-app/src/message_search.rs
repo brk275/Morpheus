@@ -19,11 +19,12 @@ use std::collections::HashSet;
 use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 
-use chrono::{Local, TimeZone};
+use chrono::{Local, NaiveDate, TimeZone};
 use morpheus_matrix::{
     AccountManager, AccountSelection, HistoryReveal, MatrixCoreError, MessageInfo,
     MessageSearchPage, MessageSearchResult,
 };
+use morpheus_matrix::{AttachmentFilter, SearchFilters};
 use slint::{ComponentHandle, Model, ModelRc, Timer, VecModel, Weak};
 use tokio::{runtime::Handle, task::JoinHandle};
 
@@ -87,6 +88,13 @@ const KEEP_COMPOSER: &str =
     "Save or cancel the edit in this room before opening another conversation.";
 // Keep in step with MAX_RESULTS.
 const RESULT_LIMIT: &str = "showing the first 200; refine the search to narrow them";
+/// A date filter is exactly "YYYY-MM-DD".
+const DATE_CHARS: usize = 10;
+const FILTER_SENDER: &str = "Enter the sender's full user ID, like @name:example.org";
+const FILTER_DATE: &str = "Enter dates as YYYY-MM-DD, from 1970 on";
+const FILTER_RANGE: &str = "The date range ends before it starts";
+const FILTER_NEEDS_WORDS: &str =
+    "An attachment filter needs words, a sender or dates to search for";
 
 /// A result to present, or fixed failure text. `Err(None)` means the account
 /// selection ended and nothing is shown.
@@ -98,8 +106,8 @@ enum Scope {
     All,
 }
 
-/// The identity of one query: the account selection and window state it was
-/// issued for. Publication requires every part of it to be unchanged.
+/// The identity of one query: the account selection, window state and filters
+/// it was issued for. Publication requires every part of it to be unchanged.
 #[derive(Clone)]
 struct Ticket {
     operation: i32,
@@ -107,6 +115,7 @@ struct Ticket {
     account: String,
     scope: Scope,
     query: String,
+    filters: SearchFilters,
 }
 
 impl Ticket {
@@ -121,8 +130,8 @@ impl Ticket {
             }
     }
 
-    fn matches(&self, query: &str, scope: Option<&Scope>) -> bool {
-        self.query == query && Some(&self.scope) == scope
+    fn matches(&self, query: &str, scope: Option<&Scope>, filters: &SearchFilters) -> bool {
+        self.query == query && Some(&self.scope) == scope && self.filters == *filters
     }
 }
 
@@ -132,6 +141,7 @@ struct Request {
     ticket: Ticket,
     next_offset: Option<usize>,
     unavailable: usize,
+    filtered: usize,
     seen: HashSet<(String, String)>,
 }
 
@@ -346,9 +356,22 @@ fn owns(ticket: &Ticket) -> bool {
     shown_ticket().is_some_and(|shown| shown.operation == ticket.operation)
 }
 
-/// Cancel every request and clear all search presentation. Used for account
-/// changes and removal, sign-out, and room changes in the open-room scope.
+/// Cancel every request and clear all search presentation, filters
+/// included: they can name a person or a time and belong to the account.
+/// Used for account changes and removal, sign-out and revocation.
 pub(crate) fn reset(ui: &AppWindow) {
+    clear_results(ui);
+    ui.set_room_search_filter_sender("".into());
+    ui.set_room_search_filter_since("".into());
+    ui.set_room_search_filter_until("".into());
+    ui.set_room_search_filter_attachment(0);
+    ui.set_room_search_filter_error("".into());
+    ui.set_room_search_filters_open(false);
+}
+
+/// Cancel every request and clear the query, results and context; the
+/// account's filters stay.
+fn clear_results(ui: &AppWindow) {
     with(|controller| {
         controller.abort_request();
         controller.abort_opening();
@@ -372,10 +395,13 @@ pub(crate) fn reset(ui: &AppWindow) {
 }
 
 /// A different room became visible. All-room results stay with their
-/// account; open-room results belong to the room that was left.
+/// account; open-room results belong to the room that was left. Filters
+/// stay until the account changes.
 pub(crate) fn room_changed(ui: &AppWindow, account_changed: bool) {
-    if account_changed || ui.get_room_search_scope() != 1 {
+    if account_changed {
         reset(ui);
+    } else if ui.get_room_search_scope() != 1 {
+        clear_results(ui);
     }
 }
 
@@ -395,6 +421,16 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, runtime: Handle) {
     ui.on_room_search_edited(move |_| {
         if let Some(window) = weak.upgrade() {
             start(&window, &edit_live, &edit_runtime, Some(DEBOUNCE));
+        }
+    });
+
+    // A changed filter supersedes the shown query like an edited one.
+    let weak = ui.as_weak();
+    let filter_live = live.clone();
+    let filter_runtime = runtime.clone();
+    ui.on_room_search_filters_edited(move || {
+        if let Some(window) = weak.upgrade() {
+            start(&window, &filter_live, &filter_runtime, Some(DEBOUNCE));
         }
     });
 
@@ -485,16 +521,81 @@ fn current_scope(window: &AppWindow) -> Option<Scope> {
     (!room.is_empty()).then_some(Scope::Room(room))
 }
 
+/// The window's filter fields as bounded search filters, or fixed feedback
+/// for the first malformed one. The sender is checked by the core's own
+/// user ID rule; dates are local calendar days, inclusive at both ends.
+fn read_filters(window: &AppWindow) -> Result<SearchFilters, &'static str> {
+    let sender = window.get_room_search_filter_sender().trim().to_owned();
+    let since = window.get_room_search_filter_since().trim().to_owned();
+    let until = window.get_room_search_filter_until().trim().to_owned();
+    let mut filters = SearchFilters::default();
+    if !sender.is_empty() {
+        filters.sender = Some(sender);
+        filters.validate().map_err(|_| FILTER_SENDER)?;
+    }
+    if !since.is_empty() {
+        filters.since_ms = Some(local_day(&since).ok_or(FILTER_DATE)?.0);
+    }
+    if !until.is_empty() {
+        filters.until_ms = Some(local_day(&until).ok_or(FILTER_DATE)?.1);
+    }
+    filters.validate().map_err(|_| FILTER_RANGE)?;
+    filters.attachment = match window.get_room_search_filter_attachment() {
+        1 => AttachmentFilter::With,
+        2 => AttachmentFilter::Without,
+        _ => AttachmentFilter::Any,
+    };
+    Ok(filters)
+}
+
+/// The first and last millisecond of the local calendar day `text` names,
+/// written exactly as YYYY-MM-DD from 1970 on.
+fn local_day(text: &str) -> Option<(u64, u64)> {
+    let bytes = text.as_bytes();
+    if bytes.len() != DATE_CHARS
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(i, value)| i != 4 && i != 7 && !value.is_ascii_digit())
+    {
+        return None;
+    }
+    let mut parts = text.splitn(3, '-');
+    let year = parts.next()?.parse::<i32>().ok()?;
+    let month = parts.next()?.parse::<u32>().ok()?;
+    let day = parts.next()?.parse::<u32>().ok()?;
+    if !(1970..=9999).contains(&year) {
+        return None;
+    }
+    let date = NaiveDate::from_ymd_opt(year, month, day)?;
+    let start = local_midnight(date)?;
+    let end = local_midnight(date.succ_opt()?)?.checked_sub(1)?;
+    Some((start, end))
+}
+
+/// Local midnight at the start of `date`, in milliseconds since the epoch.
+fn local_midnight(date: NaiveDate) -> Option<u64> {
+    let midnight = date.and_hms_opt(0, 0, 0)?;
+    let local = Local.from_local_datetime(&midnight).earliest()?;
+    u64::try_from(local.timestamp_millis()).ok()
+}
+
 /// Return with nothing highlighted: highlight the first hit of a finished
 /// search for the same query, so a second Return opens it; otherwise search
 /// immediately without the typing pause.
 fn submit(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
     let query = window.get_room_search_query().trim().to_owned();
+    let Ok(filters) = read_filters(window) else {
+        start(window, live, runtime, None);
+        return;
+    };
     let scope = current_scope(window);
     let operation = window.get_room_search_operation();
     let shown = shown_ticket()
         .filter(|ticket| ticket.operation == operation)
-        .is_some_and(|ticket| ticket.matches(&query, scope.as_ref()));
+        .is_some_and(|ticket| ticket.matches(&query, scope.as_ref(), &filters));
     let listed = window.get_room_search_results().row_count();
     if shown && listed > 0 && !window.get_room_search_loading() {
         window.set_room_search_index(0);
@@ -529,9 +630,32 @@ fn start(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, delay: Option
     clear_selection(window);
 
     let query = window.get_room_search_query().trim().to_owned();
+    // A malformed filter is reported even before words are typed, and no
+    // search runs.
+    let filters = match read_filters(window) {
+        Ok(filters) => filters,
+        Err(message) => {
+            window.set_room_search_filter_error(message.into());
+            return;
+        }
+    };
+    // Without words, a sender or date filter searches the index (the open
+    // room, or every joined room) newest first; attachment presence alone
+    // cannot.
     if query.is_empty() {
-        return;
+        let refusal = if filters.is_empty() {
+            Some("")
+        } else if !filters.indexed() {
+            Some(FILTER_NEEDS_WORDS)
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            window.set_room_search_filter_error(refusal.into());
+            return;
+        }
     }
+    window.set_room_search_filter_error("".into());
     if !live.is_live.load(Ordering::Acquire) || !window.get_live_session() {
         window.set_room_search_error(NOT_SIGNED_IN.into());
         return;
@@ -560,6 +684,7 @@ fn start(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, delay: Option
         account,
         scope,
         query,
+        filters,
     };
     window.set_room_search_loading(true);
     let weak = window.as_weak();
@@ -571,6 +696,7 @@ fn start(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, delay: Option
             ticket,
             next_offset: None,
             unavailable: 0,
+            filtered: 0,
             seen: HashSet::new(),
         });
         controller.query_task = Some(task);
@@ -622,12 +748,25 @@ async fn search_page(
     match &ticket.scope {
         Scope::Room(room) => {
             manager
-                .search_messages_page_selected(selection, room, query, PAGE_SIZE, offset)
+                .search_messages_filtered_selected(
+                    selection,
+                    room,
+                    query,
+                    &ticket.filters,
+                    PAGE_SIZE,
+                    offset,
+                )
                 .await
         }
         Scope::All => {
             manager
-                .search_all_messages_page_selected(selection, query, PAGE_SIZE, offset)
+                .search_all_messages_filtered_selected(
+                    selection,
+                    query,
+                    &ticket.filters,
+                    PAGE_SIZE,
+                    offset,
+                )
                 .await
         }
     }
@@ -698,12 +837,12 @@ fn publish_page(
         }
     };
     window.set_room_search_searched(true);
-    let Some((items, more, unavailable)) = with(|controller| accept_page(controller, page)) else {
+    let Some((items, more, counts)) = with(|controller| accept_page(controller, page)) else {
         return;
     };
     let total = append_results(window, items, append);
     window.set_room_search_has_more(more);
-    window.set_room_search_notice(page_notice(unavailable, total).into());
+    window.set_room_search_notice(page_notice(counts, total).into());
 }
 
 /// Record a page in the shown request: drop repeats by (room, event)
@@ -711,7 +850,7 @@ fn publish_page(
 fn accept_page(
     controller: &mut Controller,
     page: MessageSearchPage,
-) -> Option<(Vec<MessageSearchItem>, bool, usize)> {
+) -> Option<(Vec<MessageSearchItem>, bool, (usize, usize))> {
     let request = controller.request.as_mut()?;
     let mut items = Vec::new();
     for result in page.results {
@@ -724,19 +863,28 @@ fn accept_page(
         }
     }
     request.unavailable += page.unavailable;
+    request.filtered += page.filtered;
     request.next_offset = page.next_offset;
     if request.seen.len() >= MAX_RESULTS {
         request.next_offset = None;
     }
-    Some((items, request.next_offset.is_some(), request.unavailable))
+    let counts = (request.unavailable, request.filtered);
+    Some((items, request.next_offset.is_some(), counts))
 }
 
-fn page_notice(unavailable: usize, total: usize) -> String {
+/// Hits that could not be loaded, and loaded word matches the filters hid,
+/// are counted, never silently claimed as no match.
+fn page_notice((unavailable, filtered): (usize, usize), total: usize) -> String {
     let mut notice = Vec::new();
     if unavailable == 1 {
         notice.push("1 match could not be loaded".to_owned());
     } else if unavailable > 1 {
         notice.push(format!("{unavailable} matches could not be loaded"));
+    }
+    if filtered == 1 {
+        notice.push("1 word match hidden by the filters".to_owned());
+    } else if filtered > 1 {
+        notice.push(format!("{filtered} word matches hidden by the filters"));
     }
     if total >= MAX_RESULTS {
         notice.push(RESULT_LIMIT.to_owned());
@@ -1440,6 +1588,7 @@ pub(crate) fn result_item(result: MessageSearchResult) -> MessageSearchItem {
         body: body.into(),
         room_name: plain_or(&result.room_name, 80, "Unnamed room").into(),
         thread_root: result.thread_root.unwrap_or_default().into(),
+        has_attachment: result.has_attachment,
     }
 }
 
@@ -1454,6 +1603,7 @@ fn context_item(info: MessageInfo, room_id: &str) -> MessageSearchItem {
         body: body.into(),
         room_name: "".into(),
         thread_root: "".into(),
+        has_attachment: false,
     }
 }
 
@@ -1506,9 +1656,11 @@ mod tests {
             body: format!("Hello\n\u{200b}world {}", "x".repeat(600)),
             timestamp_ms: 0,
             relevance_score: 1.0,
+            has_attachment: true,
         });
         assert_eq!(item.room_id.as_str(), "!room:example.org");
         assert_eq!(item.event_id.as_str(), "$event:example.org");
+        assert!(item.has_attachment);
         assert_eq!(item.thread_root.as_str(), "$root:example.org");
         assert_eq!(item.sender.as_str(), "@alice :example.org");
         assert_eq!(item.room_name.as_str(), "Plans  room");
@@ -1526,5 +1678,32 @@ mod tests {
         assert_eq!(ids(&first), ["$e0", "$e1", "$e2", "$e3"]);
         let missing = trim_context(timeline(13), "$x");
         assert_eq!(missing.len(), CONTEXT_BEFORE + 1 + CONTEXT_AFTER);
+    }
+
+    #[test]
+    fn date_filters_name_whole_local_days_and_refuse_malformed_text() {
+        let (start, end) = local_day("2026-03-14").unwrap();
+        // A whole local day: 24 hours, or 23 to 25 across a clock change.
+        let length = end - start + 1;
+        let hour = 3_600_000;
+        assert!((23 * hour..=25 * hour).contains(&length));
+        let (next, _) = local_day("2026-03-15").unwrap();
+        assert_eq!(next, end + 1);
+        for text in [
+            "",
+            "2026-3-14",
+            "2026-3-014",
+            "2026-+3-14",
+            "2026-03-+4",
+            "14-03-2026",
+            "2026-02-30",
+            "2026-13-01",
+            "1969-12-31",
+            "2026/03/14",
+            "2026-03-14T",
+            "two months",
+        ] {
+            assert_eq!(local_day(text), None, "{text:?} must be refused");
+        }
     }
 }
