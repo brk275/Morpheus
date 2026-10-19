@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
 name: Reviewed attachment focused checks
-run-name: Attachment focused checks - c95a668 - ${{ inputs.platform }}
+run-name: Viewer keyboard diagnosis - a825a99 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: attachment-focused-c95a668-${{ github.ref }}
+  group: viewer-keyboard-a825a99-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: c95a6682ee20769d3fa674b5527ab34ede7f7ccb
+          ref: a825a991a3825106f5bd09d8fc5d70033ab951c2
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -135,7 +135,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='c95a6682ee20769d3fa674b5527ab34ede7f7ccb'
+          source='a825a991a3825106f5bd09d8fc5d70033ab951c2'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -379,7 +379,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='c95a6682ee20769d3fa674b5527ab34ede7f7ccb'
+          source='a825a991a3825106f5bd09d8fc5d70033ab951c2'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -453,14 +453,11 @@ jobs:
               'sdk_extraction':'Cannot unpack native SDK archive entry',
               'sdk_cache_publish':'Cannot publish verified native SDK cache',
           }
-          # Reuse 15 core media passes from39236408853 and3 previews from39238160297.
-          # Core inputs unchanged; only failed app checks run after the viewport sizing fix.
+          # Diagnose only the failing actual viewer keyboard UI case from39241751405.
+          # No native build, successful attachment checks or Matrix suite is repeated.
           # Only affected media, attachment and real generated-UI checks.
-          needed_attachment={'attachment_workbench::tests::only_unqueued_failures_and_paused_uploads_offer_retry', 'attachments::tests::download_save_replaces_only_after_complete_write', 'attachment_workbench::tests::progress_is_a_bounded_percentage', 'attachment_workbench::tests::rows_belong_to_exactly_one_account_and_room', 'attachments::tests::suggested_save_names_cannot_escape_or_disguise_the_chosen_folder', 'attachments::tests::cancellation_while_waiting_for_a_save_guard_never_writes'}
           needed_ui={'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'}
           checks=[
-              ('app_attachment',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
-                  '--bin','morpheus-app','attachment','--','--test-threads=1'],4200,needed_attachment,set()),
               ('app_attachment_ui',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
                   '--bin','morpheus-app','account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
                   '--','--exact','--test-threads=1'],4200,needed_ui,set()),
@@ -554,7 +551,7 @@ jobs:
                   for path in source_files:
                       file=workspace/path
                       if not file.is_file(): continue
-                      text=file.read_text()
+                      text=file.read_text(encoding='utf-8')
                       public_identifiers.update(re.findall(r'\b[A-Za-z_][A-Za-z0-9_]{0,127}\b',text))
                       line_limit=len(text.splitlines())+1
                       spans={(int(line),int(column)) for line,column in re.findall(re.escape(path)+r':([0-9]{1,7}):([0-9]{1,5})',normalized)
