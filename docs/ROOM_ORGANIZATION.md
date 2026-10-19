@@ -23,9 +23,9 @@ Low priority last, including rooms in a collapsed section.
 
 ## Changing a room
 
-Right-click a room in the list, or open the room and choose the star button in
-the room header (Return, Space or the Menu key open the same menu from the
-keyboard):
+Right-click a room in the list, press the Menu key or Shift+F10 on a focused
+room, or choose the star button in the open room's header (Return, Space, the
+Menu key or Shift+F10 open it from the keyboard):
 
 - **Add to Favorites / Remove from Favorites**
 - **Mark as low priority / Normal priority**

@@ -98,9 +98,9 @@ export component RoomSectionHeader inherits Rectangle {
     }
 }
 
-// The open room's organization menu in the room header. Return, Space, a
-// click, the Menu key or a right click opens it; the menu itself is
-// keyboard navigable.
+// The open room's organization menu in the room header. Return, Space,
+// the Menu key, Shift+F10 or a click opens it; the menu itself is keyboard
+// navigable.
 export component RoomOrganizationButton inherits Rectangle {
     in property <string> room-id;
     in property <string> room-name;
@@ -177,7 +177,7 @@ export component RoomOrganizationButton inherits Rectangle {
             focus-on-click: true;
             enabled: root.enabled;
             key-pressed(event) => {
-                if event.text == Key.Space || event.text == Key.Return {
+                if event.text == Key.Space || event.text == Key.Return || event.text == Key.Menu || (event.modifiers.shift && event.text == Key.F10) {
                     if root.choosable {
                         room-menu.show({ x: 0px, y: root.height });
                     }

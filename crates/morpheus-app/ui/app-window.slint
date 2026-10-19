@@ -534,8 +534,10 @@ component NavigationRoomRow inherits ActionRect {
 }
 
 // A room-list row with its organization menu. The menu area lies above the
-// row: a right click opens it, every other input reaches the row. Keyboard
-// users open the same menu from the room header (RoomOrganizationButton).
+// row: a right click opens it, every other input reaches the row. The row's
+// own control passes on keys it does not use, so the Menu key or Shift+F10
+// on a focused row opens the same menu; the room header has it too
+// (RoomOrganizationButton).
 component OrganizableRoomRow inherits Rectangle {
     in property <RoomItem> room;
     in property <bool> direct;
@@ -554,24 +556,41 @@ component OrganizableRoomRow inherits Rectangle {
     in property <bool> can-move-down;
     callback open(string, bool);
     height: row.height;
-    row := NavigationRoomRow {
+    // Never focused itself; it only sees keys the row's control passes on.
+    FocusScope {
         x: 0px;
         y: 0px;
         width: root.width;
-        room: root.room;
-        direct: root.direct;
-        selected: root.selected;
-        density-mode: root.density-mode;
-        text-scale: root.text-scale;
-        ink: root.ink;
-        muted: root.muted;
-        elevated: root.elevated;
-        hover: root.hover;
-        accent: root.accent;
-        accent-ink: root.accent-ink;
-        open(id, voice) => { root.open(id, voice); }
+        height: root.height;
+        focus-on-click: false;
+        focus-on-tab-navigation: false;
+        key-pressed(event) => {
+            if root.organizable && (event.text == Key.Menu || (event.modifiers.shift && event.text == Key.F10)) {
+                row-menu.show({ x: 0px, y: root.height });
+                accept
+            } else {
+                reject
+            }
+        }
+        row := NavigationRoomRow {
+            x: 0px;
+            y: 0px;
+            width: root.width;
+            room: root.room;
+            direct: root.direct;
+            selected: root.selected;
+            density-mode: root.density-mode;
+            text-scale: root.text-scale;
+            ink: root.ink;
+            muted: root.muted;
+            elevated: root.elevated;
+            hover: root.hover;
+            accent: root.accent;
+            accent-ink: root.accent-ink;
+            open(id, voice) => { root.open(id, voice); }
+        }
     }
-    ContextMenuArea {
+    row-menu := ContextMenuArea {
         enabled: root.organizable && RoomOrganizationState.pending-room != root.room.id;
         Menu {
             MenuItem {
