@@ -1577,11 +1577,16 @@ fn real_slint_account_dialogs_and_detach_clear_private_presentation() {
     let runtime_handle = runtime.handle().clone();
     slint::spawn_local(async move {
         let phase = std::rc::Rc::new(std::cell::Cell::new(0_u8));
+        let started = std::time::Instant::now();
+        // One process-global event loop now covers fourteen appearance and
+        // keyboard scenarios plus account dialogs. Keep a finite whole-suite
+        // deadline without making each scenario share the old 20-second cap.
         let outcome = tokio::time::timeout(
-            Duration::from_secs(20),
+            Duration::from_secs(60),
             exercise_account_ui(runtime_handle.clone(), phase.clone()),
         )
         .await;
+        eprintln!("morpheus-ui-scenario-ms={}", started.elapsed().as_millis());
         if outcome.is_err() {
             // A closed numeric stage only: never log UI text, files or accounts.
             eprintln!("morpheus-ui-timeout-phase={}", phase.get());
