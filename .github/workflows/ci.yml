@@ -1,12 +1,12 @@
 # TEMPORARY optimized live timeline acceptance. NEVER MERGE this workflow.
 name: Real-room timeline acceptance
-run-name: Real encrypted 10K timeline cf2a764 - instrumented Linux only
+run-name: Real encrypted 10K timeline 9a99185 - exact enrolled devices
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: timeline-live-linux-cf2a764
+  group: timeline-live-linux-9a99185
   cancel-in-progress: false
 jobs:
   contracts:
@@ -17,11 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: cf2a7643729589c98973ea0d2ec135d33ae51d74
+          ref: 9a991851e50dd62c7f93aee7c3ffa1ee5089585c
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact reviewed source
-        run: test "$(git rev-parse HEAD)" = cf2a7643729589c98973ea0d2ec135d33ae51d74
+        run: test "$(git rev-parse HEAD)" = 9a991851e50dd62c7f93aee7c3ffa1ee5089585c
       - name: Scan source before executing reviewed native acceptance
         shell: bash
         run: |
