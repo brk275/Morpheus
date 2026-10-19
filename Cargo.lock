@@ -5631,9 +5631,11 @@ dependencies = [
  "language-tags",
  "matrix-sdk-base",
  "matrix-sdk-common",
+ "matrix-sdk-ffi-macros",
  "matrix-sdk-indexeddb",
  "matrix-sdk-search",
  "matrix-sdk-sqlite",
+ "matrix-sdk-test",
  "mime",
  "mime2ext",
  "oauth2",
@@ -5646,14 +5648,17 @@ dependencies = [
  "serde_html_form",
  "serde_json",
  "sha2 0.11.0",
+ "strass",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
  "tokio-util",
  "tracing",
+ "uniffi",
  "url",
  "vodozemac",
+ "wiremock",
  "zeroize",
 ]
 
@@ -5765,6 +5770,16 @@ dependencies = [
  "url",
  "vodozemac",
  "zeroize",
+]
+
+[[package]]
+name = "matrix-sdk-ffi-macros"
+version = "0.7.0"
+source = "git+https://github.com/matrix-org/matrix-rust-sdk?rev=c6ad52ecc09eaa36601f55effb0a48a533eb87dd#c6ad52ecc09eaa36601f55effb0a48a533eb87dd"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -5926,9 +5941,11 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-ui"
 version = "0.19.1"
-source = "git+https://github.com/matrix-org/matrix-rust-sdk?rev=c6ad52ecc09eaa36601f55effb0a48a533eb87dd#c6ad52ecc09eaa36601f55effb0a48a533eb87dd"
 dependencies = [
+ "anyhow",
  "as_variant",
+ "assert-json-diff",
+ "assert_matches",
  "async-rx",
  "async-stream",
  "async_cell",
@@ -5948,17 +5965,26 @@ dependencies = [
  "matrix-sdk",
  "matrix-sdk-base",
  "matrix-sdk-common",
+ "matrix-sdk-test",
+ "matrix-sdk-test-utils",
  "mime",
  "pin-project-lite",
+ "proptest",
  "ruma",
  "serde",
  "serde_json",
+ "strass",
+ "stream_assert",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
  "tracing",
  "unicode-normalization",
  "unicode-segmentation",
+ "uniffi",
+ "url",
+ "wiremock",
 ]
 
 [[package]]
