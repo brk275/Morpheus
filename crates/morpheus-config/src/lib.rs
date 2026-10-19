@@ -1277,12 +1277,12 @@ impl Layout {
             return Err(field_error("layout.hidden_panes", Problem::PaneVisibility));
         }
         if !distinct(&self.collapsed_panes)
-            || self
-                .collapsed_panes
-                .iter()
-                .any(|pane| !pane.can_collapse())
+            || self.collapsed_panes.iter().any(|pane| !pane.can_collapse())
         {
-            return Err(field_error("layout.collapsed_panes", Problem::PaneVisibility));
+            return Err(field_error(
+                "layout.collapsed_panes",
+                Problem::PaneVisibility,
+            ));
         }
         Ok(())
     }
@@ -4205,7 +4205,12 @@ mod tests {
         // Missing, duplicate and partial orders are refused.
         for invalid in [
             &[PaneId::Rooms][..],
-            &[PaneId::Rooms, PaneId::Rooms, PaneId::Conversation, PaneId::Details],
+            &[
+                PaneId::Rooms,
+                PaneId::Rooms,
+                PaneId::Conversation,
+                PaneId::Details,
+            ],
             &[PaneId::Spaces, PaneId::Rooms, PaneId::Conversation],
         ] {
             assert_eq!(
@@ -4229,7 +4234,10 @@ mod tests {
         };
         assert!(field(hidden(&[PaneId::Conversation])).is_some());
         assert!(field(hidden(&[PaneId::Rooms, PaneId::Rooms])).is_some());
-        assert_eq!(field(hidden(&[PaneId::Spaces, PaneId::Rooms, PaneId::Details])), None);
+        assert_eq!(
+            field(hidden(&[PaneId::Spaces, PaneId::Rooms, PaneId::Details])),
+            None
+        );
         let collapsed = Layout {
             collapsed_panes: vec![PaneId::Spaces],
             ..Layout::default()
@@ -4246,7 +4254,10 @@ mod tests {
         };
         assert!(both.pane_hidden(PaneId::Rooms) && !both.pane_collapsed(PaneId::Rooms));
         assert!(both.restore_default_panes());
-        assert_eq!(both.effective_pane_order(), Config::default().layout.effective_pane_order());
+        assert_eq!(
+            both.effective_pane_order(),
+            Config::default().layout.effective_pane_order()
+        );
         assert!(!both.restore_default_panes());
         // Unknown pane names are rejected by the schema itself.
         assert!(
