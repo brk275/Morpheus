@@ -478,14 +478,14 @@ export component CallStage inherits Rectangle {
     }
 
     for item[index] in root.tiles : StageTile {
-        property <int> row: floor(index / root.columns);
+        property <int> tile-grid-row: floor(index / root.columns);
         x: root.featured-visible
             ? root.strip-x + (root.strip-beside ? 0px : index * (root.strip-tile-width + root.gap))
             : root.grid-x + mod(index, root.columns) * (root.cell-width + root.gap)
-                + (self.row == root.rows - 1 ? (root.columns - root.last-row-count) * (root.cell-width + root.gap) / 2 : 0px);
+                + (self.tile-grid-row == root.rows - 1 ? (root.columns - root.last-row-count) * (root.cell-width + root.gap) / 2 : 0px);
         y: root.featured-visible
             ? root.strip-y + (root.strip-beside ? index * (root.strip-tile-height + root.gap) : 0px)
-            : root.grid-y + self.row * (root.cell-height + root.gap);
+            : root.grid-y + self.tile-grid-row * (root.cell-height + root.gap);
         width: root.featured-visible ? root.strip-tile-width : root.cell-width;
         height: root.featured-visible ? root.strip-tile-height : root.cell-height;
         tile: item;
