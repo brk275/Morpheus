@@ -237,6 +237,48 @@ impl Workbench {
         owner
     }
 
+    // Used by the existing real generated-UI detach regression. No picker,
+    // file read, client, or transfer is started: only the production refresh
+    // is posted, with a private row belonging to the still-shown old IDs.
+    #[cfg(test)]
+    pub(crate) fn queue_private_projection_for_test(
+        ui: &AppWindow,
+        live: Arc<LiveUi>,
+        runtime: Handle,
+    ) {
+        let item = Item {
+            id: 1,
+            account_id: ui.get_active_account_local_id().to_string(),
+            room_id: ui.get_active_room_id().to_string(),
+            path: PathBuf::from("synthetic-never-opened.png"),
+            filename: "synthetic-private-file.png".into(),
+            mime_type: "image/png".into(),
+            size: Some(1),
+            phase: Phase::Staged,
+            note: String::new(),
+            commands: None,
+            cancel: None,
+            progress_at: None,
+        };
+        ui.set_attachment_items(ModelRc::new(VecModel::from(vec![row(&item)])));
+        ui.set_attachment_ready_count(1);
+        ui.set_attachment_can_add(true);
+        ui.set_attachment_status("private staged file".into());
+        let owner = Arc::new(Self {
+            live,
+            runtime,
+            window: ui.as_weak(),
+            state: Mutex::new(State {
+                next_id: 1,
+                items: vec![item],
+            }),
+            queued: AtomicBool::new(false),
+            save: Mutex::new(None),
+            preparing: Semaphore::new(MAX_PREPARING),
+        });
+        owner.refresh();
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|error| error.into_inner())
     }

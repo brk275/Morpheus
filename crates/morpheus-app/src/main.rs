@@ -65,8 +65,8 @@ use morpheus_config::{
     Config, ConfigStore, Density, LoadedConfig, RoomCallMode, ThemeMode, ThemePack,
 };
 use morpheus_matrix::{
-    AccountManager, Generation, MatrixLinkTarget, MessageInfo, MessageSearchResult,
-    PublicRoomInfo, PublicRoomsQuery, TextFormat, parse_matrix_link_target,
+    AccountManager, Generation, MatrixLinkTarget, MessageInfo, MessageSearchResult, PublicRoomInfo,
+    PublicRoomsQuery, TextFormat, parse_matrix_link_target,
 };
 use slint::{Color, Model, ModelRc, SharedString, StyledText, VecModel};
 use url::Url;
@@ -789,6 +789,7 @@ fn reset_attachment_view(ui: &AppWindow) {
     // account or room changes; nothing of this one remains meanwhile.
     ui.set_attachment_items(ModelRc::new(VecModel::<AttachmentItem>::default()));
     ui.set_attachment_ready_count(0);
+    ui.set_attachment_can_add(false);
     ui.set_attachment_status("".into());
     ui.set_download_operation(ui.get_download_operation().wrapping_add(1));
     ui.set_downloading_event_id("".into());
