@@ -227,7 +227,17 @@ jobs:
           def command(args):
               result=subprocess.run(args,env=environment,stdin=subprocess.DEVNULL,
                   stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60,check=False)
-              assert result.returncode==0 and len(result.stdout)<=256*1024 and len(result.stderr)<=64*1024
+              if result.returncode!=0 or len(result.stdout)>256*1024 or len(result.stderr)>64*1024:
+                  # Fixed diagnostics only; no setup output or environment data.
+                  text=(result.stdout+result.stderr).decode('utf-8',errors='ignore').lower()
+                  markers={'command_not_recognized':'is not recognized as an internal or external command',
+                      'invalid_syntax':'the syntax of the command is incorrect',
+                      'vsdevcmd_error':'[error:', 'vcvars_error':'error in script usage'}
+                  print(json.dumps({'check':'msvc_environment','status':'failed',
+                      'exit_code':result.returncode,'stdout_bytes':len(result.stdout),
+                      'stderr_bytes':len(result.stderr),
+                      'markers':sorted(key for key,value in markers.items() if value in text)}),flush=True)
+                  raise SystemExit(1)
               return result.stdout
           selected=command([str(installer),'-latest','-products','*','-requires',
               'Microsoft.VisualStudio.Component.VC.Tools.x86.x64','-property','installationPath']).decode('utf-8').strip()
@@ -237,7 +247,9 @@ jobs:
           setup=installation/'Common7'/'Tools'/'VsDevCmd.bat'
           assert setup.is_file()
           cmd=pathlib.Path(os.environ['SystemRoot'])/'System32'/'cmd.exe'
-          raw=command([str(cmd),'/d','/s','/c',f'""{setup}" -no_logo -arch=x64 -host_arch=x64 >nul && set"'])
+          # cmd.exe uses its own quoting rules. Pass a raw CreateProcess
+          # command line, avoiding list2cmdline's C-runtime quote escapes.
+          raw=command(f'"{cmd}" /d /s /c ""{setup}" -no_logo -arch=x64 -host_arch=x64 >nul && set"')
           wanted={'PATH','INCLUDE','LIB','LIBPATH','VCTOOLSINSTALLDIR','VCINSTALLDIR',
               'VSINSTALLDIR','WINDOWSSDKDIR','WINDOWSSDKVERSION'}
           values={}
