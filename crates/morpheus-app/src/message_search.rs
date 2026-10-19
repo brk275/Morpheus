@@ -10,11 +10,14 @@
 //! and thread navigation, so composer, room and thread drafts are kept by the
 //! same draft store as any other navigation. Nothing here logs a query, a
 //! message or an account identifier.
+//!
+//! The same navigation is the app's seam for any activation that names a
+//! conversation, such as a notification: see `open_conversation`.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::{Arc, atomic::Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{Local, TimeZone};
 use morpheus_matrix::{
@@ -55,6 +58,9 @@ const JUMP_ATTEMPTS: u8 = 10;
 const ARRIVAL_ATTEMPTS: u8 = 5;
 /// Events per Load newer page of a focused conversation view.
 const NEWER_PAGE: u16 = 50;
+/// How long a target in another account waits for that account to become
+/// visible (an app password or a call confirmation may come first).
+const PENDING_TARGET_LIFETIME: Duration = Duration::from_secs(120);
 
 // Fixed wording only: SDK error text is never shown, since it could echo
 // the query or an identifier.
@@ -78,7 +84,7 @@ const FOCUS_FAILED: &str =
     "The conversation around this message could not be opened, so it is shown here.";
 const NEWER_FAILED: &str = "Could not load newer messages. Check sync and retry.";
 const KEEP_COMPOSER: &str =
-    "Send or cancel the reply or edit in this room before opening a result in another room.";
+    "Send or cancel the reply or edit in this room before opening another conversation.";
 // Keep in step with MAX_RESULTS.
 const RESULT_LIMIT: &str = "showing the first 200; refine the search to narrow them";
 
@@ -129,7 +135,22 @@ struct Request {
     seen: HashSet<(String, String)>,
 }
 
-/// One hit chosen for opening, with the IDs that route it.
+/// Where an activation asks to open: one account's room and, optionally,
+/// one event in it and the thread that event belongs to. IDs route only;
+/// none is displayed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConversationTarget {
+    /// Opaque local account ID, as in `AccountOption.local-id`.
+    pub(crate) account_id: String,
+    pub(crate) room_id: String,
+    /// The event to show; `None` opens the room (or thread) only.
+    pub(crate) event_id: Option<String>,
+    /// The root of the event's thread; the thread panel opens on it.
+    pub(crate) thread_root: Option<String>,
+}
+
+/// One target being opened, with the IDs that route it. An empty event ID
+/// or thread root means none.
 #[derive(Clone)]
 struct Hit {
     room_id: String,
@@ -144,29 +165,105 @@ impl Hit {
     }
 }
 
-/// One open request: the query it came from, the hit and its context
-/// operation, which every later step re-checks, and the authority of the
-/// navigation it started, which a newer query, scope, open or reset
-/// withdraws.
+/// Who opened a target, which decides what keeps the open current.
+#[derive(Clone)]
+enum Owner {
+    /// A listed search hit: its query, and the context operation of the
+    /// hit; the hit must also stay selected.
+    Search { ticket: Ticket, operation: i32 },
+    /// An activation such as a notification: the account selection it was
+    /// started under and its activation generation, which any newer
+    /// activation replaces.
+    Activation {
+        selection: AccountSelection,
+        account: String,
+        generation: u64,
+    },
+}
+
+/// One open request: its owner, which every later step re-checks, the
+/// target and the authority of the navigation it started, which a newer
+/// open withdraws (and, for search, a newer query, scope or reset).
 #[derive(Clone)]
 struct Opening {
-    ticket: Ticket,
+    owner: Owner,
     hit: Hit,
-    operation: i32,
     authority: NavigationAuthority,
 }
 
 impl Opening {
     fn current(&self, window: &AppWindow) -> bool {
-        self.ticket.current(window)
-            && window.get_room_search_context_operation() == self.operation
-            && self.hit.selected(window)
+        match &self.owner {
+            Owner::Search { ticket, operation } => {
+                ticket.current(window)
+                    && window.get_room_search_context_operation() == *operation
+                    && self.hit.selected(window)
+            }
+            Owner::Activation {
+                selection,
+                account,
+                generation,
+            } => {
+                selection.is_current()
+                    && window.get_live_session()
+                    && window.get_active_account_local_id().as_str() == account
+                    && activation_is_current(*generation)
+            }
+        }
     }
 
-    /// The hit's room is the open one.
+    /// The target's room is the open one.
     fn here(&self, window: &AppWindow) -> bool {
         window.get_active_room_id().as_str() == self.hit.room_id
     }
+
+    fn searching(&self) -> bool {
+        matches!(self.owner, Owner::Search { .. })
+    }
+
+    fn account(&self) -> &str {
+        match &self.owner {
+            Owner::Search { ticket, .. } => &ticket.account,
+            Owner::Activation { account, .. } => account,
+        }
+    }
+
+    fn selection(&self) -> &AccountSelection {
+        match &self.owner {
+            Owner::Search { ticket, .. } => &ticket.selection,
+            Owner::Activation { selection, .. } => selection,
+        }
+    }
+
+    /// Progress text in the search panel; an activation shows none.
+    fn notice(&self, window: &AppWindow, text: &str) {
+        if self.searching() {
+            window.set_room_search_context_notice(text.into());
+        }
+    }
+
+    /// The room did not open: end the search's loading state, or show an
+    /// activation's failure as a session error.
+    fn not_opened(&self, window: &AppWindow, error: Option<&'static str>) {
+        if self.searching() {
+            window.set_room_search_context_loading(false);
+            if let Some(error) = error {
+                window.set_room_search_context_error(error.into());
+            }
+        } else if let Some(error) = error {
+            window.set_session_error(error.into());
+        }
+    }
+}
+
+/// A target in another account, waiting for the window's protected switch
+/// (app password, active call) to make that account visible.
+struct PendingTarget {
+    target: ConversationTarget,
+    live: Arc<LiveUi>,
+    runtime: Handle,
+    generation: u64,
+    expires: Instant,
 }
 
 /// Search state lives on the UI thread; Tokio tasks only return owned
@@ -177,21 +274,37 @@ struct Controller {
     query_task: Option<JoinHandle<()>>,
     context_task: Option<JoinHandle<()>>,
     reveal_task: Option<JoinHandle<()>>,
-    /// The navigation of the opened hit. It is withdrawn rather than
-    /// aborted: an abort could stop it between its commit and rollback.
-    navigation: Option<NavigationAuthority>,
+    /// The navigation of the latest open, and whether search owns it. It is
+    /// withdrawn rather than aborted: an abort could stop it between its
+    /// commit and rollback.
+    navigation: Option<(NavigationAuthority, bool)>,
+    /// Generation of the latest activation (`open_conversation`).
+    activation: u64,
+    pending: Option<PendingTarget>,
 }
 
 impl Controller {
     /// End the work of the opened hit: its nearby context, history reveal
-    /// and room or focus navigation.
+    /// and, when search owns it, its room or focus navigation.
     fn abort_opening(&mut self) {
         abort(self.context_task.take());
         abort(self.reveal_task.take());
-        if let Some(navigation) = self.navigation.take() {
+        if let Some((navigation, true)) = &self.navigation {
             navigation.withdraw();
+            self.navigation = None;
         }
     }
+
+    /// A newer open supersedes the previous navigation, whoever owns it.
+    fn claim_navigation(&mut self, authority: NavigationAuthority, search: bool) {
+        if let Some((previous, _)) = self.navigation.replace((authority, search)) {
+            previous.withdraw();
+        }
+    }
+}
+
+fn activation_is_current(generation: u64) -> bool {
+    with(|controller| controller.activation == generation)
 }
 
 thread_local! {
@@ -329,6 +442,24 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, runtime: Handle) {
         if let Some(window) = weak.upgrade() {
             load_newer(&window, &newer_live, &newer_runtime);
         }
+    });
+
+    // The navigation seam as a window callback: account, room, event and
+    // thread root IDs, with empty strings for no event or thread.
+    let weak = ui.as_weak();
+    let target_live = live.clone();
+    let target_runtime = runtime.clone();
+    ui.on_open_conversation(move |account, room, event, thread| {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        let target = ConversationTarget {
+            account_id: account.to_string(),
+            room_id: room.to_string(),
+            event_id: (!event.is_empty()).then(|| event.to_string()),
+            thread_root: (!thread.is_empty()).then(|| thread.to_string()),
+        };
+        open_conversation(&window, &target_live, &target_runtime, target);
     });
 
     let weak = ui.as_weak();
@@ -654,15 +785,144 @@ fn open(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, room_id: &str,
     let authority = NavigationAuthority::default();
     with(|controller| {
         controller.abort_opening();
-        controller.navigation = Some(authority.clone());
+        controller.claim_navigation(authority.clone(), true);
     });
     let opening = Opening {
-        ticket,
+        owner: Owner::Search { ticket, operation },
         hit,
-        operation,
         authority,
     };
-    if !elsewhere {
+    navigate(window, live, runtime, opening);
+}
+
+/// NAVIGATION SEAM. Open an exact account, room and, optionally, event and
+/// thread on behalf of an activation such as a notification; search hits
+/// take the same path below `open`.
+///
+/// - Another account is made visible only through the window's own
+///   protected switch (`switch-account`: Security dialog gate, active-call
+///   confirmation, local app password). The target waits for that account
+///   for at most `PENDING_TARGET_LIFETIME` and is dropped if any other
+///   account becomes visible or a newer activation starts.
+/// - Once its account is visible, the open is fenced by that account's
+///   selection (A -> B -> A safe), the visible account and this activation's
+///   generation; a newer activation or search open withdraws it.
+/// - The room is opened like a room-list click (revealing its Space), a
+///   loaded event is scrolled to, an older one opens the conversation around
+///   it with Return to live, and a thread target opens the thread panel.
+/// - A reply or edit being typed in another room is never dropped: the open
+///   is refused with a session error. Drafts are kept as for any navigation.
+pub(crate) fn open_conversation(
+    window: &AppWindow,
+    live: &Arc<LiveUi>,
+    runtime: &Handle,
+    target: ConversationTarget,
+) {
+    if !live.is_live.load(Ordering::Acquire)
+        || !window.get_live_session()
+        || target.account_id.is_empty()
+        || target.room_id.is_empty()
+    {
+        return;
+    }
+    let generation = with(|controller| {
+        controller.activation = controller.activation.wrapping_add(1);
+        controller.pending = None;
+        controller.activation
+    });
+    if window.get_active_account_local_id().as_str() == target.account_id {
+        activate(window, live, runtime, target, generation);
+        return;
+    }
+    let options = window.get_account_options();
+    let mut accounts = options.iter();
+    let Some(account) = accounts.find(|option| option.local_id.as_str() == target.account_id)
+    else {
+        return;
+    };
+    let pending = PendingTarget {
+        target,
+        live: live.clone(),
+        runtime: runtime.clone(),
+        generation,
+        expires: Instant::now() + PENDING_TARGET_LIFETIME,
+    };
+    with(|controller| controller.pending = Some(pending));
+    window.invoke_switch_account(account.index);
+}
+
+/// The visible account changed (called once its snapshot is applied). A
+/// pending target for that account opens now; any other one is dropped.
+pub(crate) fn account_shown(window: &AppWindow) {
+    let Some(pending) = with(|controller| controller.pending.take()) else {
+        return;
+    };
+    let account = window.get_active_account_local_id();
+    if account.as_str() != pending.target.account_id
+        || Instant::now() > pending.expires
+        || !activation_is_current(pending.generation)
+    {
+        return;
+    }
+    // Open after the snapshot that made the account visible is applied.
+    let weak = window.as_weak();
+    Timer::single_shot(Duration::ZERO, move || {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        let PendingTarget {
+            target,
+            live,
+            runtime,
+            generation,
+            ..
+        } = pending;
+        let visible = window.get_active_account_local_id().as_str() == target.account_id;
+        if visible && activation_is_current(generation) {
+            activate(&window, &live, &runtime, target, generation);
+        }
+    });
+}
+
+/// Open a target in the visible account.
+fn activate(
+    window: &AppWindow,
+    live: &Arc<LiveUi>,
+    runtime: &Handle,
+    target: ConversationTarget,
+    generation: u64,
+) {
+    let Some(selection) = live.manager.account_selection(&target.account_id) else {
+        return;
+    };
+    let elsewhere = window.get_active_room_id().as_str() != target.room_id;
+    if elsewhere && unsent_reply_or_edit(window) {
+        window.set_session_error(KEEP_COMPOSER.into());
+        return;
+    }
+    let authority = NavigationAuthority::default();
+    with(|controller| controller.claim_navigation(authority.clone(), false));
+    let hit = Hit {
+        room_id: target.room_id,
+        event_id: target.event_id.unwrap_or_default(),
+        thread_root: target.thread_root.unwrap_or_default(),
+    };
+    let owner = Owner::Activation {
+        selection,
+        account: target.account_id,
+        generation,
+    };
+    let opening = Opening {
+        owner,
+        hit,
+        authority,
+    };
+    navigate(window, live, runtime, opening);
+}
+
+/// Open the target's room unless it is already open, then show the target.
+fn navigate(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, opening: Opening) {
+    if opening.here(window) {
         arrived(window, live, runtime, &opening, false);
         return;
     }
@@ -675,7 +935,7 @@ fn open(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, room_id: &str,
     let task_live = live.clone();
     let handle = runtime.clone();
     runtime.spawn(async move {
-        let account = opening.ticket.account.as_str();
+        let account = opening.account();
         let room = opening.hit.room_id.clone();
         let authority = opening.authority.clone();
         let outcome = task_live
@@ -703,19 +963,17 @@ fn navigated(
         Ok(true) if here && live.navigation_is_current(epoch) => {
             arrived(window, live, runtime, opening, true);
         }
-        // Withdrawn or replaced by another navigation; the hit stays listed.
-        Ok(_) => window.set_room_search_context_loading(false),
-        Err(_) => {
-            window.set_room_search_context_loading(false);
-            window.set_room_search_context_error(ROOM_NOT_OPENED.into());
-        }
+        // Withdrawn or replaced by another navigation.
+        Ok(_) => opening.not_opened(window, None),
+        Err(_) => opening.not_opened(window, Some(ROOM_NOT_OPENED)),
     }
 }
 
-/// The hit's room is open: show the event, then load its nearby messages.
-/// A hit that is not among the loaded messages opens the conversation
-/// around it (after a short wait when the room was just opened and its
-/// latest messages may still be arriving); a thread hit opens its thread.
+/// The target's room is open: show its event, then (for a search hit) load
+/// the nearby messages. An event that is not among the loaded messages opens
+/// the conversation around it (after a short wait when the room was just
+/// opened and its latest messages may still be arriving); a thread target
+/// opens its thread.
 fn arrived(
     window: &AppWindow,
     live: &Arc<LiveUi>,
@@ -725,11 +983,18 @@ fn arrived(
 ) {
     let hit = &opening.hit;
     if !hit.thread_root.is_empty() {
+        // The thread panel reveals this reply once it is laid out.
+        window.set_timeline_jump_event_id(hit.event_id.as_str().into());
         open_thread(window, &hit.room_id, &hit.thread_root);
-        reveal(window, live, runtime, opening);
-    } else if !jump_timeline(window, &hit.event_id) {
+        if !hit.event_id.is_empty() {
+            reveal(window, live, runtime, opening);
+        }
+    } else if !hit.event_id.is_empty() && !jump_timeline(window, &hit.event_id) {
         let attempts = if moved { ARRIVAL_ATTEMPTS } else { 0 };
         jump_or_focus(window.as_weak(), live, runtime, opening, attempts);
+    }
+    if !opening.searching() {
+        return;
     }
     let manager = live.manager.clone();
     let opening = opening.clone();
@@ -748,8 +1013,8 @@ fn arrived(
     });
 }
 
-/// Jump to the hit once its row is loaded, checking `attempts` more times;
-/// then open the conversation around it instead.
+/// Jump to the target once its row is loaded, checking `attempts` more
+/// times; then open the conversation around it instead.
 fn jump_or_focus(
     weak: Weak<AppWindow>,
     live: &Arc<LiveUi>,
@@ -781,12 +1046,12 @@ fn jump_or_focus(
 /// are unchanged; the opening's authority stops it before it replaces the
 /// live conversation.
 fn focus(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, opening: &Opening) {
-    window.set_room_search_context_notice(FOCUSING.into());
+    opening.notice(window, FOCUSING);
     let task_live = live.clone();
     let opening = opening.clone();
     let weak = window.as_weak();
     runtime.spawn(async move {
-        let account = opening.ticket.account.as_str();
+        let account = opening.account();
         let (room, event) = (opening.hit.room_id.clone(), opening.hit.event_id.as_str());
         let authority = opening.authority.clone();
         let focus = task_live.focus_event_for(account, room, event, authority, weak.clone());
@@ -806,19 +1071,19 @@ fn focused(
     match outcome {
         Ok(Ok(true)) => {
             reset_history(window);
-            window.set_room_search_context_notice("".into());
+            opening.notice(window, "");
             jump_when_loaded(window.as_weak(), opening.clone(), JUMP_ATTEMPTS);
         }
         // Withdrawn, or the room or account changed meanwhile.
-        Ok(Ok(false)) => window.set_room_search_context_notice("".into()),
-        Ok(Err(_)) | Err(_) => window.set_room_search_context_notice(FOCUS_FAILED.into()),
+        Ok(Ok(false)) => opening.notice(window, ""),
+        Ok(Err(_)) | Err(_) => opening.notice(window, FOCUS_FAILED),
     }
 }
 
 /// Page back through the hit's thread, a bounded number of pages, until
 /// the reply is loaded. The thread panel shows what was loaded.
 fn reveal(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, opening: &Opening) {
-    window.set_room_search_context_notice(FINDING.into());
+    opening.notice(window, FINDING);
     let manager = live.manager.clone();
     let opening = opening.clone();
     let weak = window.as_weak();
@@ -835,7 +1100,7 @@ fn reveal(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle, opening: &Op
 /// How far the reveal got, or `None` when it failed, timed out or its
 /// account selection ended.
 async fn reveal_hit(manager: &AccountManager, opening: &Opening) -> Option<HistoryReveal> {
-    let selection = &opening.ticket.selection;
+    let selection = opening.selection();
     let hit = &opening.hit;
     let thread = Some(hit.thread_root.as_str());
     let (room, event) = (hit.room_id.as_str(), hit.event_id.as_str());
@@ -858,7 +1123,7 @@ fn revealed(window: &AppWindow, opening: &Opening, outcome: Option<HistoryReveal
         Some(_) => THREAD_OLDER,
         None => REVEAL_FAILED,
     };
-    window.set_room_search_context_notice(notice.into());
+    opening.notice(window, notice);
 }
 
 /// Jump once the hit's row reaches the conversation model.
@@ -876,7 +1141,7 @@ fn jump_when_loaded(weak: Weak<AppWindow>, opening: Opening, attempts: u8) {
         if attempts > 1 {
             jump_when_loaded(weak, opening, attempts - 1);
         } else {
-            window.set_room_search_context_notice(NOT_SHOWN.into());
+            opening.notice(&window, NOT_SHOWN);
         }
     });
 }
@@ -890,7 +1155,7 @@ fn return_to_live(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
         return;
     }
     with(|controller| {
-        if let Some(navigation) = controller.navigation.take() {
+        if let Some((navigation, _)) = controller.navigation.take() {
             navigation.withdraw();
         }
     });
@@ -954,7 +1219,7 @@ async fn load_context(
     manager: &AccountManager,
     opening: &Opening,
 ) -> Option<Shown<Vec<MessageInfo>>> {
-    let selection = &opening.ticket.selection;
+    let selection = opening.selection();
     let (room, event) = (opening.hit.room_id.as_str(), opening.hit.event_id.as_str());
     let context = manager.search_result_context_selected(selection, room, event, CONTEXT_EVENTS);
     let wait = tokio::time::timeout(CONTEXT_TIMEOUT, context);
@@ -1011,13 +1276,14 @@ fn trim_context(mut messages: Vec<MessageInfo>, event_id: &str) -> Vec<MessageIn
     messages
 }
 
-/// Scroll the live conversation to a loaded event. The row is highlighted by
-/// the selected event ID; no row is rebuilt.
+/// Scroll the shown conversation to a loaded event; no row is rebuilt. A
+/// search hit's row is also highlighted, by the selected event ID.
 fn jump_timeline(window: &AppWindow, event_id: &str) -> bool {
     let messages = window.get_messages();
     let Some(index) = crate::timeline_model::index_of_event(&messages, event_id) else {
         return false;
     };
+    window.set_timeline_jump_event_id(event_id.into());
     window.set_timeline_jump_index(i32::try_from(index).unwrap_or(i32::MAX));
     window.set_timeline_jump_request(window.get_timeline_jump_request().wrapping_add(1));
     true

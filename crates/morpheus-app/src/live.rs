@@ -3062,8 +3062,9 @@ fn apply_snapshot(
         // All-room results stay with their account across rooms, which is
         // how opening a hit in another room keeps the list it came from.
         crate::message_search::room_changed(ui, account_changed);
-        // A focused view belongs to the room that was left.
+        // A focused view and a jump belong to the room that was left.
         ui.set_conversation_focused(false);
+        ui.set_timeline_jump_event_id("".into());
         ui.set_room_call_mode(0);
         ui.set_composer_text(drafts.get(&view.active.id, next_room_id).into());
         ui.set_composer_markdown(drafts.markdown(&view.active.id, next_room_id));
@@ -3231,6 +3232,10 @@ fn apply_snapshot(
         ui.set_login_loading(false);
         ui.set_login_error("".into());
         ui.set_show_sign_in(false);
+    }
+    if account_changed {
+        // A conversation target that waited for this account opens now.
+        crate::message_search::account_shown(ui);
     }
 }
 

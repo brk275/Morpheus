@@ -2211,9 +2211,11 @@ export component AppWindow inherits Window {
     in-out property <string> room-search-context-notice;
     in-out property <string> room-search-selected-room-id;
     in-out property <string> room-search-selected-thread-root;
-    // Scroll the conversation to a loaded row; the row is found by its
-    // selected event ID and highlighted without rebuilding the list.
+    // Scroll the conversation to a loaded row by its index; the row with
+    // the jump event finishes the reveal. Nothing is rebuilt.
     in-out property <int> timeline-jump-index: -1;
+    // The event a jump or thread open is revealing; rows compare against it.
+    in-out property <string> timeline-jump-event-id;
     in-out property <int> timeline-jump-request: 0;
     property <int> timeline-jump-passes: 0;
     // The conversation shows the messages around an opened search hit
@@ -2436,6 +2438,9 @@ export component AppWindow inherits Window {
     callback load-older-thread-replies();
     callback return-to-live();
     callback load-newer-focused();
+    // Navigation seam (message_search::open_conversation): local account ID,
+    // room ID, event ID, thread root ID; empty for no event or thread.
+    callback open-conversation(string, string, string, string);
     callback join-discovery-target(string, string, string, string, bool);
     callback toggle-native-microphone();
     callback toggle-native-deafen();
@@ -3619,7 +3624,7 @@ export component AppWindow inherits Window {
                             message-hover := TouchArea { mouse-cursor: default; }
                             // Finish a search jump once this row exists: place it a
                             // third of the way down the visible conversation.
-                            if message-row.selected-message && root.timeline-jump-passes > 0 : Timer {
+                            if root.timeline-jump-passes > 0 && message.event-id != "" && message.event-id == root.timeline-jump-event-id : Timer {
                                 interval: 1ms;
                                 running: true;
                                 triggered => {
@@ -6237,7 +6242,7 @@ export component AppWindow inherits Window {
                                 background: root.row-surface(thread-reply.search-hit, false, reply.is-own, root.elevated);
                                 border-radius: StyleTokens.radius * 0.8;
                                 // Reveal that reply once it is laid out.
-                                if thread-reply.search-hit : Timer {
+                                if reply.event-id != "" && reply.event-id == root.timeline-jump-event-id : Timer {
                                     interval: 1ms;
                                     running: true;
                                     triggered => {
