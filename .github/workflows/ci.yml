@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
 name: Reviewed beta four-platform native checks
-run-name: Reviewed pinned integration - 2e02557 - ${{ inputs.platform }}
+run-name: Reviewed attachment integration - a825a99 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: beta-native-2e02557-${{ github.ref }}
+  group: beta-native-a825a99-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 2e0255772ef3f2d2dfc80c2c12fd806849372272
+          ref: a825a991a3825106f5bd09d8fc5d70033ab951c2
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -135,7 +135,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='2e0255772ef3f2d2dfc80c2c12fd806849372272'
+          source='a825a991a3825106f5bd09d8fc5d70033ab951c2'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -379,7 +379,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='2e0255772ef3f2d2dfc80c2c12fd806849372272'
+          source='a825a991a3825106f5bd09d8fc5d70033ab951c2'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -485,6 +485,7 @@ jobs:
               'pinned_messages::view::tests::rows_are_sanitized_and_say_why_text_is_missing',
               'pinned_messages::view::tests::summaries_count_shown_hidden_and_unsupported_entries',
           }
+          needed_app.update({'attachments::tests::download_save_replaces_only_after_complete_write', 'attachment_workbench::tests::only_unqueued_failures_and_paused_uploads_offer_retry', 'attachments::tests::cancellation_while_waiting_for_a_save_guard_never_writes', 'attachments::tests::suggested_save_names_cannot_escape_or_disguise_the_chosen_folder', 'attachment_workbench::tests::rows_belong_to_exactly_one_account_and_room', 'attachment_workbench::tests::progress_is_a_bounded_percentage'})
           allowed_app_ignore={'outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction'}
           needed_matrix={'polls::tests::votes_must_be_known_unique_within_the_limit_and_open', 'polls::tests::projection_bounds_text_answers_and_selection_limit', 'polls::tests::end_text_names_the_leaders_or_no_votes', 'polls::tests::start_content_uses_the_aggregated_msc3381_shape', 'polls::tests::drafts_are_cleaned_and_bounded_before_anything_is_built', 'history::tests::a_focused_view_is_owned_only_by_the_selection_that_loaded_it', 'tests::homeserver_must_not_send_password_over_plain_http', 'polls::tests::unsupported_remote_answer_ids_are_not_truncated_into_vote_targets', 'polls::tests::revoked_poll_actions_release_pending_work_and_report_uncertain_sends', 'history::tests::search_rejects_an_aba_selection_and_keeps_the_current_one', 'polls::tests::undisclosed_results_stay_withheld_until_the_poll_ends',
               'pinned_messages::tests::a_list_that_is_not_an_array_is_never_replaced',
@@ -502,6 +503,7 @@ jobs:
               'pinned_messages::tests::sync_batches_select_only_relevant_room_changes',
               'pinned_messages::tests::unpin_removes_every_occurrence_and_keeps_the_rest',
           }
+          needed_matrix.update({'media::tests::file_read_rejects_oversized_input', 'media::tests::sticker_previews_keep_encrypted_context_and_size_guards', 'media::preview_tests::preview_stream_enforces_smaller_limit_without_declared_size', 'media::tests::sticker_encrypted_extension_never_falls_back_to_plain_url', 'media::preview_tests::preview_decryption_consumes_eof_hash_and_rejects_tampering', 'media::tests::cdn_dns_accepts_only_public_addresses', 'media::tests::guarded_cdn_client_never_connects_to_loopback', 'media::tests::long_media_authorities_keep_their_endpoint_components', 'media::tests::malformed_media_is_rejected_before_any_homeserver_request', 'media::tests::sticker_sources_must_be_valid_matrix_media_addresses', 'media::tests::cdn_resolver_rejects_loopback_at_connection_resolution', 'media::tests::media_address_limits_are_checked_before_endpoint_construction', 'media::tests::owned_upload_rejects_cancelled_closed_and_aba_selections_before_io', 'media::tests::streamed_download_rejects_an_oversized_body', 'media::tests::media_redirects_validate_targets_before_request', 'media::tests::sticker_metadata_preserves_image_hints_without_source_or_body', 'media::preview_tests::preview_requires_image_and_each_encryption_context_opt_in', 'media::tests::filenames_and_mime_types_are_validated'})
           checks=[
               ('native_app_build',['cargo','build','--locked','-p','morpheus-app','--features','native-calls'],70*60,None,set()),
               ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
@@ -510,7 +512,7 @@ jobs:
           ]
           # Config/RTC and SDK source, locks, compiler and dependencies are unchanged.
           # SDK18 evidence is tracked separately in the prior matrix and Windows-only lane.
-          # This integration changes native UI/controllers and Matrix pinned-message logic only.
+          # This integration changes native UI/controllers and Matrix attachment admission logic.
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
               result=bounded(args,name,seconds)
