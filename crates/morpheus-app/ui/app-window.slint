@@ -1,4 +1,4 @@
-import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView, Slider, SpinBox } from "std-widgets.slint";
+import { AboutSlint, Button, ListView, Palette, ScrollView, SpinBox } from "std-widgets.slint";
 import { CallParticipantItem, CallStage, CallTileItem } from "call-stage.slint";
 import { MessageSearchItem, MessageSearchPanel } from "message-search.slint";
 import { PollCard, PollCardData, PollPalette } from "poll-card.slint";
@@ -7,7 +7,7 @@ import { PollCreateDialog } from "poll-dialog.slint";
 export { PollOptionItem, PollUiState } from "poll-card.slint";
 import { PinnedMessageItem, PinnedMessagesPanel } from "pinned-messages.slint";
 import { StyleTokens } from "style-tokens.slint";
-import { ActionRect, ControlColors, HoverSurface, TextAction, TokenButton } from "controls.slint";
+import { ActionRect, ControlColors, HoverSurface, TextAction, TokenButton, TokenSelect, TokenSlider } from "controls.slint";
 // Rust projects every accepted configuration into StyleTokens; the screen
 // files import the same global, so one projection reaches every control.
 export { BaseColorSet, ColorRole, StyleTokens, ThemeRoleSet, ThemeStateSet } from "style-tokens.slint";
@@ -1083,6 +1083,16 @@ component StickerPopup inherits Rectangle {
     in property <color> accent;
     in property <color> outline;
     in property <float> text-scale: 1;
+    // The pack list's colors; a select draws no accent ink.
+    property <ControlColors> select-colors: {
+        ink: root.ink,
+        muted: root.muted,
+        surface: root.elevated,
+        hover: root.hover,
+        outline: root.outline,
+        accent: root.accent,
+        accent-ink: root.surface,
+    };
     callback searched(string);
     callback navigate(int);
     callback choose-pack(int);
@@ -1127,10 +1137,12 @@ component StickerPopup inherits Rectangle {
                     send-current => { root.send(root.items[root.current].key); }
                     dismiss => { root.dismiss(); }
                 }
-                if root.packs.length > 1 : ComboBox {
+                if root.packs.length > 1 : TokenSelect {
                     width: 160px * root.text-scale;
                     model: root.packs;
                     current-index <=> root.pack-index;
+                    colors: root.select-colors;
+                    text-scale: root.text-scale;
                     accessible-label: "Sticker pack";
                     selected(value) => { root.choose-pack(self.current-index); }
                 }
@@ -1213,10 +1225,12 @@ component StickerPopup inherits Rectangle {
                             activated => { root.dismiss(); }
                         }
                     }
-                    if root.packs.length > 1 : ComboBox {
+                    if root.packs.length > 1 : TokenSelect {
                         height: root.field-height;
                         model: root.packs;
                         current-index <=> root.pack-index;
+                        colors: root.select-colors;
+                        text-scale: root.text-scale;
                         accessible-label: "Sticker pack";
                         selected(value) => { root.choose-pack(self.current-index); }
                     }
@@ -2338,6 +2352,7 @@ component WindowOpacitySetting inherits VerticalLayout {
     in property <string> status;
     in property <color> ink;
     in property <color> muted;
+    in property <ControlColors> colors;
     in property <float> text-scale: 1;
     // A value to preview now and save shortly; keyboard and accessibility
     // changes arrive here too.
@@ -2363,9 +2378,10 @@ component WindowOpacitySetting inherits VerticalLayout {
     }
     HorizontalLayout {
         spacing: 10px;
-        slider := Slider {
+        slider := TokenSlider {
             horizontal-stretch: 1; minimum: 0; maximum: 100; step: 1;
             value: root.value;
+            colors: root.colors; text-scale: root.text-scale;
             accessible-label: "Window background opacity, percent";
             changed(value) => { root.previewed(round(value)); }
             released(value) => { root.changed-value(round(value)); }
@@ -6375,7 +6391,7 @@ export component AppWindow inherits Window {
                                 value: root.window-opacity-percent;
                                 revision: root.window-opacity-revision;
                                 status: root.window-transparency-status;
-                                ink: root.ink; muted: root.muted; text-scale: root.text-scale;
+                                ink: root.ink; muted: root.muted; colors: root.button-colors; text-scale: root.text-scale;
                                 previewed(value) => { root.preview-window-opacity(value); }
                                 changed-value(value) => { root.set-window-opacity(value); }
                             }
@@ -7473,9 +7489,11 @@ export component AppWindow inherits Window {
                         Text { text: "Call audio devices"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Saved for your next call. Your current call keeps its selection until you leave. An unavailable selected device shows an error. System default follows your operating system's audio routing."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         Text { text: "Microphone"; color: root.ink; font-size: 13px * root.text-scale; }
-                        ComboBox {
+                        TokenSelect {
                             model: root.audio-microphone-choices;
                             current-index <=> root.audio-microphone-index;
+                            colors: root.button-colors;
+                            text-scale: root.text-scale;
                             enabled: root.audio-devices-enabled && !root.audio-devices-busy;
                             property <int> reveal-request: root.reveal-request("media.audio_devices");
                             // Keyboard focus and search share the same bounded reveal.
@@ -7502,9 +7520,11 @@ export component AppWindow inherits Window {
                             selected(value) => { root.select-audio-microphone(value); }
                         }
                         Text { text: "Speaker"; color: root.ink; font-size: 13px * root.text-scale; }
-                        ComboBox {
+                        TokenSelect {
                             model: root.audio-speaker-choices;
                             current-index <=> root.audio-speaker-index;
+                            colors: root.button-colors;
+                            text-scale: root.text-scale;
                             enabled: root.audio-devices-enabled && !root.audio-devices-busy;
                             accessible-label: "Speaker for the next call";
                             selected(value) => { root.select-audio-speaker(value); }
@@ -9018,8 +9038,9 @@ export component AppWindow inherits Window {
                             Rectangle { height: StyleTokens.line-width; background: root.divider; }
                             Text { text: "Who can join"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 700; }
                             Text { text: root.room-settings-access-description; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
-                            ComboBox {
+                            TokenSelect {
                                 model: root.room-settings-join-options; current-index <=> root.room-settings-join-index;
+                                colors: root.button-colors; text-scale: root.text-scale;
                                 enabled: root.room-settings-editable && root.room-settings-join-allowed;
                                 accessible-label: "Room join rule; only choices supported by this room version";
                                 selected(value) => { root.room-settings-action(9); }

@@ -357,7 +357,14 @@ through the same reveal as search.
 Message search, polls, the poll dialog and the call stage import the same
 `StyleTokens` global as the window (from `ui/style-tokens.slint`); pinned
 messages receives the same resolved values through its style struct. Shared
-actions and `TokenButton` live in `ui/controls.slint`.
+actions and `TokenButton` live in `ui/controls.slint`. `TokenSelect` (dropdowns) and
+`TokenSlider` (window transparency) there keep the stock ComboBox and Slider
+contracts: a select reports `selected` for every choice made with Up/Down,
+the list or the wheel, opening chooses nothing, and a click outside, Escape,
+Tab or disabling closes the list; the slider reports `changed` for every
+actual change and `released` on pointer release and on release of Left,
+Right, Home or End, so the transparency preview and save timing are
+unchanged. The window transparency number field is still the stock SpinBox.
 
 Targets (33): appearance presets, colors, window transparency, base palette,
 reduce motion, fonts, message size, sender weight, room header, conversation

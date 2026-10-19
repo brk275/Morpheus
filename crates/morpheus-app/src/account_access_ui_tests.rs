@@ -1963,6 +1963,46 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(500));
     settle(ui).await;
     assert_eq!(store.load().unwrap().window.opacity_percent, 50);
+
+    // Home and End commit on key release, as the arrows do.
+    assert!(crate::settings_search::reveal(
+        ui,
+        "appearance.window_opacity"
+    ));
+    settle(ui).await;
+    key(ui, Key::Home);
+    settle(ui).await;
+    assert_eq!(store.load().unwrap().window.opacity_percent, 0);
+    key(ui, Key::End);
+    settle(ui).await;
+    assert_eq!(store.load().unwrap().window.opacity_percent, 100);
+    // A press away from the thumb moves it there and only previews; the
+    // pointer release commits.
+    let track = control_with_label(ui, "Window background opacity, percent");
+    let center = track.map_to_window(track.geometry().center());
+    let near_start = slint::LogicalPosition::new(
+        center.x - track.geometry().size.width * 0.45,
+        center.y,
+    );
+    ui.window().dispatch_event(WindowEvent::PointerMoved {
+        position: near_start,
+    });
+    ui.window().dispatch_event(WindowEvent::PointerPressed {
+        position: near_start,
+        button: slint::platform::PointerEventButton::Left,
+    });
+    settle(ui).await;
+    assert_eq!(
+        store.load().unwrap().window.opacity_percent,
+        100,
+        "a press only previews"
+    );
+    ui.window().dispatch_event(WindowEvent::PointerReleased {
+        position: near_start,
+        button: slint::platform::PointerEventButton::Left,
+    });
+    settle(ui).await;
+    assert!(store.load().unwrap().window.opacity_percent < 50);
     ui.invoke_set_window_opacity(100);
     settle(ui).await;
 
@@ -3249,6 +3289,63 @@ async fn assert_live_preview(ui: &AppWindow) {
     settle(ui).await;
 }
 
+/// The themed select keeps ComboBox's keyboard contract: Up and Down choose
+/// directly, Return opens the list without choosing, keys in the list choose
+/// live, Escape closes it with focus back on the select, and a disabled
+/// select ignores keys.
+async fn assert_themed_select(ui: &AppWindow) {
+    use std::{cell::RefCell, rc::Rc};
+
+    let chosen = Rc::new(RefCell::new(Vec::<String>::new()));
+    let record = chosen.clone();
+    ui.on_select_audio_microphone(move |value| record.borrow_mut().push(value.into()));
+    let choices: Vec<slint::SharedString> = vec![
+        "System default".into(),
+        "Desk microphone".into(),
+        "Headset".into(),
+    ];
+    ui.set_audio_microphone_choices(ModelRc::new(VecModel::from(choices)));
+    ui.set_audio_microphone_index(0);
+    ui.set_audio_devices_enabled(true);
+    ui.set_audio_devices_busy(false);
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    ui.set_page(1);
+    settle(ui).await;
+    assert!(crate::settings_search::reveal(ui, "media.audio_devices"));
+    settle(ui).await;
+    let label = "Microphone for the next call";
+    assert!(focused_control_has_label(ui, label));
+
+    key(ui, Key::DownArrow);
+    assert_eq!(ui.get_audio_microphone_index(), 1);
+    key(ui, Key::UpArrow);
+    assert_eq!(ui.get_audio_microphone_index(), 0);
+    assert_eq!(*chosen.borrow(), ["Desk microphone", "System default"]);
+
+    key(ui, Key::Return);
+    settle(ui).await;
+    assert_eq!(chosen.borrow().len(), 2, "opening chose nothing");
+    key(ui, Key::End);
+    settle(ui).await;
+    assert_eq!(ui.get_audio_microphone_index(), 2);
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(focused_control_has_label(ui, label), "focus returns");
+    let last = chosen.borrow().last().cloned();
+    assert_eq!(last.as_deref(), Some("Headset"));
+
+    ui.set_audio_devices_busy(true);
+    settle(ui).await;
+    key(ui, Key::UpArrow);
+    assert_eq!(ui.get_audio_microphone_index(), 2, "disabled");
+
+    ui.set_audio_devices_busy(false);
+    ui.set_audio_devices_enabled(false);
+    ui.on_select_audio_microphone(|_| {});
+    ui.set_page(0);
+    settle(ui).await;
+}
+
 async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     use morpheus_config::style_profiles::ProfileStore;
     use morpheus_config::{ConfigStore, LoadedConfig};
@@ -3503,6 +3600,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     assert_style_profiles(&ui, directory.path()).await;
     phase.set(19);
     assert_live_preview(&ui).await;
+    phase.set(20);
+    assert_themed_select(&ui).await;
     phase.set(15);
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),
