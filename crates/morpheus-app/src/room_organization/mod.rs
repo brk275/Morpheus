@@ -186,6 +186,25 @@ struct Pending {
     operation: u64,
 }
 
+struct HeaderMenu<S = morpheus_matrix::AccountSelection> {
+    token: String,
+    room: String,
+    selection: S,
+}
+
+fn take_header_menu<S>(
+    slot: &mut Option<HeaderMenu<S>>,
+    room: &str,
+    token: &str,
+    is_current: impl FnOnce(&S) -> bool,
+) -> Option<S> {
+    let menu = slot.as_ref()?;
+    if menu.token != token || menu.room != room || !is_current(&menu.selection) {
+        return None;
+    }
+    slot.take().map(|menu| menu.selection)
+}
+
 #[derive(Default)]
 struct State {
     /// Account of the latest snapshot.
@@ -195,6 +214,8 @@ struct State {
     confirmed: HashMap<String, Confirmed>,
     pending: Option<Pending>,
     next_operation: u64,
+    next_menu: u64,
+    header_menu: Option<HeaderMenu>,
 }
 
 impl State {
@@ -363,6 +384,9 @@ fn with_state<T>(work: impl FnOnce(&mut State) -> T) -> T {
 pub(crate) fn remember(account_id: &str, rooms: &[RoomInfo]) {
     let now = Instant::now();
     with_state(|state| {
+        if state.account != account_id {
+            state.header_menu = None;
+        }
         state.account = account_id.to_owned();
         state.stored = rooms
             .iter()
@@ -397,8 +421,10 @@ pub(crate) fn tags(room_id: &str) -> RoomTags {
 pub(crate) fn clear(ui: &AppWindow) {
     with_state(|state| {
         let next_operation = state.next_operation;
+        let next_menu = state.next_menu;
         *state = State {
             next_operation,
+            next_menu,
             ..State::default()
         };
     });
@@ -642,6 +668,22 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, runtime: Handle) -> Ar
     let global = ui.global::<RoomOrganizationState>();
     let handler = organizer.clone();
     global.on_organize(move |room_id, action| handler.organize(&room_id, action));
+    let handler = organizer.clone();
+    global.on_capture_header_menu(move |room_id| handler.capture_header_menu(&room_id).into());
+    let handler = organizer.clone();
+    global.on_organize_header(move |room_id, action, token| {
+        let selection = with_state(|state| {
+            take_header_menu(
+                &mut state.header_menu,
+                room_id.as_str(),
+                token.as_str(),
+                morpheus_matrix::AccountSelection::is_current,
+            )
+        });
+        if let Some(selection) = selection {
+            handler.organize_captured(&room_id, action, Some(selection));
+        }
+    });
     let weak = ui.as_weak();
     global.on_active_room_changed(move || {
         if let Some(ui) = weak.upgrade() {
@@ -652,10 +694,52 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, runtime: Handle) -> Ar
 }
 
 impl Organizer {
+    /// The header survives room changes, unlike a room-list row. Capture
+    /// the exact account selection before opening its native menu; an old
+    /// popup must never acquire a replacement account's selection.
+    fn capture_header_menu(&self, room_id: &str) -> String {
+        let Some(ui) = self.ui.upgrade() else {
+            return String::new();
+        };
+        let account = ui.get_active_account_local_id();
+        let Some(selection) = self.live.manager.account_selection(account.as_str()) else {
+            return String::new();
+        };
+        with_state(|state| {
+            state.header_menu = None;
+            if !ui.get_live_session()
+                || !selection.is_current()
+                || state.account != account.as_str()
+                || !state.stored.contains_key(room_id)
+                || state.pending_here().is_some()
+            {
+                return None;
+            }
+            state.next_menu = state.next_menu.checked_add(1)?;
+            let token = state.next_menu.to_string();
+            state.header_menu = Some(HeaderMenu {
+                token: token.clone(),
+                room: room_id.to_owned(),
+                selection,
+            });
+            Some(token)
+        })
+        .unwrap_or_default()
+    }
+
     /// One explicit menu choice for a room of the visible account. A menu
     /// whose row was rebuilt meanwhile reports an empty room, which, like any
     /// room this account has not joined, does nothing.
     fn organize(self: &Arc<Self>, room_id: &str, action: i32) {
+        self.organize_captured(room_id, action, None);
+    }
+
+    fn organize_captured(
+        self: &Arc<Self>,
+        room_id: &str,
+        action: i32,
+        captured: Option<morpheus_matrix::AccountSelection>,
+    ) {
         let Some(ui) = self.ui.upgrade() else {
             return;
         };
@@ -663,8 +747,15 @@ impl Organizer {
         if !ui.get_live_session() || account_id.is_empty() || room_id.is_empty() {
             return;
         }
-        let Some(selection) = self.live.manager.account_selection(&account_id) else {
-            return;
+        let selection = match captured {
+            Some(selection) if selection.account_id() == account_id && selection.is_current() => {
+                selection
+            }
+            Some(_) => return,
+            None => match self.live.manager.account_selection(&account_id) {
+                Some(selection) => selection,
+                None => return,
+            },
         };
         let visible = ui
             .get_favourite_rooms()
@@ -805,6 +896,36 @@ pub(crate) fn publish_active(ui: &AppWindow) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_menu_ownership_rejects_revocation_replay_and_replaced_menus() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let old = Arc::new(AtomicBool::new(true));
+        let current = |epoch: &Arc<AtomicBool>| epoch.load(Ordering::Acquire);
+        let mut menu = Some(HeaderMenu {
+            token: "1".into(),
+            room: "!shared:example.org".into(),
+            selection: old.clone(),
+        });
+        // Wrong rooms and unrelated old callbacks cannot consume a menu.
+        assert!(take_header_menu(&mut menu, "!other:example.org", "1", current).is_none());
+        assert!(take_header_menu(&mut menu, "!shared:example.org", "0", current).is_none());
+        assert!(menu.is_some());
+        old.store(false, Ordering::Release);
+        assert!(take_header_menu(&mut menu, "!shared:example.org", "1", current).is_none());
+        // Returning to the same account/room uses a new selection and token.
+        let replacement = Arc::new(AtomicBool::new(true));
+        menu = Some(HeaderMenu {
+            token: "2".into(),
+            room: "!shared:example.org".into(),
+            selection: replacement.clone(),
+        });
+        assert!(take_header_menu(&mut menu, "!shared:example.org", "1", current).is_none());
+        let selected = take_header_menu(&mut menu, "!shared:example.org", "2", current).unwrap();
+        assert!(Arc::ptr_eq(&selected, &replacement));
+        assert!(take_header_menu(&mut menu, "!shared:example.org", "2", current).is_none());
+    }
 
     fn order(value: f64) -> Option<TagOrder> {
         TagOrder::new(value)

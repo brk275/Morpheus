@@ -1,3 +1,6 @@
+import { StyleTokens } from "style-tokens.slint";
+import { HoverSurface } from "controls.slint";
+
 // Matrix room organization (Favorites and Low priority) for the visible
 // account. Rust (room_organization) owns every value in
 // RoomOrganizationState; this file only presents it and reports choices.
@@ -18,6 +21,9 @@ export global RoomOrganizationState {
     in-out property <bool> active-can-move-down: false;
     // Room ID and action.
     callback organize(string, int);
+    // Header menus capture a one-use capability for their account selection.
+    callback capture-header-menu(string) -> string;
+    callback organize-header(string, int, string);
     // The open room changed; the header menu state is republished.
     callback active-room-changed();
 }
@@ -105,6 +111,7 @@ export component RoomSectionHeader inherits Rectangle {
 export component RoomOrganizationButton inherits Rectangle {
     in property <string> room-id;
     in property <string> room-name;
+    in property <string> account-context;
     in property <bool> enabled: true;
     in property <color> ink;
     in property <color> hover;
@@ -115,16 +122,44 @@ export component RoomOrganizationButton inherits Rectangle {
     // The room the open menu was shown for; its choices act on that room
     // even if another room opens meanwhile.
     property <string> menu-room;
+    property <string> menu-token;
+
+    changed account-context => {
+        root.menu-room = ""; root.menu-token = ""; room-menu.close();
+    }
+    changed enabled => {
+        if !root.enabled { root.menu-room = ""; root.menu-token = ""; room-menu.close(); }
+    }
 
     function open-menu(position: Point) {
+        room-menu.close();
         root.menu-room = root.room-id;
-        room-menu.show(position);
+        root.menu-token = RoomOrganizationState.capture-header-menu(root.menu-room);
+        if root.menu-token != "" { room-menu.show(position); }
+    }
+
+    function activate-menu(action: int) {
+        if root.choosable && root.menu-room != "" && root.menu-token != "" {
+            let token = root.menu-token;
+            root.menu-token = "";
+            RoomOrganizationState.organize-header(root.menu-room, action, token);
+        }
     }
 
     width: 34px;
     height: 34px;
-    border-radius: root.radius;
-    background: button-hit.has-hover && root.enabled ? root.hover : transparent;
+    property <length> glyph-size: min(StyleTokens.icon-size, max(18px, min(root.width, root.height) - 6px));
+    border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : root.radius;
+    background: transparent;
+    HoverSurface {
+        width: root.width; height: root.height; border-radius: root.border-radius;
+        highlighted: root.enabled && button-hit.has-hover;
+        background: StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.hover;
+    }
+    Rectangle {
+        width: root.width; height: root.height; border-radius: root.border-radius;
+        background: root.enabled && button-hit.pressed && StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color : transparent;
+    }
     forward-focus: button-focus;
     accessible-role: button;
     accessible-label: "Organize " + root.room-name + (RoomOrganizationState.active-favourite ? ", in Favorites" : (RoomOrganizationState.active-low-priority ? ", low priority" : ""));
@@ -146,25 +181,25 @@ export component RoomOrganizationButton inherits Rectangle {
             if !RoomOrganizationState.active-favourite: MenuItem {
                 title: "Add to Favorites";
                 activated => {
-                    RoomOrganizationState.organize(root.menu-room, 0);
+                    root.activate-menu(0);
                 }
             }
             if RoomOrganizationState.active-favourite: MenuItem {
                 title: "Remove from Favorites";
                 activated => {
-                    RoomOrganizationState.organize(root.menu-room, 1);
+                    root.activate-menu(1);
                 }
             }
             if !RoomOrganizationState.active-low-priority: MenuItem {
                 title: "Mark as low priority";
                 activated => {
-                    RoomOrganizationState.organize(root.menu-room, 2);
+                    root.activate-menu(2);
                 }
             }
             if RoomOrganizationState.active-low-priority: MenuItem {
                 title: "Normal priority";
                 activated => {
-                    RoomOrganizationState.organize(root.menu-room, 3);
+                    root.activate-menu(3);
                 }
             }
             MenuSeparator { }
@@ -172,14 +207,14 @@ export component RoomOrganizationButton inherits Rectangle {
                 title: "Move up in Favorites";
                 enabled: RoomOrganizationState.active-favourite && RoomOrganizationState.active-can-move-up;
                 activated => {
-                    RoomOrganizationState.organize(root.menu-room, 4);
+                    root.activate-menu(4);
                 }
             }
             MenuItem {
                 title: "Move down in Favorites";
                 enabled: RoomOrganizationState.active-favourite && RoomOrganizationState.active-can-move-down;
                 activated => {
-                    RoomOrganizationState.organize(root.menu-room, 5);
+                    root.activate-menu(5);
                 }
             }
         }
@@ -189,8 +224,8 @@ export component RoomOrganizationButton inherits Rectangle {
             width: root.width;
             height: root.height;
             text: RoomOrganizationState.active-favourite ? "★" : "☆";
-            color: root.ink;
-            font-size: 18px;
+            color: !root.enabled && StyleTokens.states.control-disabled.present ? StyleTokens.states.control-disabled.color : root.ink;
+            font-size: root.glyph-size;
             horizontal-alignment: center;
             vertical-alignment: center;
             accessible-role: none;

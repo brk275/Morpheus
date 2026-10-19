@@ -4706,8 +4706,9 @@ export component AppWindow inherits Window {
                             RoomOrganizationButton {
                                 width: StyleTokens.icon-button-size; height: StyleTokens.icon-button-size;
                                 room-id: root.active-room-id; room-name: root.active-room-name;
+                                account-context: root.active-account-local-id;
                                 enabled: root.live-session && root.active-room-id != "";
-                                ink: root.muted; hover: root.hover; radius: StyleTokens.radius * 0.9;
+                                ink: root.icon-ink; hover: root.hover; radius: StyleTokens.radius * 0.9;
                                 focus-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.ink;
                             }
                         }

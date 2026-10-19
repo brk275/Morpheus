@@ -210,6 +210,78 @@ async fn assert_navigation_projection_and_focus(ui: &AppWindow) {
     crate::apply_room_sort(ui);
 }
 
+async fn assert_header_menu_capture_and_detach(ui: &AppWindow) {
+    use std::{cell::Cell, rc::Rc};
+
+    let previous = (
+        ui.get_page(),
+        ui.get_live_session(),
+        ui.get_active_account_local_id(),
+        ui.get_active_room_id(),
+        ui.get_active_room_name(),
+    );
+    let captures = Rc::new(Cell::new(0usize));
+    let count = captures.clone();
+    let global = ui.global::<crate::RoomOrganizationState>();
+    global.on_capture_header_menu(move |room| {
+        assert_eq!(room.as_str(), "!menu-fixture:example.org");
+        count.set(count.get() + 1);
+        count.get().to_string().into()
+    });
+    let actions = Rc::new(Cell::new(0usize));
+    let count = actions.clone();
+    global.on_organize_header(move |_, _, _| count.set(count.get() + 1));
+    ui.set_page(0);
+    ui.set_live_session(true);
+    ui.set_active_account_local_id("menu-fixture-a".into());
+    ui.set_active_room_id("!menu-fixture:example.org".into());
+    ui.set_active_room_name("Menu fixture".into());
+    settle(ui).await;
+    let label = "Organize Menu fixture";
+    click_control_once(ui, label);
+    settle(ui).await;
+    assert_eq!(
+        captures.get(),
+        1,
+        "the physical click captures once before showing the menu"
+    );
+    assert_eq!(actions.get(), 0, "opening a menu performs no tag operation");
+
+    // A header survives account changes, even for a room both accounts joined.
+    // The old popup closes; keyboard activation now captures a fresh menu.
+    ui.set_active_account_local_id("menu-fixture-b".into());
+    settle(ui).await;
+    request_bridge_focus(ui, label);
+    key(ui, Key::Return);
+    settle(ui).await;
+    assert_eq!(captures.get(), 2);
+    assert_eq!(
+        actions.get(),
+        0,
+        "account changes must not activate an old menu choice"
+    );
+    ui.set_live_session(false);
+    settle(ui).await;
+    key(ui, Key::Return);
+    settle(ui).await;
+    assert_eq!(
+        captures.get(),
+        2,
+        "a detached header cannot open another menu"
+    );
+    assert_eq!(actions.get(), 0);
+
+    global.on_capture_header_menu(|_| slint::SharedString::default());
+    global.on_organize_header(|_, _, _| {});
+    ui.set_active_account_local_id(previous.2);
+    ui.set_active_room_id(previous.3);
+    ui.set_active_room_name(previous.4);
+    ui.set_live_session(previous.1);
+    ui.set_page(previous.0);
+    ui.invoke_focus_composer(false);
+    settle(ui).await;
+}
+
 fn assert_passwords_empty(ui: &AppWindow) {
     assert!(ui.get_access_current_password().is_empty());
     assert!(ui.get_access_new_password().is_empty());
@@ -3644,6 +3716,7 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     settle(&ui).await;
     phase.set(2);
     assert_navigation_projection_and_focus(&ui).await;
+    assert_header_menu_capture_and_detach(&ui).await;
     phase.set(3);
     assert_accessible_action_focus_and_first_click(&ui).await;
     phase.set(4);
