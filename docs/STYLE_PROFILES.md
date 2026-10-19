@@ -57,11 +57,17 @@ in other folders. Each profile file is at most 64 KiB. File names are chosen
 from the profile name when it is created (lowercase letters, digits and
 hyphens) and do not change when the profile is renamed.
 
-Only regular files are read. Symbolic links, folders and devices in the
-profiles folder are skipped, and a link in place of the folder itself is not
-used. Imports and exports refuse links, folders and devices too. Every write
-goes to a temporary file in the same folder that then replaces the target, so
-a failed write keeps the previous file.
+Only regular files are read. Symbolic links, folders, sockets, FIFOs and
+devices in the profiles folder are skipped, and a link (or Windows junction)
+in place of the folder itself is never used: the folder is checked before and
+after each file in it is opened, so one replaced meanwhile is noticed. Files
+are opened without following a link and without waiting on a FIFO or device
+that replaced a checked file; on Windows the profiles folder refuses any
+reparse point. File names never use Windows device names such as `con` or
+`com1`. Imports and exports refuse links, junctions, folders and devices too;
+files in a cloud-synced Documents folder can still be imported and exported.
+Every write goes to a temporary file in the same folder that then replaces
+the target, so a failed write keeps the previous file.
 
 ## File format
 
@@ -96,6 +102,10 @@ link = "#335F86"
 [senders]
 colors = ["#2E684A", "#80552C", "#625684"]
 ```
+
+Ready-to-import examples are in
+[`examples/style-profiles`](../examples/style-profiles): Harbor, Ledger and
+Lantern, checked by the configuration tests.
 
 `profile_version = 1` and `name` (1 to 48 characters, without line breaks or
 control or bidirectional formatting characters) are required. The accepted

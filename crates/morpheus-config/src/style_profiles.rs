@@ -516,16 +516,18 @@ pub fn validate_name(name: &str) -> Result<String, ProfileError> {
 pub struct ProfileFile(String);
 
 impl ProfileFile {
-    /// A stem of ASCII letters, digits, `-` and `_`, at most 64 characters:
-    /// it cannot name another folder, a hidden file or a reserved device
-    /// name with an extension.
+    /// A stem of ASCII letters, digits, `-` and `_`, at most 64 characters,
+    /// not starting with `-` and not a Windows device name: it cannot name
+    /// another folder, a hidden file or a device, also when the folder is
+    /// shared with Windows.
     pub fn parse(stem: &str) -> Option<Self> {
         let valid = !stem.is_empty()
             && stem.len() <= 64
             && stem
                 .chars()
                 .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-            && !stem.starts_with('-');
+            && !stem.starts_with('-')
+            && !reserved_device_name(stem);
         valid.then(|| Self(stem.to_owned()))
     }
 
@@ -555,9 +557,33 @@ fn stem_for(name: &str) -> String {
     let stem = stem.trim_end_matches('-');
     if stem.is_empty() {
         "profile".to_owned()
+    } else if reserved_device_name(stem) {
+        format!("{stem}-profile")
     } else {
         stem.to_owned()
     }
+}
+
+/// Windows device names: `CON`, `PRN`, `AUX`, `NUL`, `COM0`-`COM9` and
+/// `LPT0`-`LPT9`, in any case. Windows opens the device for such a name even
+/// with an extension, so none of them names a profile file.
+fn reserved_device_name(stem: &str) -> bool {
+    let upper = stem.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.as_bytes()[3].is_ascii_digit())
+}
+
+/// Whether Windows would open a device for this path's file name: the part
+/// before the first dot is a device name. Always false elsewhere.
+fn device_path(path: &Path) -> bool {
+    cfg!(windows)
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.split('.').next())
+            .is_some_and(reserved_device_name)
 }
 
 /// A file name suggested for exporting `name`.
@@ -604,14 +630,11 @@ impl ProfileStore {
     /// number of entries. Links, folders, hidden files and other names are
     /// skipped and never followed. A missing folder lists nothing.
     pub fn list(&self) -> Result<ProfileListing, ProfileError> {
-        match fs::symlink_metadata(&self.dir) {
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Ok(ProfileListing::default());
-            }
-            Err(_) => return Err(ProfileError::Folder),
-            Ok(metadata) if !metadata.is_dir() => return Err(ProfileError::Folder),
-            Ok(_) => {}
-        }
+        let folder = match self.folder() {
+            Err(ProfileError::Missing) => return Ok(ProfileListing::default()),
+            Err(error) => return Err(error),
+            Ok(folder) => folder,
+        };
         let mut listing = ProfileListing::default();
         let entries = fs::read_dir(&self.dir).map_err(|_| ProfileError::Folder)?;
         for (examined, entry) in entries.enumerate() {
@@ -639,14 +662,19 @@ impl ProfileStore {
             let profile = self.read(&file);
             listing.entries.push(ProfileEntry { file, profile });
         }
+        // The entries must have come from the folder that was checked.
+        self.same_folder(&folder).map_err(|_| ProfileError::Folder)?;
         listing.entries.sort_by(|left, right| left.file.cmp(&right.file));
         Ok(listing)
     }
 
-    /// Read and validate one listed profile.
+    /// Read and validate one listed profile. The folder must be the checked
+    /// one before and after the file is opened.
     pub fn read(&self, file: &ProfileFile) -> Result<StyleProfile, ProfileError> {
-        let raw = read_regular(&self.dir.join(file.file_name()))?;
-        StyleProfile::parse(&raw)
+        let folder = self.folder()?;
+        let raw = read_regular(&self.dir.join(file.file_name()), Place::Folder);
+        self.same_folder(&folder)?;
+        StyleProfile::parse(&raw?)
     }
 
     /// Save a new profile under a file name of its own, never replacing an
@@ -660,7 +688,7 @@ impl ProfileStore {
         if name_used(&listing, &profile.name, None) {
             return Err(ProfileError::NameTaken);
         }
-        self.ensure_folder()?;
+        let folder = self.ensure_folder()?;
         let base = stem_for(&profile.name);
         for attempt in 1..=MAX_PROFILES + 1 {
             let stem = if attempt == 1 {
@@ -671,8 +699,9 @@ impl ProfileStore {
             let Some(file) = ProfileFile::parse(&stem) else {
                 return Err(ProfileError::Write);
             };
+            self.same_folder(&folder)?;
             match write_atomic(&self.dir, &self.dir.join(file.file_name()), &raw, false) {
-                Ok(()) => return Ok(file),
+                Ok(()) => return self.same_folder(&folder).map(|()| file),
                 Err(WriteError::Exists) => continue,
                 Err(WriteError::Failed) => return Err(ProfileError::Write),
             }
@@ -681,16 +710,21 @@ impl ProfileStore {
     }
 
     /// Replace an existing profile file with `profile`, as confirmed by the
-    /// person. The file must still be a regular file in the folder.
+    /// person. The folder must be the checked one, and the file still a
+    /// regular file in it.
     pub fn replace(&self, file: &ProfileFile, profile: &StyleProfile) -> Result<(), ProfileError> {
         let raw = profile.to_toml()?;
+        let folder = self.folder()?;
         let listing = self.list()?;
         if name_used(&listing, &profile.name, Some(file)) {
             return Err(ProfileError::NameTaken);
         }
         let path = self.dir.join(file.file_name());
-        regular_file(&path).map_err(|_| ProfileError::Changed)?;
-        write_atomic(&self.dir, &path, &raw, true).map_err(|_| ProfileError::Write)
+        regular_file(&path, Place::Folder).map_err(|_| ProfileError::Changed)?;
+        self.same_folder(&folder)?;
+        write_atomic(&self.dir, &path, &raw, true).map_err(|_| ProfileError::Write)?;
+        // Report a folder replaced during the write instead of claiming it.
+        self.same_folder(&folder)
     }
 
     /// Rename a profile. Its file keeps its name, so the change is one
@@ -711,20 +745,65 @@ impl ProfileStore {
         self.create(&profile)
     }
 
-    /// Delete one profile file. Only a regular file is removed.
+    /// Delete one profile file. Only a regular file in the checked folder is
+    /// removed; a folder replaced by a link is never followed.
     pub fn delete(&self, file: &ProfileFile) -> Result<(), ProfileError> {
+        let folder = self.folder().map_err(|_| ProfileError::Changed)?;
         let path = self.dir.join(file.file_name());
-        regular_file(&path).map_err(|_| ProfileError::Changed)?;
+        regular_file(&path, Place::Folder).map_err(|_| ProfileError::Changed)?;
+        self.same_folder(&folder)?;
         fs::remove_file(&path).map_err(|_| ProfileError::Write)
     }
 
     /// Create the folder if needed. A link in its place is refused.
-    fn ensure_folder(&self) -> Result<(), ProfileError> {
+    fn ensure_folder(&self) -> Result<FolderId, ProfileError> {
         fs::create_dir_all(&self.dir).map_err(|_| ProfileError::Folder)?;
+        self.folder()
+    }
+
+    /// The profiles folder itself, which must be a directory and not a link,
+    /// junction or other reparse point. `Missing` when it does not exist.
+    fn folder(&self) -> Result<FolderId, ProfileError> {
         match fs::symlink_metadata(&self.dir) {
-            Ok(metadata) if metadata.is_dir() => Ok(()),
+            Ok(metadata) if metadata.is_dir() && !is_reparse_point(&metadata) => {
+                Ok(FolderId::of(&metadata))
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => Err(ProfileError::Missing),
             _ => Err(ProfileError::Folder),
         }
+    }
+
+    /// The folder is still the checked one: not replaced by a link or by
+    /// another directory (compared by device and inode on Unix).
+    fn same_folder(&self, before: &FolderId) -> Result<(), ProfileError> {
+        match self.folder() {
+            Ok(now) if now == *before => Ok(()),
+            _ => Err(ProfileError::Changed),
+        }
+    }
+}
+
+/// The identity of the profiles folder as checked.
+#[derive(Debug, PartialEq, Eq)]
+struct FolderId {
+    #[cfg(unix)]
+    id: (u64, u64),
+}
+
+impl FolderId {
+    #[cfg(unix)]
+    fn of(metadata: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            id: (metadata.dev(), metadata.ino()),
+        }
+    }
+
+    /// Without a stable identity in std, the folder is still checked to be a
+    /// directory that is not a reparse point each time.
+    #[cfg(not(unix))]
+    fn of(_: &fs::Metadata) -> Self {
+        Self {}
     }
 }
 
@@ -742,7 +821,10 @@ fn name_used(listing: &ProfileListing, name: &str, except: Option<&ProfileFile>)
 /// Read a profile the person chose to import. Only a regular file, not a
 /// link, of at most [`MAX_PROFILE_BYTES`] is read.
 pub fn import_profile(path: &Path) -> Result<StyleProfile, ProfileError> {
-    StyleProfile::parse(&read_regular(path)?)
+    if device_path(path) {
+        return Err(ProfileError::NotRegularFile);
+    }
+    StyleProfile::parse(&read_regular(path, Place::Chosen)?)
 }
 
 /// Write `profile` to the file the person chose to export to. An existing
@@ -750,6 +832,9 @@ pub fn import_profile(path: &Path) -> Result<StyleProfile, ProfileError> {
 /// a link, folder or device is refused. The write is atomic.
 pub fn export_profile(profile: &StyleProfile, target: &Path) -> Result<(), ProfileError> {
     let raw = profile.to_toml()?;
+    if device_path(target) {
+        return Err(ProfileError::Target);
+    }
     let parent = target
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -770,30 +855,31 @@ pub fn export_profile(profile: &StyleProfile, target: &Path) -> Result<(), Profi
     }
 }
 
-/// The path is a regular file itself, not a link to one.
-fn regular_file(path: &Path) -> Result<fs::Metadata, ProfileError> {
+/// The path is a regular file itself, not a link or other reparse point.
+fn regular_file(path: &Path, place: Place) -> Result<fs::Metadata, ProfileError> {
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() => Ok(metadata),
+        Ok(metadata) if metadata.is_file() && !place.refuses(&metadata) => Ok(metadata),
         Ok(_) => Err(ProfileError::NotRegularFile),
         Err(error) if error.kind() == ErrorKind::NotFound => Err(ProfileError::Missing),
         Err(_) => Err(ProfileError::Unreadable),
     }
 }
 
-/// Read a bounded regular file without following a link at its path. The
-/// opened file must be the one that was checked.
-fn read_regular(path: &Path) -> Result<String, ProfileError> {
-    let checked = regular_file(path)?;
+/// Read a bounded regular file. The path is checked first; the open then
+/// follows no link and never blocks (see [`open_no_follow`]), and the opened
+/// handle must be a regular file and, on Unix, the very file that was checked.
+fn read_regular(path: &Path, place: Place) -> Result<String, ProfileError> {
+    let checked = regular_file(path, place)?;
     if checked.len() > MAX_PROFILE_BYTES {
         return Err(ProfileError::TooLarge);
     }
-    let file = fs::File::open(path).map_err(|error| match error.kind() {
-        ErrorKind::NotFound => ProfileError::Missing,
-        _ => ProfileError::Unreadable,
-    })?;
+    let file = open_no_follow(path, place)?;
     let opened = file.metadata().map_err(|_| ProfileError::Unreadable)?;
-    if !opened.is_file() || !same_file(&checked, &opened) {
+    if !opened.is_file() || place.refuses(&opened) || !same_file(&checked, &opened) {
         return Err(ProfileError::NotRegularFile);
+    }
+    if opened.len() > MAX_PROFILE_BYTES {
+        return Err(ProfileError::TooLarge);
     }
     let mut bytes = Vec::new();
     file.take(MAX_PROFILE_BYTES + 1)
@@ -813,11 +899,114 @@ fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
-/// Windows exposes no stable file identity through std; the opened handle
-/// is still checked to be a regular file and the read is bounded.
+/// Windows exposes no stable file identity through std. The handle is opened
+/// on a reparse point itself rather than its target, then refused unless it
+/// is a regular file that is not a reparse point, and the read is bounded.
 #[cfg(not(unix))]
 fn same_file(_: &fs::Metadata, _: &fs::Metadata) -> bool {
     true
+}
+
+/// Open for reading without following a link at the final path component and
+/// without blocking. Unix adds `O_NOFOLLOW | O_NONBLOCK | O_NOCTTY`: a link
+/// fails to open, and a FIFO or device put in place of a checked file opens at
+/// once and is then refused instead of blocking the reader. Windows opens a
+/// link, junction or other reparse point itself, which is then refused. A
+/// failure is classified with fixed text only.
+fn open_no_follow(path: &Path, place: Place) -> Result<fs::File, ProfileError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    no_follow(&mut options, place);
+    options.open(path).map_err(|error| {
+        if error.kind() == ErrorKind::NotFound {
+            return ProfileError::Missing;
+        }
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() && !place.refuses(&metadata) => {
+                ProfileError::Unreadable
+            }
+            Ok(_) => ProfileError::NotRegularFile,
+            Err(_) => ProfileError::Unreadable,
+        }
+    })
+}
+
+/// `open(2)` flags `O_NOFOLLOW | O_NONBLOCK | O_NOCTTY` for each shipped Unix
+/// target, as the libc 0.2.190 sources this workspace locks define them
+/// (`unix/bsd/mod.rs` and `unix/bsd/apple/mod.rs` for macOS on both
+/// architectures; `linux/{gnu,musl}/b64/{x86_64,aarch64}/mod.rs` for Linux).
+/// This crate does not depend on libc; see the handoff for that alternative.
+#[cfg(target_os = "macos")]
+const NO_FOLLOW_FLAGS: Option<i32> = Some(0x0100 | 0x0004 | 0x0002_0000);
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const NO_FOLLOW_FLAGS: Option<i32> = Some(0x0002_0000 | 0x0800 | 0x0100);
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const NO_FOLLOW_FLAGS: Option<i32> = Some(0x8000 | 0x0800 | 0x0100);
+/// Unix targets that are not shipped keep only the checks around a plain
+/// open; there a FIFO put in place between the check and the open can block.
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "macos",
+        all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+    ))
+))]
+const NO_FOLLOW_FLAGS: Option<i32> = None;
+
+#[cfg(unix)]
+fn no_follow(options: &mut fs::OpenOptions, _: Place) {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(flags) = NO_FOLLOW_FLAGS {
+        options.custom_flags(flags);
+    }
+}
+
+#[cfg(windows)]
+fn no_follow(options: &mut fs::OpenOptions, place: Place) {
+    use std::os::windows::fs::OpenOptionsExt;
+    // Open a reparse point itself instead of what it points to.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    if place == Place::Folder {
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn no_follow(_: &mut fs::OpenOptions, _: Place) {}
+
+/// Where a file being read lives, which decides how strict the checks are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    /// The app's own profiles folder: any Windows reparse point is refused,
+    /// and the open never follows one.
+    Folder,
+    /// A file the person chose in the system dialog. Links and junctions are
+    /// refused, but other Windows reparse points are read, because files in a
+    /// cloud-synced Documents folder (OneDrive placeholders) are reparse
+    /// points too.
+    Chosen,
+}
+
+impl Place {
+    /// Whether this place refuses a file whose type is otherwise a regular
+    /// file. Links and junctions are never regular files in std's view.
+    fn refuses(self, metadata: &fs::Metadata) -> bool {
+        self == Self::Folder && is_reparse_point(metadata)
+    }
+}
+
+/// A Windows link, junction or other reparse point; never true elsewhere,
+/// where `symlink_metadata` and `O_NOFOLLOW` already distinguish links.
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_: &fs::Metadata) -> bool {
+    false
 }
 
 enum WriteError {
@@ -1049,6 +1238,72 @@ mod tests {
             assert!(ProfileFile::parse(stem).is_none(), "{stem}");
         }
         assert!(ProfileFile::parse("reading-room_2").is_some());
+        // Windows device names never name a profile file, in any case.
+        for device in ["con", "CON", "Prn", "aux", "NUL", "com0", "COM9", "lpt1", "Lpt9"] {
+            assert!(ProfileFile::parse(device).is_none(), "{device}");
+        }
+        for allowed in ["com10", "console", "con-2", "nul_profile", "lpt"] {
+            assert!(ProfileFile::parse(allowed).is_some(), "{allowed}");
+        }
+        assert_eq!(stem_for("Con"), "con-profile");
+        assert_eq!(export_file_name("AUX"), "aux-profile.toml");
+        assert!(ProfileFile::parse(&stem_for("com1")).is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn special_files_in_place_of_a_profile_are_refused() {
+        use std::os::unix::net::UnixListener;
+        let directory = tempfile::tempdir().unwrap();
+        let dir = directory.path().join("style-profiles");
+        fs::create_dir_all(&dir).unwrap();
+        // A short name keeps the socket path within the platform limit.
+        let socket = dir.join("s.toml");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let store = ProfileStore::at(&dir);
+        assert!(store.list().unwrap().entries.is_empty());
+        let file = ProfileFile::parse("s").unwrap();
+        assert!(matches!(store.read(&file), Err(ProfileError::NotRegularFile)));
+        assert!(matches!(store.delete(&file), Err(ProfileError::Changed)));
+        assert!(matches!(import_profile(&socket), Err(ProfileError::NotRegularFile)));
+        assert!(matches!(
+            export_profile(&StyleProfile::named("Export"), &socket),
+            Err(ProfileError::Target)
+        ));
+        assert!(socket.exists());
+        // The no-follow open itself refuses a link at the final component.
+        let target = dir.join("target.toml");
+        fs::write(&target, "profile_version = 1\nname = \"T\"\n").unwrap();
+        let link = dir.join("link.toml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(open_no_follow(&link, Place::Folder).is_err());
+        assert!(open_no_follow(&target, Place::Folder).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_profiles_folder_replaced_by_a_link_is_never_followed() {
+        use std::os::unix::fs::symlink;
+        let directory = tempfile::tempdir().unwrap();
+        let dir = directory.path().join("style-profiles");
+        let store = ProfileStore::at(&dir);
+        let kept = StyleProfile::named("Kept");
+        let file = store.create(&kept).unwrap();
+        let elsewhere = directory.path().join("elsewhere");
+        fs::rename(&dir, &elsewhere).unwrap();
+        symlink(&elsewhere, &dir).unwrap();
+        assert!(matches!(store.list(), Err(ProfileError::Folder)));
+        assert!(matches!(store.read(&file), Err(ProfileError::Folder)));
+        assert!(matches!(
+            store.replace(&file, &StyleProfile::named("Other")),
+            Err(ProfileError::Folder)
+        ));
+        assert!(matches!(store.delete(&file), Err(ProfileError::Changed)));
+        assert!(matches!(store.create(&StyleProfile::named("New")), Err(ProfileError::Folder)));
+        // The real folder's file is untouched and nothing was added there.
+        let moved = elsewhere.join("kept.toml");
+        assert_eq!(fs::read_to_string(&moved).unwrap(), kept.to_toml().unwrap());
+        assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 1);
     }
 
     #[test]
