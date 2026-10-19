@@ -325,6 +325,37 @@ fn entropy_end(bytes: &[u8], from: usize) -> Result<(usize, u8, usize), PreviewE
     Err(PreviewError::Invalid)
 }
 
+/// The orientation in a still PNG's first eXIf chunk (raw TIFF data), or
+/// upright. Only chunk headers and that one chunk are read, at most 4096
+/// chunks; the chunk itself never reaches the decoder.
+fn png_orientation(bytes: &[u8]) -> Orientation {
+    let mut position = 8usize;
+    for _ in 0..4096 {
+        let Some(header) = bytes.get(position..position + 8) else {
+            break;
+        };
+        let length = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+        let Some(end) = position
+            .checked_add(8)
+            .and_then(|start| start.checked_add(length))
+        else {
+            break;
+        };
+        match &header[4..8] {
+            b"eXIf" => {
+                return bytes
+                    .get(position + 8..end)
+                    .and_then(Orientation::from_exif_chunk)
+                    .unwrap_or(Orientation::NoTransforms);
+            }
+            b"IEND" => break,
+            _ => {}
+        }
+        position = end + 4;
+    }
+    Orientation::NoTransforms
+}
+
 pub(super) fn decode(bytes: Zeroizing<Vec<u8>>) -> Result<Pixels, PreviewError> {
     if bytes.len() > morpheus_matrix::MAX_IMAGE_PREVIEW_BYTES {
         return Err(PreviewError::TooLarge);
@@ -374,11 +405,12 @@ pub(super) fn decode(bytes: Zeroizing<Vec<u8>>) -> Result<Pixels, PreviewError> 
             }
             rgba
         };
-        Ok(Pixels {
+        let pixels = Pixels {
             width,
             height,
             rgba,
-        })
+        };
+        Ok(orient(pixels, png_orientation(&bytes)))
     } else if bytes.starts_with(b"\xff\xd8") {
         let (input, orientation) = jpeg_input(&bytes)?;
         let options = zune_core::options::DecoderOptions::default()
@@ -763,6 +795,28 @@ mod tests {
         colour.extend_from_slice(&[0xff, 0xda, 0, 10, 2, 1, 0, 2, 0, 1, 63, 0, 1]);
         colour.extend_from_slice(&[0xff, 0xd9]);
         assert!(jpeg_input(&colour).is_err());
+    }
+    #[test]
+    fn png_exif_orientation_is_read_and_the_chunk_still_discarded() {
+        let mut original = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut original)
+            .write_image(&[1, 0, 0, 255, 2, 0, 0, 255], 2, 1, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        // Big-endian TIFF, IFD0 with one orientation entry (6: quarter turn).
+        let mut data = b"MM\0*\0\0\0\x08\0\x01".to_vec();
+        data.extend_from_slice(&[0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0, 0, 0]);
+        let mut chunk = (data.len() as u32).to_be_bytes().to_vec();
+        chunk.extend_from_slice(b"eXIf");
+        chunk.extend_from_slice(&data);
+        chunk.extend_from_slice(&[0; 4]); // The CRC is not checked for discarded chunks.
+        let mut bytes = original.clone();
+        bytes.splice(33..33, chunk);
+        assert_eq!(png_orientation(&bytes), Orientation::Rotate90);
+        assert_eq!(png_orientation(&original), Orientation::NoTransforms);
+        assert!(!png_input(&bytes).unwrap().windows(4).any(|w| w == b"eXIf"));
+        let pixels = decode(Zeroizing::new(bytes)).unwrap();
+        assert_eq!((pixels.width, pixels.height), (1, 2));
+        assert_eq!(values(&pixels), [1, 2]);
     }
     #[test]
     fn jpeg_metadata_is_removed_and_later_header_injection_rejected() {
