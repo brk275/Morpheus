@@ -338,7 +338,7 @@ async fn get_most_recent_edit_excluding(
         .iter()
         .rev()
         .find(|edit| {
-            if edit.event_id().is_some_and(|id| excluded == Some(id.as_ref())) {
+            if edit.event_id().is_some_and(|id| excluded == Some(id)) {
                 return false;
             }
             if !matches!(
