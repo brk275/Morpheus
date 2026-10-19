@@ -3186,7 +3186,11 @@ pub(super) fn message_item(info: &MessageInfo) -> MessageItem {
     // Matrix body may be an unrelated fallback, so editing it would silently
     // discard visible styling when an unchanged message is saved.
     let edit_markdown = styled_markdown.is_some();
-    let edit_source = if edit_markdown {
+    // An undecryptable message has no text of its own; an empty source also
+    // hides the Edit action.
+    let edit_source = if info.undecryptable {
+        ""
+    } else if edit_markdown {
         info.rich_markdown.as_deref().unwrap_or(display_body)
     } else {
         display_body
@@ -3341,6 +3345,7 @@ mod member_tests {
             is_own: true,
             is_local_echo: false,
             send_state: MessageSendState::Sent,
+            undecryptable: false,
         };
         let item = message_item(&info);
         assert!(item.edit_markdown);
@@ -3359,6 +3364,18 @@ mod member_tests {
         assert_ne!(item.sender_palette_index, other_server.sender_palette_index);
         assert_eq!(item.edit_source.as_str(), "Visible **bold** text");
         assert_eq!(item.rich_accessible_body.as_str(), "Visible bold text");
+
+        // An own message this device cannot decrypt shows its notice and
+        // offers nothing to edit.
+        let locked = message_item(&MessageInfo {
+            body: "Waiting for keys".into(),
+            rich_markdown: None,
+            rich_accessible: None,
+            undecryptable: true,
+            ..info.clone()
+        });
+        assert_eq!(locked.body.as_str(), "Waiting for keys");
+        assert!(locked.edit_source.is_empty());
 
         let plain = message_item(&MessageInfo {
             rich_markdown: None,

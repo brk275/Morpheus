@@ -3822,7 +3822,7 @@ export component AppWindow inherits Window {
                                         message-input.focus();
                                     }
                                 }
-                                if message.event-id != "" && message.is-own && message.attachment == "" : IconAction {
+                                if message.event-id != "" && message.is-own && message.attachment == "" && message.edit-source != "" : IconAction {
                                     quiet: true; context-hover: message-hover.has-hover;
                                     width: 28px; height: 26px; icon: "✎"; label: "Edit your message";
                                     ink: root.muted; surface: transparent; hover-surface: root.hover;

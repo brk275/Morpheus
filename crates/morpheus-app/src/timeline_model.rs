@@ -192,6 +192,7 @@ pub(crate) mod tests {
             is_own: false,
             is_local_echo: false,
             send_state: MessageSendState::Sent,
+            undecryptable: false,
         }
     }
 
@@ -514,6 +515,7 @@ pub(crate) mod tests {
         changed!(is_own, true);
         changed!(is_local_echo, true);
         changed!(send_state, MessageSendState::Pending);
+        changed!(undecryptable, true);
         for row in variants {
             let model = update(ModelRc::default(), vec![base.clone()]);
             let observer = Box::pin(ModelChangeListenerContainer::new(Observer {

@@ -71,6 +71,7 @@ pub use identity_warnings::{
     IdentityAckError, IdentityWarning, IdentityWarningFeed, IdentityWarningKind, IdentityWarnings,
     MAX_IDENTITY_WARNINGS,
 };
+mod undecryptable;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -311,7 +312,8 @@ pub enum SyncPolicy {
     ClassicOnly,
 }
 
-/// Plain data for a native UI. Non-message timeline entries are omitted.
+/// Plain data for a native UI. Non-message timeline entries are omitted; a
+/// message this device cannot decrypt carries a fixed notice as its body.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageInfo {
     pub key: String,
@@ -339,6 +341,10 @@ pub struct MessageInfo {
     pub is_own: bool,
     pub is_local_echo: bool,
     pub send_state: MessageSendState,
+    /// This device could not decrypt the message: `body` is a fixed notice
+    /// and there is no text of its own to edit.
+    #[serde(default)]
+    pub undecryptable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -3930,11 +3936,16 @@ fn message_info(item: &TimelineItem) -> Option<MessageInfo> {
     let message = content.as_message();
     // Stickers are their own Matrix event type. The SDK deliberately does not
     // expose them through as_message(), but they still belong in the timeline.
-    let body = message.map(|message| message.body()).or_else(|| {
-        content
-            .as_sticker()
-            .map(|sticker| sticker.content().body.as_str())
-    })?;
+    // A message this device cannot decrypt stays visible with a notice
+    // instead of silently disappearing; the SDK replaces it once keys arrive.
+    let body = message
+        .map(|message| message.body())
+        .or_else(|| {
+            content
+                .as_sticker()
+                .map(|sticker| sticker.content().body.as_str())
+        })
+        .or_else(|| undecryptable::notice(content))?;
     let reply_preview =
         event
             .content()
@@ -4007,6 +4018,7 @@ fn message_info(item: &TimelineItem) -> Option<MessageInfo> {
         is_own: event.is_own(),
         is_local_echo: event.is_local_echo(),
         send_state,
+        undecryptable: content.is_unable_to_decrypt(),
     })
 }
 
