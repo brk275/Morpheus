@@ -112,6 +112,14 @@ export component RoomOrganizationButton inherits Rectangle {
     in property <length> radius: 9px;
 
     property <bool> choosable: root.enabled && RoomOrganizationState.pending-room == "";
+    // The room the open menu was shown for; its choices act on that room
+    // even if another room opens meanwhile.
+    property <string> menu-room;
+
+    function open-menu(position: Point) {
+        root.menu-room = root.room-id;
+        room-menu.show(position);
+    }
 
     width: 34px;
     height: 34px;
@@ -123,23 +131,40 @@ export component RoomOrganizationButton inherits Rectangle {
     accessible-enabled: root.enabled;
     accessible-action-default => {
         if root.choosable {
-            room-menu.show({ x: 0px, y: root.height });
+            root.open-menu({ x: 0px, y: root.height });
         }
     }
 
     room-menu := ContextMenuArea {
         enabled: root.choosable;
+        // Each item sends only the action its title states, for the room
+        // the menu was shown for. The menu keeps the items it was shown
+        // with: if the room's tags change meanwhile, an outdated item still
+        // sends its action, which changes nothing when the room already has
+        // that result.
         Menu {
-            MenuItem {
-                title: RoomOrganizationState.active-favourite ? "Remove from Favorites" : "Add to Favorites";
+            if !RoomOrganizationState.active-favourite: MenuItem {
+                title: "Add to Favorites";
                 activated => {
-                    RoomOrganizationState.organize(root.room-id, RoomOrganizationState.active-favourite ? 1 : 0);
+                    RoomOrganizationState.organize(root.menu-room, 0);
                 }
             }
-            MenuItem {
-                title: RoomOrganizationState.active-low-priority ? "Normal priority" : "Mark as low priority";
+            if RoomOrganizationState.active-favourite: MenuItem {
+                title: "Remove from Favorites";
                 activated => {
-                    RoomOrganizationState.organize(root.room-id, RoomOrganizationState.active-low-priority ? 3 : 2);
+                    RoomOrganizationState.organize(root.menu-room, 1);
+                }
+            }
+            if !RoomOrganizationState.active-low-priority: MenuItem {
+                title: "Mark as low priority";
+                activated => {
+                    RoomOrganizationState.organize(root.menu-room, 2);
+                }
+            }
+            if RoomOrganizationState.active-low-priority: MenuItem {
+                title: "Normal priority";
+                activated => {
+                    RoomOrganizationState.organize(root.menu-room, 3);
                 }
             }
             MenuSeparator { }
@@ -147,14 +172,14 @@ export component RoomOrganizationButton inherits Rectangle {
                 title: "Move up in Favorites";
                 enabled: RoomOrganizationState.active-favourite && RoomOrganizationState.active-can-move-up;
                 activated => {
-                    RoomOrganizationState.organize(root.room-id, 4);
+                    RoomOrganizationState.organize(root.menu-room, 4);
                 }
             }
             MenuItem {
                 title: "Move down in Favorites";
                 enabled: RoomOrganizationState.active-favourite && RoomOrganizationState.active-can-move-down;
                 activated => {
-                    RoomOrganizationState.organize(root.room-id, 5);
+                    RoomOrganizationState.organize(root.menu-room, 5);
                 }
             }
         }
@@ -180,7 +205,7 @@ export component RoomOrganizationButton inherits Rectangle {
             key-pressed(event) => {
                 if event.text == Key.Space || event.text == Key.Return || event.text == Key.Menu || (event.modifiers.shift && event.text == Key.F10) {
                     if root.choosable {
-                        room-menu.show({ x: 0px, y: root.height });
+                        root.open-menu({ x: 0px, y: root.height });
                     }
                     accept
                 } else {
@@ -198,14 +223,14 @@ export component RoomOrganizationButton inherits Rectangle {
             clicked => {
                 button-focus.focus();
                 if root.choosable {
-                    room-menu.show({ x: 0px, y: root.height });
+                    root.open-menu({ x: 0px, y: root.height });
                 }
             }
             // This area takes every button, so the menu area under it never
             // sees a right click; open the menu here instead.
             pointer-event(event) => {
                 if event.button == PointerEventButton.right && event.kind == PointerEventKind.down && root.choosable {
-                    room-menu.show({ x: self.mouse-x, y: self.mouse-y });
+                    root.open-menu({ x: self.mouse-x, y: self.mouse-y });
                 }
             }
         }

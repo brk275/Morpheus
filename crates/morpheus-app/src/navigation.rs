@@ -51,7 +51,7 @@ fn room_order(
     // Ordered rooms first by their order, then the rest by name; identity
     // breaks ties, never the display name alone.
     let tag_key = |entry: &NavigationRoomItem| {
-        let order = tags_of(entry.room.id.as_str()).order;
+        let order = tags_of(entry.room.id.as_str()).order();
         (
             order.is_none(),
             order,
@@ -289,7 +289,8 @@ mod tests {
             RoomTags {
                 favourite,
                 low_priority,
-                order,
+                favourite_order: order.filter(|_| favourite),
+                low_priority_order: order.filter(|_| low_priority && !favourite),
             }
         };
         let order = room_order(channels, directs, true, tags);

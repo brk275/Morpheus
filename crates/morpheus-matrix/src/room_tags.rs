@@ -62,26 +62,46 @@ impl TagOrder {
     }
 }
 
-/// One explicit organization change for a room.
+/// One explicit organization change for a room. The order of an added tag
+/// is the one it is written with; a tag the room keeps is not rewritten
+/// unless a failed request left it uncertain, so the caller passes the order
+/// it shows for that tag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoomTagChange {
     /// Add `m.favourite` with this order and remove `m.lowpriority`.
     Favourite(Option<TagOrder>),
-    /// Add `m.lowpriority` and remove `m.favourite`.
-    LowPriority,
+    /// Add `m.lowpriority` with this order and remove `m.favourite`.
+    LowPriority(Option<TagOrder>),
     /// Remove `m.favourite`.
     RemoveFavourite,
     /// Remove `m.lowpriority`.
     RemoveLowPriority,
 }
 
-/// Tag states the caller knows from writes the homeserver confirmed but
-/// sync has not stored yet. `None` follows the stored tags; `Some` overrides
-/// them, so a follow-up choice is decided by what the server holds.
+/// What the caller knows about one tag beyond the stored tags, which lag
+/// behind its own writes until sync stores them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TagKnowledge {
+    /// Nothing: follow the stored tags.
+    #[default]
+    Stored,
+    /// A write the homeserver confirmed left the tag present.
+    Present,
+    /// A write the homeserver confirmed left the tag absent.
+    Absent,
+    /// A failed request may have written the tag, and the stored tags may
+    /// still be behind the caller's earlier writes. Adding or removing it is
+    /// sent whatever the stored tags say: removing an absent tag changes
+    /// nothing, and adding writes the order the change carries.
+    Uncertain,
+}
+
+/// The caller's knowledge of a room's organization tags, so a follow-up
+/// choice is decided by what the homeserver holds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ConfirmedTags {
-    pub favourite: Option<bool>,
-    pub low_priority: Option<bool>,
+    pub favourite: TagKnowledge,
+    pub low_priority: TagKnowledge,
 }
 
 /// One favourite's new order.
@@ -107,7 +127,7 @@ pub enum RoomTagError {
     TooMany,
     #[error("The homeserver did not confirm the change")]
     NotConfirmed,
-    #[error("Only part of the change was saved; the room list shows what the homeserver stored")]
+    #[error("Only part of the change was saved")]
     PartlySaved,
 }
 
@@ -116,8 +136,9 @@ pub enum RoomTagError {
 pub(crate) struct TagSummary {
     pub(crate) favourite: bool,
     pub(crate) low_priority: bool,
-    /// Order of the favourite tag, else of the low-priority tag.
-    pub(crate) order: Option<TagOrder>,
+    /// Each tag's own stored order, for a tag the room has.
+    pub(crate) favourite_order: Option<TagOrder>,
+    pub(crate) low_priority_order: Option<TagOrder>,
 }
 
 /// Cached tag flags; the stored tags are read only for tagged rooms.
@@ -128,11 +149,14 @@ pub(crate) async fn tag_summary(room: &Room) -> TagSummary {
         return TagSummary::default();
     }
     let tags = stored_tags(room).await.unwrap_or_default();
-    let name = if favourite { FAVOURITE } else { LOW_PRIORITY };
+    // Both orders are kept: a room tagged both ways keeps its low-priority
+    // order when it leaves Favorites.
+    let order = |name: &str| tags.get(name).and_then(tag_order);
     TagSummary {
         favourite,
         low_priority,
-        order: tags.get(name).and_then(tag_order),
+        favourite_order: order(FAVOURITE).filter(|_| favourite),
+        low_priority_order: order(LOW_PRIORITY).filter(|_| low_priority),
     }
 }
 
@@ -172,6 +196,38 @@ fn carries_other_fields(tags: &Map<String, Value>, name: &str) -> bool {
         // Not an object: nothing Morpheus can rewrite faithfully.
         None => true,
     })
+}
+
+/// The tag one change adds (with its order) and the tag it removes. A tag is
+/// added unless it is known or stored present, so an existing tag keeps its
+/// order; it is removed unless it is known or stored absent. A tag a failed
+/// request left uncertain is added or removed whatever the stored tags say.
+fn tag_writes(
+    change: RoomTagChange,
+    confirmed: ConfirmedTags,
+    tags: &Map<String, Value>,
+) -> (Option<(&'static str, Option<TagOrder>)>, Option<&'static str>) {
+    let knowledge = |name: &str| match name {
+        FAVOURITE => confirmed.favourite,
+        _ => confirmed.low_priority,
+    };
+    let (add, order, remove) = match change {
+        RoomTagChange::Favourite(order) => (Some(FAVOURITE), order, Some(LOW_PRIORITY)),
+        RoomTagChange::LowPriority(order) => (Some(LOW_PRIORITY), order, Some(FAVOURITE)),
+        RoomTagChange::RemoveFavourite => (None, None, Some(FAVOURITE)),
+        RoomTagChange::RemoveLowPriority => (None, None, Some(LOW_PRIORITY)),
+    };
+    let add = add.filter(|&name| match knowledge(name) {
+        TagKnowledge::Present => false,
+        TagKnowledge::Absent | TagKnowledge::Uncertain => true,
+        TagKnowledge::Stored => !tags.contains_key(name),
+    });
+    let remove = remove.filter(|&name| match knowledge(name) {
+        TagKnowledge::Present | TagKnowledge::Uncertain => true,
+        TagKnowledge::Absent => false,
+        TagKnowledge::Stored => tags.contains_key(name),
+    });
+    (add.map(|name| (name, order)), remove)
 }
 
 fn tag_info(order: Option<TagOrder>) -> TagInfo {
@@ -249,9 +305,9 @@ impl AccountManager {
     }
 
     /// Apply one explicit organization change to a joined room. Unrelated
-    /// tags are untouched, and a tag the room has is not rewritten. Whether
-    /// the room has a tag follows `confirmed` where it is known, else the
-    /// stored tags, which can lag behind the caller's confirmed writes.
+    /// tags are untouched, and a tag the room has is not rewritten. What to
+    /// write follows `confirmed` over the stored tags, which can lag behind
+    /// the caller's own writes; see `tag_writes`.
     pub async fn change_room_tags_selected(
         &self,
         selection: &AccountSelection,
@@ -264,31 +320,14 @@ impl AccountManager {
         let written = AtomicUsize::new(0);
         let request = async {
             let tags = stored_tags(&room).await?;
-            let present = |name: &str| {
-                let known = if name == FAVOURITE {
-                    confirmed.favourite
-                } else {
-                    confirmed.low_priority
-                };
-                known.unwrap_or_else(|| tags.contains_key(name))
-            };
-            let (add, order, remove) = match change {
-                RoomTagChange::Favourite(order) => (Some(FAVOURITE), order, Some(LOW_PRIORITY)),
-                RoomTagChange::LowPriority => (Some(LOW_PRIORITY), None, Some(FAVOURITE)),
-                RoomTagChange::RemoveFavourite => (None, None, Some(FAVOURITE)),
-                RoomTagChange::RemoveLowPriority => (None, None, Some(LOW_PRIORITY)),
-            };
-            if let Some(name) = add
-                && !present(name)
-            {
+            let (add, remove) = tag_writes(change, confirmed, &tags);
+            if let Some((name, order)) = add {
                 room.set_tag(TagName::from(name), tag_info(order))
                     .await
                     .map_err(|_| RoomTagError::NotConfirmed)?;
                 written.fetch_add(1, Ordering::AcqRel);
             }
-            if let Some(name) = remove
-                && present(name)
-            {
+            if let Some(name) = remove {
                 room.remove_tag(TagName::from(name)).await.map_err(|_| {
                     if written.load(Ordering::Acquire) > 0 {
                         RoomTagError::PartlySaved
@@ -378,6 +417,47 @@ mod tests {
     }
 
     #[test]
+    fn changes_follow_what_the_caller_knows_over_the_stored_tags() {
+        let stored = serde_json::json!({"m.lowpriority": {"order": 0.3}, "u.work": {}});
+        let stored = stored.as_object().unwrap();
+        let order = TagOrder::new(0.5);
+        // The low-priority order the caller shows.
+        let low = RoomTagChange::LowPriority(TagOrder::new(0.3));
+        let nothing = ConfirmedTags::default();
+        // Nothing known: the stored tags decide, and a stored tag is kept.
+        assert_eq!(
+            tag_writes(RoomTagChange::Favourite(order), nothing, stored),
+            (Some((FAVOURITE, order)), Some(LOW_PRIORITY))
+        );
+        assert_eq!(tag_writes(low, nothing, stored), (None, None));
+        // A favourite added but not synced yet is removed.
+        let added = ConfirmedTags {
+            favourite: TagKnowledge::Present,
+            low_priority: TagKnowledge::Absent,
+        };
+        let new_low = RoomTagChange::LowPriority(None);
+        assert_eq!(
+            tag_writes(new_low, added, stored),
+            (Some((LOW_PRIORITY, None)), Some(FAVOURITE))
+        );
+        // After a failed request the stored tags may be behind: an uncertain
+        // tag is written with the order the caller shows, and removed in
+        // case it was written.
+        let uncertain = ConfirmedTags {
+            favourite: TagKnowledge::Uncertain,
+            low_priority: TagKnowledge::Uncertain,
+        };
+        assert_eq!(
+            tag_writes(low, uncertain, stored),
+            (Some((LOW_PRIORITY, TagOrder::new(0.3))), Some(FAVOURITE))
+        );
+        assert_eq!(
+            tag_writes(RoomTagChange::RemoveLowPriority, uncertain, &Map::new()),
+            (None, Some(LOW_PRIORITY))
+        );
+    }
+
+    #[test]
     fn stored_orders_and_foreign_fields_are_read_faithfully() {
         let tags = serde_json::json!({
             "m.favourite": {"order": 0.25},
@@ -387,7 +467,10 @@ mod tests {
         });
         let tags = tags.as_object().unwrap().clone();
         assert_eq!(tags.get(FAVOURITE).and_then(tag_order), TagOrder::new(0.25));
-        assert_eq!(tags.get(LOW_PRIORITY).and_then(tag_order), TagOrder::new(0.75));
+        assert_eq!(
+            tags.get(LOW_PRIORITY).and_then(tag_order),
+            TagOrder::new(0.75)
+        );
         assert!(!carries_other_fields(&tags, FAVOURITE));
         assert!(carries_other_fields(&tags, "u.work"));
         assert!(!carries_other_fields(&tags, "m.server_notice"));
@@ -450,7 +533,7 @@ mod tests {
                     .change_room_tags_selected(
                         &stale,
                         room,
-                        RoomTagChange::LowPriority,
+                        RoomTagChange::LowPriority(None),
                         ConfirmedTags::default(),
                     )
                     .await,
@@ -468,7 +551,7 @@ mod tests {
                     .change_room_tags_selected(
                         &current,
                         room,
-                        RoomTagChange::LowPriority,
+                        RoomTagChange::LowPriority(None),
                         ConfirmedTags::default(),
                     )
                     .await,

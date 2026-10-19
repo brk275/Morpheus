@@ -59,17 +59,30 @@ runs at a time per account, and the organization menus wait for it. Once the
 homeserver accepts it, the room list shows the change; until sync returns the
 stored tags, for at most 30 seconds, Morpheus applies the accepted change over
 its last copy, so a following choice or move starts from it and is decided by
-what the homeserver holds. Nothing is shown as saved before the homeserver
-accepted it, and a failure leaves the room where it was with a fixed message
-and shows the stored tags again. A change the homeserver accepted only in part
-(for example, a favorite added but the low-priority tag not removed, or a
-reorder that timed out after some writes) is reported as such, and the list
-shows what was stored.
+what the homeserver holds. Sync reports changes in order, so an older report
+that arrives late (for example, from before a favorite was added and removed
+again) never undoes a newer change. Nothing is shown as saved before the
+homeserver accepted it.
 
-Room rows stay in place while only their unread counts or tags change, so an
-open menu stays usable through sync updates. When rooms are added, removed or
-reordered while a menu is open, its row is replaced and the choice does nothing
-rather than act on another room.
+A refusal made before anything was sent leaves the room where it was with a
+fixed message. When a change fails after a request was sent, or was saved only
+in part (for example, a favorite added but the low-priority tag not removed, or
+a reorder that timed out after some writes), the room also keeps its place
+with a fixed message until sync shows what the homeserver stored. Until then a
+following choice treats the tags that change may have written as unknown: it
+writes a tag it needs and removes one it needs gone even if the last sync
+showed otherwise (removing an absent tag changes nothing; an added tag gets the
+order the room list shows). A later accepted change decides only the tags it
+writes.
+
+Room rows stay in place while only their unread counts or tags change. Menu
+choices are fixed when a menu opens and each sends only the action it names.
+When sync changes the room's tags while its menu is open, an outdated choice
+still applies the change it names: it does nothing when the room already has
+that result, and on a room another client tagged both ways it removes the other
+tag. When rooms are added, removed or reordered while a menu is open, its row
+is replaced and the choice does nothing rather than act on another room. The
+room header's menu acts on the room it was opened for.
 
 Only joined rooms can be changed. A room left or re-joined keeps whatever tags
 its account data holds on the homeserver.

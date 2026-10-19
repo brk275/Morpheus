@@ -62,7 +62,8 @@ pub use notification_rules::{
     NotificationDefaults, NotificationMode, RoomNotificationRule, RoomUnreadCounts,
 };
 pub use room_tags::{
-    ConfirmedTags, FavouriteOrder, MAX_TAG_ORDER_WRITES, RoomTagChange, RoomTagError, TagOrder,
+    ConfirmedTags, FavouriteOrder, MAX_TAG_ORDER_WRITES, RoomTagChange, RoomTagError, TagKnowledge,
+    TagOrder,
 };
 
 use std::{
@@ -258,9 +259,11 @@ pub struct RoomInfo {
     pub favourite: bool,
     #[serde(default)]
     pub low_priority: bool,
-    /// Order of the favourite tag, else of the low-priority tag.
+    /// Each tag's own stored order, for a tag the room has.
     #[serde(default)]
-    pub tag_order: Option<TagOrder>,
+    pub favourite_order: Option<TagOrder>,
+    #[serde(default)]
+    pub low_priority_order: Option<TagOrder>,
     pub unread_messages: u64,
     pub unread_notifications: u64,
 }
@@ -3924,7 +3927,8 @@ async fn room_info(room: &Room) -> RoomInfo {
         avatar_mxc: room.avatar_url().map(|url| url.to_string()),
         favourite: tags.favourite,
         low_priority: tags.low_priority,
-        tag_order: tags.order,
+        favourite_order: tags.favourite_order,
+        low_priority_order: tags.low_priority_order,
         unread_messages: room.num_unread_messages(),
         unread_notifications: room.num_unread_notifications(),
     }
