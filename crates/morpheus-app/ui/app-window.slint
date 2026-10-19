@@ -8260,11 +8260,14 @@ export component AppWindow inherits Window {
                                 VerticalLayout {
                                     padding: root.thread-root-is-own && StyleTokens.roles.own-surface.present ? min(8px, root.content-inset) : 0px;
                                     spacing: 10px;
-                                    Text { text: root.thread-root-sender; color: root.sender-ink(false, root.thread-root-is-own, root.thread-root-palette-index, root.thread-root-accent); font-size: 12px * root.text-scale; font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 750; vertical-stretch: 0; }
+                                    // The root message follows the message font, the sender size and,
+                                    // two pixels smaller as before, the message size.
+                                    Text { text: root.thread-root-sender; color: root.sender-ink(false, root.thread-root-is-own, root.thread-root-palette-index, root.thread-root-accent); font-family: root.message-font-family; font-size: root.sender-font-px > 0px ? root.sender-font-px : 12px * root.text-scale; font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 750; vertical-stretch: 0; }
                                     StyledText {
                                         text: root.thread-root-rich-body;
                                         default-color: root.body-ink(false, root.thread-root-is-own);
-                                        default-font-size: 12px * root.text-scale;
+                                        default-font-size: max(10px * root.text-scale, root.message-font-px - 2px * root.text-scale);
+                                        default-font-family: root.message-font-family;
                                         link-color: StyleTokens.roles.link.present ? StyleTokens.roles.link.color : root.accent;
                                         accessible-role: text;
                                         accessible-label: root.thread-root-rich-accessible-body;
@@ -8316,7 +8319,7 @@ export component AppWindow inherits Window {
                                     padding: min(12px, root.content-inset); spacing: max(2px, root.message-row-gap);
                                     HorizontalLayout {
                                         spacing: 6px;
-                                        Text { text: reply.sender; color: root.sender-ink(thread-reply.search-hit, reply.is-own, reply.sender-palette-index, reply.accent); font-size: 11px * root.text-scale; font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 700; wrap: word-wrap; horizontal-stretch: 0; min-width: 0px; accessible-label: reply.sender; }
+                                        Text { text: reply.sender; color: root.sender-ink(thread-reply.search-hit, reply.is-own, reply.sender-palette-index, reply.accent); font-family: root.message-font-family; font-size: root.sender-font-px > 0px ? root.sender-font-px : 11px * root.text-scale; font-weight: root.sender-font-weight > 0 ? root.sender-font-weight : 700; wrap: word-wrap; horizontal-stretch: 0; min-width: 0px; accessible-label: reply.sender; }
                                         // Reply clocks keep the timestamp role and the delivery status
                                         // text even when optional timestamps are hidden.
                                         if (root.show-message-timestamps || reply.time == "Sending…" || reply.time == "Failed to send") && thread-reply.time-label != "" : Text {
