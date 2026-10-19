@@ -16,6 +16,7 @@ use url::Url;
 #[path = "../../../vendor/webrtc-sys/pipewire_isolation.rs"]
 mod pipewire_archive_contract;
 
+mod reconnect;
 mod voice_space;
 
 #[cfg(feature = "device-audio")]
@@ -65,6 +66,9 @@ pub use native::{
 pub use observer::{ObservedCall, ObservedParticipant, ObserverError, PassiveCallObserver};
 #[cfg(feature = "native-rtc")]
 pub use outgoing_notification::NotificationDialect;
+pub use reconnect::{
+    ReconnectBackoff, ReconnectPolicy, ReconnectWindow, RtcCallEnd, RtcConnectionSignal,
+};
 #[cfg(feature = "device-camera")]
 pub use video_device::CameraCapture;
 #[cfg(feature = "device-screen")]

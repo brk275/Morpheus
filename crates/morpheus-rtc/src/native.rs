@@ -138,6 +138,9 @@ impl CallLease {
 struct ActiveCall {
     call: LiveKitCall,
     lease: CallLease,
+    /// Subscribed as soon as the join returns, so a host that starts watching
+    /// later still sees an early end or connection-health change.
+    events: Option<tokio::sync::broadcast::Receiver<crate::RtcCallEvent>>,
 }
 
 /// Morpheus-owned roster vocabulary. The call SDK's participant and stream
@@ -369,8 +372,13 @@ impl RtcService {
             local_identity: call.local_identity().to_owned(),
         };
         let lease = CallLease::new(info.clone(), account_user_id, account_device_id);
-        self.calls
-            .insert(room_id.to_owned(), ActiveCall { call, lease });
+        let events = Some(call.subscribe_call_events());
+        let active = ActiveCall {
+            call,
+            lease,
+            events,
+        };
+        self.calls.insert(room_id.to_owned(), active);
         Ok(info)
     }
 
@@ -389,6 +397,23 @@ impl RtcService {
 
     pub fn call_mut(&mut self, room_id: &str) -> Option<&mut LiveKitCall> {
         self.calls.get_mut(room_id).map(|active| &mut active.call)
+    }
+
+    /// The joined call's unified event stream: connection health, the end
+    /// reason, and participant/stream changes used to reconcile after a
+    /// transport reconnect. The first call returns the receiver subscribed
+    /// when the join completed, so no early event is missed; later calls
+    /// subscribe afresh.
+    pub fn take_call_events(
+        &mut self,
+        room_id: &str,
+    ) -> Result<tokio::sync::broadcast::Receiver<crate::RtcCallEvent>, RtcError> {
+        let active = self.calls.get_mut(room_id).ok_or(RtcError::NotJoined)?;
+        let events = match active.events.take() {
+            Some(events) => events,
+            None => active.call.subscribe_call_events(),
+        };
+        Ok(events)
     }
 
     pub(crate) fn call_lease(&self, room_id: &str) -> Option<&CallLease> {
