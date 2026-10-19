@@ -3656,6 +3656,53 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
 
     assert_account_theme_follows_accepted_snapshot(&ui);
 
+    // Exercise the real viewer's modal tab ring using only one synthetic
+    // pixel. Do not activate file pickers, navigation or network callbacks.
+    ui.set_show_sign_in(false);
+    ui.set_active_account_local_id("viewer-fixture".into());
+    ui.set_active_room_id("!viewer:example.org".into());
+    ui.set_image_preview_account_id("viewer-fixture".into());
+    ui.set_image_preview_room_id("!viewer:example.org".into());
+    ui.set_image_preview_title("synthetic viewer".into());
+    ui.set_image_preview_event_id("$viewer:example.org".into());
+    ui.set_image_preview_has_previous(true);
+    ui.set_image_preview_has_next(true);
+    ui.set_image_preview_loaded(true);
+    ui.set_image_preview_image(slint::Image::from_rgba8(slint::SharedPixelBuffer::<
+        slint::Rgba8Pixel,
+    >::new(1, 1)));
+    ui.set_image_preview_open(true);
+    settle(&ui).await;
+    assert!(focused_control_has_label(&ui, "Close image preview"));
+    for label in [
+        "Save synthetic viewer to a location you choose",
+        "Previous image",
+        "Next image",
+        "Zoom in",
+    ] {
+        key(&ui, Key::Tab);
+        assert!(focused_control_has_label(&ui, label), "viewer: {label}");
+    }
+    key(&ui, Key::Return); // Local zoom only: enables Out and Fit.
+    key(&ui, Key::Backtab);
+    assert!(focused_control_has_label(&ui, "Fit image to the window"));
+    key(&ui, Key::Backtab);
+    assert!(focused_control_has_label(&ui, "Zoom out"));
+    key(&ui, Key::Tab);
+    assert!(focused_control_has_label(&ui, "Fit image to the window"));
+    key(&ui, Key::Tab);
+    assert!(focused_control_has_label(&ui, "Zoom in"));
+    key(&ui, Key::Tab);
+    assert!(focused_control_has_label(&ui, "Close image preview"));
+    ui.set_image_preview_open(false);
+    ui.set_image_preview_loaded(false);
+    ui.set_image_preview_has_previous(false);
+    ui.set_image_preview_has_next(false);
+    ui.set_image_preview_event_id("".into());
+    ui.set_image_preview_image(slint::Image::default());
+    ui.set_show_sign_in(true);
+    settle(&ui).await;
+
     // A queued production attachment refresh cannot restore old private rows
     // while presentation IDs survive a revoked/detached live context.
     ui.set_active_account_local_id("old-account".into());

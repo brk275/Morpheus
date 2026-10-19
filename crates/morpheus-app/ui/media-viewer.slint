@@ -74,8 +74,7 @@ component ViewerAction inherits Rectangle {
     }
 }
 
-// The modal viewer. Escape closes; Tab moves between Close, Save and the
-// loading action; Left/Right open the previous/next loaded image, or pan
+// The modal viewer. Escape closes; Tab reaches every available control; Left/Right open the previous/next loaded image, or pan
 // while zoomed; Up/Down pan; +, - and 0 zoom in, out and back to fit.
 export component MediaViewer inherits Rectangle {
     in property <image> image;
@@ -133,18 +132,41 @@ export component MediaViewer inherits Rectangle {
         root.pan-y = clamp(y, -root.pan-limit-y, root.pan-limit-y);
     }
 
-    // Close → Save → loading action → Close, skipping disabled actions.
+    // Keep a single bounded tab ring in visual order, skipping hidden or
+    // disabled actions. Every visible button is reachable in both directions.
+    pure function tab-enabled(index: int) -> bool {
+        return index == 0 || (index == 1 && root.can-save)
+            || (index == 2 && root.has-previous) || (index == 3 && root.has-next)
+            || (index == 4 && (root.loading || root.failed))
+            || ((index == 5 || index == 6) && root.loaded && root.zoom > 1)
+            || (index == 7 && root.loaded && root.zoom < 8);
+    }
+
     function tab(forward: bool) {
-        let can-load = root.loading || root.failed;
-        if save-action.has-focus {
-            if forward && can-load { load-action.focus(); } else { close-action.focus(); }
-        } else if load-action.has-focus {
-            if !forward && root.can-save { save-action.focus(); } else { close-action.focus(); }
-        } else if forward {
-            if root.can-save { save-action.focus(); } else if can-load { load-action.focus(); } else { close-action.focus(); }
-        } else {
-            if can-load { load-action.focus(); } else if root.can-save { save-action.focus(); } else { close-action.focus(); }
-        }
+        let current = save-action.has-focus ? 1 : previous-action.has-focus ? 2
+            : next-action.has-focus ? 3 : load-action.has-focus ? 4
+            : zoom-out-action.has-focus ? 5 : fit-action.has-focus ? 6
+            : zoom-in-action.has-focus ? 7 : 0;
+        let step = forward ? 1 : 7;
+        let first = mod(current + step, 8);
+        let second = mod(first + step, 8);
+        let third = mod(second + step, 8);
+        let fourth = mod(third + step, 8);
+        let fifth = mod(fourth + step, 8);
+        let sixth = mod(fifth + step, 8);
+        let seventh = mod(sixth + step, 8);
+        let target = root.tab-enabled(first) ? first : root.tab-enabled(second) ? second
+            : root.tab-enabled(third) ? third : root.tab-enabled(fourth) ? fourth
+            : root.tab-enabled(fifth) ? fifth : root.tab-enabled(sixth) ? sixth
+            : root.tab-enabled(seventh) ? seventh : 0;
+        if target == 1 { save-action.focus(); }
+        else if target == 2 { previous-action.focus(); }
+        else if target == 3 { next-action.focus(); }
+        else if target == 4 { load-action.focus(); }
+        else if target == 5 { zoom-out-action.focus(); }
+        else if target == 6 { fit-action.focus(); }
+        else if target == 7 { zoom-in-action.focus(); }
+        else { close-action.focus(); }
     }
 
     background: root.palette.scrim;
@@ -306,7 +328,9 @@ export component MediaViewer inherits Rectangle {
                             }
                         }
                     }
-                    if root.has-previous : ViewerAction {
+                    previous-action := ViewerAction {
+                        visible: root.has-previous;
+                        enabled: root.has-previous;
                         x: 10px;
                         y: (parent.height - self.height) / 2;
                         text: "‹";
@@ -316,7 +340,9 @@ export component MediaViewer inherits Rectangle {
                         background: root.palette.surface;
                         activated => { root.previous(); }
                     }
-                    if root.has-next : ViewerAction {
+                    next-action := ViewerAction {
+                        visible: root.has-next;
+                        enabled: root.has-next;
                         x: parent.width - self.width - 10px;
                         y: (parent.height - self.height) / 2;
                         text: "›";
@@ -350,7 +376,7 @@ export component MediaViewer inherits Rectangle {
                             if root.loading { root.cancel-loading(); } else { root.retry(); }
                         }
                     }
-                    ViewerAction {
+                    zoom-out-action := ViewerAction {
                         text: "−";
                         label: "Zoom out";
                         enabled: root.loaded && root.zoom > 1;
@@ -358,7 +384,7 @@ export component MediaViewer inherits Rectangle {
                         text-scale: root.text-scale;
                         activated => { root.zoom-by(0.8); }
                     }
-                    ViewerAction {
+                    fit-action := ViewerAction {
                         // Relative to fit, so the caption's intrinsic width never
                         // depends on the viewport it helps lay out.
                         text: round(root.zoom * 100) + "% fit";
@@ -368,7 +394,7 @@ export component MediaViewer inherits Rectangle {
                         text-scale: root.text-scale;
                         activated => { root.reset-view(); }
                     }
-                    ViewerAction {
+                    zoom-in-action := ViewerAction {
                         text: "+";
                         label: "Zoom in";
                         enabled: root.loaded && root.zoom < 8;
