@@ -229,6 +229,8 @@ pub(crate) fn clear_ui(ui: &AppWindow, gate: &SecurityGate) {
         return;
     }
     crate::verification::clear_ui(ui);
+    // The session list, any sign-out step and its challenge end with the account.
+    crate::device_sessions::clear_presentation(ui);
     next_operation(ui);
     ui.set_security_device_status("Unknown".into());
     ui.set_security_recovery_status("Unknown".into());

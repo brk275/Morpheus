@@ -17,6 +17,7 @@ mod call_stage;
 mod calls;
 mod composer_mentions;
 mod config_cli;
+mod device_sessions;
 mod draft_recovery;
 mod drafts;
 mod image_previews;
@@ -1545,6 +1546,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         room_settings::RoomSettingsUi::register(&ui, live.clone(), runtime.handle());
     let pinned_messages =
         pinned_messages::PinnedMessagesUi::register(&ui, live.clone(), runtime.handle());
+    let device_sessions =
+        device_sessions::DeviceSessionsUi::register(&ui, live.clone(), runtime.handle());
     ui.set_native_call_enabled(cfg!(feature = "native-calls"));
     ui.set_native_call_status("Select a room to check call availability".into());
     let update_activity = updater::UpdateActivity::default();
@@ -4390,6 +4393,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(morpheus_timeline_acceptance)]
     let acceptance = acceptance.start(&ui, live.clone(), runtime.handle().clone())?;
     let ui_result = ui.run();
+    device_sessions.shutdown(&ui);
     pinned_messages.shutdown(&ui);
     room_settings.shutdown(&ui);
     image_previews.shutdown(&ui);

@@ -15,6 +15,7 @@ import { ActionRect, ControlColors, HoverSurface, TextAction, TokenButton, Token
 export { BaseColorSet, ColorRole, StyleTokens, ThemeRoleSet, ThemeStateSet } from "style-tokens.slint";
 import { RoomOrganizationButton, RoomOrganizationState, RoomSectionHeader } from "room-organization.slint";
 export { RoomOrganizationState } from "room-organization.slint";
+import { DeviceSessionRow, DeviceSessionsPanel, DeviceSessionsView } from "device-sessions.slint";
 
 // One Settings search result. `id` is a registry target ID, never a path or URL.
 export struct SettingsResult {
@@ -3265,6 +3266,11 @@ export component AppWindow inherits Window {
     in-out property <string> sas-incoming-flow-id;
     in-out property <string> sas-incoming-user-id;
     in-out property <bool> sas-incoming-loading: false;
+    // Settings › Security & recovery › Devices: device-sessions.slint, owned
+    // by device_sessions.rs. Row keys only route requests to that controller.
+    in-out property <DeviceSessionsView> device-sessions-view;
+    in-out property <[DeviceSessionRow]> device-session-rows;
+    in-out property <string> device-sessions-query;
     in-out property <bool> native-call-enabled: false;
     in-out property <int> room-call-mode: 0;
     in-out property <bool> native-call-request-pending: false;
@@ -3668,6 +3674,22 @@ export component AppWindow inherits Window {
     callback copy-recovery-key();
     callback dismiss-recovery-key();
     callback request-own-verification();
+    callback device-sessions-scope-changed();
+    callback device-sessions-refresh();
+    callback device-sessions-search(string);
+    callback device-sessions-select(string);
+    callback device-sessions-rename(string, string);
+    callback device-sessions-verify(string);
+    // Opens the review only; nothing is sent until it is confirmed.
+    callback device-sessions-sign-out(string);
+    callback device-sessions-confirm-sign-out();
+    // The typed password, already cleared from its field.
+    callback device-sessions-password(string);
+    callback device-sessions-open-page();
+    callback device-sessions-continue();
+    callback device-sessions-cancel();
+    // Leaving Settings ends the list and any sign-out step.
+    callback device-sessions-left();
     callback refresh-incoming-verification();
     callback accept-incoming-verification();
     callback refresh-sas-verification();
@@ -3712,6 +3734,7 @@ export component AppWindow inherits Window {
             if root.shortcut-recording != "" { root.shortcut-cancel-recording(); }
             root.security-recovery-input = "";
             root.sas-compared = false;
+            root.device-sessions-left();
             root.notification-highlight-error = "";
         }
         if root.page != 2 { root.native-capture-picker-open = false; }
@@ -7680,6 +7703,38 @@ export component AppWindow inherits Window {
                                                 root.recover-account(secret);
                                             }
                                         }
+                                    }
+                                }
+                            }
+                            Rectangle {
+                                border-radius: StyleTokens.radius * 1; background: root.elevated;
+                                VerticalLayout {
+                                    padding: 14px;
+                                    DeviceSessionsPanel {
+                                        view: root.device-sessions-view;
+                                        rows: root.device-session-rows;
+                                        colors: root.button-colors;
+                                        surface: root.panel;
+                                        divider: root.divider;
+                                        text-scale: root.text-scale;
+                                        scope-key: root.live-session ? root.active-account-local-id : "";
+                                        reveal-request: root.reveal-request("security.devices");
+                                        security-busy: root.security-busy || root.sas-busy || root.sas-stage != 0 || root.security-recovery-key != "";
+                                        query <=> root.device-sessions-query;
+                                        scope-changed => { root.device-sessions-scope-changed(); }
+                                        refresh => { root.device-sessions-refresh(); }
+                                        search(text) => { root.device-sessions-search(text); }
+                                        select(key) => { root.device-sessions-select(key); }
+                                        rename(key, name) => { root.device-sessions-rename(key, name); }
+                                        verify(key) => { root.device-sessions-verify(key); }
+                                        sign-out(key) => { root.device-sessions-sign-out(key); }
+                                        confirm-sign-out => { root.device-sessions-confirm-sign-out(); }
+                                        submit-password(secret) => { root.device-sessions-password(secret); }
+                                        open-page => { root.device-sessions-open-page(); }
+                                        continue-sign-out => { root.device-sessions-continue(); }
+                                        cancel-sign-out => { root.device-sessions-cancel(); }
+                                        reveal-at(y) => { settings-scroll.reveal(y - settings-content.absolute-position.y); }
+                                        revealed(id) => { root.settings-revealed-id = id; }
                                     }
                                 }
                             }

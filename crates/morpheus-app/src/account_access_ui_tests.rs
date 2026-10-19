@@ -4273,6 +4273,22 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     polls.set_notice_event_id("$private-poll".into());
     polls.set_notice("private poll notice".into());
     polls.set_dialog_question("private poll question".into());
+    // The account's session list and an open sign-out step are private too.
+    ui.set_device_sessions_query("private session search".into());
+    let session = crate::DeviceSessionRow {
+        key: "PRIVATEDEVICE".into(),
+        name: "Private laptop".into(),
+        device_id: "PRIVATEDEVICE".into(),
+        ..crate::DeviceSessionRow::default()
+    };
+    ui.set_device_session_rows(ModelRc::new(VecModel::from(vec![session])));
+    ui.set_device_sessions_view(crate::DeviceSessionsView {
+        panel_id: "1".into(),
+        notice: "private session notice".into(),
+        stage: 2,
+        stage_title: "Confirm with your password to sign out Private laptop".into(),
+        ..crate::DeviceSessionsView::default()
+    });
     settle(&ui).await;
     assert_eq!(control_bounds(&ui, "One-time Matrix recovery key").len(), 1);
     // A membership-denied refresh withdraws old decrypted rows and targets
@@ -4383,6 +4399,10 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     assert!(polls.get_notice().is_empty() && polls.get_notice_event_id().is_empty());
     assert!(polls.get_dialog_question().is_empty());
     assert!(!ui.get_poll_dialog_open());
+    assert!(ui.get_device_sessions_query().is_empty());
+    assert_eq!(ui.get_device_session_rows().row_count(), 0);
+    let cleared = crate::DeviceSessionsView::default();
+    assert_eq!(ui.get_device_sessions_view(), cleared);
     // The call stage clears synchronously with the account, not after an
     // asynchronous video update: no tile, pinned row, picture or roster row.
     assert_eq!(ui.get_native_call_tiles().row_count(), 0);
