@@ -1,4 +1,5 @@
 import { ListView, ScrollView } from "std-widgets.slint";
+import { StyleTokens } from "style-tokens.slint";
 
 // One local search hit. `room-id`, `event-id` and `thread-root` route the
 // open action; they are never displayed. Text fields are sanitized in Rust.
@@ -18,6 +19,7 @@ export struct MessageSearchItem {
 // The window's resolved theme roles for the search surface. Optional
 // StyleTokens roles are resolved by the window before they reach this file,
 // so customization and themes apply here exactly as in the root view.
+// Geometry, type sizes and interaction states come from StyleTokens itself.
 export struct SearchPalette {
     ink: color,
     muted: color,
@@ -42,6 +44,7 @@ component SearchAction inherits Rectangle {
     in property <bool> enabled: true;
     in property <color> focus-color;
     out property <bool> has-hover: hit.has-hover;
+    out property <bool> has-pressed: hit.pressed;
     out property <bool> has-focus: keyboard-focus.has-focus;
     callback activated();
     forward-focus: keyboard-focus;
@@ -70,7 +73,7 @@ component SearchAction inherits Rectangle {
     if keyboard-focus.has-focus : Rectangle {
         x: 0px; y: 0px; width: root.width; height: root.height;
         border-radius: root.border-radius;
-        border-width: 2px;
+        border-width: StyleTokens.focus-width;
         border-color: root.focus-color;
         background: transparent;
     }
@@ -124,6 +127,17 @@ export component MessageSearchPanel inherits VerticalLayout {
 
     property <bool> scope-ready: root.available && (root.scope == 1 || root.room-available);
     property <length> row-height: max(74px, 54px * root.text-scale + 22px);
+    // Interaction states; each unset state keeps this panel's built-in color.
+    property <color> control-hover: StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.palette.hover;
+    property <color> row-hover: StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.palette.elevated;
+    property <color> field-surface: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.palette.elevated;
+    property <color> field-border: StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.palette.divider;
+    property <bool> pressed-set: StyleTokens.states.control-pressed.present;
+    property <color> pressed: StyleTokens.states.control-pressed.color;
+    property <color> disabled-ink: StyleTokens.states.control-disabled.present ? StyleTokens.states.control-disabled.color : root.palette.muted;
+    // A zero sender size keeps this panel's built-in name size.
+    property <length> sender-size: (StyleTokens.sender-font-size > 0px ? StyleTokens.sender-font-size : 11px) * root.text-scale;
+    property <length> time-size: StyleTokens.timestamp-font-size * root.text-scale;
 
     spacing: 0px;
     forward-focus: input;
@@ -163,10 +177,12 @@ export component MessageSearchPanel inherits VerticalLayout {
             height: max(30px, 22px * root.text-scale + 8px);
             for scope-name[option] in ["This room", "All rooms"] : SearchAction {
                 horizontal-stretch: 1;
-                border-radius: root.radius * 0.7;
-                border-width: 1px;
+                border-radius: StyleTokens.control-corner;
+                border-width: StyleTokens.line-width;
                 border-color: root.scope == option ? root.palette.accent : root.palette.divider;
-                background: root.scope == option ? root.palette.selection : self.has-hover ? root.palette.hover : transparent;
+                background: root.scope == option ? root.palette.selection
+                    : self.enabled && self.has-pressed && root.pressed-set ? root.pressed
+                    : self.enabled && self.has-hover ? root.control-hover : transparent;
                 focus-color: root.palette.focus;
                 enabled: root.available && (option == 1 || root.room-available);
                 accessible-role: tab;
@@ -177,7 +193,8 @@ export component MessageSearchPanel inherits VerticalLayout {
                 Text {
                     text: scope-name;
                     color: root.scope == option && root.palette.has-selection-ink ? root.palette.selection-ink
-                        : root.scope == option ? root.palette.ink : root.palette.muted;
+                        : root.scope == option ? root.palette.ink
+                        : !(root.available && (option == 1 || root.room-available)) ? root.disabled-ink : root.palette.muted;
                     font-size: 12px * root.text-scale; font-weight: 700;
                     horizontal-alignment: center; vertical-alignment: center;
                 }
@@ -185,19 +202,19 @@ export component MessageSearchPanel inherits VerticalLayout {
         }
         Rectangle {
             height: max(36px, 26px * root.text-scale + 10px);
-            background: root.palette.elevated;
-            border-radius: root.radius * 0.7;
-            border-width: input.has-focus ? 2px : 1px;
-            border-color: input.has-focus ? root.palette.focus : root.palette.divider;
+            background: root.field-surface;
+            border-radius: StyleTokens.input-corner;
+            border-width: input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
+            border-color: input.has-focus ? root.palette.focus : root.field-border;
             if root.query == "" : Text {
-                x: 10px; width: parent.width - 20px; height: parent.height;
+                x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
                 text: root.scope == 0 ? "Search " + (root.room-name != "" ? root.room-name : "this room") + "…" : "Search all rooms…";
                 color: root.palette.muted; font-size: 12px * root.text-scale;
                 vertical-alignment: center; overflow: elide;
             }
             // Capture navigation keys before the text field edits with them.
             keys := FocusScope {
-                x: 10px; width: parent.width - 20px; height: parent.height;
+                x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
                 focus-on-click: false;
                 focus-on-tab-navigation: false;
                 capture-key-pressed(event) => {
@@ -249,7 +266,7 @@ export component MessageSearchPanel inherits VerticalLayout {
             }
         }
     }
-    Rectangle { height: 1px; background: root.palette.divider; }
+    Rectangle { height: StyleTokens.line-width; background: root.palette.divider; }
     VerticalLayout {
         padding-left: 12px;
         padding-right: 12px;
@@ -317,7 +334,7 @@ export component MessageSearchPanel inherits VerticalLayout {
                 property <bool> inked: context-row.target && root.palette.has-selection-ink;
                 min-height: 44px;
                 background: context-row.target ? root.palette.selection : root.palette.elevated;
-                border-radius: root.radius * 0.7;
+                border-radius: StyleTokens.radius * 0.7;
                 accessible-role: list-item;
                 accessible-label: (context-row.target ? "Matched message from " : "") + item.sender + ", " + item.time + ": " + item.body;
                 VerticalLayout {
@@ -326,7 +343,7 @@ export component MessageSearchPanel inherits VerticalLayout {
                     Text {
                         text: item.sender + " · " + item.time;
                         color: context-row.inked ? root.palette.selection-ink : root.palette.accent;
-                        font-size: 10px * root.text-scale; overflow: elide;
+                        font-size: root.time-size; overflow: elide;
                     }
                     Text {
                         text: item.body;
@@ -337,7 +354,7 @@ export component MessageSearchPanel inherits VerticalLayout {
             }
         }
     }
-    Rectangle { height: 1px; background: root.palette.divider; }
+    Rectangle { height: StyleTokens.line-width; background: root.palette.divider; }
     results-list := ListView {
         vertical-stretch: 1;
         horizontal-scrollbar-policy: always-off;
@@ -348,11 +365,12 @@ export component MessageSearchPanel inherits VerticalLayout {
             property <bool> inked: (result-row.highlighted || result-row.chosen) && root.palette.has-selection-ink;
             width: results-list.visible-width;
             height: root.row-height;
-            border-radius: root.radius * 0.8;
-            border-width: result-row.highlighted ? 1px : 0px;
+            border-radius: StyleTokens.radius * 0.8;
+            border-width: result-row.highlighted ? StyleTokens.line-width : 0px;
             border-color: root.palette.accent;
             background: result-row.chosen || result-row.highlighted ? root.palette.selection
-                : result-row.has-hover ? root.palette.elevated : transparent;
+                : result-row.has-pressed && root.pressed-set ? root.pressed
+                : result-row.has-hover ? root.row-hover : transparent;
             focus-color: root.palette.focus;
             accessible-role: list-item;
             accessible-item-selectable: true;
@@ -382,7 +400,7 @@ export component MessageSearchPanel inherits VerticalLayout {
                     Text {
                         text: result.time;
                         color: result-row.inked ? root.palette.selection-ink : root.palette.muted;
-                        font-size: 10px * root.text-scale;
+                        font-size: root.time-size;
                         horizontal-stretch: 0;
                     }
                 }
@@ -391,7 +409,7 @@ export component MessageSearchPanel inherits VerticalLayout {
                     Text {
                         text: result.sender;
                         color: result-row.inked ? root.palette.selection-ink : root.palette.ink;
-                        font-size: 11px * root.text-scale; font-weight: 700;
+                        font-size: root.sender-size; font-weight: 700;
                         overflow: elide; horizontal-stretch: 1;
                     }
                     if result.thread-root != "" : Text {
@@ -417,17 +435,18 @@ export component MessageSearchPanel inherits VerticalLayout {
             y: 6px;
             width: parent.width - 24px;
             height: parent.height - 12px;
-            border-radius: root.radius * 0.7;
-            border-width: 1px;
+            border-radius: StyleTokens.control-corner;
+            border-width: StyleTokens.line-width;
             border-color: root.palette.divider;
-            background: self.has-hover ? root.palette.hover : root.palette.elevated;
+            background: self.enabled && self.has-pressed && root.pressed-set ? root.pressed
+                : self.enabled && self.has-hover ? root.control-hover : root.palette.elevated;
             focus-color: root.palette.focus;
             enabled: !root.loading && !root.loading-more;
             label: "Load more search results";
             activated => { root.load-more(); }
             Text {
                 text: root.loading-more ? "Loading more…" : "Load more results";
-                color: root.loading-more ? root.palette.muted : root.palette.ink;
+                color: root.loading-more || root.loading ? root.disabled-ink : root.palette.ink;
                 font-size: 12px * root.text-scale;
                 horizontal-alignment: center;
                 vertical-alignment: center;

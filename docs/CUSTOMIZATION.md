@@ -77,6 +77,39 @@ only; text size, Reduce motion, the focus ring, notifications, shortcuts,
 devices and accounts are never saved in it or changed by it. See
 [style profiles](STYLE_PROFILES.md) for the file format and limits.
 
+### Live preview and finding a setting
+
+The top of **Settings → Appearance** shows a live preview: sample rooms,
+messages, a focused composer, an account and a call tile, buttons in their
+ordinary, hovered, pressed, focused, disabled and primary states, and the
+error, success, selection, unread, mention and link colors. It uses the same
+controls and color rules as the real views, so a theme, font, size, density,
+state color or previewed style profile shows there as soon as it applies. The
+samples are invented and inert: they take no focus or clicks and never reach
+an account, the network, a call or a camera. **Hide preview** folds it away
+for this session only; it is not saved. **Pin above settings** keeps a compact
+copy under the search field while you edit anything further down; **Unpin**
+removes it. Its height stays fixed, so the
+settings below do not move while you edit; the samples scroll inside it and
+rearrange at narrow widths and large text. **Edit colors**, **Edit sizes and
+shapes** and **Edit base palette** below it jump to the detailed editors.
+
+Settings search (`Mod+Shift+F`) finds sections, every color token and every
+size or shape metric. Results show the `config.toml` keys they edit, such as
+`colors.link`, `typography.sender_size` or, for Fonts, the three font keys;
+typing a key as shown, or a part of a metric key such as `sender_size`, finds
+its field or section. Choosing a result focuses that exact field;
+**Back to results**, Down in the search field or `Mod+Shift+F` brings the
+same results back. Each color and metric editor has its own Reset and Undo.
+
+Pinned messages, message search, polls and the call stage follow the same
+corner, outline, focus ring and control state settings as the rest of the
+window, and the control padding, field padding and icon size where they have
+those controls. Dropdowns (sticker packs, call audio devices, the room join
+rule) and the window transparency slider are drawn the same way, with the
+usual keys: Up and Down choose, Return or Space opens a list, Escape closes
+it; Left, Right, Home and End move the slider.
+
 ## Navigation
 
 **Settings → Layout → Navigation** edits the same schema-version-1 fields as

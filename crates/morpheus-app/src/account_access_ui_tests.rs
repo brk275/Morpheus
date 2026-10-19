@@ -437,6 +437,7 @@ fn request_bridge_focus(ui: &AppWindow, label: &str) {
     assert_eq!(focused.geometry().size, target.geometry().size);
 }
 
+#[track_caller]
 fn click_control_once(ui: &AppWindow, label: &str) {
     let target = control_with_label(ui, label);
     // map_to_window takes a point in the item's parent coordinates; it does
@@ -709,6 +710,39 @@ async fn assert_native_motion_and_preference(ui: &AppWindow, config_path: &std::
         assert!(!ui.global::<crate::StyleTokens>().get_reduced_motion());
         assert!(focused_control_has_label(ui, "Reduce motion, off"));
     }
+    // Use default fonts returns the three families only; other preferences,
+    // such as the message size, are kept.
+    let mut fonts = defaults.clone();
+    fonts.appearance.font_family = "serif".into();
+    fonts.typography.message_font_family = Some("monospace".into());
+    fonts.typography.monospace_font_family = "serif".into();
+    fonts.typography.message_size = 17;
+    store.save(&fonts).unwrap();
+    apply_config(ui, &fonts, None);
+    ui.invoke_reset_style_fonts();
+    let reset = store.load().unwrap();
+    assert_eq!(
+        reset.appearance.font_family,
+        defaults.appearance.font_family
+    );
+    assert_eq!(
+        reset.typography.message_font_family,
+        defaults.typography.message_font_family
+    );
+    assert_eq!(
+        reset.typography.monospace_font_family,
+        defaults.typography.monospace_font_family
+    );
+    assert_eq!(
+        reset.typography.message_size, 17,
+        "the reset kept other preferences"
+    );
+    assert_eq!(
+        ui.get_appearance_ui_font_input().as_str(),
+        defaults.appearance.font_family
+    );
+    store.save(&defaults).unwrap();
+    apply_config(ui, &defaults, None);
     let invalid = "[appearance\nreduce_motion = true\n";
     std::fs::write(config_path, invalid).unwrap();
     key(ui, Key::Space);
@@ -1936,6 +1970,44 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
     i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(500));
     settle(ui).await;
     assert_eq!(store.load().unwrap().window.opacity_percent, 50);
+
+    // Home and End commit on key release, as the arrows do.
+    assert!(crate::settings_search::reveal(
+        ui,
+        "appearance.window_opacity"
+    ));
+    settle(ui).await;
+    key(ui, Key::Home);
+    settle(ui).await;
+    assert_eq!(store.load().unwrap().window.opacity_percent, 0);
+    key(ui, Key::End);
+    settle(ui).await;
+    assert_eq!(store.load().unwrap().window.opacity_percent, 100);
+    // A press away from the thumb moves it there and only previews; the
+    // pointer release commits.
+    let track = control_with_label(ui, "Window background opacity, percent");
+    let center = track.map_to_window(track.geometry().center());
+    let near_start =
+        slint::LogicalPosition::new(center.x - track.geometry().size.width * 0.45, center.y);
+    ui.window().dispatch_event(WindowEvent::PointerMoved {
+        position: near_start,
+    });
+    ui.window().dispatch_event(WindowEvent::PointerPressed {
+        position: near_start,
+        button: slint::platform::PointerEventButton::Left,
+    });
+    settle(ui).await;
+    assert_eq!(
+        store.load().unwrap().window.opacity_percent,
+        100,
+        "a press only previews"
+    );
+    ui.window().dispatch_event(WindowEvent::PointerReleased {
+        position: near_start,
+        button: slint::platform::PointerEventButton::Left,
+    });
+    settle(ui).await;
+    assert!(store.load().unwrap().window.opacity_percent < 50);
     ui.invoke_set_window_opacity(100);
     settle(ui).await;
 
@@ -2069,14 +2141,23 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
     // One color is a direct result: typing its ID or a word of its name, then
     // Down and Enter, selects exactly that token and focuses its hex field.
     // Choosing it saves nothing.
-    for (query, token) in [
+    for (attempt, (query, token)) in [
         ("presence_online", "presence_online"),
         ("online", "presence_online"),
         ("links", "link"),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         ui.set_settings_search_query("".into());
         ui.invoke_settings_search("".into());
         settle(ui).await;
+        // Returning to results intentionally focuses this field. A later
+        // iteration must move away before exercising pointer focus again.
+        if focused_control_has_label(ui, "Search settings") {
+            key(ui, Key::Tab);
+            settle(ui).await;
+        }
         click_control_once(ui, "Search settings");
         type_text(ui, query);
         settle(ui).await;
@@ -2086,6 +2167,12 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
         let row = (0..results.row_count())
             .find(|row| results.row_data(*row).unwrap().id == id.as_str())
             .unwrap_or_else(|| panic!("{query} does not offer {token}"));
+        // Exact fields name their config.toml key.
+        assert_eq!(
+            results.row_data(row).unwrap().key,
+            format!("colors.{token}").as_str(),
+            "{query}"
+        );
         for _ in 0..row {
             key(ui, Key::DownArrow);
         }
@@ -2101,6 +2188,33 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
         assert!(
             focused_control_has_label(ui, &format!("Hex color for {label}, #RRGGBB or #RRGGBBAA")),
             "{query}: the hex field of {token} is not focused"
+        );
+        // The chosen result's list comes back without retyping, with the
+        // same highlight: by its action, by Down in the field, or by the
+        // Search Settings shortcut.
+        assert!(ui.get_settings_search_dismissed(), "{query}");
+        match attempt {
+            0 => click_control_once(ui, &format!("Back to the results for {query}")),
+            1 => {
+                click_control_once(ui, "Search settings");
+                key(ui, Key::DownArrow);
+            }
+            _ => ui.invoke_focus_settings_search(),
+        }
+        settle(ui).await;
+        assert!(
+            !ui.get_settings_search_dismissed(),
+            "{query}: results stay hidden"
+        );
+        assert_eq!(ui.get_settings_search_index(), row as i32, "{query}");
+        assert!(
+            focused_control_has_label(ui, "Search settings"),
+            "{query}: the search field is not focused"
+        );
+        assert_eq!(
+            ui.get_color_selected_id(),
+            token,
+            "{query}: returning changed the token"
         );
     }
     assert_eq!(
@@ -2206,9 +2320,17 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
         "the field keeps focus"
     );
     let last = results.row_data(registry::MAX_SEARCH_RESULTS - 1).unwrap();
+    let key_note = if last.key.is_empty() {
+        String::new()
+    } else {
+        format!(" In config.toml: {}.", last.key)
+    };
     let row = control_with_label(
         ui,
-        &format!("{}, {}. {}", last.label, last.breadcrumb, last.description),
+        &format!(
+            "{}, {}. {}{key_note}",
+            last.label, last.breadcrumb, last.description
+        ),
     );
     let top = row.map_to_window(row.geometry().origin).y;
     let bottom = top + row.geometry().size.height;
@@ -3110,6 +3232,175 @@ async fn assert_shortcut_customization(ui: &AppWindow, directory: &std::path::Pa
 /// the preview, and a save that would change the look during it is refused.
 /// Apply saves the profile's look over the re-read file and keeps every other
 /// setting; an invalid settings file is never overwritten; Delete asks first.
+/// The Settings live preview draws synthetic samples that never take focus
+/// or pointer input. Its advanced-editor links only reveal their editor, and
+/// hiding it is session state.
+async fn assert_live_preview(ui: &AppWindow) {
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    ui.set_font_scale_percent(100);
+    ui.set_settings_search_query("".into());
+    ui.invoke_settings_search("".into());
+    ui.set_page(1);
+    settle(ui).await;
+    assert!(
+        ui.get_appearance_preview_shown(),
+        "the preview starts shown"
+    );
+    // Samples sit between the header actions and the links in the tree; Tab
+    // skips every one of them.
+    tab_to_control(ui, "Hide the live preview");
+    key(ui, Key::Tab);
+    assert!(focused_control_has_label(
+        ui,
+        "Keep a compact preview above the settings while editing"
+    ));
+    key(ui, Key::Tab);
+    assert!(
+        focused_control_has_label(ui, "Go to the color editor"),
+        "a preview sample took keyboard focus"
+    );
+    key(ui, Key::Return);
+    settle(ui).await;
+    assert_eq!(ui.get_settings_revealed_id(), "appearance.colors");
+    ui.set_page(0);
+    settle(ui).await;
+    ui.set_page(1);
+    settle(ui).await;
+    tab_to_control(ui, "Hide the live preview");
+    key(ui, Key::Return);
+    settle(ui).await;
+    assert!(!ui.get_appearance_preview_shown());
+    assert!(
+        focused_control_has_label(ui, "Show the live preview"),
+        "the toggle keeps focus"
+    );
+    key(ui, Key::Return);
+    settle(ui).await;
+    assert!(ui.get_appearance_preview_shown());
+    // Pinning keeps a compact copy above the settings until its own Unpin.
+    assert!(!ui.get_appearance_preview_pinned(), "pinning is opt-in");
+    tab_to_control(
+        ui,
+        "Keep a compact preview above the settings while editing",
+    );
+    key(ui, Key::Return);
+    settle(ui).await;
+    assert!(ui.get_appearance_preview_pinned());
+    assert!(focused_control_has_label(
+        ui,
+        "Stop keeping the preview above the settings"
+    ));
+    click_control_once(ui, "Unpin the compact preview");
+    settle(ui).await;
+    assert!(!ui.get_appearance_preview_pinned());
+
+    // At the smallest window and 200% text the card keeps a bounded, stable
+    // height (its samples scroll inside it), so it never fills the page.
+    ui.window().set_size(slint::PhysicalSize::new(940, 620));
+    for (scale, expected) in [(100, 340.0f32), (200, 408.0)] {
+        ui.set_font_scale_percent(scale);
+        settle(ui).await;
+        let card = control_with_label(ui, "Live preview with sample content");
+        let height = card.geometry().size.height;
+        assert!(
+            (height - expected).abs() < 1.0,
+            "{scale}%: the preview card is {height} px, not {expected}"
+        );
+    }
+    ui.set_font_scale_percent(100);
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    ui.set_page(0);
+    settle(ui).await;
+}
+
+/// The themed select keeps ComboBox's keyboard contract: Up and Down choose
+/// directly, Return opens the list without choosing, keys in the list choose
+/// live, Escape closes it with focus back on the select, and a disabled
+/// select ignores keys.
+async fn assert_themed_select(ui: &AppWindow) {
+    use std::{cell::RefCell, rc::Rc};
+
+    let chosen = Rc::new(RefCell::new(Vec::<String>::new()));
+    let record = chosen.clone();
+    ui.on_select_audio_microphone(move |value| record.borrow_mut().push(value.into()));
+    let choices: Vec<slint::SharedString> = vec![
+        "System default".into(),
+        "Desk microphone".into(),
+        "Headset".into(),
+    ];
+    ui.set_audio_microphone_choices(ModelRc::new(VecModel::from(choices)));
+    ui.set_audio_microphone_index(0);
+    ui.set_audio_devices_enabled(true);
+    ui.set_audio_devices_busy(false);
+    ui.window().set_size(slint::PhysicalSize::new(1280, 900));
+    ui.set_page(1);
+    settle(ui).await;
+    assert!(crate::settings_search::reveal(ui, "media.audio_devices"));
+    settle(ui).await;
+    let label = "Microphone for the next call";
+    assert!(focused_control_has_label(ui, label));
+
+    key(ui, Key::DownArrow);
+    assert_eq!(ui.get_audio_microphone_index(), 1);
+    key(ui, Key::UpArrow);
+    assert_eq!(ui.get_audio_microphone_index(), 0);
+    assert_eq!(*chosen.borrow(), ["Desk microphone", "System default"]);
+
+    key(ui, Key::Return);
+    settle(ui).await;
+    assert_eq!(chosen.borrow().len(), 2, "opening chose nothing");
+    key(ui, Key::End);
+    settle(ui).await;
+    assert_eq!(ui.get_audio_microphone_index(), 2);
+    key(ui, Key::Escape);
+    settle(ui).await;
+    assert!(focused_control_has_label(ui, label), "focus returns");
+    let last = chosen.borrow().last().cloned();
+    assert_eq!(last.as_deref(), Some("Headset"));
+
+    // The wheel moves the choice while the select has focus.
+    let select = control_with_label(ui, label);
+    let center = select.map_to_window(select.geometry().center());
+    let position = slint::LogicalPosition::new(center.x, center.y);
+    ui.window()
+        .dispatch_event(WindowEvent::PointerMoved { position });
+    ui.window().dispatch_event(WindowEvent::PointerScrolled {
+        position,
+        delta_x: 0.0,
+        delta_y: 10.0,
+    });
+    settle(ui).await;
+    assert_eq!(ui.get_audio_microphone_index(), 1, "wheel up");
+
+    // Long externally supplied labels stay within the settings panel rather
+    // than increasing its minimum width. The visible caption may elide.
+    ui.set_audio_microphone_choices(ModelRc::new(VecModel::from(vec![
+        "System default".into(),
+        slint::SharedString::from("Long device label ".repeat(128)),
+        "Headset".into(),
+    ])));
+    let previous_scale = ui.get_font_scale_percent();
+    ui.set_font_scale_percent(200);
+    settle(ui).await;
+    let bounds = control_bounds(ui, label);
+    assert_eq!(bounds.len(), 1);
+    let logical_width = ui.window().size().width as f32 / ui.window().scale_factor();
+    assert!(bounds[0].left >= -0.5 && bounds[0].right <= logical_width + 0.5);
+    ui.set_font_scale_percent(previous_scale);
+    settle(ui).await;
+
+    ui.set_audio_devices_busy(true);
+    settle(ui).await;
+    key(ui, Key::UpArrow);
+    assert_eq!(ui.get_audio_microphone_index(), 1, "disabled");
+
+    ui.set_audio_devices_busy(false);
+    ui.set_audio_devices_enabled(false);
+    ui.on_select_audio_microphone(|_| {});
+    ui.set_page(0);
+    settle(ui).await;
+}
+
 async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     use morpheus_config::style_profiles::ProfileStore;
     use morpheus_config::{ConfigStore, LoadedConfig};
@@ -3362,6 +3653,10 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     assert_shortcut_customization(&ui, directory.path()).await;
     phase.set(18);
     assert_style_profiles(&ui, directory.path()).await;
+    phase.set(19);
+    assert_live_preview(&ui).await;
+    phase.set(20);
+    assert_themed_select(&ui).await;
     phase.set(15);
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),

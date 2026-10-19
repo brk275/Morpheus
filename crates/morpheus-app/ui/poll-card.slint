@@ -1,10 +1,11 @@
 // Native Matrix poll card and the shared poll interaction state. Rust owns
 // every transition: the card shows the projected SDK state and reports the
 // person's explicit choices. Choosing an option only edits a local draft;
-// a vote or an end is sent only from its button. This file cannot import the
-// window's globals, so the window passes resolved colors.
+// a vote or an end is sent only from its button. The window passes resolved
+// colors; geometry and interaction states come from StyleTokens.
 
-import { Button } from "std-widgets.slint";
+import { StyleTokens } from "style-tokens.slint";
+import { ControlColors, TokenButton } from "controls.slint";
 
 export struct PollPalette {
     ink: color,
@@ -13,6 +14,7 @@ export struct PollPalette {
     elevated: color,
     hover: color,
     accent: color,
+    accent-ink: color,
     divider: color,
     focus: color,
     error: color,
@@ -98,9 +100,12 @@ component PollChoice inherits Rectangle {
 
     // An explicit height keeps the parent-sized result bar out of layout.
     height: max(32px * root.text-scale, row.preferred-height);
-    border-radius: 6px;
-    background: touch.has-hover && root.enabled ? root.palette.hover : root.palette.elevated;
-    border-width: root.checked ? 2px : 1px;
+    border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.6;
+    background: touch.pressed && root.enabled && StyleTokens.states.control-pressed.present ? StyleTokens.states.control-pressed.color
+        : touch.has-hover && root.enabled ? (StyleTokens.states.control-hover.present ? StyleTokens.states.control-hover.color : root.palette.hover)
+        : root.palette.elevated;
+    // The chosen option keeps a heavier outline than an ordinary border.
+    border-width: root.checked ? max(2px, StyleTokens.line-width) : StyleTokens.line-width;
     border-color: root.checked ? root.palette.accent : root.palette.divider;
     forward-focus: scope;
     accessible-role: checkbox;
@@ -142,7 +147,7 @@ component PollChoice inherits Rectangle {
         }
         Text {
             text: root.text;
-            color: root.palette.ink;
+            color: root.enabled || !StyleTokens.states.control-disabled.present ? root.palette.ink : StyleTokens.states.control-disabled.color;
             font-size: 12px * root.text-scale;
             wrap: word-wrap;
             vertical-alignment: center;
@@ -181,7 +186,7 @@ component PollChoice inherits Rectangle {
     }
     if scope.has-focus : Rectangle {
         border-radius: parent.border-radius;
-        border-width: 2px;
+        border-width: StyleTokens.focus-width;
         border-color: root.palette.focus;
         background: transparent;
     }
@@ -212,6 +217,15 @@ export component PollCard inherits Rectangle {
     // in; these carry focus to the button that replaces it.
     property <bool> refocus-confirm: false;
     property <bool> refocus-actions: false;
+    property <ControlColors> button-colors: {
+        ink: root.palette.ink,
+        muted: root.palette.muted,
+        surface: root.palette.elevated,
+        hover: root.palette.hover,
+        outline: root.palette.divider,
+        accent: root.palette.accent,
+        accent-ink: root.palette.accent-ink,
+    };
     changed event-id => {
         root.refocus-confirm = false;
         root.refocus-actions = false;
@@ -219,7 +233,7 @@ export component PollCard inherits Rectangle {
 
     height: content.preferred-height;
     border-radius: root.corner;
-    border-width: 1px;
+    border-width: StyleTokens.line-width;
     border-color: root.palette.divider;
     background: root.palette.panel;
     accessible-role: groupbox;
@@ -278,27 +292,31 @@ export component PollCard inherits Rectangle {
         if !root.confirming && (root.data.can-vote || root.data.can-end) : HorizontalLayout {
             spacing: 8px;
             alignment: end;
-            if root.data.can-end : Button {
+            if root.data.can-end : TokenButton {
                 text: "End poll";
+                colors: root.button-colors;
+                text-scale: root.text-scale;
                 enabled: root.enabled && !root.busy;
-                accessible-label: "End the poll " + root.data.question;
+                label: "End the poll " + root.data.question;
                 init => {
                     if root.refocus-actions {
                         root.refocus-actions = false;
                         self.focus();
                     }
                 }
-                clicked => {
+                activated => {
                     root.refocus-confirm = self.has-focus;
                     PollUiState.request-end(root.event-id);
                 }
             }
-            if root.data.can-vote : Button {
+            if root.data.can-vote : TokenButton {
                 text: root.data.has-vote ? "Change vote" : "Vote";
                 primary: true;
+                colors: root.button-colors;
+                text-scale: root.text-scale;
                 enabled: root.enabled && root.drafting && PollUiState.draft-ready && !root.busy;
-                accessible-label: (root.data.has-vote ? "Change your vote in the poll " : "Vote in the poll ") + root.data.question;
-                clicked => { PollUiState.vote(root.event-id, root.thread-root); }
+                label: (root.data.has-vote ? "Change your vote in the poll " : "Vote in the poll ") + root.data.question;
+                activated => { PollUiState.vote(root.event-id, root.thread-root); }
             }
         }
         if root.confirming && root.data.can-end : VerticalLayout {
@@ -313,10 +331,12 @@ export component PollCard inherits Rectangle {
             HorizontalLayout {
                 spacing: 8px;
                 alignment: end;
-                Button {
+                TokenButton {
                     text: "Keep open";
+                    colors: root.button-colors;
+                    text-scale: root.text-scale;
                     enabled: !root.busy;
-                    accessible-label: "Keep the poll " + root.data.question + " open";
+                    label: "Keep the poll " + root.data.question + " open";
                     // The safe choice takes focus when End was pressed by keyboard.
                     init => {
                         if root.refocus-confirm {
@@ -324,17 +344,19 @@ export component PollCard inherits Rectangle {
                             self.focus();
                         }
                     }
-                    clicked => {
+                    activated => {
                         root.refocus-actions = self.has-focus;
                         PollUiState.cancel-end();
                     }
                 }
-                Button {
+                TokenButton {
                     text: "End poll";
                     primary: true;
+                    colors: root.button-colors;
+                    text-scale: root.text-scale;
                     enabled: root.enabled && !root.busy;
-                    accessible-label: "Confirm ending the poll " + root.data.question;
-                    clicked => {
+                    label: "Confirm ending the poll " + root.data.question;
+                    activated => {
                         root.refocus-actions = self.has-focus;
                         PollUiState.confirm-end(root.event-id, root.thread-root);
                     }
