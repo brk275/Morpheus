@@ -53,7 +53,7 @@ use crate::event_cache::RoomEventCache;
 type Password = String;
 
 /// Type of location to store [`RoomIndex`]
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum SearchIndexStoreKind {
     /// Store unencrypted in file system folder
     UnencryptedDirectory(PathBuf),
@@ -61,6 +61,20 @@ pub enum SearchIndexStoreKind {
     EncryptedDirectory(PathBuf, Password),
     /// Store in memory
     InMemory,
+}
+
+impl std::fmt::Debug for SearchIndexStoreKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnencryptedDirectory(path) => {
+                f.debug_tuple("UnencryptedDirectory").field(path).finish()
+            }
+            Self::EncryptedDirectory(path, _) => {
+                f.debug_tuple("EncryptedDirectory").field(path).field(&"<redacted>").finish()
+            }
+            Self::InMemory => f.write_str("InMemory"),
+        }
+    }
 }
 
 /// Object that handles inteeraction with [`RoomIndex`]'s for search
@@ -558,6 +572,33 @@ mod tests {
     };
 
     use crate::test_utils::mocks::MatrixMockServer;
+
+    #[test]
+    fn test_store_kind_debug_keeps_credentials_out_of_parent_diagnostics() {
+        use std::{collections::HashMap, path::PathBuf, sync::Arc};
+
+        use tokio::sync::Mutex;
+
+        use super::{SearchIndex, SearchIndexStoreKind};
+
+        let secret = "fixture-marker";
+        let kind = SearchIndexStoreKind::EncryptedDirectory(
+            PathBuf::from("synthetic-search"),
+            secret.to_owned(),
+        );
+        let text = format!("{kind:?}");
+        assert!(text.contains("EncryptedDirectory"));
+        assert!(text.contains("<redacted>"));
+        assert!(!text.contains(secret));
+        let index = SearchIndex::new(Arc::new(Mutex::new(HashMap::new())), kind);
+        assert!(!format!("{index:?}").contains(secret));
+        let guard = index.room_indexes.try_lock().unwrap();
+        let guarded = super::SearchIndexGuard {
+            index_map: guard,
+            search_index_store_kind: &index.search_index_store_kind,
+        };
+        assert!(!format!("{guarded:?}").contains(secret));
+    }
 
     #[cfg(feature = "experimental-search")]
     #[async_test]
