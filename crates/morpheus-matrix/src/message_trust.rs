@@ -2,9 +2,13 @@
 //! mode: nothing is flagged only because a person is unverified, just when
 //! the sender, their device or the encryption is wrong or cannot be checked.
 //! The SDK re-evaluates shields as device and identity data change.
+//! In-room verification requests also get a fixed line instead of the text
+//! their sender wrote.
 
+use matrix_sdk::ruma::events::room::message::MessageType;
 use matrix_sdk_ui::timeline::{
     EventTimelineItem, TimelineEventShieldState as Shield, TimelineEventShieldStateCode as Code,
+    TimelineItemContent,
 };
 
 /// A fixed warning for one message, and whether it is serious (red) rather
@@ -30,6 +34,26 @@ fn code_text(code: Code) -> &'static str {
         Code::VerificationViolation => "Sent after this person's verified identity changed.",
         Code::MismatchedSender => "The sender doesn't match the device that encrypted it.",
         Code::SentInClear => "Sent without encryption in an encrypted room.",
+    }
+}
+
+/// In-room verification requests carry fallback text the sender wrote for
+/// clients without in-room verification. The timeline shows a fixed line
+/// instead; the request banner offers the actual choices.
+pub(crate) fn verification_request_line(
+    content: &TimelineItemContent,
+    own: bool,
+) -> Option<&'static str> {
+    request_line(content.as_message().map(|message| message.msgtype()), own)
+}
+
+fn request_line(msgtype: Option<&MessageType>, own: bool) -> Option<&'static str> {
+    match msgtype {
+        Some(MessageType::VerificationRequest(_)) if own => {
+            Some("You sent a verification request.")
+        }
+        Some(MessageType::VerificationRequest(_)) => Some("Sent a verification request."),
+        _ => None,
     }
 }
 
@@ -65,5 +89,27 @@ mod tests {
         for text in texts {
             assert!(!text.contains('\n') && text.len() <= 80, "{text}");
         }
+    }
+
+    #[test]
+    fn verification_requests_show_a_fixed_line_instead_of_sender_text() {
+        use matrix_sdk::ruma::UserId;
+        use matrix_sdk::ruma::events::key::verification::VerificationMethod;
+        use matrix_sdk::ruma::events::room::message::KeyVerificationRequestEventContent;
+
+        let content = KeyVerificationRequestEventContent::new(
+            "Your client cannot verify here.".into(),
+            vec![VerificationMethod::SasV1],
+            "DEVICE".into(),
+            UserId::parse("@member:example.org").unwrap(),
+        );
+        let request = MessageType::VerificationRequest(content);
+        let own = request_line(Some(&request), true);
+        let other = request_line(Some(&request), false);
+        assert!(own.is_some() && other.is_some() && own != other);
+        assert!(!other.unwrap().contains("client"));
+        let text = MessageType::text_plain("hello");
+        assert_eq!(request_line(Some(&text), false), None);
+        assert_eq!(request_line(None, true), None);
     }
 }

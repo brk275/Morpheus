@@ -3954,6 +3954,8 @@ fn message_info(item: &TimelineItem) -> Option<MessageInfo> {
                 .map(|sticker| sticker.content().body.as_str())
         })
         .or_else(|| undecryptable::notice(content))?;
+    // Never show a verification request's sender-written fallback text.
+    let body = message_trust::verification_request_line(content, event.is_own()).unwrap_or(body);
     let reply_preview =
         event
             .content()
