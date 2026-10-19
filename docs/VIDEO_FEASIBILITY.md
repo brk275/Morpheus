@@ -69,7 +69,7 @@ live encrypted GUI call.
    streams, consumes `video_frames()` for presented ones and retains only the
    newest frame of each. Track replacement and participant departure still
    need a live UI check.
-3. **Unit tested, live UI pending:** A worker converts I420 to RGB after
+3. **Reimplemented for the new stage; checks pending:** A worker converts I420 to RGB after
    validating dimensions, strides, and planes; it applies rotation and caps
    output resolution. A bounded frame cadence forwards the image through
    `upgrade_in_event_loop`, guarded by a call-generation token. Check visible
@@ -95,7 +95,7 @@ live encrypted GUI call.
 
 ## Platform and performance risks
 
-- **Current RTC baseline:** the upstream macOS `-ObjC` link workaround and a native loopback LiveKit instance resolved the local Docker Desktop ICE problem. Gated macOS tests connected two disposable participants over UDP, delivered synthetic microphone/camera plus real display/window screen-track frames in encrypted calls, and passed leave/rejoin. The call-stage tile now compiles, but no received video has been viewed in Morpheus. See [the RTC runbook](../tests/LOCAL_MATRIX_RTC.md) and [verification record](VERIFICATION.md).
+- **Current RTC baseline:** the upstream macOS `-ObjC` link workaround and a native loopback LiveKit instance resolved the local Docker Desktop ICE problem. Gated macOS tests connected two disposable participants over UDP, delivered synthetic microphone/camera plus real display/window screen-track frames in encrypted calls, and passed leave/rejoin. The earlier single-tile stage compiled; the new multi-tile stage still needs compilation and runtime checks. No received video has been viewed in Morpheus. See [the RTC runbook](../tests/LOCAL_MATRIX_RTC.md) and [verification record](VERIFICATION.md).
 - **Wayland capture:** XCap's `capture_image()` can fall back to a Screenshot portal PNG per frame. That path is unsuitable for continuous sharing. XCap's `video_recorder()` uses the ScreenCast portal and PipeWire on Wayland; its stream behavior and permissions remain unverified in Morpheus. X11 still capture and recorder paths also need profiling.
 - **Permissions:** the macOS package has microphone, camera, and screen-capture usage strings in `packaging/macos/Info.plist`. The display picker and permission path were exercised in an ad hoc signed QA app; packaged-app consent, revoked permission, and Windows/Linux equivalents need hands-on checks. Never start capture while merely probing homeserver support.
 - **Frame budget:** I420-to-RGB conversion plus Slint texture upload copies each frame. At 1920×1080 RGB, one output frame is about 6 MiB; 30 fps exceeds 180 MiB/s before extra copies. Bound resolution/frame rate and drop stale frames. A WGPU texture path can follow only after renderer compatibility and resource-lifetime tests.

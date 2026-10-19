@@ -160,19 +160,23 @@ async fn present_roster(
     loop {
         let update = roster.borrow_and_update().clone();
         let token = update.token;
-        let members: Vec<_> = update
-            .members
-            .into_iter()
-            .map(participant_item)
-            .collect();
+        let members: Vec<_> = update.members.into_iter().map(participant_item).collect();
+        let (done, shown) = oneshot::channel();
         let calls_for_ui = calls.clone();
         let applied_for_ui = applied.clone();
-        let closed = window
-            .upgrade_in_event_loop(move |ui| {
-                apply_roster(&ui, &calls_for_ui, &mut lock(&applied_for_ui), token, members);
-            })
-            .is_err();
-        if closed || roster.changed().await.is_err() {
+        let posted = window.upgrade_in_event_loop(move |ui| {
+            apply_roster(
+                &ui,
+                &calls_for_ui,
+                &mut lock(&applied_for_ui),
+                token,
+                members,
+            );
+            let _ = done.send(());
+        });
+        // Coalesce membership and speaking changes while the UI is busy,
+        // just as frame updates do; never queue an unbounded list of rosters.
+        if posted.is_err() || shown.await.is_err() || roster.changed().await.is_err() {
             break;
         }
     }
@@ -246,9 +250,9 @@ fn apply_roster(
     let current = calls.video_token();
     if token != current {
         if applied.roster_token != current {
-            ui.set_native_call_participants(ModelRc::new(VecModel::from(Vec::<
-                CallParticipantItem,
-            >::new())));
+            ui.set_native_call_participants(ModelRc::new(VecModel::from(
+                Vec::<CallParticipantItem>::new(),
+            )));
             applied.roster_token = current;
         }
         return;

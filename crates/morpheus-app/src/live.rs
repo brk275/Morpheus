@@ -2502,7 +2502,8 @@ impl LiveUi {
         index: usize,
         consent: Option<&PublicMediaConsent>,
     ) -> Result<QueuedMessage, MatrixCoreError> {
-        self.require_media_context(catalog.account_id(), catalog.room_id()).await?;
+        self.require_media_context(catalog.account_id(), catalog.room_id())
+            .await?;
         self.manager.send_sticker_for(catalog, index, consent).await
     }
 

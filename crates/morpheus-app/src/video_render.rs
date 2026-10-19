@@ -572,9 +572,10 @@ impl<M: StageMedia> Stage<M> {
     /// Keep exactly the planned streams open, each in a stable slot.
     fn open_planned(&mut self, decode: &[DecodeRequest]) {
         for slot in 0..FRAME_SLOTS {
-            if !self.presenter.decoders[slot].as_ref().is_some_and(|decoder| {
-                decode.iter().any(|request| request.key == decoder.key)
-            }) {
+            if !self.presenter.decoders[slot]
+                .as_ref()
+                .is_some_and(|decoder| decode.iter().any(|request| request.key == decoder.key))
+            {
                 self.presenter.release(slot);
             }
         }
@@ -845,9 +846,10 @@ impl Planner {
             state,
             is_local: participant.is_local,
             microphone_muted: person
-                && participant.streams.iter().any(|stream| {
-                    stream.kind == RtcStreamKind::Microphone && stream.muted
-                }),
+                && participant
+                    .streams
+                    .iter()
+                    .any(|stream| stream.kind == RtcStreamKind::Microphone && stream.muted),
             speaking: person && input.speaking.contains(&participant.member_id),
             hand_raised: person && participant.hand_raised_at_ms.is_some(),
             frame_slot: None,
@@ -1427,9 +1429,10 @@ mod tests {
                 (RtcStreamKind::ScreenShare, false),
             ],
         )];
-        participants.extend((0..10).map(|index| {
-            participant(&format!("m{index}"), &[(RtcStreamKind::Camera, false)])
-        }));
+        participants.extend(
+            (0..10)
+                .map(|index| participant(&format!("m{index}"), &[(RtcStreamKind::Camera, false)])),
+        );
         let plan = plan(&mut planner, &participants, None, Instant::now());
         let featured = plan.layout.featured.as_ref().unwrap();
         assert_eq!(featured.key, screen("alice"));
@@ -1438,7 +1441,11 @@ mod tests {
         assert_eq!(plan.layout.pages, 11_usize.div_ceil(FILMSTRIP_PAGE));
         assert!(plan.decode.len() <= FRAME_SLOTS);
         assert_eq!(plan.decode[0].size, FEATURED_SIZE);
-        assert!(plan.decode[1..].iter().all(|request| request.size == FILMSTRIP_SIZE));
+        assert!(
+            plan.decode[1..]
+                .iter()
+                .all(|request| request.size == FILMSTRIP_SIZE)
+        );
     }
 
     #[test]
@@ -1465,7 +1472,13 @@ mod tests {
             .layout
             .tiles
             .iter()
-            .map(|tile| (tile.key.member_id.as_str(), tile.state, tile.microphone_muted))
+            .map(|tile| {
+                (
+                    tile.key.member_id.as_str(),
+                    tile.state,
+                    tile.microphone_muted,
+                )
+            })
             .collect();
         assert_eq!(
             states,
@@ -1494,11 +1507,19 @@ mod tests {
 
         let left = plan(&mut planner, &both[..1], Some(&bob), now);
         let placeholder = left.layout.featured.as_ref().unwrap();
-        assert_eq!((placeholder.id, placeholder.state), (pinned_id, TileState::Left));
+        assert_eq!(
+            (placeholder.id, placeholder.state),
+            (pinned_id, TileState::Left)
+        );
         assert!(left.decode.iter().all(|request| request.key != bob));
         assert_eq!(left.layout.tiles[0].id, alice_id);
 
-        let later = plan(&mut planner, &both[..1], Some(&bob), now + DEPARTED_PLACEHOLDER);
+        let later = plan(
+            &mut planner,
+            &both[..1],
+            Some(&bob),
+            now + DEPARTED_PLACEHOLDER,
+        );
         assert!(later.layout.featured.is_none());
         assert_eq!(later.layout.tiles[0].id, alice_id);
     }
@@ -1521,8 +1542,14 @@ mod tests {
             ..StageRequest::default()
         });
         stage.replan();
-        assert_eq!(stage.media.last_constraint(&screen("alice")), Some(sized(FEATURED_SIZE)));
-        assert_eq!(stage.media.last_constraint(&camera("bob")), Some(sized(FILMSTRIP_SIZE)));
+        assert_eq!(
+            stage.media.last_constraint(&screen("alice")),
+            Some(sized(FEATURED_SIZE))
+        );
+        assert_eq!(
+            stage.media.last_constraint(&camera("bob")),
+            Some(sized(FILMSTRIP_SIZE))
+        );
         let slot = stage.presenter.slot_of(&camera("bob")).unwrap();
         stage.presenter.frames[slot].pixels =
             Some(rgb_buffer(&padded_frame(VideoRotation::Deg0), FILMSTRIP_SIZE).unwrap());
@@ -1530,8 +1557,17 @@ mod tests {
         stage.request(&StageRequest::default());
         stage.replan();
         assert!(!stage.presenter.decoding());
-        assert!(stage.presenter.frames.iter().all(|frame| frame.pixels.is_none()));
-        assert_eq!(stage.media.last_constraint(&screen("alice")), Some(paused()));
+        assert!(
+            stage
+                .presenter
+                .frames
+                .iter()
+                .all(|frame| frame.pixels.is_none())
+        );
+        assert_eq!(
+            stage.media.last_constraint(&screen("alice")),
+            Some(paused())
+        );
         assert_eq!(stage.media.last_constraint(&camera("bob")), Some(paused()));
     }
 

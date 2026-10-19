@@ -20,9 +20,9 @@ pub use presenter::bind;
 pub(crate) fn clear_private_presentation(ui: &AppWindow) {
     clear_stage(ui);
     if ui.get_native_call_participants().row_count() > 0 {
-        ui.set_native_call_participants(ModelRc::new(VecModel::from(Vec::<
-            CallParticipantItem,
-        >::new())));
+        ui.set_native_call_participants(ModelRc::new(VecModel::from(
+            Vec::<CallParticipantItem>::new(),
+        )));
     }
     // A no-op without native calls, where nothing can fill the stage.
     ui.invoke_reset_native_call_stage();

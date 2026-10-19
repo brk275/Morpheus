@@ -2677,17 +2677,14 @@ async fn exercise_account_ui(runtime: Handle) {
         ..Default::default()
     });
     ui.set_native_call_featured_visible(true);
-    let picture = || {
-        slint::Image::from_rgb8(slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(2, 2))
-    };
+    let picture =
+        || slint::Image::from_rgb8(slint::SharedPixelBuffer::<slint::Rgb8Pixel>::new(2, 2));
     ui.set_native_call_frames(ModelRc::new(VecModel::from(vec![picture(), picture()])));
-    ui.set_native_call_participants(ModelRc::new(VecModel::from(vec![
-        CallParticipantItem {
-            name: "@private:example.org".into(),
-            detail: "Camera on".into(),
-            is_local: false,
-        },
-    ])));
+    ui.set_native_call_participants(ModelRc::new(VecModel::from(vec![CallParticipantItem {
+        name: "@private:example.org".into(),
+        detail: "Camera on".into(),
+        is_local: false,
+    }])));
     ui.set_native_call_page(1);
     ui.set_native_call_pages(2);
     ui.set_native_call_tile_count(6);
