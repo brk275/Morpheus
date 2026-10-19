@@ -61,6 +61,7 @@ mod verification;
 #[cfg(feature = "native-calls")]
 mod video_render;
 mod voice_spaces;
+mod workspace_layout;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -942,6 +943,7 @@ fn apply_appearance(
         morpheus_config::DetailsSide::Right => 0,
         morpheus_config::DetailsSide::Left => 1,
     });
+    workspace_layout::apply_config(ui, config);
     ui.set_direct_messages_first(layout.direct_messages_first);
     ui.set_room_density_choice(layout.room_density.map_or(-1, density_index));
     ui.set_message_density_choice(layout.message_density.map_or(-1, density_index));
@@ -4167,6 +4169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let weak = ui.as_weak();
     let setting_store = store.clone();
     appearance::install_callbacks(&ui, &store);
+    workspace_layout::register(&ui, &store);
     appearance_editor::register(&ui, &store);
     metric_editor::register(&ui, &store);
     sender_palette_editor::register(&ui, &store);

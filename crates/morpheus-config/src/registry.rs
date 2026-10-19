@@ -663,6 +663,10 @@ pub enum FieldKind {
     RoomIdList,
     /// A table keyed by documented names; see the field's description.
     Table,
+    /// Every workspace pane ID exactly once, or an empty list.
+    PaneOrder,
+    /// Distinct pane IDs taken from this set.
+    PaneSet(&'static [&'static str]),
 }
 
 pub struct FieldSpec {
@@ -1492,6 +1496,24 @@ pub const FIELDS: &[FieldSpec] = &[
         "Timeline message spacing density; omitted follows appearance.density.",
     ),
     field(
+        "layout.pane_order",
+        FieldKind::PaneOrder,
+        "[]",
+        "Left-to-right pane order: spaces, rooms, conversation, details, each once; empty follows details_side.",
+    ),
+    field(
+        "layout.hidden_panes",
+        FieldKind::PaneSet(&["spaces", "rooms", "details"]),
+        "[]",
+        "Panes not shown; the conversation and the account control always are.",
+    ),
+    field(
+        "layout.collapsed_panes",
+        FieldKind::PaneSet(&["rooms", "details"]),
+        "[]",
+        "Panes shown as a narrow strip with a restore control.",
+    ),
+    field(
         "notifications.enabled",
         Bool,
         "true",
@@ -1970,6 +1992,23 @@ pub const SETTING_TARGETS: &[SettingTarget] = &[
             "density",
             "compact",
             "spacious",
+        ],
+    ),
+    target(
+        "layout.arrangement",
+        "Layout",
+        "Settings › Layout › Pane arrangement",
+        "Pane arrangement",
+        "Presets, pane order, and hiding or collapsing the Space rail, room list and details panel.",
+        &[
+            "arrangement",
+            "pane order",
+            "reorder",
+            "hide panel",
+            "collapse",
+            "restore layout",
+            "workspace",
+            "preset",
         ],
     ),
     target(

@@ -71,6 +71,8 @@ pub enum Problem {
     UnknownShortcutAction,
     Shortcut(&'static str),
     ShortcutConflict,
+    PaneOrder,
+    PaneVisibility,
 }
 
 impl Problem {
@@ -89,6 +91,8 @@ impl Problem {
             Self::UnknownShortcutAction => "unknown-shortcut-action",
             Self::Shortcut(_) => "invalid-shortcut",
             Self::ShortcutConflict => "shortcut-conflict",
+            Self::PaneOrder => "invalid-pane-order",
+            Self::PaneVisibility => "invalid-pane-visibility",
         }
     }
 }
@@ -124,6 +128,12 @@ impl std::fmt::Display for Problem {
             Self::UnknownShortcutAction => formatter.write_str("names an unknown shortcut action"),
             Self::Shortcut(reason) => formatter.write_str(reason),
             Self::ShortcutConflict => formatter.write_str("conflicts with another shortcut"),
+            Self::PaneOrder => formatter.write_str(
+                "must list spaces, rooms, conversation and details once each, or be empty",
+            ),
+            Self::PaneVisibility => formatter.write_str(
+                "must name each pane at most once; the conversation is always shown and only rooms and details can collapse",
+            ),
         }
     }
 }
@@ -272,6 +282,7 @@ impl Config {
         )?;
         validate_shortcuts(&self.shortcuts)?;
         self.media.validate_audio_devices()?;
+        self.layout.validate_panes()?;
         for overrides in self.account_overrides.values() {
             for (field, rooms) in [
                 ("local_voice_rooms", &overrides.local_voice_rooms),
@@ -1145,6 +1156,141 @@ pub struct Layout {
     pub room_density: Option<Density>,
     /// Timeline message spacing density; omission follows `appearance.density`.
     pub message_density: Option<Density>,
+    /// Left-to-right order of the four workspace panes by stable ID. Empty
+    /// follows `details_side` (spaces, rooms, then the conversation and the
+    /// details panel on that side). Each pane appears exactly once.
+    pub pane_order: Vec<PaneId>,
+    /// Panes that are not shown. The conversation is always shown; the
+    /// active-account control and a layout restore stay reachable.
+    pub hidden_panes: Vec<PaneId>,
+    /// Panes shown as a narrow strip with a restore control: rooms, details.
+    pub collapsed_panes: Vec<PaneId>,
+}
+
+/// Stable IDs of the workspace panes, as written in `config.toml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneId {
+    /// The Space rail (icon rail navigation).
+    Spaces,
+    /// The room list (and, with sidebar navigation, its Space sections).
+    Rooms,
+    /// The conversation, call stage, settings and search area.
+    Conversation,
+    /// The details panel: members, threads and files.
+    Details,
+}
+
+impl PaneId {
+    pub const ALL: [Self; 4] = [Self::Spaces, Self::Rooms, Self::Conversation, Self::Details];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Spaces => "spaces",
+            Self::Rooms => "rooms",
+            Self::Conversation => "conversation",
+            Self::Details => "details",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Spaces => "Space rail",
+            Self::Rooms => "Room list",
+            Self::Conversation => "Conversation",
+            Self::Details => "Details panel",
+        }
+    }
+
+    /// Whether this pane may be hidden (everything but the conversation).
+    pub fn can_hide(self) -> bool {
+        self != Self::Conversation
+    }
+
+    /// Whether this pane may collapse to a narrow strip.
+    pub fn can_collapse(self) -> bool {
+        matches!(self, Self::Rooms | Self::Details)
+    }
+}
+
+impl Layout {
+    /// The order panes are laid out in, left to right: `pane_order` when it
+    /// is set, else the arrangement `details_side` describes.
+    pub fn effective_pane_order(&self) -> [PaneId; 4] {
+        if let Ok(order) = <[PaneId; 4]>::try_from(self.pane_order.as_slice())
+            && valid_pane_order(&order)
+        {
+            return order;
+        }
+        match self.details_side {
+            DetailsSide::Right => [
+                PaneId::Spaces,
+                PaneId::Rooms,
+                PaneId::Conversation,
+                PaneId::Details,
+            ],
+            DetailsSide::Left => [
+                PaneId::Spaces,
+                PaneId::Rooms,
+                PaneId::Details,
+                PaneId::Conversation,
+            ],
+        }
+    }
+
+    pub fn pane_hidden(&self, pane: PaneId) -> bool {
+        pane.can_hide() && self.hidden_panes.contains(&pane)
+    }
+
+    pub fn pane_collapsed(&self, pane: PaneId) -> bool {
+        pane.can_collapse() && !self.pane_hidden(pane) && self.collapsed_panes.contains(&pane)
+    }
+
+    /// Back to the default arrangement: no custom order, nothing hidden or
+    /// collapsed. Widths, side and navigation are unchanged. Returns whether
+    /// anything changed.
+    pub fn restore_default_panes(&mut self) -> bool {
+        let changed = !self.pane_order.is_empty()
+            || !self.hidden_panes.is_empty()
+            || !self.collapsed_panes.is_empty();
+        self.pane_order.clear();
+        self.hidden_panes.clear();
+        self.collapsed_panes.clear();
+        changed
+    }
+
+    fn validate_panes(&self) -> Result<(), ConfigError> {
+        if !self.pane_order.is_empty() {
+            let valid = <[PaneId; 4]>::try_from(self.pane_order.as_slice())
+                .is_ok_and(|order| valid_pane_order(&order));
+            if !valid {
+                return Err(field_error("layout.pane_order", Problem::PaneOrder));
+            }
+        }
+        let distinct = |panes: &[PaneId]| {
+            panes
+                .iter()
+                .enumerate()
+                .all(|(index, pane)| !panes[..index].contains(pane))
+        };
+        if !distinct(&self.hidden_panes) || self.hidden_panes.iter().any(|pane| !pane.can_hide()) {
+            return Err(field_error("layout.hidden_panes", Problem::PaneVisibility));
+        }
+        if !distinct(&self.collapsed_panes)
+            || self
+                .collapsed_panes
+                .iter()
+                .any(|pane| !pane.can_collapse())
+        {
+            return Err(field_error("layout.collapsed_panes", Problem::PaneVisibility));
+        }
+        Ok(())
+    }
+}
+
+/// Every pane exactly once.
+fn valid_pane_order(order: &[PaneId; 4]) -> bool {
+    PaneId::ALL.iter().all(|pane| order.contains(pane))
 }
 
 /// Where the details panel sits. Navigation and the account control stay in
@@ -1171,6 +1317,9 @@ impl Default for Layout {
             direct_messages_first: false,
             room_density: None,
             message_density: None,
+            pane_order: Vec::new(),
+            hidden_panes: Vec::new(),
+            collapsed_panes: Vec::new(),
         }
     }
 }
@@ -4015,6 +4164,97 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pane_arrangements_validate_and_keep_older_files_working() {
+        // An older file without the new keys keeps today's arrangement.
+        let older: Config =
+            toml::from_str("schema_version = 1\n[layout]\ndetails_side = 'left'\n").unwrap();
+        older.validate().unwrap();
+        assert_eq!(
+            older.layout.effective_pane_order(),
+            [
+                PaneId::Spaces,
+                PaneId::Rooms,
+                PaneId::Details,
+                PaneId::Conversation
+            ]
+        );
+        assert_eq!(
+            Config::default().layout.effective_pane_order(),
+            [
+                PaneId::Spaces,
+                PaneId::Rooms,
+                PaneId::Conversation,
+                PaneId::Details
+            ]
+        );
+        let field = |layout: Layout| match (Config {
+            layout,
+            ..Config::default()
+        })
+        .validate()
+        {
+            Err(ConfigError::Field { field, problem }) => Some((field, problem)),
+            Ok(()) => None,
+            Err(_) => Some(("other".into(), Problem::PaneOrder)),
+        };
+        let order = |panes: &[PaneId]| Layout {
+            pane_order: panes.to_vec(),
+            ..Layout::default()
+        };
+        // Missing, duplicate and partial orders are refused.
+        for invalid in [
+            &[PaneId::Rooms][..],
+            &[PaneId::Rooms, PaneId::Rooms, PaneId::Conversation, PaneId::Details],
+            &[PaneId::Spaces, PaneId::Rooms, PaneId::Conversation],
+        ] {
+            assert_eq!(
+                field(order(invalid)),
+                Some(("layout.pane_order".into(), Problem::PaneOrder))
+            );
+        }
+        let custom = order(&[
+            PaneId::Conversation,
+            PaneId::Details,
+            PaneId::Rooms,
+            PaneId::Spaces,
+        ]);
+        assert_eq!(field(custom.clone()), None);
+        assert_eq!(custom.effective_pane_order()[0], PaneId::Conversation);
+        // The conversation can never be hidden; a pane appears once; only the
+        // room list and details panel collapse.
+        let hidden = |panes: &[PaneId]| Layout {
+            hidden_panes: panes.to_vec(),
+            ..Layout::default()
+        };
+        assert!(field(hidden(&[PaneId::Conversation])).is_some());
+        assert!(field(hidden(&[PaneId::Rooms, PaneId::Rooms])).is_some());
+        assert_eq!(field(hidden(&[PaneId::Spaces, PaneId::Rooms, PaneId::Details])), None);
+        let collapsed = Layout {
+            collapsed_panes: vec![PaneId::Spaces],
+            ..Layout::default()
+        };
+        assert_eq!(
+            field(collapsed),
+            Some(("layout.collapsed_panes".into(), Problem::PaneVisibility))
+        );
+        // A hidden pane is not also collapsed; restoring clears all three.
+        let mut both = Layout {
+            hidden_panes: vec![PaneId::Rooms],
+            collapsed_panes: vec![PaneId::Rooms],
+            ..custom
+        };
+        assert!(both.pane_hidden(PaneId::Rooms) && !both.pane_collapsed(PaneId::Rooms));
+        assert!(both.restore_default_panes());
+        assert_eq!(both.effective_pane_order(), Config::default().layout.effective_pane_order());
+        assert!(!both.restore_default_panes());
+        // Unknown pane names are rejected by the schema itself.
+        assert!(
+            toml::from_str::<Config>("schema_version = 1\n[layout]\nhidden_panes = ['members']\n")
+                .is_err()
+        );
+    }
+
     /// `registry::FIELDS` is what the schema output and documentation print,
     /// so it must not drift from the real schema and validator.
     #[test]
@@ -4176,6 +4416,24 @@ mod tests {
                         vec!["[\"not a room\"]".into()],
                     ),
                     FieldKind::Table => (vec!["\"Mod+J\"".into()], vec!["\"Tab\"".into()]),
+                    FieldKind::PaneOrder => (
+                        vec![
+                            "[]".into(),
+                            "[\"details\", \"conversation\", \"rooms\", \"spaces\"]".into(),
+                        ],
+                        vec![
+                            "[\"rooms\"]".into(),
+                            "[\"rooms\", \"rooms\", \"conversation\", \"details\"]".into(),
+                            "[\"spaces\", \"rooms\", \"conversation\", \"members\"]".into(),
+                        ],
+                    ),
+                    FieldKind::PaneSet(values) => (
+                        vec!["[]".into(), format!("[\"{}\"]", values[0])],
+                        vec![
+                            "[\"conversation\"]".into(),
+                            format!("[\"{0}\", \"{0}\"]", values[0]),
+                        ],
+                    ),
                 };
                 for value in &good {
                     assert!(check(value), "{} {name} should accept {value}", field.key);

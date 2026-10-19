@@ -19,6 +19,19 @@ export { RoomOrganizationState } from "room-organization.slint";
 import { DeviceSessionRow, DeviceSessionsPanel, DeviceSessionsView } from "device-sessions.slint";
 
 // One Settings search result. `id` is a registry target ID, never a path or URL.
+// One row of the pane arrangement editor, in the current order.
+export struct LayoutPaneItem {
+    // Stable config ID: spaces, rooms, conversation or details.
+    id: string,
+    label: string,
+    hidden: bool,
+    collapsed: bool,
+    can-hide: bool,
+    can-collapse: bool,
+    can-move-up: bool,
+    can-move-down: bool,
+}
+
 export struct SettingsResult {
     id: string,
     label: string,
@@ -2827,10 +2840,11 @@ export component AppWindow inherits Window {
     title: "Morpheus";
     preferred-width: 1310px;
     preferred-height: 820px;
-    // Derive the minimum from saved pane sizes, not the window width. A
-    // width-dependent pane constraint creates a layout-info binding cycle.
-    min-width: max(940px, (root.navigation-mode == 0 ? root.rail-width-px * 1px : 0px) + root.room-list-width * 1px
-        + (root.show-side-panel && root.page == 0 ? root.details-width * 1px : 0px) + 360px);
+    // A fixed floor, never derived from the window width (that would be a
+    // layout-info binding cycle). Narrower than the saved panes, the
+    // arrangement falls back: details, then the room list, then the Space
+    // rail give way; the conversation and the account control always stay.
+    min-width: 640px;
     min-height: 620px;
 
     in-out property <[AccountItem]> accounts;
@@ -2962,6 +2976,56 @@ export component AppWindow inherits Window {
     in-out property <int> message-density-mode: 1;
     // 0 right, 1 left of the conversation.
     in-out property <int> details-side: 0;
+    // Workspace pane arrangement (Rust projects config.toml [layout]):
+    // left-to-right slot of each pane, and what is hidden or collapsed.
+    in-out property <int> pane-slot-spaces: 0;
+    in-out property <int> pane-slot-rooms: 1;
+    in-out property <int> pane-slot-conversation: 2;
+    in-out property <int> pane-slot-details: 3;
+    in-out property <bool> pane-spaces-hidden: false;
+    in-out property <bool> pane-rooms-hidden: false;
+    in-out property <bool> pane-rooms-collapsed: false;
+    in-out property <bool> pane-details-hidden: false;
+    in-out property <bool> pane-details-collapsed: false;
+    // Any custom order, hidden or collapsed pane (offers Restore).
+    in-out property <bool> layout-customized: false;
+    // The advanced editor's rows, in the current order.
+    in-out property <[LayoutPaneItem]> layout-panes;
+    in-out property <int> layout-preset: 0;
+    // Geometry. Mirrors workspace_layout::arrange in Rust (tested there).
+    property <length> pane-strip: 28px;
+    property <length> pane-conversation-min: 360px;
+    out property <length> account-column-width: 64px;
+    out property <length> account-trigger-height: max(69px, 38px * root.text-scale + 24px);
+    property <length> pane-rail-w0: root.navigation-mode == 0 && !root.pane-spaces-hidden ? root.rail-width-px * 1px : 0px;
+    property <length> pane-rooms-full: root.room-list-width * 1px;
+    property <length> pane-rooms-w0: root.pane-rooms-hidden ? 0px : root.pane-rooms-collapsed ? root.pane-strip : root.pane-rooms-full;
+    property <bool> pane-details-open: root.show-side-panel && root.page == 0 && !root.pane-details-hidden;
+    property <length> pane-details-w0: !root.pane-details-open ? 0px : root.pane-details-collapsed ? root.pane-strip : root.details-width * 1px;
+    // The room list leads when only the Space rail may come before it.
+    property <bool> pane-rooms-leads: root.pane-slot-rooms < root.pane-slot-conversation && root.pane-slot-rooms < root.pane-slot-details;
+    property <bool> pane-column0: !(root.pane-rooms-leads && root.pane-rooms-w0 == root.pane-rooms-full);
+    property <length> pane-avail0: root.width - (root.pane-column0 ? root.account-column-width : 0px);
+    out property <length> pane-details-w: root.pane-avail0 - root.pane-rail-w0 - root.pane-rooms-w0 - root.pane-details-w0 >= root.pane-conversation-min ? root.pane-details-w0
+        : root.pane-details-w0 > 0px && root.pane-avail0 - root.pane-rail-w0 - root.pane-rooms-w0 - root.pane-strip >= root.pane-conversation-min ? root.pane-strip : 0px;
+    out property <length> pane-rooms-w: root.pane-avail0 - root.pane-rail-w0 - root.pane-rooms-w0 - root.pane-details-w >= root.pane-conversation-min ? root.pane-rooms-w0
+        : root.pane-rooms-w0 > 0px && root.pane-avail0 - root.pane-rail-w0 - root.pane-strip - root.pane-details-w >= root.pane-conversation-min ? root.pane-strip : 0px;
+    // The account control gets its own column unless the room list leads at
+    // full width; it is never hidden.
+    out property <bool> account-column: root.pane-column0 || root.pane-rooms-w != root.pane-rooms-full;
+    property <length> pane-avail: root.width - (root.account-column ? root.account-column-width : 0px);
+    out property <length> pane-rail-w: root.pane-avail - root.pane-rail-w0 - root.pane-rooms-w - root.pane-details-w >= root.pane-conversation-min ? root.pane-rail-w0 : 0px;
+    out property <length> pane-conversation-w: max(0px, root.pane-avail - root.pane-rail-w - root.pane-rooms-w - root.pane-details-w);
+    out property <length> account-corner-x: root.account-column ? 0px : root.pane-x(root.pane-slot-rooms);
+    out property <length> account-corner-width: root.account-column ? root.account-column-width : root.pane-rooms-w;
+    // A pane's left edge: the account column, then every pane before it.
+    pure function pane-x(slot: int) -> length {
+        (root.account-column ? root.account-column-width : 0px)
+            + (root.pane-slot-spaces < slot ? root.pane-rail-w : 0px)
+            + (root.pane-slot-rooms < slot ? root.pane-rooms-w : 0px)
+            + (root.pane-slot-conversation < slot ? root.pane-conversation-w : 0px)
+            + (root.pane-slot-details < slot ? root.pane-details-w : 0px)
+    }
     in-out property <bool> direct-messages-first: false;
     // -1 when the pane follows density-mode, else that pane's own density.
     in-out property <int> room-density-choice: -1;
@@ -3670,6 +3734,15 @@ export component AppWindow inherits Window {
     callback return-to-live();
     callback load-newer-focused();
     callback join-discovery-target(string, string, string, string, bool);
+    // Pane arrangement edits (stable pane IDs: spaces, rooms, conversation,
+    // details); Rust validates and saves them to config.toml [layout].
+    callback move-pane(string, int);
+    callback set-pane-hidden(string, bool);
+    callback set-pane-collapsed(string, bool);
+    callback choose-layout-preset(int);
+    callback restore-default-layout();
+    callback reset-pane-order();
+    callback reset-pane-visibility();
     callback toggle-native-microphone();
     callback toggle-native-deafen();
     callback refresh-native-capture-sources(int);
@@ -4110,12 +4183,25 @@ export component AppWindow inherits Window {
         if root.dispatch-shortcut(event.text, event.modifiers.control, event.modifiers.alt, event.modifiers.shift, event.modifiers.meta) { accept } else { reject }
     }
 
-    HorizontalLayout {
-        spacing: 0px;
+    // Workspace panes. Each pane is one element placed by the arrangement
+    // (pane-x, pane-*-w below), never re-created by reordering, resizing,
+    // hiding or collapsing, so timelines, drafts, scroll and focus stay.
+
+        // The account control's own column, when the room list does not lead.
+        if root.account-column : Rectangle {
+            x: 0px; y: 0px; width: root.account-column-width; height: parent.height;
+            background: root.window-rail;
+            border-color: root.divider; border-width: StyleTokens.line-width;
+        }
 
         // Space and navigation rail (the default presentation).
         if root.navigation-mode == 0 : Rectangle {
-            width: root.rail-width-px * 1px;
+            x: root.pane-x(root.pane-slot-spaces);
+            y: 0px;
+            width: root.pane-rail-w;
+            height: parent.height;
+            visible: root.pane-rail-w > 0px;
+            clip: true;
             background: root.window-rail;
             VerticalLayout {
                 padding: 6px;
@@ -4226,9 +4312,14 @@ export component AppWindow inherits Window {
             }
         }
 
-        // Room list and bottom-left account control.
+        // Room list. The account control is drawn at the window's bottom left.
         Rectangle {
-            width: root.room-list-width * 1px;
+            x: root.pane-x(root.pane-slot-rooms);
+            y: 0px;
+            width: root.pane-rooms-w;
+            height: parent.height;
+            visible: root.pane-rooms-w > 0px;
+            clip: true;
             background: root.window-sidebar;
             VerticalLayout {
                 spacing: 0px;
@@ -4516,183 +4607,38 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                Rectangle { height: StyleTokens.line-width; background: root.divider; }
-                account-trigger := ActionRect {
-                    height: max(69px, 38px * root.text-scale + 24px);
-                    background: root.window-rail;
-                    focus-color: root.accent;
-                    label: "Account menu for " + root.active-account-name + ", " + root.active-account-handle;
-                    accessible-expanded: root.account-menu-open;
-                    activated => { root.account-menu-open = !root.account-menu-open; }
-                    HorizontalLayout {
-                        padding-left: 11px;
-                        padding-right: 11px;
-                        padding-top: 15px;
-                        padding-bottom: 15px;
-                        spacing: 10px;
-                        VerticalLayout { width: 38px; alignment: center; AvatarBadge { initials: root.active-account-initials; accent: root.active-account-accent; } }
-                        VerticalLayout {
-                            alignment: center;
-                            spacing: 2px;
-                            horizontal-stretch: 1;
-                            Text { text: root.active-account-name; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; overflow: elide; }
-                            Text { text: root.active-account-handle; color: root.muted; font-size: 11px * root.text-scale; overflow: elide; }
-                        }
-                        Text { text: "⌃"; color: root.muted; font-size: 16px * root.text-scale; vertical-alignment: center; }
-                    }
-                }
+                // The account control is drawn at the window's bottom left
+                // (see account-corner); in the default arrangement it sits
+                // here, over this reserved space.
+                Rectangle { height: root.account-column ? 0px : root.account-trigger-height + StyleTokens.line-width; }
             }
-
-            // Drawn after the sidebar so it opens upward over the room list.
-            if root.account-menu-open : Rectangle {
-                x: 9px;
-                y: parent.height - self.height - account-trigger.height - 5px;
-                width: parent.width - 18px;
-                height: min(parent.height - account-trigger.height - 14px, 170px + root.account-options.length * (max(42px, 30px * root.text-scale + 12px) + 2px));
-                background: root.elevated;
+            // Collapsed (or squeezed by a narrow window): a strip that restores it.
+            if root.pane-rooms-w > 0px && root.pane-rooms-w <= root.pane-strip : Rectangle {
+                background: root.window-sidebar;
                 border-color: root.divider;
                 border-width: StyleTokens.line-width;
-                border-radius: StyleTokens.radius * 1.2;
-                drop-shadow-color: StyleTokens.roles.shadow.present ? StyleTokens.roles.shadow.color : #00000044;
-                drop-shadow-blur: 18px;
-                drop-shadow-offset-y: 7px;
-                // Opt-in decorative fade-in: immediate at 0 ms and under reduced motion.
-                property <bool> entered: false;
-                // Opacity is first read here, at 0, so setting `entered` animates it;
-                // `init` would set it before that first read and nothing would fade.
-                Timer { interval: 1ms; running: !parent.entered && parent.opacity < 1; triggered => { parent.entered = true; } }
-                opacity: StyleTokens.popup-duration == 0ms || self.entered ? 1 : 0;
-                animate opacity { duration: StyleTokens.popup-duration; easing: ease-out; }
-                VerticalLayout {
-                    padding: 8px;
-                    spacing: 2px;
-                    Text {
-                        text: root.account-switch-pending ? "SWITCHING…" : "SWITCH ACCOUNT";
-                        color: root.muted;
-                        font-size: 10px * root.text-scale;
-                        font-weight: 750;
-                        letter-spacing: 1px;
-                        height: 22px;
-                        vertical-alignment: center;
-                    }
-                    ScrollView {
-                        vertical-stretch: 1;
-                        horizontal-scrollbar-policy: always-off;
-                        VerticalLayout {
-                            width: parent.width;
-                            spacing: 2px;
-                    for account[index] in root.account-options : account-choice := ActionRect {
-                        height: max(42px, 30px * root.text-scale + 12px);
-                        border-radius: StyleTokens.radius * 0.8;
-                        background: account.index == root.active-account-index ? root.hover : root.control-fill(self.has-hover, self.has-pressed, transparent);
-                        focus-color: root.accent;
-                        cancel-on-escape: true;
-                        label: "Switch to " + account.name + ", " + account.handle;
-                        enabled: !root.account-switch-pending;
-                        // Repeater children become focusable after initialization; defer one tick.
-                        Timer {
-                            interval: 1ms;
-                            running: index == 0;
-                            triggered => { self.running = false; account-choice.focus(); }
-                        }
-                        cancelled => { root.account-menu-open = false; account-trigger.focus(); }
-                        activated => {
-                            if root.call-connected {
-                                root.pending-account-index = account.index;
-                                root.leave-call-dialog = true;
-                                root.account-menu-open = false;
-                            } else {
-                                root.switch-account(account.index);
-                                root.account-menu-open = false;
-                                account-trigger.focus();
-                            }
-                        }
-                        HorizontalLayout {
-                            padding-left: 5px;
-                            padding-right: 5px;
-                            padding-top: 6px;
-                            padding-bottom: 6px;
-                            spacing: 9px;
-                            VerticalLayout { width: 30px; alignment: center; AvatarBadge { width: 30px; height: 30px; built-in-radius: StyleTokens.radius * 1.0; initials: account.initials; accent: account.accent; } }
-                            VerticalLayout {
-                                alignment: center;
-                                spacing: 1px;
-                                horizontal-stretch: 1;
-                                Text { text: account.name; color: root.ink; font-size: 12px * root.text-scale; font-weight: 650; overflow: elide; }
-                                Text { text: account.handle; color: root.muted; font-size: 10px * root.text-scale; overflow: elide; }
-                            }
-                            if account.index == root.active-account-index : Text { text: "✓"; color: root.accent; font-size: 15px * root.text-scale; vertical-alignment: center; }
-                        }
-                    }
-                        }
-                    }
-                    Rectangle { height: StyleTokens.line-width; background: root.divider; }
-                    add-account-choice := ActionRect {
-                        height: 35px;
-                        border-radius: StyleTokens.radius * 0.8;
-                        background: root.control-fill(self.has-hover, self.has-pressed, transparent);
-                        focus-color: root.accent;
-                        cancel-on-escape: true;
-                        label: "Add another Matrix account";
-                        Timer {
-                            interval: 1ms;
-                            running: root.account-options.length == 0;
-                            triggered => { self.running = false; add-account-choice.focus(); }
-                        }
-                        cancelled => { root.account-menu-open = false; account-trigger.focus(); }
-                        activated => {
-                            if root.call-connected {
-                                root.pending-account-index = -2;
-                                root.leave-call-dialog = true;
-                                root.account-menu-open = false;
-                            } else {
-                                root.add-account();
-                                root.account-menu-open = false;
-                            }
-                        }
-                        Text { x: 9px; text: "+   Add an account"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; }
-                    }
-                    ActionRect {
-                        height: 35px;
-                        border-radius: StyleTokens.radius * 0.8;
-                        background: root.control-fill(self.has-hover, self.has-pressed, transparent);
-                        focus-color: root.accent;
-                        cancel-on-escape: true;
-                        label: "Manage accounts";
-                        cancelled => { root.account-menu-open = false; account-trigger.focus(); }
-                        activated => { root.manage-accounts-open = true; root.manage-accounts(); root.account-menu-open = false; }
-                        Text { x: 9px; text: "⚙   Manage accounts"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; }
-                    }
-                    ActionRect {
-                        height: 35px;
-                        border-radius: StyleTokens.radius * 0.8;
-                        background: root.control-fill(self.has-hover, self.has-pressed, transparent);
-                        focus-color: root.accent;
-                        cancel-on-escape: true;
-                        label: "Log out of current Matrix account";
-                        cancelled => { root.account-menu-open = false; account-trigger.focus(); }
-                        activated => {
-                            // Rust captures the exact selection before it opens
-                            // a leave-call confirmation or starts async logout.
-                            root.log-out(); root.account-menu-open = false;
-                        }
-                        Text { x: 9px; text: "↪   Log out"; color: StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : #e47483; font-size: 12px * root.text-scale; vertical-alignment: center; }
-                    }
+                IconAction {
+                    x: (parent.width - self.width) / 2; y: 12px;
+                    width: max(24px, parent.width - 4px); height: 40px;
+                    icon: "»";
+                    label: root.pane-rooms-collapsed ? "Show the room list" : "The window is too narrow for the room list";
+                    enabled: root.pane-rooms-collapsed;
+                    ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                    activated => { root.set-pane-collapsed("rooms", false); }
                 }
             }
         }
 
-        // The conversation and the details panel share this area, which only
-        // the layout sizes. Both are placed over it below, so the panel can
-        // sit on either side while tab and reading order stay the same.
+        // The conversation's place in the arrangement. The conversation and
+        // the details panel are drawn over their own places below, so tab and
+        // reading order stay the same whatever the order on screen.
         main-area := Rectangle {
-            horizontal-stretch: 1;
-            // Match the independent conversation minimum used by the Window.
-            // Long room content must not push the fixed details pane offscreen.
-            min-width: 360px + self.panel-width;
-            property <length> panel-width: root.show-side-panel && root.page == 0 ? root.details-width * 1px : 0px;
+            x: root.pane-x(root.pane-slot-conversation);
+            y: 0px;
+            width: root.pane-conversation-w;
+            height: parent.height;
+            property <length> panel-width: 0px;
         }
-    }
 
         // Conversation, settings, and call stage share the main canvas.
         Rectangle {
@@ -7339,6 +7285,99 @@ export component AppWindow inherits Window {
                                 IconAction { icon: "+"; label: "Widen details panel"; ink: root.ink; surface: root.panel; hover-surface: root.hover; activated => { root.change-details-width(root.details-width + 20); } }
                             }
                         }
+                        // Pane arrangement: presets first, then the full editor.
+                        Text { text: "Pane arrangement"; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; }
+                        HorizontalLayout {
+                            spacing: 8px; alignment: start;
+                            for preset[index] in ["Standard", "Focused", "Conversation first", "Minimal"] : TextAction {
+                                height: 36px * root.text-scale; vertical-stretch: 0;
+                                property <int> reveal-request: index == 0 ? root.reveal-request("layout.arrangement") : 0;
+                                // Keyboard focus and search share the same bounded reveal.
+                                changed has-focus => {
+                                    if self.has-focus {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    }
+                                }
+                                changed reveal-request => {
+                                    if self.reveal-request > 0 {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                        self.focus();
+                                        if self.has-focus { root.settings-revealed-id = "layout.arrangement"; }
+                                    }
+                                }
+                                text: preset;
+                                label: "Pane arrangement preset: " + preset + (root.layout-preset == index ? ", selected" : "");
+                                ink: root.ink; muted: root.muted; surface: root.layout-preset == index ? root.hover : root.elevated;
+                                hover-surface: root.hover; outline: root.layout-preset == index ? root.accent : root.divider; text-scale: root.text-scale;
+                                activated => { root.choose-layout-preset(index); }
+                            }
+                        }
+                        Text {
+                            text: "Standard is the classic order. Focused hides the Space rail and collapses the room list. Conversation first puts the room list on the right. Minimal shows only the conversation and details. The account control stays at the bottom left in every arrangement.";
+                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                        }
+                        for pane in root.layout-panes : Rectangle {
+                            height: max(48px, 30px * root.text-scale + 18px); border-radius: StyleTokens.radius * 1; background: root.elevated;
+                            HorizontalLayout {
+                                padding-left: 16px; padding-right: 10px; spacing: 6px;
+                                Text {
+                                    text: pane.label + (pane.hidden ? " · hidden" : pane.collapsed ? " · collapsed" : "");
+                                    color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; overflow: elide;
+                                }
+                                IconAction {
+                                    icon: "↑"; label: "Move " + pane.label + " left";
+                                    enabled: pane.can-move-up;
+                                    ink: root.ink; surface: root.panel; hover-surface: root.hover;
+                                    activated => { root.move-pane(pane.id, -1); }
+                                }
+                                IconAction {
+                                    icon: "↓"; label: "Move " + pane.label + " right";
+                                    enabled: pane.can-move-down;
+                                    ink: root.ink; surface: root.panel; hover-surface: root.hover;
+                                    activated => { root.move-pane(pane.id, 1); }
+                                }
+                                if pane.can-collapse : TextAction {
+                                    height: 32px * root.text-scale; vertical-stretch: 0;
+                                    text: pane.collapsed ? "Expand" : "Collapse";
+                                    label: (pane.collapsed ? "Expand " : "Collapse ") + pane.label;
+                                    enabled: !pane.hidden;
+                                    ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                                    activated => { root.set-pane-collapsed(pane.id, !pane.collapsed); }
+                                }
+                                if pane.can-hide : TextAction {
+                                    height: 32px * root.text-scale; vertical-stretch: 0;
+                                    text: pane.hidden ? "Show" : "Hide";
+                                    label: (pane.hidden ? "Show " : "Hide ") + pane.label;
+                                    ink: root.ink; muted: root.muted; surface: root.panel; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                                    activated => { root.set-pane-hidden(pane.id, !pane.hidden); }
+                                }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 8px; alignment: start;
+                            TextAction {
+                                height: 34px * root.text-scale; vertical-stretch: 0;
+                                text: "Reset order"; label: "Reset the pane order to follow the details side";
+                                ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                                activated => { root.reset-pane-order(); }
+                            }
+                            TextAction {
+                                height: 34px * root.text-scale; vertical-stretch: 0;
+                                text: "Show all panes"; label: "Show and expand every pane";
+                                ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                                activated => { root.reset-pane-visibility(); }
+                            }
+                            TextAction {
+                                height: 34px * root.text-scale; vertical-stretch: 0;
+                                text: "Restore default layout"; label: "Restore the default pane layout";
+                                ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                                activated => { root.restore-default-layout(); }
+                            }
+                        }
+                        Text {
+                            text: "Stored in config.toml [layout] as pane_order, hidden_panes and collapsed_panes. A narrow window gives way details first, then the room list, then the Space rail; the conversation always stays.";
+                            color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
+                        }
                         Rectangle {
                             height: 70px; border-radius: StyleTokens.radius * 1; background: root.elevated;
                             HorizontalLayout {
@@ -8239,10 +8278,12 @@ export component AppWindow inherits Window {
         }
 
         if root.show-side-panel && root.page == 0 : Rectangle {
-            x: root.details-side == 1 ? main-area.x : main-area.x + main-area.width - self.width;
+            x: root.pane-x(root.pane-slot-details);
             y: main-area.y;
             height: main-area.height;
-            width: root.details-width * 1px;
+            width: root.pane-details-w;
+            visible: root.pane-details-w > 0px;
+            clip: true;
             background: root.window-panel;
             // Opt-in decorative fade-in: immediate at 0 ms and under reduced motion.
             property <bool> entered: false;
@@ -8990,6 +9031,217 @@ export component AppWindow inherits Window {
                     action(kind, id, choice) => { root.transfer-action(kind, id, choice); }
                     clear-finished => { root.clear-finished-transfers(); }
                     revealed => { root.settings-revealed-id = "files.transfers"; }
+                }
+            }
+            // Collapsed (or squeezed by a narrow window): a strip that restores it.
+            if root.pane-details-w <= root.pane-strip : Rectangle {
+                background: root.window-panel;
+                IconAction {
+                    x: (parent.width - self.width) / 2; y: 12px;
+                    width: max(24px, parent.width - 4px); height: 40px;
+                    icon: "«";
+                    label: root.pane-details-collapsed ? "Show the details panel" : "The window is too narrow for the details panel";
+                    enabled: root.pane-details-collapsed;
+                    ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+                    activated => { root.set-pane-collapsed("details", false); }
+                }
+            }
+        }
+
+        // The active account's control, always at the window's bottom left:
+        // over the room list's reserved space when the room list leads the
+        // arrangement at full width, otherwise in its own narrow column.
+        account-corner := Rectangle {
+            x: root.account-corner-x;
+            y: parent.height - self.height;
+            width: root.account-corner-width;
+            height: root.account-trigger-height + StyleTokens.line-width;
+            background: root.account-column ? root.window-rail : root.window-sidebar;
+            VerticalLayout {
+                spacing: 0px;
+                Rectangle { height: StyleTokens.line-width; background: root.divider; }
+                account-trigger := ActionRect {
+                    height: max(69px, 38px * root.text-scale + 24px);
+                    background: root.window-rail;
+                    focus-color: root.accent;
+                    label: "Account menu for " + root.active-account-name + ", " + root.active-account-handle;
+                    accessible-expanded: root.account-menu-open;
+                    activated => { root.account-menu-open = !root.account-menu-open; }
+                    HorizontalLayout {
+                        padding-left: 11px;
+                        padding-right: 11px;
+                        padding-top: 15px;
+                        padding-bottom: 15px;
+                        spacing: 10px;
+                        VerticalLayout { width: 38px; alignment: center; AvatarBadge { initials: root.active-account-initials; accent: root.active-account-accent; } }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 2px;
+                            horizontal-stretch: 1;
+                            Text { text: root.active-account-name; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; overflow: elide; }
+                            Text { text: root.active-account-handle; color: root.muted; font-size: 11px * root.text-scale; overflow: elide; }
+                        }
+                        Text { visible: account-corner.width >= 120px; text: "⌃"; color: root.muted; font-size: 16px * root.text-scale; vertical-alignment: center; }
+                    }
+                }
+            }
+        }
+        // A restore for any customized arrangement, beside the account
+        // control in its column, so a usable layout is one keypress away.
+        if root.account-column && root.layout-customized : IconAction {
+            x: root.account-corner-x + (root.account-column-width - self.width) / 2;
+            y: account-corner.y - self.height - 6px;
+            width: 44px; height: 40px;
+            icon: "▣";
+            label: "Restore the default pane layout";
+            ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+            activated => { root.restore-default-layout(); }
+        }
+        // Settings stays one click away when no rail shows its route button.
+        if root.account-column && root.pane-rail-w == 0px : IconAction {
+            x: root.account-corner-x + (root.account-column-width - self.width) / 2;
+            y: account-corner.y - (root.layout-customized ? 92px : 46px);
+            width: 44px; height: 40px;
+            icon: "⚙";
+            label: "Open settings";
+            ink: root.icon-ink; surface: transparent; hover-surface: root.hover;
+            activated => { root.page = 1; root.open-security(); }
+        }
+
+        // Drawn after every pane so it opens upward over them.
+        if root.account-menu-open : Rectangle {
+            x: root.account-corner-x + 9px;
+            y: parent.height - self.height - account-trigger.height - 5px;
+            width: max(root.account-corner-width, 280px) - 18px;
+            height: min(parent.height - account-trigger.height - 14px, 170px + root.account-options.length * (max(42px, 30px * root.text-scale + 12px) + 2px));
+            background: root.elevated;
+            border-color: root.divider;
+            border-width: StyleTokens.line-width;
+            border-radius: StyleTokens.radius * 1.2;
+            drop-shadow-color: StyleTokens.roles.shadow.present ? StyleTokens.roles.shadow.color : #00000044;
+            drop-shadow-blur: 18px;
+            drop-shadow-offset-y: 7px;
+            // Opt-in decorative fade-in: immediate at 0 ms and under reduced motion.
+            property <bool> entered: false;
+            // Opacity is first read here, at 0, so setting `entered` animates it;
+            // `init` would set it before that first read and nothing would fade.
+            Timer { interval: 1ms; running: !parent.entered && parent.opacity < 1; triggered => { parent.entered = true; } }
+            opacity: StyleTokens.popup-duration == 0ms || self.entered ? 1 : 0;
+            animate opacity { duration: StyleTokens.popup-duration; easing: ease-out; }
+            VerticalLayout {
+                padding: 8px;
+                spacing: 2px;
+                Text {
+                    text: root.account-switch-pending ? "SWITCHING…" : "SWITCH ACCOUNT";
+                    color: root.muted;
+                    font-size: 10px * root.text-scale;
+                    font-weight: 750;
+                    letter-spacing: 1px;
+                    height: 22px;
+                    vertical-alignment: center;
+                }
+                ScrollView {
+                    vertical-stretch: 1;
+                    horizontal-scrollbar-policy: always-off;
+                    VerticalLayout {
+                        width: parent.width;
+                        spacing: 2px;
+                for account[index] in root.account-options : account-choice := ActionRect {
+                    height: max(42px, 30px * root.text-scale + 12px);
+                    border-radius: StyleTokens.radius * 0.8;
+                    background: account.index == root.active-account-index ? root.hover : root.control-fill(self.has-hover, self.has-pressed, transparent);
+                    focus-color: root.accent;
+                    cancel-on-escape: true;
+                    label: "Switch to " + account.name + ", " + account.handle;
+                    enabled: !root.account-switch-pending;
+                    // Repeater children become focusable after initialization; defer one tick.
+                    Timer {
+                        interval: 1ms;
+                        running: index == 0;
+                        triggered => { self.running = false; account-choice.focus(); }
+                    }
+                    cancelled => { root.account-menu-open = false; account-trigger.focus(); }
+                    activated => {
+                        if root.call-connected {
+                            root.pending-account-index = account.index;
+                            root.leave-call-dialog = true;
+                            root.account-menu-open = false;
+                        } else {
+                            root.switch-account(account.index);
+                            root.account-menu-open = false;
+                            account-trigger.focus();
+                        }
+                    }
+                    HorizontalLayout {
+                        padding-left: 5px;
+                        padding-right: 5px;
+                        padding-top: 6px;
+                        padding-bottom: 6px;
+                        spacing: 9px;
+                        VerticalLayout { width: 30px; alignment: center; AvatarBadge { width: 30px; height: 30px; built-in-radius: StyleTokens.radius * 1.0; initials: account.initials; accent: account.accent; } }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 1px;
+                            horizontal-stretch: 1;
+                            Text { text: account.name; color: root.ink; font-size: 12px * root.text-scale; font-weight: 650; overflow: elide; }
+                            Text { text: account.handle; color: root.muted; font-size: 10px * root.text-scale; overflow: elide; }
+                        }
+                        if account.index == root.active-account-index : Text { text: "✓"; color: root.accent; font-size: 15px * root.text-scale; vertical-alignment: center; }
+                    }
+                }
+                    }
+                }
+                Rectangle { height: StyleTokens.line-width; background: root.divider; }
+                add-account-choice := ActionRect {
+                    height: 35px;
+                    border-radius: StyleTokens.radius * 0.8;
+                    background: root.control-fill(self.has-hover, self.has-pressed, transparent);
+                    focus-color: root.accent;
+                    cancel-on-escape: true;
+                    label: "Add another Matrix account";
+                    Timer {
+                        interval: 1ms;
+                        running: root.account-options.length == 0;
+                        triggered => { self.running = false; add-account-choice.focus(); }
+                    }
+                    cancelled => { root.account-menu-open = false; account-trigger.focus(); }
+                    activated => {
+                        if root.call-connected {
+                            root.pending-account-index = -2;
+                            root.leave-call-dialog = true;
+                            root.account-menu-open = false;
+                        } else {
+                            root.add-account();
+                            root.account-menu-open = false;
+                        }
+                    }
+                    Text { x: 9px; text: "+   Add an account"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; }
+                }
+                ActionRect {
+                    height: 35px;
+                    border-radius: StyleTokens.radius * 0.8;
+                    background: root.control-fill(self.has-hover, self.has-pressed, transparent);
+                    focus-color: root.accent;
+                    cancel-on-escape: true;
+                    label: "Manage accounts";
+                    cancelled => { root.account-menu-open = false; account-trigger.focus(); }
+                    activated => { root.manage-accounts-open = true; root.manage-accounts(); root.account-menu-open = false; }
+                    Text { x: 9px; text: "⚙   Manage accounts"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; }
+                }
+                ActionRect {
+                    height: 35px;
+                    border-radius: StyleTokens.radius * 0.8;
+                    background: root.control-fill(self.has-hover, self.has-pressed, transparent);
+                    focus-color: root.accent;
+                    cancel-on-escape: true;
+                    label: "Log out of current Matrix account";
+                    cancelled => { root.account-menu-open = false; account-trigger.focus(); }
+                    activated => {
+                        // Rust captures the exact selection before it opens
+                        // a leave-call confirmation or starts async logout.
+                        root.log-out(); root.account-menu-open = false;
+                    }
+                    Text { x: 9px; text: "↪   Log out"; color: StyleTokens.roles.destructive.present ? StyleTokens.roles.destructive.color : #e47483; font-size: 12px * root.text-scale; vertical-alignment: center; }
                 }
             }
         }

@@ -101,6 +101,14 @@ const SECTION_KEYS: &[(&str, &[&str])] = &[
     ("appearance.font_scale", &["appearance.scale_percent"]),
     ("appearance.sender_colors", &["senders.colors"]),
     ("layout.unread_first", &["layout.sort_unread_first"]),
+    (
+        "layout.arrangement",
+        &[
+            "layout.pane_order",
+            "layout.hidden_panes",
+            "layout.collapsed_panes",
+        ],
+    ),
     ("notifications.desktop", &["notifications.enabled"]),
     (
         "notifications.previews",

@@ -201,6 +201,11 @@ fn kind_json(kind: FieldKind) -> Value {
         FieldKind::TextList => json!({ "type": "string-list" }),
         FieldKind::RoomIdList => json!({ "type": "room-id-list" }),
         FieldKind::Table => json!({ "type": "table" }),
+        FieldKind::PaneOrder => json!({
+            "type": "pane-order",
+            "values": morpheus_config::PaneId::ALL.map(morpheus_config::PaneId::id),
+        }),
+        FieldKind::PaneSet(values) => json!({ "type": "pane-set", "values": values }),
     }
 }
 

@@ -79,6 +79,14 @@ pub const CODES: &[(&str, &str)] = &[
         "shortcut-conflict",
         "Two shortcuts with the same key combination.",
     ),
+    (
+        "invalid-pane-order",
+        "A pane order that does not name every workspace pane once.",
+    ),
+    (
+        "invalid-pane-visibility",
+        "A hidden or collapsed pane list that repeats a pane or names one that cannot be hidden or collapsed.",
+    ),
     ("invalid", "Another validation failure."),
 ];
 
@@ -708,6 +716,8 @@ mod tests {
             crate::Problem::UnknownShortcutAction,
             crate::Problem::Shortcut("reason"),
             crate::Problem::ShortcutConflict,
+            crate::Problem::PaneOrder,
+            crate::Problem::PaneVisibility,
         ] {
             assert!(documented(problem.code()), "{}", problem.code());
         }

@@ -175,6 +175,33 @@ hide every navigation surface or the account control, and the protected
 account switch, logout and Manage accounts actions keep their existing
 confirmations. Starting points keep these choices.
 
+### Pane arrangement
+
+```toml
+[layout]
+pane_order = ["spaces", "conversation", "details", "rooms"]  # each pane once; [] follows details_side
+hidden_panes = ["spaces"]        # any of spaces, rooms, details; never conversation
+collapsed_panes = ["details"]    # rooms or details: a narrow strip with a restore control
+```
+
+The four pane IDs are stable: `spaces` (the icon rail), `rooms` (the room
+list), `conversation` (conversation, call stage, settings and search) and
+`details` (members, threads and files). An empty `pane_order` keeps the
+classic order with the details panel on `details_side`. Settings › Layout ›
+Pane arrangement offers Standard, Focused, Conversation first and Minimal
+presets, per-pane move, hide and collapse, Reset order, Show all panes and
+Restore default layout.
+
+The active account's control always stays at the bottom left: over the room
+list when it comes first at full width, otherwise in its own narrow column,
+which also offers Restore whenever the arrangement is customized. A window
+narrower than the saved panes gives way details first (to a strip, then away),
+then the room list, then the Space rail; the conversation keeps at least
+360 px. Panes are moved, never rebuilt, so timelines, drafts, scroll position
+and focus survive any change. Dialogs, call indicators and security, recovery
+and password screens are not part of any pane and are never hidden. An invalid
+edit is rejected and the last valid arrangement stays in effect.
+
 ## Keyboard shortcuts
 
 **Settings → Keyboard shortcuts** lists every action with its combination and
