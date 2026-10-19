@@ -54,6 +54,8 @@ component ViewerAction inherits Rectangle {
     in property <bool> glyph: false;
     in property <ViewerPalette> palette;
     in property <ViewerStyle> style;
+    // The resting surface; hover and pressed states draw over it.
+    in property <color> idle-surface: transparent;
     in property <float> text-scale: 1;
     out property <bool> has-focus: keyboard-focus.has-focus;
     callback activated();
@@ -67,7 +69,7 @@ component ViewerAction inherits Rectangle {
         || (hit.has-hover && root.palette.hover-set));
     background: root.enabled && hit.pressed && (root.palette.pressed-set || !root.primary) ? root.palette.pressed
         : root.enabled && hit.has-hover && (root.palette.hover-set || !root.primary) ? root.palette.hover
-        : root.primary && root.enabled ? root.palette.accent : transparent;
+        : root.primary && root.enabled ? root.palette.accent : root.idle-surface;
     opacity: root.enabled || root.palette.disabled-set ? 1 : 0.45;
     forward-focus: keyboard-focus;
     accessible-role: button;
@@ -381,7 +383,7 @@ export component MediaViewer inherits Rectangle {
                         palette: root.palette;
                         style: root.style;
                         text-scale: root.text-scale;
-                        background: root.palette.surface;
+                        idle-surface: root.palette.surface;
                         activated => { root.previous(); }
                     }
                     next-action := ViewerAction {
@@ -395,7 +397,7 @@ export component MediaViewer inherits Rectangle {
                         palette: root.palette;
                         style: root.style;
                         text-scale: root.text-scale;
-                        background: root.palette.surface;
+                        idle-surface: root.palette.surface;
                         activated => { root.next(); }
                     }
                 }
