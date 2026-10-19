@@ -40,3 +40,28 @@ All original identifier bytes, encrypted vectors and assertions are preserved.
 This distinguishes public identity data from credential assignments for the
 unchanged default secret scanner. There are no scanner exclusions or suppressions.
 The provenance record lists the affected files and their original hashes.
+
+
+## Poll end authorization
+
+The timeline retains the end event sender and its checked moderation
+permission through pending aggregation replay. An end affects a poll only
+when its sender created that poll or has known permission to redact other
+users events. Unreadable or missing permission state grants no moderator
+powers; a poll creator can still close their own poll. Local moderator ends
+wait for their remote echo before affecting another users poll.
+
+Invalid ends and redundant valid ends leave the item intact, rather than
+aborting pending aggregation replay and dropping later votes. The earliest
+valid end by server timestamp wins even when it arrives later. Existing
+redaction-of-end limitations remain; this patch does not add reversible
+poll ends.
+
+The eight timeline source/test files are listed in the provenance record;
+original upstream hashes and the SDK pin, manifest, features and license are
+unchanged. Focused source regressions cover unauthorized and moderator ends,
+relations received before the start, duplicate pending ends and earlier
+valid timestamps. Full source review and isolated hosted verification are
+required before accepting this patch.
+
+Protocol reference: [MSC3381](https://github.com/matrix-org/matrix-spec-proposals/blob/main/proposals/3381-polls.md).

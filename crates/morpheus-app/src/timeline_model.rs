@@ -163,6 +163,21 @@ pub(crate) fn item_of_event(model: &ModelRc<MessageItem>, event_id: &str) -> Opt
     model.row_data(index_of_event(model, event_id)?)
 }
 
+/// The stored row for a sent event, without projecting any row. Controllers
+/// check a click against the snapshot the person actually saw.
+pub(crate) fn info_of_event(
+    model: &ModelRc<MessageItem>,
+    event_id: &str,
+) -> Option<Arc<MessageInfo>> {
+    let model = model.as_any().downcast_ref::<TimelineModel>()?;
+    model
+        .rows
+        .borrow()
+        .iter()
+        .find(|row| row.event_id.as_deref() == Some(event_id))
+        .cloned()
+}
+
 // Owned fixtures also exercise the value-equality fallback: a rebuilt row can
 // be equal even when it has a different allocation from the previous snapshot.
 #[cfg(test)]
@@ -206,6 +221,7 @@ pub(crate) mod tests {
             body,
             attachment_name: None,
             attachment_is_image: false,
+            poll: None,
             reply_preview: None,
             reaction_summary: String::new(),
             timestamp_ms: 0,

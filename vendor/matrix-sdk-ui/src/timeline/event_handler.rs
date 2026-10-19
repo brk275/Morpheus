@@ -113,6 +113,9 @@ impl Flow {
 
 pub(super) struct TimelineEventContext {
     pub(super) sender: OwnedUserId,
+    /// Permission captured when this end event was received, not when its
+    /// target poll eventually appears. False for unknown permissions.
+    pub(super) sender_can_redact_others: bool,
     pub(super) sender_profile: Option<Profile>,
     /// If the keys used to decrypt this event were shared-on-invite as part of
     /// an [MSC4268] key bundle, the user ID of the forwarder.
@@ -219,6 +222,10 @@ pub(super) enum TimelineAction {
 }
 
 impl TimelineAction {
+    pub(super) fn ends_poll(&self) -> bool {
+        matches!(self, Self::HandleAggregation { kind: HandleAggregationKind::PollEnd, .. })
+    }
+
     /// Create a new [`TimelineEventKind::AddItem`].
     fn add_item(content: TimelineItemContent) -> Self {
         Self::AddItem { content }
@@ -817,8 +824,11 @@ impl<'a, 'o> TimelineEventHandler<'a, 'o> {
 
     fn handle_poll_end(&mut self, poll_event_id: OwnedEventId) {
         let target = TimelineEventItemId::EventId(poll_event_id);
-        let aggregation =
-            self.new_aggregation(AggregationKind::PollEnd { end_date: self.ctx.timestamp });
+        let aggregation = self.new_aggregation(AggregationKind::PollEnd {
+            end_date: self.ctx.timestamp,
+            sender: self.ctx.sender.clone(),
+            sender_can_redact_others: self.ctx.sender_can_redact_others,
+        });
         self.meta.aggregations.add(target.clone(), aggregation.clone());
         find_item_and_apply_aggregation(
             &self.meta.aggregations,

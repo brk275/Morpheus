@@ -581,6 +581,18 @@ mod tests {
                     .await,
                 Err(MatrixCoreError::SelectedAccountChanged)
             ));
+            // Poll actions use the exact selection too: old UI work must not
+            // acquire a fresh room or send as the same account after A -> B -> A.
+            assert!(matches!(
+                manager
+                    .vote_poll_for(&stale, room, None, None, event, &["choice".into()])
+                    .await,
+                Err(PollError::AccountChanged)
+            ));
+            assert!(matches!(
+                manager.end_poll_for(&stale, room, None, None, event).await,
+                Err(PollError::AccountChanged)
+            ));
             // The current selection searches its own (empty) room set and
             // reports no further page.
             let current = manager.account_selection(&account.id).unwrap();

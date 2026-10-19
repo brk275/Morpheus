@@ -750,9 +750,17 @@
   "modified_upstream_files": [
     "Cargo.toml",
     "src/room_list_service/mod.rs",
+    "src/timeline/controller/aggregations.rs",
+    "src/timeline/controller/state.rs",
+    "src/timeline/controller/state_transaction.rs",
+    "src/timeline/event_handler.rs",
+    "src/timeline/event_item/content/polls.rs",
     "src/timeline/tests/encryption.rs",
+    "src/timeline/tests/mod.rs",
+    "src/timeline/tests/polls.rs",
     "src/timeline/tests/read_receipts.rs",
     "src/timeline/tests/shields.rs",
+    "src/timeline/traits.rs",
     "tests/integration/timeline/decryption.rs",
     "tests/integration/timeline/replies.rs"
   ],

@@ -1472,6 +1472,7 @@ mod tests {
             rich_accessible: None,
             attachment_name: None,
             attachment_is_image: false,
+            poll: None,
             reply_preview: None,
             reaction_summary: String::new(),
             timestamp_ms: 0,

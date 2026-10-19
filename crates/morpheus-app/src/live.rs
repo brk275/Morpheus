@@ -3661,6 +3661,8 @@ fn clear_account_context(ui: &AppWindow, security_gate: &crate::security::Securi
     // revoked here. Its call tiles, pictures and roster must not wait for
     // the asynchronous stage presenter.
     crate::call_stage::clear_private_presentation(ui);
+    // Poll drafts, pending votes and the create dialog end with the account.
+    crate::polls::clear_presentation(ui);
     ui.set_room_actions_open(false);
     ui.set_room_action_busy(false);
     ui.set_room_action_error("".into());
@@ -3910,6 +3912,7 @@ pub(super) fn message_item(info: &MessageInfo) -> MessageItem {
         attachment: info.attachment_name.as_deref().unwrap_or("").into(),
         attachment_is_image: info.attachment_is_image,
         reaction: info.reaction_summary.as_str().into(),
+        poll: crate::polls::poll_card(info),
         accent: accent(&info.sender),
     }
 }
@@ -4035,6 +4038,7 @@ mod member_tests {
             rich_accessible: Some("Visible bold text".into()),
             attachment_name: None,
             attachment_is_image: false,
+            poll: None,
             reply_preview: None,
             reaction_summary: String::new(),
             timestamp_ms: 0,

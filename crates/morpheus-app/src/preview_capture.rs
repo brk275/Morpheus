@@ -380,6 +380,7 @@ fn reset_capture_overlays(ui: &AppWindow) {
     ui.set_leave_call_dialog(false);
     ui.set_quick_switcher_open(false);
     ui.set_image_preview_open(false);
+    ui.set_poll_dialog_open(false);
     ui.set_thread_root_id("".into());
     ui.set_thread_send_pending(false);
     ui.set_thread_pending_blocked(false);

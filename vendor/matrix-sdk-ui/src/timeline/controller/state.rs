@@ -169,6 +169,9 @@ impl<P: RoomDataProvider> TimelineState<P> {
 
         let ctx = TimelineEventContext {
             sender: own_user_id,
+            // A moderator ending another persons poll waits for its remote
+            // echo and the same checked permission as any received end.
+            sender_can_redact_others: false,
             sender_profile: own_profile,
             forwarder: None,
             forwarder_profile: None,

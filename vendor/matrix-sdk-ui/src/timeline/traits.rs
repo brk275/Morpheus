@@ -103,6 +103,13 @@ pub(super) trait RoomDataProvider:
     fn own_user_id(&self) -> &UserId;
     fn room_version_rules(&self) -> RoomVersionRules;
 
+    /// Known permission to close another persons poll (MSC3381).
+    /// Unknown or unreadable permissions must not grant this authority.
+    fn user_can_redact_others<'a>(
+        &'a self,
+        user_id: &'a UserId,
+    ) -> impl Future<Output = bool> + SendOutsideWasm + 'a;
+
     fn crypto_context_info(&self)
     -> impl Future<Output = CryptoContextInfo> + SendOutsideWasm + '_;
 
@@ -162,6 +169,14 @@ pub(super) trait RoomDataProvider:
 }
 
 impl RoomDataProvider for Room {
+    async fn user_can_redact_others<'a>(&'a self, user_id: &'a UserId) -> bool {
+        // Do not turn a store/parse failure into guessed moderator powers.
+        (**self)
+            .power_levels()
+            .await
+            .is_ok_and(|levels| levels.user_can_redact_event_of_other(user_id))
+    }
+
     fn room_id(&self) -> &RoomId {
         (**self).room_id()
     }
