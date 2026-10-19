@@ -104,9 +104,11 @@ attachment is decrypted for the selected account and rejects an oversized
 declared size when present. It is written only to a path selected by the user.
 Saves started from a message wait in the account's transfer center, one in
 memory at a time. They are bound to the account selection rather than the
-room, hold the account-switch guard through an atomic local write, and replace
-an existing file only when the native Save dialog confirmed it; otherwise the
-final rename refuses to overwrite. Morpheus builds the media request with Ruma
+room, hold the account-switch guard through the local write, and publish only
+under a new name. Existing entries are never overwritten, including ones that
+appear after the Save dialog closes. A name conflict offers Retry with another
+destination; the dialog path is not treated as proof of overwrite consent.
+Morpheus builds the media request with Ruma
 and downloads through
 a dedicated HTTP client with automatic redirects disabled. Each 307/308 target
 is checked before the next request; cross-origin targets must be public-looking

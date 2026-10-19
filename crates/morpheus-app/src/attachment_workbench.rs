@@ -22,8 +22,8 @@
 //! the account's rooms; leaving the account stops them. The bounded local
 //! write, guarded by the core against account changes, is never interrupted
 //! halfway, so the reported outcome is always what happened on disk. A file
-//! is replaced only when the user chose it in the Save dialog, which asked
-//! first. Nothing is opened afterwards.
+//! is saved only under a new name; existing entries are never replaced.
+//! Nothing is opened afterwards.
 //!
 //! The transfer center lists the visible account's uploads in every room,
 //! its downloads and the transfers that recently ended, by name only: no
@@ -236,8 +236,6 @@ struct DownloadJob {
     room_id: String,
     event_id: String,
     path: PathBuf,
-    /// The Save dialog confirmed replacing a file that already existed.
-    replace: bool,
     operation: i32,
 }
 
@@ -538,9 +536,6 @@ impl Workbench {
         {
             return false;
         }
-        // The dialog asked before letting the user pick an existing file.
-        // One that appears after it closed is never replaced.
-        let replace = path.exists();
         let operation = ui.get_download_operation().wrapping_add(1);
         ui.set_download_operation(operation);
         if room_id == visible_room {
@@ -570,7 +565,6 @@ impl Workbench {
             room_id: room_id.to_owned(),
             event_id: event_id.to_owned(),
             path,
-            replace,
             operation,
         };
         let owner = self.clone();
@@ -621,7 +615,6 @@ impl Workbench {
                 &job.selection,
                 job.path.clone(),
                 downloaded.bytes,
-                job.replace,
                 cancelled,
             )
             .await
@@ -1600,7 +1593,7 @@ fn download_failure(error: &MatrixCoreError) -> &'static str {
         | MatrixCoreError::SelectedRoomChanged
         | MatrixCoreError::AccountNotFound(_) => "The account changed; nothing was written.",
         MatrixCoreError::Io(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            "A file with that name appeared in the folder; it was not replaced."
+            "That name is already in use. Retry and choose a different name; nothing was replaced."
         }
         MatrixCoreError::Io(error) if error.kind() == io::ErrorKind::PermissionDenied => {
             "That folder can't be written to; nothing was saved."
@@ -1981,7 +1974,7 @@ mod tests {
         let exists = io::Error::new(io::ErrorKind::AlreadyExists, secret);
         assert_eq!(
             download_failure(&MatrixCoreError::Io(exists)),
-            "A file with that name appeared in the folder; it was not replaced."
+            "That name is already in use. Retry and choose a different name; nothing was replaced."
         );
         assert_eq!(
             server_too_large(10_000_000),

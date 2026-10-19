@@ -3234,24 +3234,20 @@ impl LiveUi {
 
     /// Commit a transfer-center download while this exact account selection
     /// stays current. Account switching waits for the bounded local write.
-    /// An existing file is replaced only when `replace` says the user chose
-    /// it in the Save dialog, which asked first; a file that appeared later
-    /// is never overwritten.
+    /// Publication refuses existing destinations, including entries that
+    /// appeared or changed after the Save dialog closed.
     pub async fn save_download_selected(
         &self,
         selection: &AccountSelection,
         path: PathBuf,
         bytes: Vec<u8>,
-        replace: bool,
         cancelled: &tokio::sync::watch::Receiver<bool>,
     ) -> Result<Option<PathBuf>, MatrixCoreError> {
         let _transition = self.account_transition.lock().await;
         self.require_selection(selection).await?;
         // Cancellation stays effective while waiting for the guard. Once
         // submitted, the real write is awaited and its outcome reported.
-        let Some(write) =
-            crate::attachments::begin_download_save_as(path, bytes, replace, cancelled)
-        else {
+        let Some(write) = begin_download_save(path, bytes, cancelled) else {
             return Ok(None);
         };
         write

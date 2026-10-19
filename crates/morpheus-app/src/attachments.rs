@@ -88,15 +88,10 @@ pub fn safe_file_name(name: &str) -> String {
 
 /// Called on the blocking pool after the account and room are checked again.
 /// A same-directory temporary file prevents a failed write from truncating a
-/// destination that the user chose in the native Save dialog.
+/// destination that the user chose in the native Save dialog. Publication
+/// refuses every existing entry, including symlinks. A dialog path alone
+/// cannot prove consent to replace the entry present at write time.
 pub fn save_download(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
-    save_download_as(path, bytes, true)
-}
-
-/// As `save_download`, replacing an existing destination only with `replace`.
-/// Without it a file that already exists is left untouched and the write
-/// fails with `AlreadyExists`; the temporary file is removed either way.
-pub fn save_download_as(path: &Path, bytes: &[u8], replace: bool) -> io::Result<PathBuf> {
     let directory = path
         .parent()
         .filter(|directory| !directory.as_os_str().is_empty())
@@ -104,13 +99,9 @@ pub fn save_download_as(path: &Path, bytes: &[u8], replace: bool) -> io::Result<
     let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
     temporary.write_all(bytes)?;
     temporary.as_file().sync_all()?;
-    if replace {
-        temporary.persist(path).map_err(|error| error.error)?;
-    } else {
-        temporary
-            .persist_noclobber(path)
-            .map_err(|error| error.error)?;
-    }
+    temporary
+        .persist_noclobber(path)
+        .map_err(|error| error.error)?;
     Ok(path.to_path_buf())
 }
 
@@ -132,47 +123,52 @@ pub(crate) fn begin_download_save(
     }))
 }
 
-/// As `begin_download_save`, with `save_download_as`'s replace rule.
-pub(crate) fn begin_download_save_as(
-    path: PathBuf,
-    bytes: Vec<u8>,
-    replace: bool,
-    cancelled: &tokio::sync::watch::Receiver<bool>,
-) -> Option<tokio::task::JoinHandle<io::Result<PathBuf>>> {
-    let stopped = cancelled.borrow();
-    if *stopped || cancelled.has_changed().is_err() {
-        return None;
-    }
-    Some(tokio::task::spawn_blocking(move || {
-        save_download_as(&path, &bytes, replace)
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn download_save_replaces_only_after_complete_write() {
+    fn download_save_never_overwrites_an_existing_entry() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("attachment.bin");
-        std::fs::write(&target, b"previous").unwrap();
-        save_download(&target, b"decrypted media").unwrap();
-        assert_eq!(std::fs::read(&target).unwrap(), b"decrypted media");
-        // Without the Save dialog's confirmation an existing file is never
-        // replaced, and no temporary file is left behind.
-        let kept = save_download_as(&target, b"unconfirmed", false).unwrap_err();
-        assert_eq!(kept.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(std::fs::read(&target).unwrap(), b"decrypted media");
+        // Covers an entry created after choosing an absent destination as
+        // well as one changed while the download was in flight.
+        std::fs::write(&target, b"newer local file").unwrap();
+        let error = save_download(&target, b"decrypted media").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&target).unwrap(), b"newer local file");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         let fresh = dir.path().join("fresh.bin");
-        assert_eq!(save_download_as(&fresh, b"new file", false).unwrap(), fresh);
+        assert_eq!(save_download(&fresh, b"new file").unwrap(), fresh);
         assert_eq!(std::fs::read(&fresh).unwrap(), b"new file");
         assert_eq!(mime_type_for(Path::new("photo.png")), "image/png");
         assert_eq!(
             mime_type_for(Path::new("unknown.oddextension")),
             "application/octet-stream"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn download_save_refuses_symlinks_including_dangling_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.bin");
+        std::fs::write(&original, b"private original").unwrap();
+        let selected = dir.path().join("selected.bin");
+        std::os::unix::fs::symlink(&original, &selected).unwrap();
+        assert_eq!(
+            save_download(&selected, b"new media").unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&original).unwrap(), b"private original");
+        std::fs::remove_file(&original).unwrap();
+        assert_eq!(
+            save_download(&selected, b"new media").unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert!(!original.exists());
+        assert!(std::fs::symlink_metadata(&selected).unwrap().is_symlink());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[tokio::test]
@@ -203,6 +199,7 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"original");
         // After admission cancellation cannot turn a real write into a claim
         // that nothing was written. Its caller must await this exact result.
+        let target = directory.path().join("fresh-admitted.bin");
         let (cancel, signal) = tokio::sync::watch::channel(false);
         let admitted =
             begin_download_save(target.clone(), b"admitted plaintext".to_vec(), &signal).unwrap();
