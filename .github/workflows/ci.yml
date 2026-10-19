@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
-name: Reviewed style profile UI fix check
-run-name: Style profile UI fix check - 36a15b9 - ${{ inputs.platform }}
+name: Reviewed native poll focused checks
+run-name: Native poll focused checks - 9eb5315 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: style-ui-fix-36a15b9-${{ github.ref }}
+  group: native-poll-focused-9eb5315-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
@@ -24,14 +24,14 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(inputs.platform == 'macos-arm64' && '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"}]}' || inputs.platform == 'macos-intel' && '{"include":[{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"}]}' || inputs.platform == 'windows' && '{"include":[{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"}]}' || inputs.platform == 'linux' && '{"include":[{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}' || '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"},{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"},{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"},{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}') }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 180
+    timeout-minutes: 240
     env:
       MORPHEUS_EXPECTED_OS: ${{ matrix.os }}
       MORPHEUS_EXPECTED_ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 36a15b99d917d11e2d465ef00047eba2caf7dd67
+          ref: 9eb5315f98e826c439e9870b0bc9fb898cb6bd69
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -135,7 +135,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='36a15b99d917d11e2d465ef00047eba2caf7dd67'
+          source='9eb5315f98e826c439e9870b0bc9fb898cb6bd69'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -272,7 +272,7 @@ jobs:
                   output.write(name+'='+value+'\n')
           print(json.dumps({'check':'msvc_environment','status':'passed','target':'x64','linker':'msvc'}))
       - name: Build native desktop and run existing unit and controller suites
-        timeout-minutes: 160
+        timeout-minutes: 220
         env:
           CARGO_BUILD_JOBS: "2"
           CARGO_INCREMENTAL: "0"
@@ -379,7 +379,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='36a15b99d917d11e2d465ef00047eba2caf7dd67'
+          source='9eb5315f98e826c439e9870b0bc9fb898cb6bd69'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -453,41 +453,15 @@ jobs:
               'sdk_extraction':'Cannot unpack native SDK archive entry',
               'sdk_cache_publish':'Cannot publish verified native SDK cache',
           }
-          needed_app={
-              'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
-              'config_cli::tests::the_schema_lists_every_field_token_and_code_from_the_registry',
-              'style_profiles::tests::summaries_describe_the_look_without_files_or_paths',
-              'style_profiles::tests::the_dialog_permit_admits_one_operation_at_a_time',
-              'timeline_model::tests::sparse_edits_across_ten_thousand_shared_rows_notify_only_changed_rows',
-          }
-          allowed_app_ignore={"outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction"}
-          needed_config={
-              'style_profiles::tests::a_profile_holds_the_look_only_and_round_trips_sparse_toml',
-              'style_profiles::tests::applying_replaces_the_look_and_keeps_everything_else',
-              'style_profiles::tests::the_documented_profile_schema_matches_the_profile_type',
-              'style_profiles::tests::unknown_keys_versions_and_values_are_rejected_without_repeating_them',
-              'style_profiles::tests::looks_compare_appearance_and_account_colors_only',
-              'style_profiles::tests::names_and_file_stems_are_bounded_and_safe',
-              'style_profiles::tests::the_store_creates_lists_renames_duplicates_and_deletes_safely',
-              'style_profiles::tests::invalid_files_are_listed_as_invalid_and_other_entries_are_skipped',
-              'style_profiles::tests::export_and_import_round_trip_and_replace_only_regular_files',
-          }
-          if os.environ['RUNNER_OS']=='Windows':
-              needed_config.add('style_profiles::tests::the_windows_folder_anchor_prevents_replacement_until_released')
-          else:
-              needed_config.update({
-                  'style_profiles::tests::a_fifo_open_is_nonblocking_and_never_read_as_a_profile',
-                  'style_profiles::tests::special_files_in_place_of_a_profile_are_refused',
-                  'style_profiles::tests::a_profiles_folder_replaced_by_a_link_is_never_followed',
-                  'style_profiles::tests::operations_stay_in_the_anchored_folder_when_its_path_is_swapped',
-                  'style_profiles::tests::links_are_never_followed_for_profiles_imports_or_exports',
-              })
-          # The other348app, config83, examples1 and UIcompile checks passed.
-          # Diagnose only the failed actual native generated UI case.
+          # Existing poll suites and actual generated UI privacy/account regression only.
           checks=[
-              ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls','--bin','morpheus-app',
-                  'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
-                  '--','--exact','--test-threads=1'],70*60,
+              ('sdk_poll',['cargo', 'test', '--locked', '-p', 'matrix-sdk-ui', '--lib', 'timeline::tests::polls::', '--', '--test-threads=1'],4200,
+                  {'timeline::tests::polls::morpheus_duplicate_pending_ends_do_not_stop_later_pending_votes', 'timeline::tests::polls::morpheus_earliest_valid_end_wins_even_when_received_later', 'timeline::tests::polls::morpheus_known_moderator_may_end_another_users_poll', 'timeline::tests::polls::morpheus_pending_invalid_end_does_not_drop_a_pending_vote', 'timeline::tests::polls::morpheus_pending_moderator_end_is_checked_when_start_arrives', 'timeline::tests::polls::morpheus_unauthorized_poll_end_keeps_poll_open_and_creator_can_end', 'timeline::tests::polls::test_a_somewhat_complex_voting_session_yields_the_expected_outcome', 'timeline::tests::polls::test_adding_response_doesnt_clear_latest_json_edit', 'timeline::tests::polls::test_edited_poll_is_displayed', 'timeline::tests::polls::test_ending_a_poll_sets_end_time_to_results', 'timeline::tests::polls::test_ending_poll_doesnt_clear_latest_json_edit', 'timeline::tests::polls::test_events_received_before_start_are_not_lost', 'timeline::tests::polls::test_multiple_end_events_are_discarded', 'timeline::tests::polls::test_only_the_last_vote_from_a_user_is_counted', 'timeline::tests::polls::test_poll_contains_relations', 'timeline::tests::polls::test_poll_is_displayed', 'timeline::tests::polls::test_votes_after_end_are_discarded', 'timeline::tests::polls::test_voting_adds_the_vote_to_the_results'},set()),
+              ('core_poll',['cargo', 'test', '--locked', '-p', 'morpheus-matrix', '--lib', 'polls::tests::', '--', '--test-threads=1'],4200,
+                  {'polls::tests::drafts_are_cleaned_and_bounded_before_anything_is_built', 'polls::tests::end_text_names_the_leaders_or_no_votes', 'polls::tests::projection_bounds_text_answers_and_selection_limit', 'polls::tests::revoked_poll_actions_release_pending_work_and_report_uncertain_sends', 'polls::tests::start_content_uses_the_aggregated_msc3381_shape', 'polls::tests::undisclosed_results_stay_withheld_until_the_poll_ends', 'polls::tests::unsupported_remote_answer_ids_are_not_truncated_into_vote_targets', 'polls::tests::votes_must_be_known_unique_within_the_limit_and_open'},set()),
+              ('app_poll',['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'polls::', '--', '--test-threads=1'],4200,
+                  {'polls::card::tests::ended_polls_show_final_results_and_offer_no_actions', 'polls::card::tests::only_sent_polls_can_be_voted_on_and_only_their_creator_ends_them', 'polls::card::tests::withheld_results_show_no_counts_or_bars'},set()),
+              ('app_account_ui',['cargo', 'test', '--locked', '-p', 'morpheus-app', '--features', 'native-calls', '--bin', 'morpheus-app', 'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation', '--', '--exact', '--test-threads=1'],4200,
                   {'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'},set()),
           ]
           all_passed=True
