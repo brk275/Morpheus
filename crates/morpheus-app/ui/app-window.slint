@@ -2204,6 +2204,8 @@ export component AppWindow inherits Window {
     in-out property <string> person-request-name;
     in-out property <string> person-request-flow;
     in-out property <string> person-request-dismissed;
+    in-out property <bool> person-request-busy;
+    in-out property <string> person-request-error;
     property <EncryptionPalette> encryption-palette: {
         ink: root.ink,
         muted: root.muted,
@@ -2512,6 +2514,7 @@ export component AppWindow inherits Window {
     callback verify-identity-warning();
     callback person-request-scope-changed();
     callback review-person-request();
+    callback decline-person-request();
 
     in-out property <bool> account-menu-open: false;
     in-out property <bool> manage-accounts-open: false;
@@ -3486,6 +3489,8 @@ export component AppWindow inherits Window {
                     palette: root.encryption-palette;
                     text-scale: root.text-scale;
                     name: root.person-request-name;
+                    busy: root.person-request-busy;
+                    error: root.person-request-error;
                     can-review: !root.sas-busy && !root.security-busy && root.security-recovery-key == "";
                     // The comparison runs in the verification panel in Security settings.
                     review => {
@@ -3494,6 +3499,7 @@ export component AppWindow inherits Window {
                         root.open-security();
                         root.settings-search-choose("security.recovery");
                     }
+                    decline => { root.decline-person-request(); }
                     dismiss => { root.person-request-dismissed = root.person-request-flow; }
                 }
                 if root.live-session && root.page == 0 && root.identity-warning-user != "" : IdentityWarningBanner {

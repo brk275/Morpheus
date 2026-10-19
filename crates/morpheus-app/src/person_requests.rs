@@ -1,7 +1,8 @@
 //! Verification requests other people send this account. One task follows
 //! the live account's requests under the selection captured for it and shows
 //! only the newest pending one; requests that end, expire or are cancelled
-//! retire. Nothing is accepted until the person chooses Review.
+//! retire. Nothing is accepted until the person chooses Review; Decline
+//! cancels the request for both people, and Not now only hides it here.
 
 use std::{
     sync::{
@@ -47,6 +48,10 @@ fn show(ui: &AppWindow, request: Option<&PersonVerificationRequest>) {
         ),
         None => ("", "", ""),
     };
+    if ui.get_person_request_flow().as_str() != flow {
+        ui.set_person_request_busy(false);
+        ui.set_person_request_error("".into());
+    }
     ui.set_person_request_user(user.into());
     ui.set_person_request_name(name.into());
     ui.set_person_request_flow(flow.into());
@@ -58,6 +63,8 @@ pub(crate) fn clear_ui(ui: &AppWindow) {
     stop_watcher();
     GENERATION.fetch_add(1, Ordering::AcqRel);
     show(ui, None);
+    ui.set_person_request_busy(false);
+    ui.set_person_request_error("".into());
     ui.set_person_request_dismissed("".into());
 }
 
@@ -122,6 +129,48 @@ pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
         if let Some(ui) = weak.upgrade() {
             follow(&ui, &follow_live, &follow_handle);
         }
+    });
+
+    let weak = ui.as_weak();
+    let decline_live = live.clone();
+    let decline_handle = handle.clone();
+    ui.on_decline_person_request(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let Some(account_id) = scope(&ui) else { return };
+        let user_id = ui.get_person_request_user().to_string();
+        let flow_id = ui.get_person_request_flow().to_string();
+        if user_id.is_empty() || flow_id.is_empty() || ui.get_person_request_busy() {
+            return;
+        }
+        ui.set_person_request_busy(true);
+        ui.set_person_request_error("".into());
+        let generation = GENERATION.load(Ordering::Acquire);
+        let live = decline_live.clone();
+        let weak = ui.as_weak();
+        decline_handle.spawn(async move {
+            let result = {
+                let _transition = live.account_transition.lock().await;
+                live.manager
+                    .decline_verification_for(&account_id, &user_id, &flow_id)
+                    .await
+            };
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                // Only the request that was declined, in the same account view.
+                if GENERATION.load(Ordering::Acquire) != generation
+                    || scope(&ui).as_deref() != Some(account_id.as_str())
+                    || ui.get_person_request_flow().as_str() != flow_id
+                {
+                    return;
+                }
+                ui.set_person_request_busy(false);
+                match result {
+                    Ok(()) => ui.set_person_request_dismissed(flow_id.into()),
+                    Err(_) => ui.set_person_request_error(
+                        "Could not decline. The request may have expired.".into(),
+                    ),
+                }
+            });
+        });
     });
 
     let weak = ui.as_weak();

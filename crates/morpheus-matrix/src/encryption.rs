@@ -473,6 +473,23 @@ impl AccountManager {
             .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
     }
 
+    /// Decline a verification request on this exact account. The SDK tells
+    /// the other side the user cancelled; nothing is signed or trusted.
+    pub async fn decline_verification_for(
+        &self,
+        expected_account_id: &str,
+        user_id: &str,
+        flow_id: &str,
+    ) -> Result<()> {
+        let state = self.state.lock().await;
+        let client = &selected_loaded_for(&state, expected_account_id)?.client;
+        find_verification_request(client, user_id, flow_id)
+            .await?
+            .cancel()
+            .await
+            .map_err(|error| MatrixCoreError::Sdk(error.to_string()))
+    }
+
     /// Request progress plus the reason a cancelled flow stopped, so the UI
     /// can say whether it timed out, was declined or the values differed.
     pub async fn verification_outcome_for(
