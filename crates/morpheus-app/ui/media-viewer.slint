@@ -1,0 +1,374 @@
+// Native viewer for one explicitly opened image attachment. Rust fetches and
+// decodes only on request, one at a time, and never prefetches neighbours;
+// this file lays out fit, zoom and pan and reports navigation, cancel, retry,
+// save and close. Zoom and pan change immediately, with no animation.
+
+export struct ViewerPalette {
+    ink: color,
+    muted: color,
+    accent: color,
+    accent-ink: color,
+    surface: color,
+    backdrop: color,
+    scrim: color,
+    hover: color,
+    focus: color,
+    error: color,
+}
+
+// A keyboard and pointer action with a text label.
+component ViewerAction inherits Rectangle {
+    in property <string> text;
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <bool> primary: false;
+    in property <ViewerPalette> palette;
+    in property <float> text-scale: 1;
+    out property <bool> has-focus: keyboard-focus.has-focus;
+    callback activated();
+    width: max(32px, action-text.preferred-width + 18px);
+    height: 30px;
+    border-radius: 7px;
+    background: root.primary && root.enabled ? root.palette.accent : (hit.has-hover && root.enabled ? root.palette.hover : transparent);
+    opacity: root.enabled ? 1 : 0.45;
+    forward-focus: keyboard-focus;
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-enabled: root.enabled;
+    accessible-action-default => {
+        if root.enabled { root.activated(); }
+    }
+    action-text := Text {
+        text: root.text;
+        color: root.primary && root.enabled ? root.palette.accent-ink : root.palette.ink;
+        font-size: 12px * root.text-scale;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+    keyboard-focus := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == Key.Space || event.text == Key.Return {
+                if root.enabled { root.activated(); }
+                accept
+            } else {
+                reject
+            }
+        }
+    }
+    hit := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => {
+            keyboard-focus.focus();
+            root.activated();
+        }
+    }
+    if keyboard-focus.has-focus : Rectangle {
+        border-radius: parent.border-radius;
+        border-width: 2px;
+        border-color: root.palette.focus;
+        background: transparent;
+    }
+}
+
+// The modal viewer. Escape closes; Tab moves between Close, Save and the
+// loading action; Left/Right open the previous/next loaded image, or pan
+// while zoomed; Up/Down pan; +, - and 0 zoom in, out and back to fit.
+export component MediaViewer inherits Rectangle {
+    in property <image> image;
+    in property <bool> loaded: false;
+    in property <bool> loading: false;
+    in property <bool> failed: false;
+    in property <string> title;
+    in property <string> status;
+    // "3 of 12" among the room's loaded images, or empty.
+    in property <string> position;
+    in property <bool> has-previous: false;
+    in property <bool> has-next: false;
+    in property <bool> can-save: false;
+    in property <ViewerPalette> palette;
+    in property <float> text-scale: 1;
+    callback close();
+    callback previous();
+    callback next();
+    callback cancel-loading();
+    callback retry();
+    callback save();
+
+    // Zoom is relative to fitting the whole picture: 1 shows all of it.
+    property <float> zoom: 1;
+    property <length> pan-x: 0px;
+    property <length> pan-y: 0px;
+    property <length> pan-step: 48px;
+    property <length> natural-width: root.image.width * 1px;
+    property <length> natural-height: root.image.height * 1px;
+    // Fit never enlarges a small picture past its own pixels.
+    property <float> fit-scale: root.natural-width <= 0px || root.natural-height <= 0px ? 1
+        : min(1, stage.width / root.natural-width, stage.height / root.natural-height);
+    property <length> shown-width: root.natural-width * root.fit-scale * root.zoom;
+    property <length> shown-height: root.natural-height * root.fit-scale * root.zoom;
+    property <length> pan-limit-x: max(0px, (root.shown-width - stage.width) / 2);
+    property <length> pan-limit-y: max(0px, (root.shown-height - stage.height) / 2);
+
+    changed image => { root.reset-view(); }
+
+    function reset-view() {
+        root.zoom = 1;
+        root.pan-x = 0px;
+        root.pan-y = 0px;
+    }
+
+    function zoom-by(factor: float) {
+        if root.loaded {
+            root.zoom = clamp(root.zoom * factor, 1, 8);
+            root.pan-to(root.pan-x, root.pan-y);
+        }
+    }
+
+    function pan-to(x: length, y: length) {
+        root.pan-x = clamp(x, -root.pan-limit-x, root.pan-limit-x);
+        root.pan-y = clamp(y, -root.pan-limit-y, root.pan-limit-y);
+    }
+
+    // Close → Save → loading action → Close, skipping disabled actions.
+    function tab(forward: bool) {
+        let can-load = root.loading || root.failed;
+        if save-action.has-focus {
+            if forward && can-load { load-action.focus(); } else { close-action.focus(); }
+        } else if load-action.has-focus {
+            if !forward && root.can-save { save-action.focus(); } else { close-action.focus(); }
+        } else if forward {
+            if root.can-save { save-action.focus(); } else if can-load { load-action.focus(); } else { close-action.focus(); }
+        } else {
+            if can-load { load-action.focus(); } else if root.can-save { save-action.focus(); } else { close-action.focus(); }
+        }
+    }
+
+    background: root.palette.scrim;
+
+    keys := FocusScope {
+        focus-on-tab-navigation: false;
+        init => { close-action.focus(); }
+        capture-key-pressed(event) => {
+            if event.text == Key.Escape {
+                root.close();
+                accept
+            } else if event.text == Key.Backtab || (event.text == Key.Tab && event.modifiers.shift) {
+                root.tab(false);
+                accept
+            } else if event.text == Key.Tab {
+                root.tab(true);
+                accept
+            } else {
+                reject
+            }
+        }
+        key-pressed(event) => {
+            if event.text == Key.LeftArrow {
+                if root.zoom > 1 { root.pan-to(root.pan-x + root.pan-step, root.pan-y); } else if root.has-previous { root.previous(); }
+                accept
+            } else if event.text == Key.RightArrow {
+                if root.zoom > 1 { root.pan-to(root.pan-x - root.pan-step, root.pan-y); } else if root.has-next { root.next(); }
+                accept
+            } else if event.text == Key.UpArrow {
+                root.pan-to(root.pan-x, root.pan-y + root.pan-step);
+                accept
+            } else if event.text == Key.DownArrow {
+                root.pan-to(root.pan-x, root.pan-y - root.pan-step);
+                accept
+            } else if event.text == "+" || event.text == "=" {
+                root.zoom-by(1.25);
+                accept
+            } else if event.text == "-" {
+                root.zoom-by(0.8);
+                accept
+            } else if event.text == "0" {
+                root.reset-view();
+                accept
+            } else {
+                reject
+            }
+        }
+
+        // Clicks outside the dialog do nothing; Escape or Close dismisses it.
+        TouchArea { }
+
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(1100px, parent.width - 48px);
+            height: min(820px, parent.height - 48px);
+            border-radius: 14px;
+            border-width: 1px;
+            border-color: root.palette.accent;
+            background: root.palette.surface;
+            accessible-role: region;
+            accessible-label: "Image preview " + root.title;
+            VerticalLayout {
+                padding: 16px;
+                spacing: 10px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: root.title;
+                        color: root.palette.ink;
+                        font-size: 15px * root.text-scale;
+                        font-weight: 700;
+                        overflow: elide;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    if root.position != "" : Text {
+                        text: root.position;
+                        color: root.palette.muted;
+                        font-size: 12px * root.text-scale;
+                        vertical-alignment: center;
+                        accessible-label: "Image " + root.position;
+                    }
+                    save-action := ViewerAction {
+                        text: "Save…";
+                        label: "Save " + root.title + " to a location you choose";
+                        enabled: root.can-save;
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        activated => { root.save(); }
+                    }
+                    close-action := ViewerAction {
+                        text: "Close";
+                        label: "Close image preview";
+                        primary: true;
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        activated => { root.close(); }
+                    }
+                }
+                stage := Rectangle {
+                    vertical-stretch: 1;
+                    background: root.palette.backdrop;
+                    border-radius: 9px;
+                    clip: true;
+                    if root.loaded : Image {
+                        x: (parent.width - self.width) / 2 + root.pan-x;
+                        y: (parent.height - self.height) / 2 + root.pan-y;
+                        width: root.shown-width;
+                        height: root.shown-height;
+                        source: root.image;
+                        image-fit: fill;
+                        accessible-role: image;
+                        accessible-label: "Attachment " + root.title;
+                    }
+                    if !root.loaded : Text {
+                        text: root.loading ? "Loading…" : "▧";
+                        color: root.palette.muted;
+                        font-size: root.loading ? 16px * root.text-scale : 54px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        accessible-role: none;
+                    }
+                    pointer := TouchArea {
+                        property <length> start-x;
+                        property <length> start-y;
+                        enabled: root.loaded;
+                        mouse-cursor: root.zoom > 1 ? (self.pressed ? MouseCursor.grabbing : MouseCursor.grab) : MouseCursor.default;
+                        pointer-event(event) => {
+                            if event.kind == PointerEventKind.down {
+                                self.start-x = root.pan-x;
+                                self.start-y = root.pan-y;
+                            }
+                        }
+                        moved => {
+                            if self.pressed && root.zoom > 1 {
+                                root.pan-to(self.start-x + self.mouse-x - self.pressed-x, self.start-y + self.mouse-y - self.pressed-y);
+                            }
+                        }
+                        double-clicked => {
+                            if root.zoom > 1 { root.reset-view(); } else { root.zoom-by(2); }
+                        }
+                        scroll-event(event) => {
+                            if event.delta-y > 0px {
+                                root.zoom-by(1.25);
+                                accept
+                            } else if event.delta-y < 0px {
+                                root.zoom-by(0.8);
+                                accept
+                            } else {
+                                reject
+                            }
+                        }
+                    }
+                    if root.has-previous : ViewerAction {
+                        x: 10px;
+                        y: (parent.height - self.height) / 2;
+                        text: "‹";
+                        label: "Previous image";
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        background: root.palette.surface;
+                        activated => { root.previous(); }
+                    }
+                    if root.has-next : ViewerAction {
+                        x: parent.width - self.width - 10px;
+                        y: (parent.height - self.height) / 2;
+                        text: "›";
+                        label: "Next image";
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        background: root.palette.surface;
+                        activated => { root.next(); }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: root.status;
+                        color: root.failed ? root.palette.error : root.palette.muted;
+                        font-size: 12px * root.text-scale;
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        accessible-label: "Image preview status: " + root.status;
+                        accessible-live-region: polite;
+                    }
+                    load-action := ViewerAction {
+                        visible: root.loading || root.failed;
+                        enabled: root.loading || root.failed;
+                        text: root.loading ? "Cancel" : "Try again";
+                        label: root.loading ? "Cancel loading this image" : "Try loading this image again";
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        activated => {
+                            if root.loading { root.cancel-loading(); } else { root.retry(); }
+                        }
+                    }
+                    ViewerAction {
+                        text: "−";
+                        label: "Zoom out";
+                        enabled: root.loaded && root.zoom > 1;
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        activated => { root.zoom-by(0.8); }
+                    }
+                    ViewerAction {
+                        text: round(root.zoom * root.fit-scale * 100) + "%";
+                        label: "Fit image to the window";
+                        enabled: root.loaded && root.zoom != 1;
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        activated => { root.reset-view(); }
+                    }
+                    ViewerAction {
+                        text: "+";
+                        label: "Zoom in";
+                        enabled: root.loaded && root.zoom < 8;
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        activated => { root.zoom-by(1.25); }
+                    }
+                }
+            }
+        }
+    }
+}

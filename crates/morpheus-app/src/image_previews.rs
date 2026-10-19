@@ -8,7 +8,7 @@ mod decode;
 use crate::{AppWindow, live::LiveUi};
 use morpheus_config::{Config, ConfigStore};
 use morpheus_matrix::{AccountManager, AccountSelection};
-use slint::ComponentHandle;
+use slint::{ComponentHandle, Model, SharedString};
 use std::{
     sync::{
         Arc, Mutex,
@@ -47,10 +47,13 @@ impl PreviewError {
             Self::Invalid => {
                 "This image could not be decoded safely. You can still save the attachment."
             }
-            Self::Busy => {
-                "The previous image is still being released. Close this viewer and try again shortly."
-            }
+            Self::Busy => "The previous image is still being released. Try again shortly.",
         }
+    }
+
+    /// Whether loading the same image again can succeed.
+    fn retryable(self) -> bool {
+        matches!(self, Self::Unavailable | Self::Busy)
     }
 }
 
@@ -130,11 +133,47 @@ fn clear(ui: &AppWindow) {
     ui.set_image_preview_open(false);
     ui.set_image_preview_image(slint::Image::default());
     ui.set_image_preview_loaded(false);
+    ui.set_image_preview_loading(false);
+    ui.set_image_preview_failed(false);
     ui.set_image_preview_status("".into());
     ui.set_image_preview_title("".into());
+    ui.set_image_preview_event_id("".into());
+    ui.set_image_preview_position("".into());
+    ui.set_image_preview_has_previous(false);
+    ui.set_image_preview_has_next(false);
     ui.set_image_preview_account_id("".into());
     ui.set_image_preview_room_id("".into());
     ui.set_image_preview_token("".into());
+}
+
+/// The loaded images of the timeline holding `event`: the room's or the open
+/// thread's. Only rows already loaded count; nothing is fetched to extend it.
+fn gallery(ui: &AppWindow, event: &str) -> Option<(Vec<(SharedString, SharedString)>, usize)> {
+    for timeline in [ui.get_messages(), ui.get_thread_messages()] {
+        let images: Vec<_> = timeline
+            .iter()
+            .filter(|message| message.attachment_is_image && !message.event_id.is_empty())
+            .map(|message| (message.event_id, message.attachment))
+            .collect();
+        if let Some(index) = images.iter().position(|(id, _)| id.as_str() == event) {
+            return Some((images, index));
+        }
+    }
+    None
+}
+
+fn publish_position(ui: &AppWindow, event: &str) {
+    let (position, previous, next) = match gallery(ui, event) {
+        Some((images, index)) if images.len() > 1 => (
+            format!("{} of {}", index + 1, images.len()),
+            index > 0,
+            index + 1 < images.len(),
+        ),
+        _ => (String::new(), false, false),
+    };
+    ui.set_image_preview_position(position.into());
+    ui.set_image_preview_has_previous(previous);
+    ui.set_image_preview_has_next(next);
 }
 
 pub fn apply_config(ui: &AppWindow, config: &Config) {
@@ -204,6 +243,7 @@ impl ImagePreviews {
                 if !request.current() || !view_matches(&ui, &request) {
                     return;
                 }
+                ui.set_image_preview_loading(false);
                 match result {
                     Ok(pixels) => {
                         let buffer =
@@ -216,6 +256,7 @@ impl ImagePreviews {
                         // the image clears ownership, not a promise of GPU zeroing.
                         ui.set_image_preview_image(slint::Image::from_rgba8(buffer));
                         ui.set_image_preview_loaded(true);
+                        ui.set_image_preview_failed(false);
                         ui.set_image_preview_status(
                             format!(
                                 "{} × {} · preview stays in memory",
@@ -225,6 +266,7 @@ impl ImagePreviews {
                         );
                     }
                     Err(error) => {
+                        ui.set_image_preview_failed(error.retryable());
                         ui.set_image_preview_status(error.text().into());
                     }
                 }
@@ -259,72 +301,144 @@ impl ImagePreviews {
                 });
             }
         });
-        let weak = ui.as_weak();
-        let controller = owner.clone();
-        let runtime = handle.clone();
-        ui.on_preview_image_attachment(move |event, filename| {
-            let Some(ui) = weak.upgrade() else {
-                return;
-            };
-            if !ui.get_live_session() || event.is_empty() || ui.get_active_room_id().is_empty() {
-                return;
-            }
-            let Some(selection) = live
-                .manager
-                .account_selection(ui.get_active_account_local_id().as_str())
-            else {
-                return;
-            };
-            controller.cancel();
-            clear(&ui);
-            let id = controller
-                .sequence
-                .fetch_add(1, Ordering::Relaxed)
-                .wrapping_add(1);
-            let request = Arc::new(Request {
-                id,
-                selection,
-                room: ui.get_active_room_id().to_string(),
-                cancel: Cancel::default(),
+        let context = Opener {
+            controller: owner.clone(),
+            live,
+            runtime: handle.clone(),
+            weak: ui.as_weak(),
+        };
+        {
+            let context = context.clone();
+            ui.on_preview_image_attachment(move |event, filename| {
+                if let Some(ui) = context.weak.upgrade() {
+                    context.open(&ui, &event, &filename);
+                }
             });
-            ui.set_image_preview_token(id.to_string().into());
-            ui.set_image_preview_account_id(request.selection.account_id().into());
-            ui.set_image_preview_room_id(request.room.clone().into());
-            ui.set_image_preview_title(crate::directory_plain_text(&filename, 160).into());
-            ui.set_image_preview_status("Loading image into memory…".into());
-            ui.set_image_preview_open(true);
-            controller
-                .state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .request = Some(request.clone());
-            let Some(permit) = Permit::acquire(&controller.worker) else {
-                controller.present(&request, Err(PreviewError::Busy), &weak);
-                return;
-            };
-            let event = event.to_string();
-            let encrypted = ui.get_image_previews_encrypted_enabled();
-            let manager = live.manager.clone();
-            let controller = controller.clone();
-            let weak = weak.clone();
-            runtime.spawn(async move {
-                let result = fetch_decode(manager, request.clone(), event, encrypted, permit).await;
-                if let Some(result) = result {
-                    controller.present(&request, result, &weak);
+        }
+        {
+            let context = context.clone();
+            ui.on_preview_adjacent_image(move |step| {
+                let Some(ui) = context.weak.upgrade() else {
+                    return;
+                };
+                let current = ui.get_image_preview_event_id();
+                let Some((images, index)) = gallery(&ui, &current) else {
+                    return;
+                };
+                let target = index.checked_add_signed(isize::try_from(step).unwrap_or_default());
+                if let Some((event, filename)) = target.and_then(|target| images.get(target)) {
+                    context.open(&ui, event, filename);
                 }
-                if request.current() {
-                    request.cancelled().await;
+            });
+        }
+        {
+            let context = context.clone();
+            ui.on_retry_image_preview(move || {
+                let Some(ui) = context.weak.upgrade() else {
+                    return;
+                };
+                let event = ui.get_image_preview_event_id();
+                if ui.get_image_preview_open() && !event.is_empty() {
+                    context.open(&ui, &event, &ui.get_image_preview_title());
                 }
-                let owner = controller.clone();
-                let _ = weak.upgrade_in_event_loop(move |ui| {
-                    if ui.get_image_preview_token().as_str() == request.id.to_string() {
-                        owner.cancel();
-                        clear(&ui);
-                    }
-                });
+            });
+        }
+        {
+            let context = context.clone();
+            ui.on_cancel_image_preview_loading(move || {
+                let Some(ui) = context.weak.upgrade() else {
+                    return;
+                };
+                if !ui.get_image_preview_loading() {
+                    return;
+                }
+                context.controller.cancel();
+                // A token no request carries: the cancelled one can neither
+                // publish pixels nor close the viewer when it ends.
+                ui.set_image_preview_token("".into());
+                ui.set_image_preview_loading(false);
+                ui.set_image_preview_failed(true);
+                ui.set_image_preview_status("Loading cancelled.".into());
+            });
+        }
+        owner
+    }
+}
+
+/// What opening an image needs; cloned into each viewer callback.
+#[derive(Clone)]
+struct Opener {
+    controller: Arc<ImagePreviews>,
+    live: Arc<LiveUi>,
+    runtime: tokio::runtime::Handle,
+    weak: slint::Weak<AppWindow>,
+}
+
+impl Opener {
+    /// Replace whatever the viewer shows with one explicitly requested image.
+    fn open(&self, ui: &AppWindow, event: &str, filename: &str) {
+        if !ui.get_live_session() || event.is_empty() || ui.get_active_room_id().is_empty() {
+            return;
+        }
+        let Some(selection) = self
+            .live
+            .manager
+            .account_selection(ui.get_active_account_local_id().as_str())
+        else {
+            return;
+        };
+        let controller = &self.controller;
+        controller.cancel();
+        clear(ui);
+        let id = controller
+            .sequence
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let request = Arc::new(Request {
+            id,
+            selection,
+            room: ui.get_active_room_id().to_string(),
+            cancel: Cancel::default(),
+        });
+        ui.set_image_preview_token(id.to_string().into());
+        ui.set_image_preview_account_id(request.selection.account_id().into());
+        ui.set_image_preview_room_id(request.room.clone().into());
+        ui.set_image_preview_event_id(event.into());
+        ui.set_image_preview_title(crate::directory_plain_text(filename, 160).into());
+        ui.set_image_preview_status("Loading image into memory…".into());
+        ui.set_image_preview_loading(true);
+        publish_position(ui, event);
+        ui.set_image_preview_open(true);
+        controller
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .request = Some(request.clone());
+        let Some(permit) = Permit::acquire(&controller.worker) else {
+            controller.present(&request, Err(PreviewError::Busy), &self.weak);
+            return;
+        };
+        let event = event.to_owned();
+        let encrypted = ui.get_image_previews_encrypted_enabled();
+        let manager = self.live.manager.clone();
+        let controller = controller.clone();
+        let weak = self.weak.clone();
+        self.runtime.spawn(async move {
+            let result = fetch_decode(manager, request.clone(), event, encrypted, permit).await;
+            if let Some(result) = result {
+                controller.present(&request, result, &weak);
+            }
+            if request.current() {
+                request.cancelled().await;
+            }
+            let owner = controller.clone();
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                if ui.get_image_preview_token().as_str() == request.id.to_string() {
+                    owner.cancel();
+                    clear(&ui);
+                }
             });
         });
-        owner
     }
 }
 

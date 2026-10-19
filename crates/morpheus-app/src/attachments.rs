@@ -13,6 +13,75 @@ pub fn mime_type_for(path: &Path) -> String {
         .to_string()
 }
 
+/// The name suggested to the native Save dialog for a name chosen by the
+/// sender. Only the last path component is kept; control, direction and
+/// zero-width characters and those Windows forbids become `_`; leading and
+/// trailing dots and spaces are trimmed; reserved device names are prefixed;
+/// and the result is bounded with its extension kept. The user still picks
+/// the location, and nothing is opened or run.
+pub fn safe_file_name(name: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    const MAX_EXTENSION_CHARS: usize = 16;
+    let last = name.rsplit(['/', '\\']).next().unwrap_or_default();
+    let cleaned: String = last
+        .chars()
+        .map(|character| {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '<' | '>'
+                        | ':'
+                        | '"'
+                        | '|'
+                        | '?'
+                        | '*'
+                        | '\u{061c}'
+                        | '\u{200b}'..='\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2060}'..='\u{206f}'
+                        | '\u{feff}'
+                )
+            {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect();
+    let trimmed =
+        cleaned.trim_matches(|character: char| character == '.' || character.is_whitespace());
+    let mut name = if trimmed.is_empty() {
+        "attachment".to_owned()
+    } else {
+        trimmed.to_owned()
+    };
+    let stem = name.split('.').next().unwrap_or_default().to_ascii_uppercase();
+    let numbered = stem.len() == 4
+        && (stem.starts_with("COM") || stem.starts_with("LPT"))
+        && stem.as_bytes()[3].is_ascii_digit();
+    if numbered || matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        name.insert(0, '_');
+    }
+    if name.chars().count() > MAX_CHARS {
+        let extension = name
+            .rsplit_once('.')
+            .map(|(_, extension)| extension.to_owned())
+            .filter(|extension| {
+                !extension.is_empty() && extension.chars().count() <= MAX_EXTENSION_CHARS
+            });
+        let reserved = extension
+            .as_ref()
+            .map_or(0, |extension| extension.chars().count() + 1);
+        let keep = MAX_CHARS - reserved;
+        let stem: String = name.chars().take(keep).collect();
+        name = match extension {
+            Some(extension) => format!("{stem}.{extension}"),
+            None => stem,
+        };
+    }
+    name
+}
+
 /// Called on the blocking pool after the account and room are checked again.
 /// A same-directory temporary file prevents a failed write from truncating a
 /// destination that the user chose in the native Save dialog.
@@ -44,5 +113,22 @@ mod tests {
             mime_type_for(Path::new("unknown.oddextension")),
             "application/octet-stream"
         );
+    }
+
+    #[test]
+    fn suggested_save_names_cannot_escape_or_disguise_the_chosen_folder() {
+        assert_eq!(safe_file_name("../../etc/passwd"), "passwd");
+        assert_eq!(safe_file_name("C:\\Users\\me\\evil.exe"), "evil.exe");
+        assert_eq!(safe_file_name("a<b>:c|d?.png"), "a_b__c_d_.png");
+        assert_eq!(safe_file_name("report\u{202e}fdp.exe"), "report_fdp.exe");
+        assert_eq!(safe_file_name(".bashrc"), "bashrc");
+        assert_eq!(safe_file_name(" . "), "attachment");
+        assert_eq!(safe_file_name(""), "attachment");
+        assert_eq!(safe_file_name("con.txt"), "_con.txt");
+        assert_eq!(safe_file_name("COM3"), "_COM3");
+        let long = format!("{}.jpeg", "x".repeat(300));
+        let bounded = safe_file_name(&long);
+        assert_eq!(bounded.chars().count(), 120);
+        assert!(bounded.ends_with(".jpeg"));
     }
 }

@@ -3413,15 +3413,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let account_id = ui.get_active_account_local_id().to_string();
         let room_id = ui.get_active_room_id().to_string();
         let event_id = event_id.to_string();
-        let Some(path) = rfd::FileDialog::new()
+        // The sender chose this name: suggest only a sanitized final
+        // component, and let the user pick the folder explicitly.
+        let mut dialog = rfd::FileDialog::new()
             .set_title("Save attachment")
-            .set_file_name(filename.to_string())
-            .save_file()
-        else {
+            .set_file_name(attachments::safe_file_name(&filename));
+        if let Some(downloads) = directories::UserDirs::new()
+            .and_then(|dirs| dirs.download_dir().map(|dir| dir.to_path_buf()))
+        {
+            dialog = dialog.set_directory(downloads);
+        }
+        let Some(path) = dialog.save_file() else {
             return;
         };
         if ui.get_active_account_local_id().as_str() != account_id
             || ui.get_active_room_id().as_str() != room_id
+            || path.file_name().is_none()
         {
             return;
         }
@@ -3456,7 +3463,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match result {
                     Ok(path) => {
                         let name = path.file_name().unwrap_or_default().to_string_lossy();
-                        ui.set_transfer_notice(format!("Saved {name}").into());
+                        let folder = path
+                            .parent()
+                            .map(|folder| folder.display().to_string())
+                            .unwrap_or_default();
+                        let notice = format!("Saved {name} to {folder}");
+                        ui.set_transfer_notice(directory_plain_text(&notice, 300).into());
                     }
                     Err(error) => {
                         ui.set_transfer_notice("".into());
