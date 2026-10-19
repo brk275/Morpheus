@@ -419,6 +419,13 @@ actions, keep their size and draw the icon as large as fits. A narrow timeline
 row reserves room for the tallest of the sender name, message text and shown
 clock before placing the message actions below them.
 
+The composer's attachment queue and the image viewer follow the same
+settings: corner radius and control radius, focus width, control padding,
+control hover, pressed and disabled states and the error and focus colors.
+Viewer arrows, zoom symbols and the placeholder follow `icon_size`, and queue
+rows gain an outline in high contrast. Their buttons and the queue header
+grow with large text instead of clipping.
+
 High contrast draws borders at least one pixel wide even when `border_width` is
 `0`; other palettes respect `0`. Starting points reset these metrics to their
 defaults like other typography and geometry, except `focus_width`, which they

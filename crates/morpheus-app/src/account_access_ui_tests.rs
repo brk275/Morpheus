@@ -4006,12 +4006,80 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     assert!(focused_control_has_label(&ui, "Zoom in"));
     key(&ui, Key::Tab);
     assert!(focused_control_has_label(&ui, "Close image preview"));
+    // Actions are sized from their own caption: the built-in 30 px at the
+    // defaults, and at 200% text with the largest icon size (glyph captions
+    // scale by both) every action still holds its caption and stays inside
+    // the window.
+    let close = control_bounds(&ui, "Close image preview");
+    assert_eq!(close.len(), 1);
+    let height = close[0].bottom - close[0].top;
+    assert!((height - 30.0).abs() < 0.5, "default Close is {height} px");
+    let tokens = ui.global::<crate::StyleTokens>();
+    ui.set_font_scale_percent(200);
+    tokens.set_icon_size(28.0);
+    settle(&ui).await;
+    let glyph_font = 12.0 * 2.0 * 28.0 / 18.0;
+    for (label, glyph) in [
+        ("Close image preview", false),
+        ("Save synthetic viewer to a location you choose", false),
+        ("Fit image to the window", false),
+        ("Zoom in", true),
+        ("Zoom out", true),
+        ("Previous image", true),
+        ("Next image", true),
+    ] {
+        let bounds = control_bounds(&ui, label);
+        assert_eq!(bounds.len(), 1, "{label}");
+        let height = bounds[0].bottom - bounds[0].top;
+        let caption = if glyph { glyph_font } else { 24.0 };
+        assert!(
+            height >= caption + 11.5,
+            "{label}: {height} px at 200% text and 28 px icons"
+        );
+        assert!(
+            inside_window(&ui, bounds[0]),
+            "{label} at 200% text and 28 px icons"
+        );
+    }
+    tokens.set_icon_size(18.0);
+    ui.set_font_scale_percent(100);
+    settle(&ui).await;
     ui.set_image_preview_open(false);
     ui.set_image_preview_loaded(false);
     ui.set_image_preview_has_previous(false);
     ui.set_image_preview_has_next(false);
     ui.set_image_preview_event_id("".into());
     ui.set_image_preview_image(slint::Image::default());
+
+    // Measure the queue's real captions at large text too. These are inert
+    // in-memory presentation rows; no file, upload or action is submitted.
+    let previous_page = ui.get_page();
+    ui.set_page(0);
+    ui.set_font_scale_percent(200);
+    ui.set_attachment_items(ModelRc::new(VecModel::from(vec![crate::AttachmentItem {
+        id: 1,
+        name: "synthetic queued file".into(),
+        detail: "1 KiB".into(),
+        status: "Ready".into(),
+        progress: -1.0,
+        can_remove: true,
+        ..Default::default()
+    }])));
+    ui.set_attachment_ready_count(1);
+    settle(&ui).await;
+    let row = control_bounds(&ui, "synthetic queued file, 1 KiB, Ready");
+    assert_eq!(row.len(), 1);
+    assert!(row[0].bottom - row[0].top >= 49.5);
+    for label in ["Send the ready attachment", "Remove synthetic queued file"] {
+        let bounds = control_bounds(&ui, label);
+        assert_eq!(bounds.len(), 1, "{label}");
+        assert!(bounds[0].bottom - bounds[0].top >= 29.5, "{label}");
+        assert!(inside_window(&ui, bounds[0]), "{label} at 200%");
+    }
+    ui.set_attachment_items(ModelRc::new(VecModel::default()));
+    ui.set_attachment_ready_count(0);
+    ui.set_font_scale_percent(100);
+    ui.set_page(previous_page);
     ui.set_show_sign_in(true);
     settle(&ui).await;
 
