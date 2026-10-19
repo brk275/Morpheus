@@ -130,3 +130,80 @@ The redaction repair also requires the search crate's stored original-ID field.
 Older search schemas must be rebuilt through the explicit encrypted-generation
 upgrade path. Normal opening refuses a schema mismatch; it must not delete the
 old generation or bypass the profile's persistence cohort.
+
+## Optional per-request response-body limit (bounded SDK responses)
+
+STATUS: source only. Nothing has been built, formatted by tool, tested or run;
+root reviews the change and runs the affected SDK checks on fresh hosted runners.
+
+Why: upstream `http_client::response_to_http_response` reads every response
+with `reqwest::Response::bytes()`, so a homeserver can return an arbitrarily
+large body (for example a device list or a user-interactive-auth response)
+before any application cap applies after deserialization.
+
+What changed, narrowly:
+
+- `RequestConfig::max_response_bytes(impl Into<Option<u64>>)` sets an optional
+  limit (field `max_response_bytes: Option<u64>`, default `None`, shown in the
+  config's `Debug`). `None` keeps upstream behavior exactly: the body is read
+  whole, so sync and media requests are unaffected unless a caller sets a
+  limit. There is no blanket limit.
+- `HttpError::ResponseTooLarge { limit: u64 }`: a fixed message naming only the
+  limit (no body, URL or token). `HttpError::retry_kind` classifies it as
+  `Permanent`, so the native backoff never retries it, and it is not an API
+  error, so the unknown-token refresh path never re-sends it.
+- `response_to_http_response(response, max_response_bytes)` now returns
+  `HttpError`. With a limit, `BoundedBody` refuses a declared length over the
+  limit before reading, then counts each decoded chunk (after gzip
+  decompression) with checked arithmetic before the buffer grows. The buffer is
+  reserved exactly, growing geometrically but never past the limit; a declared
+  length is never trusted for more than a 64 KiB first allocation. Returning
+  the error drops the response, which stops the transfer.
+- Native `execute_request` takes the limit from the request's `RequestConfig`
+  on every attempt; the wasm `send_request` passes it the same way.
+- Wasm: the pinned reqwest has no chunked reader without its `stream` feature,
+  which the wasm target does not enable. A declared length over the limit is
+  refused before reading, but a body without one is checked after the browser
+  read it (same error and no-retry, not a memory bound). Morpheus runs native
+  only. Enabling `stream` for wasm is a manifest/feature change left to root.
+- Token refresh, authentication, timeouts, the concurrency semaphore, the send
+  progress observable, cancellation by dropping the future and the app's
+  redirect policy are unchanged. No request or response body is logged; the
+  existing span still records only the response size.
+
+Public seam for callers (root's device/session manager applies it): send the
+Ruma request through `Client::send(request).with_request_config(
+client.request_config().max_response_bytes(LIMIT))`, for example
+`get_devices::v3::Request`, `update_device::v3::Request` and
+`delete_devices::v3::Request` (including its user-interactive-auth retry with
+`auth` set). The convenience methods `Client::devices`, `Client::rename_device`
+and `Client::delete_devices` keep the client's default config, so a capped
+caller uses `Client::send` directly. A refused response is
+`HttpError::ResponseTooLarge { limit }` (or `matrix_sdk::Error::Http` wrapping
+it).
+
+Regression source (in `src/http_client/mod.rs` tests and
+`src/config/request.rs` tests): under, at and over the bound; declared
+oversize; understated or unknown length counted as bytes arrive; checked
+overflow and no reservation past the bound or for a refused chunk; permanent
+classification and redacted message; per-request limit through `Client::send`
+with a mock that would see any retry; a dropped request that leaves nothing
+running; and the unlimited default. The integration case uses a mock with a
+declared length (wiremock sends one); the streamed path is covered directly
+through `BoundedBody`.
+
+Additionally modified vendored files (upstream c6ad52e blob -> current blob):
+
+| File | Upstream git blob | Current git blob |
+| --- | --- | --- |
+| src/config/request.rs | c2a8e3067413203b49221fd1b2d685aa19cb5340 | f813a2195e7d74c0b12a0b11d0b74d7cf1679472 |
+| src/error.rs | 41b387d55ad3184cbbc0daee68f4ef3d5c4b0ba4 | 6f5d690d03d25d4ee51d932c4cc096f2de00fada |
+| src/http_client/mod.rs | 9224c8826604f4e8b8e670806efef111ba93edd6 | 799d37a84ac0f503006dca5913b8bb03dad435c4 |
+| src/http_client/native.rs | 58321de8f1ba7435a6dd22c93bef77437c22fad7 | ee5d9d819e909b7354c77e0b1fedc58e676d3ede |
+| src/http_client/wasm.rs | f08346b3093a9dda63b30fcde81d2525cfdf0dc6 | 651e1ad551e97e805105249a586f4279d128a5fa |
+
+The upstream blobs are the `git_blob` values recorded in
+`MORPHEUS_PROVENANCE.json` before any patch; those records are unchanged.
+`LICENSE` and the upstream headers are kept. No manifest, feature, lock,
+build script or dependency changed. `crates/morpheus-app/build.rs` hashes
+`vendor/`, so the persistence cohort changes with this patch.

@@ -77,7 +77,7 @@ impl HttpClient {
         async fn send_request_inner(
             http_client: &reqwest::Client,
             request: &http::Request<Bytes>,
-            timeout: Option<Duration>,
+            config: &RequestConfig,
             retry_count: &AtomicU64,
             send_progress: SharedObservable<TransmissionProgress>,
         ) -> HttpResult<http::Response<Bytes>> {
@@ -85,7 +85,14 @@ impl HttpClient {
             debug!(num_attempt, "Sending request");
             let before = ruma::time::Instant::now();
 
-            let response = execute_request(http_client, request, timeout, send_progress).await?;
+            let response = execute_request(
+                http_client,
+                request,
+                config.timeout,
+                config.max_response_bytes,
+                send_progress,
+            )
+            .await?;
 
             let request_duration = ruma::time::Instant::now().saturating_duration_since(before);
 
@@ -149,14 +156,9 @@ impl HttpClient {
         let send_request = || {
             let send_progress = send_progress.clone();
             async {
-                let response = send_request_inner(
-                    &self.inner,
-                    &request,
-                    config.timeout,
-                    &retry_count,
-                    send_progress,
-                )
-                .await?;
+                let response =
+                    send_request_inner(&self.inner, &request, &config, &retry_count, send_progress)
+                        .await?;
                 let (parts, body) = response.into_parts();
                 let response: http::Response<&[u8]> = http::Response::from_parts(parts, &body);
                 R::IncomingResponse::try_from_http_response(response).map_err(HttpError::from)
@@ -245,6 +247,7 @@ pub(super) async fn execute_request(
     client: &reqwest::Client,
     request: &http::Request<Bytes>,
     timeout: Option<Duration>,
+    max_response_bytes: Option<u64>,
     send_progress: SharedObservable<TransmissionProgress>,
 ) -> Result<http::Response<Bytes>, HttpError> {
     use std::convert::Infallible;
@@ -287,7 +290,7 @@ pub(super) async fn execute_request(
     };
 
     let response = client.execute(request).await?;
-    Ok(response_to_http_response(response).await?)
+    response_to_http_response(response, max_response_bytes).await
 }
 
 struct BytesChunks {

@@ -241,10 +241,16 @@ pub struct TransmissionProgress {
     pub total: usize,
 }
 
+/// Read a response into an [`http::Response`]. With `max_response_bytes`,
+/// the body is read under that limit (see [`BoundedBody`]); without one it is
+/// read whole, as upstream does.
 async fn response_to_http_response(
     mut response: reqwest::Response,
-) -> Result<http::Response<Bytes>, reqwest::Error> {
+    max_response_bytes: Option<u64>,
+) -> Result<http::Response<Bytes>, HttpError> {
     let status = response.status();
+    // Read before the headers move out: on wasm it comes from them.
+    let declared = response.content_length();
 
     let mut http_builder = http::Response::builder().status(status);
     let headers = http_builder.headers_mut().expect("Can't get the response builder headers");
@@ -255,9 +261,106 @@ async fn response_to_http_response(
         }
     }
 
-    let body = response.bytes().await?;
+    let body = match max_response_bytes {
+        None => response.bytes().await?,
+        Some(limit) => read_bounded_body(response, limit, declared).await?,
+    };
 
     Ok(http_builder.body(body).expect("Can't construct a response using the given body"))
+}
+
+// Morpheus patch: bounded response bodies.
+
+/// The first allocation for a body under a limit: a declared length is never
+/// trusted for more than this before bytes arrive.
+const BOUNDED_BODY_INITIAL_CAPACITY: usize = 64 * 1024;
+
+/// A response body read under a per-request byte limit.
+///
+/// A declared length over the limit is refused before reading. Each chunk is
+/// then counted with checked arithmetic before the buffer grows, and the
+/// buffer never reserves more than the limit, so an oversized body is refused
+/// while holding at most `limit` bytes of it. The count covers the bytes as
+/// they arrive after any content decoding, so neither a missing length, a
+/// chunked body nor decompression can exceed the limit.
+#[derive(Debug)]
+struct BoundedBody {
+    limit: u64,
+    buffer: Vec<u8>,
+}
+
+impl BoundedBody {
+    fn new(limit: u64, declared: Option<u64>) -> Result<Self, HttpError> {
+        if declared.is_some_and(|declared| declared > limit) {
+            return Err(HttpError::ResponseTooLarge { limit });
+        }
+        let initial = usize::try_from(declared.unwrap_or(0).min(limit))
+            .unwrap_or(usize::MAX)
+            .min(BOUNDED_BODY_INITIAL_CAPACITY);
+        Ok(Self { limit, buffer: Vec::with_capacity(initial) })
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Result<(), HttpError> {
+        let limit = self.limit;
+        let too_large = move || HttpError::ResponseTooLarge { limit };
+        let total = next_body_length(self.buffer.len(), chunk.len(), limit)
+            .and_then(|total| usize::try_from(total).ok())
+            .ok_or_else(too_large)?;
+        if total > self.buffer.capacity() {
+            // Grow geometrically for many small chunks, never past the limit.
+            let most = usize::try_from(limit).unwrap_or(usize::MAX);
+            let target = total.max(self.buffer.capacity().saturating_mul(2)).min(most);
+            self.buffer.try_reserve_exact(target - self.buffer.len()).map_err(|_| too_large())?;
+        }
+        self.buffer.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    fn finish(self) -> Bytes {
+        Bytes::from(self.buffer)
+    }
+}
+
+/// The body length after one more chunk, or `None` when it would exceed
+/// `limit` or overflow.
+fn next_body_length(current: usize, chunk: usize, limit: u64) -> Option<u64> {
+    checked_body_length(u64::try_from(current).ok()?, u64::try_from(chunk).ok()?, limit)
+}
+
+fn checked_body_length(current: u64, chunk: u64, limit: u64) -> Option<u64> {
+    let total = current.checked_add(chunk)?;
+    (total <= limit).then_some(total)
+}
+
+/// Read the decoded body chunk by chunk under `limit`. Returning an error
+/// drops the response, which stops the transfer.
+#[cfg(not(target_family = "wasm"))]
+async fn read_bounded_body(
+    mut response: reqwest::Response,
+    limit: u64,
+    declared: Option<u64>,
+) -> Result<Bytes, HttpError> {
+    let mut body = BoundedBody::new(limit, declared)?;
+    while let Some(chunk) = response.chunk().await? {
+        body.push(&chunk)?;
+    }
+    Ok(body.finish())
+}
+
+/// The pinned reqwest has no chunked reader on wasm without its `stream`
+/// feature, which this build does not enable. A declared length over the
+/// limit is still refused before reading, but a body without one is checked
+/// only after the browser has read it: the same error and no-retry behavior,
+/// not a memory bound.
+#[cfg(target_family = "wasm")]
+async fn read_bounded_body(
+    response: reqwest::Response,
+    limit: u64,
+    declared: Option<u64>,
+) -> Result<Bytes, HttpError> {
+    let mut body = BoundedBody::new(limit, declared)?;
+    body.push(&response.bytes().await?)?;
+    Ok(body.finish())
 }
 
 /// Marker trait to identify the authentication schemes that the
@@ -377,17 +480,158 @@ mod tests {
         time::Duration,
     };
 
+    use assert_matches::assert_matches;
+    use bytes::Bytes;
     use matrix_sdk_common::executor::spawn;
     use matrix_sdk_test::{async_test, test_json};
+    use ruma::api::client::account::whoami;
     use wiremock::{
         Mock, Request, ResponseTemplate,
         matchers::{method, path},
     };
 
+    use super::{BoundedBody, checked_body_length, next_body_length};
     use crate::{
+        HttpError,
         http_client::RequestConfig,
         test_utils::{set_client_session, test_client_builder_with_server},
     };
+
+    /// A valid `whoami` response body padded with whitespace to `len` bytes.
+    fn padded_whoami(len: usize) -> Vec<u8> {
+        let mut body = br#"{"user_id":"@example:localhost"}"#.to_vec();
+        assert!(len >= body.len());
+        body.resize(len, b' ');
+        body
+    }
+
+    #[test]
+    fn test_bounded_body_accepts_up_to_the_limit() {
+        // Under and exactly at the bound, with or without a declared length.
+        let mut body = BoundedBody::new(8, Some(8)).unwrap();
+        body.push(b"abc").unwrap();
+        body.push(b"defgh").unwrap();
+        assert_eq!(body.finish(), Bytes::from_static(b"abcdefgh"));
+        let mut body = BoundedBody::new(8, None).unwrap();
+        body.push(b"abcdefg").unwrap();
+        assert_eq!(body.finish().len(), 7);
+    }
+
+    #[test]
+    fn test_bounded_body_refuses_more_than_the_limit() {
+        // A declared length over the bound is refused before anything is read.
+        assert_matches!(
+            BoundedBody::new(8, Some(9)),
+            Err(HttpError::ResponseTooLarge { limit: 8 })
+        );
+        // An unknown or understated length (a chunked body, or one that grows
+        // when decoded) is counted as it arrives: the chunk crossing the bound
+        // is refused before it is stored, and nothing past the bound was ever
+        // reserved.
+        let mut body = BoundedBody::new(8, Some(2)).unwrap();
+        body.push(b"abcdef").unwrap();
+        assert_matches!(body.push(b"ghi"), Err(HttpError::ResponseTooLarge { limit: 8 }));
+        assert_eq!(body.buffer.len(), 6);
+        assert!(body.buffer.capacity() <= 8);
+        let mut body = BoundedBody::new(0, None).unwrap();
+        body.push(b"").unwrap();
+        assert_matches!(body.push(b"x"), Err(HttpError::ResponseTooLarge { limit: 0 }));
+    }
+
+    #[test]
+    fn test_bounded_body_length_is_checked_without_extra_allocation() {
+        assert_eq!(next_body_length(3, 5, 8), Some(8));
+        assert_eq!(next_body_length(3, 6, 8), None);
+        assert_eq!(checked_body_length(u64::MAX, 1, u64::MAX), None);
+        assert_eq!(checked_body_length(u64::MAX - 1, 1, u64::MAX), Some(u64::MAX));
+        // A chunk larger than the bound is refused without reserving for it.
+        let mut body = BoundedBody::new(16, None).unwrap();
+        let reserved = body.buffer.capacity();
+        assert_matches!(body.push(&[0; 17]), Err(HttpError::ResponseTooLarge { limit: 16 }));
+        assert_eq!(body.buffer.capacity(), reserved);
+        assert!(body.buffer.is_empty());
+        // A huge declared length that fits the bound is not trusted for more
+        // than the initial allocation.
+        let body = BoundedBody::new(u64::MAX, Some(u64::MAX)).unwrap();
+        assert!(body.buffer.capacity() <= super::BOUNDED_BODY_INITIAL_CAPACITY);
+    }
+
+    #[test]
+    fn test_oversized_responses_are_never_retried() {
+        assert!(matches!(
+            HttpError::ResponseTooLarge { limit: 1 }.retry_kind(),
+            crate::error::RetryKind::Permanent
+        ));
+        // The message names only the limit: no body, URL or token.
+        assert_eq!(
+            HttpError::ResponseTooLarge { limit: 8 }.to_string(),
+            "the response exceeded the 8-byte limit set for this request"
+        );
+    }
+
+    #[async_test]
+    async fn test_response_limit_applies_per_request_and_is_terminal() {
+        let (client_builder, server) = test_client_builder_with_server().await;
+        let client = client_builder.build().await.unwrap();
+        set_client_session(&client).await;
+
+        Mock::given(method("GET"))
+            .and(path("/_matrix/client/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::VERSIONS))
+            .mount(&server)
+            .await;
+        // Under, at and without the bound succeed; over the bound fails once.
+        // A retried request would exceed this count.
+        Mock::given(method("GET"))
+            .and(path("_matrix/client/r0/account/whoami"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(padded_whoami(256), "application/json"),
+            )
+            .expect(4)
+            .mount(&server)
+            .await;
+
+        let send = |limit: Option<u64>| {
+            let config = RequestConfig::default().retry_limit(3).max_response_bytes(limit);
+            client.send(whoami::v3::Request::new()).with_request_config(config)
+        };
+        send(Some(257)).await.unwrap();
+        send(Some(256)).await.unwrap();
+        // The default reads a body of any size.
+        send(None).await.unwrap();
+        assert_matches!(send(Some(255)).await, Err(HttpError::ResponseTooLarge { limit: 255 }));
+        server.verify().await;
+    }
+
+    #[async_test]
+    async fn test_response_limit_request_stops_when_dropped() {
+        let (client_builder, server) = test_client_builder_with_server().await;
+        let client = client_builder.build().await.unwrap();
+        set_client_session(&client).await;
+
+        Mock::given(method("GET"))
+            .and(path("/_matrix/client/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&*test_json::VERSIONS))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("_matrix/client/r0/account/whoami"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(padded_whoami(64), "application/json")
+                    .set_delay(Duration::from_secs(60)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let config = RequestConfig::default().retry_limit(3).max_response_bytes(16_u64);
+        let request = client.send(whoami::v3::Request::new()).with_request_config(config);
+        // Dropping the request stops it; nothing continues or retries later.
+        assert!(tokio::time::timeout(Duration::from_millis(200), request).await.is_err());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        server.verify().await;
+    }
 
     #[async_test]
     async fn test_ensure_concurrent_request_limit_is_observed() {

@@ -88,6 +88,18 @@ pub enum HttpError {
     /// [`HttpError`] into an [`Arc`] to be able to clone it.
     #[error(transparent)]
     Cached(Arc<HttpError>),
+
+    /// The response body exceeded the limit set for this request with
+    /// [`RequestConfig::max_response_bytes`](crate::config::RequestConfig::max_response_bytes).
+    ///
+    /// The response was dropped without reading past the limit, and none of
+    /// it is kept or reported. The request is not retried.
+    // Morpheus patch: bounded response bodies.
+    #[error("the response exceeded the {limit}-byte limit set for this request")]
+    ResponseTooLarge {
+        /// The configured limit, in bytes.
+        limit: u64,
+    },
 }
 
 #[rustfmt::skip] // stop rustfmt breaking the `<code>` in docs across multiple lines
@@ -149,6 +161,8 @@ impl HttpError {
                 FromHttpResponseError::Server(api_error) => RetryKind::from_api_error(api_error),
                 _ => RetryKind::Permanent,
             },
+            // The same request would bring the same oversized response.
+            HttpError::ResponseTooLarge { .. } => RetryKind::Permanent,
             _ => RetryKind::Permanent,
         }
     }

@@ -121,3 +121,16 @@ The [patch note](../vendor/matrix-rtc-core/MORPHEUS_PATCH.md) records the two
 changed source files, bounded maintenance hint, unchanged encryption/trust
 policies and required core/live tests. This source patch requires hosted
 verification; an unchanged dependency version does not establish its safety.
+
+## Optional bounded SDK response bodies, 2026-10-19
+
+The local `matrix-sdk` 0.19.1 copy (revision
+`c6ad52ecc09eaa36601f55effb0a48a533eb87dd`) gains an opt-in per-request
+response-body limit, `RequestConfig::max_response_bytes`, and the permanent
+`HttpError::ResponseTooLarge { limit }`. It uses only the already locked
+`reqwest` and `bytes` APIs: no package identity, version, feature or manifest
+changes. The default stays unlimited. The
+[patch note](../vendor/matrix-sdk/MORPHEUS_PATCH.md) lists the five changed
+source files with their upstream and current blob hashes, the wasm limitation
+and the caller seam. This source patch requires review and hosted verification
+of the SDK HTTP client tests before integration.

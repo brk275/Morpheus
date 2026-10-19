@@ -26,7 +26,7 @@ impl HttpClient {
     pub(super) async fn send_request<R>(
         &self,
         request: http::Request<Bytes>,
-        _config: RequestConfig,
+        config: RequestConfig,
         _send_progress: SharedObservable<TransmissionProgress>,
     ) -> Result<R::IncomingResponse, HttpError>
     where
@@ -39,7 +39,8 @@ impl HttpClient {
 
         let before = ruma::time::Instant::now();
 
-        let response = response_to_http_response(self.inner.execute(request).await?).await?;
+        let response = self.inner.execute(request).await?;
+        let response = response_to_http_response(response, config.max_response_bytes).await?;
 
         let request_duration = ruma::time::Instant::now().saturating_duration_since(before);
         let status_code = response.status();

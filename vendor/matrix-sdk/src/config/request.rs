@@ -49,6 +49,9 @@ pub struct RequestConfig {
     pub(crate) max_concurrent_requests: Option<NonZeroUsize>,
     pub(crate) force_auth: bool,
     pub(crate) skip_auth: bool,
+    // Morpheus patch: optional per-request response body limit; see
+    // `RequestConfig::max_response_bytes`.
+    pub(crate) max_response_bytes: Option<u64>,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -62,6 +65,7 @@ impl Debug for RequestConfig {
             force_auth,
             max_concurrent_requests,
             skip_auth: skip_optional_auth,
+            max_response_bytes,
         } = self;
 
         let mut res = fmt.debug_struct("RequestConfig");
@@ -69,7 +73,8 @@ impl Debug for RequestConfig {
             .maybe_field("read_timeout", read_timeout)
             .maybe_field("retry_limit", retry_limit)
             .maybe_field("max_retry_time", retry_timeout)
-            .maybe_field("max_concurrent_requests", max_concurrent_requests);
+            .maybe_field("max_concurrent_requests", max_concurrent_requests)
+            .maybe_field("max_response_bytes", max_response_bytes);
 
         if *force_auth {
             res.field("force_auth", &true);
@@ -93,6 +98,7 @@ impl Default for RequestConfig {
             max_concurrent_requests: Default::default(),
             force_auth: false,
             skip_auth: false,
+            max_response_bytes: None,
         }
     }
 }
@@ -191,6 +197,28 @@ impl RequestConfig {
         self.skip_auth = true;
         self
     }
+
+    /// Refuse a response body larger than `limit` bytes for the requests
+    /// using this configuration.
+    ///
+    /// A response that declares a larger length is refused before its body
+    /// is read. Otherwise the body is counted as it arrives, after any
+    /// content decoding, and the response is dropped as soon as it would
+    /// exceed the limit; at most `limit` bytes of it are ever held. The
+    /// request then fails with
+    /// [`HttpError::ResponseTooLarge`](crate::HttpError::ResponseTooLarge),
+    /// which is never retried.
+    ///
+    /// The default, `None`, reads response bodies of any size, so media and
+    /// sync requests are unaffected unless a caller sets a limit.
+    ///
+    /// On wasm, the declared length is refused before reading, but a body
+    /// without one is checked only after the browser has read it.
+    #[must_use]
+    pub fn max_response_bytes(mut self, limit: impl Into<Option<u64>>) -> Self {
+        self.max_response_bytes = limit.into();
+        self
+    }
 }
 
 #[cfg(test)]
@@ -226,5 +254,16 @@ mod tests {
 
         let cfg = RequestConfig::short_retry();
         assert_eq!(cfg.retry_limit, Some(3));
+    }
+
+    #[test]
+    fn response_limit_is_opt_in() {
+        // Default: unlimited, so existing callers read bodies of any size.
+        assert_eq!(RequestConfig::new().max_response_bytes, None);
+        let cfg = RequestConfig::short_retry().max_response_bytes(8_u64 * 1024 * 1024);
+        assert_eq!(cfg.max_response_bytes, Some(8 * 1024 * 1024));
+        // The other settings are kept.
+        assert_eq!(cfg.retry_limit, Some(3));
+        assert_eq!(cfg.max_response_bytes(None).max_response_bytes, None);
     }
 }
