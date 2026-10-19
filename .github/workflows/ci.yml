@@ -1,12 +1,12 @@
 # TEMPORARY focused native offline app checks. NEVER MERGE this workflow.
 name: Reviewed SDKUI lock metadata
-run-name: SDKUI dependency metadata - 9100616
+run-name: SDKUI registry metadata - 9100616
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: sdkui-lock-metadata-9100616
+  group: sdkui-registry-metadata-9100616
   cancel-in-progress: false
 jobs:
   contracts:
@@ -71,10 +71,10 @@ jobs:
           code = None
           before=pathlib.Path('Cargo.lock').read_bytes()
           with log.open('xb') as output:
-              child = subprocess.Popen(['cargo','update','--workspace','--offline'],
+              child = subprocess.Popen(['cargo','update','--workspace'],
                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                   env=environment, start_new_session=True)
-              deadline = time.monotonic()+90
+              deadline = time.monotonic()+180
               size = 0
               try:
                   while True:
@@ -120,6 +120,8 @@ jobs:
               'manifest': 'manifest' in output and ('parse' in output or 'failed to load' in output),
               'offline_cache': '--offline' in output or 'offline mode' in output,
               'dependency_resolution': 'failed to select a version' in output or 'no matching package' in output,
+              'git_fetch': 'failed to fetch' in output or 'failed to clone' in output,
+              'network': 'network failure' in output or 'Could not resolve host' in output or 'failed to get successful HTTP response' in output,
           }
           report['error_families']=sorted(name for name,value in families.items() if value)
           if reason is None and code==0:
