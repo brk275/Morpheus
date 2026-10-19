@@ -133,6 +133,30 @@ impl ShownBanners {
         (now.duration_since(banner.shown_at) < SHOWN_TTL).then_some(banner)
     }
 
+    /// Withdraw and forget banners past `SHOWN_TTL`: a click on one opens
+    /// nothing, and withdrawing it releases its listener.
+    fn prune(&mut self, now: Instant) {
+        let mut kept = VecDeque::with_capacity(self.0.len());
+        for banner in self.0.drain(..) {
+            if now.duration_since(banner.shown_at) < SHOWN_TTL {
+                kept.push_back(banner);
+            } else {
+                withdraw(banner);
+            }
+        }
+        self.0 = kept;
+    }
+
+    /// Withdraw and forget the oldest banner that can be withdrawn, so its
+    /// listener is free for a new banner.
+    fn withdraw_oldest(&mut self) {
+        if let Some(index) = self.0.iter().position(|banner| banner.withdrawal.is_some())
+            && let Some(banner) = self.0.remove(index)
+        {
+            withdraw(banner);
+        }
+    }
+
     /// Withdraw every banner of one room that can be withdrawn and forget it.
     /// Banners the platform cannot close stay clickable.
     fn withdraw_room(&mut self, account_id: &str, room_id: &str) {
@@ -319,10 +343,13 @@ impl DesktopNotifications {
                 let account_id = ui.get_active_account_local_id().to_string();
                 let room_id = ui.get_active_room_id().to_string();
                 let live = ui.get_live_session();
+                // A room left open in a window the user is not using still
+                // notifies; only the active window suppresses its banners.
                 let visible_room = if live
                     && ui.get_page() == 0
                     && ui.window().is_visible()
                     && !ui.window().is_minimized()
+                    && crate::notification_center::window_active(&ui)
                     && !account_id.is_empty()
                     && !room_id.is_empty()
                 {
@@ -404,7 +431,17 @@ impl DesktopNotifications {
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
-        // Account changes can happen during either await above. Returning to
+        let noted = self.room_mode(&candidate.account_id, &candidate.room_id);
+        let held = match noted {
+            Some(_) => self
+                .manager
+                .room_notification_rule_selected(&queued.selection, &candidate.room_id)
+                .await
+                .ok()
+                .map(|rule| rule.effective),
+            None => None,
+        };
+        // Account changes can happen during any await above. Returning to
         // the same account must not revive this earlier notification.
         if self.stopped.load(Ordering::Acquire) || !queued.selection.is_current() {
             return None;
@@ -414,7 +451,7 @@ impl DesktopNotifications {
             &active,
             &config,
             ui.visible_room.as_ref(),
-            self.room_mode(&candidate.account_id, &candidate.room_id),
+            noted_override(noted, held),
             now_ms(),
         )
     }
@@ -529,9 +566,16 @@ async fn deliver_queued(
                 return Ok(());
             };
             let candidate = queued.candidate;
-            // One banner per room: a newer message replaces the room's
-            // earlier banner where the platform can withdraw it.
-            service.withdraw_room(&candidate.account_id, &candidate.room_id);
+            // Keep click handling for this banner: forget banners past their
+            // lifetime and, with every listener taken, withdraw the oldest
+            // banner that can be withdrawn, which releases its listener.
+            {
+                let mut shown = service.shown();
+                shown.prune(Instant::now());
+                if presenter::listeners_full() {
+                    shown.withdraw_oldest();
+                }
+            }
             let token = service.next_token.fetch_add(1, Ordering::AcqRel);
             let withdrawal =
                 presenter::show(plan, token, service.presenter_events.clone(), runtime)?;
@@ -540,14 +584,20 @@ async fn deliver_queued(
                 if let Some(withdrawal) = withdrawal {
                     withdrawal.withdraw();
                 }
-            } else if let Some(target) = target {
-                service.shown().insert(ShownBanner {
-                    token,
-                    target,
-                    account_user_id: candidate.account_user_id,
-                    shown_at: Instant::now(),
-                    withdrawal,
-                });
+            } else {
+                // One banner per room: once shown, a newer message replaces
+                // the room's earlier banners where the platform can withdraw
+                // them. A failed show leaves them in place.
+                service.withdraw_room(&candidate.account_id, &candidate.room_id);
+                if let Some(target) = target {
+                    service.shown().insert(ShownBanner {
+                        token,
+                        target,
+                        account_user_id: candidate.account_user_id,
+                        shown_at: Instant::now(),
+                        withdrawal,
+                    });
+                }
             }
             // Without a well-formed target the banner stays, and a click on
             // it resolves to nothing.
@@ -676,6 +726,17 @@ impl Candidate {
             sdk_sound,
         })
     }
+}
+
+/// A level chosen in this window decides delivery only while the SDK holds
+/// another level for the room (or its rule cannot be read). Once sync has
+/// brought it to the SDK, the SDK's push actions decide: a keyword match
+/// notifies without a highlight, which this window cannot tell apart.
+fn noted_override(
+    noted: Option<NotificationMode>,
+    held: Option<NotificationMode>,
+) -> Option<NotificationMode> {
+    noted.filter(|mode| held != Some(*mode))
 }
 
 fn plan_notification(
@@ -936,6 +997,18 @@ mod tests {
     }
 
     #[test]
+    fn a_level_chosen_here_decides_only_until_the_sdk_holds_it() {
+        let mentions = Some(NotificationMode::MentionsAndKeywords);
+        let all = Some(NotificationMode::AllMessages);
+        // Before sync returns it, the chosen level overrides the SDK.
+        assert_eq!(noted_override(mentions, all), mentions);
+        assert_eq!(noted_override(mentions, None), mentions);
+        // Once the SDK holds it, its push actions decide, keywords included.
+        assert_eq!(noted_override(mentions, mentions), None);
+        assert_eq!(noted_override(None, all), None);
+    }
+
+    #[test]
     fn shown_banners_resolve_once_and_never_for_removed_accounts() {
         let mut shown = ShownBanners::default();
         shown.insert(banner(1, "alice", "@alice:example.org", "!a:example.org"));
@@ -967,6 +1040,31 @@ mod tests {
         assert!(shown.take(10, Instant::now()).is_none());
         shown.retain_accounts(None);
         assert!(shown.0.is_empty());
+    }
+
+    #[test]
+    fn expired_and_oldest_withdrawable_banners_release_their_listeners() {
+        let mut shown = ShownBanners::default();
+        shown.insert(banner(1, "alice", "@alice:example.org", "!a:example.org"));
+        let (withdrawal, mut oldest) = Withdrawal::for_test();
+        let mut closable = banner(2, "alice", "@alice:example.org", "!b:example.org");
+        closable.withdrawal = Some(withdrawal);
+        shown.insert(closable);
+        let (withdrawal, mut newest) = Withdrawal::for_test();
+        let mut closable = banner(3, "alice", "@alice:example.org", "!c:example.org");
+        closable.withdrawal = Some(withdrawal);
+        shown.insert(closable);
+        // The oldest banner that can be withdrawn goes first; one the
+        // platform cannot close stays clickable.
+        shown.withdraw_oldest();
+        assert_eq!(oldest.try_recv(), Ok(()));
+        assert!(newest.try_recv().is_err());
+        let tokens: Vec<u64> = shown.0.iter().map(|banner| banner.token).collect();
+        assert_eq!(tokens, [1, 3]);
+        // Banners past their lifetime are withdrawn and forgotten.
+        shown.prune(Instant::now() + SHOWN_TTL);
+        assert!(shown.0.is_empty());
+        assert_eq!(newest.try_recv(), Ok(()));
     }
 
     #[test]

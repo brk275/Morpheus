@@ -153,8 +153,10 @@ impl AccountManager {
     }
 
     /// The notification rule of every joined room (Spaces excluded), sorted
-    /// like the room list and bounded by `MAX_NOTIFICATION_ROOMS`. Reads the
-    /// push rules the SDK holds from sync; no request is sent.
+    /// like the room list and bounded by `MAX_NOTIFICATION_ROOMS`: past the
+    /// bound, the first rooms by name are listed, not whichever rooms the
+    /// SDK returns first. Reads the push rules the SDK holds from sync; no
+    /// request is sent.
     pub async fn room_notification_rules_selected(
         &self,
         selection: &AccountSelection,
@@ -162,15 +164,23 @@ impl AccountManager {
         let client = self.rule_client(selection).await?;
         self.under_rule_selection(selection, async move {
             let settings = client.notification_settings().await;
-            let mut rules = Vec::new();
-            for room in client.joined_rooms() {
-                if room.is_space() {
-                    continue;
-                }
-                if rules.len() >= MAX_NOTIFICATION_ROOMS {
-                    break;
-                }
-                rules.push(describe_room(&settings, &room).await);
+            let mut rooms = client
+                .joined_rooms()
+                .into_iter()
+                .filter(|room| !room.is_space())
+                .map(|room| {
+                    let name = match room.cached_display_name() {
+                        Some(name) => name.to_string(),
+                        None => room.room_id().to_string(),
+                    };
+                    (name.to_lowercase(), room)
+                })
+                .collect::<Vec<_>>();
+            rooms.sort_by(|a, b| (&a.0, a.1.room_id()).cmp(&(&b.0, b.1.room_id())));
+            rooms.truncate(MAX_NOTIFICATION_ROOMS);
+            let mut rules = Vec::with_capacity(rooms.len());
+            for (_, room) in &rooms {
+                rules.push(describe_room(&settings, room).await);
             }
             rules.sort_by(|a: &RoomNotificationRule, b| {
                 a.name
@@ -179,6 +189,27 @@ impl AccountManager {
                     .then_with(|| a.room_id.cmp(&b.room_id))
             });
             Ok(rules)
+        })
+        .await
+    }
+
+    /// The rule of one joined room as the SDK holds it from sync. Reads the
+    /// push rules the SDK holds; no request is sent.
+    pub async fn room_notification_rule_selected(
+        &self,
+        selection: &AccountSelection,
+        room_id: &str,
+    ) -> Result<RoomNotificationRule> {
+        let id =
+            RoomId::parse(room_id).map_err(|e| MatrixCoreError::InvalidRoomId(e.to_string()))?;
+        let client = self.rule_client(selection).await?;
+        let room = client
+            .get_room(&id)
+            .filter(|room| matches!(room.state(), RoomState::Joined) && !room.is_space())
+            .ok_or_else(|| MatrixCoreError::RoomNotFound(room_id.into()))?;
+        self.under_rule_selection(selection, async move {
+            let settings = client.notification_settings().await;
+            Ok(describe_room(&settings, &room).await)
         })
         .await
     }

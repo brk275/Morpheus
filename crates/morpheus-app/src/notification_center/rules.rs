@@ -8,7 +8,10 @@
 //! saved only after the homeserver accepted it. Errors use fixed wording and
 //! never repeat server text.
 
-use std::sync::{Arc, Mutex, MutexGuard, atomic::Ordering};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, MutexGuard, atomic::Ordering},
+};
 
 use morpheus_config::{AccountOverrides, Config, ConfigStore};
 use morpheus_matrix::{
@@ -116,7 +119,7 @@ impl Rules {
         });
         let global = ui.global::<NotificationRulesState>();
         let refresh = rules.clone();
-        global.on_refresh(move || refresh.refresh(false));
+        global.on_refresh(move || refresh.refresh());
         let search = rules.clone();
         global.on_search(move |query| search.search(&query));
         let choose = rules.clone();
@@ -191,9 +194,9 @@ impl Rules {
             && ui.get_active_account_local_id().as_str() == selection.account_id()
     }
 
-    /// Load the visible account's rules. A reopened section starts with an
-    /// empty search; a reload after changing a default keeps it.
-    fn refresh(self: &Arc<Self>, keep_query: bool) {
+    /// Load the visible account's rules. A reopened section, or one showing
+    /// another account, starts with an empty search, in the box as here.
+    fn refresh(self: &Arc<Self>) {
         let Some(ui) = self.ui.upgrade() else {
             return;
         };
@@ -214,9 +217,7 @@ impl Rules {
             state.rows.clear();
             state.keywords.clear();
             state.loaded = false;
-            if !keep_query {
-                state.query.clear();
-            }
+            state.query.clear();
             publish(&global, &state);
             publish_keywords(&global, &state.keywords);
             state.operation
@@ -230,13 +231,12 @@ impl Rules {
         global.set_defaults_busy(false);
         global.set_keywords_busy(false);
         global.set_keyword_error("".into());
-        if !keep_query {
-            global.set_keyword_input("".into());
-            global.set_default_group(0);
-            global.set_default_direct(0);
-            global.set_default_group_mixed(false);
-            global.set_default_direct_mixed(false);
-        }
+        global.set_query("".into());
+        global.set_keyword_input("".into());
+        global.set_default_group(0);
+        global.set_default_direct(0);
+        global.set_default_group_mixed(false);
+        global.set_default_direct_mixed(false);
         let Some(selection) = selection else {
             global.set_loading(false);
             return;
@@ -457,7 +457,7 @@ impl Rules {
                 match result {
                     Ok(defaults) => {
                         // Rooms following the default now show the new level.
-                        rules.refresh(true);
+                        rules.reload_levels(operation, selection.clone());
                         apply_defaults(&global, defaults);
                         global.set_notice("Default level saved.".into());
                     }
@@ -469,6 +469,63 @@ impl Rules {
             });
         });
     }
+
+    /// Reread the rooms' levels after a default changed. The list, its
+    /// search, the keywords and any room change still waiting for the
+    /// homeserver stay as they are; only rows without a pending change take
+    /// the levels read.
+    fn reload_levels(self: &Arc<Self>, operation: u64, selection: AccountSelection) {
+        let rules = self.clone();
+        self.runtime.spawn(async move {
+            let rooms = rules
+                .live
+                .manager
+                .room_notification_rules_selected(&selection)
+                .await;
+            let weak = rules.ui.clone();
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                if !rules.owns(&ui, operation, &selection) {
+                    return;
+                }
+                let global = ui.global::<NotificationRulesState>();
+                let Ok(rooms) = rooms else {
+                    global.set_error(
+                        "The default level was saved, but room levels could not be reread.".into(),
+                    );
+                    return;
+                };
+                let mut state = rules.state();
+                let changed = apply_levels(&mut state.rows, rooms);
+                // Listed rows update in place, keeping keyboard focus.
+                for index in changed {
+                    update_row(&global, &state.rows[index]);
+                }
+            });
+        });
+    }
+}
+
+/// Take the levels read for rows without a change waiting for the
+/// homeserver; returns the rows that changed.
+fn apply_levels(rows: &mut [Row], rooms: Vec<RoomNotificationRule>) -> Vec<usize> {
+    let levels = rooms
+        .into_iter()
+        .map(|rule| (rule.room_id, (rule.custom, rule.effective)))
+        .collect::<HashMap<_, _>>();
+    let mut changed = Vec::new();
+    for (index, row) in rows.iter_mut().enumerate() {
+        if row.pending {
+            continue;
+        }
+        if let Some(&(custom, effective)) = levels.get(&row.room_id)
+            && (row.custom, row.effective) != (custom, effective)
+        {
+            row.custom = custom;
+            row.effective = effective;
+            changed.push(index);
+        }
+    }
+    changed
 }
 
 impl Rules {
@@ -739,5 +796,31 @@ mod tests {
         // An unnamed room is listed by its ID rather than as a blank row.
         assert_eq!(muted.item().name.as_str(), "!quiet:example.org");
         assert_eq!((muted.item().mode, muted.item().effective), (3, 3));
+    }
+
+    #[test]
+    fn a_new_default_reaches_rows_without_a_pending_change() {
+        let rule = |room: &str, effective| RoomNotificationRule {
+            room_id: room.into(),
+            name: room.into(),
+            is_direct: false,
+            custom: None,
+            effective,
+        };
+        let all = NotificationMode::AllMessages;
+        let mentions = NotificationMode::MentionsAndKeywords;
+        let mut rows = vec![
+            Row::new(rule("!a:example.org", all)),
+            Row::new(rule("!b:example.org", all)),
+        ];
+        rows[1].pending = true;
+        let read = vec![
+            rule("!a:example.org", mentions),
+            rule("!b:example.org", mentions),
+        ];
+        assert_eq!(apply_levels(&mut rows, read), vec![0]);
+        assert_eq!(rows[0].effective, mentions);
+        // A room whose own change waits for the homeserver keeps it.
+        assert_eq!(rows[1].effective, all);
     }
 }

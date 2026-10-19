@@ -4,8 +4,9 @@ Morpheus receives notifications through the Matrix SDK's push-rule handler for
 the selected account. This covers both native sliding sync and classic sync.
 Room mutes and other Matrix push rules are evaluated by the SDK before an event
 reaches Morpheus. The app then suppresses its own messages, the room currently
-visible in the conversation pane, duplicate events, and message events more
-than five minutes old. A switch permanently invalidates queued notifications
+visible in the conversation pane of the active window, duplicate events, and
+message events more than five minutes old. A room left open in a window the
+user is not using still notifies. A switch permanently invalidates queued notifications
 from the old selection, including a quick switch from A to B and back to A.
 Each SDK callback captures a revocable selection token before its first await;
 logout, sync shutdown and reauthentication also revoke old tokens. The worker
@@ -61,8 +62,13 @@ the account's Matrix push rules on its homeserver, written through the SDK's
 notification-settings API, so they apply on every device of the account and are
 what the SDK evaluates before an event reaches Morpheus. A change is shown as
 saved only after the homeserver accepts it, and is applied to local delivery at
-once (for two minutes, until sync returns the updated rules). The list shows at
-most 100 matching rooms at a time and reads at most 2,000 rooms.
+once, until sync brings the updated rules to the SDK (at most two minutes);
+from then on the SDK's push actions decide, so keyword matches in a room set to
+mentions and keywords notify. Saving a default updates the rooms that follow it
+without clearing the search or a room change still waiting for the homeserver.
+The list shows at most 100 matching rooms at a time and reads at most 2,000
+rooms, the first ones by name. Reopening the section, or showing another
+account, clears the search.
 
 Keywords in the same section are Matrix keyword push rules, unlike local
 highlight words: a message containing one notifies in every room that is not
@@ -77,16 +83,20 @@ their results. Errors use fixed wording.
 
 While a room is on screen (the window is shown and not minimized, the
 conversation page is open and the room is selected), Morpheus marks its live
-timeline, and an open thread's, read with a private read receipt after each sync
-batch and when it comes into view. Unread and mention counts therefore clear in
-Morpheus and on the account's other devices, while other members see no read
-marker. The scroll position is not considered.
+timeline, and an open thread's, read with a private read receipt when it comes
+into view and when the window is activated again. New messages arriving by sync
+are marked read only while the window is active, or within two minutes of the
+room coming into view where the window system does not report activation, so a
+window merely left open does not mark messages nobody saw as read. Unread and
+mention counts therefore clear in Morpheus and on the account's other devices,
+while other members see no read marker. The scroll position is not considered.
 
 A shown banner is remembered only as an opaque token with its account, room,
 event and thread IDs, at most 32 of them and for at most 24 hours; no message
 text is kept and nothing is written to disk. A newer message in the same room
-replaces that room's banner, and banners of a room that was read here or
-elsewhere are withdrawn, where the platform allows: the Linux desktop
+replaces that room's banner once the new one is shown, and banners of a room
+that was read here or elsewhere are withdrawn, where the platform allows: the
+Linux desktop
 notification service supports both through `CloseNotification`; the pinned
 macOS and Windows backends have no withdrawal API, so their banners stay until
 the user or the OS dismisses them. Quitting withdraws what it can. Removing or
@@ -103,16 +113,20 @@ still asks for the local app password. The target then waits for at most two
 minutes and opens only when that exact account becomes visible; a newer click
 or search result, or a different account becoming visible, drops it, so an
 A → B → A sequence never navigates for the earlier request. While no account is
-open, a click only restores the window. An invitation banner in the visible
-account points to the invitation in the room list.
+open, a click opens the banner's saved account through its protected activation
+(app password included); the room is then in its room list. An invitation
+banner in the visible account points to the invitation in the room list; one
+for another account only switches to that account, where the invitation waits.
 
 A banner resolves once; a dismissed, replaced, expired or unknown banner opens
 nothing, and an old banner never brings back a removed account or a reused
 local ID for a different Matrix user. A reply or edit being written in another
 room is never discarded; the click is refused with a notice. A click for another
 account never replaces an app-password or leave-call dialog that is already
-open. Up to eight banners listen for clicks at a time; beyond that a banner is
-shown without click handling. On macOS the click also brings Morpheus forward;
+open. Up to eight banners listen for clicks at a time. Banners past 24 hours are
+withdrawn and forgotten; on Linux, with every listener taken, the oldest banner
+Morpheus can withdraw is withdrawn so a new one keeps click handling. Otherwise
+a banner beyond the bound is shown without click handling. On macOS the click also brings Morpheus forward;
 on Linux and Windows a minimized window is restored, but raising it is up to the
 desktop.
 

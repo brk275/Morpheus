@@ -57,3 +57,11 @@ pub(crate) fn register(
 pub(crate) fn apply_config(ui: &AppWindow, config: &Config) {
     rules::apply_config(ui, config);
 }
+
+/// Whether the window is the active one, holding the keyboard focus or
+/// showing one of its popups. Public Slint 1.18 has no API for this, so the
+/// window state the pinned version keeps from the windowing system is read.
+/// UI thread only.
+pub(crate) fn window_active(ui: &AppWindow) -> bool {
+    slint::private_unstable_api::re_exports::WindowInner::from_pub(ui.window()).active()
+}

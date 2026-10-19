@@ -47,6 +47,9 @@ export global NotificationRulesState {
     in-out property <bool> keywords-busy: false;
     // Load the visible account's rules again.
     callback refresh();
+    // The room search box's text; Rust clears it with its own query when
+    // the section is reloaded or shows another account.
+    in-out property <string> query;
     // The search text changed.
     callback search(string);
     // Room ID and level: 0 default, 1 all, 2 mentions and keywords, 3 mute.
@@ -767,6 +770,7 @@ export component NotificationRules inherits VerticalLayout {
             vertical-alignment: center;
             single-line: true;
             enabled: root.live;
+            text <=> NotificationRulesState.query;
             color: root.palette.ink;
             font-size: 12px * root.text-scale;
             accessible-label: "Search rooms for notification rules";
