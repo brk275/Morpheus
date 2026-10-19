@@ -595,6 +595,10 @@ impl Workbench {
         loop {
             tokio::select! {
                 biased;
+                // The persistent SDK queue owns an admitted upload. Stop its
+                // old observer on account departure, rather than retaining a
+                // removed profile until a paused queue emits another event.
+                _ = job.selection.revoked() => return Outcome::Uncertain,
                 command = commands.recv(), if listening => match command {
                     Some(Command::Cancel) => {
                         self.set_phase(job.id, Phase::Cancelling, "");

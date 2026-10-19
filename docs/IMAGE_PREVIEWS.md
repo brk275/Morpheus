@@ -29,3 +29,19 @@ Animated PNG/GIF, progressive or multi-scan JPEG, WebP, SVG, 16-bit PNG, audio a
 Thirteen focused regressions passed in hosted Rust suites on Apple Silicon, Intel Mac, Windows and Linux at `4fd8071`. They cover actual PNG and baseline JPEG pixels, metadata stripping, animation/size/dimension rejection, ciphertext tampering and EOF hash verification, streamed body limits, privacy combinations, permanent cancellation, worker permit ownership, queued-pixel clearing and stale view/account selection rejection. No local native build or test was used.
 
 The expanded `media_local` encrypted/plain-image API fixture did not run in that candidate because an earlier formatting check failed. No real image-download/preview API pass follows from the unit results. Real encrypted and unencrypted attachment checks, opt-in/off reload, rapid account/room switching during load, viewer keyboard/accessibility behavior, failed/oversized images and installed-package acceptance remain required.
+
+## Attachment transfer work in progress
+
+The new per-room queue is under source review. Files are staged until an
+explicit send. Preparation is limited to two tasks, and cancelled blocking
+reads retain their own admission permit until the read exits. A send belongs
+to the exact account selection that started it. Cancellation before SDK
+admission queues nothing; after admission the app awaits the handle and
+reports its actual abort result. An SDK admission error or account departure
+ends observation as delivery unconfirmed, which cannot be resent with Retry.
+The SDK owns already admitted uploads; changing rooms alone does not stop them.
+
+Save cancellation is rechecked after the account and room commit guards. Once
+the local write is admitted, it finishes and reports its actual outcome. The
+source includes focused cancellation and selection regression cases; these
+changes have not yet passed hosted or installed acceptance.
