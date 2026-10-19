@@ -1,12 +1,12 @@
 # TEMPORARY focused native offline app checks. NEVER MERGE this workflow.
 name: Reviewed settings workspace regression
-run-name: Settings workspace regression - 7eb7ede
+run-name: Settings accessibility regression - a9d9cf6
 on:
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: settings-workspace-7eb7ede
+  group: settings-accessibility-a9d9cf6
   cancel-in-progress: false
 jobs:
   contracts:
@@ -17,11 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 7eb7ede23c931dcaed5a7c7d33b741f3d36f797f
+          ref: a9d9cf67951bbdfe230093593f15019fa5cb5c2e
           fetch-depth: 0
           persist-credentials: false
       - name: Verify exact reviewed source
-        run: test "$(git rev-parse HEAD)" = 7eb7ede23c931dcaed5a7c7d33b741f3d36f797f
+        run: test "$(git rev-parse HEAD)" = a9d9cf67951bbdfe230093593f15019fa5cb5c2e
       - name: Scan source before executing reviewed native tests
         shell: bash
         run: |
@@ -58,6 +58,7 @@ jobs:
           CARGO_PROFILE_DEV_DEBUG: "0"
           CARGO_PROFILE_TEST_DEBUG: "0"
           CARGO_TERM_COLOR: never
+          SLINT_EMIT_DEBUG_INFO: "1"
         shell: bash
         run: |
           set -euo pipefail
@@ -69,7 +70,7 @@ jobs:
           assert os.environ.get('ImageOS') == 'ubuntu24'
           names = ('PATH','HOME','LANG','LC_ALL','TMPDIR','CARGO_HOME','RUSTUP_HOME','RUSTUP_TOOLCHAIN',
               'PKG_CONFIG_PATH','LD_LIBRARY_PATH','SSL_CERT_FILE','SSL_CERT_DIR','CARGO_BUILD_JOBS',
-              'CARGO_INCREMENTAL','CARGO_PROFILE_DEV_DEBUG','CARGO_PROFILE_TEST_DEBUG','CARGO_TERM_COLOR',
+              'CARGO_INCREMENTAL','CARGO_PROFILE_DEV_DEBUG','CARGO_PROFILE_TEST_DEBUG','CARGO_TERM_COLOR','SLINT_EMIT_DEBUG_INFO',
               'GITHUB_ACTIONS','RUNNER_ENVIRONMENT','RUNNER_OS','ImageOS','RUNNER_TEMP','RUNNER_TRACKING_ID')
           environment = {name:os.environ[name] for name in names if name in os.environ}
           root = pathlib.Path(tempfile.mkdtemp(prefix='morpheus-offline-app-',dir=os.environ['RUNNER_TEMP']))
@@ -175,7 +176,7 @@ jobs:
                   probe_invalid=True
           passed=passed and not probe_invalid and not probes
           print(json.dumps({'check':'native_settings_workspace_regression','motion_probe':probes,'probe_invalid':probe_invalid,'complete_test_accounting':complete,'status':'passed' if passed else 'failed',
-              'source':'7eb7ede23c931dcaed5a7c7d33b741f3d36f797f','failure':reason,
+              'source':'a9d9cf67951bbdfe230093593f15019fa5cb5c2e','failure':reason,
               'ignored_tests':sorted(ignored),'ui_binding_loop_warnings':binding_loops[:8],
               'tests_passed':passed_count,
               'tests_failed':failed_count,
