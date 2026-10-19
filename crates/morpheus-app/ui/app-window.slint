@@ -1785,7 +1785,7 @@ component ColorTokenList inherits VerticalLayout {
             }
         }
     }
-    Rectangle { height: 1px; background: root.outline; }
+    Rectangle { height: StyleTokens.line-width; background: root.outline; }
     if root.tokens.length == 0 : Text {
         text: "No colors match. Try another word."; color: root.muted;
         font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite;
@@ -1985,7 +1985,7 @@ component MetricList inherits VerticalLayout {
                     }
                 }
             }
-            Rectangle { height: 1px; background: root.outline; }
+            Rectangle { height: StyleTokens.line-width; background: root.outline; }
             if root.items.length == 0 : Text {
                 text: "No sizes match. Try another word."; color: root.muted;
                 font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite;
@@ -3919,7 +3919,7 @@ export component AppWindow inherits Window {
                         vertical-alignment: center;
                     }
                 }
-                Rectangle { height: 1px; background: root.divider; }
+                Rectangle { height: StyleTokens.line-width; background: root.divider; }
                 IconAction {
                     width: root.rail-width-px * 1px - 12px;
                     height: 48px;
@@ -3972,7 +3972,7 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                Rectangle { height: 1px; background: root.divider; }
+                Rectangle { height: StyleTokens.line-width; background: root.divider; }
                 IconAction {
                     width: root.rail-width-px * 1px - 12px;
                     height: 48px;
@@ -4053,7 +4053,7 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                Rectangle { height: 1px; background: root.divider; }
+                Rectangle { height: StyleTokens.line-width; background: root.divider; }
                 Rectangle {
                     height: max(62px, 22px * root.text-scale + 40px);
                     background: transparent;
@@ -4254,7 +4254,7 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                Rectangle { height: 1px; background: root.divider; }
+                Rectangle { height: StyleTokens.line-width; background: root.divider; }
                 account-trigger := ActionRect {
                     height: max(69px, 38px * root.text-scale + 24px);
                     background: root.window-rail;
@@ -4364,7 +4364,7 @@ export component AppWindow inherits Window {
                     }
                         }
                     }
-                    Rectangle { height: 1px; background: root.divider; }
+                    Rectangle { height: StyleTokens.line-width; background: root.divider; }
                     add-account-choice := ActionRect {
                         height: 35px;
                         border-radius: StyleTokens.radius * 0.8;
@@ -4537,7 +4537,7 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                Rectangle { height: 1px; background: root.divider; }
+                Rectangle { height: StyleTokens.line-width; background: root.divider; }
                 if root.native-call-enabled && root.live-session && root.incoming-call-account-id == root.active-account-local-id && root.incoming-call-offers.length > 0 : ScrollView {
                     height: min(220px, root.incoming-call-offers.length * (102px * root.text-scale));
                     horizontal-stretch: 1;
@@ -5435,7 +5435,7 @@ export component AppWindow inherits Window {
                         font-size: 12px * root.text-scale; wrap: word-wrap;
                         accessible-live-region: polite;
                     }
-                    Rectangle { height: 1px; background: root.divider; }
+                    Rectangle { height: StyleTokens.line-width; background: root.divider; }
                     Text { text: "JOIN BY ROOM ID, ALIAS, OR MATRIX LINK"; color: root.muted; font-size: 10px * root.text-scale; font-weight: 750; letter-spacing: 1px; }
                     HorizontalLayout {
                         height: 39px; spacing: 8px;
@@ -5468,7 +5468,7 @@ export component AppWindow inherits Window {
                         font-size: 12px * root.text-scale; wrap: word-wrap;
                         accessible-live-region: polite;
                     }
-                    Rectangle { height: 1px; background: root.divider; }
+                    Rectangle { height: StyleTokens.line-width; background: root.divider; }
                     HorizontalLayout {
                         height: 27px; spacing: 8px;
                         Text {
@@ -6700,7 +6700,7 @@ export component AppWindow inherits Window {
                                 reset-all => { root.metric-reset-all(); }
                             }
                         }
-                        Rectangle { height: 1px; background: root.divider; }
+                        Rectangle { height: StyleTokens.line-width; background: root.divider; }
                         Text { text: "Base palette for all accounts"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         HorizontalLayout {
                             spacing: 12px;
@@ -6825,7 +6825,7 @@ export component AppWindow inherits Window {
                                 Text { text: choice; color: root.ink; font-size: 12px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
                             }
                         }
-                        Rectangle { height: 1px; background: root.divider; }
+                        Rectangle { height: StyleTokens.line-width; background: root.divider; }
                         Text { text: "Layout"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Navigation"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 650; }
                         VerticalLayout {
@@ -7038,7 +7038,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
-                        Rectangle { height: 1px; background: root.divider; }
+                        Rectangle { height: StyleTokens.line-width; background: root.divider; }
                         Text { text: "Notifications"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Notifications are shown for the active account while Morpheus runs. These preferences are shared by all accounts; room rules still come from Matrix."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         ActionRect {
@@ -7176,10 +7176,10 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
-                        Rectangle { height: 1px; background: root.divider; }
+                        Rectangle { height: StyleTokens.line-width; background: root.divider; }
                         Text { text: "Accounts"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Select your account in the bottom-left corner to switch instantly."; color: root.muted; font-size: 13px * root.text-scale; wrap: word-wrap; }
-                        Rectangle { height: 1px; background: root.divider; }
+                        Rectangle { height: StyleTokens.line-width; background: root.divider; }
                         Text { text: "Security & recovery"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: root.live-session ? "Security for " + root.active-account-handle : "Sign in to inspect device verification and recovery."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         if root.live-session : VerticalLayout {
@@ -7385,7 +7385,7 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
-                        Rectangle { height: 1px; background: root.divider; }
+                        Rectangle { height: StyleTokens.line-width; background: root.divider; }
                         Text { text: "Image previews"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Images load only when clicked and stay in memory. Closing the viewer or switching rooms/accounts clears them. PNG and baseline JPEG only; animation, WebP, audio and video previews are not available yet."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         ActionRect {
@@ -7410,7 +7410,7 @@ export component AppWindow inherits Window {
                             activated => { root.set-encrypted-image-previews(!root.image-previews-encrypted-enabled); }
                             Text { x: 12px; width: parent.width - 24px; text: (root.image-previews-encrypted-enabled ? "✓  " : "□  ") + "Allow previews in encrypted rooms"; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; }
                         }
-                        Rectangle { height: 1px; background: root.divider; }
+                        Rectangle { height: StyleTokens.line-width; background: root.divider; }
                         Text { text: "Call audio devices"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Saved for your next call. Your current call keeps its selection until you leave. An unavailable selected device shows an error. System default follows your operating system's audio routing."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         Text { text: "Microphone"; color: root.ink; font-size: 13px * root.text-scale; }
@@ -7458,7 +7458,7 @@ export component AppWindow inherits Window {
                             color: root.muted; font-size: 12px * root.text-scale;
                             accessible-label: "Audio device status: " + self.text;
                         }
-                        Rectangle { height: 1px; background: root.divider; }
+                        Rectangle { height: StyleTokens.line-width; background: root.divider; }
                         Text { text: "Keyboard shortcuts"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text {
                             text: "Mod is Command on macOS and Ctrl elsewhere. Meta is Command on macOS and Windows/Super elsewhere. Combine Mod, Ctrl, Meta, Alt, or Shift with A–Z, 0–9, arrows, Home, End, PageUp, PageDown, or F1–F12. Include a modifier other than Shift. Record a combination, or type one and press Enter; Disable turns an action off. Shift+digits, Alt+letters/digits, and editing or window shortcuts are reserved.";
@@ -7501,7 +7501,7 @@ export component AppWindow inherits Window {
                             text: "Room switching and unread navigation use the current Home or Space; room cycling only opens conversations. Shortcuts pause in Settings, while recording and in dialogs, and text editing keys keep priority. No shortcut can send, remove an account, log out or switch accounts; the account menu shortcut only opens the menu.";
                             color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
                         }
-                        Rectangle { height: 1px; background: root.divider; }
+                        Rectangle { height: StyleTokens.line-width; background: root.divider; }
                         Text { text: "Advanced customization"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Edit your settings and theme pack files. Valid changes appear here automatically."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         // Read-only and selectable, so the path can be copied into an editor.
@@ -7524,7 +7524,7 @@ export component AppWindow inherits Window {
                             color: root.muted; font-size: 11px * root.text-scale;
                             accessible-label: "Settings file location";
                         }
-                        Rectangle { height: 1px; background: root.divider; }
+                        Rectangle { height: StyleTokens.line-width; background: root.divider; }
                         Text { text: "Application updates"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Updates are checked only when you ask. Downloading verifies the application signature; restarting installs the update. Leave any call and finish recovery before restarting."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         if root.update-version != "" : Text { text: "Available version: " + root.update-version; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; }
@@ -7567,7 +7567,7 @@ export component AppWindow inherits Window {
                             TokenButton { colors: root.button-colors; text-scale: root.text-scale; text: "Discard update"; enabled: root.update-can-discard; activated => { root.discard-update(); } }
                             TokenButton { colors: root.button-colors; text-scale: root.text-scale; text: "Restart to update"; primary: true; enabled: root.update-can-restart && !root.call-connected && !root.security-busy && root.security-recovery-key == ""; activated => { root.restart-to-update(); } }
                         }
-                        Rectangle { height: 1px; background: root.divider; }
+                        Rectangle { height: StyleTokens.line-width; background: root.divider; }
                         Text { text: "About"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Morpheus is an open-source Matrix desktop client."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                         Text { text: "Interface powered by Slint · slint.dev"; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
@@ -7926,7 +7926,7 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                Rectangle { height: 1px; background: root.divider; }
+                Rectangle { height: StyleTokens.line-width; background: root.divider; }
                 if root.side-panel-tab == 0 : VerticalLayout {
                     vertical-stretch: 1;
                     spacing: 0px;
@@ -8181,7 +8181,7 @@ export component AppWindow inherits Window {
                             }
                         }
                     }
-                    Rectangle { height: 1px; background: root.divider; }
+                    Rectangle { height: StyleTokens.line-width; background: root.divider; }
                     if root.thread-root-id == "" : Text {
                         text: "Choose a message and open its thread.";
                         color: root.muted; font-size: 12px * root.text-scale;
@@ -8216,7 +8216,7 @@ export component AppWindow inherits Window {
                                     }
                                 }
                             }
-                            Rectangle { height: 1px; background: root.divider; }
+                            Rectangle { height: StyleTokens.line-width; background: root.divider; }
                             // A thread feed starts with its latest replies; earlier
                             // replies load on request, a page at a time.
                             if root.live-session : TextAction {
@@ -8884,7 +8884,7 @@ export component AppWindow inherits Window {
 
                                 Text { x: 12px; width: parent.width - 24px; text: "Save topic"; color: parent.enabled ? root.accent-ink : root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
                             }
-                            Rectangle { height: 1px; background: root.divider; }
+                            Rectangle { height: StyleTokens.line-width; background: root.divider; }
                             Text { text: "Room avatar"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 700; }
                             Text { text: "Static PNG or baseline JPEG, up to 8 MiB and 4 megapixels. New avatars are resized to at most 512 px and stripped of metadata. Room avatars are shared metadata, even in encrypted rooms."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                             Rectangle {
@@ -8953,7 +8953,7 @@ export component AppWindow inherits Window {
                                 Text { x: 12px; width: parent.width - 24px; text: "Remove…"; color: parent.enabled ? root.ink : root.muted; font-size: 12px * root.text-scale; horizontal-alignment: center; vertical-alignment: center; }
                             }
                             Text { text: root.room-settings-staged ? "Staged locally. Inspect orientation and colours before saving." : "Encrypted-room previews follow your Appearance privacy setting. No avatar is downloaded automatically."; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
-                            Rectangle { height: 1px; background: root.divider; }
+                            Rectangle { height: StyleTokens.line-width; background: root.divider; }
                             Text { text: "Who can join"; color: root.ink; font-size: 15px * root.text-scale; font-weight: 700; }
                             Text { text: root.room-settings-access-description; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
                             ComboBox {
