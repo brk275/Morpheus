@@ -1946,15 +1946,20 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
     ui.set_security_loading(false);
     ui.set_security_busy(false);
     settle(ui).await;
-    for target in registry::SETTING_TARGETS {
+    for (index, target) in registry::SETTING_TARGETS.iter().enumerate() {
         ui.set_manage_accounts_open(false);
         ui.set_settings_revealed_id("".into());
         settle(ui).await;
-        assert!(
-            crate::settings_search::reveal(ui, target.id),
-            "{}",
-            target.id
-        );
+        let requested = crate::settings_search::reveal(ui, target.id);
+        if !requested {
+            // Fixed registry position and availability only; never emit account
+            // identifiers, search text, config contents or arbitrary errors.
+            eprintln!(
+                "MORPHEUS_SETTINGS_TARGET_FAILURE index={index} live={}",
+                ui.get_live_session()
+            );
+        }
+        assert!(requested, "{}", target.id);
         settle(ui).await;
         assert_eq!(
             ui.get_settings_revealed_id(),
