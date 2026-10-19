@@ -3124,7 +3124,13 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
     assert_eq!(profiles.list().unwrap().entries.len(), 1);
     let raw = std::fs::read_to_string(profiles.dir().join("reading-room.toml")).unwrap();
     assert!(raw.contains("message_size = 15"), "{raw}");
-    for absent in ["private-word", "highlight", "notifications", "shortcuts", "scale_percent"] {
+    for absent in [
+        "private-word",
+        "highlight",
+        "notifications",
+        "shortcuts",
+        "scale_percent",
+    ] {
         assert!(!raw.contains(absent), "{absent} leaked into a profile");
     }
     let items = ui.get_style_profile_items();
@@ -3198,10 +3204,23 @@ async fn assert_style_profiles(ui: &AppWindow, directory: &std::path::Path) {
         theme: None,
     };
     same.config.appearance.scale_percent = 150;
+    // A live preview must not hold back an external privacy change. These
+    // settings are deliberately excluded from profile imports and rollback.
+    assert!(ui.get_notifications_enabled());
+    assert!(ui.get_notification_show_preview());
+    same.config.notifications.enabled = false;
+    same.config.notifications.show_message_preview = false;
     crate::apply_loaded_config(ui, &same);
+    assert!(!ui.get_notifications_enabled());
+    assert!(!ui.get_notification_show_preview());
     assert!(ui.get_style_preview_active());
     assert_eq!(ui.get_message_font_size(), 15);
     assert_eq!(ui.get_font_scale_percent(), 150);
+    ui.invoke_style_profile_cancel_preview();
+    assert!(!ui.get_style_preview_active());
+    assert!(!ui.get_notifications_enabled());
+    assert!(!ui.get_notification_show_preview());
+    preview(ui);
     let mut external = store.load().unwrap();
     external.typography.message_size = 22;
     store.save(&external).unwrap();

@@ -915,11 +915,17 @@ fn apply_notification_settings(ui: &AppWindow, config: &Config) {
 
 fn apply_config(ui: &AppWindow, config: &Config, theme: Option<&ThemePack>) {
     apply_appearance(ui, config, theme, true);
+    apply_behavior(ui, config);
+    style_profiles::config_applied(ui);
+}
+
+/// Accepted behavioral settings always take effect, including while a style
+/// preview owns the appearance. Preview/cancel never applies these settings.
+fn apply_behavior(ui: &AppWindow, config: &Config) {
     shortcuts::apply_config(ui, config);
     audio_devices::apply_config(ui, config);
     image_previews::apply_config(ui, config);
     apply_notification_settings(ui, config);
-    style_profiles::config_applied(ui);
 }
 
 /// Everything of `config` that shows the look of the window, and nothing that
@@ -995,7 +1001,10 @@ fn apply_loaded_config(ui: &AppWindow, loaded: &LoadedConfig) {
     // A previewed style profile stays while the accepted look is unchanged,
     // as when the watcher re-reads this window's own save; any other change
     // ends the preview here, before it is applied.
-    if !style_profiles::keeps_preview(ui, loaded) {
+    if style_profiles::keeps_preview(ui, loaded) {
+        apply_behavior(ui, &loaded.config);
+        style_profiles::config_applied(ui);
+    } else {
         apply_config(ui, &loaded.config, loaded.theme.as_ref());
     }
     ui.set_config_error("".into());
