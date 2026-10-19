@@ -250,7 +250,7 @@ async fn test_poll_contains_relations() {
 // Morpheus: exercise authorization in the real timeline aggregation path,
 // including relations delivered before their poll start.
 #[async_test]
-async fn morpheus_unauthorized_poll_end_keeps_poll_open_and_creator_can_end() {
+async fn test_morpheus_unauthorized_poll_end_keeps_poll_open_and_creator_can_end() {
     let timeline = TestTimeline::new().await;
     timeline.send_poll_start(&ALICE, fakes::poll_a()).await;
     let poll_id = timeline.poll_event().await.event_id().unwrap().to_owned();
@@ -263,7 +263,7 @@ async fn morpheus_unauthorized_poll_end_keeps_poll_open_and_creator_can_end() {
 }
 
 #[async_test]
-async fn morpheus_known_moderator_may_end_another_users_poll() {
+async fn test_morpheus_known_moderator_may_end_another_users_poll() {
     let provider = super::TestRoomDataProvider::default().with_redactors(vec![(*BOB).to_owned()]);
     let timeline = super::TestTimelineBuilder::new().provider(provider).build().await;
     timeline.send_poll_start(&ALICE, fakes::poll_a()).await;
@@ -273,7 +273,7 @@ async fn morpheus_known_moderator_may_end_another_users_poll() {
 }
 
 #[async_test]
-async fn morpheus_pending_invalid_end_does_not_drop_a_pending_vote() {
+async fn test_morpheus_pending_invalid_end_does_not_drop_a_pending_vote() {
     let timeline = TestTimeline::new().await;
     let poll_id = event_id!("$pending_poll");
     timeline.send_poll_end(&BOB, "invalid", poll_id).await;
@@ -289,7 +289,7 @@ async fn morpheus_pending_invalid_end_does_not_drop_a_pending_vote() {
 }
 
 #[async_test]
-async fn morpheus_pending_moderator_end_is_checked_when_start_arrives() {
+async fn test_morpheus_pending_moderator_end_is_checked_when_start_arrives() {
     let provider = super::TestRoomDataProvider::default().with_redactors(vec![(*BOB).to_owned()]);
     let timeline = super::TestTimelineBuilder::new().provider(provider).build().await;
     let poll_id = event_id!("$pending_moderated_poll");
@@ -303,7 +303,7 @@ async fn morpheus_pending_moderator_end_is_checked_when_start_arrives() {
 }
 
 #[async_test]
-async fn morpheus_earliest_valid_end_wins_even_when_received_later() {
+async fn test_morpheus_earliest_valid_end_wins_even_when_received_later() {
     let timeline = TestTimeline::new().await;
     timeline.send_poll_start(&ALICE, fakes::poll_a()).await;
     let poll_id = timeline.poll_event().await.event_id().unwrap().to_owned();
@@ -329,7 +329,7 @@ async fn morpheus_earliest_valid_end_wins_even_when_received_later() {
 }
 
 #[async_test]
-async fn morpheus_duplicate_pending_ends_do_not_stop_later_pending_votes() {
+async fn test_morpheus_duplicate_pending_ends_do_not_stop_later_pending_votes() {
     let timeline = TestTimeline::new().await;
     let poll_id = event_id!("$pending_duplicate_end");
     timeline
