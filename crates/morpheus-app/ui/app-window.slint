@@ -1,5 +1,5 @@
 import { AboutSlint, Button, ComboBox, ListView, Palette, ScrollView, Slider, SpinBox } from "std-widgets.slint";
-import { EncryptionDevices, EncryptionPalette, SasVerificationPanel, TrustedDeviceItem } from "encryption-center.slint";
+import { EncryptionDevices, EncryptionPalette, SasVerificationPanel, TrustedDeviceItem, VerificationRequestBanner } from "encryption-center.slint";
 
 // Optional overrides retain each control's existing color when absent.
 export struct ColorRole {
@@ -2166,6 +2166,10 @@ export component AppWindow inherits Window {
     in-out property <bool> encryption-devices-loading: false;
     in-out property <string> encryption-devices-error;
     in-out property <int> encryption-devices-operation: 0;
+    // Newest pending request from another device of this account, and the
+    // one the person chose to hide; opaque flow IDs, never shown.
+    in-out property <string> encryption-incoming-flow-id;
+    in-out property <string> encryption-incoming-dismissed;
     property <EncryptionPalette> encryption-palette: {
         ink: root.ink,
         muted: root.muted,
@@ -3408,6 +3412,15 @@ export component AppWindow inherits Window {
                         vertical-alignment: center;
                         overflow: elide;
                     }
+                }
+                if root.live-session && root.page != 1 && root.encryption-incoming-flow-id != "" && root.encryption-incoming-flow-id != root.encryption-incoming-dismissed : VerificationRequestBanner {
+                    palette: root.encryption-palette;
+                    text-scale: root.text-scale;
+                    review => {
+                        root.open-security();
+                        root.settings-search-choose("security.recovery");
+                    }
+                    dismiss => { root.encryption-incoming-dismissed = root.encryption-incoming-flow-id; }
                 }
                 if root.config-error != "" : Rectangle {
                     height: 39px;

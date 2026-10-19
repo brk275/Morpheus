@@ -249,6 +249,46 @@ export component SasVerificationPanel inherits Rectangle {
     }
 }
 
+// Shown outside Settings when another device of this account asks to
+// verify this one. Reviewing opens the verification panel; nothing is
+// accepted or trusted from here.
+export component VerificationRequestBanner inherits Rectangle {
+    in property <EncryptionPalette> palette;
+    in property <float> text-scale: 1;
+    callback review();
+    callback dismiss();
+
+    background: root.palette.panel;
+    height: row.preferred-height;
+
+    row := HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 8px;
+        padding-top: 4px;
+        padding-bottom: 4px;
+        spacing: 8px;
+        Text {
+            text: "Another of your devices asked to verify this one.";
+            color: root.palette.ink;
+            font-size: 11px * root.text-scale;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            wrap: word-wrap;
+            accessible-live-region: polite;
+        }
+        Button {
+            text: "Review";
+            accessible-label: "Review the verification request in Security settings";
+            clicked => { root.review(); }
+        }
+        Button {
+            text: "Not now";
+            accessible-label: "Hide this verification request notice";
+            clicked => { root.dismiss(); }
+        }
+    }
+}
+
 export struct TrustedDeviceItem {
     // Opaque Matrix device ID; it only names the Verify target.
     device-id: string,

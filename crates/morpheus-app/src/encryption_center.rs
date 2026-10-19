@@ -9,7 +9,7 @@ use std::{
 };
 
 use morpheus_matrix::{DeviceTrust, OwnDeviceInfo};
-use slint::{ComponentHandle, Model, ModelRc, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, VecModel, Weak};
 use tokio::runtime::Handle;
 
 use crate::{AppWindow, TrustedDeviceItem, live::LiveUi};
@@ -98,17 +98,74 @@ fn device_items(devices: &[OwnDeviceInfo], now_ms: u64) -> Vec<TrustedDeviceItem
         .collect()
 }
 
-/// Forget this account's device list. Called on every account change,
-/// logout and entry into the offline preview, before the next account shows.
+/// Forget this account's device list and request notice. Called on every
+/// account change, logout and entry into the offline preview.
 pub(crate) fn clear_ui(ui: &AppWindow) {
     next_operation(ui);
     let empty: Vec<TrustedDeviceItem> = Vec::new();
     ui.set_encryption_devices(ModelRc::new(VecModel::from(empty)));
     ui.set_encryption_devices_loading(false);
     ui.set_encryption_devices_error("".into());
+    ui.set_encryption_incoming_flow_id("".into());
+    ui.set_encryption_incoming_dismissed("".into());
+}
+
+fn publish_incoming(weak: &Weak<AppWindow>, account_id: &str, flow_id: String) {
+    let account_id = account_id.to_owned();
+    let _ = weak.upgrade_in_event_loop(move |ui| {
+        if ui.get_live_session() && ui.get_active_account_local_id().as_str() == account_id {
+            ui.set_encryption_incoming_flow_id(flow_id.into());
+        }
+    });
+}
+
+/// Point to verification requests from this account's other devices
+/// anywhere in the app, not only while Settings polls. Only the newest
+/// pending flow ID is shown; reviewing still happens in the SAS panel. Each
+/// receiver belongs to one account's client, so resubscribe on every change.
+fn watch_incoming_requests(ui: &AppWindow, live: Arc<LiveUi>, handle: &Handle) {
+    let weak = ui.as_weak();
+    handle.spawn(async move {
+        let manager = &live.manager;
+        let mut active = manager.subscribe_active_account();
+        loop {
+            let mut account_changed = false;
+            let subscription = manager.subscribe_incoming_verification_requests().await;
+            if let Ok((account_id, mut requests)) = subscription {
+                loop {
+                    let newest = requests
+                        .borrow_and_update()
+                        .last()
+                        .map(|request| request.flow_id.clone())
+                        .unwrap_or_default();
+                    publish_incoming(&weak, &account_id, newest);
+                    tokio::select! {
+                        changed = requests.changed() => {
+                            if changed.is_err() {
+                                break;
+                            }
+                        }
+                        changed = active.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                            account_changed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            // A closed receiver for the same account would otherwise spin;
+            // wait for the next account change before resubscribing.
+            if !account_changed && active.changed().await.is_err() {
+                return;
+            }
+        }
+    });
 }
 
 pub(crate) fn register(ui: &AppWindow, live: Arc<LiveUi>, handle: Handle) {
+    watch_incoming_requests(ui, live.clone(), &handle);
     let weak = ui.as_weak();
     let refresh_live = live.clone();
     let refresh_handle = handle.clone();
