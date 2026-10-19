@@ -118,7 +118,9 @@ impl DialogPermit {
         DIALOG
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
-            .then_some(Self)
+            // Built only when acquired: a refused permit must never exist,
+            // or dropping it would release the one that is held.
+            .then(|| Self)
     }
 }
 
@@ -1036,6 +1038,8 @@ mod tests {
     #[test]
     fn the_dialog_permit_admits_one_operation_at_a_time() {
         let first = DialogPermit::acquire().expect("free");
+        assert!(DialogPermit::acquire().is_none());
+        // A refused acquire leaves the held permit in force.
         assert!(DialogPermit::acquire().is_none());
         drop(first);
         assert!(DialogPermit::acquire().is_some());
