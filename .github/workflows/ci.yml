@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
-name: Reviewed style profile native checks
-run-name: Reviewed native candidate - 518e3fd - ${{ inputs.platform }}
+name: Reviewed style profile UI diagnosis
+run-name: Style profile UI diagnosis - e352e49 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,12 +14,12 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: beta-native-518e3fd-${{ github.ref }}
+  group: style-ui-diagnosis-e352e49-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
     name: Native ${{ matrix.name }}
-    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false && contains(fromJSON('["all","macos-arm64","macos-intel","windows","linux"]'), inputs.platform)
+    if: github.repository == 'brk275/Morpheus' && github.event.repository.private == false && inputs.platform == 'linux'
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(inputs.platform == 'macos-arm64' && '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"}]}' || inputs.platform == 'macos-intel' && '{"include":[{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"}]}' || inputs.platform == 'windows' && '{"include":[{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"}]}' || inputs.platform == 'linux' && '{"include":[{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}' || '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"},{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"},{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"},{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}') }}
@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: 518e3fd1a04a17a72915f76e361605e250d03c16
+          ref: e352e49ab39dd2fcc632cdf4b4b69c5c12739b90
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -135,7 +135,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='518e3fd1a04a17a72915f76e361605e250d03c16'
+          source='e352e49ab39dd2fcc632cdf4b4b69c5c12739b90'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -379,7 +379,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='518e3fd1a04a17a72915f76e361605e250d03c16'
+          source='e352e49ab39dd2fcc632cdf4b4b69c5c12739b90'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -482,17 +482,14 @@ jobs:
                   'style_profiles::tests::operations_stay_in_the_anchored_folder_when_its_path_is_swapped',
                   'style_profiles::tests::links_are_never_followed_for_profiles_imports_or_exports',
               })
-          # First acceptance of the feature, not final integrated all4 app proof.
-          # Config exercises actual filesystem/FFI paths on every supported target.
+          # The other348app, config83, examples1 and UIcompile checks passed.
+          # Diagnose only the failed actual native generated UI case.
           checks=[
-              ('config_unit',['cargo','test','--locked','-p','morpheus-config','--lib','--','--test-threads=1'],10*60,needed_config,set()),
-              ('style_profile_examples',['cargo','test','--locked','-p','morpheus-config','--test','style_profile_examples','--','--test-threads=1'],5*60,{'style_profile_examples_are_valid_importable_profiles'},set()),
+              ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls','--bin','morpheus-app',
+                  'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation',
+                  '--','--exact','--nocapture','--test-threads=1'],70*60,
+                  {'account_access::ui_tests::real_slint_account_dialogs_and_detach_clear_private_presentation'},set()),
           ]
-          if os.environ['RUNNER_OS']=='Linux':
-              checks.extend([
-                  ('native_ui_compile',['cargo','check','--locked','-p','morpheus-ui-check'],10*60,None,set()),
-                  ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls','--bin','morpheus-app','--','--test-threads=1'],70*60,needed_app,allowed_app_ignore),
-              ])
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
               result=bounded(args,name,seconds)
@@ -558,7 +555,26 @@ jobs:
                   resolved_link=shutil.which('link.exe',path=environment.get('PATH','')) if os.name=='nt' else None
                   locked_names={package for package,version in locked}
                   failed_packages=set(re.findall(r'could not compile `([A-Za-z0-9_-]+)`',normalized))
+                  # Only known public production file names and numeric spans.
+                  # Never publish compiler text, source snippets or raw paths.
+                  ui_files=('crates/morpheus-app/ui/app-window.slint',
+                      'crates/morpheus-app/ui/message-search.slint',
+                      'crates/morpheus-app/src/account_access_ui_tests.rs',
+                      'crates/morpheus-app/src/live.rs',
+                      'crates/morpheus-app/src/message_search.rs',
+                      'crates/morpheus-matrix/src/history.rs',
+                      'crates/morpheus-matrix/src/search.rs')
+                  ui_locations=[]
+                  for path in ui_files:
+                      if not (workspace/path).is_file(): continue
+                      line_limit=len((workspace/path).read_text().splitlines())+1
+                      pattern=re.escape(path)+r':([0-9]{1,7}):([0-9]{1,5})'
+                      spans={(int(line),int(column)) for line,column in re.findall(pattern,normalized)
+                          if 0<int(line)<=line_limit and 0<int(column)<=4096}
+                      ui_locations.extend({'file':path,'line':line,'column':column} for line,column in sorted(spans)[:32])
                   record['failure_diagnostics']={
+                      'ui_timeout_phases':sorted({int(v) for v in re.findall(r'(?m)^morpheus-ui-timeout-phase=([0-9]{1,2})$',normalized) if 0<=int(v)<=18}),
+                      'ui_locations':ui_locations,
                       'linker_failures':[{'tool':tool_family(tool),'exit_code':int(code)} for tool,code in linker_failures[:8]],
                       'path_link_family':tool_family(resolved_link) if resolved_link else 'not_resolved',
                       'locked_failed_packages':sorted(failed_packages & locked_names),
