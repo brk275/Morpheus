@@ -1411,7 +1411,7 @@ fn present_thread_root(window: &AppWindow, root: &MessageInfo) {
     window.set_thread_root_rich_accessible_body(item.rich_accessible_body);
 }
 
-fn search_time(timestamp_ms: u64) -> String {
+pub(crate) fn search_time(timestamp_ms: u64) -> String {
     i64::try_from(timestamp_ms)
         .ok()
         .and_then(|timestamp| Local.timestamp_millis_opt(timestamp).single())
