@@ -7,6 +7,12 @@
 //! account change, removal or sign-out forgets every kept reply. An edit
 //! cannot be restored over its reloaded baseline, so leaving one is
 //! reported instead.
+//!
+//! The text stays in this store until a restore actually succeeds. A
+//! deferred restore holds only the store's epoch and the room's IDs; every
+//! room change and every clear moves the epoch synchronously, so a queued
+//! restore from before them does nothing, and a busy or stale attempt
+//! consumes nothing.
 
 use std::cell::RefCell;
 use std::time::Duration;
@@ -29,13 +35,67 @@ struct KeptReply {
     markdown: bool,
 }
 
-thread_local! {
-    static KEPT: RefCell<Vec<KeptReply>> = const { RefCell::new(Vec::new()) };
+/// The kept replies and the epoch that fences their deferred restores.
+#[derive(Default)]
+struct Store {
+    epoch: u64,
+    kept: Vec<KeptReply>,
 }
 
-/// The visible room is about to change within the same account: keep a
-/// reply being typed there.
+impl Store {
+    /// The visible room is changing: earlier queued restores are void.
+    fn room_changing(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+
+    fn keep(&mut self, reply: KeptReply) {
+        self.kept
+            .retain(|other| other.account != reply.account || other.room != reply.room);
+        if self.kept.len() >= MAX_KEPT {
+            self.kept.remove(0);
+        }
+        self.kept.push(reply);
+    }
+
+    /// The epoch a restore of this room's reply must still match, if one is
+    /// kept. The text stays here.
+    fn pending(&self, account: &str, room: &str) -> Option<u64> {
+        let kept = self.kept.iter();
+        let mut matching = kept.filter(|reply| reply.account == account && reply.room == room);
+        matching.next().map(|_| self.epoch)
+    }
+
+    /// Hand the reply to a restore that is still current: same epoch, same
+    /// account and room. Anything else takes nothing.
+    fn take(&mut self, epoch: u64, account: &str, room: &str) -> Option<KeptReply> {
+        if epoch != self.epoch {
+            return None;
+        }
+        let at = self
+            .kept
+            .iter()
+            .position(|reply| reply.account == account && reply.room == room)?;
+        Some(self.kept.remove(at))
+    }
+
+    fn forget_all(&mut self) {
+        self.kept.clear();
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+}
+
+thread_local! {
+    static STORE: RefCell<Store> = RefCell::new(Store::default());
+}
+
+fn with<R>(f: impl FnOnce(&mut Store) -> R) -> R {
+    STORE.with(|store| f(&mut store.borrow_mut()))
+}
+
+/// The visible room is about to change within the same account: void any
+/// queued restore and keep a reply being typed in the room being left.
 pub(crate) fn leaving_room(ui: &AppWindow) {
+    with(Store::room_changing);
     let account = ui.get_active_account_local_id().to_string();
     let room = ui.get_active_room_id().to_string();
     let text = ui.get_composer_text().to_string();
@@ -55,36 +115,23 @@ pub(crate) fn leaving_room(ui: &AppWindow) {
         return;
     }
     let reply = KeptReply {
-        label: ui.get_composer_target_label().to_string(),
-        markdown: ui.get_composer_markdown(),
         account,
         room,
         target,
+        label: ui.get_composer_target_label().to_string(),
         text,
+        markdown: ui.get_composer_markdown(),
     };
-    KEPT.with(|kept| {
-        let mut kept = kept.borrow_mut();
-        kept.retain(|other| other.account != reply.account || other.room != reply.room);
-        if kept.len() >= MAX_KEPT {
-            kept.remove(0);
-        }
-        kept.push(reply);
-    });
+    with(|store| store.keep(reply));
 }
 
-/// A room of the same account became visible: offer its kept reply again,
-/// once the room's own draft and composer state are in place.
+/// A room of the same account became visible: offer its kept reply again
+/// once the room's own draft and composer state are in place. The queued
+/// restore holds only the epoch and the room's IDs.
 pub(crate) fn entered_room(ui: &AppWindow) {
     let account = ui.get_active_account_local_id().to_string();
     let room = ui.get_active_room_id().to_string();
-    let reply = KEPT.with(|kept| {
-        let mut kept = kept.borrow_mut();
-        let at = kept
-            .iter()
-            .position(|reply| reply.account == account && reply.room == room)?;
-        Some(kept.remove(at))
-    });
-    let Some(reply) = reply else {
+    let Some(epoch) = with(|store| store.pending(&account, &room)) else {
         return;
     };
     let weak = ui.as_weak();
@@ -92,11 +139,15 @@ pub(crate) fn entered_room(ui: &AppWindow) {
         let Some(ui) = weak.upgrade() else {
             return;
         };
-        let here = ui.get_active_account_local_id().as_str() == reply.account
-            && ui.get_active_room_id().as_str() == reply.room;
+        let here = ui.get_active_account_local_id().as_str() == account
+            && ui.get_active_room_id().as_str() == room;
+        // A busy or changed composer takes nothing; the reply stays kept.
         if !here || ui.get_composer_mode() != 0 || ui.get_composer_busy() {
             return;
         }
+        let Some(reply) = with(|store| store.take(epoch, &account, &room)) else {
+            return;
+        };
         // The window's own reply action: the room draft is parked and comes
         // back when the reply is sent or cancelled.
         ui.invoke_begin_compose(
@@ -109,7 +160,57 @@ pub(crate) fn entered_room(ui: &AppWindow) {
     });
 }
 
-/// Forget every kept reply: the account changed, was removed or signed out.
+/// Forget every kept reply and void queued restores: the account changed,
+/// was removed or signed out.
 pub(crate) fn forget_all() {
-    KEPT.with(|kept| kept.borrow_mut().clear());
+    with(Store::forget_all);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ACCOUNT: &str = "account-a";
+    const ROOM: &str = "!room:example.org";
+
+    fn reply(room: &str) -> KeptReply {
+        KeptReply {
+            account: ACCOUNT.into(),
+            room: room.into(),
+            target: "$target:example.org".into(),
+            label: "Casey".into(),
+            text: "reply text".into(),
+            markdown: false,
+        }
+    }
+
+    #[test]
+    fn a_queued_restore_cannot_outlive_a_clear_or_a_room_change() {
+        let mut store = Store::default();
+        store.keep(reply(ROOM));
+        // Entering the room queues a restore; the account is cleared first.
+        let queued = store.pending(ACCOUNT, ROOM).unwrap();
+        store.forget_all();
+        assert!(store.take(queued, ACCOUNT, ROOM).is_none());
+        assert!(store.kept.is_empty());
+
+        // A room change before the queued restore runs voids it but keeps
+        // the text for the next return; another account takes nothing.
+        store.keep(reply(ROOM));
+        let queued = store.pending(ACCOUNT, ROOM).unwrap();
+        store.room_changing();
+        assert!(store.take(queued, ACCOUNT, ROOM).is_none());
+        assert_eq!(store.kept.len(), 1);
+        let current = store.pending(ACCOUNT, ROOM).unwrap();
+        assert!(store.take(current, "account-b", ROOM).is_none());
+        let restored = store.take(current, ACCOUNT, ROOM);
+        assert_eq!(restored.map(|reply| reply.text), Some("reply text".into()));
+        assert!(store.kept.is_empty());
+
+        // The store stays bounded.
+        for index in 0..MAX_KEPT + 3 {
+            store.keep(reply(&format!("!room{index}:example.org")));
+        }
+        assert_eq!(store.kept.len(), MAX_KEPT);
+    }
 }
