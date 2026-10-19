@@ -1550,7 +1550,7 @@ pub const FIELDS: &[FieldSpec] = &[
         "shortcuts.<action>",
         FieldKind::Table,
         "see description",
-        "Key combination per action: quick_switcher (Mod+K), search (Mod+F), next_unread (Alt+Down), previous_unread (Alt+Up). Omit an action to disable it.",
+        "Key combination per action; `config schema` lists every action and its default. Omit an action to disable it.",
     ),
     inactive(field(
         "experimental.background_account_sync",

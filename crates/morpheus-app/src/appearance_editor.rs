@@ -20,7 +20,7 @@ use morpheus_config::registry::{
     self, COLOR_TOKENS, ColorToken, Fallback, TokenGroup, TokenSource,
 };
 use morpheus_config::{AccountOverrides, Config, ConfigStore, ThemePack};
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use super::{
     AppWindow, ColorEditorState, ColorGroupItem, ColorTokenItem, StyleTokens, save_config_change,
@@ -64,6 +64,22 @@ struct Session {
     /// The account whose colors the undo steps and the Reset all snapshot
     /// belong to; `None` is the table for all accounts.
     scope: Option<String>,
+    /// The active account and edited scope of the last projection. Only a
+    /// change refills the hex field, so the live refresh that follows every
+    /// room update never replaces a partial value being typed.
+    view: Option<(String, Option<String>)>,
+}
+
+/// What the shown color of the selected token is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shown {
+    /// The color the window applies for the edited scope.
+    Applied,
+    /// The global value; the active account applies its own color instead.
+    GlobalValue,
+    /// The color the active account's own colors make. The value for all
+    /// accounts comes from the theme or a built-in color and is not shown.
+    ActiveAccount,
 }
 
 /// The account whose colors the editor changes, or `None` for all accounts.
@@ -209,8 +225,16 @@ pub(super) fn register(ui: &AppWindow, store: &ConfigStore) {
         clear_hint();
         // Typing the color already shown saves nothing, so an inherited color
         // does not become an override. This only ever skips a write, so a
-        // view older than the file cannot overwrite it.
-        if effective_rgba(&ui, token.id) == rgba {
+        // view older than the file cannot overwrite it. A color the active
+        // account sets itself is not the value for all accounts.
+        let (shown, shown_as) = SESSION.with(|session| {
+            let session = session.borrow();
+            let default = (Config::default(), None);
+            let (config, theme) = session.source.as_ref().unwrap_or(&default);
+            let account = scope_account(&ui);
+            shown_color(&ui, config, theme.as_ref(), account.as_deref(), token)
+        });
+        if shown == rgba && shown_as != Shown::ActiveAccount {
             reproject(&ui, false);
             return;
         }
@@ -413,7 +437,7 @@ pub(super) fn refresh(ui: &AppWindow) {
     if ui.get_active_account_local_id().is_empty() {
         ui.set_color_scope(0);
     }
-    reproject(ui, true);
+    reproject(ui, false);
 }
 
 /// Select one token for editing, as a Settings search result does: its group
@@ -542,6 +566,70 @@ fn effective_rgba(ui: &AppWindow, id: &str) -> [u8; 4] {
     [color.red(), color.green(), color.blue(), color.alpha()]
 }
 
+/// Whether the active account's own colors decide how `token` looks: the
+/// account colors it, or a token it follows, before a global color or a
+/// theme value does.
+fn account_decides(
+    config: &Config,
+    theme: Option<&ThemePack>,
+    account: &str,
+    token: &'static ColorToken,
+) -> bool {
+    let Some(own) = scoped(config, Some(account)).filter(|colors| !colors.is_empty()) else {
+        return false;
+    };
+    let mut step = Some(token);
+    // Each fallback names a different token; the bound only guards a cycle.
+    for _ in 0..COLOR_TOKENS.len() {
+        let Some(token) = step else { break };
+        if own.contains_key(token.id) {
+            return true;
+        }
+        let themed = match token.source {
+            TokenSource::Base => theme.is_some(),
+            TokenSource::Role => theme.and_then(|theme| theme.roles.get(token.id)).is_some(),
+            TokenSource::State => theme.and_then(|theme| theme.states.get(token.id)).is_some(),
+        };
+        if themed || config.colors.contains_key(token.id) {
+            return false;
+        }
+        step = match token.fallback {
+            Fallback::Token(other) => registry::color_token(other),
+            Fallback::Palette | Fallback::Legacy { .. } => None,
+        };
+    }
+    false
+}
+
+/// The color the editor shows for `token` in the edited scope. The window
+/// applies the active account's colors, so in the scope for all accounts a
+/// color that account sets itself shows the global value when the file
+/// holds one, and is marked otherwise.
+fn shown_color(
+    ui: &AppWindow,
+    config: &Config,
+    theme: Option<&ThemePack>,
+    account: Option<&str>,
+    token: &'static ColorToken,
+) -> ([u8; 4], Shown) {
+    let applied = effective_rgba(ui, token.id);
+    let active = ui.get_active_account_local_id();
+    if account.is_some()
+        || active.is_empty()
+        || !account_decides(config, theme, active.as_str(), token)
+    {
+        return (applied, Shown::Applied);
+    }
+    match config
+        .colors
+        .get(token.id)
+        .and_then(|value| registry::parse_hex_color(value))
+    {
+        Some(global) => (global, Shown::GlobalValue),
+        None => (applied, Shown::ActiveAccount),
+    }
+}
+
 /// Where the shown color of `token` comes from, as fixed text. `account` is
 /// the edited account while the editor is scoped to the active account.
 fn source_text(
@@ -585,6 +673,14 @@ fn source_text(
 fn reproject(ui: &AppWindow, refill: bool) {
     let account = scope_account(ui);
     sync_scope(&account);
+    let view = (ui.get_active_account_local_id().to_string(), account.clone());
+    let moved = SESSION.with(|session| {
+        let mut session = session.borrow_mut();
+        let moved = session.view.as_ref() != Some(&view);
+        session.view = Some(view);
+        moved
+    });
+    let refill = refill || moved;
     let account = account.as_deref();
     SESSION.with(|session| {
         let session = session.borrow();
@@ -612,7 +708,14 @@ fn reproject(ui: &AppWindow, refill: bool) {
                 overridden: overridden(token.id),
             })
             .collect();
-        ui.set_color_tokens(ModelRc::new(VecModel::from(items)));
+        // Keep the list's delegates, and keyboard focus in it, when nothing
+        // changed, as after a live refresh or the reload of this window's save.
+        let current = ui.get_color_tokens();
+        if current.row_count() != items.len()
+            || current.iter().zip(&items).any(|(shown, item)| shown != *item)
+        {
+            ui.set_color_tokens(ModelRc::new(VecModel::from(items)));
+        }
         ui.set_color_override_count(override_count as i32);
         ui.set_color_reset_all_notice(
             match &session.reset_all {
@@ -626,17 +729,27 @@ fn reproject(ui: &AppWindow, refill: bool) {
             }
             .into(),
         );
+        let (shown, shown_as) = shown_color(ui, config, theme, account, selected);
+        let source = source_text(config, theme, selected, account);
         ui.set_color_editor(ColorEditorState {
             id: selected.id.into(),
             label: selected.label.into(),
             description: selected.description.into(),
             group: selected.group.label().into(),
-            source: source_text(config, theme, selected, account).into(),
+            source: match shown_as {
+                Shown::Applied => source,
+                Shown::GlobalValue => format!("{source}. The active account uses its own color"),
+                Shown::ActiveAccount => format!(
+                    "{source}. Shown with the active account's own color; a value here applies to all accounts"
+                ),
+            }
+            .into(),
             overridden: overridden(selected.id),
             can_undo: session.previous.contains_key(selected.id),
             hint: session.hint.as_str().into(),
         });
-        let shown = effective_rgba(ui, selected.id);
+        let [red, green, blue, alpha] = shown;
+        ui.set_color_swatch(slint::Color::from_argb_u8(alpha, red, green, blue));
         let typed = registry::parse_hex_color(ui.get_color_hex_input().trim());
         if refill || typed.is_some_and(|typed| typed != shown) {
             ui.set_color_hex_input(registry::format_hex_color(shown).into());
@@ -659,7 +772,8 @@ mod tests {
             .iter()
             .map(|token| token.id)
             .collect();
-        assert_eq!(badge, ["unread_ink", "mention_ink"]);
+        // "Navigation and badges" holds the selected-room text color.
+        assert_eq!(badge, ["unread_ink", "nav_selected_ink", "mention_ink"]);
         assert!(shown_tokens(0, "no such color").is_empty());
         let surfaces = shown_tokens(0, "  ");
         assert!(

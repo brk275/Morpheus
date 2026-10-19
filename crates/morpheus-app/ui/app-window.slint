@@ -106,6 +106,17 @@ export struct ColorEditorState {
     hint: string,
 }
 
+// One keyboard shortcut action. `action` is a registry name, never a command.
+export struct ShortcutItem {
+    action: string,
+    label: string,
+    group: string,
+    // Canonical combination, or empty when the action is disabled.
+    binding: string,
+    default-binding: string,
+    customized: bool,
+}
+
 // One color of the sender-name palette, in slot order.
 export struct SenderColorRow {
     index: int,
@@ -657,15 +668,16 @@ component NavigationRoomRow inherits ActionRect {
             font-size: 9px * root.text-scale; font-weight: 750; vertical-alignment: center;
         }
         // One badge: mentions win over the plain unread count. Both grow with
-        // a long count or large text instead of overflowing the pill.
+        // a long count or large text instead of overflowing the pill; at the
+        // default size a two-digit count keeps the 20 px circle.
         if root.room.mentions > 0 : mention-pill := Rectangle {
-            width: max(20px, mention-count.preferred-width + 10px); height: max(20px, 14px * root.text-scale);
+            width: max(self.height, mention-count.preferred-width + 8px); height: max(20px, 14px * root.text-scale);
             border-radius: self.height / 2;
             background: root.mention-surface;
             mention-count := Text { text: "@" + root.room.mentions; color: root.mention-ink; font-size: 10px * root.text-scale; font-weight: 750; horizontal-alignment: center; vertical-alignment: center; }
         }
         if root.room.mentions <= 0 && root.room.unread > 0 : Rectangle {
-            width: max(20px, unread-count.preferred-width + 10px); height: max(20px, 14px * root.text-scale);
+            width: max(self.height, unread-count.preferred-width + 6px); height: max(20px, 14px * root.text-scale);
             border-radius: self.height / 2;
             background: StyleTokens.roles.unread.present ? StyleTokens.roles.unread.color : root.accent;
             unread-count := Text { text: root.room.unread; color: StyleTokens.roles.unread-ink.present ? StyleTokens.roles.unread-ink.color : root.accent-ink; font-size: 10px * root.text-scale; font-weight: 700; horizontal-alignment: center; vertical-alignment: center; }
@@ -970,7 +982,9 @@ component MentionPopup inherits Rectangle {
     height: min(360px, self.items.length * (36px * root.text-scale + 10px) + 8px);
     // Opt-in decorative fade-in: immediate at 0 ms and under reduced motion.
     property <bool> entered: false;
-    init => { self.entered = true; }
+    // Opacity is first read here, at 0, so setting `entered` animates it;
+    // `init` would set it before that first read and nothing would fade.
+    Timer { interval: 1ms; running: !root.entered && root.opacity < 1; triggered => { root.entered = true; } }
     opacity: StyleTokens.popup-duration == 0ms || self.entered ? 1 : 0;
     animate opacity { duration: StyleTokens.popup-duration; easing: ease-out; }
     background: surface; border-radius: StyleTokens.radius * 0.8; border-width: 1px; border-color: accent;
@@ -1012,7 +1026,9 @@ component EmojiPopup inherits Rectangle {
     height: min(380px, 280px * root.text-scale + 70px);
     // Opt-in decorative fade-in: immediate at 0 ms and under reduced motion.
     property <bool> entered: false;
-    init => { self.entered = true; }
+    // Opacity is first read here, at 0, so setting `entered` animates it;
+    // `init` would set it before that first read and nothing would fade.
+    Timer { interval: 1ms; running: !root.entered && root.opacity < 1; triggered => { root.entered = true; } }
     opacity: StyleTokens.popup-duration == 0ms || self.entered ? 1 : 0;
     animate opacity { duration: StyleTokens.popup-duration; easing: ease-out; }
     background: surface; border-radius: StyleTokens.radius * 0.9; border-width: 1px; border-color: accent;
@@ -1283,7 +1299,9 @@ component StickerPopup inherits Rectangle {
     height: max(140px, min(root.available-height, root.narrow ? 620px : min(470px, 330px * root.text-scale + 130px)));
     // Opt-in decorative fade-in: immediate at 0 ms and under reduced motion.
     property <bool> entered: false;
-    init => { self.entered = true; }
+    // Opacity is first read here, at 0, so setting `entered` animates it;
+    // `init` would set it before that first read and nothing would fade.
+    Timer { interval: 1ms; running: !root.entered && root.opacity < 1; triggered => { root.entered = true; } }
     opacity: StyleTokens.popup-duration == 0ms || self.entered ? 1 : 0;
     animate opacity { duration: StyleTokens.popup-duration; easing: ease-out; }
     background: surface; border-radius: StyleTokens.radius * 0.9; border-width: 1px; border-color: accent;
@@ -1498,32 +1516,182 @@ component StickerSendStatus inherits Rectangle {
     }
 }
 
-component ShortcutSetting inherits Rectangle {
-    in property <string> label;
-    in-out property <string> binding;
+// Every registry shortcut action with its combination. Activating a binding
+// records the next combination pressed; Escape or Tab cancels without a
+// trap. A combination can also be typed. Each change saves at once, and a
+// conflict names the other action instead of saving.
+component ShortcutEditor inherits VerticalLayout {
+    in property <[ShortcutItem]> items;
+    in-out property <string> filter;
+    in property <string> recording;
+    in property <string> message;
+    in property <bool> message-error;
+    in property <bool> can-undo;
     in property <color> ink;
     in property <color> muted;
     in property <color> surface;
+    in property <color> hover-surface;
     in property <color> accent;
+    in property <color> outline;
     in property <float> text-scale: 1;
-    callback edited();
-    height: 52px;
-    background: transparent;
-    forward-focus: shortcut-input;
-    out property <bool> has-focus: shortcut-input.has-focus;
-    HorizontalLayout {
-        spacing: 12px;
-        Text { text: root.label; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center; horizontal-stretch: 1; }
-        Rectangle {
-            width: 200px; height: 38px; background: root.surface; border-radius: StyleTokens.radius * 0.7;
-            border-width: shortcut-input.has-focus ? StyleTokens.focus-width : 0px; border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent;
-            if root.binding == "" : Text { x: 9px; text: "Disabled"; color: root.muted; font-size: 12px * root.text-scale; vertical-alignment: center; }
-            shortcut-input := ThemedTextInput {
-                x: 9px; width: parent.width - 18px; height: parent.height;
-                text <=> root.binding; color: root.ink; font-size: 12px * root.text-scale;
-                single-line: true; accessible-label: root.label + " keyboard shortcut; blank disables";
-                edited => { root.edited(); }
+    callback filter-edited(string);
+    callback record(string);
+    callback cancel-recording();
+    callback recorded(string, string, bool, bool, bool, bool) -> bool;
+    callback typed(string, string);
+    callback disable(string);
+    callback use-default(string);
+    callback undo();
+    callback restore-defaults();
+    out property <bool> has-focus: filter-input.has-focus;
+    // The action whose record button takes focus back when recording ends.
+    property <string> return-focus;
+    forward-focus: filter-input;
+    spacing: 6px;
+    alignment: start;
+    Rectangle {
+        height: max(36px, 30px * root.text-scale);
+        background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.surface;
+        border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.7;
+        border-width: filter-input.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
+        border-color: filter-input.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent)
+            : StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.outline;
+        if root.filter == "" : Text {
+            x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
+            text: "Filter shortcuts: panel, composer, Mod+K…"; color: root.muted;
+            font-size: 12px * root.text-scale; vertical-alignment: center; overflow: elide;
+        }
+        filter-input := ThemedTextInput {
+            x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
+            text <=> root.filter; single-line: true;
+            color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center;
+            accessible-label: "Filter keyboard shortcuts by action, group or combination";
+            edited => { root.filter-edited(self.text); }
+        }
+    }
+    if root.items.length == 0 : Text {
+        text: "No shortcuts match. Try another word."; color: root.muted;
+        font-size: 11px * root.text-scale; wrap: word-wrap; accessible-live-region: polite;
+    }
+    for item in root.items : VerticalLayout {
+        spacing: 4px; padding-top: 4px; padding-bottom: 4px;
+        HorizontalLayout {
+            spacing: 8px;
+            VerticalLayout {
+                horizontal-stretch: 1; alignment: center; spacing: 2px;
+                Text { text: item.label; color: root.ink; font-size: 12px * root.text-scale; wrap: word-wrap; }
+                Text {
+                    text: item.group + (item.customized ? " · default " + (item.default-binding == "" ? "none" : item.default-binding) : "");
+                    color: root.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
+                }
             }
+            if root.recording != item.action : TextAction {
+                text: item.binding == "" ? "Disabled" : item.binding;
+                label: item.label + " shortcut, " + (item.binding == "" ? "disabled" : item.binding) + ". Activate to record a new combination";
+                ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+                outline: root.outline; text-scale: root.text-scale;
+                // Recording ended from this row: focus comes back here.
+                init => {
+                    if root.return-focus == item.action {
+                        root.return-focus = "";
+                        self.focus();
+                    }
+                }
+                activated => { root.record(item.action); }
+            }
+            if root.recording == item.action : FocusScope {
+                min-width: 180px * root.text-scale; height: max(32px, 32px * root.text-scale);
+                accessible-role: text-input;
+                accessible-label: "Recording a shortcut for " + item.label + ". Press the new combination, or Escape to cancel";
+                focus-on-tab-navigation: false;
+                init => { self.focus(); }
+                // Escape and Tab cancel and return focus to this row's button,
+                // so focus is never trapped and the next Tab moves on.
+                key-pressed(event) => {
+                    if event.text == Key.Escape || event.text == Key.Tab || event.text == Key.Backtab {
+                        root.return-focus = item.action;
+                        root.cancel-recording();
+                        accept
+                    } else if root.recorded(item.action, event.text, event.modifiers.control, event.modifiers.alt, event.modifiers.shift, event.modifiers.meta) {
+                        if root.recording != item.action { root.return-focus = item.action; }
+                        accept
+                    } else { reject }
+                }
+                // Clicking elsewhere ends recording, which pauses every shortcut.
+                focus-lost => {
+                    if root.recording == item.action { root.cancel-recording(); }
+                }
+                Rectangle {
+                    background: root.surface;
+                    border-radius: StyleTokens.control-radius >= 0px ? StyleTokens.control-radius : StyleTokens.radius * 0.7;
+                    border-width: StyleTokens.focus-width;
+                    border-color: StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent;
+                    Text {
+                        x: StyleTokens.control-padding; width: parent.width - 2 * StyleTokens.control-padding; height: parent.height;
+                        text: "Press keys… Esc cancels"; color: root.ink;
+                        font-size: 12px * root.text-scale; vertical-alignment: center; overflow: elide;
+                    }
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px; alignment: start;
+            Rectangle {
+                width: 170px * root.text-scale; height: max(32px, 28px * root.text-scale);
+                background: StyleTokens.states.input-surface.present ? StyleTokens.states.input-surface.color : root.surface;
+                border-radius: StyleTokens.input-radius >= 0px ? StyleTokens.input-radius : StyleTokens.radius * 0.7;
+                border-width: typed-field.has-focus ? StyleTokens.focus-width : StyleTokens.line-width;
+                border-color: typed-field.has-focus ? (StyleTokens.roles.focus.present ? StyleTokens.roles.focus.color : root.accent)
+                    : StyleTokens.states.input-border.present ? StyleTokens.states.input-border.color : root.outline;
+                if typed-field.text == "" : Text {
+                    x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
+                    text: "Type, e.g. Mod+Shift+K"; color: root.muted;
+                    font-size: 11px * root.text-scale; vertical-alignment: center; overflow: elide;
+                }
+                typed-field := ThemedTextInput {
+                    x: StyleTokens.input-padding; width: parent.width - 2 * StyleTokens.input-padding; height: parent.height;
+                    single-line: true; color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center;
+                    accessible-label: "Type a combination for " + item.label + "; Enter applies";
+                    accepted => {
+                        root.typed(item.action, self.text);
+                        self.text = "";
+                    }
+                }
+            }
+            if item.binding != item.default-binding : TextAction {
+                text: "Default"; label: "Use the default shortcut for " + item.label + (item.default-binding == "" ? "" : ", " + item.default-binding);
+                ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+                outline: root.outline; text-scale: root.text-scale;
+                activated => { root.use-default(item.action); }
+            }
+            if item.binding != "" : TextAction {
+                text: "Disable"; label: "Disable the shortcut for " + item.label;
+                ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+                outline: root.outline; text-scale: root.text-scale;
+                activated => { root.disable(item.action); }
+            }
+        }
+    }
+    if root.message != "" : Text {
+        text: root.message;
+        color: root.message-error ? (StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b)
+            : (StyleTokens.roles.success.present ? StyleTokens.roles.success.color : root.ink);
+        font-size: 12px * root.text-scale; wrap: word-wrap;
+        accessible-live-region: polite;
+    }
+    HorizontalLayout {
+        spacing: 8px; alignment: start;
+        if root.can-undo : TextAction {
+            text: "Undo"; label: "Undo the last shortcut change";
+            ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+            outline: root.outline; text-scale: root.text-scale;
+            activated => { root.undo(); }
+        }
+        TextAction {
+            text: "Restore all defaults"; label: "Restore every shortcut to its default";
+            ink: root.ink; muted: root.muted; surface: root.surface; hover-surface: root.hover-surface;
+            outline: root.outline; text-scale: root.text-scale;
+            activated => { root.restore-defaults(); }
         }
     }
 }
@@ -2152,6 +2320,11 @@ component SenderPaletteEditor inherits VerticalLayout {
     Text { text: root.source; color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap; }
     for row in root.rows : HorizontalLayout {
         spacing: 8px;
+        // Typing replaces the field's binding to the row, so an in-place
+        // change (move, undo, reload) is copied in unless the field is being
+        // edited, and a value left half typed returns to the saved one.
+        property <string> saved-hex: row.hex;
+        changed saved-hex => { if !hex-field.has-focus { hex-field.text = self.saved-hex; } }
         Rectangle {
             width: 128px * root.text-scale; height: max(34px, 26px * root.text-scale);
             background: root.canvas; border-radius: StyleTokens.radius * 0.6;
@@ -2176,6 +2349,7 @@ component SenderPaletteEditor inherits VerticalLayout {
                 text: row.hex; single-line: true;
                 color: root.ink; font-size: 12px * root.text-scale; vertical-alignment: center;
                 accessible-label: "Sender color " + (row.index + 1) + " hex, #RRGGBB or #RRGGBBAA";
+                changed has-focus => { if !self.has-focus { self.text = row.hex; } }
                 accessible-description: row.readable ? "" : "Low contrast on the conversation background";
                 edited => { root.edited(row.index, self.text); }
                 accepted => { root.edited(row.index, self.text); }
@@ -2550,6 +2724,8 @@ export component AppWindow inherits Window {
     in-out property <string> color-selected-id;
     in-out property <ColorEditorState> color-editor;
     in-out property <string> color-hex-input;
+    // The selected token's shown color, matching the hex field for the edited scope.
+    in-out property <color> color-swatch;
     in-out property <string> color-reset-all-notice;
     in-out property <int> color-override-count: 0;
     callback color-filter-changed(string);
@@ -2663,17 +2839,23 @@ export component AppWindow inherits Window {
     in-out property <bool> update-can-download: false;
     in-out property <bool> update-can-restart: false;
     in-out property <bool> update-can-discard: false;
-    in-out property <string> shortcut-quick-switcher;
-    in-out property <string> shortcut-search;
-    in-out property <string> shortcut-next-unread;
-    in-out property <string> shortcut-previous-unread;
-    in-out property <string> shortcut-edit-quick-switcher;
-    in-out property <string> shortcut-edit-search;
-    in-out property <string> shortcut-edit-next-unread;
-    in-out property <string> shortcut-edit-previous-unread;
-    in-out property <bool> shortcuts-dirty: false;
-    in-out property <string> shortcut-error;
-    in-out property <string> shortcut-notice;
+    // Shortcut editor: every registry action, its binding and one message.
+    in-out property <[ShortcutItem]> shortcut-items;
+    in-out property <string> shortcut-filter;
+    // The action whose new combination is being recorded, or empty.
+    in-out property <string> shortcut-recording;
+    in-out property <string> shortcut-message;
+    in-out property <bool> shortcut-message-error: false;
+    in-out property <bool> shortcut-can-undo: false;
+    callback shortcut-filter-changed(string);
+    callback shortcut-record(string);
+    callback shortcut-cancel-recording();
+    // Action, key text, then Control, Alt, Shift and Meta; returns whether consumed.
+    callback shortcut-recorded(string, string, bool, bool, bool, bool) -> bool;
+    callback shortcut-typed(string, string);
+    callback shortcut-disable(string);
+    callback shortcut-use-default(string);
+    callback shortcut-undo();
     in-out property <bool> quick-switcher-open: false;
     in-out property <string> quick-switcher-query;
     in-out property <[RoomItem]> quick-switcher-results;
@@ -2875,7 +3057,6 @@ export component AppWindow inherits Window {
     callback restart-to-update();
     callback discard-update();
     callback dispatch-shortcut(string, bool, bool, bool, bool) -> bool;
-    callback save-shortcuts();
     callback refresh-audio-devices();
     callback select-audio-microphone(string);
     callback select-audio-speaker(string);
@@ -2901,11 +3082,31 @@ export component AppWindow inherits Window {
         root.side-panel-tab = 2;
         root.search-focus-request += 1;
     }
-    callback shortcuts-edited();
-    shortcuts-edited => {
-        root.shortcuts-dirty = true;
-        root.shortcut-error = "";
-        root.shortcut-notice = "";
+    // Keyboard shortcut destinations that need this window's own elements.
+    public function go-home() {
+        root.active-space-id = "";
+        root.active-space-name = "Home";
+        root.select-space("");
+        root.page = 0;
+    }
+    // Presentation only, like show-thread-panel.
+    public function show-members-panel() {
+        root.page = 0;
+        root.show-side-panel = true;
+        root.side-panel-tab = 0;
+    }
+    // Opens the menu and focuses its trigger; each entry keeps its own
+    // activation and confirmation.
+    public function open-account-menu() {
+        root.account-menu-open = true;
+        account-trigger.focus();
+    }
+    property <bool> settings-search-focus-pending: false;
+    property <int> settings-search-focus-request: 0;
+    public function focus-settings-search() {
+        root.settings-search-focus-pending = true;
+        root.page = 1;
+        root.settings-search-focus-request += 1;
     }
     callback submit-login(string, string, string);
     callback submit-sso(string);
@@ -3740,7 +3941,9 @@ export component AppWindow inherits Window {
                 drop-shadow-offset-y: 7px;
                 // Opt-in decorative fade-in: immediate at 0 ms and under reduced motion.
                 property <bool> entered: false;
-                init => { self.entered = true; }
+                // Opacity is first read here, at 0, so setting `entered` animates it;
+                // `init` would set it before that first read and nothing would fade.
+                Timer { interval: 1ms; running: !parent.entered && parent.opacity < 1; triggered => { parent.entered = true; } }
                 opacity: StyleTokens.popup-duration == 0ms || self.entered ? 1 : 0;
                 animate opacity { duration: StyleTokens.popup-duration; easing: ease-out; }
                 VerticalLayout {
@@ -4801,6 +5004,20 @@ export component AppWindow inherits Window {
                     height: settings-search.preferred-height + 20px;
                     background: transparent;
                     settings-search := SettingsSearchBar {
+                        // The Search Settings shortcut focuses this field once it exists.
+                        init => {
+                            if root.settings-search-focus-pending {
+                                root.settings-search-focus-pending = false;
+                                self.focus();
+                            }
+                        }
+                        property <int> focus-request: root.settings-search-focus-request;
+                        changed focus-request => {
+                            if root.settings-search-focus-pending {
+                                root.settings-search-focus-pending = false;
+                                self.focus();
+                            }
+                        }
                         x: 26px; y: 10px; width: parent.width - 52px;
                         query <=> root.settings-search-query;
                         results: root.settings-search-results;
@@ -4999,7 +5216,7 @@ export component AppWindow inherits Window {
                                 y: parent.wide ? 12px : token-list.y + token-list.height + 12px;
                                 width: parent.wide ? parent.width - token-list.width - 36px : parent.width - 24px;
                                 state: root.color-editor;
-                                swatch: root.token-color(root.color-selected-id);
+                                swatch: root.color-swatch;
                                 hex <=> root.color-hex-input;
                                 override-count: root.color-override-count;
                                 reset-all-notice: root.color-reset-all-notice;
@@ -6189,10 +6406,10 @@ export component AppWindow inherits Window {
                         Rectangle { height: 1px; background: root.divider; }
                         Text { text: "Keyboard shortcuts"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text {
-                            text: "Mod is Command on macOS and Ctrl elsewhere. Meta is Command on macOS and Windows/Super elsewhere. Combine Mod, Ctrl, Meta, Alt, or Shift with A–Z, 0–9, arrows, Home, End, PageUp, PageDown, or F1–F12. Include a modifier other than Shift. Blank disables an action. Shift+digits, Alt+letters/digits, and editing or window shortcuts are reserved.";
+                            text: "Mod is Command on macOS and Ctrl elsewhere. Meta is Command on macOS and Windows/Super elsewhere. Combine Mod, Ctrl, Meta, Alt, or Shift with A–Z, 0–9, arrows, Home, End, PageUp, PageDown, or F1–F12. Include a modifier other than Shift. Record a combination, or type one and press Enter; Disable turns an action off. Shift+digits, Alt+letters/digits, and editing or window shortcuts are reserved.";
                             color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap;
                         }
-                        ShortcutSetting {
+                        shortcut-editor := ShortcutEditor {
                             property <int> reveal-request: root.reveal-request("shortcuts");
                             // Keyboard focus and search share the same bounded reveal.
                             changed has-focus => {
@@ -6207,21 +6424,28 @@ export component AppWindow inherits Window {
                                     if self.has-focus { root.settings-revealed-id = "shortcuts"; }
                                 }
                             }
-                            label: "Switch room"; binding <=> root.shortcut-edit-quick-switcher; ink: root.ink; muted: root.muted; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; edited => { root.shortcuts-edited(); } }
-                        ShortcutSetting { label: "Search current room"; binding <=> root.shortcut-edit-search; ink: root.ink; muted: root.muted; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; edited => { root.shortcuts-edited(); } }
-                        ShortcutSetting { label: "Next unread room"; binding <=> root.shortcut-edit-next-unread; ink: root.ink; muted: root.muted; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; edited => { root.shortcuts-edited(); } }
-                        ShortcutSetting { label: "Previous unread room"; binding <=> root.shortcut-edit-previous-unread; ink: root.ink; muted: root.muted; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; edited => { root.shortcuts-edited(); } }
+                            items: root.shortcut-items;
+                            filter <=> root.shortcut-filter;
+                            recording: root.shortcut-recording;
+                            message: root.shortcut-message;
+                            message-error: root.shortcut-message-error;
+                            can-undo: root.shortcut-can-undo;
+                            ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                            accent: root.accent; outline: root.divider; text-scale: root.text-scale;
+                            filter-edited(text) => { root.shortcut-filter-changed(text); }
+                            record(action) => { root.shortcut-record(action); }
+                            cancel-recording => { root.shortcut-cancel-recording(); }
+                            recorded(action, text, control, alt, shift, meta) => { root.shortcut-recorded(action, text, control, alt, shift, meta) }
+                            typed(action, value) => { root.shortcut-typed(action, value); }
+                            disable(action) => { root.shortcut-disable(action); }
+                            use-default(action) => { root.shortcut-use-default(action); }
+                            undo => { root.shortcut-undo(); }
+                            restore-defaults => { root.reset-shortcuts(); }
+                        }
                         Text {
-                            text: "Room switching and unread navigation use the current Home or Space. Shortcuts pause in Settings and dialogs. Text editing takes priority, including arrow movement in the composer. Search requires a signed-in room. Changes also appear in config.toml; omit an action there to disable it.";
+                            text: "Room switching and unread navigation use the current Home or Space; room cycling only opens conversations. Shortcuts pause in Settings, while recording and in dialogs, and text editing keys keep priority. No shortcut can send, remove an account, log out or switch accounts; the account menu shortcut only opens the menu.";
                             color: root.muted; font-size: 11px * root.text-scale; wrap: word-wrap;
                         }
-                        HorizontalLayout {
-                            spacing: 10px; alignment: end;
-                            Button { text: "Restore defaults"; clicked => { root.reset-shortcuts(); } }
-                            Button { text: "Save shortcuts"; primary: true; enabled: root.shortcuts-dirty; clicked => { root.save-shortcuts(); } }
-                        }
-                        if root.shortcut-error != "" : Text { text: root.shortcut-error; color: StyleTokens.roles.error.present ? StyleTokens.roles.error.color : #e58e9b; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: assertive; }
-                        if root.shortcut-notice != "" : Text { text: root.shortcut-notice; color: StyleTokens.roles.success.present ? StyleTokens.roles.success.color : root.accent; font-size: 12px * root.text-scale; wrap: word-wrap; accessible-live-region: polite; }
                         Rectangle { height: 1px; background: root.divider; }
                         Text { text: "Advanced customization"; color: root.ink; font-size: 20px * root.text-scale; font-weight: 750; }
                         Text { text: "Edit your settings and theme pack files. Valid changes appear here automatically."; color: root.muted; font-size: 12px * root.text-scale; wrap: word-wrap; }
@@ -6629,7 +6853,9 @@ export component AppWindow inherits Window {
             background: root.window-panel;
             // Opt-in decorative fade-in: immediate at 0 ms and under reduced motion.
             property <bool> entered: false;
-            init => { self.entered = true; }
+            // Opacity is first read here, at 0, so setting `entered` animates it;
+            // `init` would set it before that first read and nothing would fade.
+            Timer { interval: 1ms; running: !parent.entered && parent.opacity < 1; triggered => { parent.entered = true; } }
             opacity: StyleTokens.panel-duration == 0ms || self.entered ? 1 : 0;
             animate opacity { duration: StyleTokens.panel-duration; easing: ease-out; }
             border-color: root.divider;
@@ -7318,7 +7544,9 @@ export component AppWindow inherits Window {
             background: StyleTokens.roles.scrim.present ? StyleTokens.roles.scrim.color : #000000aa;
             // Opt-in decorative fade-in: immediate at 0 ms and under reduced motion.
             property <bool> entered: false;
-            init => { self.entered = true; }
+            // Opacity is first read here, at 0, so setting `entered` animates it;
+            // `init` would set it before that first read and nothing would fade.
+            Timer { interval: 1ms; running: !parent.entered && parent.opacity < 1; triggered => { parent.entered = true; } }
             opacity: StyleTokens.popup-duration == 0ms || self.entered ? 1 : 0;
             animate opacity { duration: StyleTokens.popup-duration; easing: ease-out; }
             TouchArea { width: parent.width; height: parent.height; }

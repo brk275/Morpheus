@@ -285,6 +285,12 @@ fn schema() -> Value {
             "minimum": registry::WINDOW_OPACITY_RANGE.start(),
             "maximum": registry::WINDOW_OPACITY_RANGE.end(),
         },
+        "shortcut_actions": morpheus_config::ShortcutAction::ALL.iter().map(|action| json!({
+            "name": action.name(),
+            "label": action.label(),
+            "group": action.group().label(),
+            "default": action.default_binding(),
+        })).collect::<Vec<_>>(),
         "diagnostic_codes": diagnostics::CODES.iter().map(|(code, meaning)| json!({
             "code": code,
             "meaning": meaning,
@@ -315,6 +321,16 @@ fn schema_text() -> String {
         lines.push(format!(
             "  {} = {}{range}: {}{inactive}",
             field.key, field.default, field.description
+        ));
+    }
+    lines.push(String::new());
+    lines.push("Shortcut actions ([shortcuts] keys = default):".into());
+    for action in morpheus_config::ShortcutAction::ALL {
+        lines.push(format!(
+            "  {} = {}: {}",
+            action.name(),
+            action.default_binding().unwrap_or("(none)"),
+            action.label()
         ));
     }
     lines.push(String::new());

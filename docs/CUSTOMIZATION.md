@@ -112,6 +112,58 @@ hide every navigation surface or the account control, and the protected
 account switch, logout and Manage accounts actions keep their existing
 confirmations. Starting points keep these choices.
 
+## Keyboard shortcuts
+
+**Settings → Keyboard shortcuts** lists every action with its combination and
+a filter by action, group or combination. Activate a combination to record the
+next one you press; Escape cancels and Tab cancels and moves on, so focus is
+never trapped. A combination can also be typed, for example `Mod+Shift+K`.
+Each change saves at once. A combination already used by another action is not
+saved, and the message names that action. **Default**, **Disable**, **Undo**
+and **Restore all defaults** are available; Undo never overwrites a change made
+elsewhere.
+
+| Action (`[shortcuts]` key) | Default |
+| --- | --- |
+| Switch room (`quick_switcher`) | `Mod+K` |
+| Search current room (`search`) | `Mod+F` |
+| Next / previous unread room (`next_unread`, `previous_unread`) | `Alt+Down`, `Alt+Up` |
+| Next / previous room (`next_room`, `previous_room`) | `Alt+Shift+Down`, `Alt+Shift+Up` |
+| Go to Home (`go_home`) | `Mod+1` |
+| Open Settings (`open_settings`) | `Mod+Shift+S` |
+| Search Settings (`search_settings`) | `Mod+Shift+F` |
+| Focus the message composer (`focus_composer`) | `Mod+L` |
+| Open the emoji picker (`open_emoji_picker`) | `Mod+E` |
+| Show or hide the details panel (`toggle_details_panel`) | `Mod+Shift+D` |
+| Show members (`show_members_panel`) | `Mod+Shift+P` |
+| Show the open thread (`show_thread_panel`) | `Mod+Shift+T` |
+| Open the account menu (`open_account_menu`) | `Mod+Shift+U` |
+
+```toml
+[shortcuts]
+quick_switcher = "Mod+K"
+toggle_details_panel = "Ctrl+Shift+D"
+next_room = "Alt+PageDown"
+```
+
+`Mod` is Command on macOS and Ctrl elsewhere; recorded combinations are saved
+with `Mod` so the file works on every platform, and a conflict on either
+platform is rejected. Combinations need Mod, Ctrl, Meta or Alt with A–Z, 0–9, an
+arrow, Home, End, PageUp, PageDown or F1–F12; editing keys (`Mod+A`, `C`, `V`,
+`X`, `Y`, `Z`), window keys (`Q`, `W`, `H`, `M`, `Alt+F4`), Alt with a letter or
+digit, and Shift with a digit are reserved. An existing `[shortcuts]` table is
+used exactly as written: an action it omits stays disabled, so an older file does
+not gain new bindings until you choose **Default** or **Restore all defaults**.
+Unknown actions and malformed combinations reject the edit and keep the last
+valid configuration.
+
+Shortcuts pause in Settings, while recording and in dialogs, and keys a focused
+text field uses keep priority. Room cycling opens conversations only and never
+joins a voice space. No action can send, remove an account, log out, switch
+accounts or change a protected setting; the account menu shortcut only opens the
+menu, whose entries keep their own confirmations. Shortcuts cannot run commands
+or scripts.
+
 ## Room header
 
 **Settings → Appearance → Room header** controls the header independently of
@@ -409,7 +461,9 @@ An account's colors are drawn over the global `[colors]` table, which is drawn
 over the theme pack and the built-in palette; any registry token can be set.
 In **Settings → Appearance → Colors and window**, choose **This account** to
 edit the active account's colors and **All accounts** for the global table.
-Undo and Reset all never cross accounts: switching accounts drops their pending
+With **All accounts**, a color the active account sets for itself shows the
+global value when `config.toml` holds one, and the source line says the
+account uses its own color. Undo and Reset all never cross accounts: switching accounts drops their pending
 steps, and with no active account the editor returns to **All accounts**.
 Removing or logging out of an account removes that account's theme and colors
 and leaves every other account and the global preferences untouched.

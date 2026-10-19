@@ -1291,30 +1291,79 @@ impl RoomCallMode {
     }
 }
 
+/// The default binding of every action, as written to a new `config.toml`.
+/// An existing `[shortcuts]` table is used exactly as written: an action it
+/// omits stays disabled, so a file never gains a binding silently.
 pub fn default_shortcuts() -> BTreeMap<String, String> {
-    BTreeMap::from([
-        ("quick_switcher".into(), "Mod+K".into()),
-        ("search".into(), "Mod+F".into()),
-        ("next_unread".into(), "Alt+Down".into()),
-        ("previous_unread".into(), "Alt+Up".into()),
-    ])
+    ShortcutAction::ALL
+        .into_iter()
+        .filter_map(|action| Some((action.name().into(), action.default_binding()?.into())))
+        .collect()
 }
 
-/// Supported commands, shared by the TOML validator and the desktop dispatcher.
+/// Where an action appears in the shortcut editor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShortcutGroup {
+    Navigation,
+    Composer,
+    Search,
+    Panels,
+    Account,
+}
+
+impl ShortcutGroup {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Navigation => "Navigation",
+            Self::Composer => "Composer",
+            Self::Search => "Search",
+            Self::Panels => "Panels",
+            Self::Account => "Account",
+        }
+    }
+}
+
+/// Supported commands, shared by the TOML validator, the in-app editor and
+/// the desktop dispatcher. Each one moves focus, opens a view or toggles a
+/// panel. None of them sends, removes, logs out, switches accounts or
+/// changes a protected setting, so no binding can trigger such an action;
+/// those keep their own confirmation flows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShortcutAction {
     QuickSwitcher,
     Search,
     NextUnread,
     PreviousUnread,
+    NextRoom,
+    PreviousRoom,
+    GoHome,
+    OpenSettings,
+    SearchSettings,
+    FocusComposer,
+    OpenEmojiPicker,
+    ToggleDetailsPanel,
+    ShowMembersPanel,
+    ShowThreadPanel,
+    OpenAccountMenu,
 }
 
 impl ShortcutAction {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 15] = [
         Self::QuickSwitcher,
         Self::Search,
         Self::NextUnread,
         Self::PreviousUnread,
+        Self::NextRoom,
+        Self::PreviousRoom,
+        Self::GoHome,
+        Self::OpenSettings,
+        Self::SearchSettings,
+        Self::FocusComposer,
+        Self::OpenEmojiPicker,
+        Self::ToggleDetailsPanel,
+        Self::ShowMembersPanel,
+        Self::ShowThreadPanel,
+        Self::OpenAccountMenu,
     ];
 
     pub fn name(self) -> &'static str {
@@ -1323,7 +1372,78 @@ impl ShortcutAction {
             Self::Search => "search",
             Self::NextUnread => "next_unread",
             Self::PreviousUnread => "previous_unread",
+            Self::NextRoom => "next_room",
+            Self::PreviousRoom => "previous_room",
+            Self::GoHome => "go_home",
+            Self::OpenSettings => "open_settings",
+            Self::SearchSettings => "search_settings",
+            Self::FocusComposer => "focus_composer",
+            Self::OpenEmojiPicker => "open_emoji_picker",
+            Self::ToggleDetailsPanel => "toggle_details_panel",
+            Self::ShowMembersPanel => "show_members_panel",
+            Self::ShowThreadPanel => "show_thread_panel",
+            Self::OpenAccountMenu => "open_account_menu",
         }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::QuickSwitcher => "Switch room",
+            Self::Search => "Search current room",
+            Self::NextUnread => "Next unread room",
+            Self::PreviousUnread => "Previous unread room",
+            Self::NextRoom => "Next room",
+            Self::PreviousRoom => "Previous room",
+            Self::GoHome => "Go to Home",
+            Self::OpenSettings => "Open Settings",
+            Self::SearchSettings => "Search Settings",
+            Self::FocusComposer => "Focus the message composer",
+            Self::OpenEmojiPicker => "Open the emoji picker",
+            Self::ToggleDetailsPanel => "Show or hide the details panel",
+            Self::ShowMembersPanel => "Show members",
+            Self::ShowThreadPanel => "Show the open thread",
+            Self::OpenAccountMenu => "Open the account menu",
+        }
+    }
+
+    pub fn group(self) -> ShortcutGroup {
+        match self {
+            Self::QuickSwitcher
+            | Self::NextUnread
+            | Self::PreviousUnread
+            | Self::NextRoom
+            | Self::PreviousRoom
+            | Self::GoHome
+            | Self::OpenSettings => ShortcutGroup::Navigation,
+            Self::FocusComposer | Self::OpenEmojiPicker => ShortcutGroup::Composer,
+            Self::Search | Self::SearchSettings => ShortcutGroup::Search,
+            Self::ToggleDetailsPanel | Self::ShowMembersPanel | Self::ShowThreadPanel => {
+                ShortcutGroup::Panels
+            }
+            Self::OpenAccountMenu => ShortcutGroup::Account,
+        }
+    }
+
+    /// The binding a new configuration and Restore defaults use. Each one
+    /// passes [`Shortcut::parse`] and none conflicts on either platform.
+    pub fn default_binding(self) -> Option<&'static str> {
+        Some(match self {
+            Self::QuickSwitcher => "Mod+K",
+            Self::Search => "Mod+F",
+            Self::NextUnread => "Alt+Down",
+            Self::PreviousUnread => "Alt+Up",
+            Self::NextRoom => "Alt+Shift+Down",
+            Self::PreviousRoom => "Alt+Shift+Up",
+            Self::GoHome => "Mod+1",
+            Self::OpenSettings => "Mod+Shift+S",
+            Self::SearchSettings => "Mod+Shift+F",
+            Self::FocusComposer => "Mod+L",
+            Self::OpenEmojiPicker => "Mod+E",
+            Self::ToggleDetailsPanel => "Mod+Shift+D",
+            Self::ShowMembersPanel => "Mod+Shift+P",
+            Self::ShowThreadPanel => "Mod+Shift+T",
+            Self::OpenAccountMenu => "Mod+Shift+U",
+        })
     }
 
     pub fn parse(name: &str) -> Option<Self> {
@@ -1455,6 +1575,15 @@ impl Shortcut {
         Ok(shortcut)
     }
 
+    /// Whether both combinations are the same keys on macOS or elsewhere. A
+    /// configuration is portable, so either platform's alias conflicts.
+    pub fn conflicts_with(&self, other: &Shortcut) -> bool {
+        self.key == other.key
+            && [false, true]
+                .into_iter()
+                .any(|macos| self.modifiers(macos) == other.modifiers(macos))
+    }
+
     pub fn modifiers(&self, macos: bool) -> ShortcutModifiers {
         let mut modifiers = self.modifiers;
         if self.primary {
@@ -1510,11 +1639,7 @@ pub fn validate_shortcuts(values: &BTreeMap<String, String>) -> Result<(), Confi
         for (_, other) in &bindings {
             // A config is portable: reject an alias conflict on either platform,
             // even when the file is currently being edited on the other one.
-            if other.key == shortcut.key
-                && [false, true]
-                    .into_iter()
-                    .any(|macos| other.modifiers(macos) == shortcut.modifiers(macos))
-            {
+            if other.conflicts_with(&shortcut) {
                 return Err(field_error(
                     format!("shortcuts.{name}"),
                     Problem::ShortcutConflict,
@@ -3895,6 +4020,8 @@ mod tests {
         full.geometry.composer_radius = Some(6);
         full.geometry.avatar_size = Some(30);
         full.geometry.avatar_roundness = Some(50);
+        full.layout.room_density = Some(Density::Compact);
+        full.layout.message_density = Some(Density::Spacious);
         full.media.microphone_device = Some("alsa:microphone".into());
         full.media.speaker_device = Some("alsa:speaker".into());
         full.media.camera_device = Some("camera".into());

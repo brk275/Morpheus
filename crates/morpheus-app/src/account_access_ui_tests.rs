@@ -2720,6 +2720,31 @@ async fn assert_account_scoped_appearance(ui: &AppWindow, directory: &std::path:
     assert!(!saved.colors.contains_key("link"), "the global table changed");
     assert!(!saved.account_overrides["account-two"].colors.contains_key("link"));
     assert!(ui.get_color_editor().can_undo);
+    // A live refresh after every room update keeps a partial value.
+    ui.set_color_hex_input("#AB".into());
+    ui.invoke_color_hex_edited("#AB".into());
+    crate::appearance::apply_theme_mode(ui);
+    settle(ui).await;
+    assert_eq!(ui.get_color_hex_input().as_str(), "#AB");
+    // For all accounts, a color the active account sets itself shows and
+    // edits the global value.
+    ui.invoke_color_scope_chosen(0);
+    ui.invoke_color_token_chosen("canvas".into());
+    settle(ui).await;
+    assert_eq!(ui.get_color_hex_input().as_str(), "#101010");
+    assert_eq!(ui.get_color_swatch(), global);
+    assert!(ui.get_color_editor().source.contains("active account uses its own color"));
+    ui.invoke_color_hex_edited("#203040".into());
+    settle(ui).await;
+    assert_eq!(
+        store.load().unwrap().colors.get("canvas").map(String::as_str),
+        Some("#203040")
+    );
+    assert_eq!(ui.get_color_hex_input().as_str(), "#203040");
+    ui.invoke_color_hex_edited("#101010".into());
+    settle(ui).await;
+    assert_eq!(store.load().unwrap().colors, saved.colors);
+    assert_eq!(canvas(), own, "the account keeps its own color");
     // Switching accounts drops the undo step; Undo cannot reach another account.
     ui.set_active_account_local_id("account-two".into());
     crate::appearance::apply_theme_mode(ui);
@@ -2751,6 +2776,139 @@ async fn assert_account_scoped_appearance(ui: &AppWindow, directory: &std::path:
     settle(ui).await;
 }
 
+/// Keyboard customization on the real generated window: every registry
+/// action is listed; a recorded combination saves in portable form; typed
+/// conflicts name the other action and save nothing; reserved keys are
+/// refused; Disable, Default and Undo follow the file; recording pauses every
+/// shortcut; and new actions dispatch to their real destinations.
+async fn assert_shortcut_customization(ui: &AppWindow, directory: &std::path::Path) {
+    use morpheus_config::{ConfigStore, ShortcutAction};
+    use std::{cell::RefCell, rc::Rc};
+
+    let store = ConfigStore::at(directory.join("shortcuts.toml"));
+    let config = store.load_or_create().unwrap();
+    crate::shortcuts::register(ui, store.clone());
+    apply_config(ui, &config, None);
+    ui.set_page(1);
+    settle(ui).await;
+    assert_eq!(ui.get_shortcut_items().row_count(), ShortcutAction::ALL.len());
+    let binding = |name: &str| store.load().unwrap().shortcuts.get(name).cloned();
+
+    // A recorded combination saves at once, written with Mod.
+    ui.invoke_shortcut_record("toggle_details_panel".into());
+    assert_eq!(ui.get_shortcut_recording(), "toggle_details_panel");
+    // A modifier on its own keeps waiting for the key.
+    assert!(ui.invoke_shortcut_recorded(
+        "toggle_details_panel".into(),
+        SharedString::from(Key::Shift),
+        false,
+        false,
+        true,
+        false
+    ));
+    assert_eq!(ui.get_shortcut_recording(), "toggle_details_panel");
+    assert!(ui.invoke_shortcut_recorded(
+        "toggle_details_panel".into(),
+        "j".into(),
+        true,
+        false,
+        true,
+        false
+    ));
+    settle(ui).await;
+    assert_eq!(binding("toggle_details_panel").as_deref(), Some("Mod+Shift+J"));
+    assert!(ui.get_shortcut_recording().is_empty());
+    assert!(ui.get_shortcut_can_undo());
+
+    // A conflict names the other action; a reserved key is refused.
+    let before = std::fs::read_to_string(store.path()).unwrap();
+    ui.invoke_shortcut_typed("go_home".into(), "mod+k".into());
+    settle(ui).await;
+    assert!(ui.get_shortcut_message_error());
+    assert!(ui.get_shortcut_message().contains("Switch room"));
+    ui.invoke_shortcut_typed("go_home".into(), "Mod+C".into());
+    settle(ui).await;
+    assert!(ui.get_shortcut_message_error());
+    assert_eq!(std::fs::read_to_string(store.path()).unwrap(), before);
+
+    // Disable, Default and Undo.
+    ui.invoke_shortcut_disable("open_emoji_picker".into());
+    settle(ui).await;
+    assert_eq!(binding("open_emoji_picker"), None);
+    ui.invoke_shortcut_use_default("open_emoji_picker".into());
+    settle(ui).await;
+    assert_eq!(binding("open_emoji_picker").as_deref(), Some("Mod+E"));
+    ui.invoke_shortcut_undo();
+    settle(ui).await;
+    assert_eq!(binding("open_emoji_picker"), None);
+    // Undo never overwrites a later edit made elsewhere.
+    ui.invoke_shortcut_use_default("open_emoji_picker".into());
+    settle(ui).await;
+    let mut external = store.load().unwrap();
+    external.shortcuts.remove("go_home");
+    store.save(&external).unwrap();
+    let superseded = std::fs::read_to_string(store.path()).unwrap();
+    ui.invoke_shortcut_undo();
+    settle(ui).await;
+    assert_eq!(std::fs::read_to_string(store.path()).unwrap(), superseded);
+    assert!(ui.get_shortcut_message_error());
+
+    // Dispatch outside Settings; recording pauses every shortcut.
+    let current = store.load().unwrap();
+    apply_config(ui, &current, None);
+    ui.invoke_show_thread_panel();
+    ui.set_show_side_panel(false);
+    settle(ui).await;
+    let press = |text: &str, shift: bool| {
+        ui.invoke_dispatch_shortcut(text.into(), true, false, shift, false)
+    };
+    ui.set_shortcut_recording("search".into());
+    assert!(!press("p", true), "a shortcut ran while recording");
+    ui.set_shortcut_recording("".into());
+    assert!(press("p", true));
+    assert!(ui.get_show_side_panel());
+    assert_eq!(ui.get_side_panel_tab(), 0);
+    ui.set_active_space_id("!space:example.org".into());
+    ui.set_page(3);
+    assert!(!press("1", false), "go_home was removed outside this window");
+    let mut restored = store.load().unwrap();
+    restored.shortcuts.insert("go_home".into(), "Mod+1".into());
+    store.save(&restored).unwrap();
+    apply_config(ui, &restored, None);
+    assert!(press("1", false));
+    assert_eq!((ui.get_page(), ui.get_active_space_id().as_str()), (0, ""));
+    let opened = Rc::new(RefCell::new(Vec::new()));
+    let seen = opened.clone();
+    ui.on_open_room(move |id| seen.borrow_mut().push(id.to_string()));
+    let room = |id: &str| RoomItem {
+        id: id.into(),
+        name: id.into(),
+        ..Default::default()
+    };
+    ui.set_unsorted_channels(ModelRc::new(VecModel::from(vec![room("!a"), room("!b")])));
+    crate::navigation::apply_room_order(ui);
+    ui.set_active_room_id("!a".into());
+    assert!(ui.invoke_dispatch_shortcut(
+        SharedString::from(Key::DownArrow),
+        false,
+        true,
+        true,
+        false
+    ));
+    assert_eq!(*opened.borrow(), ["!b"]);
+    assert!(press("u", true));
+    assert!(ui.get_account_menu_open());
+    assert!(!press("p", true), "shortcuts pause while the menu is open");
+    ui.set_account_menu_open(false);
+
+    ui.on_open_room(|_| {});
+    ui.set_unsorted_channels(ModelRc::new(VecModel::<RoomItem>::default()));
+    crate::navigation::apply_room_order(ui);
+    ui.set_active_room_id("".into());
+    apply_config(ui, &Config::default(), None);
+    settle(ui).await;
+}
+
 async fn exercise_account_ui(runtime: Handle) {
     #[cfg(not(morpheus_timeline_acceptance))]
     exercise_startup_recovery();
@@ -2778,6 +2936,7 @@ async fn exercise_account_ui(runtime: Handle) {
     assert_interaction_states_and_sender_palette(&ui, directory.path()).await;
     assert_pane_composition_and_motion(&ui).await;
     assert_account_scoped_appearance(&ui, directory.path()).await;
+    assert_shortcut_customization(&ui, directory.path()).await;
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),
     )));
