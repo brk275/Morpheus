@@ -2125,11 +2125,32 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
         }
         assert!(requested, "{}", target.id);
         settle(ui).await;
+        if target.id == "files.transfers" {
+            // Exercise the real deferred focus timer after the conditional
+            // panel is instantiated; keep the real-focus assertion below.
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+            settle(ui).await;
+        }
         if ui.get_settings_revealed_id() != target.id {
             eprintln!(
                 "MORPHEUS_SETTINGS_TARGET_FAILURE stage=1 index={index} live={}",
                 ui.get_live_session()
             );
+            if target.id == "files.transfers" {
+                let heading = format!("Transfers: {}", ui.get_transfer_summary());
+                let visible = ElementHandle::find_by_accessible_label(ui, &heading)
+                    .filter(|item| item.is_visible())
+                    .count();
+                // Numeric/boolean UI state only; never print the summary,
+                // profile, transfer labels or arbitrary assertion text.
+                eprintln!(
+                    "MORPHEUS_TRANSFER_FOCUS_STATE page={} panel={} tab={} pending={} headings={visible}",
+                    ui.get_page(),
+                    ui.get_show_side_panel(),
+                    ui.get_side_panel_tab(),
+                    ui.get_transfer_focus_pending()
+                );
+            }
         }
         assert_eq!(
             ui.get_settings_revealed_id(),
@@ -2159,6 +2180,16 @@ async fn assert_appearance_workspace_and_search(ui: &AppWindow, directory: &std:
                 "transfer destination must have real keyboard focus"
             );
             assert!(!ui.get_transfer_focus_pending());
+            ui.set_settings_revealed_id("".into());
+            assert!(crate::settings_search::reveal(ui, "files.transfers"));
+            settle(ui).await;
+            i_slint_backend_testing::mock_elapsed_time(Duration::from_millis(1));
+            settle(ui).await;
+            assert_eq!(ui.get_settings_revealed_id(), "files.transfers");
+            assert!(focused_control_has_label(
+                ui,
+                &format!("Transfers: {}", ui.get_transfer_summary())
+            ));
         }
     }
     for (target, label) in [

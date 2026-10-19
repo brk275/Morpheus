@@ -125,6 +125,8 @@ export component TransferCenterPanel inherits Rectangle {
     // focuses its heading once it exists, so merely showing it never moves
     // focus.
     in-out property <bool> focus-pending: false;
+    in property <int> focus-request: 0;
+    property <int> handled-focus-request: 0;
     // (kind, id, 0 remove, 1 cancel, 2 retry, 3 open its room)
     callback action(int, int, int);
     callback clear-finished();
@@ -138,8 +140,15 @@ export component TransferCenterPanel inherits Rectangle {
     accessible-label: "Transfers";
     forward-focus: heading-focus;
 
-    changed focus-pending => {
-        if root.focus-pending {
+    // A conditional panel's descendants and focus chain are ready only
+    // after instantiation. Defer one event-loop tick, as the account menu
+    // does for its repeater items. Each explicit request gets one attempt;
+    // a hidden/unfocusable panel never spins a repeating timer.
+    Timer {
+        interval: 1ms;
+        running: root.focus-pending && root.focus-request != root.handled-focus-request;
+        triggered => {
+            root.handled-focus-request = root.focus-request;
             heading-focus.focus();
             if heading-focus.has-focus {
                 root.focus-pending = false;
@@ -199,12 +208,6 @@ export component TransferCenterPanel inherits Rectangle {
                     height: parent.height;
                     accessible-role: text;
                     accessible-label: "Transfers: " + summary-text.text;
-                    // The containing panel's init can precede creation of
-                    // this focus item. Consume the request only once this
-                    // actual destination exists and receives focus.
-                    init => {
-                        if root.focus-pending { self.focus(); }
-                    }
                     changed has-focus => {
                         if self.has-focus {
                             root.focus-pending = false;

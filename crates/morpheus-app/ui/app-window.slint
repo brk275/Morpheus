@@ -3645,6 +3645,7 @@ export component AppWindow inherits Window {
     // Presentation only: show the transfers tab of the side panel and focus
     // its heading.
     public function show-transfer-panel() {
+        root.transfer-focus-request += 1;
         root.transfer-focus-pending = true;
         root.page = 0;
         root.show-side-panel = true;
@@ -3909,6 +3910,7 @@ export component AppWindow inherits Window {
     in-out property <string> transfer-summary;
     in-out property <int> transfer-active-count: 0;
     in-out property <bool> transfer-focus-pending: false;
+    in-out property <int> transfer-focus-request: 0;
     callback transfer-action(int, int, int);
     callback clear-finished-transfers();
     in-out property <int> composer-operation: 0;
@@ -9011,6 +9013,7 @@ export component AppWindow inherits Window {
                     summary: root.transfer-summary;
                     available: root.live-session;
                     focus-pending <=> root.transfer-focus-pending;
+                    focus-request: root.transfer-focus-request;
                     text-scale: root.text-scale;
                     palette: {
                         ink: root.ink,
