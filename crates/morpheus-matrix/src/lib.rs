@@ -25,7 +25,7 @@ pub use discovery::{
     parse_matrix_link_target,
 };
 mod history;
-pub use history::HistoryReveal;
+pub use history::{FocusedView, HistoryReveal};
 mod search;
 pub use search::{MessageSearchPage, MessageSearchResult};
 mod formatting;

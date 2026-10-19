@@ -119,8 +119,64 @@ pub struct LiveUi {
     space_scan_key: Mutex<Option<(String, Vec<String>)>>,
     space_scan_failed_at: Mutex<Option<Instant>>,
     space_scan_epoch: AtomicU64,
+    /// The one focused conversation view shown, owned here (see FocusSlot).
+    focused: std::sync::Mutex<FocusSlot<morpheus_matrix::FocusedView>>,
     #[cfg(test)]
     pauses: TestPauses,
+}
+
+/// The one focused conversation view the app shows, with the feed
+/// generation that installed it. Loading a view never touches the slot; only
+/// a commit that still holds its navigation authority installs one, and any
+/// newer feed generation (a live feed, another view) makes it stale. Paging
+/// takes exactly the view shown under the current generation.
+struct FocusSlot<V> {
+    shown: Option<(u64, V)>,
+}
+
+impl<V> Default for FocusSlot<V> {
+    fn default() -> Self {
+        Self { shown: None }
+    }
+}
+
+impl<V: Clone> FocusSlot<V> {
+    /// Install `view` under a new feed generation, only while `authority`
+    /// holds. Withdrawal takes the same lock, so a superseded view whose
+    /// open was withdrawn is never installed. Returns that generation.
+    fn commit(
+        &mut self,
+        generation: &AtomicU64,
+        authority: &NavigationAuthority,
+        view: V,
+    ) -> Option<u64> {
+        let withdrawn = authority.state();
+        if *withdrawn {
+            return None;
+        }
+        let installed = generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.shown = Some((installed, view));
+        Some(installed)
+    }
+
+    /// The view shown under feed generation `current`, if any.
+    fn view(&self, current: u64) -> Option<V> {
+        match &self.shown {
+            Some((installed, view)) if *installed == current => Some(view.clone()),
+            _ => None,
+        }
+    }
+
+    /// Forget a view that a newer feed generation replaced.
+    fn drop_stale(&mut self, current: u64) {
+        if self
+            .shown
+            .as_ref()
+            .is_some_and(|(installed, _)| *installed != current)
+        {
+            self.shown = None;
+        }
+    }
 }
 
 /// Test-only synchronization points at the real write and authorization
@@ -287,6 +343,7 @@ impl LiveUi {
             space_scan_key: Mutex::new(None),
             space_scan_failed_at: Mutex::new(None),
             space_scan_epoch: AtomicU64::new(0),
+            focused: std::sync::Mutex::new(FocusSlot::default()),
             #[cfg(test)]
             pauses: TestPauses::default(),
         })
@@ -2298,12 +2355,9 @@ impl LiveUi {
                 return;
             }
         }
-        // A live feed ends this room's focused view, if one was kept.
-        let _ = self
-            .manager
-            .release_focused_selected(&selection, &room_id)
-            .await;
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        // A live feed ends the focused view it replaces; a newer one stays.
+        self.drop_stale_focus();
         let feed = match self
             .manager
             .message_feed_selected(&selection, &room_id)
@@ -2406,11 +2460,30 @@ impl LiveUi {
 
     pub async fn clear_feed(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
+        self.drop_stale_focus();
         if let Some(task) = self.feed.lock().await.take() {
             task.abort();
         }
         *self.feed_key.lock().await = None;
         self.clear_thread().await;
+    }
+
+    /// Held only around synchronous slot updates, never across an await.
+    fn focus_slot(&self) -> std::sync::MutexGuard<'_, FocusSlot<morpheus_matrix::FocusedView>> {
+        self.focused.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn drop_stale_focus(&self) {
+        let current = self.generation.load(Ordering::Acquire);
+        self.focus_slot().drop_stale(current);
+    }
+
+    /// The focused view shown in `room_id` under the current feed, for
+    /// paging exactly that view. Capture it when the user acts.
+    pub(crate) fn focused_view(&self, room_id: &str) -> Option<morpheus_matrix::FocusedView> {
+        let current = self.generation.load(Ordering::Acquire);
+        let view = self.focus_slot().view(current);
+        view.filter(|view| view.room_id() == room_id)
     }
 
     /// Show the open room's conversation around `event_id` in place of its
@@ -2432,10 +2505,11 @@ impl LiveUi {
         };
         let navigation_epoch = self.current_navigation_epoch();
         // Load without the transition lock: account controls never wait on
-        // the homeserver. Revocation of the selection ends the load.
-        let feed = self
+        // the homeserver. Revocation of the selection ends the load. The
+        // loaded view is this call's alone until the commit below.
+        let (view, feed) = self
             .manager
-            .focused_message_feed_selected(&selection, &room_id, event_id, FOCUS_CONTEXT_EVENTS)
+            .focused_view_selected(&selection, &room_id, event_id, FOCUS_CONTEXT_EVENTS)
             .await?;
         let _transition = self.account_transition.lock().await;
         if !selection.is_current()
@@ -2446,13 +2520,14 @@ impl LiveUi {
             return Ok(false);
         }
         // The commit: from here the live feed is stale and this view owns
-        // the conversation.
-        let generation = {
-            let withdrawn = authority.state();
-            if *withdrawn {
-                return Ok(false);
-            }
-            self.generation.fetch_add(1, Ordering::AcqRel) + 1
+        // the conversation. A superseded load (its authority withdrawn by a
+        // newer open) installs nothing and is dropped here.
+        let committed = {
+            let mut slot = self.focus_slot();
+            slot.commit(&self.generation, &authority, view.clone())
+        };
+        let Some(generation) = committed else {
+            return Ok(false);
         };
         if let Some(previous) = self.feed.lock().await.take() {
             previous.abort();
@@ -2464,7 +2539,8 @@ impl LiveUi {
         let is_live = self.is_live.clone();
         let feed_account_id = account_id.to_owned();
         let handle = tokio::spawn(async move {
-            let _feed = feed;
+            // The feed task keeps its own view alive while it publishes.
+            let (_view, _feed) = (view, feed);
             let delivery = Arc::new(crate::timeline_delivery::Latest::new());
             loop {
                 if delivery.submit(updates.borrow_and_update().clone()) {
@@ -2526,6 +2602,7 @@ impl LiveUi {
                 return;
             }
             self.generation.fetch_add(1, Ordering::AcqRel);
+            self.drop_stale_focus();
             if let Some(task) = self.feed.lock().await.take() {
                 task.abort();
             }
@@ -3813,6 +3890,30 @@ mod account_presentation_tests {
         assert_eq!(live.selected_room.lock().await.as_deref(), Some(old_room));
         assert_eq!(live.selected_space.lock().await.as_deref(), Some(old_space));
         close_profile(directory, live).await;
+    }
+
+    #[test]
+    fn a_focused_view_loaded_out_of_order_never_replaces_the_shown_one() {
+        let generation = AtomicU64::new(7);
+        let mut slot = FocusSlot::default();
+        let view_a = NavigationAuthority::default();
+        let view_b = NavigationAuthority::default();
+        // A starts loading; B is opened before A finishes, which withdraws A.
+        view_a.withdraw();
+        let shown = slot.commit(&generation, &view_b, "B").expect("B commits");
+        // A finishes after B: its commit is refused and B stays the paged view.
+        assert_eq!(slot.commit(&generation, &view_a, "A"), None);
+        assert_eq!(generation.load(Ordering::Acquire), shown);
+        assert_eq!(slot.view(shown), Some("B"));
+        // Dropping a stale handle or a stale generation cannot remove B.
+        slot.drop_stale(shown);
+        assert_eq!(slot.view(shown), Some("B"));
+        // A newer feed (live, or another view) makes B stale: nothing is paged
+        // through it and it is forgotten.
+        let live = generation.fetch_add(1, Ordering::AcqRel) + 1;
+        assert_eq!(slot.view(live), None);
+        slot.drop_stale(live);
+        assert!(slot.shown.is_none());
     }
 
     #[tokio::test]

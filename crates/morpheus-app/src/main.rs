@@ -2624,19 +2624,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let Some(selection) = history_live.manager.account_selection(&account_id) else {
             return;
         };
+        // A conversation focused on an older message pages exactly the view
+        // shown at this click, never a view loaded or shown since.
+        let focused = if window.get_conversation_focused() {
+            let Some(view) = history_live.focused_view(&room_id) else {
+                return;
+            };
+            Some(view)
+        } else {
+            None
+        };
         let operation = window.get_history_operation().wrapping_add(1);
         window.set_history_operation(operation);
         window.set_history_loading(true);
         window.set_history_error("".into());
-        // A conversation focused on an older message pages its own view.
-        let focused = window.get_conversation_focused();
         let live = history_live.clone();
         let weak = weak.clone();
         history_handle.spawn(async move {
             let manager = &live.manager;
-            let result = if focused {
+            let result = if let Some(view) = &focused {
                 manager
-                    .paginate_focused_selected(&selection, &room_id, true, 50)
+                    .paginate_focused_selected(&selection, view, true, 50)
                     .await
             } else {
                 manager

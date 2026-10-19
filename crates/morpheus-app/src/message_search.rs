@@ -1204,6 +1204,10 @@ fn load_newer(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
     let Some(selection) = live.manager.account_selection(&account) else {
         return;
     };
+    // Page exactly the view shown at this click.
+    let Some(view) = live.focused_view(&room) else {
+        return;
+    };
     // Focusing again or returning to live bumps the history operation, so
     // a late result never lands on another view.
     let operation = window.get_history_operation();
@@ -1212,7 +1216,7 @@ fn load_newer(window: &AppWindow, live: &Arc<LiveUi>, runtime: &Handle) {
     let manager = live.manager.clone();
     let weak = window.as_weak();
     runtime.spawn(async move {
-        let newer = manager.paginate_focused_selected(&selection, &room, false, NEWER_PAGE);
+        let newer = manager.paginate_focused_selected(&selection, &view, false, NEWER_PAGE);
         let result = tokio::time::timeout(FOCUS_TIMEOUT, newer).await;
         let _ = weak.upgrade_in_event_loop(move |window| {
             if window.get_active_account_local_id().as_str() != account

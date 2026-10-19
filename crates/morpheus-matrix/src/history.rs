@@ -17,9 +17,21 @@ const REVEAL_PAGE_EVENTS: u16 = 50;
 /// Most events a focused conversation view loads around its event.
 const MAX_FOCUS_CONTEXT: u16 = 50;
 
-/// Cache key of a room's focused conversation view; one per room.
-fn focus_key(room_id: &str) -> String {
-    format!("focus:{room_id}")
+/// One conversation view focused on an event, owned by whoever loaded it.
+/// Nothing about it is cached or shared: loading another view never
+/// replaces it, paging acts on exactly this view, and dropping the last
+/// clone ends it.
+#[derive(Clone)]
+pub struct FocusedView {
+    account_id: String,
+    room_id: String,
+    timeline: Arc<Timeline>,
+}
+
+impl FocusedView {
+    pub fn room_id(&self) -> &str {
+        &self.room_id
+    }
 }
 
 /// How far a bounded backward reveal through history got.
@@ -142,17 +154,18 @@ impl AccountManager {
         .await
     }
 
-    /// A conversation view of one room focused on `event_id`, with up to
-    /// `num_context_events` around it, for showing an older message in
-    /// context. It replaces the room's previous focused view and is kept
-    /// until released; its feed has the same ownership rules as live feeds.
-    pub async fn focused_message_feed_selected(
+    /// Load a conversation view of one room focused on `event_id`, with up
+    /// to `num_context_events` around it, for showing an older message in
+    /// context. The view and its feed belong to the caller alone: nothing is
+    /// cached, so a superseded load can never replace a view that is shown.
+    /// The feed has the same ownership rules as live feeds.
+    pub async fn focused_view_selected(
         &self,
         selection: &AccountSelection,
         room_id: &str,
         event_id: &str,
         num_context_events: u16,
-    ) -> Result<MessageFeed> {
+    ) -> Result<(FocusedView, MessageFeed)> {
         let target = parse_event_id(event_id)?;
         self.read_selected_timeline(selection, |loaded| async move {
             let id = RoomId::parse(room_id)
@@ -173,28 +186,34 @@ impl AccountManager {
                 .build()
                 .await
                 .map_err(|error| MatrixCoreError::Sdk(error.to_string()))?;
-            let timeline = Arc::new(timeline);
-            let key = focus_key(room_id);
-            loaded.timelines.lock().await.insert(key, timeline.clone());
-            let account_id = selection.account_id().to_owned();
-            Ok(message_feed_from_timeline(account_id, room_id, timeline).await)
+            let view = FocusedView {
+                account_id: selection.account_id().to_owned(),
+                room_id: room_id.to_owned(),
+                timeline: Arc::new(timeline),
+            };
+            let account_id = view.account_id.clone();
+            let timeline = view.timeline.clone();
+            let feed = message_feed_from_timeline(account_id, room_id, timeline).await;
+            Ok((view, feed))
         })
         .await
     }
 
-    /// Page a room's focused conversation view to older (`backwards`) or
-    /// newer messages. Returns true when that end of the room was reached.
+    /// Page exactly `view` to older (`backwards`) or newer messages under the
+    /// caller's selection, which must be the view's account. Returns true
+    /// when that end of the room was reached.
     pub async fn paginate_focused_selected(
         &self,
         selection: &AccountSelection,
-        room_id: &str,
+        view: &FocusedView,
         backwards: bool,
         count: u16,
     ) -> Result<bool> {
-        self.read_selected_timeline(selection, |loaded| async move {
-            let key = focus_key(room_id);
-            let focused = loaded.timelines.lock().await.get(&key).cloned();
-            let timeline = focused.ok_or_else(|| MatrixCoreError::RoomNotFound(room_id.into()))?;
+        if view.account_id != selection.account_id() {
+            return Err(MatrixCoreError::SelectedAccountChanged);
+        }
+        let timeline = view.timeline.clone();
+        self.read_selected_timeline(selection, |_| async move {
             let reached = if backwards {
                 timeline.paginate_backwards(count).await
             } else {
@@ -204,20 +223,6 @@ impl AccountManager {
         })
         .await
     }
-
-    /// Drop a room's focused conversation view, ending its feed's updates.
-    pub async fn release_focused_selected(
-        &self,
-        selection: &AccountSelection,
-        room_id: &str,
-    ) -> Result<()> {
-        self.read_selected_timeline(selection, |loaded| async move {
-            loaded.timelines.lock().await.remove(&focus_key(room_id));
-            Ok(())
-        })
-        .await
-    }
-
     fn current_timeline_selection(&self) -> Result<AccountSelection> {
         let account_id = self
             .active_tx
