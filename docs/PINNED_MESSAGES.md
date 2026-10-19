@@ -12,8 +12,13 @@ app controller is `crates/morpheus-app/src/pinned_messages/`, and the pane is
 - The list, this account's membership, the room's create event and its power
   levels come from server GETs, never from the SDK's cached state. Sliding sync
   does not request pinned state, so the local copy can be stale or missing.
+- Reads require the full-event state format added in Matrix v1.16. Older
+  homeservers that return only content report this view as unavailable;
+  Morpheus will not guess permission metadata to enable a write. See the
+  [Matrix state endpoint](https://spec.matrix.org/v1.19/client-server-api/#get_matrixclientv3roomsroomidstateeventtypestatekey).
 - Each GET is a single attempt with a 10 s timeout. The four run concurrently
-  inside a 30 s bound, and a state response is capped at 160 KiB.
+  inside a 30 s bound, and state responses larger than 160 KiB are rejected before application parsing.
+  This check follows SDK body buffering; it is not a transport memory limit.
 - Permission comes from those authoritative power levels and the room
   version's rules, and fails closed for an unknown room version. Ruma treats a
   room with no power-levels event as `state_default` 50, so only creators can
@@ -21,7 +26,8 @@ app controller is `crates/morpheus-app/src/pinned_messages/`, and the pane is
 - The pane shows the newest 50 pins. They are fetched through the account's
   SDK client (`Room::event`, which decrypts), at most 4 at a time. Each fetch
   is one attempt with an 8 s timeout, the whole load is bounded at 40 s, and
-  each event is capped at 512 KiB.
+  events larger than 512 KiB are rejected before row parsing, after SDK body
+  buffering.
 - An event that fails or times out becomes an "unavailable" row. Redacted,
   undecryptable and unsupported events (state, polls, pinned edits) each get
   their own row, so the list never looks shorter than it is.
@@ -41,12 +47,14 @@ app controller is `crates/morpheus-app/src/pinned_messages/`, and the pane is
   pane. Only one change runs at a time.
 - Each change rereads the list first. It edits only the `pinned` array. Other
   content fields and list entries (invalid entries and duplicates included) are
-  kept byte for byte. Unpinning removes every occurrence of the event.
+  kept byte for byte. Ambiguous content with duplicate top-level field names
+  is refused before any write. Unpinning removes every occurrence of the event.
 - Nothing is sent if the list is already in the requested state. A list whose
   `pinned` value is not an array, or that has more than 2048 entries, is read
   only.
 - Adding a pin is refused at 256 pins, and a body over 60 KiB is refused.
-  Removing a pin is always allowed.
+  Removing a pin is allowed only from a supported list and when the resulting
+  state remains within the write limit.
 - The write is one unretried request. After it, the list is reread. Matrix
   state has no compare-and-swap, so a concurrent change between that reread
   and the write can still be overwritten.
@@ -63,7 +71,8 @@ app controller is `crates/morpheus-app/src/pinned_messages/`, and the pane is
   rows, flags, filter text and notices synchronously on the UI thread, and
   cancel the scope's requests and sync watcher.
 - Decrypted rows are kept only in memory while the pane is open. Closing the
-  pane drops them. Nothing is logged or written to disk.
+  pane drops them. Losing membership also withdraws cached rows, activation
+  targets and the filter immediately. Nothing is logged or written to disk.
 - Sync batches that touch the pinned list, power levels, membership or
   redactions of the visible room cause one reread per 750 ms burst.
 

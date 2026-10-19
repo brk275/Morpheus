@@ -647,6 +647,36 @@ fn may_send_pinned(own: &UserId, create: &Envelope, power: Option<&Envelope>) ->
     Ok(levels.user_can_send_state(own, StateEventType::RoomPinnedEvents))
 }
 
+// A normal map deserializer silently keeps only the last duplicate key.
+// Refuse ambiguous objects rather than dropping an unknown field on write.
+struct UniqueFields(BTreeMap<String, Box<RawValue>>);
+impl<'de> Deserialize<'de> for UniqueFields {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct FieldsVisitor;
+        impl<'de> serde::de::Visitor<'de> for FieldsVisitor {
+            type Value = UniqueFields;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an object with unique field names")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> std::result::Result<Self::Value, M::Error> {
+                let mut fields = BTreeMap::new();
+                while let Some((key, value)) = map.next_entry::<String, Box<RawValue>>()? {
+                    if fields.insert(key, value).is_some() {
+                        return Err(serde::de::Error::custom("duplicate state content field"));
+                    }
+                }
+                Ok(UniqueFields(fields))
+            }
+        }
+        deserializer.deserialize_map(FieldsVisitor)
+    }
+}
+
 /// The pinned-events content as the server sent it. `fields` keeps every
 /// top-level value as raw JSON and `entries` keeps every list entry as raw
 /// JSON, so an edit reproduces everything it does not change.
@@ -669,8 +699,9 @@ impl PinnedContent {
         let Some(content) = content else {
             return Ok(parsed);
         };
-        parsed.fields =
+        let fields: UniqueFields =
             serde_json::from_str(content.get()).map_err(|_| PinnedMessagesError::InvalidState)?;
+        parsed.fields = fields.0;
         // A redacted list keeps no `pinned` field. Adding one loses nothing.
         let Some(list) = parsed.fields.get("pinned") else {
             return Ok(parsed);
@@ -1003,6 +1034,21 @@ mod tests {
             body.get(),
             r#"{"org.example.big":12345678901234567890,"pinned":["$a:example.org",17,"not an id","$a:example.org","$b:example.org"],"z":{"nested":[1.50,"x"]}}"#
         );
+    }
+
+    #[test]
+    fn duplicate_content_fields_are_refused_instead_of_lost_on_write() {
+        for json in [
+            r#"{"pinned":[],"pinned":["$other:example.org"]}"#,
+            r#"{"pinned":[],"org.example.extra":1,"org.example.extra":2}"#,
+            r#"{"pinned":[],"org.example.extra":1,"org.example.\u0065xtra":2}"#,
+        ] {
+            let raw = RawValue::from_string(json.to_owned()).unwrap();
+            assert!(matches!(
+                PinnedContent::parse(Some(&raw)),
+                Err(PinnedMessagesError::InvalidState)
+            ));
+        }
     }
 
     #[test]
