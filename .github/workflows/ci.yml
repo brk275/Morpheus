@@ -1,7 +1,7 @@
 # TEMPORARY narrowly scoped shared-native verification. NEVER MERGE this workflow.
 # No package, installed UI, Wayland, physical device, live-account or artifact jobs.
 name: Reviewed beta four-platform native checks
-run-name: Reviewed native candidate - f237c2c - ${{ inputs.platform }}
+run-name: Reviewed native candidate - 2ce16b4 - ${{ inputs.platform }}
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +14,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: beta-native-f237c2c-${{ github.ref }}
+  group: beta-native-2ce16b4-${{ github.ref }}
   cancel-in-progress: false
 jobs:
   native:
@@ -24,14 +24,14 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(inputs.platform == 'macos-arm64' && '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"}]}' || inputs.platform == 'macos-intel' && '{"include":[{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"}]}' || inputs.platform == 'windows' && '{"include":[{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"}]}' || inputs.platform == 'linux' && '{"include":[{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}' || '{"include":[{"name":"macOS ARM64","runner":"macos-15","os":"macOS","arch":"ARM64"},{"name":"macOS Intel","runner":"macos-15-intel","os":"macOS","arch":"X64"},{"name":"Windows x64","runner":"windows-2025","os":"Windows","arch":"X64"},{"name":"Linux x64","runner":"ubuntu-24.04","os":"Linux","arch":"X64"}]}') }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 180
+    timeout-minutes: 240
     env:
       MORPHEUS_EXPECTED_OS: ${{ matrix.os }}
       MORPHEUS_EXPECTED_ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: f237c2c1e500e4449e795e4f4cc9cefb0348099a
+          ref: 2ce16b4e5a833ce18d4cea0ee56bbd6eab063c0c
           fetch-depth: 0
           persist-credentials: false
       - name: Verify source and scan Git history before candidate execution
@@ -135,7 +135,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, urllib.request, zipfile
-          source='f237c2c1e500e4449e795e4f4cc9cefb0348099a'
+          source='2ce16b4e5a833ce18d4cea0ee56bbd6eab063c0c'
           identity=bounded(['git','rev-parse','HEAD'],'source-identity',15,4096)
           if identity['reason'] or identity['code']!=0 or identity['log'].read_text().strip()!=source:
               print(json.dumps({'check':'reviewed_source','status':'failed'})); raise SystemExit(1)
@@ -272,7 +272,7 @@ jobs:
                   output.write(name+'='+value+'\n')
           print(json.dumps({'check':'msvc_environment','status':'passed','target':'x64','linker':'msvc'}))
       - name: Build native desktop and run existing unit and controller suites
-        timeout-minutes: 160
+        timeout-minutes: 220
         env:
           CARGO_BUILD_JOBS: "2"
           CARGO_INCREMENTAL: "0"
@@ -379,7 +379,7 @@ jobs:
               return {'code':code,'reason':reason,'bytes':log.stat().st_size,'log':log}
 
           import io, tarfile, zipfile
-          source='f237c2c1e500e4449e795e4f4cc9cefb0348099a'
+          source='2ce16b4e5a833ce18d4cea0ee56bbd6eab063c0c'
           scanner=private/('gitleaks.exe' if os.name=='nt' else 'gitleaks')
           archive_digests={
               ('Linux','X64'):'551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb',
@@ -454,6 +454,9 @@ jobs:
               'sdk_cache_publish':'Cannot publish verified native SDK cache',
           }
           needed_app={
+              'polls::card::tests::withheld_results_show_no_counts_or_bars',
+              'polls::card::tests::ended_polls_show_final_results_and_offer_no_actions',
+              'polls::card::tests::only_sent_polls_can_be_voted_on_and_only_their_creator_ends_them',
               'style_profiles::tests::summaries_describe_the_look_without_files_or_paths',
               'style_profiles::tests::the_dialog_permit_admits_one_operation_at_a_time',
               'kept_replies::tests::a_queued_restore_cannot_outlive_a_clear_or_a_room_change',
@@ -476,16 +479,20 @@ jobs:
               'calls::tests::late_recovery_status_cannot_overwrite_a_leave',
           }
           allowed_app_ignore={'outgoing_ring::live_tests::actual_outgoing_invitation_encrypted_receipt_and_redaction'}
-          # Matrix/RTC and config inputs are unchanged from their exact accepted
-          # platform evidence. Only the integrated native app is affected here.
+          needed_matrix={'polls::tests::votes_must_be_known_unique_within_the_limit_and_open', 'polls::tests::projection_bounds_text_answers_and_selection_limit', 'polls::tests::end_text_names_the_leaders_or_no_votes', 'polls::tests::start_content_uses_the_aggregated_msc3381_shape', 'polls::tests::drafts_are_cleaned_and_bounded_before_anything_is_built', 'history::tests::a_focused_view_is_owned_only_by_the_selection_that_loaded_it', 'tests::homeserver_must_not_send_password_over_plain_http', 'polls::tests::unsupported_remote_answer_ids_are_not_truncated_into_vote_targets', 'polls::tests::revoked_poll_actions_release_pending_work_and_report_uncertain_sends', 'history::tests::search_rejects_an_aba_selection_and_keeps_the_current_one', 'polls::tests::undisclosed_results_stay_withheld_until_the_poll_ends'}
+          needed_sdk={'timeline::tests::polls::test_only_the_last_vote_from_a_user_is_counted', 'timeline::tests::polls::test_morpheus_pending_invalid_end_does_not_drop_a_pending_vote', 'timeline::tests::polls::test_morpheus_earliest_valid_end_wins_even_when_received_later', 'timeline::tests::polls::test_ending_a_poll_sets_end_time_to_results', 'timeline::tests::polls::test_votes_after_end_are_discarded', 'timeline::tests::polls::test_adding_response_doesnt_clear_latest_json_edit', 'timeline::tests::polls::test_morpheus_duplicate_pending_ends_do_not_stop_later_pending_votes', 'timeline::tests::polls::test_morpheus_unauthorized_poll_end_keeps_poll_open_and_creator_can_end', 'timeline::tests::polls::test_ending_poll_doesnt_clear_latest_json_edit', 'timeline::tests::polls::test_events_received_before_start_are_not_lost', 'timeline::tests::polls::test_edited_poll_is_displayed', 'timeline::tests::polls::test_poll_contains_relations', 'timeline::tests::polls::test_morpheus_known_moderator_may_end_another_users_poll', 'timeline::tests::polls::test_poll_is_displayed', 'timeline::tests::polls::test_a_somewhat_complex_voting_session_yields_the_expected_outcome', 'timeline::tests::polls::test_voting_adds_the_vote_to_the_results', 'timeline::tests::polls::test_morpheus_pending_moderator_end_is_checked_when_start_arrives', 'timeline::tests::polls::test_multiple_end_events_are_discarded'}
           checks=[
               ('native_app_build',['cargo','build','--locked','-p','morpheus-app','--features','native-calls'],70*60,None,set()),
               ('app_unit_controller',['cargo','test','--locked','-p','morpheus-app','--features','native-calls',
                   '--bin','morpheus-app','--','--test-threads=1'],40*60,needed_app,allowed_app_ignore),
+              ('matrix_unit',['cargo','test','--locked','-p','morpheus-matrix','--lib','--','--test-threads=1'],20*60,needed_matrix,set()),
           ]
-          # Config source/lock/toolchain inputs match36 accepted config-only
-          # checks39213015761 and Linux39208985621; Matrix/RTC matchf7 evidence.
-          # Run only changed app/controller and Matrix inputs on all4.
+          # Config/RTC platform evidence is unchanged. SDK source and its own
+          # resolved graph are identical to accepted Linux18 case run39217737364;
+          # only the unrelated config crate's already locked libc edge differs.
+          if os.environ['RUNNER_OS']!='Linux':
+              checks.append(('sdk_poll',['cargo','test','--locked','-p','matrix-sdk-ui','--lib',
+                  'timeline::tests::polls::','--','--test-threads=1'],70*60,needed_sdk,set()))
           all_passed=True
           for name,args,seconds,required,allowed_ignored in checks:
               result=bounded(args,name,seconds)
