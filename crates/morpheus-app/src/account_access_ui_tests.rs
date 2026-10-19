@@ -3757,6 +3757,8 @@ async fn exercise_account_ui(runtime: Handle, phase: std::rc::Rc<std::cell::Cell
     assert_live_preview(&ui).await;
     phase.set(20);
     assert_themed_select(&ui).await;
+    phase.set(26);
+    assert_layout_navigation_recovery(&ui, directory.path()).await;
     phase.set(15);
     let voices = Arc::new(VoiceSpaces::new(morpheus_config::ConfigStore::at(
         directory.path().join("config.toml"),
@@ -5597,5 +5599,66 @@ async fn assert_bounded_strip_with_eight_records(ui: &AppWindow) {
     );
     draft_recovery::publish_thread(ui, &PendingSummary::default(), &[]);
     draft_recovery::publish_room(ui, &PendingSummary::default(), &[]);
+    settle(ui).await;
+}
+
+/// Real generated controls remain visible and usable when only the Space
+/// rail is hidden; the full room list does not require an account column.
+async fn assert_layout_navigation_recovery(ui: &AppWindow, directory: &std::path::Path) {
+    use morpheus_config::{ConfigStore, PaneId};
+    let store = ConfigStore::at(directory.join("layout-recovery.toml"));
+    crate::workspace_layout::register(ui, &store);
+    let page = ui.get_page();
+    for hidden in [vec![PaneId::Spaces], vec![PaneId::Spaces, PaneId::Rooms]] {
+        let mut config = Config::default();
+        config.layout.hidden_panes = hidden.clone();
+        store.save(&config).unwrap();
+        apply_config(ui, &config, None);
+        ui.set_page(0);
+        settle(ui).await;
+        let column = hidden.contains(&PaneId::Rooms);
+        assert_eq!(ui.get_account_column(), column);
+        let (settings, restore) = if column {
+            ("Open settings", "Restore the default pane layout")
+        } else {
+            (
+                "Open settings from account controls",
+                "Restore layout from account controls",
+            )
+        };
+        // In the full-list case the original hidden rail still has a Settings
+        // item, so the account toolbar deliberately uses distinct labels.
+        if !column {
+            for label in [settings, restore] {
+                let item = control_with_label(ui, label);
+                assert!(
+                    item.is_visible(),
+                    "{label} must be visible without the rail"
+                );
+                assert!(
+                    inside_window(ui, item_bounds(&item)),
+                    "{label} must remain in the window"
+                );
+            }
+            click_control_once(ui, settings);
+            settle(ui).await;
+            assert_eq!(ui.get_page(), 1);
+            ui.set_page(0);
+            settle(ui).await;
+            click_control_once(ui, restore);
+        } else {
+            // The compact column's restore is distinct from the Settings
+            // action, which can also exist in the hidden rail.
+            let item = control_with_label(ui, restore);
+            assert!(item.is_visible());
+            assert!(inside_window(ui, item_bounds(&item)));
+            click_control_once(ui, restore);
+        }
+        settle(ui).await;
+        assert!(store.load().unwrap().layout.hidden_panes.is_empty());
+        assert!(!ui.get_layout_customized());
+    }
+    apply_config(ui, &Config::default(), None);
+    ui.set_page(page);
     settle(ui).await;
 }

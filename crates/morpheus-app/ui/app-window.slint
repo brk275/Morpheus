@@ -2997,6 +2997,10 @@ export component AppWindow inherits Window {
     property <length> pane-conversation-min: 360px;
     out property <length> account-column-width: 64px;
     out property <length> account-trigger-height: max(69px, 38px * root.text-scale + 24px);
+    // A full room list can remain while the Space rail (including Settings)
+    // is hidden. Keep navigation recovery beside the account in that case.
+    property <bool> account-toolbar: !root.account-column && root.pane-rail-w == 0px;
+    property <length> account-toolbar-height: root.account-toolbar ? 44px * root.text-scale : 0px;
     property <length> pane-rail-w0: root.navigation-mode == 0 && !root.pane-spaces-hidden ? root.rail-width-px * 1px : 0px;
     property <length> pane-rooms-full: root.room-list-width * 1px;
     property <length> pane-rooms-w0: root.pane-rooms-hidden ? 0px : root.pane-rooms-collapsed ? root.pane-strip : root.pane-rooms-full;
@@ -4610,7 +4614,7 @@ export component AppWindow inherits Window {
                 // The account control is drawn at the window's bottom left
                 // (see account-corner); in the default arrangement it sits
                 // here, over this reserved space.
-                Rectangle { height: root.account-column ? 0px : root.account-trigger-height + StyleTokens.line-width; }
+                Rectangle { height: root.account-column ? 0px : root.account-toolbar-height + root.account-trigger-height + StyleTokens.line-width; }
             }
             // Collapsed (or squeezed by a narrow window): a strip that restores it.
             if root.pane-rooms-w > 0px && root.pane-rooms-w <= root.pane-strip : Rectangle {
@@ -9055,11 +9059,29 @@ export component AppWindow inherits Window {
             x: root.account-corner-x;
             y: parent.height - self.height;
             width: root.account-corner-width;
-            height: root.account-trigger-height + StyleTokens.line-width;
+            height: root.account-toolbar-height + root.account-trigger-height + StyleTokens.line-width;
             background: root.account-column ? root.window-rail : root.window-sidebar;
             VerticalLayout {
                 spacing: 0px;
                 Rectangle { height: StyleTokens.line-width; background: root.divider; }
+                if root.account-toolbar : HorizontalLayout {
+                    padding-left: 6px; padding-right: 6px; spacing: 4px;
+                    height: root.account-toolbar-height;
+                    TextAction {
+                        text: "Settings";
+                        label: "Open settings from account controls";
+                        ink: root.ink; muted: root.muted; surface: root.window-sidebar;
+                        hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                        activated => { root.page = 1; root.open-security(); }
+                    }
+                    if root.layout-customized : TextAction {
+                        text: "Restore";
+                        label: "Restore layout from account controls";
+                        ink: root.ink; muted: root.muted; surface: root.window-sidebar;
+                        hover-surface: root.hover; outline: root.divider; text-scale: root.text-scale;
+                        activated => { root.restore-default-layout(); }
+                    }
+                }
                 account-trigger := ActionRect {
                     height: max(69px, 38px * root.text-scale + 24px);
                     background: root.window-rail;
@@ -9068,20 +9090,20 @@ export component AppWindow inherits Window {
                     accessible-expanded: root.account-menu-open;
                     activated => { root.account-menu-open = !root.account-menu-open; }
                     HorizontalLayout {
-                        padding-left: 11px;
-                        padding-right: 11px;
+                        padding-left: root.account-column ? 13px : 11px;
+                        padding-right: root.account-column ? 13px : 11px;
                         padding-top: 15px;
                         padding-bottom: 15px;
-                        spacing: 10px;
+                        spacing: root.account-column ? 0px : 10px;
                         VerticalLayout { width: 38px; alignment: center; AvatarBadge { initials: root.active-account-initials; accent: root.active-account-accent; } }
-                        VerticalLayout {
+                        if !root.account-column : VerticalLayout {
                             alignment: center;
                             spacing: 2px;
                             horizontal-stretch: 1;
                             Text { text: root.active-account-name; color: root.ink; font-size: 13px * root.text-scale; font-weight: 700; overflow: elide; }
                             Text { text: root.active-account-handle; color: root.muted; font-size: 11px * root.text-scale; overflow: elide; }
                         }
-                        Text { visible: account-corner.width >= 120px; text: "⌃"; color: root.muted; font-size: 16px * root.text-scale; vertical-alignment: center; }
+                        if !root.account-column : Text { text: "⌃"; color: root.muted; font-size: 16px * root.text-scale; vertical-alignment: center; }
                     }
                 }
             }
