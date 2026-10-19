@@ -2853,6 +2853,8 @@ export component AppWindow inherits Window {
     in-out property <string> appearance-mono-font-input;
     callback choose-style-preset(int);
     callback set-style-fonts(string, string, string);
+    // Return the three font families to their built-in defaults.
+    callback reset-style-fonts();
     callback change-style-number(int, int);
     callback choose-message-layout(int);
     callback choose-conversation-header-mode(int);
@@ -6199,10 +6201,29 @@ export component AppWindow inherits Window {
                             ink: root.ink; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; }
                         StyleFontSetting { label: "Monospaced font family · timestamps and security codes"; family <=> root.appearance-mono-font-input;
                             ink: root.ink; surface: root.elevated; accent: root.accent; text-scale: root.text-scale; }
-                        TextAction {
-                            text: "Apply fonts"; ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
-                            outline: root.divider; text-scale: root.text-scale;
-                            activated => { root.set-style-fonts(root.appearance-ui-font-input, root.appearance-message-font-input, root.appearance-mono-font-input); }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: start;
+                            TextAction {
+                                text: "Apply fonts"; ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                                outline: root.divider; text-scale: root.text-scale;
+                                activated => { root.set-style-fonts(root.appearance-ui-font-input, root.appearance-message-font-input, root.appearance-mono-font-input); }
+                            }
+                            TextAction {
+                                text: "Use default fonts"; label: "Use the default interface, message and monospaced fonts";
+                                ink: root.ink; muted: root.muted; surface: root.elevated; hover-surface: root.hover;
+                                outline: root.divider; text-scale: root.text-scale;
+                                changed has-focus => {
+                                    if self.has-focus {
+                                        settings-scroll.reveal(self.absolute-position.y - settings-content.absolute-position.y);
+                                    }
+                                }
+                                activated => { root.reset-style-fonts(); }
+                            }
+                        }
+                        Text {
+                            text: "Keys: appearance.font_family, typography.message_font_family and typography.monospace_font_family in config.toml.";
+                            color: root.muted; font-size: 10px * root.text-scale; wrap: word-wrap;
                         }
                         StyleNumberSetting {
                             property <int> reveal-request: root.reveal-request("appearance.message_size");

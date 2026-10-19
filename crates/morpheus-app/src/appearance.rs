@@ -666,6 +666,20 @@ pub(super) fn install_callbacks(ui: &AppWindow, store: &ConfigStore) {
     });
 
     let weak = ui.as_weak();
+    let store_for_font_reset = store.clone();
+    ui.on_reset_style_fonts(move || {
+        if let Some(ui) = weak.upgrade() {
+            // Only the three families; every other preference is kept.
+            let defaults = Config::default();
+            let _ = save_config_change(&ui, &store_for_font_reset, |config| {
+                config.appearance.font_family = defaults.appearance.font_family;
+                config.typography.message_font_family = defaults.typography.message_font_family;
+                config.typography.monospace_font_family = defaults.typography.monospace_font_family;
+            });
+        }
+    });
+
+    let weak = ui.as_weak();
     let store_for_number = store.clone();
     ui.on_change_style_number(move |field, value| {
         if !(0..=7).contains(&field) {

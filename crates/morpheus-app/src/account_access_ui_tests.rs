@@ -709,6 +709,33 @@ async fn assert_native_motion_and_preference(ui: &AppWindow, config_path: &std::
         assert!(!ui.global::<crate::StyleTokens>().get_reduced_motion());
         assert!(focused_control_has_label(ui, "Reduce motion, off"));
     }
+    // Use default fonts returns the three families only; other preferences,
+    // such as the message size, are kept.
+    let mut fonts = defaults.clone();
+    fonts.appearance.font_family = "serif".into();
+    fonts.typography.message_font_family = Some("monospace".into());
+    fonts.typography.monospace_font_family = "serif".into();
+    fonts.typography.message_size = 17;
+    store.save(&fonts).unwrap();
+    apply_config(ui, &fonts, None);
+    ui.invoke_reset_style_fonts();
+    let reset = store.load().unwrap();
+    assert_eq!(reset.appearance.font_family, defaults.appearance.font_family);
+    assert_eq!(
+        reset.typography.message_font_family,
+        defaults.typography.message_font_family
+    );
+    assert_eq!(
+        reset.typography.monospace_font_family,
+        defaults.typography.monospace_font_family
+    );
+    assert_eq!(reset.typography.message_size, 17, "the reset kept other preferences");
+    assert_eq!(
+        ui.get_appearance_ui_font_input().as_str(),
+        defaults.appearance.font_family
+    );
+    store.save(&defaults).unwrap();
+    apply_config(ui, &defaults, None);
     let invalid = "[appearance\nreduce_motion = true\n";
     std::fs::write(config_path, invalid).unwrap();
     key(ui, Key::Space);
