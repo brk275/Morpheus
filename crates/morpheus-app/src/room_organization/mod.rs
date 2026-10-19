@@ -25,7 +25,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use morpheus_matrix::{RoomInfo, RoomMembership, RoomTagChange, RoomTagError, TagOrder};
+use morpheus_matrix::{
+    ConfirmedTags, FavouriteOrder, RoomInfo, RoomMembership, RoomTagChange, RoomTagError, TagOrder,
+};
 use slint::{ComponentHandle, Model, ModelRc, VecModel, Weak};
 use tokio::runtime::Handle;
 
@@ -56,7 +58,22 @@ pub(crate) struct RoomTags {
 struct Confirmed {
     account: String,
     tags: RoomTags,
+    /// False when the write left an order this module cannot know (the
+    /// low-priority order of a room that was tagged both ways).
+    order_known: bool,
     until: Instant,
+}
+
+impl Confirmed {
+    /// Whether a snapshot's tags show this write.
+    fn shown_by(&self, stored: RoomTags) -> bool {
+        if self.order_known {
+            stored == self.tags
+        } else {
+            stored.favourite == self.tags.favourite
+                && stored.low_priority == self.tags.low_priority
+        }
+    }
 }
 
 struct Pending {
@@ -77,15 +94,40 @@ struct State {
 }
 
 impl State {
+    fn stored_tags(&self, room_id: &str) -> RoomTags {
+        self.stored
+            .get(room_id)
+            .map(|(tags, _)| *tags)
+            .unwrap_or_default()
+    }
+
+    /// The confirmed write still shown for a room of the snapshot account.
+    fn confirmed(&self, room_id: &str) -> Option<&Confirmed> {
+        self.confirmed.get(room_id).filter(|confirmed| {
+            confirmed.account == self.account && Instant::now() < confirmed.until
+        })
+    }
+
     fn tags(&self, room_id: &str) -> RoomTags {
-        match self.confirmed.get(room_id) {
-            Some(confirmed) if confirmed.account == self.account => confirmed.tags,
-            _ => self
-                .stored
-                .get(room_id)
-                .map(|(tags, _)| *tags)
-                .unwrap_or_default(),
+        match self.confirmed(room_id) {
+            Some(confirmed) if confirmed.order_known => confirmed.tags,
+            Some(confirmed) => RoomTags {
+                order: None,
+                ..confirmed.tags
+            },
+            None => self.stored_tags(room_id),
         }
+    }
+
+    /// What the homeserver holds for a room beyond the snapshot, for the
+    /// core's add/remove decisions.
+    fn confirmed_tags(&self, room_id: &str) -> ConfirmedTags {
+        self.confirmed(room_id)
+            .map(|confirmed| ConfirmedTags {
+                favourite: Some(confirmed.tags.favourite),
+                low_priority: Some(confirmed.tags.low_priority),
+            })
+            .unwrap_or_default()
     }
 
     /// Every favourite of the account in tag order: ordered rooms first by
@@ -146,7 +188,9 @@ pub(crate) fn remember(account_id: &str, rooms: &[RoomInfo]) {
         state.confirmed.retain(|room_id, confirmed| {
             confirmed.account == account_id
                 && now < confirmed.until
-                && stored.get(room_id).map(|(tags, _)| *tags) != Some(confirmed.tags)
+                && !stored
+                    .get(room_id)
+                    .is_some_and(|(tags, _)| confirmed.shown_by(*tags))
         });
     });
 }
@@ -170,12 +214,22 @@ pub(crate) fn clear(ui: &AppWindow) {
     publish_active(ui);
 }
 
-/// What one menu choice asks the homeserver for, and the tags each written
-/// room has once it is accepted.
+/// What one menu choice asks the homeserver for, and for a change the tags
+/// the room has once it is accepted (and whether their order is known).
 #[derive(Debug, PartialEq)]
 enum Request {
-    Change(RoomTagChange, RoomTags),
+    Change(RoomTagChange, RoomTags, bool),
     Orders(Vec<(String, TagOrder)>),
+}
+
+impl Request {
+    /// Rooms the request writes.
+    fn rooms<'a>(&'a self, room_id: &'a str) -> Vec<&'a str> {
+        match self {
+            Self::Change(..) => vec![room_id],
+            Self::Orders(orders) => orders.iter().map(|(id, _)| id.as_str()).collect(),
+        }
+    }
 }
 
 /// Plan one menu choice for `room_id`, whose tags are `current`.
@@ -203,17 +257,18 @@ fn plan(
                 order,
             };
             let change = RoomTagChange::Favourite((!current.favourite).then_some(order).flatten());
-            Some(Request::Change(change, expected))
+            Some(Request::Change(change, expected, true))
         }
         REMOVE_FAVOURITE if current.favourite => {
             let expected = RoomTags {
                 favourite: false,
                 low_priority: current.low_priority,
-                // The low-priority order of a room tagged both ways is not
-                // known here; sync supplies it.
                 order: None,
             };
-            Some(Request::Change(RoomTagChange::RemoveFavourite, expected))
+            // The low-priority order of a room tagged both ways is not known
+            // here; sync supplies it.
+            let order_known = !current.low_priority;
+            Some(Request::Change(RoomTagChange::RemoveFavourite, expected, order_known))
         }
         LOW_PRIORITY if !current.low_priority || current.favourite => {
             let expected = RoomTags {
@@ -221,7 +276,7 @@ fn plan(
                 low_priority: true,
                 order: None,
             };
-            Some(Request::Change(RoomTagChange::LowPriority, expected))
+            Some(Request::Change(RoomTagChange::LowPriority, expected, true))
         }
         NORMAL_PRIORITY if current.low_priority => {
             let expected = RoomTags {
@@ -229,7 +284,7 @@ fn plan(
                 low_priority: false,
                 order: current.favourite.then_some(current.order).flatten(),
             };
-            Some(Request::Change(RoomTagChange::RemoveLowPriority, expected))
+            Some(Request::Change(RoomTagChange::RemoveLowPriority, expected, true))
         }
         MOVE_UP | MOVE_DOWN if current.favourite => {
             let up = action == MOVE_UP;
@@ -314,10 +369,17 @@ fn plan_reorder(
     )
 }
 
-/// The tags a confirmed request leaves on each written room.
-fn confirmed_tags(request: &Request, before: impl Fn(&str) -> RoomTags) -> Vec<(String, RoomTags)> {
+/// The tags a confirmed request leaves on each written room, and whether
+/// their order is known.
+fn written_tags(
+    request: &Request,
+    room_id: &str,
+    before: impl Fn(&str) -> RoomTags,
+) -> Vec<(String, RoomTags, bool)> {
     match request {
-        Request::Change(_, _) => Vec::new(),
+        Request::Change(_, expected, order_known) => {
+            vec![(room_id.to_owned(), *expected, *order_known)]
+        }
         Request::Orders(orders) => orders
             .iter()
             .map(|(room_id, order)| {
@@ -327,9 +389,34 @@ fn confirmed_tags(request: &Request, before: impl Fn(&str) -> RoomTags) -> Vec<(
                     low_priority: current.low_priority,
                     order: Some(*order),
                 };
-                (room_id.clone(), tags)
+                (room_id.clone(), tags, true)
             })
             .collect(),
+    }
+}
+
+/// The core call for a planned request, with what this window knows from
+/// confirmed writes sync has not stored yet.
+enum Call {
+    Change(RoomTagChange, ConfirmedTags),
+    Orders(Vec<FavouriteOrder>),
+}
+
+fn call_for(request: &Request, room_id: &str, state: &State) -> Call {
+    match request {
+        Request::Change(change, _, _) => Call::Change(*change, state.confirmed_tags(room_id)),
+        Request::Orders(orders) => Call::Orders(
+            orders
+                .iter()
+                .map(|(room_id, order)| FavouriteOrder {
+                    room_id: room_id.clone(),
+                    order: *order,
+                    confirmed_favourite: state
+                        .confirmed(room_id)
+                        .is_some_and(|confirmed| confirmed.tags.favourite),
+                })
+                .collect(),
+        ),
     }
 }
 
@@ -410,6 +497,7 @@ impl Organizer {
                 &state.favourites(),
                 &visible,
             )?;
+            let call = call_for(&request, room_id, state);
             state.next_operation = state.next_operation.wrapping_add(1);
             let operation = state.next_operation;
             state.pending = Some(Pending {
@@ -417,9 +505,9 @@ impl Organizer {
                 room: room_id.to_owned(),
                 operation,
             });
-            Some((request, operation))
+            Some((request, call, operation))
         });
-        let Some((request, operation)) = started else {
+        let Some((request, call, operation)) = started else {
             return;
         };
         publish_active(&ui);
@@ -427,15 +515,15 @@ impl Organizer {
         let room_id = room_id.to_owned();
         self.runtime.spawn(async move {
             let manager = organizer.live.manager.clone();
-            let result = match &request {
-                Request::Change(change, _) => {
+            let result = match call {
+                Call::Change(change, confirmed) => {
                     manager
-                        .change_room_tags_selected(&selection, &room_id, *change)
+                        .change_room_tags_selected(&selection, &room_id, change, confirmed)
                         .await
                 }
-                Request::Orders(orders) => {
+                Call::Orders(orders) => {
                     manager
-                        .set_favourite_orders_selected(&selection, orders.clone())
+                        .set_favourite_orders_selected(&selection, orders)
                         .await
                 }
             };
@@ -469,19 +557,23 @@ fn finish(
         if visible && result.is_ok() {
             // Accepted by the homeserver: shown until sync returns it.
             let until = Instant::now() + CONFIRMED_LIFETIME;
-            let mut written = confirmed_tags(request, |id| state.tags(id));
-            if let Request::Change(_, expected) = request {
-                written.push((room_id.to_owned(), *expected));
-            }
-            for (room, tags) in written {
+            let written = written_tags(request, room_id, |id| state.tags(id));
+            for (room, tags, order_known) in written {
                 state.confirmed.insert(
                     room,
                     Confirmed {
                         account: account.to_owned(),
                         tags,
+                        order_known,
                         until,
                     },
                 );
+            }
+        } else if visible {
+            // What the homeserver now holds for these rooms is uncertain:
+            // show the stored tags, not an earlier accepted write.
+            for room in request.rooms(room_id) {
+                state.confirmed.remove(room);
             }
         }
         visible
@@ -614,21 +706,27 @@ mod tests {
             plan(ADD_FAVOURITE, "new", normal, &all, &visible),
             Some(Request::Change(
                 RoomTagChange::Favourite(order(0.875)),
-                favourite(order(0.875))
+                favourite(order(0.875)),
+                true
             ))
         );
         assert_eq!(
             plan(ADD_FAVOURITE, "new", normal, &[], &[]),
             Some(Request::Change(
                 RoomTagChange::Favourite(order(0.5)),
-                favourite(order(0.5))
+                favourite(order(0.5)),
+                true
             ))
         );
         // Next to unordered favourites a new one has no order either.
         let unordered = list(&[("a", order(0.25)), ("b", None)]);
         assert_eq!(
             plan(ADD_FAVOURITE, "new", normal, &unordered, &visible),
-            Some(Request::Change(RoomTagChange::Favourite(None), favourite(None)))
+            Some(Request::Change(
+                RoomTagChange::Favourite(None),
+                favourite(None),
+                true
+            ))
         );
         // An existing favourite keeps its tag: adding again only drops the
         // other tag of a room tagged both ways, and never rewrites the order.
@@ -641,7 +739,8 @@ mod tests {
             plan(ADD_FAVOURITE, "a", both, &all, &visible),
             Some(Request::Change(
                 RoomTagChange::Favourite(None),
-                favourite(order(0.25))
+                favourite(order(0.25)),
+                true
             ))
         );
         assert_eq!(plan(ADD_FAVOURITE, "a", favourite(order(0.25)), &all, &visible), None);
@@ -680,6 +779,7 @@ mod tests {
                 Confirmed {
                     account: "alice".into(),
                     tags: favourite(order(0.5)),
+                    order_known: true,
                     until: Instant::now() + CONFIRMED_LIFETIME,
                 },
             )
@@ -697,6 +797,7 @@ mod tests {
                 Confirmed {
                     account: "alice".into(),
                     tags: favourite(order(0.25)),
+                    order_known: true,
                     until: Instant::now() + CONFIRMED_LIFETIME,
                 },
             )
@@ -704,5 +805,81 @@ mod tests {
         remember("bob", &[room("!a", false, None)]);
         assert_eq!(tags("!a"), RoomTags::default());
         assert!(with_state(|state| state.confirmed.is_empty()));
+    }
+
+    #[test]
+    fn follow_up_choices_use_confirmed_writes_and_unknown_orders_match_by_tags() {
+        let room = |id: &str, favourite: bool, low_priority: bool, order| RoomInfo {
+            room_id: id.into(),
+            name: id.into(),
+            topic: None,
+            membership: RoomMembership::Joined,
+            is_direct: false,
+            is_space: false,
+            avatar_mxc: None,
+            favourite,
+            low_priority,
+            tag_order: order,
+            unread_messages: 0,
+            unread_notifications: 0,
+        };
+        remember("alice", &[room("!a", false, false, None)]);
+        // A favourite added here but not synced yet: a following move tells
+        // the core it is a favourite, and a following change tells it which
+        // tags the homeserver holds.
+        with_state(|state| {
+            state.confirmed.insert(
+                "!a".into(),
+                Confirmed {
+                    account: "alice".into(),
+                    tags: favourite(order(0.5)),
+                    order_known: true,
+                    until: Instant::now() + CONFIRMED_LIFETIME,
+                },
+            );
+            let Call::Orders(writes) = call_for(
+                &Request::Orders(vec![("!a".to_owned(), order(0.25).unwrap())]),
+                "!a",
+                state,
+            ) else {
+                panic!("a move is an order write");
+            };
+            assert!(writes[0].confirmed_favourite);
+            let Call::Change(_, confirmed) = call_for(
+                &Request::Change(RoomTagChange::LowPriority, RoomTags::default(), true),
+                "!a",
+                state,
+            ) else {
+                panic!("a change is a tag change");
+            };
+            assert_eq!(confirmed.favourite, Some(true));
+            assert_eq!(confirmed.low_priority, Some(false));
+            // An expired write is neither shown nor reported.
+            state.confirmed.get_mut("!a").unwrap().until = Instant::now();
+            assert_eq!(state.tags("!a"), RoomTags::default());
+            assert_eq!(state.confirmed_tags("!a"), ConfirmedTags::default());
+        });
+        // Removing the favourite of a room tagged both ways leaves a
+        // low-priority order this window does not know: the write ends as
+        // soon as sync shows the tags, whatever order it reports.
+        remember("alice", &[room("!b", true, true, order(0.3))]);
+        with_state(|state| {
+            state.confirmed.insert(
+                "!b".into(),
+                Confirmed {
+                    account: "alice".into(),
+                    tags: RoomTags {
+                        favourite: false,
+                        low_priority: true,
+                        order: None,
+                    },
+                    order_known: false,
+                    until: Instant::now() + CONFIRMED_LIFETIME,
+                },
+            )
+        });
+        remember("alice", &[room("!b", false, true, order(0.7))]);
+        assert!(with_state(|state| state.confirmed.is_empty()));
+        assert_eq!(tags("!b").order, order(0.7));
     }
 }

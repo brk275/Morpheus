@@ -58,12 +58,18 @@ visible when it was made; switching accounts discards its result. One change
 runs at a time per account, and the organization menus wait for it. Once the
 homeserver accepts it, the room list shows the change; until sync returns the
 stored tags, for at most 30 seconds, Morpheus applies the accepted change over
-its last copy, so a following move starts from it. Nothing is shown as saved
-before the homeserver accepted it, and a failure leaves the room where it was
-with a fixed message. A change the homeserver accepted only in part (for
-example, a favorite added but the low-priority tag not removed, or a reorder
-that timed out after some writes) is reported as such, and the list shows what
-was stored. A menu whose row was rebuilt while it was open does nothing.
+its last copy, so a following choice or move starts from it and is decided by
+what the homeserver holds. Nothing is shown as saved before the homeserver
+accepted it, and a failure leaves the room where it was with a fixed message
+and shows the stored tags again. A change the homeserver accepted only in part
+(for example, a favorite added but the low-priority tag not removed, or a
+reorder that timed out after some writes) is reported as such, and the list
+shows what was stored.
+
+Room rows stay in place while only their unread counts or tags change, so an
+open menu stays usable through sync updates. When rooms are added, removed or
+reordered while a menu is open, its row is replaced and the choice does nothing
+rather than act on another room.
 
 Only joined rooms can be changed. A room left or re-joined keeps whatever tags
 its account data holds on the homeserver.

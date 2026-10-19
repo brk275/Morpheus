@@ -75,6 +75,24 @@ pub enum RoomTagChange {
     RemoveLowPriority,
 }
 
+/// Tag states the caller knows from writes the homeserver confirmed but
+/// sync has not stored yet. `None` follows the stored tags; `Some` overrides
+/// them, so a follow-up choice is decided by what the server holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConfirmedTags {
+    pub favourite: Option<bool>,
+    pub low_priority: Option<bool>,
+}
+
+/// One favourite's new order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FavouriteOrder {
+    pub room_id: String,
+    pub order: TagOrder,
+    /// The room became a favourite by a confirmed write sync has not stored.
+    pub confirmed_favourite: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RoomTagError {
     #[error("The selected account changed")]
@@ -231,18 +249,29 @@ impl AccountManager {
     }
 
     /// Apply one explicit organization change to a joined room. Unrelated
-    /// tags are untouched, and a tag the room already has is not rewritten.
+    /// tags are untouched, and a tag the room has is not rewritten. Whether
+    /// the room has a tag follows `confirmed` where it is known, else the
+    /// stored tags, which can lag behind the caller's confirmed writes.
     pub async fn change_room_tags_selected(
         &self,
         selection: &AccountSelection,
         room_id: &str,
         change: RoomTagChange,
+        confirmed: ConfirmedTags,
     ) -> std::result::Result<(), RoomTagError> {
         let client = self.tag_client(selection).await?;
         let room = Self::joined_room(&client, room_id)?;
         let written = AtomicUsize::new(0);
         let request = async {
             let tags = stored_tags(&room).await?;
+            let present = |name: &str| {
+                let known = if name == FAVOURITE {
+                    confirmed.favourite
+                } else {
+                    confirmed.low_priority
+                };
+                known.unwrap_or_else(|| tags.contains_key(name))
+            };
             let (add, order, remove) = match change {
                 RoomTagChange::Favourite(order) => (Some(FAVOURITE), order, Some(LOW_PRIORITY)),
                 RoomTagChange::LowPriority => (Some(LOW_PRIORITY), None, Some(FAVOURITE)),
@@ -250,7 +279,7 @@ impl AccountManager {
                 RoomTagChange::RemoveLowPriority => (None, None, Some(LOW_PRIORITY)),
             };
             if let Some(name) = add
-                && !tags.contains_key(name)
+                && !present(name)
             {
                 room.set_tag(TagName::from(name), tag_info(order))
                     .await
@@ -258,7 +287,7 @@ impl AccountManager {
                 written.fetch_add(1, Ordering::AcqRel);
             }
             if let Some(name) = remove
-                && tags.contains_key(name)
+                && present(name)
             {
                 room.remove_tag(TagName::from(name)).await.map_err(|_| {
                     if written.load(Ordering::Acquire) > 0 {
@@ -276,12 +305,13 @@ impl AccountManager {
     }
 
     /// Write new favourite orders, at most `MAX_TAG_ORDER_WRITES` rooms.
-    /// Every room is checked first (joined, a favourite, no other fields in
-    /// its favourite tag); nothing is written if any check fails.
+    /// Every room is checked first (joined, a favourite stored or confirmed,
+    /// no other fields in its stored favourite tag); nothing is written if
+    /// any check fails.
     pub async fn set_favourite_orders_selected(
         &self,
         selection: &AccountSelection,
-        orders: Vec<(String, TagOrder)>,
+        orders: Vec<FavouriteOrder>,
     ) -> std::result::Result<(), RoomTagError> {
         if orders.len() > MAX_TAG_ORDER_WRITES {
             return Err(RoomTagError::TooMany);
@@ -289,21 +319,24 @@ impl AccountManager {
         let client = self.tag_client(selection).await?;
         let rooms = orders
             .into_iter()
-            .map(|(room_id, order)| Ok((Self::joined_room(&client, &room_id)?, order)))
+            .map(|write| {
+                let room = Self::joined_room(&client, &write.room_id)?;
+                Ok((room, write.order, write.confirmed_favourite))
+            })
             .collect::<std::result::Result<Vec<_>, RoomTagError>>()?;
         let timeout = TAG_TIMEOUT + ORDER_WRITE_TIMEOUT * rooms.len() as u32;
         let written = AtomicUsize::new(0);
         let request = async {
-            for (room, _) in &rooms {
+            for (room, _, confirmed_favourite) in &rooms {
                 let tags = stored_tags(room).await?;
-                if !tags.contains_key(FAVOURITE) {
+                if !*confirmed_favourite && !tags.contains_key(FAVOURITE) {
                     return Err(RoomTagError::NotFavourite);
                 }
                 if carries_other_fields(&tags, FAVOURITE) {
                     return Err(RoomTagError::UnsupportedTagData);
                 }
             }
-            for (room, order) in &rooms {
+            for (room, order, _) in &rooms {
                 room.set_tag(TagName::Favorite, tag_info(Some(*order)))
                     .await
                     .map_err(|_| {
@@ -407,27 +440,42 @@ mod tests {
             manager.selections.replace(Some(&account.id));
             let order = TagOrder::new(0.5).unwrap();
             let room = "!room:localhost";
+            let write = |room_id: String| FavouriteOrder {
+                room_id,
+                order,
+                confirmed_favourite: false,
+            };
             assert_eq!(
                 manager
-                    .change_room_tags_selected(&stale, room, RoomTagChange::LowPriority)
+                    .change_room_tags_selected(
+                        &stale,
+                        room,
+                        RoomTagChange::LowPriority,
+                        ConfirmedTags::default(),
+                    )
                     .await,
                 Err(RoomTagError::AccountChanged)
             );
             assert_eq!(
                 manager
-                    .set_favourite_orders_selected(&stale, vec![(room.to_owned(), order)])
+                    .set_favourite_orders_selected(&stale, vec![write(room.to_owned())])
                     .await,
                 Err(RoomTagError::AccountChanged)
             );
             let current = manager.account_selection(&account.id).unwrap();
             assert_eq!(
                 manager
-                    .change_room_tags_selected(&current, room, RoomTagChange::LowPriority)
+                    .change_room_tags_selected(
+                        &current,
+                        room,
+                        RoomTagChange::LowPriority,
+                        ConfirmedTags::default(),
+                    )
                     .await,
                 Err(RoomTagError::RoomUnavailable)
             );
             let too_many = (0..=MAX_TAG_ORDER_WRITES)
-                .map(|index| (format!("!{index}:localhost"), order))
+                .map(|index| write(format!("!{index}:localhost")))
                 .collect();
             assert_eq!(
                 manager

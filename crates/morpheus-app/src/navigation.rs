@@ -100,12 +100,47 @@ pub(crate) fn apply_room_order(ui: &AppWindow) {
         ui.get_sort_unread_first(),
         crate::room_organization::tags,
     );
-    ui.set_channels(ModelRc::new(VecModel::from(order.channels)));
-    ui.set_direct_messages(ModelRc::new(VecModel::from(order.direct_messages)));
-    ui.set_combined_rooms(ModelRc::new(VecModel::from(order.combined)));
-    ui.set_favourite_rooms(ModelRc::new(VecModel::from(order.favourites)));
-    ui.set_low_priority_rooms(ModelRc::new(VecModel::from(order.low_priority)));
+    let same_room = |a: &RoomItem, b: &RoomItem| a.id == b.id;
+    let same_entry = |a: &NavigationRoomItem, b: &NavigationRoomItem| a.room.id == b.room.id;
+    sync_model(ui.get_channels(), order.channels, same_room, |model| ui.set_channels(model));
+    sync_model(ui.get_direct_messages(), order.direct_messages, same_room, |model| {
+        ui.set_direct_messages(model)
+    });
+    sync_model(ui.get_combined_rooms(), order.combined, same_entry, |model| {
+        ui.set_combined_rooms(model)
+    });
+    sync_model(ui.get_favourite_rooms(), order.favourites, same_entry, |model| {
+        ui.set_favourite_rooms(model)
+    });
+    sync_model(ui.get_low_priority_rooms(), order.low_priority, same_entry, |model| {
+        ui.set_low_priority_rooms(model)
+    });
     crate::room_organization::publish_active(ui);
+}
+
+/// Replace a room list's model only when its rooms or their order change.
+/// The same rooms in the same order are updated row by row, so each row, its
+/// keyboard focus and an open organization menu survive unread and tag
+/// updates from sync. A row is never rewritten with a different room, so an
+/// open menu cannot end up acting on another room.
+fn sync_model<T: Clone + PartialEq + 'static>(
+    current: ModelRc<T>,
+    rows: Vec<T>,
+    same_room: impl Fn(&T, &T) -> bool,
+    replace: impl FnOnce(ModelRc<T>),
+) {
+    if let Some(model) = current.as_any().downcast_ref::<VecModel<T>>()
+        && model.row_count() == rows.len()
+        && model.iter().zip(&rows).all(|(old, new)| same_room(&old, new))
+    {
+        for (index, row) in rows.into_iter().enumerate() {
+            if model.row_data(index).as_ref() != Some(&row) {
+                model.set_row_data(index, row);
+            }
+        }
+        return;
+    }
+    replace(ModelRc::new(VecModel::from(rows)));
 }
 
 /// Keyboard navigation follows the same displayed list order; duplicate IDs
@@ -290,5 +325,33 @@ mod tests {
         );
         assert!(order.direct_messages.is_empty());
         assert_eq!(order.combined.len(), 1);
+    }
+
+    #[test]
+    fn unchanged_room_sequences_update_rows_in_place() {
+        let first = ModelRc::new(VecModel::from(vec![
+            room("!a", "A", 0, false),
+            room("!b", "B", 0, false),
+        ]));
+        let mut replaced = None;
+        // Same rooms, new unread count: the model is kept, the row updated.
+        sync_model(
+            first.clone(),
+            vec![room("!a", "A", 3, false), room("!b", "B", 0, false)],
+            |a, b| a.id == b.id,
+            |model| replaced = Some(model),
+        );
+        assert!(replaced.is_none());
+        assert_eq!(first.row_data(0).map(|row| row.unread), Some(3));
+        // Another order, or another room set, replaces the model.
+        sync_model(
+            first.clone(),
+            vec![room("!b", "B", 0, false), room("!a", "A", 3, false)],
+            |a, b| a.id == b.id,
+            |model| replaced = Some(model),
+        );
+        let replaced = replaced.expect("a reordered list is a new model");
+        assert_eq!(replaced.row_data(0).map(|row| row.id), Some("!b".into()));
+        assert_eq!(first.row_data(0).map(|row| row.id), Some("!a".into()));
     }
 }
