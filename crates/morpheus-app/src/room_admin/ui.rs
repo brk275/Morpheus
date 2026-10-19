@@ -903,6 +903,7 @@ fn access_row(row: super::AccessRow, pending: Option<AccessChange>) -> RosterPer
         Some(AccessChange::Encrypt) => row.kind == super::ACCESS_ENCRYPTION,
         Some(AccessChange::Upgrade) => row.kind == super::ACCESS_UPGRADE,
         Some(AccessChange::Servers { .. }) => row.kind == super::ACCESS_SERVERS,
+        Some(AccessChange::Publish { .. }) => row.kind == super::ACCESS_DIRECTORY,
         None => false,
     };
     RosterPermission {

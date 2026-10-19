@@ -34,10 +34,10 @@ export struct RosterPermission {
     // A threshold's index, or -1 for an access row.
     key: int,
     // 0 threshold, 1 history visibility, 2 guest access, 3 encryption, 4 room version,
-    // 5 blocked servers.
+    // 5 blocked servers, 6 room directory listing.
     kind: int,
     // Access rows: the current option index (guests: 1 allowed; encryption:
-    // 1 on; blocked servers: how many), or -1.
+    // 1 on; blocked servers: how many; directory: 1 listed), or -1.
     choice: int,
     label: string,
     description: string,
@@ -852,6 +852,26 @@ export component RoomMembersPanel inherits VerticalLayout {
                         label: "Review unblocking this server";
                         enabled: !root.busy && root.server-input != "" && root.chosen.choice > 0;
                         activated => { root.request-server(false, root.server-input); }
+                    }
+                }
+                if root.chosen.kind == 6 && root.chosen.editable : HorizontalLayout {
+                    spacing: 5px; alignment: start;
+                    RosterButton {
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        text: "List in directory…";
+                        destructive: true;
+                        label: "Review listing this room in the public room directory";
+                        enabled: !root.busy && root.chosen.choice == 0;
+                        activated => { root.request-access(6, 1); }
+                    }
+                    RosterButton {
+                        palette: root.palette;
+                        text-scale: root.text-scale;
+                        text: "Remove listing…";
+                        label: "Review removing this room from the public room directory";
+                        enabled: !root.busy && root.chosen.choice == 1;
+                        activated => { root.request-access(6, 0); }
                     }
                 }
                 if root.chosen.kind == 2 && root.chosen.editable : HorizontalLayout {

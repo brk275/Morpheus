@@ -84,6 +84,11 @@ const CUSTOM_SERVERS: &str =
     "This room limits servers with an allow list or settings Morpheus does not edit.";
 const BLOCK_BODY: &str = "can no longer join, send messages or receive new ones in this room. \
      Members already here stay listed but are cut off. Other rooms are unaffected.";
+const LISTING_UNKNOWN: &str = "Your homeserver did not say whether it lists this room.";
+const LIST_BODY: &str = "People on your homeserver, and people searching from other servers, \
+     can find this room by its name, topic and address. Who can join is unchanged.";
+const UNLIST_BODY: &str =
+    "People can no longer find it in the directory. Members and addresses are unaffected.";
 /// Blocked servers named in the row summary; the rest are counted.
 const MAX_LISTED_SERVERS: usize = 20;
 
@@ -106,6 +111,7 @@ pub(crate) const ACCESS_GUESTS: i32 = 2;
 pub(crate) const ACCESS_ENCRYPTION: i32 = 3;
 pub(crate) const ACCESS_UPGRADE: i32 = 4;
 pub(crate) const ACCESS_SERVERS: i32 = 5;
+pub(crate) const ACCESS_DIRECTORY: i32 = 6;
 /// History options in the panel's order, narrowest first. The Slint option
 /// labels follow the same order.
 pub(crate) const HISTORY_CHOICES: [HistoryChoice; 4] = [
@@ -403,6 +409,8 @@ fn access_lock(kind: i32, access: AccessSettings, snapshot: &RoomAdminSnapshot) 
         }
         ACCESS_ENCRYPTION if access.encrypted => return ENCRYPTION_ON.to_owned(),
         ACCESS_ENCRYPTION => (true, access.encryption_editable, access.encryption_level),
+        ACCESS_DIRECTORY if access.listed.is_none() => return LISTING_UNKNOWN.to_owned(),
+        ACCESS_DIRECTORY => (true, access.listing_editable, access.listing_level),
         _ => {
             let known = access.guests_can_join.is_some();
             (known, access.guests_editable, access.guests_level)
@@ -428,6 +436,11 @@ pub(crate) fn access_rows(snapshot: &RoomAdminSnapshot) -> Vec<AccessRow> {
     };
     let encryption = if access.encrypted { "On" } else { "Off" };
     let history = access.history.map_or(CUSTOM_HISTORY, history_text);
+    let listing = match access.listed {
+        Some(true) => "Listed in the room directory",
+        Some(false) => "Not listed",
+        None => "Your homeserver did not say",
+    };
     let mut rows = vec![
         AccessRow {
             kind: ACCESS_HISTORY,
@@ -458,6 +471,16 @@ pub(crate) fn access_rows(snapshot: &RoomAdminSnapshot) -> Vec<AccessRow> {
             restriction: access_lock(ACCESS_ENCRYPTION, access, snapshot),
         },
     ];
+    rows.push(AccessRow {
+        kind: ACCESS_DIRECTORY,
+        choice: access.listed.map_or(-1, i32::from),
+        label: "Room directory",
+        description: "Whether people can find this room in your homeserver's public room \
+            directory. Who can join is set separately.",
+        summary: listing.to_owned(),
+        editable: access.listing_editable,
+        restriction: access_lock(ACCESS_DIRECTORY, access, snapshot),
+    });
     if let Some(upgrade) = &snapshot.upgrade {
         rows.push(upgrade_row(upgrade, snapshot));
     }
@@ -615,6 +638,7 @@ fn access_current(change: AccessChange, access: AccessSettings) -> bool {
         AccessChange::History { from, .. } => access.history == Some(from),
         AccessChange::Guests { allow } => access.guests_can_join == Some(!allow),
         AccessChange::Encrypt => !access.encrypted,
+        AccessChange::Publish { publish } => access.listed == Some(!publish),
         // Checked against the snapshot's version settings or block list instead.
         AccessChange::Upgrade | AccessChange::Servers { .. } => true,
     }
@@ -669,6 +693,17 @@ pub(crate) fn access_intent(
                 return Err("Encryption is already off.".to_owned());
             }
             (AccessChange::Encrypt, "End-to-end encryption")
+        }
+        ACCESS_DIRECTORY => {
+            let listed = access.listed.ok_or_else(|| LISTING_UNKNOWN.to_owned())?;
+            if !access.listing_editable {
+                return Err(access_restriction(access.listing_level, snapshot));
+            }
+            let publish = choice == 1;
+            if publish == listed {
+                return Err("The room directory already shows it that way.".to_owned());
+            }
+            (AccessChange::Publish { publish }, "Room directory")
         }
         ACCESS_UPGRADE => {
             let upgrade = snapshot.upgrade.as_ref();
@@ -1119,6 +1154,18 @@ pub(crate) fn confirmation(intent: &Intent, snapshot: &RoomAdminSnapshot) -> Opt
             action: "Turn on encryption",
             destructive: true,
         },
+        AdminAction::SetAccess(AccessChange::Publish { publish: true }) => Confirmation {
+            title: "List this room in the room directory?".to_owned(),
+            body: LIST_BODY.to_owned(),
+            action: "List room",
+            destructive: true,
+        },
+        AdminAction::SetAccess(AccessChange::Publish { publish: false }) => Confirmation {
+            title: "Remove this room from the room directory?".to_owned(),
+            body: UNLIST_BODY.to_owned(),
+            action: "Remove listing",
+            destructive: false,
+        },
         AdminAction::SetAccess(AccessChange::Servers { block: true }) => {
             let server = crate::directory_plain_text(&intent.user_id, 260);
             Confirmation {
@@ -1335,6 +1382,13 @@ fn access_outcome_text(change: AccessChange, confirmed: bool) -> String {
         }
         AccessChange::Upgrade => "The room was upgraded.".to_owned(),
         AccessChange::Servers { .. } => "The blocked servers changed.".to_owned(),
+        AccessChange::Publish { publish: true } => {
+            "The room is listed in the room directory. The homeserver confirmed it.".to_owned()
+        }
+        AccessChange::Publish { publish: false } => {
+            "The room is no longer listed in the room directory. The homeserver confirmed it."
+                .to_owned()
+        }
     }
 }
 
@@ -1352,6 +1406,7 @@ pub(crate) fn permission_text(action: AdminAction, snapshot: &RoomAdminSnapshot)
             AccessChange::Encrypt => access.encryption_level,
             AccessChange::Upgrade => snapshot.upgrade.as_ref().map_or(100, |up| up.level),
             AccessChange::Servers { .. } => snapshot.servers.as_ref().map_or(100, |acl| acl.level),
+            AccessChange::Publish { .. } => access.listing_level,
         };
         return access_restriction(level, snapshot);
     }
@@ -1899,6 +1954,9 @@ mod tests {
             encrypted: false,
             encryption_level: 50,
             encryption_editable: editable,
+            listed: Some(false),
+            listing_level: 50,
+            listing_editable: editable,
         });
         snapshot
     }
@@ -2002,10 +2060,52 @@ mod tests {
         assert!(access_intent(ACCESS_HISTORY, 3, &custom).is_err());
 
         let rows = access_rows(&snapshot);
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         assert_eq!((rows[0].choice, rows[1].choice, rows[2].choice), (0, 0, 0));
+        assert_eq!((rows[3].kind, rows[3].choice), (ACCESS_DIRECTORY, 0));
         let unlocked = |row: &AccessRow| row.editable && row.restriction.is_empty();
         assert!(rows.iter().all(unlocked));
+    }
+
+    #[test]
+    fn directory_listing_is_reviewed_and_unknown_listings_stay_read_only() {
+        let mut snapshot = with_access(true);
+        let list = access_intent(ACCESS_DIRECTORY, 1, &snapshot).unwrap();
+        let publish = AccessChange::Publish { publish: true };
+        assert_eq!(list.action, AdminAction::SetAccess(publish));
+        assert!(list.still_matches(&snapshot));
+        let review = confirmation(&list, &snapshot).unwrap();
+        assert!(review.destructive && review.body.contains("Who can join is unchanged"));
+        let already = access_intent(ACCESS_DIRECTORY, 0, &snapshot);
+        assert!(already.is_err());
+        let outcome = AdminOutcome {
+            observed: Some(ObservedTarget {
+                membership: ObservedMembership::None,
+                power: MemberPower::Level(0),
+            }),
+            confirmed: true,
+            snapshot: std::sync::Arc::new(snapshot.clone()),
+            replacement: None,
+            removal: None,
+        };
+        let text = outcome_text(&list, &outcome);
+        assert!(text.starts_with("The room is listed in the room directory."));
+        if let Some(access) = snapshot.access.as_mut() {
+            access.listed = Some(true);
+        }
+        // Listed meanwhile: the review is withdrawn, and removal is offered.
+        assert!(!list.still_matches(&snapshot));
+        let unlist = access_intent(ACCESS_DIRECTORY, 0, &snapshot).unwrap();
+        assert!(!confirmation(&unlist, &snapshot).unwrap().destructive);
+        if let Some(access) = snapshot.access.as_mut() {
+            access.listed = None;
+            access.listing_editable = false;
+        }
+        let unknown = access_intent(ACCESS_DIRECTORY, 1, &snapshot);
+        assert_eq!(unknown, Err(LISTING_UNKNOWN.to_owned()));
+        let row = &access_rows(&snapshot)[3];
+        assert_eq!(row.choice, -1);
+        assert_eq!(row.restriction, LISTING_UNKNOWN);
     }
 
     #[test]

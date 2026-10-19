@@ -23,6 +23,7 @@ use matrix_sdk::{
         UserId,
         api::{
             client::{
+                directory::{get_room_visibility, set_room_visibility},
                 discovery::get_capabilities,
                 membership::{
                     ban_user,
@@ -34,7 +35,7 @@ use matrix_sdk::{
                 },
                 message::get_message_events,
                 redact::redact_event,
-                room::upgrade_room,
+                room::{Visibility, upgrade_room},
                 state::send_state_event,
             },
             error::ErrorKind,
@@ -299,6 +300,13 @@ pub struct AccessSettings {
     pub encryption_level: i64,
     /// Encryption is off and the account may turn it on.
     pub encryption_editable: bool,
+    /// Listed in the homeserver's public room directory; `None` when the
+    /// homeserver did not say.
+    pub listed: Option<bool>,
+    /// The level needed to change the listing: homeservers allow it to those
+    /// who may change the room's main address.
+    pub listing_level: i64,
+    pub listing_editable: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -316,6 +324,9 @@ pub enum AccessChange {
     /// Block or unblock, in `m.room.server_acl`, the server name or pattern
     /// given as the request's user ID.
     Servers { block: bool },
+    /// List the room in, or remove it from, the homeserver's public room
+    /// directory.
+    Publish { publish: bool },
 }
 
 /// Homeservers the room blocks with `m.room.server_acl`. People on a blocked
@@ -710,7 +721,10 @@ impl RoomAdminSession {
             self.check()?;
             let (history, guests) = (history.as_ref(), guests.as_ref());
             let encrypted = encryption.is_some();
-            let access = access_settings(levels, &self.own_user, history, guests, encrypted);
+            let mut access = access_settings(levels, &self.own_user, history, guests, encrypted);
+            access.listed = self.listing().await;
+            self.check()?;
+            access.listing_editable &= access.listed.is_some();
             snapshot.access = Some(access);
             let tombstone = self.optional_state(StateEventType::RoomTombstone).await?;
             let recommended = self.recommended_version().await;
@@ -795,6 +809,74 @@ impl RoomAdminSession {
         })
         .await
     }
+    /// Whether the homeserver lists the room in its public room directory,
+    /// from one bounded read; `None` when it did not answer.
+    async fn listing(&self) -> Option<bool> {
+        let request = get_room_visibility::v3::Request::new(self.room.room_id().to_owned());
+        let client = self.room.client();
+        let response = client
+            .send(request)
+            .with_request_config(write_config())
+            .await;
+        match response.ok()?.visibility {
+            Visibility::Public => Some(true),
+            Visibility::Private => Some(false),
+            _ => None,
+        }
+    }
+    /// List the room in, or remove it from, the homeserver's public room
+    /// directory. Homeservers allow this to those who may change the room's
+    /// main address; the same rule is checked first.
+    async fn set_listing(&self, publish: bool) -> Result<AdminOutcome> {
+        self.run(WRITE_TIMEOUT, async {
+            let power = self.power_state().await?;
+            let levels = room_settings::effective_power_levels(&self.create, power.as_ref())?
+                .ok_or(RoomAdminError::InvalidState)?;
+            let kind = StateEventType::RoomCanonicalAlias;
+            if !levels.user_can_send_state(&self.own_user, kind) {
+                return Err(RoomAdminError::InsufficientPower);
+            }
+            match self.listing().await {
+                Some(listed) if listed == publish => return Err(RoomAdminError::NotApplicable),
+                Some(_) => {}
+                None => return Err(RoomAdminError::Unavailable),
+            }
+            let visibility = if publish {
+                Visibility::Public
+            } else {
+                Visibility::Private
+            };
+            let room_id = self.room.room_id().to_owned();
+            let request = set_room_visibility::v3::Request::new(room_id, visibility);
+            self.check()?;
+            self.room
+                .client()
+                .send(request)
+                .with_request_config(write_config())
+                .await
+                .map_err(write_failure)?;
+            self.check()?;
+            // Accepted by the server; a failed read-back is unconfirmed, not failed.
+            let built = match self.build(power.as_ref()).await {
+                Ok(built) => Some(self.publish(built)?),
+                Err(_) => None,
+            };
+            let access = built.as_ref().and_then(|built| built.access);
+            let confirmed = access.is_some_and(|access| access.listed == Some(publish));
+            let read_back = ObservedTarget {
+                membership: ObservedMembership::None,
+                power: MemberPower::Level(0),
+            };
+            Ok(AdminOutcome {
+                confirmed,
+                observed: built.is_some().then_some(read_back),
+                snapshot: built.unwrap_or_else(|| self.snapshot()),
+                replacement: None,
+                removal: None,
+            })
+        })
+        .await
+    }
     async fn optional_state(&self, kind: StateEventType) -> Result<Option<StateEnvelope>> {
         let state = room_settings::state(&self.room, kind, "").await?;
         Ok(state)
@@ -817,6 +899,9 @@ impl RoomAdminSession {
         }
         if let AdminAction::SetAccess(AccessChange::Servers { block }) = request.action {
             return self.set_server_block(&request.user_id, block).await;
+        }
+        if let AdminAction::SetAccess(AccessChange::Publish { publish }) = request.action {
+            return self.set_listing(publish).await;
         }
         if let AdminAction::SetAccess(change) = request.action {
             return self.set_access(change).await;
@@ -1564,6 +1649,7 @@ fn access_settings(
     let history_kind = StateEventType::RoomHistoryVisibility;
     let guests_kind = StateEventType::RoomGuestAccess;
     let encryption_kind = StateEventType::RoomEncryption;
+    let alias_kind = StateEventType::RoomCanonicalAlias;
     AccessSettings {
         history,
         history_level: levels.for_state(history_kind.clone()).into(),
@@ -1574,6 +1660,10 @@ fn access_settings(
         encrypted,
         encryption_level: levels.for_state(encryption_kind.clone()).into(),
         encryption_editable: !encrypted && levels.user_can_send_state(own, encryption_kind),
+        // Filled in from the homeserver's directory by the caller.
+        listed: None,
+        listing_level: levels.for_state(alias_kind.clone()).into(),
+        listing_editable: levels.user_can_send_state(own, alias_kind),
     }
 }
 
@@ -1584,6 +1674,7 @@ fn access_kind(change: AccessChange) -> StateEventType {
         AccessChange::Encrypt => StateEventType::RoomEncryption,
         AccessChange::Upgrade => StateEventType::RoomTombstone,
         AccessChange::Servers { .. } => StateEventType::RoomServerAcl,
+        AccessChange::Publish { .. } => StateEventType::RoomCanonicalAlias,
     }
 }
 
@@ -1594,8 +1685,8 @@ fn access_matches(change: AccessChange, current: Option<&StateEnvelope>) -> bool
         // Any encryption event, even one this client cannot read, means it
         // is on already; it is never replaced.
         AccessChange::Encrypt | AccessChange::Upgrade => current.is_none(),
-        // Checked against the block list by its own path.
-        AccessChange::Servers { .. } => false,
+        // Checked against the block list or the directory by their own paths.
+        AccessChange::Servers { .. } | AccessChange::Publish { .. } => false,
     }
 }
 
@@ -1606,6 +1697,7 @@ fn access_applied(change: AccessChange, access: AccessSettings) -> bool {
         AccessChange::Encrypt => access.encrypted,
         // Confirmed from the tombstone or the block list, not from these settings.
         AccessChange::Upgrade | AccessChange::Servers { .. } => false,
+        AccessChange::Publish { publish } => access.listed == Some(publish),
     }
 }
 
@@ -1631,7 +1723,7 @@ fn access_request(room: &RoomId, change: AccessChange) -> Result<send_state_even
         }
         // An upgrade is its own request, and the block list keeps fields
         // this client does not edit, so neither is a typed state event.
-        AccessChange::Upgrade | AccessChange::Servers { .. } => {
+        AccessChange::Upgrade | AccessChange::Servers { .. } | AccessChange::Publish { .. } => {
             return Err(RoomAdminError::NotApplicable);
         }
     };
@@ -2349,6 +2441,23 @@ mod tests {
         assert_eq!(full.removable.len(), MAX_REMOVED_MESSAGES);
         assert!(full.more);
         assert_eq!(full.removable[0].as_str(), "$spam0");
+    }
+
+    #[test]
+    fn directory_listing_follows_the_main_address_rule_and_starts_unknown() {
+        let levels = levels("11", json!({"@mod:example.org": 50}));
+        let moderator = user_id!("@mod:example.org");
+        let member = user_id!("@member:example.org");
+        let settings = access_settings(&levels, moderator, None, None, false);
+        assert_eq!((settings.listed, settings.listing_level), (None, 50));
+        assert!(settings.listing_editable);
+        assert!(!access_settings(&levels, member, None, None, false).listing_editable);
+        let publish = AccessChange::Publish { publish: true };
+        assert_eq!(access_kind(publish), StateEventType::RoomCanonicalAlias);
+        assert!(access_request(room_id!("!admin:example.org"), publish).is_err());
+        let mut listed = settings;
+        listed.listed = Some(true);
+        assert!(access_applied(publish, listed) && !access_applied(publish, settings));
     }
 
     #[test]
