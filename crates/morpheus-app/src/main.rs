@@ -10,6 +10,8 @@ mod audio_devices;
 #[cfg(feature = "native-calls")]
 mod call_membership;
 #[cfg(feature = "native-calls")]
+mod call_recovery;
+#[cfg(feature = "native-calls")]
 mod calls;
 mod composer_mentions;
 mod config_cli;
@@ -1257,6 +1259,7 @@ fn call_status_label(status: &CallStatus) -> String {
         CallStatus::OpeningSlot { .. } => "Opening MatrixRTC room call…".into(),
         CallStatus::Starting { .. } => "Joining MatrixRTC audio…".into(),
         CallStatus::Joined { .. } => "Room call joined".into(),
+        CallStatus::Reconnecting { interruption, .. } => interruption.label(),
         CallStatus::Ending { .. } => "Leaving call…".into(),
         CallStatus::CleanupFailed { reason, .. } => {
             format!(
@@ -1266,6 +1269,9 @@ fn call_status_label(status: &CallStatus) -> String {
         }
         CallStatus::Failed { reason, .. } => {
             format!("Call failed: {}", directory_plain_text(reason, 180))
+        }
+        CallStatus::Ended { reason, .. } => {
+            format!("Call ended: {}", directory_plain_text(reason, 180))
         }
     }
 }
@@ -1277,8 +1283,10 @@ fn call_room_id(status: &CallStatus) -> Option<&str> {
         | CallStatus::Starting { room_id, .. }
         | CallStatus::Ending { room_id, .. }
         | CallStatus::CleanupFailed { room_id, .. } => Some(room_id),
-        CallStatus::Joined { call, .. } => Some(&call.room_id),
-        CallStatus::Idle | CallStatus::Failed { .. } => None,
+        CallStatus::Joined { call, .. } | CallStatus::Reconnecting { call, .. } => {
+            Some(&call.room_id)
+        }
+        CallStatus::Idle | CallStatus::Failed { .. } | CallStatus::Ended { .. } => None,
     }
 }
 
@@ -1657,7 +1665,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 let current = status.borrow_and_update().clone();
                 let connected = current.blocks_account_switch();
-                let joined = matches!(current, CallStatus::Joined { .. });
+                let joined = current.has_live_join();
                 let leave_unconfirmed = matches!(current, CallStatus::CleanupFailed { .. });
                 let label = call_status_label(&current);
                 let room_id = call_room_id(&current).unwrap_or("").to_owned();

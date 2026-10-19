@@ -541,6 +541,9 @@ pub struct AudioState {
 struct AudioControlState {
     desired: AudioState,
     applied: AudioState,
+    /// Outgoing audio is withheld while the host cannot follow signalling.
+    /// This never changes `desired`, so the user's mute choice survives.
+    suspended: bool,
     microphone: Option<Arc<Publication>>,
     speaker_mixer: Option<Arc<Mutex<AudioMixer>>>,
 }
@@ -599,6 +602,7 @@ impl AudioControls {
             state: Arc::new(Mutex::new(AudioControlState {
                 desired,
                 applied,
+                suspended: false,
                 microphone: None,
                 speaker_mixer: None,
             })),
@@ -626,6 +630,49 @@ impl AudioControls {
 
     pub fn subscribe_applied_state(&self) -> watch::Receiver<AudioState> {
         self.applied.subscribe()
+    }
+
+    /// The user's requested mute and deafen state. Unlike `applied_state`,
+    /// cancellation and transmission pauses never change it.
+    pub fn requested_state(&self) -> AudioState {
+        *self.requested.borrow()
+    }
+
+    /// Seed new controls for a rejoined membership with the previous join's
+    /// requested state before its audio loop starts. Devices are untouched;
+    /// the loop applies the state when it attaches the new publication.
+    pub fn preset_requested_state(&self, requested: AudioState) -> Result<(), MediaError> {
+        self.ensure_authorized()?;
+        if self.running.load(Ordering::Acquire) {
+            return Err(MediaError::ControlAlreadyRunning);
+        }
+        let mut state = self.lock_state()?;
+        self.ensure_authorized()?;
+        state.desired = requested;
+        self.requested.send_replace(requested);
+        Ok(())
+    }
+
+    /// Withhold or resume outgoing microphone audio without changing the
+    /// requested mute state or reopening a device. Pausing mutes the live
+    /// publication at once. Resuming only wakes the capture loop, which
+    /// discards buffered frames before applying a still-requested unmute.
+    pub fn set_transmission_suspended(&self, suspended: bool) -> Result<(), MediaError> {
+        self.ensure_authorized()?;
+        let mut state = self.lock_state()?;
+        self.ensure_authorized()?;
+        state.suspended = suspended;
+        if suspended {
+            // Record the pause before touching the transport so a failing
+            // mute still stops the capture loop from sending frames.
+            state.applied.microphone_muted = true;
+            self.applied.send_replace(state.applied);
+            if let Some(publication) = &state.microphone {
+                publication.set_muted(true)?;
+            }
+        }
+        self.requested.send_replace(state.desired);
+        Ok(())
     }
 
     pub fn is_running(&self) -> bool {
@@ -747,10 +794,13 @@ impl AudioControls {
         let mut state = self.lock_state()?;
         self.ensure_authorized()?;
         speaker.set_deafened(state.desired.deafened)?;
-        if !state.desired.microphone_muted {
+        if !state.desired.microphone_muted && !state.suspended {
             publication.set_muted(false)?;
         }
         state.applied = state.desired;
+        if state.suspended {
+            state.applied.microphone_muted = true;
+        }
         state.microphone = Some(publication);
         state.speaker_mixer = Some(Arc::clone(&speaker.mixer));
         self.applied.send_replace(state.applied);
@@ -761,13 +811,16 @@ impl AudioControls {
         self.ensure_authorized()?;
         let needs_unmute = {
             let state = self.lock_state()?;
-            !state.desired.microphone_muted && state.applied.microphone_muted
+            !state.suspended && !state.desired.microphone_muted && state.applied.microphone_muted
         };
         if needs_unmute {
             microphone.discard_buffered_frames();
             let mut state = self.lock_state()?;
             self.ensure_authorized()?;
-            if !state.desired.microphone_muted && state.applied.microphone_muted {
+            if !state.suspended
+                && !state.desired.microphone_muted
+                && state.applied.microphone_muted
+            {
                 if let Some(publication) = &state.microphone {
                     publication.set_muted(false)?;
                     state.applied.microphone_muted = false;
@@ -781,7 +834,7 @@ impl AudioControls {
     fn should_send_microphone(&self) -> Result<bool, MediaError> {
         self.ensure_authorized()?;
         let state = self.lock_state()?;
-        Ok(!state.applied.microphone_muted)
+        Ok(!state.suspended && !state.applied.microphone_muted)
     }
 }
 
@@ -1429,6 +1482,44 @@ mod tests {
         ));
         let fresh = guarded_controls(|| true);
         assert!(AudioRunGuard::start(&fresh).is_ok());
+    }
+
+    #[test]
+    fn paused_transmission_withholds_audio_and_keeps_the_requested_mute_state() {
+        let requested = AudioState {
+            microphone_muted: false,
+            deafened: true,
+        };
+        let controls = guarded_controls(|| true);
+        controls.preset_requested_state(requested).unwrap();
+        let running = AudioRunGuard::start(&controls).unwrap();
+        assert!(matches!(
+            controls.preset_requested_state(requested),
+            Err(MediaError::ControlAlreadyRunning)
+        ));
+        {
+            let mut state = controls.lock_state().unwrap();
+            state.applied.microphone_muted = false;
+            controls.applied.send_replace(state.applied);
+        }
+        assert!(controls.should_send_microphone().unwrap());
+        controls.set_transmission_suspended(true).unwrap();
+        assert!(!controls.should_send_microphone().unwrap());
+        assert!(controls.applied_state().microphone_muted);
+        // An unmute requested during the pause is remembered, not applied.
+        controls.set_microphone_muted(false).unwrap();
+        assert!(!controls.should_send_microphone().unwrap());
+        assert_eq!(controls.requested_state(), requested);
+        // Resuming leaves the actual unmute to the capture loop, which first
+        // discards frames buffered during the pause.
+        controls.set_transmission_suspended(false).unwrap();
+        assert!(!controls.should_send_microphone().unwrap());
+        assert_eq!(controls.requested_state(), requested);
+        drop(running);
+        assert!(matches!(
+            controls.set_transmission_suspended(false),
+            Err(MediaError::CallEnded)
+        ));
     }
 
     #[tokio::test]

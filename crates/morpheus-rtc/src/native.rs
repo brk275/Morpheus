@@ -391,6 +391,18 @@ impl RtcService {
         self.calls.get_mut(room_id).map(|active| &mut active.call)
     }
 
+    /// The joined call's unified event stream: connection health, the end
+    /// reason, and participant/stream changes used to reconcile after a
+    /// transport reconnect.
+    pub fn subscribe_call_events(
+        &self,
+        room_id: &str,
+    ) -> Result<tokio::sync::broadcast::Receiver<crate::RtcCallEvent>, RtcError> {
+        self.call(room_id)
+            .map(LiveKitCall::subscribe_call_events)
+            .ok_or(RtcError::NotJoined)
+    }
+
     pub(crate) fn call_lease(&self, room_id: &str) -> Option<&CallLease> {
         self.calls.get(room_id).map(|active| &active.lease)
     }

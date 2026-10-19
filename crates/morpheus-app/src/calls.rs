@@ -22,6 +22,12 @@
 //! the room's current encryption state and never uses Morpheus's optional
 //! voice-space presentation marker to decide permissions or call semantics.
 //! Live microphone, camera, and screen controls are bound to the current join.
+//!
+//! Interruptions keep the call (and the account-switch block) alive while it
+//! recovers: LiveKit resumes media inside one join, a transient sync loss
+//! pauses outgoing media for a bounded grace period, and a lost join is left
+//! and rejoined a bounded number of times with the same options. See
+//! `call_recovery`. Leave, account changes and terminal sync loss always win.
 
 use std::{
     fmt,
@@ -39,14 +45,18 @@ use morpheus_matrix::{
 pub use morpheus_rtc::CallInfo;
 use morpheus_rtc::{
     AudioControls, AudioDeviceSelection, AudioState, CallOptions, LocalRtcSupport, MediaError,
-    RtcError, RtcService, TransportSupport, local_device_support, local_support,
+    ReconnectBackoff, ReconnectPolicy, RtcCallEnd, RtcConnectionSignal, RtcError, RtcService,
+    TransportSupport, local_device_support, local_support,
 };
 use tokio::{
-    sync::{Mutex, mpsc, oneshot, watch},
+    sync::{Mutex, broadcast, mpsc, oneshot, watch},
     time::timeout,
 };
 
 use crate::{
+    call_recovery::{
+        RejoinCause, SIGNALING_GRACE, SignalingHealth, rejoin_retryable, signaling_health,
+    },
     incoming_ring::controller::{AcceptedOffer, EstablishedAuthorization, EstablishedGuard},
     local_video::{
         CaptureCommand, CaptureKind, CaptureSource, CaptureStop, LocalVideoSession,
@@ -62,6 +72,7 @@ const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 const JOIN_TIMEOUT: Duration = Duration::from_secs(45);
 const LEAVE_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(75);
+const INVITATION_INTERRUPTED: &str = "Invitation interrupted by a lost connection.";
 
 /// A read-only compatibility result. `TransportReady` means the binary,
 /// account sync, and homeserver transport can support native calls; it does
@@ -134,6 +145,13 @@ pub enum CallStatus {
         account_id: String,
         call: CallInfo,
     },
+    /// Still the user's call, recovering from an interruption. `call` is the
+    /// latest join, which may already have been left while rejoining.
+    Reconnecting {
+        account_id: String,
+        call: CallInfo,
+        interruption: CallInterruption,
+    },
     Ending {
         account_id: String,
         room_id: String,
@@ -147,6 +165,11 @@ pub enum CallStatus {
         room_id: String,
         reason: String,
     },
+    /// The call ended without a local Leave, e.g. its slot was closed.
+    Ended {
+        room_id: String,
+        reason: String,
+    },
 }
 
 impl CallStatus {
@@ -157,9 +180,54 @@ impl CallStatus {
             Self::OpeningSlot { .. }
                 | Self::Starting { .. }
                 | Self::Joined { .. }
+                | Self::Reconnecting { .. }
                 | Self::Ending { .. }
                 | Self::CleanupFailed { .. }
         )
+    }
+
+    /// The current join is alive, possibly while its media or signalling
+    /// reconnects, so its media controls apply. False while rejoining.
+    pub fn has_live_join(&self) -> bool {
+        matches!(
+            self,
+            Self::Joined { .. }
+                | Self::Reconnecting {
+                    interruption: CallInterruption::Media | CallInterruption::Signaling,
+                    ..
+                }
+        )
+    }
+}
+
+/// What a joined call is recovering from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CallInterruption {
+    /// LiveKit is resuming the SFU media connection inside the same join.
+    Media,
+    /// Matrix sync is reconnecting. Outgoing audio and video are paused,
+    /// because a member leaving now could not trigger a media-key rotation.
+    Signaling,
+    /// The join was lost; waiting for the homeserver before leaving it and
+    /// joining again.
+    WaitingForNetwork,
+    /// The join was lost; a fresh join with the same options is under way.
+    Rejoining { attempt: u32, max_attempts: u32 },
+}
+
+impl CallInterruption {
+    pub fn label(self) -> String {
+        match self {
+            Self::Media => "Reconnecting call media…".into(),
+            Self::Signaling => {
+                "Reconnecting to the homeserver… microphone and video are paused".into()
+            }
+            Self::WaitingForNetwork => "Connection lost · waiting for the network…".into(),
+            Self::Rejoining {
+                attempt,
+                max_attempts,
+            } => format!("Connection lost · rejoining (attempt {attempt} of {max_attempts})…"),
+        }
     }
 }
 
@@ -181,6 +249,7 @@ pub enum CallControllerError {
     TimedOut(&'static str),
     Cleanup(String),
     Update(UpdateError),
+    ConnectionLost(String),
 }
 
 impl fmt::Display for CallControllerError {
@@ -212,6 +281,9 @@ impl fmt::Display for CallControllerError {
             Self::TimedOut(phase) => write!(formatter, "timed out while {phase}"),
             Self::Cleanup(error) => write!(formatter, "could not leave the call cleanly: {error}"),
             Self::Update(error) => write!(formatter, "{error}"),
+            Self::ConnectionLost(detail) => {
+                write!(formatter, "the call connection was lost: {detail}")
+            }
         }
     }
 }
@@ -238,6 +310,9 @@ impl From<MediaError> for CallControllerError {
 
 struct RunningCall {
     token: u64,
+    /// UI generation of the current join. Equal to `token` until a rejoin
+    /// starts a new one, so the ended join's queued UI updates are rejected.
+    presentation: u64,
     account_id: String,
     room_id: String,
     cancel: Option<oneshot::Sender<()>>,
@@ -426,6 +501,25 @@ impl Shared {
             *slot = CallSlot::Idle;
             self.release_update_lease();
             self.status.send_replace(CallStatus::Idle);
+        }
+    }
+
+    /// Publish a live-call status only while the worker for `token` still
+    /// owns the un-cancelled slot, so a Leave's `Ending` is never overwritten.
+    async fn publish_live_status(&self, token: u64, stop: &CaptureStop, status: CallStatus) {
+        let slot = self.slot.lock().await;
+        let owned = matches!(
+            &*slot,
+            CallSlot::Running(running) if running.token == token && running.cancel.is_some()
+        );
+        if owned && !stop.requested() {
+            self.status.send_if_modified(|current| {
+                if *current == status {
+                    return false;
+                }
+                *current = status;
+                true
+            });
         }
     }
 
@@ -635,11 +729,11 @@ impl CallController {
             let CallSlot::Running(running) = &*slot else {
                 return Err(CallControllerError::StaleCall);
             };
-            if running.token != token
+            if running.presentation != token
                 || running.account_id != account.id
                 || running.cancel.is_none()
                 || running.capture_stop.requested()
-                || !matches!(self.status(), CallStatus::Joined { .. })
+                || !self.status().has_live_join()
             {
                 return Err(CallControllerError::StaleCall);
             }
@@ -673,7 +767,7 @@ impl CallController {
         let CallSlot::Running(running) = &*slot else {
             return Err(CallControllerError::StaleCall);
         };
-        if running.token != token || running.cancel.is_none() {
+        if running.presentation != token || running.cancel.is_none() {
             return Err(CallControllerError::StaleCall);
         }
         if running.account_id != account.id {
@@ -915,6 +1009,7 @@ impl CallController {
             self.shared.reserve_update_lease()?;
             *slot = CallSlot::Running(RunningCall {
                 token,
+                presentation: token,
                 account_id: account.id.clone(),
                 room_id: room_id.to_owned(),
                 cancel: Some(cancel_tx),
@@ -958,6 +1053,7 @@ impl CallController {
             options,
             audio_devices,
             token,
+            presentation: token,
             cancel: cancel_rx,
             done: done_tx,
             ready: Some(ready_tx),
@@ -1042,7 +1138,7 @@ impl CallController {
             }
             None => {}
         }
-        let (cancel, mut done, token, account_id, room_id) = {
+        let (cancel, mut done, token, presentation, account_id, room_id) = {
             let mut slot = self.shared.slot.lock().await;
             let running = match &mut *slot {
                 CallSlot::Idle => return Ok(()),
@@ -1065,6 +1161,7 @@ impl CallController {
                 cancel,
                 done,
                 running.token,
+                running.presentation,
                 running.account_id.clone(),
                 running.room_id.clone(),
             )
@@ -1072,7 +1169,7 @@ impl CallController {
         if let Some(cancel) = cancel {
             let _ = cancel.send(());
         }
-        self.shared.clear_media(token);
+        self.shared.clear_media(presentation);
         let finished = timeout(SHUTDOWN_TIMEOUT, async {
             loop {
                 if let Some(result) = done.borrow_and_update().clone() {
@@ -1114,8 +1211,10 @@ impl CallController {
             }
         };
         let _ = wait_cleanup_done(&mut done).await?;
-        if self.shared.active_audio_token.load(Ordering::SeqCst) == token
-            || self.shared.active_video_token.load(Ordering::SeqCst) == token
+        // No other call can start while this slot is blocked, so any live
+        // UI generation (including a rejoin's) belongs to this call.
+        if self.shared.active_audio_token.load(Ordering::SeqCst) != 0
+            || self.shared.active_video_token.load(Ordering::SeqCst) != 0
             || self.shared.active_capture_workers.load(Ordering::SeqCst) != 0
         {
             return Err(CallControllerError::Cleanup(
@@ -1188,15 +1287,16 @@ async fn wait_cleanup_done(
 
 // Read by the detached audio opener as well as the async call owner. Account
 // and sync invalidation must not wait for the owner's next select-loop poll.
+// A transient sync loss pauses transmission in the worker instead; only the
+// end of sticky sync for this session revokes capture.
 fn audio_capture_allowed(stop: &CaptureStop, selection_current: bool, sync: &SyncStatus) -> bool {
     !stop.requested()
         && selection_current
-        && matches!(
-            sync,
-            SyncStatus::Running {
-                backend: SyncBackend::SlidingSticky
-            }
-        )
+        && signaling_health(sync) != SignalingHealth::Unavailable
+}
+
+fn sticky_sync_required(state: SyncStatus) -> CallControllerError {
+    CallControllerError::Unavailable(AudioCallCapability::StickySyncRequired(state))
 }
 
 fn accepted_cancelled(
@@ -1256,6 +1356,97 @@ where
     }
 }
 
+/// How one join's media session ended.
+enum SessionEnd {
+    /// Leave, cancellation, or an error that ends the call.
+    Finish(Result<(), CallControllerError>),
+    /// The call ended for everyone, e.g. its slot was closed.
+    Ended(&'static str),
+    /// The join is unusable while the user still wants the call.
+    Rejoin(RejoinCause),
+}
+
+fn session_end(end: RtcCallEnd) -> SessionEnd {
+    match end {
+        RtcCallEnd::SlotClosed => SessionEnd::Ended("the room call was closed"),
+        // No local Leave was requested, so the membership ended without us,
+        // e.g. its delayed leave fired while this device was offline.
+        RtcCallEnd::Left => SessionEnd::Rejoin(RejoinCause::MembershipEnded),
+        RtcCallEnd::ConnectionLost => SessionEnd::Rejoin(RejoinCause::TransportClosed),
+    }
+}
+
+/// Why a rejoin installed no new join.
+enum RejoinEnd {
+    /// Leave (`Ok`), an account change, or a terminal failure. The worker's
+    /// teardown still leaves any join that remains.
+    Stopped(Result<(), CallControllerError>),
+    /// A leave failed, so a membership may still be published.
+    CleanupFailed(String),
+}
+
+enum JoinAttemptError {
+    Stopped(RejoinEnd),
+    Failed(CallControllerError),
+}
+
+/// How a finished call is reported to the UI.
+enum CallOutcome {
+    Idle,
+    Failed(String),
+    Ended(String),
+}
+
+fn rejoin_exhausted(
+    cause: RejoinCause,
+    attempts: u32,
+    last_error: Option<CallControllerError>,
+) -> CallControllerError {
+    let reason = cause.message();
+    CallControllerError::ConnectionLost(match (attempts, last_error) {
+        (0, _) => format!("{reason}; it did not recover within the reconnect window"),
+        (attempts, Some(error)) => {
+            format!("{reason}; rejoining failed after {attempts} attempt(s): {error}")
+        }
+        (attempts, None) => format!("{reason}; rejoining failed after {attempts} attempt(s)"),
+    })
+}
+
+async fn leave_after(
+    rtc: &mut RtcService,
+    room_id: &str,
+    result: Result<(), CallControllerError>,
+) -> RejoinEnd {
+    match leave_with_timeout(rtc, room_id).await {
+        Ok(()) => RejoinEnd::Stopped(result),
+        Err(error) => RejoinEnd::CleanupFailed(error.to_string()),
+    }
+}
+
+fn signaling_ready(sync: &watch::Receiver<SyncStatus>) -> bool {
+    signaling_health(&sync.borrow()) == SignalingHealth::Ready
+}
+
+/// Watchers that stop OS capture as soon as the account, sync session or
+/// incoming-call authority behind it ends, even while the worker is
+/// suspended in a publish or a rejoin. Dropping the value stops them.
+struct CaptureGuards(Vec<tokio::task::JoinHandle<()>>);
+
+impl Drop for CaptureGuards {
+    fn drop(&mut self) {
+        for guard in &self.0 {
+            guard.abort();
+        }
+    }
+}
+
+fn revoke_capture(stop: &CaptureStop, audio: Option<&AudioControls>) {
+    stop.request();
+    if let Some(audio) = audio {
+        audio.cancel();
+    }
+}
+
 struct CallWorker {
     manager: Arc<AccountManager>,
     shared: Arc<Shared>,
@@ -1265,6 +1456,7 @@ struct CallWorker {
     options: CallOptions,
     audio_devices: AudioDeviceSelection,
     token: u64,
+    presentation: u64,
     cancel: oneshot::Receiver<()>,
     done: watch::Sender<Option<Result<(), String>>>,
     ready: Option<oneshot::Sender<Result<CallInfo, CallControllerError>>>,
@@ -1305,7 +1497,7 @@ impl CallWorker {
                 .is_err()
             || !self.selection.is_current()
         {
-            self.shared.clear_media(self.token);
+            self.shared.clear_media(self.presentation);
             let leave = leave_with_timeout(&mut rtc, &self.room_id).await;
             self.send_ready(Err(CallControllerError::Cancelled));
             self.finish(leave.map_err(|error| error.to_string()), None)
@@ -1333,18 +1525,8 @@ impl CallWorker {
         }
         let mut active = self.manager.subscribe_active_account();
         let mut sync = self.manager.subscribe_sync_status();
-        let audio_selection = self.selection.clone();
-        let audio_stop = Arc::clone(&self.capture_stop);
-        let audio_sync = sync.clone();
-        let audio_incoming = incoming_guard.clone();
-        let audio_info = info.clone();
-        let controls = match rtc.audio_controls_cancellable(&self.room_id, move || {
-            audio_capture_allowed(
-                &audio_stop,
-                audio_selection.is_current(),
-                &audio_sync.borrow(),
-            ) && incoming_capture_allowed(audio_incoming.as_ref(), &audio_info)
-        }) {
+        let created = self.new_audio_controls(&rtc, &info, incoming_guard.as_ref(), &sync);
+        let controls = match created {
             Ok(controls) => controls,
             Err(error) => {
                 let leave = leave_with_timeout(&mut rtc, &self.room_id).await;
@@ -1390,17 +1572,13 @@ impl CallWorker {
         let account_still_active = active.borrow().as_ref().map(|account| account.id.as_str())
             == Some(self.account_id.as_str());
         let sync_state = sync.borrow().clone();
+        // A transient sync loss is handled inside the session below.
         if !account_still_active
             || !incoming_capture_allowed(incoming_guard.as_ref(), &info)
             || !self.selection.is_current()
-            || !matches!(
-                sync_state,
-                SyncStatus::Running {
-                    backend: SyncBackend::SlidingSticky
-                }
-            )
+            || signaling_health(&sync_state) == SignalingHealth::Unavailable
         {
-            self.shared.clear_media(self.token);
+            self.shared.clear_media(self.presentation);
             let reason = if account_still_active && self.selection.is_current() {
                 CallControllerError::Unavailable(AudioCallCapability::StickySyncRequired(
                     sync_state,
@@ -1414,7 +1592,7 @@ impl CallWorker {
             return;
         }
         let mut outgoing = LocalVideoSession::new(
-            self.token,
+            self.presentation,
             self.video_commands
                 .take()
                 .expect("call owns video commands"),
@@ -1422,214 +1600,284 @@ impl CallWorker {
             Arc::clone(&self.capture_stop),
             Arc::clone(&self.shared.active_capture_workers),
         );
-        // A platform publish operation can suspend the call worker. These
-        // watchers stop OS capture immediately even if the worker has not yet
-        // returned to its main account/sync select loop.
-        let account_capture_guard = {
-            let mut active = active.clone();
-            let account_id = self.account_id.clone();
-            let selection = self.selection.clone();
-            let stop = Arc::clone(&self.capture_stop);
-            let audio = controls.clone();
-            tokio::spawn(async move {
-                loop {
-                    if !selection.is_current()
-                        || active.borrow().as_ref().map(|account| account.id.as_str())
-                            != Some(account_id.as_str())
-                    {
-                        stop.request();
-                        audio.cancel();
-                        break;
-                    }
-                    tokio::select! {
-                        _ = selection.revoked() => {
-                            stop.request();
-                            audio.cancel();
-                            break;
-                        }
-                        changed = active.changed() => {
-                            if changed.is_err() {
-                                stop.request();
-                                audio.cancel();
-                                break;
-                            }
-                        }
-                    }
-                }
-            })
-        };
-        let sync_capture_guard = {
-            let mut sync = sync.clone();
-            let stop = Arc::clone(&self.capture_stop);
-            let audio = controls.clone();
-            tokio::spawn(async move {
-                loop {
-                    if !matches!(
-                        *sync.borrow(),
-                        SyncStatus::Running {
-                            backend: SyncBackend::SlidingSticky
-                        }
-                    ) {
-                        stop.request();
-                        audio.cancel();
-                        break;
-                    }
-                    if sync.changed().await.is_err() {
-                        stop.request();
-                        audio.cancel();
-                        break;
-                    }
-                }
-            })
-        };
-        let incoming_capture_guard = incoming_guard.clone().map(|guard| {
-            let stop = Arc::clone(&self.capture_stop);
-            let audio = controls.clone();
-            tokio::spawn(async move {
-                guard.cancelled().await;
-                stop.request();
-                audio.cancel();
-            })
-        });
-        let mut invitation_receipt = None;
-        let media_result = {
+        let local_voice_space = {
             let voice_spaces = Arc::clone(&self.voice_spaces);
             let voice_account = self.account_id.clone();
             let voice_room = self.room_id.clone();
-            let local_voice_space = move || {
+            move || {
                 voice_spaces
                     .local_rooms(&voice_account)
                     .contains(&voice_room)
-            };
-            let invitation = OutgoingRing::new(
-                &self.account,
-                self.selection.clone(),
-                &info,
-                self.options.interop_mode,
-                self.token,
-                &self.shared.active_video_token,
-                &self.capture_stop,
-                &local_voice_space,
-            )
-            .send(&rtc);
-            tokio::pin!(invitation);
-            let mut invitation_pending = self.intent == CallStartIntent::Notify;
-            let mut invitation_deadline = None;
-            if invitation_pending {
-                self.shared
-                    .send_invitation(self.token, &self.selection, "Preparing invitation…");
             }
-            let audio = rtc.run_audio_controlled_with_devices(
-                &self.room_id,
-                &controls,
-                self.audio_devices.clone(),
+        };
+        let mut info = info;
+        let mut controls = controls;
+        let mut invitation_pending = self.intent == CallStartIntent::Notify;
+        let mut invitation_deadline = None;
+        let mut invitation_receipt = None;
+        if invitation_pending {
+            self.shared
+                .send_invitation(self.presentation, &self.selection, "Preparing invitation…");
+        }
+        // One iteration per join. A lost join is left and replaced in place:
+        // the call generation, its running captures and its Leave stay valid.
+        let (outcome, rejoin_cleanup) = loop {
+            // A platform publish operation can suspend the call worker. These
+            // watchers stop OS capture immediately even if the worker has not
+            // yet returned to its main account/sync select loop.
+            let guards = self.spawn_capture_guards(
+                &active,
+                &sync,
+                incoming_guard.as_ref(),
+                Some(&controls),
             );
-            let mut applied_audio = controls.subscribe_applied_state();
-            let video = run_remote_video(
-                &rtc,
-                &self.room_id,
-                self.token,
-                self.shared.video.clone(),
-                self.shared.roster.clone(),
-                &self.shared.active_video_token,
-            );
-            tokio::pin!(audio);
-            tokio::pin!(video);
-            let mut audio_running = true;
-            let mut video_running = true;
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = &mut self.cancel => break Ok(()),
-                    _ = established_cancelled(incoming_guard.as_ref()) => break Err(CallControllerError::IncomingOfferUnavailable),
-                    _ = self.selection.revoked() => break Err(CallControllerError::AccountChanged),
-                    changed = active.changed() => {
-                        if changed.is_err() || !self.selection.is_current()
-                            || active.borrow().as_ref().map(|account| account.id.as_str()) != Some(self.account_id.as_str()) {
-                            break Err(CallControllerError::AccountChanged);
-                        }
+            let session = {
+                let mut call_events = match rtc.subscribe_call_events(&self.room_id) {
+                    Ok(events) => events,
+                    Err(error) => {
+                        let error = CallControllerError::from(error);
+                        break (CallOutcome::Failed(error.to_string()), Ok(()));
                     }
-                    changed = sync.changed() => {
-                        let state = sync.borrow().clone();
-                        if changed.is_err() || !matches!(state, SyncStatus::Running { backend: SyncBackend::SlidingSticky }) {
-                            break Err(CallControllerError::Unavailable(AudioCallCapability::StickySyncRequired(state)));
-                        }
-                    }
-                    outcome = &mut invitation, if invitation_pending => {
-                        invitation_pending = false;
-                        self.shared.send_invitation(self.token, &self.selection, outcome.status_text());
-                        if let InvitationOutcome::Sent(receipt) = outcome {
-                            invitation_deadline = Some(tokio::time::Instant::from_std(receipt.expires_at()));
-                            invitation_receipt = Some(receipt);
-                        }
-                    }
-                    _ = tokio::time::sleep_until(invitation_deadline.unwrap_or_else(tokio::time::Instant::now)), if invitation_deadline.is_some() => {
-                        invitation_deadline = None;
-                        self.shared.send_invitation(self.token, &self.selection,
-                            "Invitation sent; its 30-second window has ended.");
-                    }
-                    result = &mut audio, if audio_running => match result {
-                        Ok(()) => break Ok(()),
-                        Err(MediaError::CallEnded) => break Err(CallControllerError::Media(MediaError::CallEnded)),
-                        Err(error) => {
-                            // A missing or stuck local audio device must not
-                            // tear down the receive-only call stage.
-                            audio_running = false;
-                            self.shared.fail_audio(self.token, AudioFailure::from_error(&error));
-                        }
-                    },
-                    changed = applied_audio.changed() => {
-                        if changed.is_ok() && controls.is_running() {
-                            self.shared.send_applied_audio(self.token, *applied_audio.borrow_and_update());
-                        }
-                    }
-                    // A closed roster/video stream must not end microphone
-                    // audio. run_remote_video normally waits for cancellation.
-                    () = &mut video, if video_running => video_running = false,
-                    event = outgoing.next_event() => {
-                        // A capture command may be ready in the same select
-                        // as Leave or an account change. Check the current
-                        // generation before opening any OS capture device.
-                        if self.cancel.try_recv().is_ok() {
-                            break Ok(());
-                        }
-                        if self.shared.active_video_token.load(Ordering::SeqCst) != self.token
-                            || !incoming_capture_allowed(incoming_guard.as_ref(), &info)
-                            || !self.selection.is_current()
-                            || active.borrow().as_ref().map(|account| account.id.as_str())
-                                != Some(self.account_id.as_str())
-                        {
-                            break Err(CallControllerError::AccountChanged);
-                        }
-                        outgoing.handle_event(&rtc, &self.room_id, event).await;
-                    },
+                };
+                // Only the first join may notify; a rejoin is always quiet.
+                let invitation = OutgoingRing::new(
+                    &self.account,
+                    self.selection.clone(),
+                    &info,
+                    self.options.interop_mode,
+                    self.presentation,
+                    &self.shared.active_video_token,
+                    &self.capture_stop,
+                    &local_voice_space,
+                )
+                .send(&rtc);
+                tokio::pin!(invitation);
+                let audio = rtc.run_audio_controlled_with_devices(
+                    &self.room_id,
+                    &controls,
+                    self.audio_devices.clone(),
+                );
+                let mut applied_audio = controls.subscribe_applied_state();
+                let video = run_remote_video(
+                    &rtc,
+                    &self.room_id,
+                    self.presentation,
+                    self.shared.video.clone(),
+                    self.shared.roster.clone(),
+                    &self.shared.active_video_token,
+                );
+                tokio::pin!(audio);
+                tokio::pin!(video);
+                let mut audio_running = true;
+                let mut video_running = true;
+                let mut media_degraded = false;
+                let mut signaling_deadline = None;
+                if signaling_health(&sync.borrow_and_update()) == SignalingHealth::Interrupted {
+                    let _ = controls.set_transmission_suspended(true);
+                    outgoing.pause_transmission();
+                    signaling_deadline = Some(tokio::time::Instant::now() + SIGNALING_GRACE);
+                } else {
+                    outgoing.resume_transmission();
                 }
+                let paused = signaling_deadline.is_some();
+                let status = self.session_status(&info, media_degraded, paused);
+                self.shared
+                    .publish_live_status(self.token, &self.capture_stop, status)
+                    .await;
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut self.cancel => break SessionEnd::Finish(Ok(())),
+                        _ = established_cancelled(incoming_guard.as_ref()) => break SessionEnd::Finish(Err(CallControllerError::IncomingOfferUnavailable)),
+                        _ = self.selection.revoked() => break SessionEnd::Finish(Err(CallControllerError::AccountChanged)),
+                        changed = active.changed() => {
+                            if changed.is_err() || !self.selection.is_current()
+                                || active.borrow().as_ref().map(|account| account.id.as_str()) != Some(self.account_id.as_str()) {
+                                break SessionEnd::Finish(Err(CallControllerError::AccountChanged));
+                            }
+                        }
+                        changed = sync.changed() => {
+                            let state = sync.borrow_and_update().clone();
+                            let health = signaling_health(&state);
+                            if changed.is_err() || health == SignalingHealth::Unavailable {
+                                break SessionEnd::Finish(Err(CallControllerError::Unavailable(AudioCallCapability::StickySyncRequired(state))));
+                            }
+                            // Pause on loss, resume on return; the user's mute
+                            // and capture choices are never rewritten here.
+                            if health == SignalingHealth::Interrupted && signaling_deadline.is_none() {
+                                let _ = controls.set_transmission_suspended(true);
+                                outgoing.pause_transmission();
+                                signaling_deadline = Some(tokio::time::Instant::now() + SIGNALING_GRACE);
+                            } else if health == SignalingHealth::Ready && signaling_deadline.take().is_some() {
+                                let _ = controls.set_transmission_suspended(false);
+                                outgoing.resume_transmission();
+                            }
+                            let status = self.session_status(&info, media_degraded, signaling_deadline.is_some());
+                            self.shared.publish_live_status(self.token, &self.capture_stop, status).await;
+                        }
+                        // Past the grace period the membership's delayed leave
+                        // may have fired, so this join can no longer be trusted.
+                        _ = tokio::time::sleep_until(signaling_deadline.unwrap_or_else(tokio::time::Instant::now)), if signaling_deadline.is_some() => {
+                            break SessionEnd::Rejoin(RejoinCause::SignalingTimeout);
+                        }
+                        event = call_events.recv() => match event {
+                            Ok(event) => match RtcConnectionSignal::from_event(&event) {
+                                Some(RtcConnectionSignal::Ended(end)) => break session_end(end),
+                                Some(signal) => {
+                                    let degraded = signal == RtcConnectionSignal::MediaDegraded;
+                                    if degraded != media_degraded {
+                                        media_degraded = degraded;
+                                        let status = self.session_status(&info, media_degraded, signaling_deadline.is_some());
+                                        self.shared.publish_live_status(self.token, &self.capture_stop, status).await;
+                                    }
+                                }
+                                None => {}
+                            },
+                            // A missed health change is re-reported by the next
+                            // signal; remote audio and video resynchronise their
+                            // participants and tracks on their own refresh ticks.
+                            Err(broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(broadcast::error::RecvError::Closed) => break SessionEnd::Rejoin(RejoinCause::TransportClosed),
+                        },
+                        outcome = &mut invitation, if invitation_pending => {
+                            invitation_pending = false;
+                            self.shared.send_invitation(self.presentation, &self.selection, outcome.status_text());
+                            if let InvitationOutcome::Sent(receipt) = outcome {
+                                invitation_deadline = Some(tokio::time::Instant::from_std(receipt.expires_at()));
+                                invitation_receipt = Some(receipt);
+                            }
+                        }
+                        _ = tokio::time::sleep_until(invitation_deadline.unwrap_or_else(tokio::time::Instant::now)), if invitation_deadline.is_some() => {
+                            invitation_deadline = None;
+                            self.shared.send_invitation(self.presentation, &self.selection,
+                                "Invitation sent; its 30-second window has ended.");
+                        }
+                        result = &mut audio, if audio_running => match result {
+                            // The audio loop returns only once the call ended;
+                            // the call event branch above reports how.
+                            Ok(()) => audio_running = false,
+                            Err(MediaError::CallEnded) => break SessionEnd::Finish(Err(CallControllerError::Media(MediaError::CallEnded))),
+                            Err(error) => {
+                                // A missing or stuck local audio device must not
+                                // tear down the receive-only call stage.
+                                audio_running = false;
+                                self.shared.fail_audio(self.presentation, AudioFailure::from_error(&error));
+                            }
+                        },
+                        changed = applied_audio.changed() => {
+                            if changed.is_ok() && controls.is_running() {
+                                self.shared.send_applied_audio(self.presentation, *applied_audio.borrow_and_update());
+                            }
+                        }
+                        // A closed roster/video stream must not end microphone
+                        // audio. run_remote_video normally waits for cancellation.
+                        () = &mut video, if video_running => video_running = false,
+                        event = outgoing.next_event() => {
+                            // A capture command may be ready in the same select
+                            // as Leave or an account change. Check the current
+                            // generation before opening any OS capture device.
+                            if self.cancel.try_recv().is_ok() {
+                                break SessionEnd::Finish(Ok(()));
+                            }
+                            if self.shared.active_video_token.load(Ordering::SeqCst) != self.presentation
+                                || !incoming_capture_allowed(incoming_guard.as_ref(), &info)
+                                || !self.selection.is_current()
+                                || active.borrow().as_ref().map(|account| account.id.as_str())
+                                    != Some(self.account_id.as_str())
+                            {
+                                break SessionEnd::Finish(Err(CallControllerError::AccountChanged));
+                            }
+                            outgoing.handle_event(&rtc, &self.room_id, event).await;
+                        },
+                    }
+                }
+            };
+            drop(guards);
+            controls.cancel();
+            let cause = match session {
+                SessionEnd::Finish(Ok(())) => break (CallOutcome::Idle, Ok(())),
+                SessionEnd::Finish(Err(error)) => {
+                    break (CallOutcome::Failed(error.to_string()), Ok(()));
+                }
+                SessionEnd::Ended(reason) => break (CallOutcome::Ended(reason.to_owned()), Ok(())),
+                SessionEnd::Rejoin(cause) => cause,
+            };
+            if incoming_guard.is_some() {
+                // An answered call is authorized for its admitted join only;
+                // a fresh membership would need a new Answer.
+                let error = CallControllerError::ConnectionLost(format!(
+                    "{}; an answered incoming call is not rejoined automatically",
+                    cause.message()
+                ));
+                break (CallOutcome::Failed(error.to_string()), Ok(()));
+            }
+            if self.capture_stop.requested() {
+                let error = CallControllerError::AccountChanged;
+                break (CallOutcome::Failed(error.to_string()), Ok(()));
+            }
+            if invitation_pending {
+                // The invitation named the lost membership. It is never resent.
+                invitation_pending = false;
+                self.shared
+                    .send_invitation(self.presentation, &self.selection, INVITATION_INTERRUPTED);
+            }
+            outgoing.detach_publications();
+            if !self.advance_presentation(&mut outgoing).await {
+                // Leave or an account change won before the rejoin began.
+                break match self.stop_result() {
+                    Ok(()) => (CallOutcome::Idle, Ok(())),
+                    Err(error) => (CallOutcome::Failed(error.to_string()), Ok(())),
+                };
+            }
+            let requested = controls.requested_state();
+            let guards = self.spawn_capture_guards(&active, &sync, None, None);
+            let rejoined = self
+                .rejoin(&mut rtc, cause, &info, requested, &mut active, &mut sync)
+                .await;
+            drop(guards);
+            match rejoined {
+                Ok((joined, rejoined_controls)) => {
+                    info = joined;
+                    controls = rejoined_controls;
+                }
+                Err(RejoinEnd::Stopped(Ok(()))) => break (CallOutcome::Idle, Ok(())),
+                Err(RejoinEnd::Stopped(Err(error))) => {
+                    break (CallOutcome::Failed(error.to_string()), Ok(()));
+                }
+                Err(RejoinEnd::CleanupFailed(reason)) => break (CallOutcome::Idle, Err(reason)),
             }
         };
         self.capture_stop.request();
         controls.cancel();
-        account_capture_guard.abort();
-        sync_capture_guard.abort();
-        if let Some(guard) = incoming_capture_guard {
-            guard.abort();
-        }
         let outgoing_result = outgoing.shutdown().await;
-        self.shared.clear_media(self.token);
+        self.shared.clear_media(self.presentation);
         // Local media and invitation UI stop before the bounded network
         // cleanup. Unknown HTTP completion has no receipt and is not retried;
         // the invitation's original short expiry remains the fallback.
         if let Some(receipt) = invitation_receipt {
             let _ = receipt.redact(&rtc).await;
         }
-        let leave_result = leave_with_timeout(&mut rtc, &self.room_id).await;
-        let cleanup = match (leave_result, outgoing_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) => Err(error.to_string()),
-            (Ok(()), Err(video)) => Err(format!("video cleanup: {video}")),
-            (Err(error), Err(video)) => Err(format!("{error}; video cleanup: {video}")),
+        let leave_result = match leave_with_timeout(&mut rtc, &self.room_id).await {
+            // A rejoin that failed after leaving the lost join left nothing.
+            Err(CallControllerError::Rtc(RtcError::NotJoined)) => Ok(()),
+            result => result,
         };
-        let failure = media_result.err().map(|error| error.to_string());
-        self.finish(cleanup, failure).await;
+        let mut problems = Vec::new();
+        if let Err(reason) = rejoin_cleanup {
+            problems.push(reason);
+        }
+        if let Err(error) = leave_result {
+            problems.push(error.to_string());
+        }
+        if let Err(video) = outgoing_result {
+            problems.push(format!("video cleanup: {video}"));
+        }
+        let cleanup = if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(problems.join("; "))
+        };
+        self.finish_with(cleanup, outcome).await;
     }
 
     async fn setup(&mut self) -> Result<(RtcService, CallInfo), CallControllerError> {
@@ -1788,6 +2036,402 @@ impl CallWorker {
         Ok((rtc, info))
     }
 
+    fn new_audio_controls(
+        &self,
+        rtc: &RtcService,
+        info: &CallInfo,
+        incoming_guard: Option<&EstablishedGuard>,
+        sync: &watch::Receiver<SyncStatus>,
+    ) -> Result<AudioControls, MediaError> {
+        let selection = self.selection.clone();
+        let stop = Arc::clone(&self.capture_stop);
+        let sync = sync.clone();
+        let incoming = incoming_guard.cloned();
+        let info = info.clone();
+        rtc.audio_controls_cancellable(&self.room_id, move || {
+            audio_capture_allowed(&stop, selection.is_current(), &sync.borrow())
+                && incoming_capture_allowed(incoming.as_ref(), &info)
+        })
+    }
+
+    fn spawn_capture_guards(
+        &self,
+        active: &watch::Receiver<Option<AccountInfo>>,
+        sync: &watch::Receiver<SyncStatus>,
+        incoming_guard: Option<&EstablishedGuard>,
+        audio: Option<&AudioControls>,
+    ) -> CaptureGuards {
+        let mut guards = Vec::with_capacity(3);
+        guards.push({
+            let mut active = active.clone();
+            let account_id = self.account_id.clone();
+            let selection = self.selection.clone();
+            let stop = Arc::clone(&self.capture_stop);
+            let audio = audio.cloned();
+            tokio::spawn(async move {
+                loop {
+                    if !selection.is_current()
+                        || active.borrow().as_ref().map(|account| account.id.as_str())
+                            != Some(account_id.as_str())
+                    {
+                        revoke_capture(&stop, audio.as_ref());
+                        break;
+                    }
+                    tokio::select! {
+                        _ = selection.revoked() => {
+                            revoke_capture(&stop, audio.as_ref());
+                            break;
+                        }
+                        changed = active.changed() => {
+                            if changed.is_err() {
+                                revoke_capture(&stop, audio.as_ref());
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+        });
+        guards.push({
+            let mut sync = sync.clone();
+            let stop = Arc::clone(&self.capture_stop);
+            let audio = audio.cloned();
+            tokio::spawn(async move {
+                loop {
+                    // A transient sync loss pauses media in the worker; only
+                    // the end of sticky sync for this session revokes capture.
+                    if signaling_health(&sync.borrow()) == SignalingHealth::Unavailable {
+                        revoke_capture(&stop, audio.as_ref());
+                        break;
+                    }
+                    if sync.changed().await.is_err() {
+                        revoke_capture(&stop, audio.as_ref());
+                        break;
+                    }
+                }
+            })
+        });
+        if let Some(guard) = incoming_guard.cloned() {
+            let stop = Arc::clone(&self.capture_stop);
+            let audio = audio.cloned();
+            guards.push(tokio::spawn(async move {
+                guard.cancelled().await;
+                revoke_capture(&stop, audio.as_ref());
+            }));
+        }
+        CaptureGuards(guards)
+    }
+
+    /// Joined, or reconnecting inside the same join. Signalling outranks
+    /// media because it also pauses outgoing media.
+    fn session_status(&self, info: &CallInfo, media_degraded: bool, paused: bool) -> CallStatus {
+        if paused {
+            self.reconnecting(info, CallInterruption::Signaling)
+        } else if media_degraded {
+            self.reconnecting(info, CallInterruption::Media)
+        } else {
+            CallStatus::Joined {
+                account_id: self.account_id.clone(),
+                call: info.clone(),
+            }
+        }
+    }
+
+    fn reconnecting(&self, info: &CallInfo, interruption: CallInterruption) -> CallStatus {
+        CallStatus::Reconnecting {
+            account_id: self.account_id.clone(),
+            call: info.clone(),
+            interruption,
+        }
+    }
+
+    async fn publish_recovery(&mut self, status: CallStatus) {
+        self.shared
+            .publish_live_status(self.token, &self.capture_stop, status)
+            .await;
+    }
+
+    /// Leave (`Ok`) or an account change, as observed while rejoining.
+    fn stop_result(&self) -> Result<(), CallControllerError> {
+        if self.selection.is_current() {
+            Ok(())
+        } else {
+            Err(CallControllerError::AccountChanged)
+        }
+    }
+
+    /// Start a new UI generation before rejoining. Every frame, roster and
+    /// audio update queued for the ended join then fails the UI's token
+    /// checks, while the call's capture authority and Leave stay untouched.
+    async fn advance_presentation(&mut self, outgoing: &mut LocalVideoSession) -> bool {
+        let generation = self.shared.next_token.fetch_add(1, Ordering::Relaxed);
+        let previous = self.presentation;
+        let mut slot = self.shared.slot.lock().await;
+        let CallSlot::Running(running) = &mut *slot else {
+            return false;
+        };
+        if running.token != self.token
+            || running.presentation != previous
+            || running.cancel.is_none()
+            || self.capture_stop.requested()
+        {
+            return false;
+        }
+        let swapped = self
+            .shared
+            .active_video_token
+            .compare_exchange(previous, generation, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok();
+        if !swapped {
+            return false;
+        }
+        // A failed local audio device cleared the old audio generation; the
+        // rejoined membership opens audio again under the new one.
+        self.shared
+            .active_audio_token
+            .store(generation, Ordering::SeqCst);
+        running.presentation = generation;
+        self.presentation = generation;
+        self.shared
+            .video
+            .send_replace(VideoUpdate::Clear { token: generation });
+        self.shared.roster.send_replace(RosterUpdate {
+            token: generation,
+            members: Vec::new(),
+        });
+        self.shared
+            .audio
+            .send_replace(AudioUpdate::Unavailable { token: generation });
+        self.shared.invitation.send_replace(InvitationUpdate {
+            token: generation,
+            text: "",
+        });
+        outgoing.set_presentation_token(generation);
+        true
+    }
+
+    /// Wait until `until`, or with `need_signaling` until sticky sync is
+    /// ready again, honouring Leave, account changes and terminal sync loss.
+    /// Returns false when `until` passed while still waiting for sync.
+    async fn recovery_pause(
+        &mut self,
+        active: &mut watch::Receiver<Option<AccountInfo>>,
+        sync: &mut watch::Receiver<SyncStatus>,
+        until: tokio::time::Instant,
+        need_signaling: bool,
+    ) -> Result<bool, RejoinEnd> {
+        let sleep = tokio::time::sleep_until(until);
+        tokio::pin!(sleep);
+        loop {
+            let state = sync.borrow_and_update().clone();
+            match signaling_health(&state) {
+                SignalingHealth::Ready if need_signaling => return Ok(true),
+                SignalingHealth::Unavailable => {
+                    return Err(RejoinEnd::Stopped(Err(sticky_sync_required(state))));
+                }
+                _ => {}
+            }
+            tokio::select! {
+                biased;
+                _ = &mut self.cancel => return Err(RejoinEnd::Stopped(Ok(()))),
+                _ = self.selection.revoked() => {
+                    return Err(RejoinEnd::Stopped(Err(CallControllerError::AccountChanged)));
+                }
+                changed = active.changed() => {
+                    if changed.is_err()
+                        || !self.selection.is_current()
+                        || active.borrow().as_ref().map(|account| account.id.as_str())
+                            != Some(self.account_id.as_str())
+                    {
+                        return Err(RejoinEnd::Stopped(Err(CallControllerError::AccountChanged)));
+                    }
+                }
+                changed = sync.changed() => {
+                    if changed.is_err() {
+                        let state = sync.borrow().clone();
+                        return Err(RejoinEnd::Stopped(Err(sticky_sync_required(state))));
+                    }
+                }
+                () = &mut sleep => return Ok(!need_signaling),
+            }
+        }
+    }
+
+    /// One fresh join with the original options. Cancellation observes but
+    /// never drops a join already in flight; a join that completes after
+    /// Leave or an account change is left again before returning.
+    async fn join_attempt(&mut self, rtc: &mut RtcService) -> Result<CallInfo, JoinAttemptError> {
+        let room_id = self.room_id.clone();
+        let (joined, cancelled) = {
+            let join = timeout(JOIN_TIMEOUT, rtc.join(&room_id, self.options.clone()));
+            let cancel = &mut self.cancel;
+            let selection = &self.selection;
+            let cancelled = async {
+                tokio::select! {
+                    _ = cancel => {},
+                    _ = selection.revoked() => {},
+                }
+            };
+            settle_owned_join(join, cancelled, || {}).await
+        };
+        let Some(joined) = joined else {
+            let stopped = RejoinEnd::Stopped(self.stop_result());
+            return Err(JoinAttemptError::Stopped(stopped));
+        };
+        let result = match joined {
+            Ok(Ok(info)) => Ok(info),
+            Ok(Err(error)) => {
+                let original = CallControllerError::from(error);
+                Err(cleanup_after_failed_join(rtc, &room_id, original).await)
+            }
+            Err(_) => {
+                let original = CallControllerError::TimedOut("rejoining MatrixRTC call");
+                Err(cleanup_after_failed_join(rtc, &room_id, original).await)
+            }
+        };
+        if cancelled {
+            let end = match result {
+                Ok(_) => leave_after(rtc, &self.room_id, self.stop_result()).await,
+                Err(CallControllerError::Cleanup(reason)) => RejoinEnd::CleanupFailed(reason),
+                Err(_) => RejoinEnd::Stopped(self.stop_result()),
+            };
+            return Err(JoinAttemptError::Stopped(end));
+        }
+        let info = result.map_err(JoinAttemptError::Failed)?;
+        let account = ensure_account(&self.manager, &self.account_id).await;
+        if account.is_err() || !self.selection.is_current() {
+            let changed = Err(CallControllerError::AccountChanged);
+            let end = leave_after(rtc, &self.room_id, changed).await;
+            return Err(JoinAttemptError::Stopped(end));
+        }
+        Ok(info)
+    }
+
+    /// Leave the unusable join once the homeserver is reachable, then make a
+    /// bounded number of fresh joins with the original options: never a
+    /// notification, another protocol, or an old token or endpoint. Each join
+    /// repeats discovery, encryption readiness and the transport's HTTPS
+    /// authorization and WSS media endpoint checks.
+    async fn rejoin(
+        &mut self,
+        rtc: &mut RtcService,
+        cause: RejoinCause,
+        last: &CallInfo,
+        requested: AudioState,
+        active: &mut watch::Receiver<Option<AccountInfo>>,
+        sync: &mut watch::Receiver<SyncStatus>,
+    ) -> Result<(CallInfo, AudioControls), RejoinEnd> {
+        let started = std::time::Instant::now();
+        let mut backoff = ReconnectBackoff::new(ReconnectPolicy::rejoin(), started);
+        let max_attempts = backoff.policy().max_attempts;
+        let deadline = tokio::time::Instant::from_std(backoff.deadline());
+        let waiting = self.reconnecting(last, CallInterruption::WaitingForNetwork);
+        // Confirm the old departure before any fresh membership is published,
+        // so peers never see two joins from this device.
+        if !signaling_ready(sync) {
+            self.publish_recovery(waiting.clone()).await;
+            if !self.recovery_pause(active, sync, deadline, true).await? {
+                let error = rejoin_exhausted(cause, 0, None);
+                return Err(RejoinEnd::Stopped(Err(error)));
+            }
+        }
+        let first = CallInterruption::Rejoining {
+            attempt: 1,
+            max_attempts,
+        };
+        let starting = self.reconnecting(last, first);
+        self.publish_recovery(starting).await;
+        match leave_with_timeout(rtc, &self.room_id).await {
+            Ok(()) | Err(CallControllerError::Rtc(RtcError::NotJoined)) => {}
+            Err(error) => {
+                return Err(RejoinEnd::CleanupFailed(format!(
+                    "{}; leaving the interrupted join failed: {error}",
+                    cause.message()
+                )));
+            }
+        }
+        let mut last_error = None;
+        loop {
+            let Some(delay) = backoff.next_attempt(std::time::Instant::now()) else {
+                let error = rejoin_exhausted(cause, backoff.attempts(), last_error);
+                return Err(RejoinEnd::Stopped(Err(error)));
+            };
+            let interruption = CallInterruption::Rejoining {
+                attempt: backoff.attempts(),
+                max_attempts,
+            };
+            let rejoining = self.reconnecting(last, interruption);
+            self.publish_recovery(rejoining.clone()).await;
+            let attempt_at = tokio::time::Instant::now() + delay;
+            self.recovery_pause(active, sync, attempt_at, false).await?;
+            if !signaling_ready(sync) {
+                self.publish_recovery(waiting.clone()).await;
+                if !self.recovery_pause(active, sync, deadline, true).await? {
+                    let attempts = backoff.attempts().saturating_sub(1);
+                    let error = rejoin_exhausted(cause, attempts, last_error);
+                    return Err(RejoinEnd::Stopped(Err(error)));
+                }
+                self.publish_recovery(rejoining).await;
+            }
+            match self.join_attempt(rtc).await {
+                Ok(info) => return self.install_rejoined(rtc, info, requested, sync).await,
+                Err(JoinAttemptError::Stopped(end)) => return Err(end),
+                Err(JoinAttemptError::Failed(CallControllerError::Cleanup(reason))) => {
+                    return Err(RejoinEnd::CleanupFailed(reason));
+                }
+                Err(JoinAttemptError::Failed(error)) if rejoin_retryable(&error) => {
+                    last_error = Some(error);
+                }
+                Err(JoinAttemptError::Failed(terminal)) => {
+                    return Err(RejoinEnd::Stopped(Err(terminal)));
+                }
+            }
+        }
+    }
+
+    /// Bind fresh audio controls, carrying the requested mute and deafen
+    /// state, to the new join and swap them in unless Leave or an account
+    /// change won meanwhile; the new join is left again in that case.
+    async fn install_rejoined(
+        &mut self,
+        rtc: &mut RtcService,
+        info: CallInfo,
+        requested: AudioState,
+        sync: &watch::Receiver<SyncStatus>,
+    ) -> Result<(CallInfo, AudioControls), RejoinEnd> {
+        let controls = match self.new_audio_controls(rtc, &info, None, sync) {
+            Ok(controls) => controls,
+            Err(error) => return Err(leave_after(rtc, &self.room_id, Err(error.into())).await),
+        };
+        if let Err(error) = controls.preset_requested_state(requested) {
+            return Err(leave_after(rtc, &self.room_id, Err(error.into())).await);
+        }
+        let installed = {
+            let mut slot = self.shared.slot.lock().await;
+            match &mut *slot {
+                CallSlot::Running(running)
+                    if running.token == self.token
+                        && running.presentation == self.presentation
+                        && running.cancel.is_some()
+                        && self.selection.is_current()
+                        && !self.capture_stop.requested() =>
+                {
+                    running.audio_controls = Some(controls.clone());
+                    self.shared.status.send_replace(CallStatus::Joined {
+                        account_id: self.account_id.clone(),
+                        call: info.clone(),
+                    });
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !installed {
+            return Err(leave_after(rtc, &self.room_id, self.stop_result()).await);
+        }
+        Ok((info, controls))
+    }
+
     /// Return true if the caller waiting for startup has gone away.
     fn send_ready(&mut self, result: Result<CallInfo, CallControllerError>) -> bool {
         self.ready
@@ -1796,7 +2440,12 @@ impl CallWorker {
     }
 
     async fn finish(&mut self, cleanup: Result<(), String>, failure: Option<String>) {
-        self.shared.clear_media(self.token);
+        let outcome = failure.map_or(CallOutcome::Idle, CallOutcome::Failed);
+        self.finish_with(cleanup, outcome).await;
+    }
+
+    async fn finish_with(&mut self, cleanup: Result<(), String>, outcome: CallOutcome) {
+        self.shared.clear_media(self.presentation);
         {
             let mut slot = self.shared.slot.lock().await;
             let done = match &*slot {
@@ -1822,11 +2471,15 @@ impl CallWorker {
                 } else {
                     *slot = CallSlot::Idle;
                     self.shared.release_update_lease();
-                    self.shared.status.send_replace(match failure {
-                        None => CallStatus::Idle,
-                        Some(ref reason) => CallStatus::Failed {
+                    self.shared.status.send_replace(match outcome {
+                        CallOutcome::Idle => CallStatus::Idle,
+                        CallOutcome::Failed(reason) => CallStatus::Failed {
                             room_id: self.room_id.clone(),
-                            reason: reason.clone(),
+                            reason,
+                        },
+                        CallOutcome::Ended(reason) => CallStatus::Ended {
+                            room_id: self.room_id.clone(),
+                            reason,
                         },
                     });
                 }
@@ -1981,6 +2634,16 @@ mod tests {
         assert!(!audio_capture_allowed(&stop, false, &current.borrow()));
         sync.send_replace(SyncStatus::Stopped);
         assert!(!audio_capture_allowed(&stop, true, &current.borrow()));
+        // A sticky-less fallback ends authorization; a retry only pauses it.
+        sync.send_replace(SyncStatus::Running {
+            backend: SyncBackend::Classic,
+        });
+        assert!(!audio_capture_allowed(&stop, true, &current.borrow()));
+        sync.send_replace(SyncStatus::Retrying {
+            after_seconds: 2,
+            reason: "offline".into(),
+        });
+        assert!(audio_capture_allowed(&stop, true, &current.borrow()));
         sync.send_replace(SyncStatus::Running {
             backend: SyncBackend::SlidingSticky,
         });
